@@ -229,15 +229,12 @@ impl GitRepo {
             "-z".into(),
         ];
         if let Some(base) = base.filter(|base| !base.is_empty()) {
-            let spec = String::from_utf8_lossy(base).into_owned();
-            let oid = self.rev_parse(&spec).await.map_err(|err| match err {
-                GitError::RevisionNotFound(_) => {
-                    GitError::Message(format!("failed to resolve base commit {spec:?}: {err:?}"))
-                }
-                other => other,
-            })?;
-            // The baseline wraps resolution failures; only head errors become
-            // `NotFound`. Keep the message for diagnostics.
+            // The baseline wraps base failures with `errors.Wrapf`, which
+            // keeps `RevisionNotFoundError` in the chain, so both base and
+            // head resolution failures surface as `NotFound`.
+            let oid = self
+                .rev_parse(&String::from_utf8_lossy(base))
+                .await?;
             args.push(oid.into());
         }
         let head_spec = String::from_utf8_lossy(head).into_owned();
@@ -436,6 +433,12 @@ mod tests {
 
         let files = repo.changed_files(None, head.as_bytes()).await.expect("diff");
         assert_eq!(files, vec![(b'A', b"a.txt".to_vec())]);
+
+        // Base resolution failures are `RevisionNotFound` like head failures.
+        assert!(matches!(
+            repo.changed_files(Some(b"deadbeef"), head.as_bytes()).await,
+            Err(GitError::RevisionNotFound(_))
+        ));
 
         // Unknown revision and missing file are distinguishable.
         assert!(matches!(
