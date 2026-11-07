@@ -122,6 +122,118 @@ impl Request {
     }
 }
 
+/// A file that matched the search query (`protocol.FileMatch`).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct FileMatch {
+    pub path: String,
+    pub language: String,
+    pub chunk_matches: Vec<ChunkMatch>,
+    /// The limit was hit while searching this file.
+    pub limit_hit: bool,
+}
+
+impl FileMatch {
+    /// Baseline `FileMatch.MatchCount`: a path match still counts as one.
+    pub fn match_count(&self) -> i32 {
+        if self.chunk_matches.is_empty() {
+            return 1;
+        }
+        self.chunk_matches
+            .iter()
+            .map(|chunk| chunk.ranges.len() as i32)
+            .sum()
+    }
+
+    /// Baseline `FileMatch.Limit`: truncate ranges to `limit` matches,
+    /// dropping chunks that no longer carry a range.
+    pub fn limit(&mut self, mut limit: i32) {
+        for index in 0..self.chunk_matches.len() {
+            let len = self.chunk_matches[index].ranges.len() as i32;
+            if len <= limit {
+                limit -= len;
+                continue;
+            }
+            // Invariant: limit < len.
+            self.chunk_matches[index]
+                .ranges
+                .truncate(limit.max(0) as usize);
+            if limit > 0 {
+                self.chunk_matches.truncate(index + 1);
+            } else {
+                self.chunk_matches.truncate(index);
+            }
+            self.limit_hit = true;
+            return;
+        }
+    }
+
+    /// Baseline `FileMatch.ToProto`.
+    pub fn to_proto(&self) -> pb::FileMatch {
+        pb::FileMatch {
+            path: self.path.as_bytes().to_vec(),
+            language: self.language.as_bytes().to_vec(),
+            chunk_matches: self
+                .chunk_matches
+                .iter()
+                .map(ChunkMatch::to_proto)
+                .collect(),
+            limit_hit: self.limit_hit,
+        }
+    }
+}
+
+/// A contiguous region of a file around one or more matches.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ChunkMatch {
+    pub content: String,
+    pub content_start: Location,
+    pub ranges: Vec<Range>,
+}
+
+impl ChunkMatch {
+    pub fn to_proto(&self) -> pb::ChunkMatch {
+        pb::ChunkMatch {
+            content: self.content.as_bytes().to_vec(),
+            content_start: Some(self.content_start.to_proto()),
+            ranges: self.ranges.iter().map(Range::to_proto).collect(),
+        }
+    }
+}
+
+/// A match span within a chunk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Range {
+    pub start: Location,
+    pub end: Location,
+}
+
+impl Range {
+    pub fn to_proto(&self) -> pb::Range {
+        pb::Range {
+            start: Some(self.start.to_proto()),
+            end: Some(self.end.to_proto()),
+        }
+    }
+}
+
+/// A byte offset plus its 0-based line and rune-based column.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Location {
+    pub offset: i32,
+    pub line: i32,
+    pub column: i32,
+}
+
+impl Location {
+    pub fn to_proto(&self) -> pb::Location {
+        pb::Location {
+            offset: self.offset,
+            line: self.line,
+            column: self.column,
+        }
+    }
+}
+
 fn node_from_proto(node: &pb::QueryNode) -> Option<QueryNode> {
     use pb::query_node::Value;
 
@@ -252,6 +364,54 @@ mod tests {
             })]),
         ]);
         assert_eq!(node.to_string(), "(\"needle\" AND (NOT /a.*b/))");
+    }
+
+    fn chunk(ranges: usize) -> ChunkMatch {
+        ChunkMatch {
+            content: String::new(),
+            content_start: Location::default(),
+            ranges: vec![Range::default(); ranges],
+        }
+    }
+
+    #[test]
+    fn counts_matches_like_the_baseline() {
+        let mut file_match = FileMatch::default();
+        assert_eq!(file_match.match_count(), 1);
+
+        file_match.chunk_matches = vec![chunk(2), chunk(3)];
+        assert_eq!(file_match.match_count(), 5);
+    }
+
+    #[test]
+    fn truncates_matches_at_the_limit() {
+        let mut file_match = FileMatch {
+            chunk_matches: vec![chunk(2), chunk(3), chunk(1)],
+            ..FileMatch::default()
+        };
+        // Exactly consumes the first chunk and part of the second.
+        file_match.limit(4);
+        assert_eq!(file_match.chunk_matches.len(), 2);
+        assert_eq!(file_match.chunk_matches[1].ranges.len(), 2);
+        assert!(file_match.limit_hit);
+
+        // A limit that lands on a chunk boundary drops the remaining chunks.
+        let mut file_match = FileMatch {
+            chunk_matches: vec![chunk(2), chunk(3)],
+            ..FileMatch::default()
+        };
+        file_match.limit(2);
+        assert_eq!(file_match.chunk_matches.len(), 1);
+        assert!(file_match.limit_hit);
+
+        // A limit larger than the match count leaves the file untouched.
+        let mut file_match = FileMatch {
+            chunk_matches: vec![chunk(2)],
+            ..FileMatch::default()
+        };
+        file_match.limit(5);
+        assert_eq!(file_match.chunk_matches.len(), 1);
+        assert!(!file_match.limit_hit);
     }
 
     #[test]
