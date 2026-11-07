@@ -51,6 +51,19 @@ pub fn is_grpc<B>(req: &Request<B>) -> bool {
             .is_some_and(|value| value.contains("application/grpc"))
 }
 
+/// Bind a TCP listener, accepting Go-style addresses with an empty host.
+///
+/// The baseline defaults (`SEARCHER_ADDR=:3181`, `SYMBOLS_ADDR=:3184`,
+/// `SRC_PROF_HTTP=:6060`) use `:port`, which Go treats as all interfaces.
+/// glibc's `getaddrinfo` rejects the empty host that `std::net::ToSocketAddrs`
+/// passes through, so expand it to the IPv4 wildcard explicitly.
+pub async fn listen(addr: &str) -> io::Result<TcpListener> {
+    match addr.strip_prefix(':') {
+        Some(port) => TcpListener::bind(format!("0.0.0.0:{port}")).await,
+        None => TcpListener::bind(addr).await,
+    }
+}
+
 /// Serve gRPC and plain HTTP on an already-bound listener until `shutdown` is
 /// cancelled.
 pub async fn serve(
@@ -176,5 +189,16 @@ async fn dispatch(
             .map_err(|err| io::Error::other(err.to_string()))
     } else {
         Ok(http(req).await)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::listen;
+
+    #[tokio::test]
+    async fn binds_go_style_wildcard_addresses() {
+        let listener = listen(":0").await.expect("bind :0");
+        assert!(listener.local_addr().expect("local addr").ip().is_unspecified());
     }
 }

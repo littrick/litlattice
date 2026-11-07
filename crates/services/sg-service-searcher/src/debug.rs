@@ -13,7 +13,6 @@ use std::sync::Arc;
 use http::{header, Request, Response, StatusCode};
 use http_body_util::Full;
 use hyper::body::{Bytes, Incoming};
-use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 
 /// Baseline `debugserver` default (`SRC_PROF_HTTP`).
@@ -26,7 +25,7 @@ const INDEX_HTML: &str =
 /// Bind `addr` and serve the debug HTTP surface until `shutdown` is cancelled.
 /// A bind error is logged and swallowed.
 pub async fn serve(addr: &str, shutdown: CancellationToken) {
-    let listener = match TcpListener::bind(addr).await {
+    let listener = match sg_http::listen(addr).await {
         Ok(listener) => listener,
         Err(err) => {
             tracing::warn!(addr, error = %err, "debug server failed to listen");

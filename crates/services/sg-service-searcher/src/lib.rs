@@ -11,7 +11,6 @@ use async_trait::async_trait;
 use http::{header, Request, Response, StatusCode};
 use http_body_util::Full;
 use hyper::body::{Bytes, Incoming};
-use tokio::net::TcpListener;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::Stream;
 use tokio_util::sync::CancellationToken;
@@ -186,7 +185,7 @@ impl Service for SearcherService {
         }
         let search_service = Arc::new(search_service);
 
-        let listener = TcpListener::bind(self.addr.as_str()).await.map_err(|err| {
+        let listener = sg_http::listen(self.addr.as_str()).await.map_err(|err| {
             ServiceError::with_source(format!("failed to listen on {}", self.addr), err)
         })?;
 

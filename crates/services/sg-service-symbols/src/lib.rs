@@ -11,7 +11,6 @@ use async_trait::async_trait;
 use http::{header, Request, Response, StatusCode};
 use http_body_util::Full;
 use hyper::body::{Bytes, Incoming};
-use tokio::net::TcpListener;
 use tonic::{Request as GrpcRequest, Response as GrpcResponse, Status};
 
 use sg_core::{ConfigError, EnvReader, Service, ServiceContext, ServiceError};
@@ -121,7 +120,7 @@ impl Service for SymbolsService {
             .clone()
             .ok_or_else(|| ServiceError::new("symbols configuration was not loaded"))?;
 
-        let listener = TcpListener::bind(self.addr.as_str()).await.map_err(|err| {
+        let listener = sg_http::listen(self.addr.as_str()).await.map_err(|err| {
             ServiceError::with_source(format!("failed to listen on {}", self.addr), err)
         })?;
 
