@@ -1,0 +1,15 @@
+{
+  "expected": {
+    "error": {
+      "code": "not_found",
+      "message": "revision not found"
+    }
+  },
+  "request": {
+    "commit_sha": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+    "path": "python/example.py",
+    "repo_name": "test/symbols-fixture"
+  },
+  "rpc": "stat",
+  "service": "gitserver"
+}

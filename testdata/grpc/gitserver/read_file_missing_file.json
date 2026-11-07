@@ -1,0 +1,15 @@
+{
+  "expected": {
+    "error": {
+      "code": "not_found",
+      "message": "file not found"
+    }
+  },
+  "request": {
+    "commit": "5abdba2559d350afdf6b4dcbf32f5edaadcbdda1",
+    "path": "missing.txt",
+    "repo_name": "test/symbols-fixture"
+  },
+  "rpc": "read_file",
+  "service": "gitserver"
+}

@@ -1021,82 +1021,123 @@ async fn call_searcher(
     Ok(normalize_searcher_response(&messages))
 }
 
+/// Why a gitserver replay produced no response: an RPC status (frozen in the
+/// fixture as `{"error": {...}}`) or a fixture bug (surfaced as a hard error).
+enum GitserverFailure {
+    Status(tonic::Status),
+    Fixture(String),
+}
+
+impl From<tonic::Status> for GitserverFailure {
+    fn from(status: tonic::Status) -> Self {
+        Self::Status(status)
+    }
+}
+
+/// Error responses are part of the contract: freeze the gRPC code and message
+/// (details/`Any` payloads are not compared yet).
+fn normalize_status(status: &tonic::Status) -> Value {
+    json!({
+        "error": {
+            "code": code_name(status.code()),
+            "message": status.message(),
+        }
+    })
+}
+
+fn code_name(code: tonic::Code) -> &'static str {
+    match code {
+        tonic::Code::Ok => "ok",
+        tonic::Code::Cancelled => "cancelled",
+        tonic::Code::Unknown => "unknown",
+        tonic::Code::InvalidArgument => "invalid_argument",
+        tonic::Code::DeadlineExceeded => "deadline_exceeded",
+        tonic::Code::NotFound => "not_found",
+        tonic::Code::AlreadyExists => "already_exists",
+        tonic::Code::PermissionDenied => "permission_denied",
+        tonic::Code::ResourceExhausted => "resource_exhausted",
+        tonic::Code::FailedPrecondition => "failed_precondition",
+        tonic::Code::Aborted => "aborted",
+        tonic::Code::OutOfRange => "out_of_range",
+        tonic::Code::Unimplemented => "unimplemented",
+        tonic::Code::Internal => "internal",
+        tonic::Code::Unavailable => "unavailable",
+        tonic::Code::DataLoss => "data_loss",
+        tonic::Code::Unauthenticated => "unauthenticated",
+    }
+}
+
+#[allow(clippy::result_large_err)] // `tonic::Status` is the RPC error type.
 async fn call_gitserver(
     client: &mut gpb::gitserver_service_client::GitserverServiceClient<tonic::transport::Channel>,
     rpc: GitserverRpc,
     request: &Value,
-) -> Result<Value, String> {
+) -> Result<Value, GitserverFailure> {
     match rpc {
         GitserverRpc::Archive => {
             let mut stream = client
-                .archive(gitserver_archive_request(request)?)
-                .await
-                .map_err(|err| format!("Archive RPC failed: {err}"))?
+                .archive(gitserver_archive_request(request).map_err(GitserverFailure::Fixture)?)
+                .await?
                 .into_inner();
             let mut messages = Vec::new();
-            while let Some(message) = stream
-                .message()
-                .await
-                .map_err(|err| format!("Archive stream failed: {err}"))?
-            {
+            while let Some(message) = stream.message().await? {
                 messages.push(message);
             }
             Ok(normalize_archive(&messages))
         }
         GitserverRpc::ReadFile => {
             let mut stream = client
-                .read_file(gitserver_read_file_request(request)?)
-                .await
-                .map_err(|err| format!("ReadFile RPC failed: {err}"))?
+                .read_file(gitserver_read_file_request(request).map_err(GitserverFailure::Fixture)?)
+                .await?
                 .into_inner();
             let mut messages = Vec::new();
-            while let Some(message) = stream
-                .message()
-                .await
-                .map_err(|err| format!("ReadFile stream failed: {err}"))?
-            {
+            while let Some(message) = stream.message().await? {
                 messages.push(message);
             }
             Ok(normalize_read_file(&messages))
         }
         GitserverRpc::ResolveRevision => {
             let response = client
-                .resolve_revision(gitserver_resolve_revision_request(request)?)
-                .await
-                .map_err(|err| format!("ResolveRevision RPC failed: {err}"))?
+                .resolve_revision(
+                    gitserver_resolve_revision_request(request)
+                        .map_err(GitserverFailure::Fixture)?,
+                )
+                .await?
                 .into_inner();
             Ok(json!({"commit_sha": response.commit_sha}))
         }
         GitserverRpc::GetObject => {
             let response = client
-                .get_object(gitserver_get_object_request(request)?)
-                .await
-                .map_err(|err| format!("GetObject RPC failed: {err}"))?
+                .get_object(
+                    gitserver_get_object_request(request).map_err(GitserverFailure::Fixture)?,
+                )
+                .await?
                 .into_inner();
             let object = response.object.map(|object| normalize_git_object(&object));
             Ok(json!({"object": object}))
         }
         GitserverRpc::DefaultBranch => {
             let response = client
-                .default_branch(gitserver_default_branch_request(request)?)
-                .await
-                .map_err(|err| format!("DefaultBranch RPC failed: {err}"))?
+                .default_branch(
+                    gitserver_default_branch_request(request).map_err(GitserverFailure::Fixture)?,
+                )
+                .await?
                 .into_inner();
             Ok(json!({"ref_name": response.ref_name, "commit": response.commit}))
         }
         GitserverRpc::MergeBase => {
             let response = client
-                .merge_base(gitserver_merge_base_request(request)?)
-                .await
-                .map_err(|err| format!("MergeBase RPC failed: {err}"))?
+                .merge_base(
+                    gitserver_merge_base_request(request).map_err(GitserverFailure::Fixture)?,
+                )
+                .await?
                 .into_inner();
             Ok(json!({"merge_base_commit_sha": response.merge_base_commit_sha}))
         }
         GitserverRpc::Stat => {
             let response = client
-                .stat(gitserver_stat_request(request)?)
-                .await
-                .map_err(|err| format!("Stat RPC failed: {err}"))?
+                .stat(gitserver_stat_request(request).map_err(GitserverFailure::Fixture)?)
+                .await?
                 .into_inner();
             Ok(json!({
                 "file_info": response.file_info.as_ref().map(normalize_file_info),
@@ -1104,16 +1145,11 @@ async fn call_gitserver(
         }
         GitserverRpc::ReadDir => {
             let mut stream = client
-                .read_dir(gitserver_read_dir_request(request)?)
-                .await
-                .map_err(|err| format!("ReadDir RPC failed: {err}"))?
+                .read_dir(gitserver_read_dir_request(request).map_err(GitserverFailure::Fixture)?)
+                .await?
                 .into_inner();
             let mut files = Vec::new();
-            while let Some(message) = stream
-                .message()
-                .await
-                .map_err(|err| format!("ReadDir stream failed: {err}"))?
-            {
+            while let Some(message) = stream.message().await? {
                 files.extend(message.file_info.iter().map(normalize_file_info));
             }
             // Chunk boundaries are an implementation detail; order is git's
@@ -1123,16 +1159,13 @@ async fn call_gitserver(
         }
         GitserverRpc::ChangedFiles => {
             let mut stream = client
-                .changed_files(gitserver_changed_files_request(request)?)
-                .await
-                .map_err(|err| format!("ChangedFiles RPC failed: {err}"))?
+                .changed_files(
+                    gitserver_changed_files_request(request).map_err(GitserverFailure::Fixture)?,
+                )
+                .await?
                 .into_inner();
             let mut messages = Vec::new();
-            while let Some(message) = stream
-                .message()
-                .await
-                .map_err(|err| format!("ChangedFiles stream failed: {err}"))?
-            {
+            while let Some(message) = stream.message().await? {
                 messages.push(message);
             }
             Ok(normalize_changed_files(&messages))
@@ -1187,7 +1220,15 @@ async fn evaluate(service: &str, addr: &str, cases: &[FixtureCase]) -> Result<Ve
                         case.path.display()
                     ));
                 };
-                results.push(call_gitserver(&mut client, rpc, &case.request).await?);
+                match call_gitserver(&mut client, rpc, &case.request).await {
+                    Ok(value) => results.push(value),
+                    Err(GitserverFailure::Status(status)) => {
+                        results.push(normalize_status(&status))
+                    }
+                    Err(GitserverFailure::Fixture(err)) => {
+                        return Err(format!("{}: {err}", case.path.display()))
+                    }
+                }
             }
         }
         other => {
@@ -1417,6 +1458,17 @@ mod tests {
         assert_eq!(normalized["files"][0]["path"], json!("a.txt"));
         assert_eq!(normalized["files"][0]["status"], json!("added"));
         assert_eq!(normalized["files"][1]["status"], json!("deleted"));
+    }
+
+    #[test]
+    fn normalizes_gitserver_error_statuses() {
+        let status = tonic::Status::not_found("file not found");
+        assert_eq!(
+            normalize_status(&status),
+            json!({"error": {"code": "not_found", "message": "file not found"}})
+        );
+        assert_eq!(code_name(tonic::Code::Unimplemented), "unimplemented");
+        assert_eq!(code_name(tonic::Code::InvalidArgument), "invalid_argument");
     }
 
     #[test]

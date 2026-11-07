@@ -1,0 +1,15 @@
+{
+  "expected": {
+    "error": {
+      "code": "not_found",
+      "message": "file not found"
+    }
+  },
+  "request": {
+    "commit_sha": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+    "path": "",
+    "repo_name": "test/symbols-fixture"
+  },
+  "rpc": "stat",
+  "service": "gitserver"
+}

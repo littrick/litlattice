@@ -1,0 +1,14 @@
+{
+  "expected": {
+    "error": {
+      "code": "not_found",
+      "message": "revision not found"
+    }
+  },
+  "request": {
+    "object_name": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+    "repo": "test/symbols-fixture"
+  },
+  "rpc": "get_object",
+  "service": "gitserver"
+}
