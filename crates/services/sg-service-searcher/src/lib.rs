@@ -26,6 +26,8 @@ pub mod matchtree;
 pub mod metrics;
 pub mod pathmatch;
 pub mod protocol;
+pub mod regex_search;
+pub mod sender;
 pub mod store;
 pub mod zipcache;
 
