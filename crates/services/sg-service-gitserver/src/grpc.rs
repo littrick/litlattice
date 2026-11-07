@@ -1,8 +1,8 @@
 //! `gitserver.v1.GitserverService`: read path plus `UNIMPLEMENTED` stubs.
 //!
-//! Only `Archive`, `ReadFile` and `ChangedFiles` are implemented (M9.2 first
-//! slice). Every other RPC returns `UNIMPLEMENTED`, matching what a Go
-//! gitserver build without those features would report.
+//! Implemented so far: `Archive`, `ReadFile`, `ChangedFiles`, `ResolveRevision`,
+//! `GetObject`, `DefaultBranch`, `MergeBase`, `Stat` and `ReadDir` (M9.2).
+//! Every other RPC returns `UNIMPLEMENTED`.
 
 use std::pin::Pin;
 use std::sync::Arc;
@@ -14,7 +14,7 @@ use tonic::{Request as GrpcRequest, Response as GrpcResponse, Status};
 
 use sg_proto::gitserver as gpb;
 
-use crate::git::{pump_stdout, GitError, GitRepo, CHUNK_MESSAGE_SIZE};
+use crate::git::{pump_stdout, GitError, GitRepo, TreeEntry, CHUNK_MESSAGE_SIZE};
 use crate::repo::repo_dir;
 
 type Stream<T> = Pin<Box<dyn tokio_stream::Stream<Item = Result<T, Status>> + Send>>;
@@ -29,8 +29,8 @@ impl Grpc {
     /// exists.
     #[allow(clippy::result_large_err)] // `tonic::Status` is the RPC error type.
     fn repo(&self, name: &str) -> Result<GitRepo, Status> {
-        let dir = repo_dir(&self.repos_dir, name)
-            .ok_or_else(|| Status::not_found("repo not found"))?;
+        let dir =
+            repo_dir(&self.repos_dir, name).ok_or_else(|| Status::not_found("repo not found"))?;
         match std::fs::metadata(dir.join("HEAD")) {
             Ok(_) => Ok(GitRepo::new(dir)),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
@@ -44,7 +44,9 @@ impl Grpc {
 }
 
 fn unimplemented(rpc: &str) -> Status {
-    Status::unimplemented(format!("{rpc} is not implemented by the Rust gitserver yet"))
+    Status::unimplemented(format!(
+        "{rpc} is not implemented by the Rust gitserver yet"
+    ))
 }
 
 fn git_status(err: GitError) -> Status {
@@ -52,6 +54,20 @@ fn git_status(err: GitError) -> Status {
         GitError::RevisionNotFound(_) => Status::not_found("revision not found"),
         GitError::FileNotFound => Status::not_found("file not found"),
         GitError::Message(message) => Status::unknown(message),
+    }
+}
+
+fn file_info(entry: TreeEntry) -> gpb::FileInfo {
+    gpb::FileInfo {
+        name: entry.name,
+        size: entry.size,
+        mode: entry.mode,
+        blob_oid: entry.blob_oid.unwrap_or_default(),
+        submodule: entry.submodule.map(|submodule| gpb::GitSubmodule {
+            url: submodule.url,
+            path: submodule.path,
+            commit_sha: submodule.commit_sha,
+        }),
     }
 }
 
@@ -96,12 +112,7 @@ impl gpb::gitserver_service_server::GitserverService for Grpc {
             let result = pump_stdout(child, |data| {
                 // A failed send means the client disconnected; stop git.
                 let sender = sender.clone();
-                async move {
-                    sender
-                        .send(Ok(gpb::ArchiveResponse { data }))
-                        .await
-                        .is_ok()
-                }
+                async move { sender.send(Ok(gpb::ArchiveResponse { data })).await.is_ok() }
             })
             .await;
             if let Err(message) = result {
@@ -239,7 +250,10 @@ impl gpb::gitserver_service_server::GitserverService for Grpc {
             return Err(Status::invalid_argument("object name must be specified"));
         }
         let repo = self.repo(&request.repo)?;
-        let (id, object_type) = repo.get_object(&request.object_name).await.map_err(git_status)?;
+        let (id, object_type) = repo
+            .get_object(&request.object_name)
+            .await
+            .map_err(git_status)?;
         let r#type = match object_type.as_str() {
             "commit" => gpb::git_object::ObjectType::Commit,
             "tag" => gpb::git_object::ObjectType::Tag,
@@ -269,7 +283,8 @@ impl gpb::gitserver_service_server::GitserverService for Grpc {
         Err(unimplemented("list_gitolite"))
     }
 
-    type SearchStream = Pin<Box<dyn tokio_stream::Stream<Item = Result<gpb::SearchResponse, Status>> + Send>>;
+    type SearchStream =
+        Pin<Box<dyn tokio_stream::Stream<Item = Result<gpb::SearchResponse, Status>> + Send>>;
 
     async fn search(
         &self,
@@ -277,7 +292,6 @@ impl gpb::gitserver_service_server::GitserverService for Grpc {
     ) -> Result<GrpcResponse<Self::SearchStream>, Status> {
         Err(unimplemented("search"))
     }
-
 
     async fn repo_clone_progress(
         &self,
@@ -365,7 +379,8 @@ impl gpb::gitserver_service_server::GitserverService for Grpc {
         }))
     }
 
-    type BlameStream = Pin<Box<dyn tokio_stream::Stream<Item = Result<gpb::BlameResponse, Status>> + Send>>;
+    type BlameStream =
+        Pin<Box<dyn tokio_stream::Stream<Item = Result<gpb::BlameResponse, Status>> + Send>>;
 
     async fn blame(
         &self,
@@ -394,7 +409,6 @@ impl gpb::gitserver_service_server::GitserverService for Grpc {
         }))
     }
 
-
     async fn get_commit(
         &self,
         _request: GrpcRequest<gpb::GetCommitRequest>,
@@ -415,14 +429,14 @@ impl gpb::gitserver_service_server::GitserverService for Grpc {
         // `ensure_revision` would fetch missing revisions in the baseline;
         // the Rust gitserver has no write path yet, so it behaves like a
         // failed ensure and reports `NotFound`.
-        let commit_sha = repo
-            .resolve_revision(&spec)
-            .await
-            .map_err(git_status)?;
-        Ok(GrpcResponse::new(gpb::ResolveRevisionResponse { commit_sha }))
+        let commit_sha = repo.resolve_revision(&spec).await.map_err(git_status)?;
+        Ok(GrpcResponse::new(gpb::ResolveRevisionResponse {
+            commit_sha,
+        }))
     }
 
-    type ListRefsStream = Pin<Box<dyn tokio_stream::Stream<Item = Result<gpb::ListRefsResponse, Status>> + Send>>;
+    type ListRefsStream =
+        Pin<Box<dyn tokio_stream::Stream<Item = Result<gpb::ListRefsResponse, Status>> + Send>>;
 
     async fn list_refs(
         &self,
@@ -438,7 +452,8 @@ impl gpb::gitserver_service_server::GitserverService for Grpc {
         Err(unimplemented("rev_at_time"))
     }
 
-    type RawDiffStream = Pin<Box<dyn tokio_stream::Stream<Item = Result<gpb::RawDiffResponse, Status>> + Send>>;
+    type RawDiffStream =
+        Pin<Box<dyn tokio_stream::Stream<Item = Result<gpb::RawDiffResponse, Status>> + Send>>;
 
     async fn raw_diff(
         &self,
@@ -468,24 +483,75 @@ impl gpb::gitserver_service_server::GitserverService for Grpc {
         Err(unimplemented("behind_ahead"))
     }
 
-
     async fn stat(
         &self,
-        _request: GrpcRequest<gpb::StatRequest>,
+        request: GrpcRequest<gpb::StatRequest>,
     ) -> Result<GrpcResponse<gpb::StatResponse>, Status> {
-        Err(unimplemented("stat"))
+        let request = request.into_inner();
+        if request.repo_name.is_empty() {
+            return Err(Status::invalid_argument("repo must be specified"));
+        }
+        if request.commit_sha.is_empty() {
+            return Err(Status::invalid_argument("commit_sha must be specified"));
+        }
+        let repo = self.repo(&request.repo_name)?;
+        let entry = repo
+            .stat(&request.commit_sha, &request.path)
+            .await
+            .map_err(git_status)?;
+        Ok(GrpcResponse::new(gpb::StatResponse {
+            file_info: Some(file_info(entry)),
+        }))
     }
 
-    type ReadDirStream = Pin<Box<dyn tokio_stream::Stream<Item = Result<gpb::ReadDirResponse, Status>> + Send>>;
+    type ReadDirStream =
+        Pin<Box<dyn tokio_stream::Stream<Item = Result<gpb::ReadDirResponse, Status>> + Send>>;
 
     async fn read_dir(
         &self,
-        _request: GrpcRequest<gpb::ReadDirRequest>,
+        request: GrpcRequest<gpb::ReadDirRequest>,
     ) -> Result<GrpcResponse<Self::ReadDirStream>, Status> {
-        Err(unimplemented("read_dir"))
+        let request = request.into_inner();
+        if request.repo_name.is_empty() {
+            return Err(Status::invalid_argument("repo must be specified"));
+        }
+        if request.commit_sha.is_empty() {
+            return Err(Status::invalid_argument("commit_sha must be specified"));
+        }
+        let repo = self.repo(&request.repo_name)?;
+        let entries = repo
+            .read_dir(
+                &request.commit_sha,
+                request.path.as_deref().unwrap_or_default(),
+                request.recursive,
+            )
+            .await
+            .map_err(git_status)?;
+
+        // Chunk at 1 MiB like the baseline `internal/grpc/chunk`.
+        let mut responses = Vec::new();
+        let mut chunk = Vec::new();
+        let mut size = 0usize;
+        for entry in entries {
+            let file = file_info(entry);
+            let file_size = file.encoded_len();
+            if size + file_size >= CHUNK_MESSAGE_SIZE {
+                responses.push(Ok(gpb::ReadDirResponse {
+                    file_info: std::mem::take(&mut chunk),
+                }));
+                size = 0;
+            }
+            size += file_size;
+            chunk.push(file);
+        }
+        if !chunk.is_empty() {
+            responses.push(Ok(gpb::ReadDirResponse { file_info: chunk }));
+        }
+        Ok(GrpcResponse::new(Box::pin(tokio_stream::iter(responses))))
     }
 
-    type CommitLogStream = Pin<Box<dyn tokio_stream::Stream<Item = Result<gpb::CommitLogResponse, Status>> + Send>>;
+    type CommitLogStream =
+        Pin<Box<dyn tokio_stream::Stream<Item = Result<gpb::CommitLogResponse, Status>> + Send>>;
 
     async fn commit_log(
         &self,

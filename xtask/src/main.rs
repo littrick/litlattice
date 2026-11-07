@@ -235,6 +235,8 @@ enum GitserverRpc {
     GetObject,
     DefaultBranch,
     MergeBase,
+    Stat,
+    ReadDir,
 }
 
 impl GitserverRpc {
@@ -247,9 +249,11 @@ impl GitserverRpc {
             "get_object" => Ok(Self::GetObject),
             "default_branch" => Ok(Self::DefaultBranch),
             "merge_base" => Ok(Self::MergeBase),
+            "stat" => Ok(Self::Stat),
+            "read_dir" => Ok(Self::ReadDir),
             other => Err(format!(
                 "unknown gitserver rpc {other:?} (archive, read_file, changed_files, \
-                 resolve_revision, get_object, default_branch, merge_base)"
+                 resolve_revision, get_object, default_branch, merge_base, stat, read_dir)"
             )),
         }
     }
@@ -703,7 +707,11 @@ fn chunk_json(chunk: &spb::ChunkMatch) -> Value {
 
 fn file_match_json(file_match: &spb::FileMatch) -> Value {
     let mut chunks: Vec<Value> = file_match.chunk_matches.iter().map(chunk_json).collect();
-    chunks.sort_by_key(|chunk| chunk["content_start"]["offset"].as_i64().unwrap_or_default());
+    chunks.sort_by_key(|chunk| {
+        chunk["content_start"]["offset"]
+            .as_i64()
+            .unwrap_or_default()
+    });
     json!({
         "path": String::from_utf8_lossy(&file_match.path),
         "language": String::from_utf8_lossy(&file_match.language),
@@ -735,10 +743,7 @@ fn normalize_searcher_response(messages: &[spb::SearchResponse]) -> Value {
                 value["chunks"][0]["content_start"]["offset"]
                     .as_i64()
                     .unwrap_or_default(),
-                value["chunks"]
-                    .as_array()
-                    .map(Vec::len)
-                    .unwrap_or_default(),
+                value["chunks"].as_array().map(Vec::len).unwrap_or_default(),
             )
         };
         key(left).cmp(&key(right))
@@ -870,6 +875,49 @@ fn gitserver_merge_base_request(value: &Value) -> Result<gpb::MergeBaseRequest, 
         repo_name: string(value, "repo_name")?,
         base: string(value, "base")?.into_bytes(),
         head: string(value, "head")?.into_bytes(),
+    })
+}
+
+fn gitserver_stat_request(value: &Value) -> Result<gpb::StatRequest, String> {
+    Ok(gpb::StatRequest {
+        repo_name: string(value, "repo_name")?,
+        commit_sha: string(value, "commit_sha")?,
+        path: optional_string(value, "path")?.into_bytes(),
+    })
+}
+
+fn gitserver_read_dir_request(value: &Value) -> Result<gpb::ReadDirRequest, String> {
+    Ok(gpb::ReadDirRequest {
+        repo_name: string(value, "repo_name")?,
+        commit_sha: string(value, "commit_sha")?,
+        path: match value.get("path") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(text)) => Some(text.clone().into_bytes()),
+            Some(_) => return Err("request: path must be a string".to_owned()),
+        },
+        recursive: value
+            .get("recursive")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+    })
+}
+
+/// `proto.FileInfo` as JSON. Modes are the raw Go `fs.FileMode` bits; the
+/// names are compared byte-for-byte.
+fn normalize_file_info(file: &gpb::FileInfo) -> Value {
+    let submodule = file.submodule.as_ref().map(|submodule| {
+        json!({
+            "url": submodule.url,
+            "path": String::from_utf8_lossy(&submodule.path),
+            "commit_sha": submodule.commit_sha,
+        })
+    });
+    json!({
+        "name": String::from_utf8_lossy(&file.name),
+        "size": file.size,
+        "mode": file.mode,
+        "blob_oid": file.blob_oid,
+        "submodule": submodule,
     })
 }
 
@@ -1044,6 +1092,35 @@ async fn call_gitserver(
                 .into_inner();
             Ok(json!({"merge_base_commit_sha": response.merge_base_commit_sha}))
         }
+        GitserverRpc::Stat => {
+            let response = client
+                .stat(gitserver_stat_request(request)?)
+                .await
+                .map_err(|err| format!("Stat RPC failed: {err}"))?
+                .into_inner();
+            Ok(json!({
+                "file_info": response.file_info.as_ref().map(normalize_file_info),
+            }))
+        }
+        GitserverRpc::ReadDir => {
+            let mut stream = client
+                .read_dir(gitserver_read_dir_request(request)?)
+                .await
+                .map_err(|err| format!("ReadDir RPC failed: {err}"))?
+                .into_inner();
+            let mut files = Vec::new();
+            while let Some(message) = stream
+                .message()
+                .await
+                .map_err(|err| format!("ReadDir stream failed: {err}"))?
+            {
+                files.extend(message.file_info.iter().map(normalize_file_info));
+            }
+            // Chunk boundaries are an implementation detail; order is git's
+            // tree order, but sort so fixtures do not depend on it.
+            files.sort_by(|left, right| left["name"].as_str().cmp(&right["name"].as_str()));
+            Ok(json!({"file_info": files}))
+        }
         GitserverRpc::ChangedFiles => {
             let mut stream = client
                 .changed_files(gitserver_changed_files_request(request)?)
@@ -1069,11 +1146,10 @@ async fn evaluate(service: &str, addr: &str, cases: &[FixtureCase]) -> Result<Ve
     let mut results = Vec::with_capacity(cases.len());
     match service {
         "symbols" => {
-            let mut client = pb::symbols_service_client::SymbolsServiceClient::connect(
-                addr.to_owned(),
-            )
-            .await
-            .map_err(|err| format!("connect {addr}: {err}"))?;
+            let mut client =
+                pb::symbols_service_client::SymbolsServiceClient::connect(addr.to_owned())
+                    .await
+                    .map_err(|err| format!("connect {addr}: {err}"))?;
             for case in cases {
                 let FixtureService::Symbols(rpc) = case.service else {
                     return Err(format!(
@@ -1085,11 +1161,10 @@ async fn evaluate(service: &str, addr: &str, cases: &[FixtureCase]) -> Result<Ve
             }
         }
         "searcher" => {
-            let mut client = spb::searcher_service_client::SearcherServiceClient::connect(
-                addr.to_owned(),
-            )
-            .await
-            .map_err(|err| format!("connect {addr}: {err}"))?;
+            let mut client =
+                spb::searcher_service_client::SearcherServiceClient::connect(addr.to_owned())
+                    .await
+                    .map_err(|err| format!("connect {addr}: {err}"))?;
             for case in cases {
                 if case.service != FixtureService::Searcher {
                     return Err(format!(
@@ -1211,8 +1286,7 @@ async fn record(args: &[String]) -> Result<(), String> {
 
     for (case, actual) in cases.iter().zip(actuals) {
         let mut document: Value = serde_json::from_slice(
-            &fs::read(&case.path)
-                .map_err(|err| format!("read {}: {err}", case.path.display()))?,
+            &fs::read(&case.path).map_err(|err| format!("read {}: {err}", case.path.display()))?,
         )
         .map_err(|err| format!("parse {}: {err}", case.path.display()))?;
         document["expected"] = actual;
@@ -1365,5 +1439,28 @@ mod tests {
         }))
         .expect("changed files request");
         assert_eq!(request.base, None);
+
+        let request = gitserver_stat_request(&json!({
+            "repo_name": "r", "commit_sha": "c", "path": "dir/file.txt",
+        }))
+        .expect("stat request");
+        assert_eq!(request.path, b"dir/file.txt".to_vec());
+
+        // An omitted path means the root.
+        let request = gitserver_stat_request(&json!({"repo_name": "r", "commit_sha": "c"}))
+            .expect("stat request");
+        assert!(request.path.is_empty());
+
+        let request = gitserver_read_dir_request(&json!({"repo_name": "r", "commit_sha": "c"}))
+            .expect("read_dir request");
+        assert_eq!(request.path, None);
+        assert!(!request.recursive);
+
+        let request = gitserver_read_dir_request(&json!({
+            "repo_name": "r", "commit_sha": "c", "path": "", "recursive": true,
+        }))
+        .expect("read_dir request");
+        assert_eq!(request.path, Some(Vec::new()));
+        assert!(request.recursive);
     }
 }

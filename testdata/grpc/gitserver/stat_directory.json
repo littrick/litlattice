@@ -1,0 +1,18 @@
+{
+  "expected": {
+    "file_info": {
+      "blob_oid": "651e9f16df0e3413e9c6c3e06f5f19d7d1c1b5cf",
+      "mode": 2147500032,
+      "name": "python",
+      "size": 0,
+      "submodule": null
+    }
+  },
+  "request": {
+    "commit_sha": "5abdba2559d350afdf6b4dcbf32f5edaadcbdda1",
+    "path": "python",
+    "repo_name": "test/symbols-fixture"
+  },
+  "rpc": "stat",
+  "service": "gitserver"
+}

@@ -1,0 +1,33 @@
+{
+  "expected": {
+    "file_info": [
+      {
+        "blob_oid": "a005e25075e8737f1858ce1fdbe31bf757bcef83",
+        "mode": 2147500032,
+        "name": "java1",
+        "size": 0,
+        "submodule": null
+      },
+      {
+        "blob_oid": "651e9f16df0e3413e9c6c3e06f5f19d7d1c1b5cf",
+        "mode": 2147500032,
+        "name": "python",
+        "size": 0,
+        "submodule": null
+      },
+      {
+        "blob_oid": "20b36025e41eff619c869707d97ce35ec8d3e777",
+        "mode": 2147500032,
+        "name": "starlark",
+        "size": 0,
+        "submodule": null
+      }
+    ]
+  },
+  "request": {
+    "commit_sha": "5abdba2559d350afdf6b4dcbf32f5edaadcbdda1",
+    "repo_name": "test/symbols-fixture"
+  },
+  "rpc": "read_dir",
+  "service": "gitserver"
+}

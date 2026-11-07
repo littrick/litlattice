@@ -1,0 +1,140 @@
+{
+  "expected": {
+    "file_info": [
+      {
+        "blob_oid": "a005e25075e8737f1858ce1fdbe31bf757bcef83",
+        "mode": 2147500032,
+        "name": "java1",
+        "size": 0,
+        "submodule": null
+      },
+      {
+        "blob_oid": "33e7f06ad2ca469f66b84467bc9ec9e7f785974e",
+        "mode": 2147500032,
+        "name": "java1/src",
+        "size": 0,
+        "submodule": null
+      },
+      {
+        "blob_oid": "3d8bbc83ef8d7eecf9269b085ed87938713c5892",
+        "mode": 2147500032,
+        "name": "java1/src/sub",
+        "size": 0,
+        "submodule": null
+      },
+      {
+        "blob_oid": "2705a67d92636fdd08acf1a64529af1b3cb49e32",
+        "mode": 33188,
+        "name": "java1/src/sub/Sample.java",
+        "size": 2678,
+        "submodule": null
+      },
+      {
+        "blob_oid": "99b7fc97278941d9b4c77609530cbe5ae0859dae",
+        "mode": 33188,
+        "name": "java1/src/sub/Sample2.java",
+        "size": 87,
+        "submodule": null
+      },
+      {
+        "blob_oid": "c8bb04c2c74278fc514b9194189d05357c79a0b2",
+        "mode": 2147500032,
+        "name": "java1/src/sub/sub2",
+        "size": 0,
+        "submodule": null
+      },
+      {
+        "blob_oid": "fd37177a4f0b9653bc94a99deb8ed94039dc7af7",
+        "mode": 33188,
+        "name": "java1/src/sub/sub2/Sample3.java",
+        "size": 384,
+        "submodule": null
+      },
+      {
+        "blob_oid": "651e9f16df0e3413e9c6c3e06f5f19d7d1c1b5cf",
+        "mode": 2147500032,
+        "name": "python",
+        "size": 0,
+        "submodule": null
+      },
+      {
+        "blob_oid": "17bb768ed481b0978433eab2195fbe96b501f6a5",
+        "mode": 33188,
+        "name": "python/example.py",
+        "size": 1890,
+        "submodule": null
+      },
+      {
+        "blob_oid": "45b9ca6d84b9e6e274e5c7b07110daef98d195d4",
+        "mode": 33188,
+        "name": "python/example2.py",
+        "size": 331,
+        "submodule": null
+      },
+      {
+        "blob_oid": "8722aaa409f095ccdc1e748a33b4a5054be3e9bc",
+        "mode": 2147500032,
+        "name": "python/sub",
+        "size": 0,
+        "submodule": null
+      },
+      {
+        "blob_oid": "a9f662a2ed006558c9615f1c5704cd8f2f7172e5",
+        "mode": 33188,
+        "name": "python/sub/example3.py",
+        "size": 42,
+        "submodule": null
+      },
+      {
+        "blob_oid": "20b36025e41eff619c869707d97ce35ec8d3e777",
+        "mode": 2147500032,
+        "name": "starlark",
+        "size": 0,
+        "submodule": null
+      },
+      {
+        "blob_oid": "2517b15b38ffbc7c2128fe5d408f1c2c65cbaeef",
+        "mode": 33188,
+        "name": "starlark/BUILD",
+        "size": 99,
+        "submodule": null
+      },
+      {
+        "blob_oid": "2517b15b38ffbc7c2128fe5d408f1c2c65cbaeef",
+        "mode": 33188,
+        "name": "starlark/BUILD.bazel",
+        "size": 99,
+        "submodule": null
+      },
+      {
+        "blob_oid": "2517b15b38ffbc7c2128fe5d408f1c2c65cbaeef",
+        "mode": 33188,
+        "name": "starlark/WORKSPACE",
+        "size": 99,
+        "submodule": null
+      },
+      {
+        "blob_oid": "e17c013b9419f0b86a6451bd04700028d93bf488",
+        "mode": 33188,
+        "name": "starlark/bzl_library.bzl",
+        "size": 60,
+        "submodule": null
+      },
+      {
+        "blob_oid": "fc861d1e8f0c12490bb97bd693e460f625aaf8c8",
+        "mode": 33188,
+        "name": "starlark/sample.bzl",
+        "size": 300,
+        "submodule": null
+      }
+    ]
+  },
+  "request": {
+    "commit_sha": "5abdba2559d350afdf6b4dcbf32f5edaadcbdda1",
+    "path": "",
+    "recursive": true,
+    "repo_name": "test/symbols-fixture"
+  },
+  "rpc": "read_dir",
+  "service": "gitserver"
+}

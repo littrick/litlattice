@@ -1,0 +1,34 @@
+{
+  "expected": {
+    "file_info": [
+      {
+        "blob_oid": "17bb768ed481b0978433eab2195fbe96b501f6a5",
+        "mode": 33188,
+        "name": "python/example.py",
+        "size": 1890,
+        "submodule": null
+      },
+      {
+        "blob_oid": "45b9ca6d84b9e6e274e5c7b07110daef98d195d4",
+        "mode": 33188,
+        "name": "python/example2.py",
+        "size": 331,
+        "submodule": null
+      },
+      {
+        "blob_oid": "8722aaa409f095ccdc1e748a33b4a5054be3e9bc",
+        "mode": 2147500032,
+        "name": "python/sub",
+        "size": 0,
+        "submodule": null
+      }
+    ]
+  },
+  "request": {
+    "commit_sha": "5abdba2559d350afdf6b4dcbf32f5edaadcbdda1",
+    "path": "python",
+    "repo_name": "test/symbols-fixture"
+  },
+  "rpc": "read_dir",
+  "service": "gitserver"
+}

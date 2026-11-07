@@ -4,35 +4,50 @@ use std::path::{Path, PathBuf};
 
 /// Port of Go `path.Clean` for slash-separated paths.
 fn clean_path(path: &str) -> String {
+    // `path.Clean` is byte-oriented; repo names and revision paths are both
+    // arbitrary byte strings, so the shared implementation stays on bytes.
+    String::from_utf8(clean_path_bytes(path.as_bytes()))
+        .expect("cleaning valid UTF-8 yields valid UTF-8")
+}
+
+/// Byte-string version of Go `path.Clean`; also used for revision paths,
+/// which are not guaranteed to be valid UTF-8.
+pub(crate) fn clean_path_bytes(path: &[u8]) -> Vec<u8> {
     if path.is_empty() {
-        return ".".to_owned();
+        return b".".to_vec();
     }
-    let rooted = path.starts_with('/');
-    let mut parts: Vec<&str> = Vec::new();
-    for part in path.split('/') {
+    let rooted = path[0] == b'/';
+    let mut parts: Vec<&[u8]> = Vec::new();
+    for part in path.split(|byte| *byte == b'/') {
         match part {
-            "" | "." => {}
-            ".." => match parts.last() {
-                Some(&last) if last != ".." => {
+            b"" | b"." => {}
+            b".." => match parts.last() {
+                Some(last) if *last != b".." => {
                     parts.pop();
                 }
                 _ => {
                     if !rooted {
-                        parts.push("..");
+                        parts.push(part);
                     }
                 }
             },
             other => parts.push(other),
         }
     }
-    let joined = parts.join("/");
+    let mut out = Vec::new();
     if rooted {
-        format!("/{joined}")
-    } else if joined.is_empty() {
-        ".".to_owned()
-    } else {
-        joined
+        out.push(b'/');
     }
+    for (index, part) in parts.iter().enumerate() {
+        if index > 0 {
+            out.push(b'/');
+        }
+        out.extend_from_slice(part);
+    }
+    if out.is_empty() {
+        out.extend_from_slice(b".");
+    }
+    out
 }
 
 /// Port of `protocol.NormalizeRepo`: clean the path, lowercase the host and
@@ -75,9 +90,36 @@ mod tests {
         assert_eq!(normalize_repo("foo//bar/./baz"), "foo/bar/baz");
         assert_eq!(normalize_repo("foo/../bar"), "bar");
         assert_eq!(normalize_repo("../bar"), "bar");
-        assert_eq!(normalize_repo("GitHub.com/Owner/Repo"), "github.com/owner/repo");
-        assert_eq!(normalize_repo("gitlab.com/Owner/Repo"), "gitlab.com/Owner/Repo");
+        assert_eq!(
+            normalize_repo("GitHub.com/Owner/Repo"),
+            "github.com/owner/repo"
+        );
+        assert_eq!(
+            normalize_repo("gitlab.com/Owner/Repo"),
+            "gitlab.com/Owner/Repo"
+        );
         assert_eq!(normalize_repo("github.com/../foo/bar"), "foo/bar");
+    }
+
+    #[test]
+    fn cleans_paths_like_go() {
+        let cases: &[(&[u8], &[u8])] = &[
+            (b"", b"."),
+            (b".", b"."),
+            (b"/", b"/"),
+            (b"//", b"/"),
+            (b"a//b/./c", b"a/b/c"),
+            (b"a/../b", b"b"),
+            (b"../a", b"../a"),
+            (b"a/../../b", b"../b"),
+            (b"/..", b"/"),
+            (b"./", b"."),
+            (b"dir/", b"dir"),
+            (b"dir/sub/", b"dir/sub"),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(clean_path_bytes(input), *expected, "clean {:?}", input);
+        }
     }
 
     #[test]
