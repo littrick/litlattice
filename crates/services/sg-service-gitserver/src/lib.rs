@@ -1,11 +1,10 @@
 #![forbid(unsafe_code)]
 
-//! `gitserver` service: `gitserver.v1.GitserverService` and HTTP `/ping`
-//! multiplexed on one cleartext port (`:3178` by default), matching the Go
-//! baseline.
+//! `gitserver` service: `gitserver.v1.GitserverService`, HTTP `/ping` and the
+//! `/git/` smart Git HTTP transport multiplexed on one cleartext port (`:3178`
+//! by default), matching the Go baseline.
 //!
-//! Implemented RPCs: `Archive`, `ReadFile`, `ChangedFiles` (read path).
-//! Everything else reports `UNIMPLEMENTED` until later M9 slices land.
+//! Unimplemented RPCs report `UNIMPLEMENTED` until later M9 slices land.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -21,10 +20,12 @@ use sg_proto::gitserver as gpb;
 
 pub mod config;
 pub mod git;
+pub mod gitservice;
 pub mod grpc;
 pub mod repo;
 
 use config::GitserverConfig;
+use gitservice::GitService;
 use grpc::Grpc;
 
 pub fn service_name() -> &'static str {
@@ -98,9 +99,9 @@ impl Service for GitserverService {
             .clone()
             .ok_or_else(|| ServiceError::new("gitserver listen address was not loaded"))?;
 
-        let listener = sg_http::listen(&addr).await.map_err(|err| {
-            ServiceError::with_source(format!("failed to listen on {addr}"), err)
-        })?;
+        let listener = sg_http::listen(&addr)
+            .await
+            .map_err(|err| ServiceError::with_source(format!("failed to listen on {addr}"), err))?;
 
         // `git` may be slow: the baseline allows 1m per command and 2h for
         // long commands; the RPC layer here has no deadline of its own yet.
@@ -112,8 +113,14 @@ impl Service for GitserverService {
         let routes = tonic::service::Routes::new(
             gpb::gitserver_service_server::GitserverServiceServer::new(grpc),
         );
-        let http: sg_http::HttpHandler =
-            Arc::new(|req: Request<Incoming>| Box::pin(async move { http_response(req) }));
+        let git_service = GitService {
+            repos_dir: Arc::new(config.repos_dir.clone()),
+            tasks: tasks.clone(),
+        };
+        let http: sg_http::HttpHandler = Arc::new(move |req: Request<Incoming>| {
+            let service = git_service.clone();
+            Box::pin(async move { http_response(service, req).await })
+        });
 
         tracing::info!(
             addr = %addr,
@@ -132,15 +139,25 @@ impl Service for GitserverService {
     }
 }
 
-/// Baseline `gitservice`: `/ping` answers 200 with an empty body.
-fn http_response(req: Request<Incoming>) -> Response<tonic::body::BoxBody> {
-    match req.uri().path() {
+/// Baseline `NewHTTPHandler`: `/ping` answers 200 with an empty body and
+/// `/git/` serves the smart Git HTTP transport.
+async fn http_response(
+    service: GitService,
+    req: Request<Incoming>,
+) -> Response<tonic::body::BoxBody> {
+    let path = req.uri().path().to_owned();
+    match path.as_str() {
         "/ping" => {
             let mut response = Response::new(tonic::body::boxed(Full::new(Bytes::new())));
             *response.status_mut() = StatusCode::OK;
             response
         }
         _ => {
+            if let Some(stripped) = path.strip_prefix("/git/") {
+                // Go's `http.StripPrefix("/git", …)` keeps the leading slash.
+                let stripped = format!("/{stripped}");
+                return service.handle(req, &stripped).await;
+            }
             let mut response = Response::new(tonic::body::boxed(Full::new(Bytes::from_static(
                 b"404 page not found\n",
             ))));

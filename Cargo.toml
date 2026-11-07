@@ -40,8 +40,10 @@ tree-sitter-typescript = { path = "vendor/tree-sitter-typescript" }
 tree-sitter-cpp = { path = "vendor/tree-sitter-cpp" }
 tree-sitter-ruby = { path = "vendor/tree-sitter-ruby" }
 bytes = "1"
+flate2 = "1"
 http = "1"
 http-body-util = "0.1"
+percent-encoding = "2"
 hyper = { version = "1", features = ["server", "client", "http1", "http2"] }
 hyper-util = { version = "0.1", features = ["server-auto", "server-graceful", "tokio"] }
 tower = { version = "0.5", features = ["util"] }
