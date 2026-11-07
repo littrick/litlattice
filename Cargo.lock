@@ -1777,6 +1777,14 @@ checksum = "589f6da84c646204747d1270a2a5661ea66ed1cced2631d546fdfb155959f9ec"
 [[package]]
 name = "xtask"
 version = "0.1.0"
+dependencies = [
+ "prost-types",
+ "serde_json",
+ "sg-proto",
+ "sha2",
+ "tokio",
+ "tonic",
+]
 
 [[package]]
 name = "zerocopy"
