@@ -77,6 +77,12 @@ impl LimitedStream {
     pub fn limit_hit(&self) -> bool {
         self.limit_hit.load(Ordering::SeqCst)
     }
+
+    /// The cancellation token handed to the search workers: cancelled when the
+    /// limit is hit or the caller cancels it (client disconnect, shutdown).
+    pub fn cancel_token(&self) -> CancellationToken {
+        self.cancel.clone()
+    }
 }
 
 #[cfg(test)]

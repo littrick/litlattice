@@ -110,7 +110,7 @@ impl RegexSearch<'_> {
             }
         });
 
-        match error.into_inner().expect("error slot").take() {
+        match error.into_inner().expect("error slot") {
             Some(err) => Err(SearchError::Io(err)),
             None => Ok(()),
         }
