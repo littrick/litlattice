@@ -5,6 +5,7 @@
 
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use http::{header, Request, Response, StatusCode};
@@ -16,12 +17,21 @@ use tonic::{Request as GrpcRequest, Response as GrpcResponse, Status};
 use sg_core::{ConfigError, EnvReader, Service, ServiceContext, ServiceError};
 use sg_proto::symbols as pb;
 
+pub mod cache;
 pub mod config;
 pub mod ctags;
 pub mod gitserver;
+pub mod index;
+pub mod language;
+pub mod search;
+pub mod store;
 pub mod tar;
 
+use cache::Cache;
 use config::SymbolsConfig;
+use gitserver::{GitserverClient, GitserverReader};
+use index::Indexer;
+use search::SearchEngine;
 
 /// Baseline `cmd/symbols/shared` binds a fixed address.
 pub const DEFAULT_ADDR: &str = ":3184";
@@ -100,8 +110,17 @@ impl Service for SymbolsService {
             ServiceError::with_source(format!("failed to listen on {}", self.addr), err)
         })?;
 
+        let gitserver: Arc<dyn GitserverReader> =
+            Arc::new(GitserverClient::new(config.gitserver_addrs.clone()));
+        let indexer = Arc::new(Indexer::new(config.clone(), gitserver));
+        let cache = Arc::new(Cache::new(&config, indexer, &ctx.shutdown));
+        cache.spawn_janitor();
+        let engine = Arc::new(SearchEngine::new(Arc::clone(&cache)));
+
         let routes = tonic::service::Routes::new(
-            pb::symbols_service_server::SymbolsServiceServer::new(SymbolsGrpc),
+            pb::symbols_service_server::SymbolsServiceServer::new(SymbolsGrpc {
+                engine: Arc::clone(&engine),
+            }),
         );
         let http: sg_http::HttpHandler =
             Arc::new(|req: Request<Incoming>| Box::pin(async move { http_response(req) }));
@@ -114,22 +133,62 @@ impl Service for SymbolsService {
         );
         ctx.ready.mark_ready();
 
-        sg_http::serve(listener, routes, http, ctx.shutdown.clone())
-            .await
-            .map_err(|err| ServiceError::with_source("symbols http server failed", err))
+        let served = sg_http::serve(listener, routes, http, ctx.shutdown.clone()).await;
+        cache.shutdown().await;
+        served.map_err(|err| ServiceError::with_source("symbols http server failed", err))
     }
 }
 
-#[derive(Default)]
-struct SymbolsGrpc;
+struct SymbolsGrpc {
+    engine: Arc<SearchEngine>,
+}
 
 #[tonic::async_trait]
 impl pb::symbols_service_server::SymbolsService for SymbolsGrpc {
     async fn search(
         &self,
-        _request: GrpcRequest<pb::SearchRequest>,
+        request: GrpcRequest<pb::SearchRequest>,
     ) -> Result<GrpcResponse<pb::SearchResponse>, Status> {
-        Err(Status::unimplemented("Search is not implemented yet"))
+        let request = request.into_inner();
+        let params = search::Params {
+            repo: request.repo,
+            commit: request.commit_id,
+            query: request.query,
+            is_case_sensitive: request.is_case_sensitive,
+            include_patterns: request.include_patterns,
+            exclude_pattern: request.exclude_pattern,
+            first: i64::from(request.first),
+            timeout: request.timeout.map(|timeout| {
+                Duration::new(timeout.seconds.max(0) as u64, timeout.nanos.max(0) as u32)
+            }),
+            include_langs: request.include_langs,
+            exclude_langs: request.exclude_langs,
+        };
+
+        // The baseline returns search failures in the response body and keeps
+        // the RPC successful.
+        let response = match self.engine.search(&params).await {
+            Ok(outcome) => pb::SearchResponse {
+                symbols: outcome.symbols.into_iter().map(convert_symbol).collect(),
+                error: None,
+                limit_hit: outcome.limit_hit,
+            },
+            Err(err) => {
+                tracing::error!(
+                    repo = %params.repo,
+                    commit = %params.commit,
+                    query = %params.query,
+                    error = %err,
+                    "symbol search failed"
+                );
+                pb::SearchResponse {
+                    symbols: Vec::new(),
+                    error: Some(err),
+                    limit_hit: false,
+                }
+            }
+        };
+        Ok(GrpcResponse::new(response))
     }
 
     type LocalCodeIntelStream = Pin<
@@ -161,6 +220,21 @@ impl pb::symbols_service_server::SymbolsService for SymbolsGrpc {
         _request: GrpcRequest<pb::HealthzRequest>,
     ) -> Result<GrpcResponse<pb::HealthzResponse>, Status> {
         Ok(GrpcResponse::new(pb::HealthzResponse {}))
+    }
+}
+
+fn convert_symbol(symbol: store::Symbol) -> pb::search_response::Symbol {
+    pb::search_response::Symbol {
+        name: symbol.name,
+        path: symbol.path,
+        line: symbol.line,
+        character: symbol.character,
+        kind: symbol.kind,
+        language: symbol.language,
+        parent: symbol.parent,
+        parent_kind: symbol.parent_kind,
+        signature: symbol.signature,
+        file_limited: symbol.file_limited,
     }
 }
 

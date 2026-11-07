@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::io;
 use std::pin::Pin;
 
+use async_trait::async_trait;
 use bytes::Bytes;
 use tokio::sync::Mutex;
 use tokio_stream::{Stream, StreamExt};
@@ -19,6 +20,43 @@ use sg_proto::gitserver as pb;
 type Client = pb::gitserver_service_client::GitserverServiceClient<tonic::transport::Channel>;
 
 pub type TarByteStream = Pin<Box<dyn Stream<Item = io::Result<Bytes>> + Send>>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChangeStatus {
+    Added,
+    Modified,
+    Deleted,
+    TypeChanged,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChangedFile {
+    pub path: String,
+    pub status: ChangeStatus,
+}
+
+/// Operations the symbols service needs from gitserver. Production code uses
+/// [`GitserverClient`]; tests supply an in-memory archive.
+#[async_trait]
+pub trait GitserverReader: Send + Sync {
+    /// Stream a tar archive for `repo@commit`. An empty `paths` means the full
+    /// archive.
+    async fn fetch_tar(
+        &self,
+        repo: &str,
+        commit: &str,
+        paths: &[String],
+    ) -> Result<TarByteStream, String>;
+
+    async fn changed_files(
+        &self,
+        repo: &str,
+        base: &str,
+        head: &str,
+    ) -> Result<Vec<ChangedFile>, String>;
+
+    async fn read_file(&self, repo: &str, commit: &str, path: &str) -> Result<Vec<u8>, String>;
+}
 
 #[derive(Debug, Default)]
 pub struct GitserverClient {
@@ -88,6 +126,55 @@ impl GitserverClient {
         })))
     }
 
+    /// Paths that changed between two commits (`gitserver.ChangedFiles`).
+    pub async fn changed_files(
+        &self,
+        repo: &str,
+        base: &str,
+        head: &str,
+    ) -> Result<Vec<ChangedFile>, String> {
+        let addr = self
+            .addr_for(repo)
+            .ok_or_else(|| "no gitserver address configured".to_owned())?;
+        let mut client = self.client(addr).await?;
+
+        let request = pb::ChangedFilesRequest {
+            repo_name: repo.to_owned(),
+            base: Some(base.as_bytes().to_vec()),
+            head: head.as_bytes().to_vec(),
+        };
+
+        let mut response = client
+            .changed_files(request)
+            .await
+            .map_err(|status| format!("changed files {repo} {base}..{head}: {status}"))?
+            .into_inner();
+
+        let mut files = Vec::new();
+        while let Some(chunk) = response
+            .message()
+            .await
+            .map_err(|status| format!("changed files {repo} {base}..{head}: {status}"))?
+        {
+            for file in chunk.files {
+                let status = match pb::changed_file::Status::try_from(file.status) {
+                    Ok(pb::changed_file::Status::Added) => ChangeStatus::Added,
+                    Ok(pb::changed_file::Status::Modified) => ChangeStatus::Modified,
+                    Ok(pb::changed_file::Status::Deleted) => ChangeStatus::Deleted,
+                    Ok(pb::changed_file::Status::TypeChanged) => ChangeStatus::TypeChanged,
+                    // Unknown/unset statuses are ignored like the baseline's
+                    // switch over gitdomain statuses.
+                    _ => continue,
+                };
+                files.push(ChangedFile {
+                    path: String::from_utf8_lossy(&file.path).into_owned(),
+                    status,
+                });
+            }
+        }
+        Ok(files)
+    }
+
     /// Read one file at `repo@commit:path` (used by `LocalCodeIntel`).
     pub async fn read_file(&self, repo: &str, commit: &str, path: &str) -> Result<Vec<u8>, String> {
         let addr = self
@@ -116,5 +203,30 @@ impl GitserverClient {
             data.extend_from_slice(&chunk.data);
         }
         Ok(data)
+    }
+}
+
+#[async_trait]
+impl GitserverReader for GitserverClient {
+    async fn fetch_tar(
+        &self,
+        repo: &str,
+        commit: &str,
+        paths: &[String],
+    ) -> Result<TarByteStream, String> {
+        GitserverClient::fetch_tar(self, repo, commit, paths).await
+    }
+
+    async fn changed_files(
+        &self,
+        repo: &str,
+        base: &str,
+        head: &str,
+    ) -> Result<Vec<ChangedFile>, String> {
+        GitserverClient::changed_files(self, repo, base, head).await
+    }
+
+    async fn read_file(&self, repo: &str, commit: &str, path: &str) -> Result<Vec<u8>, String> {
+        GitserverClient::read_file(self, repo, commit, path).await
     }
 }
