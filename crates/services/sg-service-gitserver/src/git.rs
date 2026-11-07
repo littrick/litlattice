@@ -9,7 +9,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 use std::process::Stdio;
 
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt};
 use tokio::process::{Child, Command};
 
 use crate::repo::clean_path_bytes;
@@ -175,6 +175,58 @@ pub struct ContributorCount {
 pub struct BehindAhead {
     pub behind: u32,
     pub ahead: u32,
+}
+
+/// `git.BlameRange`: 1-indexed start and end lines.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlameRange {
+    pub start_line: u32,
+    pub end_line: u32,
+}
+
+/// `gitdomain.PreviousCommit` (`proto.PreviousCommit`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreviousCommit {
+    pub commit: String,
+    pub filename: String,
+}
+
+/// `gitdomain.Hunk` (`proto.BlameHunk`). `author_name` stays raw bytes because
+/// git does not require author names to be valid UTF-8.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlameHunk {
+    pub start_line: u32,
+    /// Exclusive, like the baseline (`start_line + num_lines`).
+    pub end_line: u32,
+    pub start_byte: u32,
+    pub end_byte: u32,
+    pub commit: String,
+    pub author_name: Vec<u8>,
+    pub author_email: String,
+    /// Unix seconds; `ZERO_TIMESTAMP_SECONDS` while the body has not set it,
+    /// matching Go's zero `time.Time`.
+    pub author_date_seconds: i64,
+    pub message: String,
+    pub filename: String,
+    pub previous: Option<PreviousCommit>,
+}
+
+impl BlameHunk {
+    fn new(commit: String) -> Self {
+        Self {
+            start_line: 0,
+            end_line: 0,
+            start_byte: 0,
+            end_byte: 0,
+            commit,
+            author_name: Vec::new(),
+            author_email: String::new(),
+            author_date_seconds: ZERO_TIMESTAMP_SECONDS,
+            message: String::new(),
+            filename: String::new(),
+            previous: None,
+        }
+    }
 }
 
 /// Go `revListUsageString`: the stderr of `git rev-list` on an empty repo.
@@ -985,6 +1037,83 @@ impl GitRepo {
         }
         parse_shortlog(&output.stdout)
     }
+
+    /// Launch `git blame --porcelain --incremental`; the caller parses hunks
+    /// with [`pump_blame`]. The blob is verified first, like the baseline's
+    /// `getBlobOID`.
+    pub async fn blame(
+        &self,
+        commit: &str,
+        path: &[u8],
+        ignore_whitespace: bool,
+        range: Option<BlameRange>,
+    ) -> Result<Child, GitError> {
+        check_spec_arg_safety(commit)?;
+        self.blob_oid(commit, path).await?;
+
+        let mut args: Vec<OsString> =
+            vec!["blame".into(), "--porcelain".into(), "--incremental".into()];
+        if ignore_whitespace {
+            args.push("-w".into());
+        }
+        if let Some(range) = range {
+            args.push(format!("-L{},{}", range.start_line, range.end_line).into());
+        }
+        args.push(commit.into());
+        args.push("--".into());
+        // `filepath.ToSlash` is a no-op for already-slash paths (the proto
+        // carries bytes), so the path is passed through unchanged.
+        args.push(OsStr::from_bytes(path).to_owned());
+
+        self.command(&args)
+            .spawn()
+            .map_err(|err| GitError::Message(format!("failed to run git blame: {err}")))
+    }
+
+    /// Baseline `getBlobOID`: `git ls-tree <commit> -- <path>`, with empty
+    /// output meaning the file does not exist.
+    async fn blob_oid(&self, commit: &str, path: &[u8]) -> Result<String, GitError> {
+        let output = self
+            .output(&[
+                "ls-tree".into(),
+                commit.into(),
+                "--".into(),
+                OsStr::from_bytes(path).to_owned(),
+            ])
+            .await?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if output.status.code() == Some(128)
+                && (stderr.contains("not a tree object")
+                    || stderr.contains("Not a valid object name"))
+            {
+                return Err(GitError::RevisionNotFound(commit.to_owned()));
+            }
+            return Err(GitError::Message(format!(
+                "git ls-tree {commit}: {}",
+                stderr.trim_end()
+            )));
+        }
+        let stdout = output.stdout;
+        let stdout = trim_ascii(&stdout);
+        if stdout.is_empty() {
+            return Err(GitError::FileNotFound);
+        }
+        let fields: Vec<&[u8]> = stdout
+            .split(|byte| byte.is_ascii_whitespace())
+            .filter(|field| !field.is_empty())
+            .collect();
+        if fields.len() < 3 {
+            return Err(GitError::Message(format!(
+                "unexpected output while parsing blob OID: {:?}",
+                String::from_utf8_lossy(stdout)
+            )));
+        }
+        if fields[0] == b"160000" {
+            return Err(GitError::Message("blob is a submodule".to_owned()));
+        }
+        Ok(String::from_utf8_lossy(fields[2]).into_owned())
+    }
 }
 
 fn decode_hex(text: &str) -> Option<Vec<u8>> {
@@ -1674,6 +1803,198 @@ where
         )));
     }
     Ok(())
+}
+
+/// Parse `git blame --porcelain --incremental` stdout into hunks and hand each
+/// one to `send`.
+///
+/// The baseline's `blameHunkReader` ignores the child's exit status: a failed
+/// `git blame` (after the blob check) produces an empty stream, not an error.
+pub async fn pump_blame<F, Fut>(mut child: Child, mut send: F) -> Result<(), GitError>
+where
+    F: FnMut(BlameHunk) -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| GitError::Message("git process has no stdout".to_owned()))?;
+    let mut stdout = tokio::io::BufReader::new(stdout);
+    let mut line = Vec::new();
+    let mut hunk = BlameHunk::new(String::new());
+    let mut reading_body = false;
+    loop {
+        line.clear();
+        let read = match stdout.read_until(b'\n', &mut line).await {
+            Ok(read) => read,
+            Err(err) => {
+                let _ = child.start_kill();
+                return Err(GitError::Message(format!(
+                    "failed to read git output: {err}"
+                )));
+            }
+        };
+        if read == 0 {
+            break;
+        }
+        // `bufio.Scanner` strips the newline and a trailing `\r`.
+        if line.last() == Some(&b'\n') {
+            line.pop();
+        }
+        if line.last() == Some(&b'\r') {
+            line.pop();
+        }
+        if !reading_body {
+            parse_blame_header(&mut hunk, &line)?;
+            reading_body = true;
+        } else if parse_blame_body(&mut hunk, &line)? {
+            // A "filename" line terminates the hunk.
+            if !send(hunk.clone()).await {
+                let _ = child.start_kill();
+                return Ok(());
+            }
+            reading_body = false;
+        }
+    }
+    Ok(())
+}
+
+/// Baseline `parseHeader`: `<commit> <orig line> <result line> <num lines>`.
+fn parse_blame_header(hunk: &mut BlameHunk, line: &[u8]) -> Result<(), GitError> {
+    let mut fields = line.splitn(4, |byte| *byte == b' ');
+    let commit = fields.next().unwrap_or_default();
+    let _original_line = fields.next().unwrap_or_default();
+    let result_line = fields.next().unwrap_or_default();
+    let num_lines = fields.next().unwrap_or_default();
+    let result_line = parse_blame_int(result_line)?;
+    let num_lines = parse_blame_int(num_lines)?;
+    if hunk.commit.as_bytes() != commit {
+        // Start of a new commit: every field is reset.
+        *hunk = BlameHunk::new(String::from_utf8_lossy(commit).into_owned());
+    }
+    hunk.start_line = result_line as u32;
+    hunk.end_line = (result_line + num_lines) as u32;
+    Ok(())
+}
+
+fn parse_blame_int(value: &[u8]) -> Result<i64, GitError> {
+    String::from_utf8_lossy(value)
+        .trim()
+        .parse()
+        .map_err(|_| GitError::Message(format!("invalid blame integer {value:?}")))
+}
+
+/// Baseline `parseBody`: update `hunk` from one `annotation value` line.
+/// Returns true when the hunk is complete (`filename`).
+fn parse_blame_body(hunk: &mut BlameHunk, line: &[u8]) -> Result<bool, GitError> {
+    let (annotation, content) = match line.iter().position(|byte| *byte == b' ') {
+        Some(index) => (&line[..index], &line[index + 1..]),
+        None => (line, [].as_slice()),
+    };
+    match annotation {
+        b"author" => hunk.author_name = content.to_vec(),
+        b"author-mail" => {
+            hunk.author_email = String::from_utf8_lossy(trim_bytes(content, b"<>")).into_owned();
+        }
+        b"author-time" => hunk.author_date_seconds = parse_blame_int(content)?,
+        b"summary" => hunk.message = String::from_utf8_lossy(content).into_owned(),
+        b"previous" => {
+            let (commit, filename) = match content.iter().position(|byte| *byte == b' ') {
+                Some(index) => (&content[..index], &content[index + 1..]),
+                None => (content, [].as_slice()),
+            };
+            hunk.previous = Some(PreviousCommit {
+                commit: String::from_utf8_lossy(commit).into_owned(),
+                filename: unquote_git_path(filename),
+            });
+        }
+        b"filename" => {
+            hunk.filename = unquote_git_path(content);
+            return Ok(true);
+        }
+        _ => {}
+    }
+    Ok(false)
+}
+
+/// Go `bytes.Trim(s, cutset)`: trim every byte from `cutset` at both ends.
+fn trim_bytes<'a>(bytes: &'a [u8], cutset: &[u8]) -> &'a [u8] {
+    let mut start = 0;
+    let mut end = bytes.len();
+    while start < end && cutset.contains(&bytes[start]) {
+        start += 1;
+    }
+    while end > start && cutset.contains(&bytes[end - 1]) {
+        end -= 1;
+    }
+    &bytes[start..end]
+}
+
+/// Baseline `unquotedStringFromBytes`: `strconv.Unquote` when the value is a
+/// quoted Go string, otherwise the raw bytes.
+fn unquote_git_path(bytes: &[u8]) -> String {
+    if bytes.len() < 2 || bytes[0] != b'"' || bytes[bytes.len() - 1] != b'"' {
+        return String::from_utf8_lossy(bytes).into_owned();
+    }
+    match unquote_go_string(&bytes[1..bytes.len() - 1]) {
+        Some(unquoted) => String::from_utf8_lossy(&unquoted).into_owned(),
+        None => String::from_utf8_lossy(bytes).into_owned(),
+    }
+}
+
+/// The escape subset `strconv.Unquote` accepts for double-quoted strings.
+fn unquote_go_string(bytes: &[u8]) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        index += 1;
+        if byte != b'\\' {
+            out.push(byte);
+            continue;
+        }
+        let escaped = *bytes.get(index)?;
+        index += 1;
+        match escaped {
+            b'a' => out.push(0x07),
+            b'b' => out.push(0x08),
+            b'f' => out.push(0x0c),
+            b'n' => out.push(b'\n'),
+            b'r' => out.push(b'\r'),
+            b't' => out.push(b'\t'),
+            b'v' => out.push(0x0b),
+            b'\\' => out.push(b'\\'),
+            b'"' => out.push(b'"'),
+            b'x' => {
+                let hex = bytes.get(index..index + 2)?;
+                out.push(u8::from_str_radix(std::str::from_utf8(hex).ok()?, 16).ok()?);
+                index += 2;
+            }
+            b'u' | b'U' => {
+                let digits = if escaped == b'u' { 4 } else { 8 };
+                let hex = bytes.get(index..index + digits)?;
+                let code = u32::from_str_radix(std::str::from_utf8(hex).ok()?, 16).ok()?;
+                let character = char::from_u32(code)?;
+                let mut encoded = [0u8; 4];
+                out.extend_from_slice(character.encode_utf8(&mut encoded).as_bytes());
+                index += digits;
+            }
+            b'0'..=b'7' => {
+                // Go requires exactly three octal digits.
+                let rest = bytes.get(index..index + 2)?;
+                if !rest.iter().all(|digit| (b'0'..=b'7').contains(digit)) {
+                    return None;
+                }
+                let value = u32::from(escaped - b'0') * 64
+                    + u32::from(rest[0] - b'0') * 8
+                    + u32::from(rest[1] - b'0');
+                out.push(u8::try_from(value).ok()?);
+                index += 2;
+            }
+            _ => return None,
+        }
+    }
+    Some(out)
 }
 
 /// Read a child's stdout into `send`, chunked at `STREAM_CHUNK`.
@@ -2373,6 +2694,105 @@ mod tests {
             Some("deadbeef")
         );
         assert_eq!(extract_invalid_object_name(b"fatal: other\n"), None);
+    }
+
+    #[test]
+    fn parses_blame_headers_and_bodies() {
+        let mut hunk = BlameHunk::new(String::new());
+        parse_blame_header(&mut hunk, b"abc123 10 20 2").expect("header");
+        assert_eq!(hunk.commit, "abc123");
+        assert_eq!((hunk.start_line, hunk.end_line), (20, 22));
+
+        assert!(!parse_blame_body(&mut hunk, b"author Jane Doe").expect("author"));
+        assert_eq!(hunk.author_name, b"Jane Doe".to_vec());
+        assert!(!parse_blame_body(&mut hunk, b"author-mail <jane@example.com>").expect("mail"));
+        assert_eq!(hunk.author_email, "jane@example.com");
+        assert!(!parse_blame_body(&mut hunk, b"author-time 1700000000").expect("time"));
+        assert_eq!(hunk.author_date_seconds, 1_700_000_000);
+        assert!(!parse_blame_body(&mut hunk, b"summary fix stuff").expect("summary"));
+        assert_eq!(hunk.message, "fix stuff");
+        assert!(parse_blame_body(&mut hunk, b"filename \"a\\tb.txt\"").expect("filename"));
+        assert_eq!(hunk.filename, "a\tb.txt");
+
+        // Same commit: unchanged fields carry over, only the range moves.
+        parse_blame_header(&mut hunk, b"abc123 1 3 1").expect("header");
+        assert_eq!(hunk.author_name, b"Jane Doe".to_vec());
+        assert_eq!((hunk.start_line, hunk.end_line), (3, 4));
+
+        // A different commit resets every field.
+        parse_blame_header(&mut hunk, b"def456 1 1 1").expect("header");
+        assert_eq!(hunk.commit, "def456");
+        assert!(hunk.author_name.is_empty());
+        assert_eq!(hunk.author_date_seconds, ZERO_TIMESTAMP_SECONDS);
+    }
+
+    #[test]
+    fn unquotes_git_paths() {
+        assert_eq!(unquote_git_path(b"plain.txt"), "plain.txt");
+        assert_eq!(
+            unquote_git_path(b"\"a\\tb\\\"c\\\\d\\u00e9\""),
+            "a\tb\"c\\d\u{e9}"
+        );
+        // An invalid escape makes `strconv.Unquote` fail; the raw bytes win.
+        assert_eq!(unquote_git_path(b"\"bad\\q\""), "\"bad\\q\"");
+    }
+
+    #[tokio::test]
+    async fn blames_a_file() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (dir, head) = fixture_repo(tmp.path());
+        let repo = GitRepo::new(dir);
+
+        let child = repo
+            .blame(&head, b"a.txt", false, None)
+            .await
+            .expect("blame");
+        let mut hunks = Vec::new();
+        pump_blame(child, |hunk| {
+            hunks.push(hunk);
+            async { true }
+        })
+        .await
+        .expect("pump");
+        assert_eq!(hunks.len(), 1);
+        let hunk = &hunks[0];
+        assert_eq!(hunk.commit, head);
+        assert_eq!((hunk.start_line, hunk.end_line), (1, 2));
+        assert_eq!(hunk.filename, "a.txt");
+        assert!(!hunk.author_name.is_empty());
+
+        // `range` restricts the blamed lines.
+        let child = repo
+            .blame(
+                &head,
+                b"a.txt",
+                false,
+                Some(BlameRange {
+                    start_line: 1,
+                    end_line: 1,
+                }),
+            )
+            .await
+            .expect("range blame");
+        let mut ranged = Vec::new();
+        pump_blame(child, |hunk| {
+            ranged.push(hunk);
+            async { true }
+        })
+        .await
+        .expect("pump");
+        assert_eq!(ranged.len(), 1);
+        assert_eq!((ranged[0].start_line, ranged[0].end_line), (1, 2));
+
+        // A missing blob or commit is rejected before `git blame` runs.
+        assert!(matches!(
+            repo.blame(&head, b"missing.txt", false, None).await,
+            Err(GitError::FileNotFound)
+        ));
+        assert!(matches!(
+            repo.blame("nope", b"a.txt", false, None).await,
+            Err(GitError::RevisionNotFound(spec)) if spec == "nope"
+        ));
     }
 
     #[tokio::test]

@@ -1,0 +1,74 @@
+{
+  "expected": {
+    "hunks": [
+      {
+        "author": {
+          "date": {
+            "nanos": 0,
+            "seconds": 1714608000
+          },
+          "email": "bravo@example.com",
+          "name": "Bravo Writer"
+        },
+        "commit": "44ee0ae4a49f454514ace8e6ca81bfdbf4303412",
+        "end_byte": 0,
+        "end_line": 2,
+        "filename": "file.txt",
+        "message": "rewrite first and last lines",
+        "previous_commit": {
+          "commit": "241c2f444340443b88aa2c476522953f9bf512d9",
+          "filename": "file.txt"
+        },
+        "start_byte": 0,
+        "start_line": 1
+      },
+      {
+        "author": {
+          "date": {
+            "nanos": 0,
+            "seconds": 1714608000
+          },
+          "email": "bravo@example.com",
+          "name": "Bravo Writer"
+        },
+        "commit": "44ee0ae4a49f454514ace8e6ca81bfdbf4303412",
+        "end_byte": 0,
+        "end_line": 5,
+        "filename": "file.txt",
+        "message": "rewrite first and last lines",
+        "previous_commit": {
+          "commit": "241c2f444340443b88aa2c476522953f9bf512d9",
+          "filename": "file.txt"
+        },
+        "start_byte": 0,
+        "start_line": 4
+      },
+      {
+        "author": {
+          "date": {
+            "nanos": 0,
+            "seconds": 1711929600
+          },
+          "email": "alpha@example.com",
+          "name": "Alpha Writer"
+        },
+        "commit": "241c2f444340443b88aa2c476522953f9bf512d9",
+        "end_byte": 0,
+        "end_line": 4,
+        "filename": "file.txt",
+        "message": "root commit",
+        "previous_commit": null,
+        "start_byte": 0,
+        "start_line": 2
+      }
+    ]
+  },
+  "request": {
+    "commit": "HEAD",
+    "ignore_whitespace": true,
+    "path": "file.txt",
+    "repo_name": "test/blame-fixture"
+  },
+  "rpc": "blame",
+  "service": "gitserver"
+}

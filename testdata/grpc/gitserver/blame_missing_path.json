@@ -1,0 +1,15 @@
+{
+  "expected": {
+    "error": {
+      "code": "invalid_argument",
+      "message": "path must be specified"
+    }
+  },
+  "request": {
+    "commit": "HEAD",
+    "path": "",
+    "repo_name": "test/blame-fixture"
+  },
+  "rpc": "blame",
+  "service": "gitserver"
+}

@@ -1,0 +1,15 @@
+{
+  "expected": {
+    "error": {
+      "code": "invalid_argument",
+      "message": "commit must be specified"
+    }
+  },
+  "request": {
+    "commit": "",
+    "path": "file.txt",
+    "repo_name": "test/blame-fixture"
+  },
+  "rpc": "blame",
+  "service": "gitserver"
+}

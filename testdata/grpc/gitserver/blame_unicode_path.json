@@ -1,0 +1,31 @@
+{
+  "expected": {
+    "hunks": [
+      {
+        "author": {
+          "date": {
+            "nanos": 0,
+            "seconds": 1711929600
+          },
+          "email": "alpha@example.com",
+          "name": "Alpha Writer"
+        },
+        "commit": "241c2f444340443b88aa2c476522953f9bf512d9",
+        "end_byte": 0,
+        "end_line": 2,
+        "filename": "héllo.txt",
+        "message": "root commit",
+        "previous_commit": null,
+        "start_byte": 0,
+        "start_line": 1
+      }
+    ]
+  },
+  "request": {
+    "commit": "HEAD",
+    "path": "héllo.txt",
+    "repo_name": "test/blame-fixture"
+  },
+  "rpc": "blame",
+  "service": "gitserver"
+}

@@ -3,8 +3,8 @@
 //! Implemented so far: `Archive`, `ReadFile`, `ChangedFiles`, `ResolveRevision`,
 //! `GetObject`, `DefaultBranch`, `MergeBase`, `MergeBaseOctopus`, `Stat`,
 //! `ReadDir`, `ListRefs`, `GetCommit`, `RevAtTime`, `RawDiff`, `CommitLog`,
-//! `ContributorCounts`, `FirstEverCommit` and `BehindAhead` (M9.2). Every other
-//! RPC returns `UNIMPLEMENTED`.
+//! `ContributorCounts`, `FirstEverCommit`, `BehindAhead` and `Blame` (M9.2).
+//! Every other RPC returns `UNIMPLEMENTED`.
 
 use std::pin::Pin;
 use std::sync::Arc;
@@ -17,8 +17,9 @@ use tonic::{Request as GrpcRequest, Response as GrpcResponse, Status};
 use sg_proto::gitserver as gpb;
 
 use crate::git::{
-    pump_commit_log, pump_stdout, CommitLogOptions, CommitLogOrder, GitCommit, GitError, GitRef,
-    GitRepo, RawDiffComparison, RefType, TreeEntry, CHUNK_MESSAGE_SIZE,
+    pump_blame, pump_commit_log, pump_stdout, BlameHunk, BlameRange, CommitLogOptions,
+    CommitLogOrder, GitCommit, GitError, GitRef, GitRepo, RawDiffComparison, RefType, TreeEntry,
+    CHUNK_MESSAGE_SIZE,
 };
 use crate::repo::repo_dir;
 
@@ -113,6 +114,28 @@ fn git_commit_proto(commit: GitCommit) -> (gpb::GitCommit, Vec<Vec<u8>>) {
         },
         commit.modified_files,
     )
+}
+
+fn blame_hunk_proto(hunk: BlameHunk) -> gpb::BlameHunk {
+    gpb::BlameHunk {
+        start_line: hunk.start_line,
+        end_line: hunk.end_line,
+        start_byte: hunk.start_byte,
+        end_byte: hunk.end_byte,
+        commit: hunk.commit,
+        author: Some(gpb::BlameAuthor {
+            // git does not require author names to be valid UTF-8.
+            name: hunk.author_name,
+            email: hunk.author_email,
+            date: Some(timestamp(hunk.author_date_seconds)),
+        }),
+        message: hunk.message,
+        filename: hunk.filename,
+        previous_commit: hunk.previous.map(|previous| gpb::PreviousCommit {
+            commit: previous.commit,
+            filename: previous.filename,
+        }),
+    }
 }
 
 #[tonic::async_trait]
@@ -428,9 +451,53 @@ impl gpb::gitserver_service_server::GitserverService for Grpc {
 
     async fn blame(
         &self,
-        _request: GrpcRequest<gpb::BlameRequest>,
+        request: GrpcRequest<gpb::BlameRequest>,
     ) -> Result<GrpcResponse<Self::BlameStream>, Status> {
-        Err(unimplemented("blame"))
+        let request = request.into_inner();
+        if request.repo_name.is_empty() {
+            return Err(Status::invalid_argument("repo must be specified"));
+        }
+        if request.commit.is_empty() {
+            return Err(Status::invalid_argument("commit must be specified"));
+        }
+        if request.path.is_empty() {
+            return Err(Status::invalid_argument("path must be specified"));
+        }
+        let repo = self.repo(&request.repo_name)?;
+        let range = request.range.map(|range| BlameRange {
+            start_line: range.start_line,
+            end_line: range.end_line,
+        });
+        let child = repo
+            .blame(
+                &request.commit,
+                &request.path,
+                request.ignore_whitespace,
+                range,
+            )
+            .await
+            .map_err(git_status)?;
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<gpb::BlameResponse, Status>>(64);
+        self.tasks.spawn(async move {
+            let sender = tx.clone();
+            let result = pump_blame(child, |hunk| {
+                let sender = sender.clone();
+                async move {
+                    sender
+                        .send(Ok(gpb::BlameResponse {
+                            hunk: Some(blame_hunk_proto(hunk)),
+                        }))
+                        .await
+                        .is_ok()
+                }
+            })
+            .await;
+            if let Err(err) = result {
+                let _ = tx.send(Err(git_status(err))).await;
+            }
+        });
+        Ok(GrpcResponse::new(Box::pin(ReceiverStream::new(rx))))
     }
 
     async fn default_branch(

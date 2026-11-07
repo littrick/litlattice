@@ -1,0 +1,15 @@
+{
+  "expected": {
+    "error": {
+      "code": "not_found",
+      "message": "file not found"
+    }
+  },
+  "request": {
+    "commit": "HEAD",
+    "path": "missing.txt",
+    "repo_name": "test/blame-fixture"
+  },
+  "rpc": "blame",
+  "service": "gitserver"
+}

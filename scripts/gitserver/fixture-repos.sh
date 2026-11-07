@@ -53,3 +53,42 @@ git --git-dir="$REPO" fetch -q "$WORK" \
 git --git-dir="$REPO" symbolic-ref HEAD refs/heads/main
 
 git --git-dir="$REPO" log --format='%H %s' main
+
+# ---------------------------------------------------------------- blame fixture
+# Three commits change `file.txt` in ways that produce several blame hunks:
+# `c2` rewrites lines 1 and 4, `c3` makes a whitespace-only change to line 2,
+# so `-w` reassigns that line to `c1`. `héllo.txt` exercises git's quoted
+# (octal-escaped) porcelain filenames.
+BLAME_REPO="$REPOS_DIR/test/blame-fixture/.git"
+BLAME_WORK="$WORK/blame"
+git init -q --bare "$BLAME_REPO"
+git init -q -b main "$BLAME_WORK"
+
+blame_commit() {
+    local message=$1 date=$2 name=$3 email=$4
+    git -C "$BLAME_WORK" add -A
+    GIT_AUTHOR_DATE="$date" GIT_COMMITTER_DATE="$date" \
+    GIT_AUTHOR_NAME="$name" GIT_AUTHOR_EMAIL="$email" \
+    GIT_COMMITTER_NAME="$name" GIT_COMMITTER_EMAIL="$email" \
+        git -C "$BLAME_WORK" commit -q -m "$message"
+}
+
+printf 'alpha\nbeta\ngamma\ndelta\n' >"$BLAME_WORK/file.txt"
+printf 'other\n' >"$BLAME_WORK/other.txt"
+printf 'unicode\n' >"$BLAME_WORK/héllo.txt"
+blame_commit "root commit" "2024-04-01T00:00:00Z" \
+    "Alpha Writer" "alpha@example.com"
+
+printf 'ALPHA\nbeta\ngamma\nDELTA\n' >"$BLAME_WORK/file.txt"
+blame_commit "rewrite first and last lines" "2024-05-02T00:00:00Z" \
+    "Bravo Writer" "bravo@example.com"
+
+printf 'ALPHA\n beta\ngamma\nDELTA\n' >"$BLAME_WORK/file.txt"
+blame_commit "whitespace only change" "2024-06-03T00:00:00Z" \
+    "Charlie Writer" "charlie@example.com"
+
+git --git-dir="$BLAME_REPO" fetch -q "$BLAME_WORK" \
+    'refs/heads/*:refs/heads/*'
+git --git-dir="$BLAME_REPO" symbolic-ref HEAD refs/heads/main
+
+git --git-dir="$BLAME_REPO" log --format='%H %s' main

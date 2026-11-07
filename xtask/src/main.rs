@@ -246,6 +246,7 @@ enum GitserverRpc {
     ContributorCounts,
     FirstEverCommit,
     BehindAhead,
+    Blame,
 }
 
 impl GitserverRpc {
@@ -269,11 +270,13 @@ impl GitserverRpc {
             "contributor_counts" => Ok(Self::ContributorCounts),
             "first_ever_commit" => Ok(Self::FirstEverCommit),
             "behind_ahead" => Ok(Self::BehindAhead),
+            "blame" => Ok(Self::Blame),
             other => Err(format!(
                 "unknown gitserver rpc {other:?} (archive, read_file, changed_files, \
                  resolve_revision, get_object, default_branch, merge_base, stat, read_dir, \
                  list_refs, get_commit, rev_at_time, raw_diff, commit_log, \
-                 merge_base_octopus, contributor_counts, first_ever_commit, behind_ahead)"
+                 merge_base_octopus, contributor_counts, first_ever_commit, behind_ahead, \
+                 blame)"
             )),
         }
     }
@@ -1109,6 +1112,34 @@ fn gitserver_behind_ahead_request(value: &Value) -> Result<gpb::BehindAheadReque
     })
 }
 
+fn gitserver_blame_request(value: &Value) -> Result<gpb::BlameRequest, String> {
+    let range = match value.get("range") {
+        None | Some(Value::Null) => None,
+        Some(object) => Some(gpb::BlameRange {
+            start_line: object
+                .get("start_line")
+                .and_then(Value::as_u64)
+                .and_then(|line| u32::try_from(line).ok())
+                .ok_or_else(|| "request: range.start_line must be a u32".to_owned())?,
+            end_line: object
+                .get("end_line")
+                .and_then(Value::as_u64)
+                .and_then(|line| u32::try_from(line).ok())
+                .ok_or_else(|| "request: range.end_line must be a u32".to_owned())?,
+        }),
+    };
+    Ok(gpb::BlameRequest {
+        repo_name: string(value, "repo_name")?,
+        commit: string(value, "commit")?,
+        path: optional_string(value, "path")?.into_bytes(),
+        ignore_whitespace: value
+            .get("ignore_whitespace")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        range,
+    })
+}
+
 /// `proto.FileInfo` as JSON. Modes are the raw Go `fs.FileMode` bits; the
 /// names are compared byte-for-byte.
 fn normalize_file_info(file: &gpb::FileInfo) -> Value {
@@ -1190,6 +1221,37 @@ fn normalize_commit_log(chunks: &[gpb::CommitLogResponse]) -> Value {
         }
     }
     json!({"commits": commits})
+}
+
+fn normalize_blame_hunk(hunk: &gpb::BlameHunk) -> Value {
+    json!({
+        "start_line": hunk.start_line,
+        "end_line": hunk.end_line,
+        "start_byte": hunk.start_byte,
+        "end_byte": hunk.end_byte,
+        "commit": hunk.commit,
+        "author": hunk.author.as_ref().map(|author| json!({
+            "name": String::from_utf8_lossy(&author.name),
+            "email": author.email,
+            "date": author.date.as_ref().map(normalize_timestamp),
+        })),
+        "message": hunk.message,
+        "filename": hunk.filename,
+        "previous_commit": hunk.previous_commit.as_ref().map(|previous| json!({
+            "commit": previous.commit,
+            "filename": previous.filename,
+        })),
+    })
+}
+
+fn normalize_blame(chunks: &[gpb::BlameResponse]) -> Value {
+    json!({
+        "hunks": chunks
+            .iter()
+            .filter_map(|chunk| chunk.hunk.as_ref())
+            .map(normalize_blame_hunk)
+            .collect::<Vec<_>>(),
+    })
 }
 
 /// `RawDiff` chunks are compared by concatenated text; chunk boundaries are
@@ -1549,6 +1611,17 @@ async fn call_gitserver(
                 .await?
                 .into_inner();
             Ok(json!({"behind": response.behind, "ahead": response.ahead}))
+        }
+        GitserverRpc::Blame => {
+            let mut stream = client
+                .blame(gitserver_blame_request(request).map_err(GitserverFailure::Fixture)?)
+                .await?
+                .into_inner();
+            let mut messages = Vec::new();
+            while let Some(message) = stream.message().await? {
+                messages.push(message);
+            }
+            Ok(normalize_blame(&messages))
         }
         GitserverRpc::ChangedFiles => {
             let mut stream = client
@@ -2033,5 +2106,25 @@ mod tests {
             .expect("behind_ahead request");
         assert!(request.left.is_empty());
         assert!(request.right.is_empty());
+
+        let request = gitserver_blame_request(&json!({
+            "repo_name": "r",
+            "commit": "HEAD",
+            "path": "a.txt",
+            "ignore_whitespace": true,
+            "range": {"start_line": 2, "end_line": 5},
+        }))
+        .expect("blame request");
+        assert_eq!(request.commit, "HEAD");
+        assert_eq!(request.path, b"a.txt");
+        assert!(request.ignore_whitespace);
+        let range = request.range.expect("range");
+        assert_eq!((range.start_line, range.end_line), (2, 5));
+
+        let request = gitserver_blame_request(&json!({"repo_name": "r", "commit": "HEAD"}))
+            .expect("blame request");
+        assert!(request.path.is_empty());
+        assert!(!request.ignore_whitespace);
+        assert!(request.range.is_none());
     }
 }
