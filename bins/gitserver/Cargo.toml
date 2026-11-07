@@ -11,4 +11,7 @@ name = "gitserver"
 path = "src/main.rs"
 
 [dependencies]
+sg-core = { path = "../../crates/base/sg-core" }
+sg-log = { path = "../../crates/base/sg-log" }
 sg-service-gitserver = { path = "../../crates/services/sg-service-gitserver" }
+tokio = { workspace = true }
