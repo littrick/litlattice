@@ -7,3 +7,9 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+sg-env = { path = "../sg-env" }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }

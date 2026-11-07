@@ -11,4 +11,7 @@ name = "symbols"
 path = "src/main.rs"
 
 [dependencies]
+sg-core = { path = "../../crates/base/sg-core" }
+sg-log = { path = "../../crates/base/sg-log" }
 sg-service-symbols = { path = "../../crates/services/sg-service-symbols" }
+tokio = { workspace = true }

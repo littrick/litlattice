@@ -8,3 +8,14 @@ publish.workspace = true
 
 [dependencies]
 sg-core = { path = "../../base/sg-core" }
+sg-http = { path = "../../net/sg-http" }
+sg-proto = { path = "../../net/sg-proto" }
+async-trait = { workspace = true }
+http = { workspace = true }
+http-body-util = { workspace = true }
+hyper = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+tokio-util = { workspace = true }
+tonic = { workspace = true }
+tracing = { workspace = true }
