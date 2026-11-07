@@ -9,7 +9,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 
 /// `ctags.d` arguments shipped with go-ctags (verbatim).
 const CTAGS_ARGS: &str = include_str!("ctags_args.txt");
@@ -298,31 +298,40 @@ impl Drop for CtagsProcess {
     }
 }
 
+/// Go's `encoding/json` leaves a string field untouched when the JSON value is
+/// `null`; ctags emits `null` for absent fields (e.g. Python's `scope`).
+fn null_as_default<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Ok(Option::<String>::deserialize(deserializer)?.unwrap_or_default())
+}
+
 #[derive(Debug, Default, Deserialize)]
 struct Reply {
-    #[serde(rename = "_type")]
+    #[serde(rename = "_type", default, deserialize_with = "null_as_default")]
     typ: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     name: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     message: String,
     #[serde(default)]
     fatal: bool,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     path: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     language: String,
     #[serde(default)]
     line: i32,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     kind: String,
-    #[serde(default, rename = "scope")]
+    #[serde(default, rename = "scope", deserialize_with = "null_as_default")]
     scope: String,
-    #[serde(default, rename = "scopeKind")]
+    #[serde(default, rename = "scopeKind", deserialize_with = "null_as_default")]
     scope_kind: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     signature: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pattern: String,
 }
 
@@ -348,6 +357,16 @@ mod tests {
                 .map(|status| status.success())
                 .unwrap_or(false)
         })
+    }
+
+    #[test]
+    fn null_fields_default_like_go() {
+        let reply: Reply = serde_json::from_str(
+            r#"{"_type":"tag","name":"C1","path":"example.py","language":"python","line":54,"kind":"class","scope":null}"#,
+        )
+        .expect("null fields must deserialize");
+        assert_eq!(reply.scope, "");
+        assert_eq!(reply.scope_kind, "");
     }
 
     #[test]
