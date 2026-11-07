@@ -1,8 +1,9 @@
 //! `gitserver.v1.GitserverService`: read path plus `UNIMPLEMENTED` stubs.
 //!
 //! Implemented so far: `Archive`, `ReadFile`, `ChangedFiles`, `ResolveRevision`,
-//! `GetObject`, `DefaultBranch`, `MergeBase`, `Stat`, `ReadDir`, `ListRefs` and
-//! `GetCommit` (M9.2). Every other RPC returns `UNIMPLEMENTED`.
+//! `GetObject`, `DefaultBranch`, `MergeBase`, `Stat`, `ReadDir`, `ListRefs`,
+//! `GetCommit`, `RevAtTime`, `RawDiff` and `CommitLog` (M9.2). Every other RPC
+//! returns `UNIMPLEMENTED`.
 
 use std::pin::Pin;
 use std::sync::Arc;
@@ -15,7 +16,8 @@ use tonic::{Request as GrpcRequest, Response as GrpcResponse, Status};
 use sg_proto::gitserver as gpb;
 
 use crate::git::{
-    pump_stdout, GitCommit, GitError, GitRef, GitRepo, RefType, TreeEntry, CHUNK_MESSAGE_SIZE,
+    pump_commit_log, pump_stdout, CommitLogOptions, CommitLogOrder, GitCommit, GitError, GitRef,
+    GitRepo, RawDiffComparison, RefType, TreeEntry, CHUNK_MESSAGE_SIZE,
 };
 use crate::repo::repo_dir;
 
@@ -492,6 +494,177 @@ impl gpb::gitserver_service_server::GitserverService for Grpc {
         }))
     }
 
+    async fn rev_at_time(
+        &self,
+        request: GrpcRequest<gpb::RevAtTimeRequest>,
+    ) -> Result<GrpcResponse<gpb::RevAtTimeResponse>, Status> {
+        let request = request.into_inner();
+        if request.repo_name.is_empty() {
+            return Err(Status::invalid_argument("repo must be specified"));
+        }
+        let repo = self.repo(&request.repo_name)?;
+        let spec = String::from_utf8_lossy(&request.rev_spec).into_owned();
+        // A missing timestamp arrives as `None`; the baseline calls `AsTime()`
+        // on the nil pointer, which is the Unix epoch.
+        let before_seconds = request.time.as_ref().map_or(0, |time| time.seconds);
+        let commit_sha = match repo.rev_at_time(&spec, before_seconds).await {
+            Ok(commit_sha) => commit_sha,
+            Err(GitError::RevisionNotFound(_)) => {
+                return Err(Status::not_found("revision not found"))
+            }
+            // The baseline wraps every other fault as `Internal`.
+            Err(err) => return Err(Status::internal(err.message())),
+        };
+        Ok(GrpcResponse::new(gpb::RevAtTimeResponse { commit_sha }))
+    }
+
+    type RawDiffStream = Stream<gpb::RawDiffResponse>;
+
+    async fn raw_diff(
+        &self,
+        request: GrpcRequest<gpb::RawDiffRequest>,
+    ) -> Result<GrpcResponse<Self::RawDiffStream>, Status> {
+        let request = request.into_inner();
+        if request.repo_name.is_empty() {
+            return Err(Status::invalid_argument("repo must be specified"));
+        }
+        if request.base_rev_spec.is_empty() {
+            return Err(Status::invalid_argument("base_rev_spec must be specified"));
+        }
+        if request.head_rev_spec.is_empty() {
+            return Err(Status::invalid_argument("head_rev_spec must be specified"));
+        }
+        let comparison =
+            match gpb::raw_diff_request::ComparisonType::try_from(request.comparison_type) {
+                Ok(gpb::raw_diff_request::ComparisonType::OnlyInHead) => {
+                    RawDiffComparison::OnlyInHead
+                }
+                Ok(gpb::raw_diff_request::ComparisonType::Intersection) => {
+                    RawDiffComparison::Intersection
+                }
+                // The baseline rejects the unspecified value despite the proto
+                // comment mentioning a fallback.
+                Ok(gpb::raw_diff_request::ComparisonType::Unspecified) | Err(_) => {
+                    return Err(Status::invalid_argument(
+                        "comparison_type must be specified",
+                    ))
+                }
+            };
+        let repo = self.repo(&request.repo_name)?;
+        let base = String::from_utf8_lossy(&request.base_rev_spec).into_owned();
+        let head = String::from_utf8_lossy(&request.head_rev_spec).into_owned();
+        let child = repo
+            .raw_diff(
+                &base,
+                &head,
+                comparison,
+                request.inter_hunk_context.unwrap_or(3),
+                request.context_lines.unwrap_or(3),
+                &request.paths,
+            )
+            .await
+            .map_err(git_status)?;
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<gpb::RawDiffResponse, Status>>(64);
+        self.tasks.spawn(async move {
+            let sender = tx.clone();
+            let result = pump_stdout(child, |data| {
+                let sender = sender.clone();
+                async move {
+                    sender
+                        .send(Ok(gpb::RawDiffResponse { chunk: data }))
+                        .await
+                        .is_ok()
+                }
+            })
+            .await;
+            if let Err(message) = result {
+                let _ = tx.send(Err(Status::unknown(message))).await;
+            }
+        });
+        Ok(GrpcResponse::new(Box::pin(ReceiverStream::new(rx))))
+    }
+
+    type CommitLogStream = Stream<gpb::CommitLogResponse>;
+
+    async fn commit_log(
+        &self,
+        request: GrpcRequest<gpb::CommitLogRequest>,
+    ) -> Result<GrpcResponse<Self::CommitLogStream>, Status> {
+        let request = request.into_inner();
+        if request.repo_name.is_empty() {
+            return Err(Status::invalid_argument("repo must be specified"));
+        }
+        if request.ranges.is_empty() && !request.all_refs {
+            return Err(Status::invalid_argument("must specify ranges or all_refs"));
+        }
+        if !request.ranges.is_empty() && request.all_refs {
+            return Err(Status::invalid_argument(
+                "cannot specify both ranges and all_refs",
+            ));
+        }
+        let order = match gpb::commit_log_request::CommitLogOrder::try_from(request.order) {
+            Ok(gpb::commit_log_request::CommitLogOrder::Unspecified) => CommitLogOrder::Default,
+            Ok(gpb::commit_log_request::CommitLogOrder::CommitDate) => CommitLogOrder::CommitDate,
+            Ok(gpb::commit_log_request::CommitLogOrder::TopoDate) => CommitLogOrder::TopoDate,
+            Err(_) => return Err(Status::invalid_argument("unknown order")),
+        };
+        let repo = self.repo(&request.repo_name)?;
+        let spec = request
+            .ranges
+            .iter()
+            .map(|range| String::from_utf8_lossy(range).into_owned())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let options = CommitLogOptions {
+            ranges: request.ranges,
+            all_refs: request.all_refs,
+            after_seconds: request.after.as_ref().map_or(0, |time| time.seconds),
+            before_seconds: request.before.as_ref().map_or(0, |time| time.seconds),
+            max_commits: request.max_commits,
+            skip: request.skip,
+            follow_only_first_parent: request.follow_only_first_parent,
+            include_modified_files: request.include_modified_files,
+            order,
+            message_query: request.message_query,
+            author_query: request.author_query,
+            path: request.path,
+            follow_path_renames: request.follow_path_renames,
+        };
+        let child = repo.commit_log(&options).await.map_err(git_status)?;
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<gpb::CommitLogResponse, Status>>(64);
+        self.tasks.spawn(async move {
+            let sender = tx.clone();
+            let result = pump_commit_log(child, spec, |commit| {
+                let sender = sender.clone();
+                async move {
+                    let (commit, modified_files) = git_commit_proto(commit);
+                    sender
+                        .send(Ok(gpb::CommitLogResponse {
+                            commits: vec![gpb::GetCommitResponse {
+                                commit: Some(commit),
+                                modified_files,
+                            }],
+                        }))
+                        .await
+                        .is_ok()
+                }
+            })
+            .await;
+            match result {
+                Ok(()) => {}
+                Err(GitError::RevisionNotFound(_)) => {
+                    let _ = tx.send(Err(Status::not_found("revision not found"))).await;
+                }
+                Err(err) => {
+                    let _ = tx.send(Err(Status::unknown(err.message()))).await;
+                }
+            }
+        });
+        Ok(GrpcResponse::new(Box::pin(ReceiverStream::new(rx))))
+    }
+
     type ListRefsStream =
         Pin<Box<dyn tokio_stream::Stream<Item = Result<gpb::ListRefsResponse, Status>> + Send>>;
 
@@ -534,23 +707,6 @@ impl gpb::gitserver_service_server::GitserverService for Grpc {
             responses.push(Ok(gpb::ListRefsResponse { refs: chunk }));
         }
         Ok(GrpcResponse::new(Box::pin(tokio_stream::iter(responses))))
-    }
-
-    async fn rev_at_time(
-        &self,
-        _request: GrpcRequest<gpb::RevAtTimeRequest>,
-    ) -> Result<GrpcResponse<gpb::RevAtTimeResponse>, Status> {
-        Err(unimplemented("rev_at_time"))
-    }
-
-    type RawDiffStream =
-        Pin<Box<dyn tokio_stream::Stream<Item = Result<gpb::RawDiffResponse, Status>> + Send>>;
-
-    async fn raw_diff(
-        &self,
-        _request: GrpcRequest<gpb::RawDiffRequest>,
-    ) -> Result<GrpcResponse<Self::RawDiffStream>, Status> {
-        Err(unimplemented("raw_diff"))
     }
 
     async fn contributor_counts(
@@ -639,16 +795,6 @@ impl gpb::gitserver_service_server::GitserverService for Grpc {
             responses.push(Ok(gpb::ReadDirResponse { file_info: chunk }));
         }
         Ok(GrpcResponse::new(Box::pin(tokio_stream::iter(responses))))
-    }
-
-    type CommitLogStream =
-        Pin<Box<dyn tokio_stream::Stream<Item = Result<gpb::CommitLogResponse, Status>> + Send>>;
-
-    async fn commit_log(
-        &self,
-        _request: GrpcRequest<gpb::CommitLogRequest>,
-    ) -> Result<GrpcResponse<Self::CommitLogStream>, Status> {
-        Err(unimplemented("commit_log"))
     }
 
     async fn merge_base_octopus(

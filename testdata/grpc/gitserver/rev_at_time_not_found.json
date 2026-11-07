@@ -1,0 +1,18 @@
+{
+  "expected": {
+    "error": {
+      "code": "not_found",
+      "message": "revision not found"
+    }
+  },
+  "request": {
+    "repo_name": "test/git-refs-fixture",
+    "rev_spec": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+    "time": {
+      "nanos": 0,
+      "seconds": 1705276800
+    }
+  },
+  "rpc": "rev_at_time",
+  "service": "gitserver"
+}

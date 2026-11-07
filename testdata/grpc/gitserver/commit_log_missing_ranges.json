@@ -1,0 +1,13 @@
+{
+  "expected": {
+    "error": {
+      "code": "invalid_argument",
+      "message": "must specify ranges or all_refs"
+    }
+  },
+  "request": {
+    "repo_name": "test/git-refs-fixture"
+  },
+  "rpc": "commit_log",
+  "service": "gitserver"
+}

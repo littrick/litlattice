@@ -1,0 +1,13 @@
+{
+  "expected": {
+    "commits": []
+  },
+  "request": {
+    "ranges": [
+      "main"
+    ],
+    "repo_name": "test/git-refs-fixture"
+  },
+  "rpc": "commit_log",
+  "service": "gitserver"
+}

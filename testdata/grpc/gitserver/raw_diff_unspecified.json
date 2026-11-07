@@ -1,0 +1,16 @@
+{
+  "expected": {
+    "error": {
+      "code": "invalid_argument",
+      "message": "comparison_type must be specified"
+    }
+  },
+  "request": {
+    "base_rev_spec": "1a65c506a93996f8dccdfe52216bf3909de71d9d",
+    "comparison_type": "unspecified",
+    "head_rev_spec": "2e6511bf87f7e6f0af1afb6247e39b1ddf5cc799",
+    "repo_name": "test/git-refs-fixture"
+  },
+  "rpc": "raw_diff",
+  "service": "gitserver"
+}

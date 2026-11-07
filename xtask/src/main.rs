@@ -239,6 +239,9 @@ enum GitserverRpc {
     ReadDir,
     ListRefs,
     GetCommit,
+    RevAtTime,
+    RawDiff,
+    CommitLog,
 }
 
 impl GitserverRpc {
@@ -255,10 +258,13 @@ impl GitserverRpc {
             "read_dir" => Ok(Self::ReadDir),
             "list_refs" => Ok(Self::ListRefs),
             "get_commit" => Ok(Self::GetCommit),
+            "rev_at_time" => Ok(Self::RevAtTime),
+            "raw_diff" => Ok(Self::RawDiff),
+            "commit_log" => Ok(Self::CommitLog),
             other => Err(format!(
                 "unknown gitserver rpc {other:?} (archive, read_file, changed_files, \
                  resolve_revision, get_object, default_branch, merge_base, stat, read_dir, \
-                 list_refs, get_commit)"
+                 list_refs, get_commit, rev_at_time, raw_diff, commit_log)"
             )),
         }
     }
@@ -938,6 +944,123 @@ fn gitserver_get_commit_request(value: &Value) -> Result<gpb::GetCommitRequest, 
     })
 }
 
+/// A protobuf timestamp given as `{"seconds": n, "nanos": n}`; `None` when the
+/// field is absent or null.
+fn optional_timestamp(
+    value: &Value,
+    field: &str,
+) -> Result<Option<prost_types::Timestamp>, String> {
+    match value.get(field) {
+        None | Some(Value::Null) => Ok(None),
+        Some(object) => Ok(Some(prost_types::Timestamp {
+            seconds: object
+                .get("seconds")
+                .and_then(Value::as_i64)
+                .ok_or_else(|| format!("request: {field}.seconds must be an integer"))?,
+            nanos: object
+                .get("nanos")
+                .and_then(Value::as_i64)
+                .unwrap_or(0)
+                .try_into()
+                .map_err(|_| format!("request: {field}.nanos out of range"))?,
+        })),
+    }
+}
+
+fn gitserver_rev_at_time_request(value: &Value) -> Result<gpb::RevAtTimeRequest, String> {
+    Ok(gpb::RevAtTimeRequest {
+        repo_name: string(value, "repo_name")?,
+        rev_spec: optional_string(value, "rev_spec")?.into_bytes(),
+        time: optional_timestamp(value, "time")?,
+    })
+}
+
+fn gitserver_raw_diff_request(value: &Value) -> Result<gpb::RawDiffRequest, String> {
+    let comparison_type = match string(value, "comparison_type")?.as_str() {
+        "unspecified" => gpb::raw_diff_request::ComparisonType::Unspecified,
+        "only_in_head" => gpb::raw_diff_request::ComparisonType::OnlyInHead,
+        "intersection" => gpb::raw_diff_request::ComparisonType::Intersection,
+        other => return Err(format!("request: unknown comparison_type {other:?}")),
+    };
+    Ok(gpb::RawDiffRequest {
+        repo_name: string(value, "repo_name")?,
+        base_rev_spec: string(value, "base_rev_spec")?.into_bytes(),
+        head_rev_spec: string(value, "head_rev_spec")?.into_bytes(),
+        comparison_type: comparison_type as i32,
+        paths: strings(value, "paths")?
+            .into_iter()
+            .map(String::into_bytes)
+            .collect(),
+        inter_hunk_context: optional_u32(value, "inter_hunk_context")?,
+        context_lines: optional_u32(value, "context_lines")?,
+    })
+}
+
+fn optional_u32(value: &Value, field: &str) -> Result<Option<u32>, String> {
+    match value.get(field) {
+        None | Some(Value::Null) => Ok(None),
+        Some(number) => number
+            .as_u64()
+            .and_then(|number| u32::try_from(number).ok())
+            .map(Some)
+            .ok_or_else(|| format!("request: {field} must be a u32")),
+    }
+}
+
+fn gitserver_commit_log_request(value: &Value) -> Result<gpb::CommitLogRequest, String> {
+    let order = match value
+        .get("order")
+        .and_then(Value::as_str)
+        .unwrap_or("unspecified")
+    {
+        "unspecified" | "default" => gpb::commit_log_request::CommitLogOrder::Unspecified,
+        "commit_date" => gpb::commit_log_request::CommitLogOrder::CommitDate,
+        "topo_date" => gpb::commit_log_request::CommitLogOrder::TopoDate,
+        other => return Err(format!("request: unknown order {other:?}")),
+    };
+    Ok(gpb::CommitLogRequest {
+        repo_name: string(value, "repo_name")?,
+        ranges: strings(value, "ranges")?
+            .into_iter()
+            .map(String::into_bytes)
+            .collect(),
+        all_refs: value
+            .get("all_refs")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        after: optional_timestamp(value, "after")?,
+        before: optional_timestamp(value, "before")?,
+        max_commits: value
+            .get("max_commits")
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+            .try_into()
+            .map_err(|_| "request: max_commits out of range".to_owned())?,
+        skip: value
+            .get("skip")
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+            .try_into()
+            .map_err(|_| "request: skip out of range".to_owned())?,
+        follow_only_first_parent: value
+            .get("follow_only_first_parent")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        include_modified_files: value
+            .get("include_modified_files")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        order: order as i32,
+        message_query: optional_string(value, "message_query")?.into_bytes(),
+        author_query: optional_string(value, "author_query")?.into_bytes(),
+        path: optional_string(value, "path")?.into_bytes(),
+        follow_path_renames: value
+            .get("follow_path_renames")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+    })
+}
+
 /// `proto.FileInfo` as JSON. Modes are the raw Go `fs.FileMode` bits; the
 /// names are compared byte-for-byte.
 fn normalize_file_info(file: &gpb::FileInfo) -> Value {
@@ -993,6 +1116,36 @@ fn normalize_git_commit(commit: &gpb::GitCommit) -> Value {
         "committer": commit.committer.as_ref().map(normalize_git_signature),
         "message": String::from_utf8_lossy(&commit.message),
         "parents": commit.parents,
+    })
+}
+
+fn normalize_commit_log(chunks: &[gpb::CommitLogResponse]) -> Value {
+    let mut commits = Vec::new();
+    for chunk in chunks {
+        for response in &chunk.commits {
+            commits.push(json!({
+                "commit": response.commit.as_ref().map(normalize_git_commit),
+                "modified_files": response
+                    .modified_files
+                    .iter()
+                    .map(|file| String::from_utf8_lossy(file).into_owned())
+                    .collect::<Vec<_>>(),
+            }));
+        }
+    }
+    json!({"commits": commits})
+}
+
+/// `RawDiff` chunks are compared by concatenated text; chunk boundaries are
+/// implementation details.
+fn normalize_raw_diff(chunks: &[gpb::RawDiffResponse]) -> Value {
+    let mut data = Vec::new();
+    for chunk in chunks {
+        data.extend_from_slice(&chunk.chunk);
+    }
+    json!({
+        "diff": String::from_utf8_lossy(&data),
+        "size_bytes": data.len(),
     })
 }
 
@@ -1260,6 +1413,39 @@ async fn call_gitserver(
                     .map(|file| String::from_utf8_lossy(file).into_owned())
                     .collect::<Vec<_>>(),
             }))
+        }
+        GitserverRpc::RevAtTime => {
+            let response = client
+                .rev_at_time(
+                    gitserver_rev_at_time_request(request).map_err(GitserverFailure::Fixture)?,
+                )
+                .await?
+                .into_inner();
+            Ok(json!({"commit_sha": response.commit_sha}))
+        }
+        GitserverRpc::RawDiff => {
+            let mut stream = client
+                .raw_diff(gitserver_raw_diff_request(request).map_err(GitserverFailure::Fixture)?)
+                .await?
+                .into_inner();
+            let mut messages = Vec::new();
+            while let Some(message) = stream.message().await? {
+                messages.push(message);
+            }
+            Ok(normalize_raw_diff(&messages))
+        }
+        GitserverRpc::CommitLog => {
+            let mut stream = client
+                .commit_log(
+                    gitserver_commit_log_request(request).map_err(GitserverFailure::Fixture)?,
+                )
+                .await?
+                .into_inner();
+            let mut messages = Vec::new();
+            while let Some(message) = stream.message().await? {
+                messages.push(message);
+            }
+            Ok(normalize_commit_log(&messages))
         }
         GitserverRpc::ChangedFiles => {
             let mut stream = client
@@ -1652,5 +1838,58 @@ mod tests {
         }))
         .expect("get_commit request");
         assert!(request.include_modified_files);
+
+        let request = gitserver_rev_at_time_request(&json!({
+            "repo_name": "r", "rev_spec": "main", "time": {"seconds": 1705276800},
+        }))
+        .expect("rev_at_time request");
+        assert_eq!(request.rev_spec, b"main");
+        assert_eq!(request.time.map(|time| time.seconds), Some(1_705_276_800));
+
+        let request =
+            gitserver_rev_at_time_request(&json!({"repo_name": "r"})).expect("rev_at_time request");
+        assert!(request.rev_spec.is_empty());
+        assert_eq!(request.time, None);
+
+        let request = gitserver_raw_diff_request(&json!({
+            "repo_name": "r",
+            "base_rev_spec": "a",
+            "head_rev_spec": "b",
+            "comparison_type": "intersection",
+            "paths": ["p"],
+            "inter_hunk_context": 5,
+        }))
+        .expect("raw_diff request");
+        assert_eq!(
+            request.comparison_type,
+            gpb::raw_diff_request::ComparisonType::Intersection as i32
+        );
+        assert_eq!(request.paths, vec![b"p".to_vec()]);
+        assert_eq!(request.inter_hunk_context, Some(5));
+        assert_eq!(request.context_lines, None);
+
+        let request = gitserver_commit_log_request(&json!({
+            "repo_name": "r",
+            "ranges": ["main", "dev"],
+            "before": {"seconds": 1735689600},
+            "max_commits": 2,
+            "skip": 1,
+            "include_modified_files": true,
+            "order": "commit_date",
+            "message_query": "fix",
+        }))
+        .expect("commit_log request");
+        assert_eq!(request.ranges, vec![b"main".to_vec(), b"dev".to_vec()]);
+        assert!(!request.all_refs);
+        assert_eq!(request.before.map(|time| time.seconds), Some(1_735_689_600));
+        assert_eq!(request.after, None);
+        assert_eq!(request.max_commits, 2);
+        assert_eq!(request.skip, 1);
+        assert!(request.include_modified_files);
+        assert_eq!(
+            request.order,
+            gpb::commit_log_request::CommitLogOrder::CommitDate as i32
+        );
+        assert_eq!(request.message_query, b"fix");
     }
 }

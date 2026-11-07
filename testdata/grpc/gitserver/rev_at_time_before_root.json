@@ -1,0 +1,15 @@
+{
+  "expected": {
+    "commit_sha": ""
+  },
+  "request": {
+    "repo_name": "test/git-refs-fixture",
+    "rev_spec": "main",
+    "time": {
+      "nanos": 0,
+      "seconds": 1701388800
+    }
+  },
+  "rpc": "rev_at_time",
+  "service": "gitserver"
+}

@@ -126,6 +126,42 @@ pub struct GitCommit {
     pub modified_files: Vec<Vec<u8>>,
 }
 
+/// `git.CommitLogOrder` without the proto dependency.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommitLogOrder {
+    Default,
+    CommitDate,
+    TopoDate,
+}
+
+/// `git.CommitLogOpts` without the proto dependency.
+#[derive(Debug, Clone)]
+pub struct CommitLogOptions {
+    pub ranges: Vec<Vec<u8>>,
+    pub all_refs: bool,
+    /// The gRPC handler passes `GetAfter().AsTime()` even when the timestamp is
+    /// unset; a nil `Timestamppb` yields the Unix epoch (not Go's zero time), so
+    /// both filters are always emitted.
+    pub after_seconds: i64,
+    pub before_seconds: i64,
+    pub max_commits: u32,
+    pub skip: u32,
+    pub follow_only_first_parent: bool,
+    pub include_modified_files: bool,
+    pub order: CommitLogOrder,
+    pub message_query: Vec<u8>,
+    pub author_query: Vec<u8>,
+    pub path: Vec<u8>,
+    pub follow_path_renames: bool,
+}
+
+/// `git.GitDiffComparisonType` without the proto dependency.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RawDiffComparison {
+    OnlyInHead,
+    Intersection,
+}
+
 impl GitRepo {
     pub fn new(git_dir: impl Into<PathBuf>) -> Self {
         Self {
@@ -649,6 +685,138 @@ impl GitRepo {
         }
         parse_commit_log(&output.stdout)
     }
+
+    /// Baseline `RevAtTime`: resolve the spec, then walk first parents for the
+    /// newest commit whose committer time is before `before_seconds`. An empty
+    /// result means no such ancestor exists.
+    pub async fn rev_at_time(&self, spec: &str, before_seconds: i64) -> Result<String, GitError> {
+        let sha = self.resolve_revision(spec).await?;
+        let output = self
+            .output(&[
+                "log".into(),
+                "--format=format:%H".into(),
+                "--first-parent".into(),
+                format!("--before={before_seconds}").into(),
+                "--max-count=1".into(),
+                sha.into(),
+            ])
+            .await?;
+        if !output.status.success() {
+            return Err(GitError::Message(format!(
+                "git log: {}",
+                String::from_utf8_lossy(&output.stderr).trim_end()
+            )));
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+    }
+
+    /// Baseline `RawDiff`: resolve both specs, linearize `BASE...HEAD` through
+    /// `merge-base`, then stream `git diff-tree --patch`.
+    pub async fn raw_diff(
+        &self,
+        base: &str,
+        head: &str,
+        comparison: RawDiffComparison,
+        inter_hunk_context: u32,
+        context_lines: u32,
+        paths: &[Vec<u8>],
+    ) -> Result<Child, GitError> {
+        let mut base_oid = self.resolve_revision(base).await?;
+        let head_oid = self.resolve_revision(head).await?;
+        // Go re-checks the resolved OIDs before handing them to git.
+        check_spec_arg_safety(&base_oid)?;
+        check_spec_arg_safety(&head_oid)?;
+        if comparison == RawDiffComparison::Intersection {
+            base_oid = self.merge_base(&base_oid, &head_oid).await?;
+        }
+
+        let mut args: Vec<OsString> = vec![
+            // The baseline uses `diff-tree` so that arbitrary on-disk files can
+            // never be diffed.
+            "diff-tree".into(),
+            "--patch".into(),
+            "--find-renames".into(),
+            "--full-index".into(),
+            format!("--inter-hunk-context={inter_hunk_context}").into(),
+            format!("--unified={context_lines}").into(),
+            "--no-prefix".into(),
+            base_oid.into(),
+            head_oid.into(),
+            "--".into(),
+        ];
+        for path in paths {
+            args.push(OsStr::from_bytes(path).to_owned());
+        }
+        self.command(&args)
+            .spawn()
+            .map_err(|err| GitError::Message(format!("failed to run git diff-tree: {err}")))
+    }
+
+    /// Baseline `CommitLog`: spawn `git log` with the shared NUL format; the
+    /// caller parses records with [`pump_commit_log`].
+    pub async fn commit_log(&self, options: &CommitLogOptions) -> Result<Child, GitError> {
+        for range in &options.ranges {
+            if range.first() == Some(&b'-') {
+                return Err(GitError::Message(format!(
+                    "invalid git revision spec {:?} (begins with '-')",
+                    String::from_utf8_lossy(range)
+                )));
+            }
+        }
+
+        let mut args: Vec<OsString> = vec!["log".into(), LOG_FORMAT_WITHOUT_REFS.into()];
+        if options.max_commits != 0 {
+            args.push("-n".into());
+            args.push(options.max_commits.to_string().into());
+        }
+        if options.skip != 0 {
+            args.push(format!("--skip={}", options.skip).into());
+        }
+        if !options.author_query.is_empty() {
+            args.push("--fixed-strings".into());
+            let mut arg = OsString::from("--author=");
+            arg.push(OsStr::from_bytes(&options.author_query));
+            args.push(arg);
+        }
+        // See `CommitLogOptions`: unset timestamps arrive as the Unix epoch.
+        args.push(format!("--after={}", rfc3339_utc(options.after_seconds)).into());
+        args.push(format!("--before={}", rfc3339_utc(options.before_seconds)).into());
+        match options.order {
+            CommitLogOrder::CommitDate => args.push("--date-order".into()),
+            CommitLogOrder::TopoDate => args.push("--topo-order".into()),
+            CommitLogOrder::Default => {}
+        }
+        if !options.message_query.is_empty() {
+            args.push("--fixed-strings".into());
+            args.push("--regexp-ignore-case".into());
+            let mut arg = OsString::from("--grep=");
+            arg.push(OsStr::from_bytes(&options.message_query));
+            args.push(arg);
+        }
+        if options.follow_only_first_parent {
+            args.push("--first-parent".into());
+        }
+        if options.all_refs {
+            args.push("--all".into());
+        }
+        if options.include_modified_files {
+            args.push("--name-only".into());
+        }
+        if options.follow_path_renames {
+            args.push("--follow".into());
+        }
+        for range in &options.ranges {
+            args.push(OsStr::from_bytes(range).to_owned());
+        }
+        args.push("--".into());
+        if !options.path.is_empty() {
+            args.push(OsStr::from_bytes(&options.path).to_owned());
+        }
+
+        self.command(&args)
+            .spawn()
+            .map_err(|err| GitError::Message(format!("failed to run git log: {err}")))
+    }
 }
 
 fn decode_hex(text: &str) -> Option<Vec<u8>> {
@@ -1067,6 +1235,139 @@ fn parse_commit_log(output: &[u8]) -> Result<GitCommit, GitError> {
         parents,
         modified_files,
     })
+}
+
+/// Format Unix seconds as Go's `time.RFC3339` in UTC (seconds precision).
+fn rfc3339_utc(seconds: i64) -> String {
+    let days = seconds.div_euclid(86_400);
+    let day_seconds = seconds.rem_euclid(86_400);
+    let (year, month, day) = civil_from_days(days);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
+        day_seconds / 3600,
+        (day_seconds % 3600) / 60,
+        day_seconds % 60
+    )
+}
+
+/// Howard Hinnant's `civil_from_days`: convert days since 1970-01-01 to a
+/// proleptic Gregorian date.
+fn civil_from_days(days: i64) -> (i64, i64, i64) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    (if month <= 2 { y + 1 } else { y }, month, day)
+}
+
+/// Stream the `\x1e`-separated records of `CommitLog`'s NUL format.
+///
+/// `send` resolves to false once the client went away; the child is killed
+/// then. Baseline error mapping: exit 128 with a bad-revision marker becomes
+/// `RevisionNotFound`; an empty repository ends the stream cleanly.
+pub async fn pump_commit_log<F, Fut>(
+    mut child: Child,
+    spec: String,
+    mut send: F,
+) -> Result<(), GitError>
+where
+    F: FnMut(GitCommit) -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| GitError::Message("git process has no stdout".to_owned()))?;
+    let mut buffer: Vec<u8> = Vec::new();
+    let mut chunk = vec![0u8; STREAM_CHUNK];
+    let mut wrote_any = false;
+    loop {
+        let read = match stdout.read(&mut chunk).await {
+            Ok(0) => break,
+            Ok(read) => read,
+            Err(err) => {
+                let _ = child.start_kill();
+                return Err(GitError::Message(format!(
+                    "failed to read git output: {err}"
+                )));
+            }
+        };
+        wrote_any = true;
+        buffer.extend_from_slice(&chunk[..read]);
+        // The leading `\x1e` opens a record; the next one closes it.
+        while buffer.len() > 1 {
+            let Some(offset) = buffer[1..].iter().position(|byte| *byte == 0x1e) else {
+                break;
+            };
+            // Keep the next record's leading separator: it opens the next
+            // token. `drain(..=end)` would swallow the first byte of the next
+            // commit ID.
+            let end = offset + 1;
+            let record = buffer[1..end].to_vec();
+            buffer.drain(..end);
+            let commit = parse_commit_log(&record)?;
+            if !send(commit).await {
+                let _ = child.start_kill();
+                return Ok(());
+            }
+        }
+    }
+    if buffer.len() > 1 {
+        let record = buffer[1..].to_vec();
+        let commit = parse_commit_log(&record)?;
+        if !send(commit).await {
+            let _ = child.start_kill();
+            return Ok(());
+        }
+    }
+
+    let status = child
+        .wait()
+        .await
+        .map_err(|err| GitError::Message(format!("failed to wait for git: {err}")))?;
+    if status.success() {
+        return Ok(());
+    }
+    let mut stderr = String::new();
+    if let Some(mut err) = child.stderr.take() {
+        let _ = err.read_to_string(&mut stderr).await;
+    }
+    if status.code() == Some(128) {
+        // A repository without commits is an empty result, not an error.
+        if stderr.contains("fatal: bad revision 'HEAD'")
+            || (stderr.contains("fatal: your current branch")
+                && stderr.contains("does not have any commits yet"))
+        {
+            return Ok(());
+        }
+        let markers = [
+            "not a tree object",
+            "fatal: bad object",
+            "fatal: Invalid revision range",
+            "fatal: bad revision",
+        ];
+        if markers.iter().any(|marker| stderr.contains(marker))
+            || (stderr.contains("fatal: ambiguous argument")
+                && stderr.contains("unknown revision or path not in the working tree."))
+        {
+            return Err(GitError::RevisionNotFound(spec));
+        }
+    }
+    if !wrote_any || !stderr.is_empty() {
+        return Err(GitError::Message(format!(
+            "git exited with {}: {}",
+            status
+                .code()
+                .map_or("signal".to_owned(), |code| code.to_string()),
+            stderr.trim_end()
+        )));
+    }
+    Ok(())
 }
 
 /// Read a child's stdout into `send`, chunked at `STREAM_CHUNK`.
@@ -1580,6 +1881,103 @@ mod tests {
         assert!(matches!(
             repo.get_commit("deadbeefdeadbeefdeadbeefdeadbeefdeadbeef", false)
                 .await,
+            Err(GitError::RevisionNotFound(_))
+        ));
+    }
+
+    #[test]
+    fn formats_rfc3339_like_go() {
+        // Go formats `time.Unix(sec, 0).UTC()` with `time.RFC3339`.
+        assert_eq!(rfc3339_utc(0), "1970-01-01T00:00:00Z");
+        assert_eq!(rfc3339_utc(1_706_832_000), "2024-02-02T00:00:00Z");
+        assert_eq!(rfc3339_utc(1_709_251_200), "2024-03-01T00:00:00Z");
+        // Leap day and a negative epoch (1969).
+        assert_eq!(rfc3339_utc(1_709_164_800), "2024-02-29T00:00:00Z");
+        assert_eq!(rfc3339_utc(-86_400), "1969-12-31T00:00:00Z");
+        assert_eq!(rfc3339_utc(-1), "1969-12-31T23:59:59Z");
+    }
+
+    fn now_seconds() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_secs() as i64
+    }
+
+    #[tokio::test]
+    async fn resolves_revisions_at_time() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (dir, head) = fixture_repo(tmp.path());
+        let repo = GitRepo::new(dir);
+
+        let date = repo
+            .get_commit(&head, false)
+            .await
+            .expect("commit")
+            .committer
+            .date_seconds;
+        assert_eq!(
+            repo.rev_at_time("main", date + 1).await.expect("after"),
+            head
+        );
+        // Strictly before the root commit: no ancestor matches.
+        assert_eq!(
+            repo.rev_at_time("main", date - 1).await.expect("before"),
+            ""
+        );
+        assert!(matches!(
+            repo.rev_at_time("deadbeefdeadbeefdeadbeefdeadbeefdeadbeef", date + 1)
+                .await,
+            Err(GitError::RevisionNotFound(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn streams_commit_log_records() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (dir, head) = fixture_repo(tmp.path());
+        let repo = GitRepo::new(dir);
+        let before = now_seconds() + 86_400;
+        let options = |ranges: Vec<Vec<u8>>| CommitLogOptions {
+            ranges,
+            all_refs: false,
+            after_seconds: 0,
+            before_seconds: before,
+            max_commits: 0,
+            skip: 0,
+            follow_only_first_parent: false,
+            include_modified_files: true,
+            order: CommitLogOrder::Default,
+            message_query: Vec::new(),
+            author_query: Vec::new(),
+            path: Vec::new(),
+            follow_path_renames: false,
+        };
+
+        let child = repo
+            .commit_log(&options(vec![b"main".to_vec()]))
+            .await
+            .expect("commit log");
+        let mut commits = Vec::new();
+        pump_commit_log(child, "main".to_owned(), |commit| {
+            commits.push(commit);
+            async { true }
+        })
+        .await
+        .expect("pump");
+        assert_eq!(commits.len(), 1);
+        assert_eq!(commits[0].oid, head);
+        assert_eq!(commits[0].message, b"first");
+        assert_eq!(commits[0].modified_files, vec![b"a.txt".to_vec()]);
+
+        let child = repo
+            .commit_log(&options(vec![
+                b"deadbeefdeadbeefdeadbeefdeadbeefdeadbeef".to_vec()
+            ]))
+            .await
+            .expect("commit log");
+        assert!(matches!(
+            pump_commit_log(child, "deadbeef".to_owned(), |_commit| async { true }).await,
             Err(GitError::RevisionNotFound(_))
         ));
     }

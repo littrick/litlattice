@@ -1,0 +1,14 @@
+{
+  "expected": {
+    "diff": "diff --git a.txt a.txt\nindex 78981922613b2afb6025042ff6bd878ac1994e85..61780798228d17af2d34fce4cfbdf35556832472 100644\n--- a.txt\n+++ a.txt\n@@ -1 +1 @@\n-a\n+b\ndiff --git b.txt b.txt\nnew file mode 100644\nindex 0000000000000000000000000000000000000000..61780798228d17af2d34fce4cfbdf35556832472\n--- /dev/null\n+++ b.txt\n@@ -0,0 +1 @@\n+b\n",
+    "size_bytes": 331
+  },
+  "request": {
+    "base_rev_spec": "1a65c506a93996f8dccdfe52216bf3909de71d9d",
+    "comparison_type": "only_in_head",
+    "head_rev_spec": "2e6511bf87f7e6f0af1afb6247e39b1ddf5cc799",
+    "repo_name": "test/git-refs-fixture"
+  },
+  "rpc": "raw_diff",
+  "service": "gitserver"
+}
