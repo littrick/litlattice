@@ -1233,6 +1233,8 @@ dependencies = [
  "hyper",
  "prost",
  "regex",
+ "serde",
+ "serde_json",
  "sg-core",
  "sg-git",
  "sg-http",

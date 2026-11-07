@@ -34,6 +34,7 @@ pub mod regex_search;
 pub mod search;
 pub mod sender;
 pub mod store;
+pub mod structural_search;
 pub mod zipcache;
 
 use config::SearcherConfig;
@@ -62,6 +63,8 @@ pub struct SearcherService {
     fetcher: Option<Arc<dyn ArchiveFetcher>>,
     /// Test hook: replaces `SEARCHER_CACHE_DIR`.
     cache_dir: Option<std::path::PathBuf>,
+    /// Test hook: replaces the `comby` executable found on `PATH`.
+    comby_path: Option<std::path::PathBuf>,
 }
 
 impl SearcherService {
@@ -72,6 +75,7 @@ impl SearcherService {
             config: None,
             fetcher: None,
             cache_dir: None,
+            comby_path: None,
         }
     }
 
@@ -83,6 +87,7 @@ impl SearcherService {
             config: None,
             fetcher: None,
             cache_dir: None,
+            comby_path: None,
         }
     }
 
@@ -95,6 +100,12 @@ impl SearcherService {
     /// Test hook: keep fetched archives under `dir`.
     pub fn with_cache_dir(mut self, dir: impl Into<std::path::PathBuf>) -> Self {
         self.cache_dir = Some(dir.into());
+        self
+    }
+
+    /// Test hook: run a different comby executable.
+    pub fn with_comby_path(mut self, path: impl Into<std::path::PathBuf>) -> Self {
+        self.comby_path = Some(path.into());
         self
     }
 }
@@ -169,7 +180,11 @@ impl Service for SearcherService {
             ctx.shutdown.clone(),
         );
         store.start();
-        let search_service = Arc::new(SearchService::new(Arc::clone(&store)));
+        let mut search_service = SearchService::new(Arc::clone(&store));
+        if let Some(comby_path) = self.comby_path.clone() {
+            search_service = search_service.with_comby_path(comby_path);
+        }
+        let search_service = Arc::new(search_service);
 
         let listener = TcpListener::bind(self.addr.as_str()).await.map_err(|err| {
             ServiceError::with_source(format!("failed to listen on {}", self.addr), err)
@@ -398,6 +413,22 @@ mod tests {
         })
     }
 
+    /// Executable that prints a fixed comby JSON-lines result.
+    fn comby_stub(dir: &std::path::Path, output: &str) -> std::path::PathBuf {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = dir.join("comby");
+        let mut file = std::fs::File::create(&path).expect("stub");
+        writeln!(file, "#!/bin/sh").expect("write");
+        writeln!(file, "cat <<'EOF'").expect("write");
+        writeln!(file, "{output}").expect("write");
+        writeln!(file, "EOF").expect("write");
+        file.set_permissions(std::fs::Permissions::from_mode(0o755))
+            .expect("chmod");
+        path
+    }
+
     fn context(shutdown: CancellationToken, ready: ReadyHandle) -> ServiceContext {
         let mut env = EnvReader::new();
         let mut service = Box::new(SearcherService::with_addr("127.0.0.1:0"));
@@ -431,17 +462,31 @@ mod tests {
         CancellationToken,
         tokio::task::JoinHandle<Result<(), ServiceError>>,
     ) {
+        start_with_comby(fetcher, None).await
+    }
+
+    async fn start_with_comby(
+        fetcher: Arc<dyn ArchiveFetcher>,
+        comby_path: Option<std::path::PathBuf>,
+    ) -> (
+        std::net::SocketAddr,
+        tempfile::TempDir,
+        CancellationToken,
+        tokio::task::JoinHandle<Result<(), ServiceError>>,
+    ) {
         let addr = probe_addr();
         let cache = tempfile::tempdir().expect("cache dir");
         let shutdown = CancellationToken::new();
         let ready = ReadyHandle::new();
         let ctx = context(shutdown.clone(), ready.clone());
 
-        let mut service = Box::new(
-            SearcherService::with_addr(addr.to_string())
-                .with_fetcher(fetcher)
-                .with_cache_dir(cache.path()),
-        );
+        let mut service = SearcherService::with_addr(addr.to_string())
+            .with_fetcher(fetcher)
+            .with_cache_dir(cache.path());
+        if let Some(comby_path) = comby_path {
+            service = service.with_comby_path(comby_path);
+        }
+        let mut service = Box::new(service);
         let mut env = EnvReader::new();
         service.configure(&mut env).expect("configure");
         let server = tokio::spawn(async move { service.start(ctx).await });
@@ -555,6 +600,43 @@ mod tests {
         }
         assert_eq!(matches, 1);
         assert!(done.expect("done").limit_hit);
+
+        shutdown.cancel();
+        server.await.expect("server task").expect("clean stop");
+    }
+
+    #[tokio::test]
+    async fn streams_structural_search_results() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let comby = comby_stub(
+            dir.path(),
+            r#"{"uri":"a.go","matches":[{"range":{"start":{"offset":12,"line":1,"column":13},"end":{"offset":20,"line":1,"column":21}},"matched":"foo(bar)"}]}"#,
+        );
+        let fetcher = fetcher(&[("a.go", b"fn main() { foo(bar); }\n")]);
+        let (addr, _cache, shutdown, server) = start_with_comby(fetcher, Some(comby)).await;
+
+        let mut client = connect(addr).await;
+        let mut request = request("foo(:[x])", 0);
+        request.pattern_info.as_mut().expect("info").is_structural = true;
+        let mut stream = client.search(request).await.expect("search").into_inner();
+
+        let mut matches = Vec::new();
+        let mut done = None;
+        while let Some(message) = stream.next().await {
+            let message = message.expect("ok");
+            match message.message {
+                Some(pb::search_response::Message::FileMatch(file_match)) => {
+                    matches.push(file_match)
+                }
+                Some(pb::search_response::Message::DoneMessage(done_message)) => {
+                    done = Some(done_message)
+                }
+                None => {}
+            }
+        }
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].path, b"a.go");
+        assert!(!done.expect("done").limit_hit);
 
         shutdown.cancel();
         server.await.expect("server task").expect("clean stop");

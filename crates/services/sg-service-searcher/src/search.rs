@@ -2,13 +2,15 @@
 
 //! Search orchestration (`Service.search` in `search.go`).
 //!
-//! M8.6 implements the unindexed path: query compilation, archive
-//! preparation through [`Store`], and the worker-pool scan in
-//! [`RegexSearch`]. Hybrid/zoekt offload and structural search land in M8.7;
-//! until then structural requests fail loudly instead of silently running a
-//! regexp search.
+//! Unindexed regexp search compiles the query, prepares the archive through
+//! [`Store`], and runs the worker-pool scan in [`RegexSearch`]. Structural
+//! requests narrow the archive with an approximate regexp pass and stream
+//! comby results. Hybrid/zoekt offload is not wired yet; without it every
+//! request searches the whole archive, which is the baseline fallback when
+//! indexed search is unavailable.
 
 use std::io;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -19,6 +21,7 @@ use crate::protocol::Request;
 use crate::regex_search::{RegexSearch, SearchError};
 use crate::sender::LimitedStream;
 use crate::store::{Store, StoreError};
+use crate::structural_search::{filtered_structural_search, StructuralError};
 
 /// Baseline `Service.search` default when the request carries no timeout.
 pub const DEFAULT_FETCH_TIMEOUT: Duration = Duration::from_millis(500);
@@ -32,8 +35,8 @@ pub enum ServiceError {
     Archive(StoreError),
     /// The archive scan failed.
     Search(SearchError),
-    /// The request needs a code path scheduled for a later milestone.
-    Unsupported(&'static str),
+    /// Structural search failed (comby or candidate scan).
+    Structural(StructuralError),
 }
 
 impl std::fmt::Display for ServiceError {
@@ -45,7 +48,7 @@ impl std::fmt::Display for ServiceError {
             | Self::Archive(StoreError::Canceled(message))
             | Self::Archive(StoreError::Temporary(message)) => f.write_str(message),
             Self::Search(err) => err.fmt(f),
-            Self::Unsupported(message) => f.write_str(message),
+            Self::Structural(err) => err.fmt(f),
         }
     }
 }
@@ -64,14 +67,30 @@ impl From<SearchError> for ServiceError {
     }
 }
 
+impl From<StructuralError> for ServiceError {
+    fn from(err: StructuralError) -> Self {
+        Self::Structural(err)
+    }
+}
+
 /// Baseline `Service`: everything the unindexed search path needs.
 pub struct SearchService {
     store: Arc<Store>,
+    comby_path: PathBuf,
 }
 
 impl SearchService {
     pub fn new(store: Arc<Store>) -> Self {
-        Self { store }
+        Self {
+            store,
+            comby_path: crate::structural_search::default_comby_path(),
+        }
+    }
+
+    /// Test hook: run a different comby executable.
+    pub fn with_comby_path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.comby_path = path.into();
+        self
     }
 
     pub fn store(&self) -> &Arc<Store> {
@@ -87,10 +106,40 @@ impl SearchService {
         request: &Request,
         sender: Arc<LimitedStream>,
     ) -> Result<(), ServiceError> {
+        let fetch_timeout = if request.fetch_timeout.is_zero() {
+            DEFAULT_FETCH_TIMEOUT
+        } else {
+            request.fetch_timeout
+        };
+
         if request.pattern_info.is_structural {
-            return Err(ServiceError::Unsupported(
-                "structural search is not implemented yet",
-            ));
+            // The baseline fetches the archive before validating the query.
+            let (path, zip) = self
+                .store
+                .get_zip_file(&request.repo, &request.commit, &[], fetch_timeout)
+                .await?;
+
+            let pattern_info = request.pattern_info.clone();
+            let comby_path = self.comby_path.clone();
+            let context_lines = request.num_context_lines;
+            tokio::task::spawn_blocking(move || {
+                filtered_structural_search(
+                    &path,
+                    &zip,
+                    &pattern_info,
+                    &comby_path,
+                    context_lines,
+                    &sender,
+                )
+            })
+            .await
+            .map_err(|err| {
+                ServiceError::Structural(StructuralError::Comby(format!(
+                    "structural search worker panicked: {err}"
+                )))
+            })??;
+
+            return Ok(());
         }
 
         let query =
@@ -102,12 +151,6 @@ impl SearchService {
         let lang_matcher = to_lang_matcher(&request.pattern_info);
         let path_matcher = to_path_matcher(&request.pattern_info)
             .map_err(|err| ServiceError::BadRequest(err.to_string()))?;
-
-        let fetch_timeout = if request.fetch_timeout.is_zero() {
-            DEFAULT_FETCH_TIMEOUT
-        } else {
-            request.fetch_timeout
-        };
 
         // No hybrid search yet: the whole archive is unsearched.
         let (_path, zip) = self

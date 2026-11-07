@@ -52,6 +52,22 @@ impl ZipFile {
         &self.path
     }
 
+    /// The entry with the given repo-relative path, if present.
+    pub fn file_by_name(&self, name: &str) -> Option<&SrcFile> {
+        // Paths are stored in offset order, not sorted by name; structural
+        // search does one lookup per comby result, which is rare enough that a
+        // linear scan beats keeping a second index.
+        self.files.iter().find(|file| file.name == name)
+    }
+
+    /// `zip.Reader.Open` by name, used by structural search.
+    pub fn data_by_name(&self, name: &str) -> io::Result<Option<Vec<u8>>> {
+        match self.file_by_name(name) {
+            Some(file) => self.data_for(file).map(Some),
+            None => Ok(None),
+        }
+    }
+
     /// `zipFile.DataFor`: the contents are copies so they may outlive the
     /// cache entry.
     pub fn data_for(&self, file: &SrcFile) -> io::Result<Vec<u8>> {
