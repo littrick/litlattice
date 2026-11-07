@@ -17,11 +17,14 @@ use tonic::{Request as GrpcRequest, Response as GrpcResponse, Status};
 use sg_core::{ConfigError, EnvReader, Service, ServiceContext, ServiceError};
 use sg_proto::searcher as pb;
 
+pub mod chunk;
 pub mod config;
 pub mod debug;
 pub mod filter;
 pub mod langmatch;
+pub mod matchtree;
 pub mod metrics;
+pub mod pathmatch;
 pub mod protocol;
 pub mod store;
 pub mod zipcache;
