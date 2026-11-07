@@ -312,6 +312,14 @@ fn string(value: &Value, field: &str) -> Result<String, String> {
         .ok_or_else(|| format!("request: {field} must be a string"))
 }
 
+fn optional_string(value: &Value, field: &str) -> Result<String, String> {
+    match value.get(field) {
+        None | Some(Value::Null) => Ok(String::new()),
+        Some(Value::String(text)) => Ok(text.clone()),
+        Some(_) => Err(format!("request: {field} must be a string")),
+    }
+}
+
 fn strings(value: &Value, field: &str) -> Result<Vec<String>, String> {
     match value.get(field) {
         None | Some(Value::Null) => Ok(Vec::new()),
@@ -384,7 +392,7 @@ fn search_request(value: &Value) -> Result<pb::SearchRequest, String> {
         is_reg_exp: bool_field(value, "is_reg_exp")?,
         is_case_sensitive: bool_field(value, "is_case_sensitive")?,
         include_patterns: strings(value, "include_patterns")?,
-        exclude_pattern: string(value, "exclude_pattern")?,
+        exclude_pattern: optional_string(value, "exclude_pattern")?,
         first: i32_field(value, "first")?,
         timeout: duration(value)?,
         include_langs: strings(value, "include_langs")?,

@@ -1,0 +1,481 @@
+{
+  "expected": {
+    "symbols": [
+      {
+        "def": {
+          "column": 12,
+          "length": 1,
+          "row": 99
+        },
+        "hover": "```java\n        int _ = c2.f2;\n```\n\n---\n\nvv f2 ref\n",
+        "name": "_",
+        "refs": [
+          {
+            "column": 12,
+            "length": 1,
+            "row": 99
+          }
+        ]
+      },
+      {
+        "def": {
+          "column": 14,
+          "length": 3,
+          "row": 78
+        },
+        "hover": "```java\n        C1.C2 c12; // < \"C1\" C1 ref\n```\n\n---\n\nvv C2 ref\n",
+        "name": "c12",
+        "refs": [
+          {
+            "column": 14,
+            "length": 3,
+            "row": 78
+          }
+        ]
+      },
+      {
+        "def": {
+          "column": 12,
+          "length": 2,
+          "row": 13
+        },
+        "hover": "```java\n        var c2 = new C2();\n```",
+        "name": "c2",
+        "refs": [
+          {
+            "column": 12,
+            "length": 2,
+            "row": 13
+          },
+          {
+            "column": 13,
+            "length": 2,
+            "row": 16
+          }
+        ]
+      },
+      {
+        "def": {
+          "column": 11,
+          "length": 2,
+          "row": 75
+        },
+        "hover": "```java\n        C2 c2; // < \"C2\" C2 ref\n```",
+        "name": "c2",
+        "refs": [
+          {
+            "column": 11,
+            "length": 2,
+            "row": 75
+          },
+          {
+            "column": 17,
+            "length": 2,
+            "row": 81
+          }
+        ]
+      },
+      {
+        "def": {
+          "column": 15,
+          "length": 2,
+          "row": 97
+        },
+        "hover": "```java\n    void m4(C2 c2) {\n```",
+        "name": "c2",
+        "refs": [
+          {
+            "column": 15,
+            "length": 2,
+            "row": 97
+          },
+          {
+            "column": 16,
+            "length": 2,
+            "row": 99
+          }
+        ]
+      },
+      {
+        "def": {
+          "column": 33,
+          "length": 1,
+          "row": 65
+        },
+        "hover": "```java\n        try { } catch (Exception e) { Exception e2 = e; }\n```\n\n---\n\nv e def\nv e ref\n",
+        "name": "e",
+        "refs": [
+          {
+            "column": 33,
+            "length": 1,
+            "row": 65
+          },
+          {
+            "column": 53,
+            "length": 1,
+            "row": 65
+          }
+        ]
+      },
+      {
+        "def": {
+          "column": 48,
+          "length": 2,
+          "row": 65
+        },
+        "hover": "```java\n        try { } catch (Exception e) { Exception e2 = e; }\n```\n\n---\n\nv e def\nv e ref\n",
+        "name": "e2",
+        "refs": [
+          {
+            "column": 48,
+            "length": 2,
+            "row": 65
+          }
+        ]
+      },
+      {
+        "def": {
+          "column": 12,
+          "length": 2,
+          "row": 81
+        },
+        "hover": "```java\n        int f1 = c2.f2;\n```\n\n---\n\nvv f2 ref\n",
+        "name": "f1",
+        "refs": [
+          {
+            "column": 38,
+            "length": 2,
+            "row": 37
+          },
+          {
+            "column": 31,
+            "length": 2,
+            "row": 46
+          },
+          {
+            "column": 12,
+            "length": 2,
+            "row": 81
+          },
+          {
+            "column": 39,
+            "length": 2,
+            "row": 89
+          }
+        ]
+      },
+      {
+        "def": {
+          "column": 17,
+          "length": 1,
+          "row": 69
+        },
+        "hover": "```java\n        for (int i = 0; i < 5; i++) { }\n```\n\n---\n\nv for.i def\nv for.i ref\n",
+        "name": "i",
+        "refs": [
+          {
+            "column": 17,
+            "length": 1,
+            "row": 69
+          },
+          {
+            "column": 24,
+            "length": 1,
+            "row": 69
+          },
+          {
+            "column": 31,
+            "length": 1,
+            "row": 69
+          }
+        ]
+      },
+      {
+        "def": {
+          "column": 17,
+          "length": 1,
+          "row": 73
+        },
+        "hover": "```java\n        for (int i : p2) { p1 = i; }\n```\n\n---\n\nv enhanced_for.i def\nv enhanced_for.i ref\n",
+        "name": "i",
+        "refs": [
+          {
+            "column": 17,
+            "length": 1,
+            "row": 73
+          },
+          {
+            "column": 32,
+            "length": 1,
+            "row": 73
+          }
+        ]
+      },
+      {
+        "def": {
+          "column": 12,
+          "length": 2,
+          "row": 25
+        },
+        "hover": "```java\n        int l1;\n```\n\n---\n\nvv l1 def\n",
+        "name": "l1",
+        "refs": [
+          {
+            "column": 12,
+            "length": 2,
+            "row": 25
+          },
+          {
+            "column": 8,
+            "length": 2,
+            "row": 37
+          },
+          {
+            "column": 23,
+            "length": 2,
+            "row": 37
+          },
+          {
+            "column": 8,
+            "length": 2,
+            "row": 46
+          }
+        ]
+      },
+      {
+        "def": {
+          "column": 12,
+          "length": 2,
+          "row": 29
+        },
+        "hover": "```java\n        int l2, l3 = 0;\n```\n\n---\n\nvv l2 def\nvv l3 def\n",
+        "name": "l2",
+        "refs": [
+          {
+            "column": 12,
+            "length": 2,
+            "row": 29
+          },
+          {
+            "column": 28,
+            "length": 2,
+            "row": 37
+          },
+          {
+            "column": 11,
+            "length": 2,
+            "row": 61
+          }
+        ]
+      },
+      {
+        "def": {
+          "column": 16,
+          "length": 2,
+          "row": 29
+        },
+        "hover": "```java\n        int l2, l3 = 0;\n```\n\n---\n\nvv l2 def\nvv l3 def\n",
+        "name": "l3",
+        "refs": [
+          {
+            "column": 16,
+            "length": 2,
+            "row": 29
+          },
+          {
+            "column": 33,
+            "length": 2,
+            "row": 37
+          }
+        ]
+      },
+      {
+        "def": {
+          "column": 24,
+          "length": 1,
+          "row": 54
+        },
+        "hover": "```java\n        numbers.forEach(n -> System.out.println(n));\n```\n\n---\n\nv m1.n def\nv m1.n ref\n",
+        "name": "n",
+        "refs": [
+          {
+            "column": 24,
+            "length": 1,
+            "row": 54
+          },
+          {
+            "column": 48,
+            "length": 1,
+            "row": 54
+          }
+        ]
+      },
+      {
+        "def": {
+          "column": 27,
+          "length": 7,
+          "row": 48
+        },
+        "hover": "```java\n        ArrayList<Integer> numbers = new ArrayList<Integer>();\n```",
+        "name": "numbers",
+        "refs": [
+          {
+            "column": 27,
+            "length": 7,
+            "row": 48
+          },
+          {
+            "column": 8,
+            "length": 7,
+            "row": 49
+          },
+          {
+            "column": 8,
+            "length": 7,
+            "row": 50
+          },
+          {
+            "column": 8,
+            "length": 7,
+            "row": 54
+          },
+          {
+            "column": 8,
+            "length": 7,
+            "row": 57
+          }
+        ]
+      },
+      {
+        "def": {
+          "column": 11,
+          "length": 2,
+          "row": 9
+        },
+        "hover": "```java\n    C1(int p1) {\n```\n\n---\n\nvv constructor.p1 def\n",
+        "name": "p1",
+        "refs": [
+          {
+            "column": 11,
+            "length": 2,
+            "row": 9
+          },
+          {
+            "column": 13,
+            "length": 2,
+            "row": 11
+          }
+        ]
+      },
+      {
+        "def": {
+          "column": 16,
+          "length": 2,
+          "row": 22
+        },
+        "hover": "```java\n    void m1(int p1, int ...p2) {\n```\n\n---\n\nvv m1 def\nvv p1 def\nvv p2 def\n",
+        "name": "p1",
+        "refs": [
+          {
+            "column": 16,
+            "length": 2,
+            "row": 22
+          },
+          {
+            "column": 13,
+            "length": 2,
+            "row": 37
+          },
+          {
+            "column": 27,
+            "length": 2,
+            "row": 73
+          },
+          {
+            "column": 8,
+            "length": 2,
+            "row": 89
+          }
+        ]
+      },
+      {
+        "def": {
+          "column": 17,
+          "length": 1,
+          "row": 61
+        },
+        "hover": "```java\n        L2 l2 = (x, y) -> y;\n```\n\n---\n\nv l2.y def\nv l2.y ref\n",
+        "name": "x",
+        "refs": [
+          {
+            "column": 17,
+            "length": 1,
+            "row": 61
+          }
+        ]
+      },
+      {
+        "def": {
+          "column": 22,
+          "length": 1,
+          "row": 113
+        },
+        "hover": "```java\n    public int l2(int x, int y);\n```",
+        "name": "x",
+        "refs": [
+          {
+            "column": 22,
+            "length": 1,
+            "row": 113
+          }
+        ]
+      },
+      {
+        "def": {
+          "column": 20,
+          "length": 1,
+          "row": 61
+        },
+        "hover": "```java\n        L2 l2 = (x, y) -> y;\n```\n\n---\n\nv l2.y def\nv l2.y ref\n",
+        "name": "y",
+        "refs": [
+          {
+            "column": 20,
+            "length": 1,
+            "row": 61
+          },
+          {
+            "column": 26,
+            "length": 1,
+            "row": 61
+          }
+        ]
+      },
+      {
+        "def": {
+          "column": 29,
+          "length": 1,
+          "row": 113
+        },
+        "hover": "```java\n    public int l2(int x, int y);\n```",
+        "name": "y",
+        "refs": [
+          {
+            "column": 29,
+            "length": 1,
+            "row": 113
+          }
+        ]
+      }
+    ]
+  },
+  "request": {
+    "repo_commit_path": {
+      "commit": "5abdba2559d350afdf6b4dcbf32f5edaadcbdda1",
+      "path": "java1/src/sub/Sample.java",
+      "repo": "test/symbols-fixture"
+    }
+  },
+  "rpc": "local_code_intel",
+  "service": "symbols"
+}

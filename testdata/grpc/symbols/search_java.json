@@ -1,0 +1,53 @@
+{
+  "expected": {
+    "error": null,
+    "limit_hit": false,
+    "symbols": [
+      {
+        "character": 10,
+        "file_limited": false,
+        "kind": "class",
+        "language": "Java",
+        "line": 103,
+        "name": "C2",
+        "parent": "C1",
+        "parent_kind": "class",
+        "path": "java1/src/sub/Sample.java",
+        "signature": ""
+      },
+      {
+        "character": 10,
+        "file_limited": false,
+        "kind": "classes",
+        "language": "Java",
+        "line": 103,
+        "name": "C2",
+        "parent": "",
+        "parent_kind": "",
+        "path": "java1/src/sub/Sample.java",
+        "signature": ""
+      },
+      {
+        "character": 6,
+        "file_limited": false,
+        "kind": "class",
+        "language": "python",
+        "line": 71,
+        "name": "C2",
+        "parent": "",
+        "parent_kind": "",
+        "path": "python/example.py",
+        "signature": ""
+      }
+    ]
+  },
+  "request": {
+    "commit_id": "5abdba2559d350afdf6b4dcbf32f5edaadcbdda1",
+    "first": 50,
+    "is_case_sensitive": true,
+    "query": "^C2$",
+    "repo": "test/symbols-fixture"
+  },
+  "rpc": "search",
+  "service": "symbols"
+}

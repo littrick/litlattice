@@ -1,0 +1,32 @@
+{
+  "expected": {
+    "result": {
+      "definition": {
+        "range": {
+          "column": 11,
+          "length": 2,
+          "row": 108
+        },
+        "repo_commit_path": {
+          "commit": "5abdba2559d350afdf6b4dcbf32f5edaadcbdda1",
+          "path": "java1/src/sub/Sample.java",
+          "repo": "test/symbols-fixture"
+        }
+      },
+      "hover": "```java\n        C3 m2() { }\n```\n\n---\n\nvv C2.m2 def\n"
+    }
+  },
+  "request": {
+    "point": {
+      "column": 24,
+      "row": 89
+    },
+    "repo_commit_path": {
+      "commit": "5abdba2559d350afdf6b4dcbf32f5edaadcbdda1",
+      "path": "java1/src/sub/Sample.java",
+      "repo": "test/symbols-fixture"
+    }
+  },
+  "rpc": "symbol_info",
+  "service": "symbols"
+}
