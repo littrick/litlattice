@@ -1,9 +1,13 @@
 //! Ports of the baseline squirrel tests:
 //! `local_code_intel_test.go`, `hover_test.go` and `service_test.go`.
 
-use regex::Regex;
-use sg_service_symbols::squirrel::{self, FileSource, RepoCommitPath, Service};
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+
+use regex::Regex;
+use sg_service_symbols::squirrel::{
+    self, FileSource, FoundSymbol, Point, RepoCommitPath, Service, SymbolInfo, SymbolSource,
+};
 
 /// In-memory `readFile`.
 struct MemFiles {
@@ -253,6 +257,225 @@ fn local_code_intel_hovers_include_preceding_comments() {
                 .collect::<Vec<_>>()
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Cross-file definition tests (`service_test.go`)
+// ---------------------------------------------------------------------------
+
+struct TestReposFiles {
+    root: PathBuf,
+}
+
+impl FileSource for TestReposFiles {
+    fn read_file(&self, path: &RepoCommitPath) -> Result<Vec<u8>, String> {
+        std::fs::read(self.root.join(&path.repo).join(&path.path))
+            .map_err(|err| format!("read {}/{}: {err}", path.repo, path.path))
+    }
+}
+
+struct TestSymbols {
+    symbols: Vec<FoundSymbol>,
+}
+
+impl SymbolSource for TestSymbols {
+    fn search_symbols(
+        &self,
+        _repo: &str,
+        _commit: &str,
+        include: &[String],
+        ident: &str,
+    ) -> Result<Vec<FoundSymbol>, String> {
+        let query = Regex::new(&format!("^{ident}$")).map_err(|err| err.to_string())?;
+        let includes = include
+            .iter()
+            .map(|pattern| Regex::new(pattern).map_err(|err| err.to_string()))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(self
+            .symbols
+            .iter()
+            .filter(|symbol| includes.iter().all(|re| re.is_match(&symbol.path)))
+            .filter(|symbol| query.is_match(&symbol.name))
+            .cloned()
+            .collect())
+    }
+}
+
+fn test_repos_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/test_repos")
+}
+
+fn walk_files(root: &Path, into: &mut Vec<PathBuf>) {
+    let mut entries: Vec<PathBuf> = std::fs::read_dir(root)
+        .expect("read test_repos")
+        .map(|entry| entry.expect("dir entry").path())
+        .collect();
+    entries.sort();
+    for entry in entries {
+        if entry.is_dir() {
+            walk_files(&entry, into);
+        } else {
+            into.push(entry);
+        }
+    }
+}
+
+#[test]
+fn non_local_definitions_match_the_baseline() {
+    let root = test_repos_root();
+    let mut repos: Vec<PathBuf> = std::fs::read_dir(&root)
+        .expect("read test_repos")
+        .filter_map(|entry| {
+            let path = entry.expect("dir entry").path();
+            path.is_dir().then_some(path)
+        })
+        .collect();
+    repos.sort();
+
+    let files = TestReposFiles { root: root.clone() };
+
+    let mut annotations = Vec::new();
+    let mut all_symbols = Vec::new();
+    // Collect annotations and top-level symbols in the baseline's walk order.
+    let probe = Service::new(&files, None);
+    for repo_dir in &repos {
+        let repo = repo_dir
+            .file_name()
+            .expect("repo name")
+            .to_string_lossy()
+            .into_owned();
+        let mut paths = Vec::new();
+        walk_files(repo_dir, &mut paths);
+        for path in paths {
+            let relative = path
+                .strip_prefix(repo_dir)
+                .expect("relative path")
+                .to_string_lossy()
+                .into_owned();
+            let rcp = RepoCommitPath {
+                repo: repo.clone(),
+                commit: "abc".to_owned(),
+                path: relative.clone(),
+            };
+            let contents = std::fs::read_to_string(&path).expect("read fixture");
+            annotations.extend(collect_annotations(&rcp, &contents));
+            let symbols = probe
+                .top_level_symbols(rcp)
+                .unwrap_or_else(|err| panic!("getSymbols {repo}/{relative}: {err}"));
+            all_symbols.extend(symbols);
+        }
+    }
+
+    let symbols = TestSymbols {
+        symbols: all_symbols,
+    };
+    let service = Service::new(&files, Some(&symbols));
+
+    // Group by symbol and tag.
+    let mut grouped: HashMap<String, HashMap<String, Vec<Ann>>> = HashMap::new();
+    for ann in &annotations {
+        let by_tag = grouped.entry(ann.symbol.clone()).or_default();
+        for tag in &ann.tags {
+            by_tag.entry(tag.clone()).or_default().push(ann.clone());
+        }
+    }
+
+    let solo = annotations
+        .iter()
+        .find(|ann| ann.tags.iter().any(|tag| tag == "solo"))
+        .map(|ann| ann.symbol.clone());
+
+    let mut symbols: Vec<String> = grouped.keys().cloned().collect();
+    symbols.sort();
+
+    let mut tests = 0usize;
+    for symbol in &symbols {
+        if let Some(solo) = &solo {
+            if symbol != solo {
+                continue;
+            }
+        }
+        let tags = &grouped[symbol];
+        if !tags.contains_key("def") && tags.contains_key("path") {
+            continue;
+        }
+
+        let def = tags.get("def").and_then(|defs| {
+            assert_eq!(defs.len(), 1, "multiple definitions for symbol {symbol}");
+            defs.first()
+        });
+
+        for reference in tags.get("ref").into_iter().flatten() {
+            let info = symbol_info(&service, reference)
+                .unwrap_or_else(|err| panic!("symbolInfo {}: {err}", reference.symbol));
+
+            if reference.tags.iter().any(|tag| tag == "nodef") {
+                assert!(
+                    info.is_none(),
+                    "unexpected definition for {}",
+                    reference.symbol
+                );
+                tests += 1;
+                continue;
+            }
+
+            let info = info.unwrap_or_else(|| panic!("no symbolInfo for symbol {symbol}"));
+            let def = def.unwrap_or_else(|| panic!("no \"def\" for symbol {symbol:?}"));
+            let range = info
+                .definition
+                .range
+                .unwrap_or_else(|| panic!("no definition range for symbol {symbol}"));
+            assert_eq!(
+                (
+                    info.definition.repo_commit_path.repo.as_str(),
+                    info.definition.repo_commit_path.path.as_str(),
+                    range.row,
+                    range.column
+                ),
+                (def.repo.as_str(), def.path.as_str(), def.row, def.column),
+                "wrong symbolInfo for {symbol:?}"
+            );
+            tests += 1;
+        }
+    }
+
+    // Also test path definitions.
+    for ann in &annotations {
+        if let Some(solo) = &solo {
+            if ann.symbol != *solo {
+                continue;
+            }
+        }
+        if !ann.tags.iter().any(|tag| tag == "path") {
+            continue;
+        }
+        let info = symbol_info(&service, ann)
+            .unwrap_or_else(|err| panic!("symbolInfo path {}: {err}", ann.symbol))
+            .unwrap_or_else(|| panic!("no symbolInfo for path {}", ann.symbol));
+        assert!(
+            info.definition.range.is_none(),
+            "symbolInfo returned a range for {}",
+            ann.symbol
+        );
+        assert_eq!(info.definition.repo_commit_path.path, ann.symbol);
+        tests += 1;
+    }
+
+    assert!(tests > 0, "expected at least one definition test");
+}
+
+fn symbol_info(service: &Service<'_>, ann: &Ann) -> Result<Option<SymbolInfo>, squirrel::Error> {
+    service.symbol_info(
+        RepoCommitPath {
+            repo: ann.repo.clone(),
+            commit: ann.commit.clone(),
+            path: ann.path.clone(),
+        },
+        Point {
+            row: ann.row,
+            column: ann.column,
+        },
+    )
 }
 
 const JAVA_HOVER: &str = r#"

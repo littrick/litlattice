@@ -232,9 +232,33 @@ impl pb::symbols_service_server::SymbolsService for SymbolsGrpc {
 
     async fn symbol_info(
         &self,
-        _request: GrpcRequest<pb::SymbolInfoRequest>,
+        request: GrpcRequest<pb::SymbolInfoRequest>,
     ) -> Result<GrpcResponse<pb::SymbolInfoResponse>, Status> {
-        Err(Status::unimplemented("symbol info is not implemented yet"))
+        let request = request.into_inner();
+        let path = internal_repo_commit_path(request.repo_commit_path);
+        let point = request
+            .point
+            .map(|point| squirrel::Point {
+                row: point.row.max(0) as u32,
+                column: point.column.max(0) as u32,
+            })
+            .unwrap_or_default();
+        let files = BlockingFileSource {
+            gitserver: Arc::clone(&self.gitserver),
+        };
+        let symbols = SqliteSymbolSource {
+            engine: Arc::clone(&self.engine),
+        };
+
+        let info = tokio::task::spawn_blocking(move || {
+            let service = squirrel::Service::new(&files, Some(&symbols));
+            service.symbol_info(path, point)
+        })
+        .await
+        .map_err(|err| Status::unknown(format!("symbol info task failed: {err}")))?
+        .map_err(squirrel_status)?;
+
+        Ok(GrpcResponse::new(convert_symbol_info(info)))
     }
 
     async fn healthz(
@@ -276,6 +300,46 @@ impl squirrel::FileSource for BlockingFileSource {
     }
 }
 
+/// `squirrel.symbolSearch` backed by the SQLite index, with the baseline's
+/// `symbolSearchOne` parameters: anchored regex, case-sensitive, first=1.
+struct SqliteSymbolSource {
+    engine: Arc<SearchEngine>,
+}
+
+impl squirrel::SymbolSource for SqliteSymbolSource {
+    fn search_symbols(
+        &self,
+        repo: &str,
+        commit: &str,
+        include: &[String],
+        ident: &str,
+    ) -> Result<Vec<squirrel::FoundSymbol>, String> {
+        let params = search::Params {
+            repo: repo.to_owned(),
+            commit: commit.to_owned(),
+            query: format!("^{ident}$"),
+            is_case_sensitive: true,
+            include_patterns: include.to_vec(),
+            exclude_pattern: String::new(),
+            first: 1,
+            timeout: None,
+            include_langs: Vec::new(),
+            exclude_langs: Vec::new(),
+        };
+        let outcome = tokio::runtime::Handle::current().block_on(self.engine.search(&params))?;
+        Ok(outcome
+            .symbols
+            .into_iter()
+            .map(|symbol| squirrel::FoundSymbol {
+                name: symbol.name,
+                path: symbol.path,
+                line: symbol.line.max(0) as u32,
+                character: symbol.character.max(0) as u32,
+            })
+            .collect())
+    }
+}
+
 fn internal_repo_commit_path(path: Option<pb::RepoCommitPath>) -> squirrel::RepoCommitPath {
     path.map(|path| squirrel::RepoCommitPath {
         repo: path.repo,
@@ -299,6 +363,26 @@ fn convert_local_symbol(symbol: squirrel::Symbol) -> pb::local_code_intel_respon
         hover: symbol.hover,
         def: Some(convert_range(symbol.def)),
         refs: symbol.refs.into_iter().map(convert_range).collect(),
+    }
+}
+
+fn convert_symbol_info(info: Option<squirrel::SymbolInfo>) -> pb::SymbolInfoResponse {
+    let Some(info) = info else {
+        return pb::SymbolInfoResponse { result: None };
+    };
+    let definition = info.definition;
+    pb::SymbolInfoResponse {
+        result: Some(pb::symbol_info_response::DefinitionResult {
+            definition: Some(pb::symbol_info_response::Definition {
+                repo_commit_path: Some(pb::RepoCommitPath {
+                    repo: definition.repo_commit_path.repo,
+                    commit: definition.repo_commit_path.commit,
+                    path: definition.repo_commit_path.path,
+                }),
+                range: definition.range.map(convert_range),
+            }),
+            hover: info.hover,
+        }),
     }
 }
 
