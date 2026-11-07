@@ -44,6 +44,7 @@ flate2 = "1"
 http = "1"
 http-body-util = "0.1"
 percent-encoding = "2"
+rustix = { version = "1", features = ["fs"] }
 hyper = { version = "1", features = ["server", "client", "http1", "http2"] }
 hyper-util = { version = "0.1", features = ["server-auto", "server-graceful", "tokio"] }
 tower = { version = "0.5", features = ["util"] }

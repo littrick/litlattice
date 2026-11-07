@@ -1,0 +1,12 @@
+{
+  "expected": {
+    "free_space_le_total": true,
+    "free_space_positive": true,
+    "percent_used_matches_formula": true,
+    "percent_used_rounded": 50,
+    "total_space": 2013991550976
+  },
+  "request": {},
+  "rpc": "disk_info",
+  "service": "gitserver"
+}

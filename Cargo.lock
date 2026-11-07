@@ -1244,6 +1244,7 @@ dependencies = [
  "percent-encoding",
  "prost",
  "prost-types",
+ "rustix",
  "sg-core",
  "sg-http",
  "sg-metrics",

@@ -3,8 +3,8 @@
 //! Implemented so far: `Archive`, `ReadFile`, `ChangedFiles`, `ResolveRevision`,
 //! `GetObject`, `DefaultBranch`, `MergeBase`, `MergeBaseOctopus`, `Stat`,
 //! `ReadDir`, `ListRefs`, `GetCommit`, `RevAtTime`, `RawDiff`, `CommitLog`,
-//! `ContributorCounts`, `FirstEverCommit`, `BehindAhead` and `Blame` (M9.2).
-//! Every other RPC returns `UNIMPLEMENTED`.
+//! `ContributorCounts`, `FirstEverCommit`, `BehindAhead`, `Blame` and
+//! `DiskInfo` (M9.2). Every other RPC returns `UNIMPLEMENTED`.
 
 use std::pin::Pin;
 use std::sync::Arc;
@@ -16,6 +16,7 @@ use tonic::{Request as GrpcRequest, Response as GrpcResponse, Status};
 
 use sg_proto::gitserver as gpb;
 
+use crate::disk::disk_usage;
 use crate::git::{
     pump_blame, pump_commit_log, pump_stdout, BlameHunk, BlameRange, CommitLogOptions,
     CommitLogOrder, GitCommit, GitError, GitRef, GitRepo, RawDiffComparison, RefType, TreeEntry,
@@ -296,13 +297,6 @@ impl gpb::gitserver_service_server::GitserverService for Grpc {
         _request: GrpcRequest<tonic::Streaming<gpb::CreateCommitFromPatchBinaryRequest>>,
     ) -> Result<GrpcResponse<gpb::CreateCommitFromPatchBinaryResponse>, Status> {
         Err(unimplemented("create_commit_from_patch_binary"))
-    }
-
-    async fn disk_info(
-        &self,
-        _request: GrpcRequest<gpb::DiskInfoRequest>,
-    ) -> Result<GrpcResponse<gpb::DiskInfoResponse>, Status> {
-        Err(unimplemented("disk_info"))
     }
 
     async fn get_object(
@@ -860,6 +854,20 @@ impl gpb::gitserver_service_server::GitserverService for Grpc {
         Ok(GrpcResponse::new(gpb::BehindAheadResponse {
             behind: behind_ahead.behind,
             ahead: behind_ahead.ahead,
+        }))
+    }
+
+    async fn disk_info(
+        &self,
+        _request: GrpcRequest<gpb::DiskInfoRequest>,
+    ) -> Result<GrpcResponse<gpb::DiskInfoResponse>, Status> {
+        let usage = disk_usage(&self.repos_dir).map_err(|err| {
+            Status::unknown(format!("statfs {}: {err}", self.repos_dir.display()))
+        })?;
+        Ok(GrpcResponse::new(gpb::DiskInfoResponse {
+            total_space: usage.total_space,
+            free_space: usage.free_space,
+            percent_used: usage.percent_used,
         }))
     }
 

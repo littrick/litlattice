@@ -19,6 +19,7 @@ use sg_core::{ConfigError, EnvReader, Service, ServiceContext, ServiceError};
 use sg_proto::gitserver as gpb;
 
 pub mod config;
+pub mod disk;
 pub mod git;
 pub mod gitservice;
 pub mod grpc;

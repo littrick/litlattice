@@ -247,6 +247,7 @@ enum GitserverRpc {
     FirstEverCommit,
     BehindAhead,
     Blame,
+    DiskInfo,
 }
 
 impl GitserverRpc {
@@ -271,12 +272,13 @@ impl GitserverRpc {
             "first_ever_commit" => Ok(Self::FirstEverCommit),
             "behind_ahead" => Ok(Self::BehindAhead),
             "blame" => Ok(Self::Blame),
+            "disk_info" => Ok(Self::DiskInfo),
             other => Err(format!(
                 "unknown gitserver rpc {other:?} (archive, read_file, changed_files, \
                  resolve_revision, get_object, default_branch, merge_base, stat, read_dir, \
                  list_refs, get_commit, rev_at_time, raw_diff, commit_log, \
                  merge_base_octopus, contributor_counts, first_ever_commit, behind_ahead, \
-                 blame)"
+                 blame, disk_info)"
             )),
         }
     }
@@ -1112,6 +1114,11 @@ fn gitserver_behind_ahead_request(value: &Value) -> Result<gpb::BehindAheadReque
     })
 }
 
+/// `DiskInfoRequest` has no fields.
+fn gitserver_disk_info_request(_value: &Value) -> Result<gpb::DiskInfoRequest, String> {
+    Ok(gpb::DiskInfoRequest {})
+}
+
 fn gitserver_blame_request(value: &Value) -> Result<gpb::BlameRequest, String> {
     let range = match value.get("range") {
         None | Some(Value::Null) => None,
@@ -1264,6 +1271,27 @@ fn normalize_raw_diff(chunks: &[gpb::RawDiffResponse]) -> Value {
     json!({
         "diff": String::from_utf8_lossy(&data),
         "size_bytes": data.len(),
+    })
+}
+
+/// `DiskInfo` reads the live filesystem, so only the volume size is compared
+/// exactly; the free/used split moves with unrelated writes, so it is frozen
+/// as invariants plus a whole-percent value (Go and Rust both compute it from
+/// the same `statfs` fields in `float32`).
+fn normalize_disk_info(response: &gpb::DiskInfoResponse) -> Value {
+    let total = response.total_space;
+    let free = response.free_space;
+    let expected = if total > 0 {
+        (total - free) as f64 / total as f64 * 100.0
+    } else {
+        0.0
+    };
+    json!({
+        "total_space": total,
+        "free_space_positive": free > 0,
+        "free_space_le_total": free <= total,
+        "percent_used_rounded": f64::from(response.percent_used).round() as i64,
+        "percent_used_matches_formula": (f64::from(response.percent_used) - expected).abs() < 0.05,
     })
 }
 
@@ -1622,6 +1650,13 @@ async fn call_gitserver(
                 messages.push(message);
             }
             Ok(normalize_blame(&messages))
+        }
+        GitserverRpc::DiskInfo => {
+            let response = client
+                .disk_info(gitserver_disk_info_request(request).map_err(GitserverFailure::Fixture)?)
+                .await?
+                .into_inner();
+            Ok(normalize_disk_info(&response))
         }
         GitserverRpc::ChangedFiles => {
             let mut stream = client
@@ -2126,5 +2161,8 @@ mod tests {
         assert!(request.path.is_empty());
         assert!(!request.ignore_whitespace);
         assert!(request.range.is_none());
+
+        let request = gitserver_disk_info_request(&json!({})).expect("disk_info request");
+        assert_eq!(request, gpb::DiskInfoRequest {});
     }
 }
