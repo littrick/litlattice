@@ -75,6 +75,57 @@ pub struct TreeEntry {
     pub submodule: Option<Submodule>,
 }
 
+/// `for-each-ref` field order used by `ListRefs`.
+const FOR_EACH_REF_FORMAT: &str = "%(objecttype)%00%(HEAD)%00%(refname)%00%(refname:short)%00\
+     %(objectname)%00%(*objectname)%00%(creatordate:unix)";
+
+/// `logFormatWithoutRefs`: record separator, then ten NUL-separated fields.
+const LOG_FORMAT_WITHOUT_REFS: &str = "--format=format:%x1e%H%x00%aN%x00%aE%x00%at%x00%cN%x00\
+     %cE%x00%ct%x00%B%x00%P%x00";
+
+/// Go `time.Time{}` as a proto timestamp (year 1).
+pub const ZERO_TIMESTAMP_SECONDS: i64 = -62_135_596_800;
+
+/// `proto.GitRef.RefType` without the proto dependency.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefType {
+    Unspecified,
+    Branch,
+    Tag,
+}
+
+/// One ref, already mapped to `proto.GitRef`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitRef {
+    pub ref_name: Vec<u8>,
+    pub short_ref_name: Vec<u8>,
+    pub target_commit: String,
+    pub ref_oid: String,
+    /// Unix seconds; `ZERO_TIMESTAMP_SECONDS` for the Go zero time.
+    pub created_at_seconds: i64,
+    pub ref_type: RefType,
+    pub is_head: bool,
+}
+
+/// A commit signature (`proto.GitSignature`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Signature {
+    pub name: Vec<u8>,
+    pub email: Vec<u8>,
+    pub date_seconds: i64,
+}
+
+/// A commit plus the files it modified (`proto.GitCommit`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitCommit {
+    pub oid: String,
+    pub author: Signature,
+    pub committer: Signature,
+    pub message: Vec<u8>,
+    pub parents: Vec<String>,
+    pub modified_files: Vec<Vec<u8>>,
+}
+
 impl GitRepo {
     pub fn new(git_dir: impl Into<PathBuf>) -> Self {
         Self {
@@ -493,6 +544,111 @@ impl GitRepo {
         }
         Ok(parse_gitmodules(&output.stdout))
     }
+
+    /// Baseline `ListRefs`: `for-each-ref` with the same sort keys, format and
+    /// filters. Output order is git's and is preserved.
+    pub async fn list_refs(
+        &self,
+        heads_only: bool,
+        tags_only: bool,
+        points_at_commit: &[String],
+        contains_sha: Option<&str>,
+    ) -> Result<Vec<GitRef>, GitError> {
+        let mut args: Vec<OsString> = vec![
+            "for-each-ref".into(),
+            "--sort".into(),
+            "-refname".into(),
+            "--sort".into(),
+            "-creatordate".into(),
+            "--sort".into(),
+            "-HEAD".into(),
+            "--format".into(),
+            FOR_EACH_REF_FORMAT.into(),
+        ];
+        for commit in points_at_commit {
+            args.push(format!("--points-at={commit}").into());
+        }
+        if let Some(contains) = contains_sha.filter(|contains| !contains.is_empty()) {
+            args.push(format!("--contains={contains}").into());
+        }
+        // The `--` separator is added once, before the first pattern.
+        let mut added_separator = false;
+        if heads_only {
+            added_separator = true;
+            args.push("--".into());
+            args.push("refs/heads/".into());
+        }
+        if tags_only {
+            if !added_separator {
+                args.push("--".into());
+            }
+            args.push("refs/tags/".into());
+        }
+
+        let output = self.output(&args).await?;
+        if !output.status.success() {
+            return Err(GitError::Message(format!(
+                "git for-each-ref: {}",
+                String::from_utf8_lossy(&output.stderr).trim_end()
+            )));
+        }
+        parse_refs(&output.stdout)
+    }
+
+    /// Baseline `revParse` used by `GetCommit`: resolve to an absolute revision
+    /// or report `RevisionNotFound`.
+    async fn rev_parse_commit(&self, spec: &str) -> Result<String, GitError> {
+        let sha = self.rev_parse(spec).await?;
+        if !is_absolute_revision(&sha) {
+            if sha == "HEAD" {
+                // Empty repository: `rev-parse` echoes the unresolved name.
+                return Err(GitError::RevisionNotFound(spec.to_owned()));
+            }
+            return Err(GitError::Message(format!(
+                "bad commit {sha:?} for revision {spec:?}"
+            )));
+        }
+        Ok(sha)
+    }
+
+    /// Baseline `GetCommit`: `git log -n 1` with the NUL-separated format.
+    pub async fn get_commit(
+        &self,
+        commit: &str,
+        include_modified_files: bool,
+    ) -> Result<GitCommit, GitError> {
+        check_spec_arg_safety(commit)?;
+        let commit_id = self.rev_parse_commit(commit).await?;
+
+        let mut args: Vec<OsString> = vec![
+            "log".into(),
+            LOG_FORMAT_WITHOUT_REFS.into(),
+            "-n".into(),
+            "1".into(),
+        ];
+        if include_modified_files {
+            args.push("--name-only".into());
+        }
+        args.push(commit_id.into());
+
+        let output = self.output(&args).await?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            // `rev-parse` accepted the object but `log` cannot walk it (for
+            // example a tree ID): the baseline reports this as a missing
+            // revision.
+            if output.status.code() == Some(128)
+                && (stderr.contains("fatal: bad object") || stderr.contains("fatal: bad revision"))
+            {
+                return Err(GitError::RevisionNotFound(commit.to_owned()));
+            }
+            return Err(GitError::Message(format!(
+                "git log {commit}: {}",
+                stderr.trim_end()
+            )));
+        }
+        parse_commit_log(&output.stdout)
+    }
 }
 
 fn decode_hex(text: &str) -> Option<Vec<u8>> {
@@ -789,6 +945,128 @@ fn parse_config_value(raw: &[u8]) -> String {
         }
     }
     String::from_utf8_lossy(trim_ascii(&value)).into_owned()
+}
+
+/// Baseline `refTypeForString`: annotated tags are `tag`; commits are tags when
+/// the ref lives under `refs/tags/` (lightweight tags) and branches otherwise.
+fn ref_type_for(object_type: &str, ref_name: &[u8]) -> RefType {
+    match object_type {
+        "tag" => RefType::Tag,
+        "commit" => {
+            if ref_name.starts_with(b"refs/tags/") {
+                RefType::Tag
+            } else {
+                RefType::Branch
+            }
+        }
+        _ => RefType::Unspecified,
+    }
+}
+
+/// Parse newline-separated `for-each-ref` records of seven NUL-separated
+/// fields: objecttype, HEAD marker, refname, short refname, objectname,
+/// dereferenced objectname, creator date.
+fn parse_refs(output: &[u8]) -> Result<Vec<GitRef>, GitError> {
+    let mut refs = Vec::new();
+    for line in output.split(|byte| *byte == b'\n') {
+        if line.is_empty() {
+            continue;
+        }
+        let parts: Vec<&[u8]> = line.split(|byte| *byte == 0).collect();
+        if parts.len() != 7 {
+            return Err(GitError::Message(format!(
+                "unexpected output from git for-each-ref {:?}",
+                String::from_utf8_lossy(line)
+            )));
+        }
+        let object_type = String::from_utf8_lossy(parts[0]).into_owned();
+        // Only tags dereference to a target object; for everything else the
+        // target commit equals the ref's own object ID.
+        let target_commit = if object_type == "tag" {
+            String::from_utf8_lossy(parts[5]).into_owned()
+        } else {
+            String::from_utf8_lossy(parts[4]).into_owned()
+        };
+        let created_at_seconds = if parts[6].is_empty() {
+            ZERO_TIMESTAMP_SECONDS
+        } else {
+            let text = String::from_utf8_lossy(parts[6]);
+            text.parse::<i64>().map_err(|_| {
+                GitError::Message(format!(
+                    "unexpected output from git for-each-ref (bad date format) {:?}",
+                    String::from_utf8_lossy(line)
+                ))
+            })?
+        };
+        refs.push(GitRef {
+            ref_name: parts[2].to_vec(),
+            short_ref_name: parts[3].to_vec(),
+            target_commit,
+            ref_oid: String::from_utf8_lossy(parts[4]).into_owned(),
+            created_at_seconds,
+            ref_type: ref_type_for(&object_type, parts[2]),
+            is_head: parts[1] == b"*",
+        });
+    }
+    Ok(refs)
+}
+
+/// Parse the single commit emitted by `LOG_FORMAT_WITHOUT_REFS`.
+fn parse_commit_log(output: &[u8]) -> Result<GitCommit, GitError> {
+    let output = output.strip_prefix(b"\x1e").unwrap_or(output);
+    let parts: Vec<&[u8]> = output.split(|byte| *byte == 0).collect();
+    if parts.len() != 10 {
+        return Err(GitError::Message(format!(
+            "internal error: expected 10 parts, got {}",
+            parts.len()
+        )));
+    }
+    // `git log` separates commits with a newline, which lands at the start of
+    // the first field for every commit but the first.
+    let oid = String::from_utf8_lossy(parts[0].strip_prefix(b"\n").unwrap_or(parts[0]))
+        .trim()
+        .to_owned();
+    let parse_time = |bytes: &[u8], what: &str| -> Result<i64, GitError> {
+        String::from_utf8_lossy(bytes)
+            .parse::<i64>()
+            .map_err(|err| GitError::Message(format!("parsing git commit {what} time: {err}")))
+    };
+    let parents = if parts[8].is_empty() {
+        Vec::new()
+    } else {
+        parts[8]
+            .split(|byte| *byte == b' ')
+            .map(|parent| String::from_utf8_lossy(parent).into_owned())
+            .collect()
+    };
+    let modified_files = {
+        let trimmed = trim_ascii(parts[9]);
+        if trimmed.is_empty() {
+            Vec::new()
+        } else {
+            trimmed
+                .split(|byte| *byte == b'\n')
+                .map(<[u8]>::to_vec)
+                .collect()
+        }
+    };
+    let message = parts[7].strip_suffix(b"\n").unwrap_or(parts[7]);
+    Ok(GitCommit {
+        oid,
+        author: Signature {
+            name: parts[1].to_vec(),
+            email: parts[2].to_vec(),
+            date_seconds: parse_time(parts[3], "author")?,
+        },
+        committer: Signature {
+            name: parts[4].to_vec(),
+            email: parts[5].to_vec(),
+            date_seconds: parse_time(parts[6], "committer")?,
+        },
+        message: message.to_vec(),
+        parents,
+        modified_files,
+    })
 }
 
 /// Read a child's stdout into `send`, chunked at `STREAM_CHUNK`.
@@ -1207,6 +1485,101 @@ mod tests {
 
         assert!(matches!(
             repo.archive("tar", "deadbeef", &[]).await,
+            Err(GitError::RevisionNotFound(_))
+        ));
+    }
+
+    #[test]
+    fn parses_annotated_tag_refs() {
+        let output: Vec<u8> = [
+            &b"tag\0*\0refs/tags/v1\0v1\0tagoid\0commitoid\0"[..],
+            &b"1709216000\n"[..],
+            &b"commit\0 \0refs/heads/main\0main\0commitoid\0\0\n"[..],
+        ]
+        .concat();
+        let refs = parse_refs(&output).expect("parse refs");
+        assert_eq!(refs.len(), 2);
+
+        // Annotated tags dereference `*objectname` for the target commit and
+        // keep the tag object ID as `ref_oid`.
+        assert_eq!(refs[0].ref_name, b"refs/tags/v1");
+        assert_eq!(refs[0].target_commit, "commitoid");
+        assert_eq!(refs[0].ref_oid, "tagoid");
+        assert_eq!(refs[0].ref_type, RefType::Tag);
+        assert_eq!(refs[0].created_at_seconds, 1_709_216_000);
+        assert!(refs[0].is_head);
+
+        // A commit under refs/tags is still a tag. Empty dates map to Go's
+        // zero time instead of failing.
+        assert_eq!(refs[1].ref_type, RefType::Branch);
+        assert_eq!(refs[1].target_commit, "commitoid");
+        assert_eq!(refs[1].created_at_seconds, ZERO_TIMESTAMP_SECONDS);
+        assert!(!refs[1].is_head);
+    }
+
+    #[tokio::test]
+    async fn lists_refs_and_reads_commits() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (dir, head) = fixture_repo(tmp.path());
+        let repo = GitRepo::new(dir);
+
+        let refs = repo
+            .list_refs(false, false, &[], None)
+            .await
+            .expect("list refs");
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].ref_name, b"refs/heads/main");
+        assert_eq!(refs[0].short_ref_name, b"main");
+        assert_eq!(refs[0].target_commit, head);
+        assert_eq!(refs[0].ref_oid, head);
+        assert_eq!(refs[0].ref_type, RefType::Branch);
+        assert!(refs[0].is_head);
+        assert!(refs[0].created_at_seconds > 0);
+
+        assert_eq!(
+            repo.list_refs(true, false, &[], None)
+                .await
+                .expect("heads only")
+                .len(),
+            1
+        );
+        assert!(repo
+            .list_refs(false, true, &[], None)
+            .await
+            .expect("tags only")
+            .is_empty());
+        assert_eq!(
+            repo.list_refs(false, false, std::slice::from_ref(&head), None)
+                .await
+                .expect("points at")
+                .len(),
+            1
+        );
+        assert!(repo
+            .list_refs(
+                false,
+                false,
+                &["deadbeefdeadbeefdeadbeefdeadbeefdeadbeef".to_owned()],
+                None,
+            )
+            .await
+            .expect("no ref points at")
+            .is_empty());
+
+        let commit = repo.get_commit(&head, false).await.expect("commit");
+        assert_eq!(commit.oid, head);
+        assert_eq!(commit.message, b"first");
+        assert!(commit.parents.is_empty());
+        assert!(commit.modified_files.is_empty());
+        assert_eq!(commit.author.name, b"test");
+        assert_eq!(commit.author.email, b"test@example.com");
+
+        let commit = repo.get_commit(&head, true).await.expect("commit files");
+        assert_eq!(commit.modified_files, vec![b"a.txt".to_vec()]);
+
+        assert!(matches!(
+            repo.get_commit("deadbeefdeadbeefdeadbeefdeadbeefdeadbeef", false)
+                .await,
             Err(GitError::RevisionNotFound(_))
         ));
     }

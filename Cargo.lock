@@ -1214,6 +1214,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "prost",
+ "prost-types",
  "sg-core",
  "sg-http",
  "sg-metrics",

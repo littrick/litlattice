@@ -237,6 +237,8 @@ enum GitserverRpc {
     MergeBase,
     Stat,
     ReadDir,
+    ListRefs,
+    GetCommit,
 }
 
 impl GitserverRpc {
@@ -251,9 +253,12 @@ impl GitserverRpc {
             "merge_base" => Ok(Self::MergeBase),
             "stat" => Ok(Self::Stat),
             "read_dir" => Ok(Self::ReadDir),
+            "list_refs" => Ok(Self::ListRefs),
+            "get_commit" => Ok(Self::GetCommit),
             other => Err(format!(
                 "unknown gitserver rpc {other:?} (archive, read_file, changed_files, \
-                 resolve_revision, get_object, default_branch, merge_base, stat, read_dir)"
+                 resolve_revision, get_object, default_branch, merge_base, stat, read_dir, \
+                 list_refs, get_commit)"
             )),
         }
     }
@@ -902,6 +907,37 @@ fn gitserver_read_dir_request(value: &Value) -> Result<gpb::ReadDirRequest, Stri
     })
 }
 
+fn gitserver_list_refs_request(value: &Value) -> Result<gpb::ListRefsRequest, String> {
+    Ok(gpb::ListRefsRequest {
+        repo_name: string(value, "repo_name")?,
+        heads_only: value
+            .get("heads_only")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        tags_only: value
+            .get("tags_only")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        points_at_commit: strings(value, "points_at_commit")?,
+        contains_sha: match value.get("contains_sha") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(text)) => Some(text.clone()),
+            Some(_) => return Err("request: contains_sha must be a string".to_owned()),
+        },
+    })
+}
+
+fn gitserver_get_commit_request(value: &Value) -> Result<gpb::GetCommitRequest, String> {
+    Ok(gpb::GetCommitRequest {
+        repo_name: string(value, "repo_name")?,
+        commit: string(value, "commit")?,
+        include_modified_files: value
+            .get("include_modified_files")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+    })
+}
+
 /// `proto.FileInfo` as JSON. Modes are the raw Go `fs.FileMode` bits; the
 /// names are compared byte-for-byte.
 fn normalize_file_info(file: &gpb::FileInfo) -> Value {
@@ -918,6 +954,45 @@ fn normalize_file_info(file: &gpb::FileInfo) -> Value {
         "mode": file.mode,
         "blob_oid": file.blob_oid,
         "submodule": submodule,
+    })
+}
+
+fn normalize_timestamp(timestamp: &prost_types::Timestamp) -> Value {
+    json!({"seconds": timestamp.seconds, "nanos": timestamp.nanos})
+}
+
+fn normalize_git_ref(git_ref: &gpb::GitRef) -> Value {
+    let ref_type = match gpb::git_ref::RefType::try_from(git_ref.ref_type) {
+        Ok(gpb::git_ref::RefType::Branch) => "branch",
+        Ok(gpb::git_ref::RefType::Tag) => "tag",
+        Ok(gpb::git_ref::RefType::Unspecified) | Err(_) => "unspecified",
+    };
+    json!({
+        "ref_name": String::from_utf8_lossy(&git_ref.ref_name),
+        "short_ref_name": String::from_utf8_lossy(&git_ref.short_ref_name),
+        "target_commit": git_ref.target_commit,
+        "ref_oid": git_ref.ref_oid,
+        "created_at": git_ref.created_at.as_ref().map(normalize_timestamp),
+        "ref_type": ref_type,
+        "is_head": git_ref.is_head,
+    })
+}
+
+fn normalize_git_signature(signature: &gpb::GitSignature) -> Value {
+    json!({
+        "name": String::from_utf8_lossy(&signature.name),
+        "email": String::from_utf8_lossy(&signature.email),
+        "date": signature.date.as_ref().map(normalize_timestamp),
+    })
+}
+
+fn normalize_git_commit(commit: &gpb::GitCommit) -> Value {
+    json!({
+        "oid": commit.oid,
+        "author": commit.author.as_ref().map(normalize_git_signature),
+        "committer": commit.committer.as_ref().map(normalize_git_signature),
+        "message": String::from_utf8_lossy(&commit.message),
+        "parents": commit.parents,
     })
 }
 
@@ -1156,6 +1231,35 @@ async fn call_gitserver(
             // tree order, but sort so fixtures do not depend on it.
             files.sort_by(|left, right| left["name"].as_str().cmp(&right["name"].as_str()));
             Ok(json!({"file_info": files}))
+        }
+        GitserverRpc::ListRefs => {
+            let mut stream = client
+                .list_refs(gitserver_list_refs_request(request).map_err(GitserverFailure::Fixture)?)
+                .await?
+                .into_inner();
+            let mut refs = Vec::new();
+            while let Some(message) = stream.message().await? {
+                refs.extend(message.refs.iter().map(normalize_git_ref));
+            }
+            // Chunking is an implementation detail; git's ref order is stable
+            // and meaningful, so preserve it.
+            Ok(json!({"refs": refs}))
+        }
+        GitserverRpc::GetCommit => {
+            let response = client
+                .get_commit(
+                    gitserver_get_commit_request(request).map_err(GitserverFailure::Fixture)?,
+                )
+                .await?
+                .into_inner();
+            Ok(json!({
+                "commit": response.commit.as_ref().map(normalize_git_commit),
+                "modified_files": response
+                    .modified_files
+                    .iter()
+                    .map(|file| String::from_utf8_lossy(file).into_owned())
+                    .collect::<Vec<_>>(),
+            }))
         }
         GitserverRpc::ChangedFiles => {
             let mut stream = client
@@ -1514,5 +1618,39 @@ mod tests {
         .expect("read_dir request");
         assert_eq!(request.path, Some(Vec::new()));
         assert!(request.recursive);
+
+        let request =
+            gitserver_list_refs_request(&json!({"repo_name": "r"})).expect("list_refs request");
+        assert!(!request.heads_only);
+        assert!(!request.tags_only);
+        assert!(request.points_at_commit.is_empty());
+        assert_eq!(request.contains_sha, None);
+
+        let request = gitserver_list_refs_request(&json!({
+            "repo_name": "r",
+            "heads_only": true,
+            "tags_only": true,
+            "points_at_commit": ["a", "b"],
+            "contains_sha": "c",
+        }))
+        .expect("list_refs request");
+        assert!(request.heads_only);
+        assert!(request.tags_only);
+        assert_eq!(
+            request.points_at_commit,
+            vec!["a".to_owned(), "b".to_owned()]
+        );
+        assert_eq!(request.contains_sha.as_deref(), Some("c"));
+
+        let request = gitserver_get_commit_request(&json!({"repo_name": "r", "commit": "c"}))
+            .expect("get_commit request");
+        assert_eq!(request.commit, "c");
+        assert!(!request.include_modified_files);
+
+        let request = gitserver_get_commit_request(&json!({
+            "repo_name": "r", "commit": "c", "include_modified_files": true,
+        }))
+        .expect("get_commit request");
+        assert!(request.include_modified_files);
     }
 }

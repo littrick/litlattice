@@ -1,0 +1,48 @@
+{
+  "expected": {
+    "refs": [
+      {
+        "created_at": {
+          "nanos": 0,
+          "seconds": 1706832000
+        },
+        "is_head": true,
+        "ref_name": "refs/heads/main",
+        "ref_oid": "2e6511bf87f7e6f0af1afb6247e39b1ddf5cc799",
+        "ref_type": "branch",
+        "short_ref_name": "main",
+        "target_commit": "2e6511bf87f7e6f0af1afb6247e39b1ddf5cc799"
+      },
+      {
+        "created_at": {
+          "nanos": 0,
+          "seconds": 1706832000
+        },
+        "is_head": false,
+        "ref_name": "refs/heads/feature",
+        "ref_oid": "2e6511bf87f7e6f0af1afb6247e39b1ddf5cc799",
+        "ref_type": "branch",
+        "short_ref_name": "feature",
+        "target_commit": "2e6511bf87f7e6f0af1afb6247e39b1ddf5cc799"
+      },
+      {
+        "created_at": {
+          "nanos": 0,
+          "seconds": 1704067200
+        },
+        "is_head": false,
+        "ref_name": "refs/heads/dev",
+        "ref_oid": "1a65c506a93996f8dccdfe52216bf3909de71d9d",
+        "ref_type": "branch",
+        "short_ref_name": "dev",
+        "target_commit": "1a65c506a93996f8dccdfe52216bf3909de71d9d"
+      }
+    ]
+  },
+  "request": {
+    "heads_only": true,
+    "repo_name": "test/git-refs-fixture"
+  },
+  "rpc": "list_refs",
+  "service": "gitserver"
+}

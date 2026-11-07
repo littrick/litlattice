@@ -1,8 +1,8 @@
 //! `gitserver.v1.GitserverService`: read path plus `UNIMPLEMENTED` stubs.
 //!
 //! Implemented so far: `Archive`, `ReadFile`, `ChangedFiles`, `ResolveRevision`,
-//! `GetObject`, `DefaultBranch`, `MergeBase`, `Stat` and `ReadDir` (M9.2).
-//! Every other RPC returns `UNIMPLEMENTED`.
+//! `GetObject`, `DefaultBranch`, `MergeBase`, `Stat`, `ReadDir`, `ListRefs` and
+//! `GetCommit` (M9.2). Every other RPC returns `UNIMPLEMENTED`.
 
 use std::pin::Pin;
 use std::sync::Arc;
@@ -14,7 +14,9 @@ use tonic::{Request as GrpcRequest, Response as GrpcResponse, Status};
 
 use sg_proto::gitserver as gpb;
 
-use crate::git::{pump_stdout, GitError, GitRepo, TreeEntry, CHUNK_MESSAGE_SIZE};
+use crate::git::{
+    pump_stdout, GitCommit, GitError, GitRef, GitRepo, RefType, TreeEntry, CHUNK_MESSAGE_SIZE,
+};
 use crate::repo::repo_dir;
 
 type Stream<T> = Pin<Box<dyn tokio_stream::Stream<Item = Result<T, Status>> + Send>>;
@@ -69,6 +71,45 @@ fn file_info(entry: TreeEntry) -> gpb::FileInfo {
             commit_sha: submodule.commit_sha,
         }),
     }
+}
+
+fn timestamp(seconds: i64) -> prost_types::Timestamp {
+    prost_types::Timestamp { seconds, nanos: 0 }
+}
+
+fn git_ref_proto(git_ref: GitRef) -> gpb::GitRef {
+    let ref_type = match git_ref.ref_type {
+        RefType::Unspecified => gpb::git_ref::RefType::Unspecified,
+        RefType::Branch => gpb::git_ref::RefType::Branch,
+        RefType::Tag => gpb::git_ref::RefType::Tag,
+    };
+    gpb::GitRef {
+        ref_name: git_ref.ref_name,
+        short_ref_name: git_ref.short_ref_name,
+        target_commit: git_ref.target_commit,
+        ref_oid: git_ref.ref_oid,
+        created_at: Some(timestamp(git_ref.created_at_seconds)),
+        ref_type: ref_type as i32,
+        is_head: git_ref.is_head,
+    }
+}
+
+fn git_commit_proto(commit: GitCommit) -> (gpb::GitCommit, Vec<Vec<u8>>) {
+    let signature = |signature: crate::git::Signature| gpb::GitSignature {
+        name: signature.name,
+        email: signature.email,
+        date: Some(timestamp(signature.date_seconds)),
+    };
+    (
+        gpb::GitCommit {
+            oid: commit.oid,
+            author: Some(signature(commit.author)),
+            committer: Some(signature(commit.committer)),
+            message: commit.message,
+            parents: commit.parents,
+        },
+        commit.modified_files,
+    )
 }
 
 #[tonic::async_trait]
@@ -411,9 +452,25 @@ impl gpb::gitserver_service_server::GitserverService for Grpc {
 
     async fn get_commit(
         &self,
-        _request: GrpcRequest<gpb::GetCommitRequest>,
+        request: GrpcRequest<gpb::GetCommitRequest>,
     ) -> Result<GrpcResponse<gpb::GetCommitResponse>, Status> {
-        Err(unimplemented("get_commit"))
+        let request = request.into_inner();
+        if request.repo_name.is_empty() {
+            return Err(Status::invalid_argument("repo must be specified"));
+        }
+        if request.commit.is_empty() {
+            return Err(Status::invalid_argument("commit must be specified"));
+        }
+        let repo = self.repo(&request.repo_name)?;
+        let commit = repo
+            .get_commit(&request.commit, request.include_modified_files)
+            .await
+            .map_err(git_status)?;
+        let (commit, modified_files) = git_commit_proto(commit);
+        Ok(GrpcResponse::new(gpb::GetCommitResponse {
+            commit: Some(commit),
+            modified_files,
+        }))
     }
 
     async fn resolve_revision(
@@ -440,9 +497,43 @@ impl gpb::gitserver_service_server::GitserverService for Grpc {
 
     async fn list_refs(
         &self,
-        _request: GrpcRequest<gpb::ListRefsRequest>,
+        request: GrpcRequest<gpb::ListRefsRequest>,
     ) -> Result<GrpcResponse<Self::ListRefsStream>, Status> {
-        Err(unimplemented("list_refs"))
+        let request = request.into_inner();
+        if request.repo_name.is_empty() {
+            return Err(Status::invalid_argument("repo must be specified"));
+        }
+        let repo = self.repo(&request.repo_name)?;
+        let refs = repo
+            .list_refs(
+                request.heads_only,
+                request.tags_only,
+                &request.points_at_commit,
+                request.contains_sha.as_deref(),
+            )
+            .await
+            .map_err(git_status)?;
+
+        // Chunk at 1 MiB like the baseline `internal/grpc/chunk`.
+        let mut responses = Vec::new();
+        let mut chunk = Vec::new();
+        let mut size = 0usize;
+        for git_ref in refs {
+            let git_ref = git_ref_proto(git_ref);
+            let ref_size = git_ref.encoded_len();
+            if size + ref_size >= CHUNK_MESSAGE_SIZE {
+                responses.push(Ok(gpb::ListRefsResponse {
+                    refs: std::mem::take(&mut chunk),
+                }));
+                size = 0;
+            }
+            size += ref_size;
+            chunk.push(git_ref);
+        }
+        if !chunk.is_empty() {
+            responses.push(Ok(gpb::ListRefsResponse { refs: chunk }));
+        }
+        Ok(GrpcResponse::new(Box::pin(tokio_stream::iter(responses))))
     }
 
     async fn rev_at_time(

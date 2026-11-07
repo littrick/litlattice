@@ -1,0 +1,83 @@
+{
+  "expected": {
+    "refs": [
+      {
+        "created_at": {
+          "nanos": 0,
+          "seconds": 1706832000
+        },
+        "is_head": true,
+        "ref_name": "refs/heads/main",
+        "ref_oid": "2e6511bf87f7e6f0af1afb6247e39b1ddf5cc799",
+        "ref_type": "branch",
+        "short_ref_name": "main",
+        "target_commit": "2e6511bf87f7e6f0af1afb6247e39b1ddf5cc799"
+      },
+      {
+        "created_at": {
+          "nanos": 0,
+          "seconds": 1709424000
+        },
+        "is_head": false,
+        "ref_name": "refs/tags/v2.0",
+        "ref_oid": "300c88b5fedfe8670602011694dc026d8c34e9b8",
+        "ref_type": "tag",
+        "short_ref_name": "v2.0",
+        "target_commit": "2e6511bf87f7e6f0af1afb6247e39b1ddf5cc799"
+      },
+      {
+        "created_at": {
+          "nanos": 0,
+          "seconds": 1709424000
+        },
+        "is_head": false,
+        "ref_name": "refs/tags/v1.0",
+        "ref_oid": "f6485a7555bcd325c954173da490fb682c6d1cbf",
+        "ref_type": "tag",
+        "short_ref_name": "v1.0",
+        "target_commit": "1a65c506a93996f8dccdfe52216bf3909de71d9d"
+      },
+      {
+        "created_at": {
+          "nanos": 0,
+          "seconds": 1706832000
+        },
+        "is_head": false,
+        "ref_name": "refs/heads/feature",
+        "ref_oid": "2e6511bf87f7e6f0af1afb6247e39b1ddf5cc799",
+        "ref_type": "branch",
+        "short_ref_name": "feature",
+        "target_commit": "2e6511bf87f7e6f0af1afb6247e39b1ddf5cc799"
+      },
+      {
+        "created_at": {
+          "nanos": 0,
+          "seconds": 1704067200
+        },
+        "is_head": false,
+        "ref_name": "refs/tags/lightweight",
+        "ref_oid": "1a65c506a93996f8dccdfe52216bf3909de71d9d",
+        "ref_type": "tag",
+        "short_ref_name": "lightweight",
+        "target_commit": "1a65c506a93996f8dccdfe52216bf3909de71d9d"
+      },
+      {
+        "created_at": {
+          "nanos": 0,
+          "seconds": 1704067200
+        },
+        "is_head": false,
+        "ref_name": "refs/heads/dev",
+        "ref_oid": "1a65c506a93996f8dccdfe52216bf3909de71d9d",
+        "ref_type": "branch",
+        "short_ref_name": "dev",
+        "target_commit": "1a65c506a93996f8dccdfe52216bf3909de71d9d"
+      }
+    ]
+  },
+  "request": {
+    "repo_name": "test/git-refs-fixture"
+  },
+  "rpc": "list_refs",
+  "service": "gitserver"
+}

@@ -1,0 +1,35 @@
+{
+  "expected": {
+    "commit": {
+      "author": {
+        "date": {
+          "nanos": 0,
+          "seconds": 1704067200
+        },
+        "email": "fixture@example.com",
+        "name": "Fixture Author"
+      },
+      "committer": {
+        "date": {
+          "nanos": 0,
+          "seconds": 1704067200
+        },
+        "email": "fixture@example.com",
+        "name": "Fixture Author"
+      },
+      "message": "root commit",
+      "oid": "1a65c506a93996f8dccdfe52216bf3909de71d9d",
+      "parents": []
+    },
+    "modified_files": [
+      "a.txt"
+    ]
+  },
+  "request": {
+    "commit": "1a65c506a93996f8dccdfe52216bf3909de71d9d",
+    "include_modified_files": true,
+    "repo_name": "test/git-refs-fixture"
+  },
+  "rpc": "get_commit",
+  "service": "gitserver"
+}

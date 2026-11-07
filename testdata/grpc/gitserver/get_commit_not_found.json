@@ -1,0 +1,14 @@
+{
+  "expected": {
+    "error": {
+      "code": "not_found",
+      "message": "revision not found"
+    }
+  },
+  "request": {
+    "commit": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+    "repo_name": "test/git-refs-fixture"
+  },
+  "rpc": "get_commit",
+  "service": "gitserver"
+}
