@@ -1,0 +1,30 @@
+{
+  "entries": [
+    {
+      "key": "actor",
+      "base64": "eyJhY3RvciI6eyJVSUQiOjF9LCJsYXN0QWN0aXZlIjoiMjAyNi0xMS0wN1QxNToxOToxNS43MDMzOTg2NDZaIiwiZXhwaXJ5UGVyaW9kIjo3Nzc2MDAwMDAwMDAwMDAwLCJ1c2VyQ3JlYXRlZEF0IjoiMjAyNi0xMS0wN1QxMzo1NjoyNS41NTM0MzJaIn0=",
+      "len": 143
+    },
+    {
+      "key": "oauthState",
+      "base64": "InN0YXRlLTEyMyI=",
+      "len": 11
+    },
+    {
+      "key": "oidcState",
+      "base64": "Im9pZGMtc3RhdGUtNDU2Ig==",
+      "len": 16
+    },
+    {
+      "key": "oidc@0",
+      "base64": "eyJzdGF0ZSI6ImFiYyIsIm5vbmNlIjoiZGVmIn0=",
+      "len": 29
+    },
+    {
+      "key": "soap@0",
+      "base64": "bnVsbA==",
+      "len": 4
+    }
+  ],
+  "gob_len": 377
+}

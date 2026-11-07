@@ -1,0 +1,6 @@
+{
+  "expiryPeriod_ns": 7776000000000000,
+  "expiryPeriod_str": "2160h0m0s",
+  "json": "{\"actor\":{\"UID\":1},\"lastActive\":\"2026-11-07T15:19:15.703398646Z\",\"expiryPeriod\":7776000000000000,\"userCreatedAt\":\"2026-11-07T13:56:25.553432Z\"}",
+  "len": 143
+}
