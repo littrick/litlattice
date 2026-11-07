@@ -1,0 +1,16 @@
+{
+  "expected": {
+    "error": {
+      "code": "invalid_argument",
+      "message": "at least 2 revspecs must be specified"
+    }
+  },
+  "request": {
+    "repo_name": "test/git-refs-fixture",
+    "revspecs": [
+      "main"
+    ]
+  },
+  "rpc": "merge_base_octopus",
+  "service": "gitserver"
+}

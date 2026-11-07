@@ -1,0 +1,18 @@
+{
+  "expected": {
+    "error": {
+      "code": "not_found",
+      "message": "revision not found"
+    }
+  },
+  "request": {
+    "after": {
+      "nanos": 0,
+      "seconds": 1700000000
+    },
+    "range": "nope",
+    "repo_name": "test/git-refs-fixture"
+  },
+  "rpc": "contributor_counts",
+  "service": "gitserver"
+}

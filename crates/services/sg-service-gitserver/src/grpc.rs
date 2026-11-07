@@ -1,9 +1,10 @@
 //! `gitserver.v1.GitserverService`: read path plus `UNIMPLEMENTED` stubs.
 //!
 //! Implemented so far: `Archive`, `ReadFile`, `ChangedFiles`, `ResolveRevision`,
-//! `GetObject`, `DefaultBranch`, `MergeBase`, `Stat`, `ReadDir`, `ListRefs`,
-//! `GetCommit`, `RevAtTime`, `RawDiff` and `CommitLog` (M9.2). Every other RPC
-//! returns `UNIMPLEMENTED`.
+//! `GetObject`, `DefaultBranch`, `MergeBase`, `MergeBaseOctopus`, `Stat`,
+//! `ReadDir`, `ListRefs`, `GetCommit`, `RevAtTime`, `RawDiff`, `CommitLog`,
+//! `ContributorCounts`, `FirstEverCommit` and `BehindAhead` (M9.2). Every other
+//! RPC returns `UNIMPLEMENTED`.
 
 use std::pin::Pin;
 use std::sync::Arc;
@@ -711,23 +712,88 @@ impl gpb::gitserver_service_server::GitserverService for Grpc {
 
     async fn contributor_counts(
         &self,
-        _request: GrpcRequest<gpb::ContributorCountsRequest>,
+        request: GrpcRequest<gpb::ContributorCountsRequest>,
     ) -> Result<GrpcResponse<gpb::ContributorCountsResponse>, Status> {
-        Err(unimplemented("contributor_counts"))
+        let request = request.into_inner();
+        if request.repo_name.is_empty() {
+            return Err(Status::invalid_argument("repo must be specified"));
+        }
+        let repo = self.repo(&request.repo_name)?;
+        let range = String::from_utf8_lossy(&request.range).into_owned();
+        // A missing timestamp arrives as `None`; the baseline calls `AsTime()`
+        // on the nil pointer, which is the Unix epoch.
+        let after_seconds = request.after.as_ref().map_or(0, |time| time.seconds);
+        let counts = match repo
+            .contributor_counts(&range, after_seconds, &request.path)
+            .await
+        {
+            Ok(counts) => counts,
+            Err(GitError::RevisionNotFound(_)) => {
+                return Err(Status::not_found("revision not found"))
+            }
+            // The baseline returns every other fault unchanged (`Unknown`).
+            Err(err) => return Err(Status::unknown(err.message())),
+        };
+        Ok(GrpcResponse::new(gpb::ContributorCountsResponse {
+            counts: counts
+                .into_iter()
+                .map(|count| gpb::ContributorCount {
+                    author: Some(gpb::GitSignature {
+                        name: count.name.into_bytes(),
+                        email: count.email.into_bytes(),
+                        date: None,
+                    }),
+                    count: count.count,
+                })
+                .collect(),
+        }))
     }
 
     async fn first_ever_commit(
         &self,
-        _request: GrpcRequest<gpb::FirstEverCommitRequest>,
+        request: GrpcRequest<gpb::FirstEverCommitRequest>,
     ) -> Result<GrpcResponse<gpb::FirstEverCommitResponse>, Status> {
-        Err(unimplemented("first_ever_commit"))
+        let request = request.into_inner();
+        if request.repo_name.is_empty() {
+            return Err(Status::invalid_argument("repo must be specified"));
+        }
+        let repo = self.repo(&request.repo_name)?;
+        let id = match repo.first_ever_commit().await {
+            Ok(id) => id,
+            Err(GitError::RevisionNotFound(_)) => {
+                return Err(Status::not_found("revision not found"))
+            }
+            Err(err) => return Err(Status::unknown(err.message())),
+        };
+        let commit = match repo.get_commit(&id, false).await {
+            Ok(commit) => commit,
+            Err(GitError::RevisionNotFound(_)) => {
+                return Err(Status::not_found("revision not found"))
+            }
+            Err(err) => return Err(Status::unknown(err.message())),
+        };
+        let (commit, _modified_files) = git_commit_proto(commit);
+        Ok(GrpcResponse::new(gpb::FirstEverCommitResponse {
+            commit: Some(commit),
+        }))
     }
 
     async fn behind_ahead(
         &self,
-        _request: GrpcRequest<gpb::BehindAheadRequest>,
+        request: GrpcRequest<gpb::BehindAheadRequest>,
     ) -> Result<GrpcResponse<gpb::BehindAheadResponse>, Status> {
-        Err(unimplemented("behind_ahead"))
+        let request = request.into_inner();
+        if request.repo_name.is_empty() {
+            return Err(Status::invalid_argument("repo must be specified"));
+        }
+        let repo = self.repo(&request.repo_name)?;
+        let left = String::from_utf8_lossy(&request.left).into_owned();
+        let right = String::from_utf8_lossy(&request.right).into_owned();
+        let behind_ahead = repo.behind_ahead(&left, &right).await.map_err(git_status)?;
+        Ok(GrpcResponse::new(gpb::BehindAheadResponse {
+            behind: behind_ahead.behind,
+            ahead: behind_ahead.ahead,
+        }))
     }
 
     async fn stat(
@@ -799,8 +865,30 @@ impl gpb::gitserver_service_server::GitserverService for Grpc {
 
     async fn merge_base_octopus(
         &self,
-        _request: GrpcRequest<gpb::MergeBaseOctopusRequest>,
+        request: GrpcRequest<gpb::MergeBaseOctopusRequest>,
     ) -> Result<GrpcResponse<gpb::MergeBaseOctopusResponse>, Status> {
-        Err(unimplemented("merge_base_octopus"))
+        let request = request.into_inner();
+        if request.repo_name.is_empty() {
+            return Err(Status::invalid_argument("repo must be specified"));
+        }
+        // The baseline checks the count before touching the repository.
+        if request.revspecs.len() < 2 {
+            return Err(Status::invalid_argument(
+                "at least 2 revspecs must be specified",
+            ));
+        }
+        let repo = self.repo(&request.repo_name)?;
+        let revspecs = request
+            .revspecs
+            .iter()
+            .map(|revspec| String::from_utf8_lossy(revspec).into_owned())
+            .collect::<Vec<_>>();
+        let merge_base_commit_sha = repo
+            .merge_base_octopus(&revspecs)
+            .await
+            .map_err(git_status)?;
+        Ok(GrpcResponse::new(gpb::MergeBaseOctopusResponse {
+            merge_base_commit_sha,
+        }))
     }
 }

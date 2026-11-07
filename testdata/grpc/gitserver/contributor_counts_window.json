@@ -1,0 +1,24 @@
+{
+  "expected": {
+    "counts": [
+      {
+        "author": {
+          "date": null,
+          "email": "fixture@example.com",
+          "name": "Fixture Author"
+        },
+        "count": 1
+      }
+    ]
+  },
+  "request": {
+    "after": {
+      "nanos": 0,
+      "seconds": 1700000000
+    },
+    "range": "HEAD~1..HEAD",
+    "repo_name": "test/git-refs-fixture"
+  },
+  "rpc": "contributor_counts",
+  "service": "gitserver"
+}

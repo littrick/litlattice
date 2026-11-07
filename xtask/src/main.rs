@@ -242,6 +242,10 @@ enum GitserverRpc {
     RevAtTime,
     RawDiff,
     CommitLog,
+    MergeBaseOctopus,
+    ContributorCounts,
+    FirstEverCommit,
+    BehindAhead,
 }
 
 impl GitserverRpc {
@@ -261,10 +265,15 @@ impl GitserverRpc {
             "rev_at_time" => Ok(Self::RevAtTime),
             "raw_diff" => Ok(Self::RawDiff),
             "commit_log" => Ok(Self::CommitLog),
+            "merge_base_octopus" => Ok(Self::MergeBaseOctopus),
+            "contributor_counts" => Ok(Self::ContributorCounts),
+            "first_ever_commit" => Ok(Self::FirstEverCommit),
+            "behind_ahead" => Ok(Self::BehindAhead),
             other => Err(format!(
                 "unknown gitserver rpc {other:?} (archive, read_file, changed_files, \
                  resolve_revision, get_object, default_branch, merge_base, stat, read_dir, \
-                 list_refs, get_commit, rev_at_time, raw_diff, commit_log)"
+                 list_refs, get_commit, rev_at_time, raw_diff, commit_log, \
+                 merge_base_octopus, contributor_counts, first_ever_commit, behind_ahead)"
             )),
         }
     }
@@ -1061,6 +1070,45 @@ fn gitserver_commit_log_request(value: &Value) -> Result<gpb::CommitLogRequest, 
     })
 }
 
+fn gitserver_merge_base_octopus_request(
+    value: &Value,
+) -> Result<gpb::MergeBaseOctopusRequest, String> {
+    Ok(gpb::MergeBaseOctopusRequest {
+        repo_name: string(value, "repo_name")?,
+        revspecs: strings(value, "revspecs")?
+            .into_iter()
+            .map(String::into_bytes)
+            .collect(),
+    })
+}
+
+fn gitserver_contributor_counts_request(
+    value: &Value,
+) -> Result<gpb::ContributorCountsRequest, String> {
+    Ok(gpb::ContributorCountsRequest {
+        repo_name: string(value, "repo_name")?,
+        range: optional_string(value, "range")?.into_bytes(),
+        after: optional_timestamp(value, "after")?,
+        path: optional_string(value, "path")?.into_bytes(),
+    })
+}
+
+fn gitserver_first_ever_commit_request(
+    value: &Value,
+) -> Result<gpb::FirstEverCommitRequest, String> {
+    Ok(gpb::FirstEverCommitRequest {
+        repo_name: string(value, "repo_name")?,
+    })
+}
+
+fn gitserver_behind_ahead_request(value: &Value) -> Result<gpb::BehindAheadRequest, String> {
+    Ok(gpb::BehindAheadRequest {
+        repo_name: string(value, "repo_name")?,
+        left: optional_string(value, "left")?.into_bytes(),
+        right: optional_string(value, "right")?.into_bytes(),
+    })
+}
+
 /// `proto.FileInfo` as JSON. Modes are the raw Go `fs.FileMode` bits; the
 /// names are compared byte-for-byte.
 fn normalize_file_info(file: &gpb::FileInfo) -> Value {
@@ -1106,6 +1154,14 @@ fn normalize_git_signature(signature: &gpb::GitSignature) -> Value {
         "name": String::from_utf8_lossy(&signature.name),
         "email": String::from_utf8_lossy(&signature.email),
         "date": signature.date.as_ref().map(normalize_timestamp),
+    })
+}
+
+fn normalize_contributor_count(count: &gpb::ContributorCount) -> Value {
+    json!({
+        // `ContributorCount.ToProto` never sets a date.
+        "author": count.author.as_ref().map(normalize_git_signature),
+        "count": count.count,
     })
 }
 
@@ -1446,6 +1502,53 @@ async fn call_gitserver(
                 messages.push(message);
             }
             Ok(normalize_commit_log(&messages))
+        }
+        GitserverRpc::MergeBaseOctopus => {
+            let response = client
+                .merge_base_octopus(
+                    gitserver_merge_base_octopus_request(request)
+                        .map_err(GitserverFailure::Fixture)?,
+                )
+                .await?
+                .into_inner();
+            Ok(json!({"merge_base_commit_sha": response.merge_base_commit_sha}))
+        }
+        GitserverRpc::ContributorCounts => {
+            let response = client
+                .contributor_counts(
+                    gitserver_contributor_counts_request(request)
+                        .map_err(GitserverFailure::Fixture)?,
+                )
+                .await?
+                .into_inner();
+            Ok(json!({
+                "counts": response
+                    .counts
+                    .iter()
+                    .map(normalize_contributor_count)
+                    .collect::<Vec<_>>(),
+            }))
+        }
+        GitserverRpc::FirstEverCommit => {
+            let response = client
+                .first_ever_commit(
+                    gitserver_first_ever_commit_request(request)
+                        .map_err(GitserverFailure::Fixture)?,
+                )
+                .await?
+                .into_inner();
+            Ok(json!({
+                "commit": response.commit.as_ref().map(normalize_git_commit),
+            }))
+        }
+        GitserverRpc::BehindAhead => {
+            let response = client
+                .behind_ahead(
+                    gitserver_behind_ahead_request(request).map_err(GitserverFailure::Fixture)?,
+                )
+                .await?
+                .into_inner();
+            Ok(json!({"behind": response.behind, "ahead": response.ahead}))
         }
         GitserverRpc::ChangedFiles => {
             let mut stream = client
@@ -1891,5 +1994,44 @@ mod tests {
             gpb::commit_log_request::CommitLogOrder::CommitDate as i32
         );
         assert_eq!(request.message_query, b"fix");
+
+        let request = gitserver_merge_base_octopus_request(&json!({
+            "repo_name": "r", "revspecs": ["main", "dev"],
+        }))
+        .expect("merge_base_octopus request");
+        assert_eq!(request.revspecs, vec![b"main".to_vec(), b"dev".to_vec()]);
+
+        let request = gitserver_contributor_counts_request(&json!({
+            "repo_name": "r",
+            "range": "main",
+            "after": {"seconds": 1700000000},
+            "path": "a.txt",
+        }))
+        .expect("contributor_counts request");
+        assert_eq!(request.range, b"main");
+        assert_eq!(request.after.map(|time| time.seconds), Some(1_700_000_000));
+        assert_eq!(request.path, b"a.txt");
+
+        let request = gitserver_contributor_counts_request(&json!({"repo_name": "r"}))
+            .expect("contributor_counts request");
+        assert!(request.range.is_empty());
+        assert_eq!(request.after, None);
+        assert!(request.path.is_empty());
+
+        let request = gitserver_first_ever_commit_request(&json!({"repo_name": "r"}))
+            .expect("first_ever_commit request");
+        assert_eq!(request.repo_name, "r");
+
+        let request = gitserver_behind_ahead_request(&json!({
+            "repo_name": "r", "left": "main", "right": "dev",
+        }))
+        .expect("behind_ahead request");
+        assert_eq!(request.left, b"main");
+        assert_eq!(request.right, b"dev");
+
+        let request = gitserver_behind_ahead_request(&json!({"repo_name": "r"}))
+            .expect("behind_ahead request");
+        assert!(request.left.is_empty());
+        assert!(request.right.is_empty());
     }
 }

@@ -1,0 +1,13 @@
+{
+  "expected": {
+    "ahead": 0,
+    "behind": 1
+  },
+  "request": {
+    "left": "main",
+    "repo_name": "test/git-refs-fixture",
+    "right": "dev"
+  },
+  "rpc": "behind_ahead",
+  "service": "gitserver"
+}

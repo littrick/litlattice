@@ -162,6 +162,24 @@ pub enum RawDiffComparison {
     Intersection,
 }
 
+/// One `git shortlog --summary` entry (`proto.ContributorCount`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContributorCount {
+    pub name: String,
+    pub email: String,
+    pub count: i32,
+}
+
+/// `gitdomain.BehindAhead`: commits reachable only from `left` / `right`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BehindAhead {
+    pub behind: u32,
+    pub ahead: u32,
+}
+
+/// Go `revListUsageString`: the stderr of `git rev-list` on an empty repo.
+const REV_LIST_USAGE: &str = "usage: git rev-list [<options>] <commit>... [--] [<path>...]";
+
 impl GitRepo {
     pub fn new(git_dir: impl Into<PathBuf>) -> Self {
         Self {
@@ -817,6 +835,156 @@ impl GitRepo {
             .spawn()
             .map_err(|err| GitError::Message(format!("failed to run git log: {err}")))
     }
+
+    /// Baseline `MergeBaseOctopus`: `git merge-base --octopus -- <revspecs>`.
+    /// Exit 1 with empty stderr means there is no common base (empty SHA); an
+    /// unresolvable revspec is reported as `RevisionNotFound`.
+    pub async fn merge_base_octopus(&self, revspecs: &[String]) -> Result<String, GitError> {
+        if revspecs.len() < 2 {
+            return Err(GitError::Message(
+                "at least two revspecs must be given".to_owned(),
+            ));
+        }
+        let mut args: Vec<OsString> = vec!["merge-base".into(), "--octopus".into(), "--".into()];
+        args.extend(revspecs.iter().map(OsString::from));
+        let output = self.output(&args).await?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if output.status.code() == Some(1) && stderr.is_empty() {
+                return Ok(String::new());
+            }
+            if output.status.code() == Some(128)
+                && stderr.contains("fatal: Not a valid object name")
+            {
+                let spec = extract_invalid_object_name(&output.stderr).unwrap_or_default();
+                return Err(GitError::RevisionNotFound(spec));
+            }
+            return Err(GitError::Message(format!(
+                "git merge-base --octopus: {}",
+                stderr.trim_end()
+            )));
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+    }
+
+    /// Baseline `BehindAhead`: `git rev-list --count --left-right <left>...<right>`.
+    pub async fn behind_ahead(&self, left: &str, right: &str) -> Result<BehindAhead, GitError> {
+        check_spec_arg_safety(left)?;
+        check_spec_arg_safety(right)?;
+        let left = if left.is_empty() { "HEAD" } else { left };
+        let right = if right.is_empty() { "HEAD" } else { right };
+        let range = format!("{left}...{right}");
+        let output = self
+            .output(&[
+                "rev-list".into(),
+                "--count".into(),
+                "--left-right".into(),
+                range.clone().into(),
+            ])
+            .await?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if output.status.code() == Some(128)
+                && (stderr.contains("fatal: ambiguous argument")
+                    || stderr.contains("fatal: Invalid symmetric difference expression"))
+            {
+                return Err(GitError::RevisionNotFound(range));
+            }
+            return Err(GitError::Message(format!(
+                "git rev-list: {}",
+                stderr.trim_end()
+            )));
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        // The baseline strips exactly one trailing newline before splitting.
+        let stdout = stdout.strip_suffix('\n').unwrap_or(&stdout);
+        let mut fields = stdout.split('\t');
+        let parse = |field: Option<&str>| -> Result<u32, GitError> {
+            field
+                .and_then(|field| field.trim().parse().ok())
+                .ok_or_else(|| {
+                    GitError::Message(format!("failed to parse behindahead output {stdout:?}"))
+                })
+        };
+        Ok(BehindAhead {
+            behind: parse(fields.next())?,
+            ahead: parse(fields.next())?,
+        })
+    }
+
+    /// Baseline `FirstEverCommit`: the root commit reachable from `HEAD`.
+    pub async fn first_ever_commit(&self) -> Result<String, GitError> {
+        let output = self
+            .output(&[
+                "rev-list".into(),
+                "--reverse".into(),
+                "--date-order".into(),
+                "--max-parents=0".into(),
+                "HEAD".into(),
+            ])
+            .await?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            // The baseline only maps git's usage error; every other failure is
+            // returned as-is.
+            if output.status.code() == Some(129) && stderr.contains(REV_LIST_USAGE) {
+                return Err(GitError::RevisionNotFound("HEAD".to_owned()));
+            }
+            return Err(GitError::Message(format!(
+                "git rev-list command failed: {}",
+                stderr.trim_end()
+            )));
+        }
+        let lines = trim_ascii(&output.stdout);
+        let first = lines
+            .split(|byte| *byte == b'\n')
+            .next()
+            .unwrap_or_default();
+        Ok(String::from_utf8_lossy(trim_ascii(first)).into_owned())
+    }
+
+    /// Baseline `ContributorCounts`: `git shortlog --summary --numbered --email
+    /// --no-merges --after=<unix> <range> -- <path>`.
+    pub async fn contributor_counts(
+        &self,
+        range: &str,
+        after_seconds: i64,
+        path: &[u8],
+    ) -> Result<Vec<ContributorCount>, GitError> {
+        let range = if range.is_empty() { "HEAD" } else { range };
+        check_spec_arg_safety(range)?;
+        let mut args: Vec<OsString> = vec![
+            "shortlog".into(),
+            "--summary".into(),
+            "--numbered".into(),
+            "--email".into(),
+            "--no-merges".into(),
+        ];
+        // The gRPC handler passes `GetAfter().AsTime()`; a nil timestamp is the
+        // Unix epoch (not Go's zero time), so `--after` is always emitted. Git's
+        // approxidate reads a bare `0` as "now", so requests without `after`
+        // only see commits dated in the current second.
+        args.push(format!("--after={after_seconds}").into());
+        args.push(range.into());
+        args.push("--".into());
+        if !path.is_empty() {
+            args.push(OsStr::from_bytes(path).to_owned());
+        }
+        let output = self.output(&args).await?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if output.status.code() == Some(128)
+                && (stderr.contains("fatal: bad object") || stderr.contains("fatal: bad revision"))
+            {
+                return Err(GitError::RevisionNotFound(range.to_owned()));
+            }
+            return Err(GitError::Message(format!(
+                "git shortlog: {}",
+                stderr.trim_end()
+            )));
+        }
+        parse_shortlog(&output.stdout)
+    }
 }
 
 fn decode_hex(text: &str) -> Option<Vec<u8>> {
@@ -881,6 +1049,144 @@ fn check_spec_arg_safety(spec: &str) -> Result<(), GitError> {
         )));
     }
     Ok(())
+}
+
+/// Baseline `octopusNotAValidObjectRegexp` = `fatal: Not a valid object name
+/// ([^\s]+)`: the first non-space run after the marker.
+fn extract_invalid_object_name(stderr: &[u8]) -> Option<String> {
+    const MARKER: &[u8] = b"fatal: Not a valid object name ";
+    let start = stderr
+        .windows(MARKER.len())
+        .position(|window| window == MARKER)?
+        + MARKER.len();
+    let rest = &stderr[start..];
+    let end = rest
+        .iter()
+        .position(|byte| byte.is_ascii_whitespace())
+        .unwrap_or(rest.len());
+    Some(String::from_utf8_lossy(&rest[..end]).into_owned())
+}
+
+/// Baseline `parseShortLog`: one `count<TAB>Name <email>` line per author.
+fn parse_shortlog(output: &[u8]) -> Result<Vec<ContributorCount>, GitError> {
+    let mut counts = Vec::new();
+    for line in output.split(|byte| *byte == b'\n') {
+        // `bufio.Scanner` drops a trailing `\r` as well.
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        if line.is_empty() {
+            continue;
+        }
+        let Some(tab) = line.iter().position(|byte| *byte == b'\t') else {
+            return Err(invalid_shortlog_line(line));
+        };
+        let count = String::from_utf8_lossy(trim_ascii(&line[..tab]))
+            .parse::<i32>()
+            .map_err(|_| invalid_shortlog_line(line))?;
+        let author = String::from_utf8_lossy(&line[tab + 1..]);
+        let (name, email) = parse_contributor_author(&author);
+        counts.push(ContributorCount { name, email, count });
+    }
+    Ok(counts)
+}
+
+fn invalid_shortlog_line(line: &[u8]) -> GitError {
+    GitError::Message(format!(
+        "invalid git shortlog line: {:?}",
+        String::from_utf8_lossy(line)
+    ))
+}
+
+/// Approximates Go's `lenientParseAddress` + caller fallback: `Name <addr>`,
+/// `<addr>`, bare `addr` and `addr (Name)` are parsed; multi-address or
+/// trailing-token input falls back to the recovery that keeps the text after
+/// the last `<`; anything else keeps the whole string as the name.
+fn parse_contributor_author(author: &str) -> (String, String) {
+    if let Some(address) = parse_single_address(author) {
+        return address;
+    }
+    if let Some(address) = lenient_multi_address(author) {
+        return address;
+    }
+    (author.to_owned(), String::new())
+}
+
+fn parse_single_address(author: &str) -> Option<(String, String)> {
+    let trimmed = author.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Some(open) = trimmed.find('<') {
+        if trimmed.ends_with('>')
+            && trimmed.matches('<').count() == 1
+            && trimmed.matches('>').count() == 1
+            && !trimmed.contains(',')
+        {
+            let address = &trimmed[open + 1..trimmed.len() - 1];
+            if is_addr_spec(address) {
+                return Some((unquote_name(trimmed[..open].trim()), address.to_owned()));
+            }
+        }
+        return None;
+    }
+    if trimmed.contains(',') {
+        return None;
+    }
+    // Go reports the comment of `addr (comment)` as the display name.
+    if let Some(open) = trimmed.find('(') {
+        let comment = trimmed[open + 1..].strip_suffix(')')?;
+        let address = trimmed[..open].trim();
+        if is_addr_spec(address) {
+            return Some((comment.trim().to_owned(), address.to_owned()));
+        }
+        return None;
+    }
+    if is_addr_spec(trimmed) {
+        return Some((String::new(), trimmed.to_owned()));
+    }
+    None
+}
+
+/// Go's recovery for inputs the parser rejects with "expected single address":
+/// keep everything from the last `<`, trimming spaces and angle brackets.
+fn lenient_multi_address(author: &str) -> Option<(String, String)> {
+    let open = author.rfind('<')?;
+    let closed_before = author[..open].contains('>');
+    let trailing = author
+        .rfind('>')
+        .is_some_and(|close| !author[close + 1..].trim().is_empty());
+    if !(author.contains(',') || closed_before || trailing) {
+        return None;
+    }
+    let name = author[..open].trim().to_owned();
+    let address = author[open..]
+        .trim_matches(|character| matches!(character, ' ' | '<' | '>'))
+        .to_owned();
+    Some((name, address))
+}
+
+/// Go `mail.Address` unquotes the display name; only backslash escapes matter.
+fn unquote_name(name: &str) -> String {
+    if name.len() >= 2 && name.starts_with('"') && name.ends_with('"') {
+        let mut unquoted = String::with_capacity(name.len() - 2);
+        let mut escaped = false;
+        for character in name[1..name.len() - 1].chars() {
+            if escaped {
+                unquoted.push(character);
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else {
+                unquoted.push(character);
+            }
+        }
+        unquoted
+    } else {
+        name.to_owned()
+    }
+}
+
+fn is_addr_spec(text: &str) -> bool {
+    !text.is_empty() && text.contains('@') && !text.chars().any(char::is_whitespace)
 }
 
 /// Baseline `rel`: make an absolute slash path relative to the repository
@@ -1979,6 +2285,155 @@ mod tests {
         assert!(matches!(
             pump_commit_log(child, "deadbeef".to_owned(), |_commit| async { true }).await,
             Err(GitError::RevisionNotFound(_))
+        ));
+    }
+
+    #[test]
+    fn parses_shortlog_authors() {
+        assert_eq!(
+            parse_contributor_author("Fixture Author <fixture@example.com>"),
+            (
+                "Fixture Author".to_owned(),
+                "fixture@example.com".to_owned()
+            )
+        );
+        assert_eq!(
+            parse_contributor_author("foo@gmail.com <foo@gmail.com>"),
+            ("foo@gmail.com".to_owned(), "foo@gmail.com".to_owned())
+        );
+        assert_eq!(
+            parse_contributor_author("<x@y>"),
+            (String::new(), "x@y".to_owned())
+        );
+        assert_eq!(
+            parse_contributor_author("  x@y  "),
+            (String::new(), "x@y".to_owned())
+        );
+        assert_eq!(
+            parse_contributor_author("\"Jane Doe\" <x@y>"),
+            ("Jane Doe".to_owned(), "x@y".to_owned())
+        );
+        // Go reports the comment of `addr (comment)` as the display name.
+        assert_eq!(
+            parse_contributor_author("x@y (comment)"),
+            ("comment".to_owned(), "x@y".to_owned())
+        );
+        // "expected single address" recovery keeps everything after the last `<`.
+        assert_eq!(
+            parse_contributor_author("Jane Doe <x@y>, John <z@w>"),
+            ("Jane Doe <x@y>, John".to_owned(), "z@w".to_owned())
+        );
+        assert_eq!(
+            parse_contributor_author("Name <x@y> extra"),
+            ("Name".to_owned(), "x@y> extra".to_owned())
+        );
+        // Anything else keeps the raw author as the name.
+        assert_eq!(
+            parse_contributor_author("Jane Doe"),
+            ("Jane Doe".to_owned(), String::new())
+        );
+        assert_eq!(
+            parse_contributor_author("a@b, c@d"),
+            ("a@b, c@d".to_owned(), String::new())
+        );
+        assert_eq!(
+            parse_contributor_author("<x@y"),
+            ("<x@y".to_owned(), String::new())
+        );
+    }
+
+    #[test]
+    fn parses_shortlog_lines() {
+        let counts = parse_shortlog(
+            b"     2\tFixture Author <fixture@example.com>\n1\tfixture <fixture@localhost>\n",
+        )
+        .expect("parse");
+        assert_eq!(
+            counts,
+            vec![
+                ContributorCount {
+                    name: "Fixture Author".to_owned(),
+                    email: "fixture@example.com".to_owned(),
+                    count: 2,
+                },
+                ContributorCount {
+                    name: "fixture".to_owned(),
+                    email: "fixture@localhost".to_owned(),
+                    count: 1,
+                },
+            ]
+        );
+        assert!(parse_shortlog(b"no tab here\n").is_err());
+    }
+
+    #[test]
+    fn extracts_invalid_object_names() {
+        assert_eq!(
+            extract_invalid_object_name(b"fatal: Not a valid object name deadbeef\n").as_deref(),
+            Some("deadbeef")
+        );
+        assert_eq!(extract_invalid_object_name(b"fatal: other\n"), None);
+    }
+
+    #[tokio::test]
+    async fn reads_root_behind_ahead_and_contributors() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (dir, head) = fixture_repo(tmp.path());
+        let repo = GitRepo::new(dir);
+
+        assert_eq!(repo.first_ever_commit().await.expect("first"), head);
+        assert_eq!(
+            repo.behind_ahead("", "").await.expect("behind_ahead"),
+            BehindAhead {
+                behind: 0,
+                ahead: 0
+            }
+        );
+        assert!(matches!(
+            repo.behind_ahead("missing", "HEAD").await,
+            Err(GitError::RevisionNotFound(_))
+        ));
+
+        // A real `after` includes the single commit; a future one excludes it.
+        // (`--after` is always emitted: an unset timestamp arrives as the Unix
+        // epoch, which git's approxidate reads as "now".)
+        let counts = repo
+            .contributor_counts("", 1_000_000_000, b"")
+            .await
+            .expect("counts");
+        assert_eq!(
+            counts,
+            vec![ContributorCount {
+                name: "test".to_owned(),
+                email: "test@example.com".to_owned(),
+                count: 1,
+            }]
+        );
+        assert!(repo
+            .contributor_counts("", now_seconds() + 86_400, b"")
+            .await
+            .expect("counts")
+            .is_empty());
+        assert!(matches!(
+            repo.contributor_counts("missing", 1_000_000_000, b"").await,
+            Err(GitError::RevisionNotFound(_))
+        ));
+
+        // `merge-base --octopus` needs at least two revspecs.
+        assert!(repo.merge_base_octopus(&["HEAD".to_owned()]).await.is_err());
+        assert_eq!(
+            repo.merge_base_octopus(&["HEAD".to_owned(), head.clone()])
+                .await
+                .expect("octopus"),
+            head
+        );
+        // A non-hex name produces "Not a valid object name"; a full hex OID
+        // that is absent produces "Not a valid commit name" and is *not*
+        // mapped by the baseline.
+        assert!(matches!(
+            repo.merge_base_octopus(&["HEAD".to_owned(), "nope".to_owned()])
+                .await,
+            Err(GitError::RevisionNotFound(spec)) if spec == "nope"
         ));
     }
 }

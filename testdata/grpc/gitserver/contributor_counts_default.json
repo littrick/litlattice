@@ -1,0 +1,10 @@
+{
+  "expected": {
+    "counts": []
+  },
+  "request": {
+    "repo_name": "test/git-refs-fixture"
+  },
+  "rpc": "contributor_counts",
+  "service": "gitserver"
+}

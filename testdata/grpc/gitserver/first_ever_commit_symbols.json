@@ -1,0 +1,30 @@
+{
+  "expected": {
+    "commit": {
+      "author": {
+        "date": {
+          "nanos": 0,
+          "seconds": 1794076488
+        },
+        "email": "fixture@localhost",
+        "name": "fixture"
+      },
+      "committer": {
+        "date": {
+          "nanos": 0,
+          "seconds": 1794076488
+        },
+        "email": "fixture@localhost",
+        "name": "fixture"
+      },
+      "message": "symbols fixtures",
+      "oid": "5abdba2559d350afdf6b4dcbf32f5edaadcbdda1",
+      "parents": []
+    }
+  },
+  "request": {
+    "repo_name": "test/symbols-fixture"
+  },
+  "rpc": "first_ever_commit",
+  "service": "gitserver"
+}

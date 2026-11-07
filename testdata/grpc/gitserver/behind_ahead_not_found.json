@@ -1,0 +1,15 @@
+{
+  "expected": {
+    "error": {
+      "code": "not_found",
+      "message": "revision not found"
+    }
+  },
+  "request": {
+    "left": "nope",
+    "repo_name": "test/git-refs-fixture",
+    "right": "main"
+  },
+  "rpc": "behind_ahead",
+  "service": "gitserver"
+}

@@ -1,0 +1,24 @@
+{
+  "expected": {
+    "counts": [
+      {
+        "author": {
+          "date": null,
+          "email": "fixture@localhost",
+          "name": "fixture"
+        },
+        "count": 1
+      }
+    ]
+  },
+  "request": {
+    "after": {
+      "nanos": 0,
+      "seconds": 1000000000
+    },
+    "range": "HEAD",
+    "repo_name": "test/symbols-fixture"
+  },
+  "rpc": "contributor_counts",
+  "service": "gitserver"
+}
