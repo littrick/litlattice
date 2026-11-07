@@ -22,9 +22,8 @@ pub mod debug;
 pub mod filter;
 pub mod metrics;
 pub mod protocol;
+pub mod store;
 pub mod zipcache;
-
-// Wired in by the archive store commit.
 
 use config::SearcherConfig;
 use protocol::Request as SearchRequest;
