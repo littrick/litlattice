@@ -8,3 +8,28 @@ publish.workspace = true
 
 [dependencies]
 sg-core = { path = "../../base/sg-core" }
+sg-git = { path = "../../domain/sg-git" }
+sg-http = { path = "../../net/sg-http" }
+sg-metrics = { path = "../../base/sg-metrics" }
+sg-proto = { path = "../../net/sg-proto" }
+async-trait = { workspace = true }
+bytes = { workspace = true }
+http = { workspace = true }
+http-body-util = { workspace = true }
+hyper = { workspace = true }
+prost = { workspace = true }
+regex = { workspace = true }
+regex-syntax = { workspace = true }
+sha2 = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+tokio-util = { workspace = true }
+tonic = { workspace = true }
+tracing = { workspace = true }
+memmap2 = "0.9"
+tar = "0.4"
+walkdir = "2"
+zip = { version = "2", default-features = false }
+
+[dev-dependencies]
+tempfile = "3"
