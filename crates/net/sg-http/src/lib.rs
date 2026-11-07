@@ -94,6 +94,57 @@ pub async fn serve(
         }
     }
 
+    drain(graceful, &mut connections).await;
+
+    Ok(())
+}
+
+/// Serve plain HTTP on an already-bound listener until `shutdown` is cancelled.
+///
+/// The Go baseline runs the per-service debug server (`SRC_PROF_HTTP`, which
+/// exposes `/metrics`) outside the gRPC multiplexer; this is the same shape for
+/// the Rust services.
+pub async fn serve_http(
+    listener: TcpListener,
+    http: HttpHandler,
+    shutdown: CancellationToken,
+) -> io::Result<()> {
+    let mut connections: JoinSet<()> = JoinSet::new();
+    let graceful = GracefulShutdown::new();
+
+    loop {
+        tokio::select! {
+            _ = shutdown.cancelled() => break,
+            accepted = listener.accept() => {
+                let (stream, peer) = accepted?;
+                let http = http.clone();
+                let watcher = graceful.watcher();
+                connections.spawn(async move {
+                    let service = service_fn(move |req: Request<Incoming>| {
+                        let http = http.clone();
+                        async move { Ok::<_, std::convert::Infallible>(http(req).await) }
+                    });
+                    let builder = auto::Builder::new(TokioExecutor::new());
+                    let conn = builder.serve_connection(TokioIo::new(stream), service);
+                    if let Err(err) = watcher.watch(conn).await {
+                        tracing::debug!(%peer, error = %err, "connection closed with error");
+                    }
+                });
+            }
+            Some(joined) = connections.join_next() => {
+                if let Err(err) = joined {
+                    tracing::error!(error = %err, "connection task failed");
+                }
+            }
+        }
+    }
+
+    drain(graceful, &mut connections).await;
+
+    Ok(())
+}
+
+async fn drain(graceful: GracefulShutdown, connections: &mut JoinSet<()>) {
     let drained = graceful.shutdown();
     tokio::pin!(drained);
     if tokio::time::timeout(DRAIN_GRACE, &mut drained)
@@ -109,8 +160,6 @@ pub async fn serve(
         let _ = tokio::time::timeout(Duration::from_secs(1), drained).await;
     }
     while connections.join_next().await.is_some() {}
-
-    Ok(())
 }
 
 async fn dispatch(
