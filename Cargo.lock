@@ -1066,6 +1066,13 @@ version = "0.1.0"
 [[package]]
 name = "sg-git"
 version = "0.1.0"
+dependencies = [
+ "bytes",
+ "sg-proto",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+]
 
 [[package]]
 name = "sg-graphql"
@@ -1181,6 +1188,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sg-core",
+ "sg-git",
  "sg-http",
  "sg-metrics",
  "sg-proto",
