@@ -2,6 +2,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let protos = [
         "proto/symbols/v1/symbols.proto",
         "proto/searcher/v1/searcher.proto",
+        "proto/gitserver/v1/gitserver.proto",
     ];
 
     tonic_build::configure()

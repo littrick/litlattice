@@ -69,6 +69,27 @@ impl EnvReader {
         parse_bool(&raw)
     }
 
+    /// Baseline `env.ChooseFallbackVariableName`: pick the first name whose raw
+    /// environment value is non-empty, falling back to `first`, then register
+    /// only the chosen name.
+    pub fn get_with_fallback(
+        &mut self,
+        first: &str,
+        additional: &[&str],
+        default: &str,
+        description: &str,
+    ) -> String {
+        let chosen = std::iter::once(first)
+            .chain(additional.iter().copied())
+            .find(|name| {
+                env::var(name)
+                    .map(|value| !value.is_empty())
+                    .unwrap_or(false)
+            })
+            .unwrap_or(first);
+        self.get(chosen, default, description)
+    }
+
     /// Read a variable registered earlier; panics if it was never registered.
     pub fn value(&self, name: &str) -> String {
         assert!(self.locked, "env.value({name}) called before env.Lock()");

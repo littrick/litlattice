@@ -16,6 +16,13 @@ use tonic::{Request as GrpcRequest, Response as GrpcResponse, Status};
 use sg_core::{ConfigError, EnvReader, Service, ServiceContext, ServiceError};
 use sg_proto::symbols as pb;
 
+pub mod config;
+pub mod ctags;
+pub mod gitserver;
+pub mod tar;
+
+use config::SymbolsConfig;
+
 /// Baseline `cmd/symbols/shared` binds a fixed address.
 pub const DEFAULT_ADDR: &str = ":3184";
 
@@ -25,22 +32,27 @@ pub fn service_name() -> &'static str {
     "symbols"
 }
 
-/// The symbols service. For now only the lifecycle and health endpoints are
-/// implemented; the search RPCs return `UNIMPLEMENTED`.
+/// The symbols service. The fetch/parse building blocks are implemented; the
+/// search RPCs still return `UNIMPLEMENTED` until the SQLite store lands.
 pub struct SymbolsService {
     addr: String,
+    config: Option<SymbolsConfig>,
 }
 
 impl SymbolsService {
     pub fn new() -> Self {
         Self {
             addr: DEFAULT_ADDR.to_owned(),
+            config: None,
         }
     }
 
     /// Test hook: bind a different address.
     pub fn with_addr(addr: impl Into<String>) -> Self {
-        Self { addr: addr.into() }
+        Self {
+            addr: addr.into(),
+            config: None,
+        }
     }
 }
 
@@ -64,6 +76,7 @@ impl Service for SymbolsService {
             "false",
             "check that go-sqlite3 works then exit 0 if it's ok or 1 if not",
         );
+        self.config = Some(SymbolsConfig::load(env)?);
         Ok(())
     }
 
@@ -71,10 +84,18 @@ impl Service for SymbolsService {
         if self.addr.is_empty() {
             return Err(ConfigError::new("symbols listen address must not be empty"));
         }
-        Ok(())
+        self.config
+            .as_ref()
+            .ok_or_else(|| ConfigError::new("symbols configuration was not loaded"))?
+            .validate()
     }
 
     async fn start(self: Box<Self>, ctx: ServiceContext) -> Result<(), ServiceError> {
+        let config = self
+            .config
+            .clone()
+            .ok_or_else(|| ServiceError::new("symbols configuration was not loaded"))?;
+
         let listener = TcpListener::bind(self.addr.as_str()).await.map_err(|err| {
             ServiceError::with_source(format!("failed to listen on {}", self.addr), err)
         })?;
@@ -85,7 +106,12 @@ impl Service for SymbolsService {
         let http: sg_http::HttpHandler =
             Arc::new(|req: Request<Incoming>| Box::pin(async move { http_response(req) }));
 
-        tracing::info!(addr = %self.addr, "symbols listening");
+        tracing::info!(
+            addr = %self.addr,
+            cache_dir = %config.cache_dir.display(),
+            gitservers = ?config.gitserver_addrs,
+            "symbols listening"
+        );
         ctx.ready.mark_ready();
 
         sg_http::serve(listener, routes, http, ctx.shutdown.clone())
@@ -166,21 +192,6 @@ mod tests {
 
     use super::*;
 
-    fn test_context(shutdown: CancellationToken) -> (ServiceContext, ReadyHandle) {
-        let mut env = EnvReader::new();
-        env.lock();
-        let ready = ReadyHandle::new();
-        (
-            ServiceContext {
-                service_name: service_name(),
-                shutdown,
-                ready: ready.clone(),
-                env: Arc::new(LockedEnv::new(env)),
-            },
-            ready,
-        )
-    }
-
     #[tokio::test]
     async fn serves_http_healthz_and_grpc_healthz_on_one_port() {
         let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("probe bind");
@@ -188,12 +199,18 @@ mod tests {
         drop(probe);
 
         let shutdown = CancellationToken::new();
-        let (ctx, ready) = test_context(shutdown.clone());
-        let server = tokio::spawn(async move {
-            Box::new(SymbolsService::with_addr(addr.to_string()))
-                .start(ctx)
-                .await
-        });
+        let ready = ReadyHandle::new();
+        let mut service = Box::new(SymbolsService::with_addr(addr.to_string()));
+        let mut env = EnvReader::new();
+        service.configure(&mut env).expect("configure");
+        env.lock();
+        let ctx = ServiceContext {
+            service_name: service_name(),
+            shutdown: shutdown.clone(),
+            ready: ready.clone(),
+            env: Arc::new(LockedEnv::new(env)),
+        };
+        let server = tokio::spawn(async move { service.start(ctx).await });
         ready.wait_ready().await;
 
         // gRPC over HTTP/2 prior knowledge.
