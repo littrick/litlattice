@@ -1,0 +1,12 @@
+{
+  "expected": {
+    "clone_in_progress": false,
+    "clone_progress": "",
+    "cloned": true
+  },
+  "request": {
+    "repo_name": "test/symbols-fixture"
+  },
+  "rpc": "repo_clone_progress",
+  "service": "gitserver"
+}

@@ -248,6 +248,7 @@ enum GitserverRpc {
     BehindAhead,
     Blame,
     DiskInfo,
+    RepoCloneProgress,
 }
 
 impl GitserverRpc {
@@ -273,12 +274,13 @@ impl GitserverRpc {
             "behind_ahead" => Ok(Self::BehindAhead),
             "blame" => Ok(Self::Blame),
             "disk_info" => Ok(Self::DiskInfo),
+            "repo_clone_progress" => Ok(Self::RepoCloneProgress),
             other => Err(format!(
                 "unknown gitserver rpc {other:?} (archive, read_file, changed_files, \
                  resolve_revision, get_object, default_branch, merge_base, stat, read_dir, \
                  list_refs, get_commit, rev_at_time, raw_diff, commit_log, \
                  merge_base_octopus, contributor_counts, first_ever_commit, behind_ahead, \
-                 blame, disk_info)"
+                 blame, disk_info, repo_clone_progress)"
             )),
         }
     }
@@ -1119,6 +1121,15 @@ fn gitserver_disk_info_request(_value: &Value) -> Result<gpb::DiskInfoRequest, S
     Ok(gpb::DiskInfoRequest {})
 }
 
+fn gitserver_repo_clone_progress_request(
+    value: &Value,
+) -> Result<gpb::RepoCloneProgressRequest, String> {
+    // The empty name is a valid request that the server rejects.
+    Ok(gpb::RepoCloneProgressRequest {
+        repo_name: optional_string(value, "repo_name")?,
+    })
+}
+
 fn gitserver_blame_request(value: &Value) -> Result<gpb::BlameRequest, String> {
     let range = match value.get("range") {
         None | Some(Value::Null) => None,
@@ -1658,6 +1669,20 @@ async fn call_gitserver(
                 .into_inner();
             Ok(normalize_disk_info(&response))
         }
+        GitserverRpc::RepoCloneProgress => {
+            let response = client
+                .repo_clone_progress(
+                    gitserver_repo_clone_progress_request(request)
+                        .map_err(GitserverFailure::Fixture)?,
+                )
+                .await?
+                .into_inner();
+            Ok(json!({
+                "cloned": response.cloned,
+                "clone_in_progress": response.clone_in_progress,
+                "clone_progress": response.clone_progress,
+            }))
+        }
         GitserverRpc::ChangedFiles => {
             let mut stream = client
                 .changed_files(
@@ -2164,5 +2189,15 @@ mod tests {
 
         let request = gitserver_disk_info_request(&json!({})).expect("disk_info request");
         assert_eq!(request, gpb::DiskInfoRequest {});
+
+        let request = gitserver_repo_clone_progress_request(&json!({
+            "repo_name": "r",
+        }))
+        .expect("repo_clone_progress request");
+        assert_eq!(request.repo_name, "r");
+
+        let request = gitserver_repo_clone_progress_request(&json!({"repo_name": ""}))
+            .expect("repo_clone_progress request");
+        assert!(request.repo_name.is_empty());
     }
 }

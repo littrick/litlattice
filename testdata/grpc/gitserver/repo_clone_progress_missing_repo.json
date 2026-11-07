@@ -1,0 +1,13 @@
+{
+  "expected": {
+    "error": {
+      "code": "invalid_argument",
+      "message": "repo must be specified"
+    }
+  },
+  "request": {
+    "repo_name": ""
+  },
+  "rpc": "repo_clone_progress",
+  "service": "gitserver"
+}

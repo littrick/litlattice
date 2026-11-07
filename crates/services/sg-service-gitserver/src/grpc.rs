@@ -3,8 +3,8 @@
 //! Implemented so far: `Archive`, `ReadFile`, `ChangedFiles`, `ResolveRevision`,
 //! `GetObject`, `DefaultBranch`, `MergeBase`, `MergeBaseOctopus`, `Stat`,
 //! `ReadDir`, `ListRefs`, `GetCommit`, `RevAtTime`, `RawDiff`, `CommitLog`,
-//! `ContributorCounts`, `FirstEverCommit`, `BehindAhead`, `Blame` and
-//! `DiskInfo` (M9.2). Every other RPC returns `UNIMPLEMENTED`.
+//! `ContributorCounts`, `FirstEverCommit`, `BehindAhead`, `Blame`, `DiskInfo`
+//! and `RepoCloneProgress` (M9.2). Every other RPC returns `UNIMPLEMENTED`.
 
 use std::pin::Pin;
 use std::sync::Arc;
@@ -22,7 +22,7 @@ use crate::git::{
     CommitLogOrder, GitCommit, GitError, GitRef, GitRepo, RawDiffComparison, RefType, TreeEntry,
     CHUNK_MESSAGE_SIZE,
 };
-use crate::repo::repo_dir;
+use crate::repo::{normalize_repo, repo_dir};
 
 type Stream<T> = Pin<Box<dyn tokio_stream::Stream<Item = Result<T, Status>> + Send>>;
 
@@ -48,6 +48,11 @@ impl Grpc {
             ))),
         }
     }
+}
+
+/// `isAlwaysCloningTest`: `NormalizeRepo(name).Equal("github.com/sourcegraphtest/alwayscloningtest")`.
+fn is_always_cloning_test(name: &str) -> bool {
+    normalize_repo(name).eq_ignore_ascii_case("github.com/sourcegraphtest/alwayscloningtest")
 }
 
 fn unimplemented(rpc: &str) -> Status {
@@ -356,9 +361,38 @@ impl gpb::gitserver_service_server::GitserverService for Grpc {
 
     async fn repo_clone_progress(
         &self,
-        _request: GrpcRequest<gpb::RepoCloneProgressRequest>,
+        request: GrpcRequest<gpb::RepoCloneProgressRequest>,
     ) -> Result<GrpcResponse<gpb::RepoCloneProgressResponse>, Status> {
-        Err(unimplemented("repo_clone_progress"))
+        let request = request.into_inner();
+        if request.repo_name.is_empty() {
+            return Err(Status::invalid_argument("repo must be specified"));
+        }
+
+        let always_cloning = is_always_cloning_test(&request.repo_name);
+
+        // `repoCloned`: `<gitdir>/HEAD` exists. A name that escapes
+        // `repos_dir` cannot have been cloned; the baseline panics there.
+        let cloned = match repo_dir(&self.repos_dir, &request.repo_name) {
+            Some(dir) => match std::fs::metadata(dir.join("HEAD")) {
+                Ok(_) => true,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,
+                Err(err) => return Err(Status::unknown(format!("determine clone status: {err}"))),
+            },
+            None => false,
+        };
+
+        // `RepositoryLocker.Status` only has entries while a clone is in
+        // flight; the Rust server has no write path yet (M9.3), so the locker
+        // is empty and the `!cloned && locked` branch cannot trigger.
+        let mut response = gpb::RepoCloneProgressResponse {
+            cloned,
+            clone_in_progress: always_cloning,
+            clone_progress: String::new(),
+        };
+        if always_cloning {
+            response.clone_progress = "This will never finish cloning".to_owned();
+        }
+        Ok(GrpcResponse::new(response))
     }
 
     async fn is_perforce_path_cloneable(
@@ -965,5 +999,28 @@ impl gpb::gitserver_service_server::GitserverService for Grpc {
         Ok(GrpcResponse::new(gpb::MergeBaseOctopusResponse {
             merge_base_commit_sha,
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_always_cloning_test;
+
+    #[test]
+    fn matches_the_always_cloning_test_repo() {
+        assert!(is_always_cloning_test(
+            "github.com/sourcegraphtest/alwayscloningtest"
+        ));
+        // `NormalizeRepo` lowercases GitHub paths and `Equal` folds case.
+        assert!(is_always_cloning_test(
+            "GitHub.com/SourcegraphTest/AlwaysCloningTest"
+        ));
+        assert!(is_always_cloning_test(
+            "/github.com//sourcegraphtest/alwayscloningtest/"
+        ));
+        assert!(!is_always_cloning_test("github.com/sourcegraphtest/other"));
+        assert!(!is_always_cloning_test(
+            "gitlab.com/sourcegraphtest/alwayscloningtest"
+        ));
     }
 }

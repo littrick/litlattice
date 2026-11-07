@@ -1,0 +1,12 @@
+{
+  "expected": {
+    "clone_in_progress": true,
+    "clone_progress": "This will never finish cloning",
+    "cloned": false
+  },
+  "request": {
+    "repo_name": "github.com/sourcegraphtest/alwayscloningtest"
+  },
+  "rpc": "repo_clone_progress",
+  "service": "gitserver"
+}

@@ -1,0 +1,12 @@
+{
+  "expected": {
+    "clone_in_progress": false,
+    "clone_progress": "",
+    "cloned": false
+  },
+  "request": {
+    "repo_name": "test/missing-clone-progress-fixture"
+  },
+  "rpc": "repo_clone_progress",
+  "service": "gitserver"
+}
