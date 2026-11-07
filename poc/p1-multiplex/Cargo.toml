@@ -1,0 +1,23 @@
+[package]
+name = "p1-multiplex"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Independent workspace: PoCs are not part of the production build.
+[workspace]
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+hyper = { version = "1", features = ["server", "client", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["server-auto", "tokio", "client-legacy"] }
+http-body-util = "0.1"
+bytes = "1"
+tonic = "0.12"
+prost = "0.13"
+tower = "0.5"
+serde_json = "1"
+http = "1"
+
+[build-dependencies]
+tonic-build = "0.12"
