@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use tokio::time::Instant;
 
-use crate::cache::Cache;
+use crate::cache::{Cache, ParseAmount};
 use crate::store::{self, SearchParams, Symbol};
 
 /// `api.searchTimeout`.
@@ -35,6 +35,8 @@ pub struct Params {
 pub struct Outcome {
     pub symbols: Vec<Symbol>,
     pub limit_hit: bool,
+    /// How the index was obtained, for the `parseAmount` metric label.
+    pub parse_amount: ParseAmount,
 }
 
 pub struct SearchEngine {
@@ -52,7 +54,7 @@ impl SearchEngine {
             _ => SEARCH_TIMEOUT,
         };
 
-        let db_file = match tokio::time::timeout_at(
+        let (db_file, parse_amount) = match tokio::time::timeout_at(
             Instant::now() + timeout,
             self.cache.get_or_create(&params.repo, &params.commit),
         )
@@ -79,6 +81,7 @@ impl SearchEngine {
         Ok(Outcome {
             symbols: result.symbols,
             limit_hit: result.limit_hit,
+            parse_amount,
         })
     }
 }

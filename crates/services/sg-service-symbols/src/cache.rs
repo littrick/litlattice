@@ -24,10 +24,30 @@ use crate::index::Indexer;
 const SYMBOLS_DB_VERSION: &str = "5";
 const EVICTION_INTERVAL: Duration = Duration::from_secs(10);
 
+/// Which code path produced a repository database, exported as the
+/// `parseAmount` label of `src_codeintel_symbols_api_*`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ParseAmount {
+    #[default]
+    Full,
+    Partial,
+    Cached,
+}
+
+impl ParseAmount {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Full => "full-parse",
+            Self::Partial => "partial-parse",
+            Self::Cached => "cached-parse",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 enum BuildState {
     Building,
-    Done(Result<PathBuf, String>),
+    Done(Result<(PathBuf, ParseAmount), String>),
 }
 
 pub struct Cache {
@@ -78,7 +98,8 @@ impl Cache {
         });
     }
 
-    /// Return the database path for `repo@commit`, building it if needed.
+    /// Return the database path for `repo@commit`, building it if needed, plus
+    /// the path that satisfied the request (`cached-parse` on a hit).
     ///
     /// The build itself is not tied to the caller: dropping the returned
     /// future only stops waiting, like `diskcache`'s background fetch.
@@ -86,10 +107,10 @@ impl Cache {
         self: &Arc<Self>,
         repo: &str,
         commit: &str,
-    ) -> Result<PathBuf, String> {
+    ) -> Result<(PathBuf, ParseAmount), String> {
         let path = self.db_path(repo, commit);
         if path.exists() {
-            return Ok(path);
+            return Ok((path, ParseAmount::Cached));
         }
 
         let key = key(repo, commit);
@@ -106,7 +127,7 @@ impl Cache {
                 let commit = commit.to_owned();
                 self.tracker.spawn(async move {
                     let result = cache.build(&repo, &commit, &build_path).await;
-                    let state = BuildState::Done(result.map(|()| build_path));
+                    let state = BuildState::Done(result.map(|amount| (build_path, amount)));
                     cache.registry.lock().expect("cache registry").remove(&key);
                     let _ = tx.send(state);
                 });
@@ -140,13 +161,19 @@ impl Cache {
         self.dir.join(encode(SYMBOLS_DB_VERSION)).join(encode(repo))
     }
 
-    async fn build(&self, repo: &str, commit: &str, db_path: &Path) -> Result<(), String> {
+    async fn build(&self, repo: &str, commit: &str, db_path: &Path) -> Result<ParseAmount, String> {
+        let metrics = crate::metrics::Metrics::global();
+        metrics.fetch_enqueued();
         let permit = tokio::select! {
             permit = Arc::clone(&self.semaphore).acquire_owned() => {
                 permit.map_err(|err| err.to_string())?
             }
-            _ = self.token.cancelled() => return Err("shutting down".to_owned()),
+            _ = self.token.cancelled() => {
+                metrics.fetch_dequeued();
+                return Err("shutting down".to_owned());
+            }
         };
+        metrics.fetch_dequeued();
 
         let result = tokio::select! {
             result = tokio::time::timeout(
@@ -175,10 +202,15 @@ impl Cache {
             return Ok(());
         }
 
+        let metrics = crate::metrics::Metrics::global();
         let mut entries: Vec<(SystemTime, PathBuf, u64)> = Vec::new();
         let mut total: u64 = 0;
-        collect_files(&self.dir, &mut entries, &mut total)
-            .map_err(|err| format!("walk {}: {err}", self.dir.display()))?;
+        if let Err(err) = collect_files(&self.dir, &mut entries, &mut total) {
+            metrics.eviction_error();
+            return Err(format!("walk {}: {err}", self.dir.display()));
+        }
+        // `EvictStats.CacheSize` is the size before evicting.
+        metrics.cache_size(total);
         if total <= self.max_bytes {
             return Ok(());
         }
@@ -193,6 +225,7 @@ impl Cache {
             }
             if std::fs::remove_file(&path).is_ok() {
                 total = total.saturating_sub(size);
+                metrics.eviction();
             }
         }
         Ok(())

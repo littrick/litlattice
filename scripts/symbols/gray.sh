@@ -31,6 +31,8 @@ RUST_BIN="${RUST_BIN:-$REPO_DIR/target/debug/symbols}"
 GO_ADDR="127.0.0.1:3184"
 RUST_ADDR="127.0.0.1:13184"
 PROXY_ADDR="127.0.0.1:13185"
+# Rust debug/metrics port; the test_ws stack already uses 6060/6063/6064.
+RUST_PROF_ADDR="${RUST_PROF_ADDR:-127.0.0.1:6074}"
 
 mkdir -p "$RUN_DIR" "$LOG_DIR"
 
@@ -49,6 +51,7 @@ start_rust() {
     local cache="$RUN_DIR/rust-symbols-cache"
     mkdir -p "$cache"
     SG_SYMBOLS_ADDR="$RUST_ADDR" \
+    SRC_PROF_HTTP="$RUST_PROF_ADDR" \
     SRC_GIT_SERVERS="$GIT_SERVERS" \
     SYMBOLS_CACHE_DIR="$cache" \
     CTAGS_COMMAND="$CTAGS" \

@@ -9,6 +9,7 @@
 use std::collections::HashMap;
 use std::io;
 use std::pin::Pin;
+use std::time::Instant;
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -101,6 +102,18 @@ impl GitserverClient {
         commit: &str,
         paths: &[String],
     ) -> Result<TarByteStream, String> {
+        let started = Instant::now();
+        let result = self.fetch_tar_inner(repo, commit, paths).await;
+        crate::metrics::Metrics::global().gitserver_observe("FetchTar", started, result.is_err());
+        result
+    }
+
+    async fn fetch_tar_inner(
+        &self,
+        repo: &str,
+        commit: &str,
+        paths: &[String],
+    ) -> Result<TarByteStream, String> {
         let addr = self
             .addr_for(repo)
             .ok_or_else(|| "no gitserver address configured".to_owned())?;
@@ -128,6 +141,22 @@ impl GitserverClient {
 
     /// Paths that changed between two commits (`gitserver.ChangedFiles`).
     pub async fn changed_files(
+        &self,
+        repo: &str,
+        base: &str,
+        head: &str,
+    ) -> Result<Vec<ChangedFile>, String> {
+        let started = Instant::now();
+        let result = self.changed_files_inner(repo, base, head).await;
+        crate::metrics::Metrics::global().gitserver_observe(
+            "ChangedFiles",
+            started,
+            result.is_err(),
+        );
+        result
+    }
+
+    async fn changed_files_inner(
         &self,
         repo: &str,
         base: &str,

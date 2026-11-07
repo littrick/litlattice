@@ -9,17 +9,19 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Instant, SystemTime};
 
 use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinSet;
 use tokio_util::io::StreamReader;
 use tokio_util::sync::CancellationToken;
 
+use crate::cache::ParseAmount;
 use crate::config::SymbolsConfig;
 use crate::ctags::{CtagsProcess, Entry};
 use crate::gitserver::{ChangeStatus, GitserverReader};
 use crate::language::{self, ParserType};
+use crate::metrics::Metrics;
 use crate::store::{self, Symbol};
 use crate::tar;
 
@@ -35,29 +37,36 @@ impl Indexer {
 
     /// Write the database for `repo@commit` to `db_path`, reusing the newest
     /// database for the repository when a diff is available.
+    ///
+    /// The returned [`ParseAmount`] is the baseline `parseAmount` label:
+    /// `partial-parse` for the incremental path, `full-parse` otherwise.
     pub async fn write_database(
         &self,
         repo: &str,
         commit: &str,
         db_path: &Path,
         token: &CancellationToken,
-    ) -> Result<(), String> {
+    ) -> Result<ParseAmount, String> {
         let repo_dir = db_path
             .parent()
             .ok_or_else(|| "database path has no parent directory".to_owned())?;
 
-        let result = match self.incremental_base(repo_dir) {
-            Some((newest, old_commit)) => {
+        let (result, amount) = match self.incremental_base(repo_dir) {
+            Some((newest, old_commit)) => (
                 self.write_incrementally(repo, commit, db_path, &newest, &old_commit, token)
-                    .await
-            }
-            None => self.write_fully(repo, commit, db_path, token).await,
+                    .await,
+                ParseAmount::Partial,
+            ),
+            None => (
+                self.write_fully(repo, commit, db_path, token).await,
+                ParseAmount::Full,
+            ),
         };
 
         if result.is_err() {
             let _ = std::fs::remove_file(part_path(db_path));
         }
-        result
+        result.map(|()| amount)
     }
 
     /// Newest database in the repository directory plus its indexed revision.
@@ -215,13 +224,18 @@ impl Indexer {
             batch_by_total_length(paths, self.config.max_total_paths_length)
         };
 
+        let metrics = Metrics::global();
         let mut produced = Ok(());
         for batch in batches {
             if token.is_cancelled() {
                 produced = Err("canceled".to_owned());
                 break;
             }
+            let started = Instant::now();
+            metrics.fetch_started();
             let fetched = self.gitserver.fetch_tar(repo, commit, &batch).await;
+            metrics.fetch_finished();
+            metrics.fetcher_observe("FetchRepositoryArchive", started, fetched.is_err());
             let stream = match fetched {
                 Ok(stream) => stream,
                 Err(err) => {
@@ -278,6 +292,7 @@ async fn parse_worker(
     let mut universal: Option<CtagsProcess> = None;
     let mut scip: Option<CtagsProcess> = None;
 
+    let metrics = Metrics::global();
     loop {
         let request = {
             let mut receiver = request_rx.lock().await;
@@ -287,8 +302,12 @@ async fn parse_worker(
             break;
         };
         if token.is_cancelled() {
+            // Baseline `parseCanceled`: the job was dequeued but canceled
+            // before it could run; it is not a parse failure.
+            metrics.parse_canceled_job();
             break;
         }
+        let handle_started = Instant::now();
 
         let Some(language) = language::detect(&request.path, &request.data) else {
             continue;
@@ -312,7 +331,9 @@ async fn parse_worker(
         // A missing/broken ctags binary aborts the build: without it every
         // file would silently index to nothing. Per-file parse errors are
         // logged and skipped, like the baseline.
-        let (symbols, parser) = tokio::task::spawn_blocking(move || {
+        let parse_started = Instant::now();
+        metrics.parse_started();
+        let outcome = tokio::task::spawn_blocking(move || {
             parse_file(
                 slot_value,
                 &bin,
@@ -323,15 +344,30 @@ async fn parse_worker(
                 &data,
             )
         })
-        .await
-        .map_err(|err| format!("ctags worker panicked: {err}"))??;
-        *slot = parser;
+        .await;
+        let outcome = match outcome {
+            Ok(Ok(outcome)) => outcome,
+            Ok(Err(err)) => {
+                metrics.parse_finished(true, false);
+                metrics.parser_observe("Parse", parse_started, true);
+                return Err(err);
+            }
+            Err(err) => {
+                metrics.parse_finished(true, false);
+                metrics.parser_observe("Parse", parse_started, true);
+                return Err(format!("ctags worker panicked: {err}"));
+            }
+        };
+        metrics.parse_finished(outcome.failed, false);
+        metrics.parser_observe("Parse", parse_started, outcome.failed);
+        *slot = outcome.parser;
 
-        for symbol in symbols {
+        for symbol in outcome.symbols {
             if symbol_tx.send(Ok(symbol)).await.is_err() {
                 return Ok(());
             }
         }
+        metrics.parser_observe("HandleParseRequest", handle_started, false);
     }
 
     if let Some(mut parser) = universal {
@@ -341,6 +377,14 @@ async fn parse_worker(
         parser.close();
     }
     Ok(())
+}
+
+/// Result of parsing one file (`parser.Parse`).
+struct ParseOutcome {
+    symbols: Vec<Symbol>,
+    parser: Option<CtagsProcess>,
+    /// The file was rejected by ctags itself (counted as `parseFailed`).
+    failed: bool,
 }
 
 /// Apply the baseline filters and turn ctags entries into store symbols.
@@ -356,14 +400,22 @@ fn parse_file(
     max_symbols: u64,
     path: &str,
     data: &[u8],
-) -> Result<(Vec<Symbol>, Option<CtagsProcess>), String> {
+) -> Result<ParseOutcome, String> {
     // `parser.FilteringParser.Parse`.
     if data.len() as u64 > max_file_size {
-        return Ok((Vec::new(), parser));
+        return Ok(ParseOutcome {
+            symbols: Vec::new(),
+            parser,
+            failed: false,
+        });
     }
     let probe = &data[..data.len().min(256)];
     if probe.contains(&0) {
-        return Ok((Vec::new(), parser));
+        return Ok(ParseOutcome {
+            symbols: Vec::new(),
+            parser,
+            failed: false,
+        });
     }
 
     let mut parser = match parser {
@@ -377,15 +429,27 @@ fn parse_file(
         Err(err) => {
             tracing::error!(path, error = %err, "ctags parse failed");
             parser.close();
-            return Ok((Vec::new(), None));
+            return Ok(ParseOutcome {
+                symbols: Vec::new(),
+                parser: None,
+                failed: true,
+            });
         }
     };
 
     if entries.len() as u64 > max_symbols {
-        return Ok((Vec::new(), Some(parser)));
+        return Ok(ParseOutcome {
+            symbols: Vec::new(),
+            parser: Some(parser),
+            failed: false,
+        });
     }
 
-    Ok((build_symbols(path, data, entries), Some(parser)))
+    Ok(ParseOutcome {
+        symbols: build_symbols(path, data, entries),
+        parser: Some(parser),
+        failed: false,
+    })
 }
 
 fn build_symbols(path: &str, data: &[u8], entries: Vec<Entry>) -> Vec<Symbol> {

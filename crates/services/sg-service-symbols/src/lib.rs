@@ -20,9 +20,11 @@ use sg_proto::symbols as pb;
 pub mod cache;
 pub mod config;
 pub mod ctags;
+pub mod debug;
 pub mod gitserver;
 pub mod index;
 pub mod language;
+pub mod metrics;
 pub mod search;
 pub mod squirrel;
 pub mod store;
@@ -47,6 +49,8 @@ pub fn service_name() -> &'static str {
 /// search RPCs still return `UNIMPLEMENTED` until the SQLite store lands.
 pub struct SymbolsService {
     addr: String,
+    /// `SRC_PROF_HTTP`; `None` disables the debug server (baseline noop server).
+    prof_addr: Option<String>,
     config: Option<SymbolsConfig>,
 }
 
@@ -54,6 +58,7 @@ impl SymbolsService {
     pub fn new() -> Self {
         Self {
             addr: DEFAULT_ADDR.to_owned(),
+            prof_addr: None,
             config: None,
         }
     }
@@ -62,6 +67,7 @@ impl SymbolsService {
     pub fn with_addr(addr: impl Into<String>) -> Self {
         Self {
             addr: addr.into(),
+            prof_addr: None,
             config: None,
         }
     }
@@ -87,6 +93,14 @@ impl Service for SymbolsService {
             "false",
             "check that go-sqlite3 works then exit 0 if it's ok or 1 if not",
         );
+        // Registered by the baseline `internal/debugserver` init in every
+        // service binary; an empty value disables the server.
+        let prof_addr = env.get(
+            "SRC_PROF_HTTP",
+            debug::DEFAULT_ADDR,
+            "net/http/pprof http bind address.",
+        );
+        self.prof_addr = Some(prof_addr).filter(|addr| !addr.is_empty());
         self.config = Some(SymbolsConfig::load(env)?);
         Ok(())
     }
@@ -135,7 +149,20 @@ impl Service for SymbolsService {
         );
         ctx.ready.mark_ready();
 
+        sg_metrics::register_service_metadata(sg_metrics::VERSION);
+        // Register every metric family up front: gauges and counters exist at
+        // zero from startup, like the Go process.
+        let _ = metrics::Metrics::global();
+        let mut background = tokio::task::JoinSet::new();
+        if let Some(prof_addr) = self.prof_addr.clone() {
+            let shutdown = ctx.shutdown.clone();
+            background.spawn(async move { debug::serve(&prof_addr, shutdown).await });
+        }
+
         let served = sg_http::serve(listener, routes, http, ctx.shutdown.clone()).await;
+        // The debug server may outlive an early main-server failure.
+        ctx.shutdown.cancel();
+        while background.join_next().await.is_some() {}
         cache.shutdown().await;
         served.map_err(|err| ServiceError::with_source("symbols http server failed", err))
     }
@@ -170,13 +197,23 @@ impl pb::symbols_service_server::SymbolsService for SymbolsGrpc {
 
         // The baseline returns search failures in the response body and keeps
         // the RPC successful.
+        let started = std::time::Instant::now();
         let response = match self.engine.search(&params).await {
-            Ok(outcome) => pb::SearchResponse {
-                symbols: outcome.symbols.into_iter().map(convert_symbol).collect(),
-                error: None,
-                limit_hit: outcome.limit_hit,
-            },
+            Ok(outcome) => {
+                metrics::Metrics::global().api_observe(
+                    outcome.parse_amount.label(),
+                    started,
+                    false,
+                );
+                pb::SearchResponse {
+                    symbols: outcome.symbols.into_iter().map(convert_symbol).collect(),
+                    error: None,
+                    limit_hit: outcome.limit_hit,
+                }
+            }
             Err(err) => {
+                // The baseline never sets a parse amount on this path.
+                metrics::Metrics::global().api_observe("", started, true);
                 tracing::error!(
                     repo = %params.repo,
                     commit = %params.commit,
