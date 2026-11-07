@@ -1,0 +1,12 @@
+{
+  "expected": {
+    "merge_base_commit_sha": "5abdba2559d350afdf6b4dcbf32f5edaadcbdda1"
+  },
+  "request": {
+    "base": "5abdba2559d350afdf6b4dcbf32f5edaadcbdda1",
+    "head": "5abdba2559d350afdf6b4dcbf32f5edaadcbdda1",
+    "repo_name": "test/symbols-fixture"
+  },
+  "rpc": "merge_base",
+  "service": "gitserver"
+}

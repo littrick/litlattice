@@ -1,0 +1,12 @@
+{
+  "expected": {
+    "commit": "5abdba2559d350afdf6b4dcbf32f5edaadcbdda1",
+    "ref_name": "main"
+  },
+  "request": {
+    "repo_name": "test/symbols-fixture",
+    "short_ref": true
+  },
+  "rpc": "default_branch",
+  "service": "gitserver"
+}

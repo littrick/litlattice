@@ -1,0 +1,11 @@
+{
+  "expected": {
+    "commit_sha": "5abdba2559d350afdf6b4dcbf32f5edaadcbdda1"
+  },
+  "request": {
+    "repo_name": "test/symbols-fixture",
+    "rev_spec": "5abdba2559d350afdf6b4dcbf32f5edaadcbdda1"
+  },
+  "rpc": "resolve_revision",
+  "service": "gitserver"
+}

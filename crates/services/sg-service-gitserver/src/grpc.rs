@@ -229,9 +229,30 @@ impl gpb::gitserver_service_server::GitserverService for Grpc {
 
     async fn get_object(
         &self,
-        _request: GrpcRequest<gpb::GetObjectRequest>,
+        request: GrpcRequest<gpb::GetObjectRequest>,
     ) -> Result<GrpcResponse<gpb::GetObjectResponse>, Status> {
-        Err(unimplemented("get_object"))
+        let request = request.into_inner();
+        if request.repo.is_empty() {
+            return Err(Status::invalid_argument("repo must be specified"));
+        }
+        if request.object_name.is_empty() {
+            return Err(Status::invalid_argument("object name must be specified"));
+        }
+        let repo = self.repo(&request.repo)?;
+        let (id, object_type) = repo.get_object(&request.object_name).await.map_err(git_status)?;
+        let r#type = match object_type.as_str() {
+            "commit" => gpb::git_object::ObjectType::Commit,
+            "tag" => gpb::git_object::ObjectType::Tag,
+            "tree" => gpb::git_object::ObjectType::Tree,
+            "blob" => gpb::git_object::ObjectType::Blob,
+            _ => gpb::git_object::ObjectType::Unspecified,
+        };
+        Ok(GrpcResponse::new(gpb::GetObjectResponse {
+            object: Some(gpb::GitObject {
+                id,
+                r#type: r#type as i32,
+            }),
+        }))
     }
 
     async fn is_repo_cloneable(
@@ -323,9 +344,25 @@ impl gpb::gitserver_service_server::GitserverService for Grpc {
 
     async fn merge_base(
         &self,
-        _request: GrpcRequest<gpb::MergeBaseRequest>,
+        request: GrpcRequest<gpb::MergeBaseRequest>,
     ) -> Result<GrpcResponse<gpb::MergeBaseResponse>, Status> {
-        Err(unimplemented("merge_base"))
+        let request = request.into_inner();
+        if request.repo_name.is_empty() {
+            return Err(Status::invalid_argument("repo must be specified"));
+        }
+        if request.base.is_empty() {
+            return Err(Status::invalid_argument("base must be specified"));
+        }
+        if request.head.is_empty() {
+            return Err(Status::invalid_argument("head must be specified"));
+        }
+        let repo = self.repo(&request.repo_name)?;
+        let base = String::from_utf8_lossy(&request.base).into_owned();
+        let head = String::from_utf8_lossy(&request.head).into_owned();
+        let merge_base_commit_sha = repo.merge_base(&base, &head).await.map_err(git_status)?;
+        Ok(GrpcResponse::new(gpb::MergeBaseResponse {
+            merge_base_commit_sha,
+        }))
     }
 
     type BlameStream = Pin<Box<dyn tokio_stream::Stream<Item = Result<gpb::BlameResponse, Status>> + Send>>;
@@ -339,9 +376,22 @@ impl gpb::gitserver_service_server::GitserverService for Grpc {
 
     async fn default_branch(
         &self,
-        _request: GrpcRequest<gpb::DefaultBranchRequest>,
+        request: GrpcRequest<gpb::DefaultBranchRequest>,
     ) -> Result<GrpcResponse<gpb::DefaultBranchResponse>, Status> {
-        Err(unimplemented("default_branch"))
+        let request = request.into_inner();
+        if request.repo_name.is_empty() {
+            return Err(Status::invalid_argument("repo must be specified"));
+        }
+        let repo = self.repo(&request.repo_name)?;
+        let ref_name = repo
+            .symbolic_ref_head(request.short_ref)
+            .await
+            .map_err(git_status)?;
+        let commit = repo.rev_parse_head().await.map_err(git_status)?;
+        Ok(GrpcResponse::new(gpb::DefaultBranchResponse {
+            ref_name,
+            commit,
+        }))
     }
 
 
@@ -354,9 +404,22 @@ impl gpb::gitserver_service_server::GitserverService for Grpc {
 
     async fn resolve_revision(
         &self,
-        _request: GrpcRequest<gpb::ResolveRevisionRequest>,
+        request: GrpcRequest<gpb::ResolveRevisionRequest>,
     ) -> Result<GrpcResponse<gpb::ResolveRevisionResponse>, Status> {
-        Err(unimplemented("resolve_revision"))
+        let request = request.into_inner();
+        if request.repo_name.is_empty() {
+            return Err(Status::invalid_argument("repo must be specified"));
+        }
+        let repo = self.repo(&request.repo_name)?;
+        let spec = String::from_utf8_lossy(&request.rev_spec).into_owned();
+        // `ensure_revision` would fetch missing revisions in the baseline;
+        // the Rust gitserver has no write path yet, so it behaves like a
+        // failed ensure and reports `NotFound`.
+        let commit_sha = repo
+            .resolve_revision(&spec)
+            .await
+            .map_err(git_status)?;
+        Ok(GrpcResponse::new(gpb::ResolveRevisionResponse { commit_sha }))
     }
 
     type ListRefsStream = Pin<Box<dyn tokio_stream::Stream<Item = Result<gpb::ListRefsResponse, Status>> + Send>>;

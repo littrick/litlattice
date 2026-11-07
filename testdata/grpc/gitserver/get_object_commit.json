@@ -1,0 +1,14 @@
+{
+  "expected": {
+    "object": {
+      "id": "5abdba2559d350afdf6b4dcbf32f5edaadcbdda1",
+      "type": "commit"
+    }
+  },
+  "request": {
+    "object_name": "HEAD",
+    "repo": "test/symbols-fixture"
+  },
+  "rpc": "get_object",
+  "service": "gitserver"
+}

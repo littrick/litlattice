@@ -1,0 +1,14 @@
+{
+  "expected": {
+    "object": {
+      "id": "9b91e3b89bea9ad810a5f1fd948b66069c0bb15f",
+      "type": "tree"
+    }
+  },
+  "request": {
+    "object_name": "HEAD^{tree}",
+    "repo": "test/symbols-fixture"
+  },
+  "rpc": "get_object",
+  "service": "gitserver"
+}

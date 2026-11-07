@@ -120,6 +120,89 @@ impl GitRepo {
         Ok(stdout.lines().next().unwrap_or_default().trim().to_owned())
     }
 
+    /// Baseline `ResolveRevision`: empty means `HEAD`; anything else is
+    /// resolved through `<spec>^0` so that non-commit objects are rejected.
+    pub async fn resolve_revision(&self, spec: &str) -> Result<String, GitError> {
+        let spec = if spec.is_empty() { "HEAD" } else { spec };
+        let spec = if spec == "HEAD" {
+            spec.to_owned()
+        } else {
+            format!("{spec}^0")
+        };
+        if spec.starts_with('-') {
+            return Err(GitError::Message(format!(
+                "invalid git revision spec {spec:?} (begins with '-')"
+            )));
+        }
+        self.rev_parse(&spec).await
+    }
+
+    /// Baseline `GetObject`: resolve the name, then report its object type.
+    /// Returns the raw OID bytes (the proto field is `bytes`) and the type.
+    pub async fn get_object(&self, name: &str) -> Result<(Vec<u8>, String), GitError> {
+        if name.starts_with('-') {
+            return Err(GitError::Message(format!(
+                "invalid git revision spec {name:?} (begins with '-')"
+            )));
+        }
+        let sha = self.rev_parse(name).await?;
+        let oid = decode_hex(&sha)
+            .ok_or_else(|| GitError::Message(format!("failed to decode OID {sha:?}")))?;
+        let object_type = self.object_type(&sha).await?;
+        Ok((oid, object_type))
+    }
+
+    /// Baseline `SymbolicRefHead`. `short` asks git for the abbreviated ref.
+    pub async fn symbolic_ref_head(&self, short: bool) -> Result<String, GitError> {
+        let mut args: Vec<OsString> = vec!["symbolic-ref".into(), "HEAD".into()];
+        if short {
+            args.push("--short".into());
+        }
+        let output = self.output(&args).await?;
+        if !output.status.success() {
+            return Err(GitError::Message(format!(
+                "git symbolic-ref HEAD: {}",
+                String::from_utf8_lossy(&output.stderr).trim_end()
+            )));
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+    }
+
+    /// Baseline `RevParseHead`, including the "HEAD does not point to
+    /// anything" case of an empty repository.
+    pub async fn rev_parse_head(&self) -> Result<String, GitError> {
+        let sha = self.rev_parse("HEAD").await?;
+        if sha == "HEAD" {
+            return Err(GitError::RevisionNotFound("HEAD".to_owned()));
+        }
+        Ok(sha)
+    }
+
+    /// Baseline `MergeBase`: exit 1 with empty stderr means "no merge base"
+    /// and is reported as an empty SHA rather than an error.
+    pub async fn merge_base(&self, base: &str, head: &str) -> Result<String, GitError> {
+        let output = self
+            .output(&["merge-base".into(), "--".into(), base.into(), head.into()])
+            .await?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if output.status.code() == Some(1) && stderr.is_empty() {
+                return Ok(String::new());
+            }
+            if output.status.code() == Some(128)
+                && stderr.contains("fatal: Not a valid object name")
+            {
+                let spec = if stderr.contains(base) { base } else { head };
+                return Err(GitError::RevisionNotFound(spec.to_owned()));
+            }
+            return Err(GitError::Message(format!(
+                "git merge-base: {}",
+                stderr.trim_end()
+            )));
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+    }
+
     /// Launch `git archive` and return the child; the caller pumps stdout.
     pub async fn archive(
         &self,
@@ -252,6 +335,16 @@ impl GitRepo {
     }
 }
 
+fn decode_hex(text: &str) -> Option<Vec<u8>> {
+    if text.len() % 2 != 0 {
+        return None;
+    }
+    (0..text.len())
+        .step_by(2)
+        .map(|index| u8::from_str_radix(&text[index..index + 2], 16).ok())
+        .collect()
+}
+
 fn trim_ascii(bytes: &[u8]) -> &[u8] {
     let mut start = 0;
     let mut end = bytes.len();
@@ -374,6 +467,10 @@ mod tests {
         assert_eq!(trim_ascii(b"   "), b"");
     }
 
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
     fn git(dir: &std::path::Path, args: &[&str]) {
         let status = std::process::Command::new("git")
             .args(args)
@@ -407,6 +504,9 @@ mod tests {
             &work,
             &["push", "-q", dir.to_str().expect("utf8"), "HEAD:refs/heads/main"],
         );
+        // gitserver sets HEAD after cloning; a bare `git init` leaves it on
+        // the default branch.
+        git(&dir, &["symbolic-ref", "HEAD", "refs/heads/main"]);
         (dir, head)
     }
 
@@ -448,6 +548,39 @@ mod tests {
         assert!(matches!(
             repo.read_file(&head, b"missing.txt").await,
             Err(GitError::FileNotFound)
+        ));
+    }
+
+    #[tokio::test]
+    async fn resolves_revisions_heads_and_merge_bases() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (dir, head) = fixture_repo(tmp.path());
+        let repo = GitRepo::new(dir);
+
+        // Empty spec defaults to HEAD; branches go through `^0`.
+        assert_eq!(repo.resolve_revision("").await.expect("HEAD"), head);
+        assert_eq!(repo.resolve_revision("main").await.expect("main"), head);
+        assert!(matches!(
+            repo.resolve_revision("deadbeef").await,
+            Err(GitError::RevisionNotFound(_))
+        ));
+
+        let (oid, object_type) = repo.get_object("HEAD").await.expect("object");
+        assert_eq!(object_type, "commit");
+        assert_eq!(oid.len(), 20);
+        assert_eq!(hex(&oid), head);
+
+        assert_eq!(
+            repo.symbolic_ref_head(false).await.expect("ref"),
+            "refs/heads/main"
+        );
+        assert_eq!(repo.symbolic_ref_head(true).await.expect("short"), "main");
+        assert_eq!(repo.rev_parse_head().await.expect("head"), head);
+
+        assert_eq!(repo.merge_base(&head, &head).await.expect("merge-base"), head);
+        assert!(matches!(
+            repo.merge_base("deadbeef", &head).await,
+            Err(GitError::RevisionNotFound(_))
         ));
     }
 

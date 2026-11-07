@@ -231,6 +231,10 @@ enum GitserverRpc {
     Archive,
     ReadFile,
     ChangedFiles,
+    ResolveRevision,
+    GetObject,
+    DefaultBranch,
+    MergeBase,
 }
 
 impl GitserverRpc {
@@ -239,8 +243,13 @@ impl GitserverRpc {
             "archive" => Ok(Self::Archive),
             "read_file" => Ok(Self::ReadFile),
             "changed_files" => Ok(Self::ChangedFiles),
+            "resolve_revision" => Ok(Self::ResolveRevision),
+            "get_object" => Ok(Self::GetObject),
+            "default_branch" => Ok(Self::DefaultBranch),
+            "merge_base" => Ok(Self::MergeBase),
             other => Err(format!(
-                "unknown gitserver rpc {other:?} (archive, read_file, changed_files)"
+                "unknown gitserver rpc {other:?} (archive, read_file, changed_files, \
+                 resolve_revision, get_object, default_branch, merge_base)"
             )),
         }
     }
@@ -829,6 +838,56 @@ fn normalize_changed_files(chunks: &[gpb::ChangedFilesResponse]) -> Value {
     })
 }
 
+fn gitserver_resolve_revision_request(
+    value: &Value,
+) -> Result<gpb::ResolveRevisionRequest, String> {
+    Ok(gpb::ResolveRevisionRequest {
+        repo_name: string(value, "repo_name")?,
+        rev_spec: optional_string(value, "rev_spec")?.into_bytes(),
+        ensure_revision: value.get("ensure_revision").and_then(Value::as_bool),
+    })
+}
+
+fn gitserver_get_object_request(value: &Value) -> Result<gpb::GetObjectRequest, String> {
+    Ok(gpb::GetObjectRequest {
+        repo: string(value, "repo")?,
+        object_name: string(value, "object_name")?,
+    })
+}
+
+fn gitserver_default_branch_request(value: &Value) -> Result<gpb::DefaultBranchRequest, String> {
+    Ok(gpb::DefaultBranchRequest {
+        repo_name: string(value, "repo_name")?,
+        short_ref: value
+            .get("short_ref")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+    })
+}
+
+fn gitserver_merge_base_request(value: &Value) -> Result<gpb::MergeBaseRequest, String> {
+    Ok(gpb::MergeBaseRequest {
+        repo_name: string(value, "repo_name")?,
+        base: string(value, "base")?.into_bytes(),
+        head: string(value, "head")?.into_bytes(),
+    })
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn normalize_git_object(object: &gpb::GitObject) -> Value {
+    let r#type = match gpb::git_object::ObjectType::try_from(object.r#type) {
+        Ok(gpb::git_object::ObjectType::Commit) => "commit",
+        Ok(gpb::git_object::ObjectType::Tag) => "tag",
+        Ok(gpb::git_object::ObjectType::Tree) => "tree",
+        Ok(gpb::git_object::ObjectType::Blob) => "blob",
+        Ok(gpb::git_object::ObjectType::Unspecified) | Err(_) => "unspecified",
+    };
+    json!({"id": hex(&object.id), "type": r#type})
+}
+
 // ---------------------------------------------------------------------------
 // RPC calls
 // ---------------------------------------------------------------------------
@@ -951,6 +1010,39 @@ async fn call_gitserver(
                 messages.push(message);
             }
             Ok(normalize_read_file(&messages))
+        }
+        GitserverRpc::ResolveRevision => {
+            let response = client
+                .resolve_revision(gitserver_resolve_revision_request(request)?)
+                .await
+                .map_err(|err| format!("ResolveRevision RPC failed: {err}"))?
+                .into_inner();
+            Ok(json!({"commit_sha": response.commit_sha}))
+        }
+        GitserverRpc::GetObject => {
+            let response = client
+                .get_object(gitserver_get_object_request(request)?)
+                .await
+                .map_err(|err| format!("GetObject RPC failed: {err}"))?
+                .into_inner();
+            let object = response.object.map(|object| normalize_git_object(&object));
+            Ok(json!({"object": object}))
+        }
+        GitserverRpc::DefaultBranch => {
+            let response = client
+                .default_branch(gitserver_default_branch_request(request)?)
+                .await
+                .map_err(|err| format!("DefaultBranch RPC failed: {err}"))?
+                .into_inner();
+            Ok(json!({"ref_name": response.ref_name, "commit": response.commit}))
+        }
+        GitserverRpc::MergeBase => {
+            let response = client
+                .merge_base(gitserver_merge_base_request(request)?)
+                .await
+                .map_err(|err| format!("MergeBase RPC failed: {err}"))?
+                .into_inner();
+            Ok(json!({"merge_base_commit_sha": response.merge_base_commit_sha}))
         }
         GitserverRpc::ChangedFiles => {
             let mut stream = client

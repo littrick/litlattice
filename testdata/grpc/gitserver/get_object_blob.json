@@ -1,0 +1,14 @@
+{
+  "expected": {
+    "object": {
+      "id": "17bb768ed481b0978433eab2195fbe96b501f6a5",
+      "type": "blob"
+    }
+  },
+  "request": {
+    "object_name": "HEAD:python/example.py",
+    "repo": "test/symbols-fixture"
+  },
+  "rpc": "get_object",
+  "service": "gitserver"
+}
