@@ -5,7 +5,7 @@ members = [
     "bins/*",
     "xtask",
 ]
-exclude = ["vendor/tree-sitter-ruby"]
+exclude = ["vendor/*"]
 
 [workspace.package]
 version = "0.1.0"
@@ -27,16 +27,17 @@ rusqlite = { version = "0.32", features = ["bundled", "functions"] }
 regex = "1"
 regex-syntax = "0.8"
 sha2 = "0.10"
-# tree-sitter grammars pinned to the versions vendored by the Go baseline
-# (github.com/smacker/go-tree-sitter @ 233c2f923ac7).
+# tree-sitter grammars vendored from the exact parser sources used by the Go
+# baseline (github.com/smacker/go-tree-sitter @ 233c2f923ac7). Published crate
+# versions track different grammar commits, so runtimes must not be swapped.
 tree-sitter = "=0.20.10"
-tree-sitter-java = "=0.20.2"
-tree-sitter-go = "=0.20.0"
-tree-sitter-c-sharp = "=0.20.0"
-tree-sitter-python = "=0.20.0"
-tree-sitter-javascript = "=0.20.1"
-tree-sitter-typescript = "=0.20.3"
-tree-sitter-cpp = "=0.20.0"
+tree-sitter-java = { path = "vendor/tree-sitter-java" }
+tree-sitter-go = { path = "vendor/tree-sitter-go" }
+tree-sitter-c-sharp = { path = "vendor/tree-sitter-c-sharp" }
+tree-sitter-python = { path = "vendor/tree-sitter-python" }
+tree-sitter-javascript = { path = "vendor/tree-sitter-javascript" }
+tree-sitter-typescript = { path = "vendor/tree-sitter-typescript" }
+tree-sitter-cpp = { path = "vendor/tree-sitter-cpp" }
 tree-sitter-ruby = { path = "vendor/tree-sitter-ruby" }
 bytes = "1"
 http = "1"
