@@ -64,6 +64,15 @@ pub async fn listen(addr: &str) -> io::Result<TcpListener> {
     }
 }
 
+/// Go's `net` enables `TCP_NODELAY` on accepted connections; without it a
+/// streamed gRPC response can sit in the kernel until the delayed-ACK timer
+/// fires (~40ms), which dominates small Search responses.
+fn enable_nodelay(stream: &tokio::net::TcpStream, peer: std::net::SocketAddr) {
+    if let Err(err) = stream.set_nodelay(true) {
+        tracing::debug!(%peer, error = %err, "failed to set TCP_NODELAY");
+    }
+}
+
 /// Serve gRPC and plain HTTP on an already-bound listener until `shutdown` is
 /// cancelled.
 pub async fn serve(
@@ -81,6 +90,7 @@ pub async fn serve(
             _ = shutdown.cancelled() => break,
             accepted = listener.accept() => {
                 let (stream, peer) = accepted?;
+                enable_nodelay(&stream, peer);
                 let routes = routes.clone();
                 let http = http.clone();
                 let watcher = graceful.watcher();
@@ -130,6 +140,7 @@ pub async fn serve_http(
             _ = shutdown.cancelled() => break,
             accepted = listener.accept() => {
                 let (stream, peer) = accepted?;
+                enable_nodelay(&stream, peer);
                 let http = http.clone();
                 let watcher = graceful.watcher();
                 connections.spawn(async move {
