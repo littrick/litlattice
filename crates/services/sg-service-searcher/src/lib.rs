@@ -20,6 +20,7 @@ use sg_proto::searcher as pb;
 pub mod config;
 pub mod debug;
 pub mod filter;
+pub mod langmatch;
 pub mod metrics;
 pub mod protocol;
 pub mod store;

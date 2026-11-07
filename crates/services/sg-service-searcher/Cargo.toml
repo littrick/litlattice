@@ -19,14 +19,12 @@ http-body-util = { workspace = true }
 hyper = { workspace = true }
 prost = { workspace = true }
 regex = { workspace = true }
-regex-syntax = { workspace = true }
 sha2 = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
 tokio-util = { workspace = true }
 tonic = { workspace = true }
 tracing = { workspace = true }
-memmap2 = "0.9"
 tar = "0.4"
 walkdir = "2"
 zip = { version = "2", default-features = false }
