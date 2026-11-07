@@ -1,0 +1,64 @@
+{
+  "expected": {
+    "done": {
+      "limit_hit": true
+    },
+    "file_matches": [
+      {
+        "chunks": [
+          {
+            "content": "#     vv py.C1 def\n",
+            "content_start": {
+              "column": 0,
+              "line": 52,
+              "offset": 1180
+            },
+            "ranges": [
+              {
+                "end": {
+                  "column": 14,
+                  "line": 52,
+                  "offset": 1194
+                },
+                "start": {
+                  "column": 12,
+                  "line": 52,
+                  "offset": 1192
+                }
+              }
+            ]
+          }
+        ],
+        "language": "",
+        "limit_hit": true,
+        "path": "python/example.py"
+      }
+    ]
+  },
+  "request": {
+    "commit_oid": "5abdba2559d350afdf6b4dcbf32f5edaadcbdda1",
+    "fetch_timeout": {
+      "nanos": 0,
+      "seconds": 5
+    },
+    "pattern_info": {
+      "include_patterns": [
+        "^python/example\\.py$"
+      ],
+      "is_case_sensitive": true,
+      "limit": 1,
+      "pattern_matches_content": true,
+      "query": {
+        "pattern": {
+          "boost": false,
+          "is_negated": false,
+          "is_regexp": false,
+          "value": "C1"
+        }
+      }
+    },
+    "repo": "test/symbols-fixture"
+  },
+  "rpc": "search",
+  "service": "searcher"
+}

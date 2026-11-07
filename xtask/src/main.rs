@@ -5,7 +5,7 @@
 //! Subcommands:
 //! - `gen-proto`: verify (or update) the pinned baseline proto snapshot.
 //! - `contract`: T0 static checks (proto snapshot + gRPC surface).
-//! - `diff`: replay `symbols` fixtures against an endpoint and compare.
+//! - `diff`: replay `symbols`/`searcher` fixtures against an endpoint and compare.
 //! - `record`: call an endpoint and store its normalized response in a fixture.
 
 use std::collections::BTreeMap;
@@ -16,6 +16,7 @@ use std::process::ExitCode;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
+use sg_proto::searcher as spb;
 use sg_proto::symbols as pb;
 
 /// Baseline commit the snapshot was taken from.
@@ -59,9 +60,9 @@ usage: xtask <command> [options]
 commands:
   gen-proto [--update]            verify pinned protos against the baseline snapshot
   contract                        T0 static checks (protos + gRPC surface)
-  diff --service symbols --fixture DIR [--addr URL]
+  diff --service symbols|searcher --fixture DIR [--addr URL]
                                   replay fixtures and compare normalized responses
-  record --service symbols --fixture DIR --addr URL
+  record --service symbols|searcher --fixture DIR --addr URL
                                   store normalized responses into fixtures
 "
     .to_owned()
@@ -223,9 +224,26 @@ impl Rpc {
     }
 }
 
+/// Which service a fixture targets. `searcher` has a single streaming RPC, so
+/// its `rpc` is fixed rather than an enum.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FixtureService {
+    Symbols(Rpc),
+    Searcher,
+}
+
+impl FixtureService {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Symbols(_) => "symbols",
+            Self::Searcher => "searcher",
+        }
+    }
+}
+
 struct FixtureCase {
     path: PathBuf,
-    rpc: Rpc,
+    service: FixtureService,
     request: Value,
     expected: Option<Value>,
 }
@@ -240,23 +258,35 @@ fn load_fixture(path: &Path) -> Result<FixtureCase, String> {
         .get("service")
         .and_then(Value::as_str)
         .ok_or_else(|| format!("{}: missing service", path.display()))?;
-    if service != "symbols" {
-        return Err(format!(
-            "{}: unsupported service {service:?} (only symbols for now)",
-            path.display()
-        ));
-    }
     let rpc = value
         .get("rpc")
         .and_then(Value::as_str)
         .ok_or_else(|| format!("{}: missing rpc", path.display()))?;
+    let service = match service {
+        "symbols" => FixtureService::Symbols(Rpc::parse(rpc)?),
+        "searcher" => {
+            if rpc != "search" {
+                return Err(format!(
+                    "{}: unknown searcher rpc {rpc:?} (only search)",
+                    path.display()
+                ));
+            }
+            FixtureService::Searcher
+        }
+        other => {
+            return Err(format!(
+                "{}: unsupported service {other:?} (symbols or searcher)",
+                path.display()
+            ))
+        }
+    };
     let request = value
         .get("request")
         .cloned()
         .ok_or_else(|| format!("{}: missing request", path.display()))?;
     Ok(FixtureCase {
         path: path.to_path_buf(),
-        rpc: Rpc::parse(rpc)?,
+        service,
         request,
         expected: value.get("expected").cloned(),
     })
@@ -509,6 +539,180 @@ fn normalize_symbol_info(response: &pb::SymbolInfoResponse) -> Value {
 }
 
 // ---------------------------------------------------------------------------
+// searcher request/response JSON
+// ---------------------------------------------------------------------------
+
+fn u32_field(value: &Value, field: &str) -> Result<u32, String> {
+    match value.get(field) {
+        None | Some(Value::Null) => Ok(0),
+        Some(number) => number
+            .as_u64()
+            .and_then(|number| u32::try_from(number).ok())
+            .ok_or_else(|| format!("request: {field} must be a uint32")),
+    }
+}
+
+fn searcher_duration(value: &Value) -> Result<Option<prost_types::Duration>, String> {
+    match value.get("fetch_timeout") {
+        None | Some(Value::Null) => Ok(None),
+        Some(timeout) => Ok(Some(prost_types::Duration {
+            seconds: timeout.get("seconds").and_then(Value::as_i64).unwrap_or(0),
+            nanos: timeout.get("nanos").and_then(Value::as_i64).unwrap_or(0) as i32,
+        })),
+    }
+}
+
+fn searcher_query_nodes(value: &Value) -> Result<Vec<spb::QueryNode>, String> {
+    let items = value
+        .as_array()
+        .ok_or_else(|| "request: query children must be an array".to_owned())?;
+    items.iter().map(searcher_query_node).collect()
+}
+
+fn searcher_query_node(value: &Value) -> Result<spb::QueryNode, String> {
+    let node = if let Some(pattern) = value.get("pattern") {
+        spb::query_node::Value::Pattern(spb::PatternNode {
+            value: string(pattern, "value")?,
+            is_negated: bool_field(pattern, "is_negated")?,
+            is_regexp: bool_field(pattern, "is_regexp")?,
+            boost: bool_field(pattern, "boost")?,
+        })
+    } else if let Some(children) = value.get("and") {
+        spb::query_node::Value::And(spb::AndNode {
+            children: searcher_query_nodes(children)?,
+        })
+    } else if let Some(children) = value.get("or") {
+        spb::query_node::Value::Or(spb::OrNode {
+            children: searcher_query_nodes(children)?,
+        })
+    } else {
+        return Err("request: query node must be one of pattern, and, or".to_owned());
+    };
+    Ok(spb::QueryNode { value: Some(node) })
+}
+
+fn searcher_pattern_info(value: &Value) -> Result<spb::PatternInfo, String> {
+    let query = value
+        .get("query")
+        .ok_or_else(|| "request: pattern_info.query is required".to_owned())?;
+    Ok(spb::PatternInfo {
+        is_structural: bool_field(value, "is_structural")?,
+        is_case_sensitive: bool_field(value, "is_case_sensitive")?,
+        exclude_pattern: optional_string(value, "exclude_pattern")?,
+        include_patterns: strings(value, "include_patterns")?,
+        path_patterns_are_case_sensitive: bool_field(value, "path_patterns_are_case_sensitive")?,
+        limit: i64_field(value, "limit")?,
+        pattern_matches_content: bool_field(value, "pattern_matches_content")?,
+        pattern_matches_path: bool_field(value, "pattern_matches_path")?,
+        comby_rule: optional_string(value, "comby_rule")?,
+        languages: strings(value, "languages")?,
+        select: optional_string(value, "select")?,
+        query: Some(searcher_query_node(query)?),
+        include_langs: strings(value, "include_langs")?,
+        exclude_langs: strings(value, "exclude_langs")?,
+    })
+}
+
+fn searcher_request(value: &Value) -> Result<spb::SearchRequest, String> {
+    let pattern_info = value
+        .get("pattern_info")
+        .ok_or_else(|| "request: missing pattern_info".to_owned())?;
+    Ok(spb::SearchRequest {
+        repo: string(value, "repo")?,
+        repo_id: u32_field(value, "repo_id")?,
+        commit_oid: string(value, "commit_oid")?,
+        indexed: bool_field(value, "indexed")?,
+        pattern_info: Some(searcher_pattern_info(pattern_info)?),
+        branch: optional_string(value, "branch")?,
+        fetch_timeout: searcher_duration(value)?,
+        num_context_lines: i32_field(value, "num_context_lines")?,
+    })
+}
+
+fn i64_field(value: &Value, field: &str) -> Result<i64, String> {
+    match value.get(field) {
+        None | Some(Value::Null) => Ok(0),
+        Some(number) => number
+            .as_i64()
+            .ok_or_else(|| format!("request: {field} must be an int64")),
+    }
+}
+
+fn location_json(location: &spb::Location) -> Value {
+    json!({
+        "offset": location.offset,
+        "line": location.line,
+        "column": location.column,
+    })
+}
+
+fn chunk_json(chunk: &spb::ChunkMatch) -> Value {
+    let mut ranges: Vec<Value> = chunk
+        .ranges
+        .iter()
+        .map(|range| {
+            json!({
+                "start": range.start.as_ref().map(location_json),
+                "end": range.end.as_ref().map(location_json),
+            })
+        })
+        .collect();
+    // Ranges are emitted in match order, which follows the worker's scan but
+    // can interleave for AND/OR queries; sort for a stable comparison.
+    ranges.sort_by_key(|range| range["start"]["offset"].as_i64().unwrap_or_default());
+    json!({
+        "content": String::from_utf8_lossy(&chunk.content),
+        "content_start": chunk.content_start.as_ref().map(location_json),
+        "ranges": ranges,
+    })
+}
+
+fn file_match_json(file_match: &spb::FileMatch) -> Value {
+    let mut chunks: Vec<Value> = file_match.chunk_matches.iter().map(chunk_json).collect();
+    chunks.sort_by_key(|chunk| chunk["content_start"]["offset"].as_i64().unwrap_or_default());
+    json!({
+        "path": String::from_utf8_lossy(&file_match.path),
+        "language": String::from_utf8_lossy(&file_match.language),
+        "limit_hit": file_match.limit_hit,
+        "chunks": chunks,
+    })
+}
+
+/// Collect the streaming events into one document. File matches are sorted
+/// because parallel workers and path order make emission order unstable.
+fn normalize_searcher_response(messages: &[spb::SearchResponse]) -> Value {
+    let mut files = Vec::new();
+    let mut done = Value::Null;
+    for message in messages {
+        match &message.message {
+            Some(spb::search_response::Message::FileMatch(file_match)) => {
+                files.push(file_match_json(file_match));
+            }
+            Some(spb::search_response::Message::DoneMessage(done_message)) => {
+                done = json!({ "limit_hit": done_message.limit_hit });
+            }
+            None => {}
+        }
+    }
+    files.sort_by(|left, right| {
+        let key = |value: &Value| {
+            (
+                value["path"].as_str().unwrap_or_default().to_owned(),
+                value["chunks"][0]["content_start"]["offset"]
+                    .as_i64()
+                    .unwrap_or_default(),
+                value["chunks"]
+                    .as_array()
+                    .map(Vec::len)
+                    .unwrap_or_default(),
+            )
+        };
+        key(left).cmp(&key(right))
+    });
+    json!({ "file_matches": files, "done": done })
+}
+
+// ---------------------------------------------------------------------------
 // RPC calls
 // ---------------------------------------------------------------------------
 
@@ -561,7 +765,7 @@ async fn call_symbol_info(
     Ok(normalize_symbol_info(&response))
 }
 
-async fn call(
+async fn call_symbols(
     client: &mut pb::symbols_service_client::SymbolsServiceClient<tonic::transport::Channel>,
     rpc: Rpc,
     request: &Value,
@@ -573,45 +777,131 @@ async fn call(
     }
 }
 
+async fn call_searcher(
+    client: &mut spb::searcher_service_client::SearcherServiceClient<tonic::transport::Channel>,
+    request: &Value,
+) -> Result<Value, String> {
+    let mut stream = client
+        .search(searcher_request(request)?)
+        .await
+        .map_err(|err| format!("Search RPC failed: {err}"))?
+        .into_inner();
+    let mut messages = Vec::new();
+    while let Some(message) = stream
+        .message()
+        .await
+        .map_err(|err| format!("Search stream failed: {err}"))?
+    {
+        messages.push(message);
+    }
+    Ok(normalize_searcher_response(&messages))
+}
+
+/// Replay every fixture against one endpoint. All cases must belong to
+/// `service`; callers pass that same name from `--service`.
+async fn evaluate(service: &str, addr: &str, cases: &[FixtureCase]) -> Result<Vec<Value>, String> {
+    let mut results = Vec::with_capacity(cases.len());
+    match service {
+        "symbols" => {
+            let mut client = pb::symbols_service_client::SymbolsServiceClient::connect(
+                addr.to_owned(),
+            )
+            .await
+            .map_err(|err| format!("connect {addr}: {err}"))?;
+            for case in cases {
+                let FixtureService::Symbols(rpc) = case.service else {
+                    return Err(format!(
+                        "{}: fixture targets searcher, not symbols",
+                        case.path.display()
+                    ));
+                };
+                results.push(call_symbols(&mut client, rpc, &case.request).await?);
+            }
+        }
+        "searcher" => {
+            let mut client = spb::searcher_service_client::SearcherServiceClient::connect(
+                addr.to_owned(),
+            )
+            .await
+            .map_err(|err| format!("connect {addr}: {err}"))?;
+            for case in cases {
+                if case.service != FixtureService::Searcher {
+                    return Err(format!(
+                        "{}: fixture targets symbols, not searcher",
+                        case.path.display()
+                    ));
+                }
+                results.push(call_searcher(&mut client, &case.request).await?);
+            }
+        }
+        other => {
+            return Err(format!(
+                "unsupported service {other:?} (symbols or searcher)"
+            ))
+        }
+    }
+    Ok(results)
+}
+
 // ---------------------------------------------------------------------------
 // diff / record
 // ---------------------------------------------------------------------------
+
+fn default_addr(service: &str) -> &'static str {
+    match service {
+        "searcher" => "http://127.0.0.1:3181",
+        _ => "http://127.0.0.1:3184",
+    }
+}
+
+fn load_cases(fixture_dir: &Path, service: &str) -> Result<Vec<FixtureCase>, String> {
+    let cases = collect_fixtures(fixture_dir)?
+        .iter()
+        .map(|path| load_fixture(path))
+        .collect::<Result<Vec<_>, _>>()?;
+    for case in &cases {
+        if case.service.name() != service {
+            return Err(format!(
+                "{}: fixture targets {}, but --service is {service}",
+                case.path.display(),
+                case.service.name()
+            ));
+        }
+    }
+    Ok(cases)
+}
 
 #[tokio::main]
 async fn diff(args: &[String]) -> Result<(), String> {
     let args = parse_args(args)?;
     let service = required(&args, "service")?;
-    if service != "symbols" {
+    if !matches!(service, "symbols" | "searcher") {
         return Err(format!(
-            "diff: unsupported service {service:?} (only symbols)"
+            "diff: unsupported service {service:?} (symbols or searcher)"
         ));
     }
     let fixture_dir = PathBuf::from(required(&args, "fixture")?);
     let addr = args
         .get("addr")
         .cloned()
-        .unwrap_or_else(|| "http://127.0.0.1:3184".to_owned());
+        .unwrap_or_else(|| default_addr(service).to_owned());
 
-    let fixtures = collect_fixtures(&fixture_dir)?;
-    let mut client = pb::symbols_service_client::SymbolsServiceClient::connect(addr.clone())
-        .await
-        .map_err(|err| format!("connect {addr}: {err}"))?;
+    let cases = load_cases(&fixture_dir, service)?;
+    let actuals = evaluate(service, &addr, &cases).await?;
 
     let mut failures = 0usize;
-    for path in fixtures {
-        let case = load_fixture(&path)?;
+    for (case, actual) in cases.iter().zip(&actuals) {
         let expected = case
             .expected
             .as_ref()
             .ok_or_else(|| format!("{}: missing expected response", case.path.display()))?;
-        let actual = call(&mut client, case.rpc, &case.request).await?;
-        if &actual == expected {
-            println!("PASS {}", relative(&path));
+        if actual == expected {
+            println!("PASS {}", relative(&case.path));
         } else {
             failures += 1;
-            eprintln!("FAIL {}", relative(&path));
+            eprintln!("FAIL {}", relative(&case.path));
             eprintln!("  expected: {}", compact(expected));
-            eprintln!("  actual:   {}", compact(&actual));
+            eprintln!("  actual:   {}", compact(actual));
         }
     }
 
@@ -626,32 +916,29 @@ async fn diff(args: &[String]) -> Result<(), String> {
 async fn record(args: &[String]) -> Result<(), String> {
     let args = parse_args(args)?;
     let service = required(&args, "service")?;
-    if service != "symbols" {
+    if !matches!(service, "symbols" | "searcher") {
         return Err(format!(
-            "record: unsupported service {service:?} (only symbols)"
+            "record: unsupported service {service:?} (symbols or searcher)"
         ));
     }
     let fixture_dir = PathBuf::from(required(&args, "fixture")?);
     let addr = required(&args, "addr")?.to_owned();
 
-    let fixtures = collect_fixtures(&fixture_dir)?;
-    let mut client = pb::symbols_service_client::SymbolsServiceClient::connect(addr.clone())
-        .await
-        .map_err(|err| format!("connect {addr}: {err}"))?;
+    let cases = load_cases(&fixture_dir, service)?;
+    let actuals = evaluate(service, &addr, &cases).await?;
 
-    for path in fixtures {
-        let case = load_fixture(&path)?;
-        let actual = call(&mut client, case.rpc, &case.request).await?;
+    for (case, actual) in cases.iter().zip(actuals) {
         let mut document: Value = serde_json::from_slice(
-            &fs::read(&path).map_err(|err| format!("read {}: {err}", path.display()))?,
+            &fs::read(&case.path)
+                .map_err(|err| format!("read {}: {err}", case.path.display()))?,
         )
-        .map_err(|err| format!("parse {}: {err}", path.display()))?;
+        .map_err(|err| format!("parse {}: {err}", case.path.display()))?;
         document["expected"] = actual;
         let serialized = serde_json::to_string_pretty(&document)
-            .map_err(|err| format!("serialize {}: {err}", path.display()))?;
-        fs::write(&path, format!("{serialized}\n"))
-            .map_err(|err| format!("write {}: {err}", path.display()))?;
-        println!("RECORDED {}", relative(&path));
+            .map_err(|err| format!("serialize {}: {err}", case.path.display()))?;
+        fs::write(&case.path, format!("{serialized}\n"))
+            .map_err(|err| format!("write {}: {err}", case.path.display()))?;
+        println!("RECORDED {}", relative(&case.path));
     }
     Ok(())
 }
@@ -665,4 +952,83 @@ fn relative(path: &Path) -> String {
 
 fn compact(value: &Value) -> String {
     serde_json::to_string(value).unwrap_or_else(|_| "<unserializable>".to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn location(offset: i32) -> spb::Location {
+        spb::Location {
+            offset,
+            line: 0,
+            column: offset,
+        }
+    }
+
+    fn file(path: &str, chunk_offsets: &[i32]) -> spb::FileMatch {
+        spb::FileMatch {
+            path: path.as_bytes().to_vec(),
+            chunk_matches: chunk_offsets
+                .iter()
+                .map(|&offset| spb::ChunkMatch {
+                    content: b"x".to_vec(),
+                    content_start: Some(location(offset)),
+                    ranges: vec![spb::Range {
+                        start: Some(location(offset)),
+                        end: Some(location(offset + 1)),
+                    }],
+                })
+                .collect(),
+            limit_hit: false,
+            language: b"Go".to_vec(),
+        }
+    }
+
+    #[test]
+    fn normalizes_and_sorts_stream_events() {
+        let messages = vec![
+            spb::SearchResponse {
+                message: Some(spb::search_response::Message::FileMatch(file("b", &[30]))),
+            },
+            spb::SearchResponse {
+                message: Some(spb::search_response::Message::DoneMessage(
+                    spb::search_response::Done { limit_hit: true },
+                )),
+            },
+            spb::SearchResponse {
+                message: Some(spb::search_response::Message::FileMatch(file(
+                    "a",
+                    &[20, 5],
+                ))),
+            },
+        ];
+        let normalized = normalize_searcher_response(&messages);
+        assert_eq!(normalized["done"]["limit_hit"], json!(true));
+        assert_eq!(normalized["file_matches"][0]["path"], json!("a"));
+        assert_eq!(
+            normalized["file_matches"][0]["chunks"][0]["content_start"]["offset"],
+            json!(5)
+        );
+        assert_eq!(normalized["file_matches"][1]["path"], json!("b"));
+    }
+
+    #[test]
+    fn parses_boolean_query_nodes() {
+        let value = json!({
+            "and": [
+                {"pattern": {"value": "a", "is_regexp": true}},
+                {"or": [{"pattern": {"value": "b"}}]},
+            ]
+        });
+        let node = searcher_query_node(&value).expect("query");
+        let Some(spb::query_node::Value::And(and)) = node.value else {
+            panic!("expected an and node");
+        };
+        assert_eq!(and.children.len(), 2);
+        assert!(matches!(
+            and.children[1].value,
+            Some(spb::query_node::Value::Or(_))
+        ));
+    }
 }

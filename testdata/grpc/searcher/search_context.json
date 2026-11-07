@@ -1,0 +1,62 @@
+{
+  "expected": {
+    "done": {
+      "limit_hit": false
+    },
+    "file_matches": [
+      {
+        "chunks": [
+          {
+            "content": "\n#   vvvvv _impl def\ndef _impl():\n    pass\n\n",
+            "content_start": {
+              "column": 0,
+              "line": 3,
+              "offset": 162
+            },
+            "ranges": [
+              {
+                "end": {
+                  "column": 9,
+                  "line": 5,
+                  "offset": 192
+                },
+                "start": {
+                  "column": 0,
+                  "line": 5,
+                  "offset": 183
+                }
+              }
+            ]
+          }
+        ],
+        "language": "",
+        "limit_hit": false,
+        "path": "starlark/sample.bzl"
+      }
+    ]
+  },
+  "request": {
+    "commit_oid": "5abdba2559d350afdf6b4dcbf32f5edaadcbdda1",
+    "fetch_timeout": {
+      "nanos": 0,
+      "seconds": 5
+    },
+    "num_context_lines": 2,
+    "pattern_info": {
+      "is_case_sensitive": true,
+      "limit": 100,
+      "pattern_matches_content": true,
+      "query": {
+        "pattern": {
+          "boost": false,
+          "is_negated": false,
+          "is_regexp": false,
+          "value": "def _impl"
+        }
+      }
+    },
+    "repo": "test/symbols-fixture"
+  },
+  "rpc": "search",
+  "service": "searcher"
+}

@@ -1,0 +1,31 @@
+{
+  "expected": {
+    "done": {
+      "limit_hit": false
+    },
+    "file_matches": []
+  },
+  "request": {
+    "commit_oid": "5abdba2559d350afdf6b4dcbf32f5edaadcbdda1",
+    "fetch_timeout": {
+      "nanos": 0,
+      "seconds": 5
+    },
+    "pattern_info": {
+      "is_case_sensitive": false,
+      "limit": 100,
+      "pattern_matches_content": true,
+      "query": {
+        "pattern": {
+          "boost": false,
+          "is_negated": false,
+          "is_regexp": false,
+          "value": "sample"
+        }
+      }
+    },
+    "repo": "test/symbols-fixture"
+  },
+  "rpc": "search",
+  "service": "searcher"
+}

@@ -1,0 +1,51 @@
+{
+  "expected": {
+    "done": {
+      "limit_hit": false
+    },
+    "file_matches": [
+      {
+        "chunks": [],
+        "language": "",
+        "limit_hit": false,
+        "path": "java1/src/sub/Sample.java"
+      },
+      {
+        "chunks": [],
+        "language": "",
+        "limit_hit": false,
+        "path": "java1/src/sub/Sample2.java"
+      },
+      {
+        "chunks": [],
+        "language": "",
+        "limit_hit": false,
+        "path": "java1/src/sub/sub2/Sample3.java"
+      }
+    ]
+  },
+  "request": {
+    "commit_oid": "5abdba2559d350afdf6b4dcbf32f5edaadcbdda1",
+    "fetch_timeout": {
+      "nanos": 0,
+      "seconds": 5
+    },
+    "pattern_info": {
+      "is_case_sensitive": true,
+      "limit": 100,
+      "pattern_matches_content": false,
+      "pattern_matches_path": true,
+      "query": {
+        "pattern": {
+          "boost": false,
+          "is_negated": false,
+          "is_regexp": true,
+          "value": "Sample"
+        }
+      }
+    },
+    "repo": "test/symbols-fixture"
+  },
+  "rpc": "search",
+  "service": "searcher"
+}

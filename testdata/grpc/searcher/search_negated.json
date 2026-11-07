@@ -1,0 +1,284 @@
+{
+  "expected": {
+    "done": {
+      "limit_hit": false
+    },
+    "file_matches": [
+      {
+        "chunks": [
+          {
+            "content": "#                          vvvvvvvvvvvvv bzl_library ref\n",
+            "content_start": {
+              "column": 0,
+              "line": 0,
+              "offset": 0
+            },
+            "ranges": [
+              {
+                "end": {
+                  "column": 52,
+                  "line": 0,
+                  "offset": 52
+                },
+                "start": {
+                  "column": 41,
+                  "line": 0,
+                  "offset": 41
+                }
+              }
+            ]
+          },
+          {
+            "content": "load(\"//:bzl_library.bzl\", \"bzl_library\")\n",
+            "content_start": {
+              "column": 0,
+              "line": 1,
+              "offset": 57
+            },
+            "ranges": [
+              {
+                "end": {
+                  "column": 20,
+                  "line": 1,
+                  "offset": 77
+                },
+                "start": {
+                  "column": 9,
+                  "line": 1,
+                  "offset": 66
+                }
+              },
+              {
+                "end": {
+                  "column": 39,
+                  "line": 1,
+                  "offset": 96
+                },
+                "start": {
+                  "column": 28,
+                  "line": 1,
+                  "offset": 85
+                }
+              }
+            ]
+          }
+        ],
+        "language": "",
+        "limit_hit": false,
+        "path": "starlark/BUILD"
+      },
+      {
+        "chunks": [
+          {
+            "content": "#                          vvvvvvvvvvvvv bzl_library ref\n",
+            "content_start": {
+              "column": 0,
+              "line": 0,
+              "offset": 0
+            },
+            "ranges": [
+              {
+                "end": {
+                  "column": 52,
+                  "line": 0,
+                  "offset": 52
+                },
+                "start": {
+                  "column": 41,
+                  "line": 0,
+                  "offset": 41
+                }
+              }
+            ]
+          },
+          {
+            "content": "load(\"//:bzl_library.bzl\", \"bzl_library\")\n",
+            "content_start": {
+              "column": 0,
+              "line": 1,
+              "offset": 57
+            },
+            "ranges": [
+              {
+                "end": {
+                  "column": 20,
+                  "line": 1,
+                  "offset": 77
+                },
+                "start": {
+                  "column": 9,
+                  "line": 1,
+                  "offset": 66
+                }
+              },
+              {
+                "end": {
+                  "column": 39,
+                  "line": 1,
+                  "offset": 96
+                },
+                "start": {
+                  "column": 28,
+                  "line": 1,
+                  "offset": 85
+                }
+              }
+            ]
+          }
+        ],
+        "language": "",
+        "limit_hit": false,
+        "path": "starlark/BUILD.bazel"
+      },
+      {
+        "chunks": [
+          {
+            "content": "#                          vvvvvvvvvvvvv bzl_library ref\n",
+            "content_start": {
+              "column": 0,
+              "line": 0,
+              "offset": 0
+            },
+            "ranges": [
+              {
+                "end": {
+                  "column": 52,
+                  "line": 0,
+                  "offset": 52
+                },
+                "start": {
+                  "column": 41,
+                  "line": 0,
+                  "offset": 41
+                }
+              }
+            ]
+          },
+          {
+            "content": "load(\"//:bzl_library.bzl\", \"bzl_library\")\n",
+            "content_start": {
+              "column": 0,
+              "line": 1,
+              "offset": 57
+            },
+            "ranges": [
+              {
+                "end": {
+                  "column": 20,
+                  "line": 1,
+                  "offset": 77
+                },
+                "start": {
+                  "column": 9,
+                  "line": 1,
+                  "offset": 66
+                }
+              },
+              {
+                "end": {
+                  "column": 39,
+                  "line": 1,
+                  "offset": 96
+                },
+                "start": {
+                  "column": 28,
+                  "line": 1,
+                  "offset": 85
+                }
+              }
+            ]
+          }
+        ],
+        "language": "",
+        "limit_hit": false,
+        "path": "starlark/WORKSPACE"
+      },
+      {
+        "chunks": [
+          {
+            "content": "#   vvvvvvvvvvv bzl_library def\n",
+            "content_start": {
+              "column": 0,
+              "line": 0,
+              "offset": 0
+            },
+            "ranges": [
+              {
+                "end": {
+                  "column": 27,
+                  "line": 0,
+                  "offset": 27
+                },
+                "start": {
+                  "column": 16,
+                  "line": 0,
+                  "offset": 16
+                }
+              }
+            ]
+          },
+          {
+            "content": "def bzl_library():\n",
+            "content_start": {
+              "column": 0,
+              "line": 1,
+              "offset": 32
+            },
+            "ranges": [
+              {
+                "end": {
+                  "column": 15,
+                  "line": 1,
+                  "offset": 47
+                },
+                "start": {
+                  "column": 4,
+                  "line": 1,
+                  "offset": 36
+                }
+              }
+            ]
+          }
+        ],
+        "language": "",
+        "limit_hit": false,
+        "path": "starlark/bzl_library.bzl"
+      }
+    ]
+  },
+  "request": {
+    "commit_oid": "5abdba2559d350afdf6b4dcbf32f5edaadcbdda1",
+    "fetch_timeout": {
+      "nanos": 0,
+      "seconds": 5
+    },
+    "pattern_info": {
+      "is_case_sensitive": true,
+      "limit": 100,
+      "pattern_matches_content": true,
+      "query": {
+        "and": [
+          {
+            "pattern": {
+              "boost": false,
+              "is_negated": false,
+              "is_regexp": false,
+              "value": "bzl_library"
+            }
+          },
+          {
+            "pattern": {
+              "boost": false,
+              "is_negated": true,
+              "is_regexp": false,
+              "value": "custom_bzl_library"
+            }
+          }
+        ]
+      }
+    },
+    "repo": "test/symbols-fixture"
+  },
+  "rpc": "search",
+  "service": "searcher"
+}
