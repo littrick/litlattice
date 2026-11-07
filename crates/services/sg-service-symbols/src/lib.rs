@@ -24,6 +24,7 @@ pub mod gitserver;
 pub mod index;
 pub mod language;
 pub mod search;
+pub mod squirrel;
 pub mod store;
 pub mod tar;
 
@@ -112,7 +113,7 @@ impl Service for SymbolsService {
 
         let gitserver: Arc<dyn GitserverReader> =
             Arc::new(GitserverClient::new(config.gitserver_addrs.clone()));
-        let indexer = Arc::new(Indexer::new(config.clone(), gitserver));
+        let indexer = Arc::new(Indexer::new(config.clone(), Arc::clone(&gitserver)));
         let cache = Arc::new(Cache::new(&config, indexer, &ctx.shutdown));
         cache.spawn_janitor();
         let engine = Arc::new(SearchEngine::new(Arc::clone(&cache)));
@@ -120,6 +121,7 @@ impl Service for SymbolsService {
         let routes = tonic::service::Routes::new(
             pb::symbols_service_server::SymbolsServiceServer::new(SymbolsGrpc {
                 engine: Arc::clone(&engine),
+                gitserver: Arc::clone(&gitserver),
             }),
         );
         let http: sg_http::HttpHandler =
@@ -141,6 +143,7 @@ impl Service for SymbolsService {
 
 struct SymbolsGrpc {
     engine: Arc<SearchEngine>,
+    gitserver: Arc<dyn GitserverReader>,
 }
 
 #[tonic::async_trait]
@@ -199,20 +202,39 @@ impl pb::symbols_service_server::SymbolsService for SymbolsGrpc {
         >,
     >;
 
+    // The stream item type is fixed by tonic (`Result<_, Status>`).
+    #[allow(clippy::result_large_err)]
     async fn local_code_intel(
         &self,
-        _request: GrpcRequest<pb::LocalCodeIntelRequest>,
+        request: GrpcRequest<pb::LocalCodeIntelRequest>,
     ) -> Result<GrpcResponse<Self::LocalCodeIntelStream>, Status> {
-        Err(Status::unimplemented(
-            "LocalCodeIntel is not implemented yet",
-        ))
+        let path = internal_repo_commit_path(request.into_inner().repo_commit_path);
+        let files = BlockingFileSource {
+            gitserver: Arc::clone(&self.gitserver),
+        };
+
+        // Tree-sitter parsing is CPU-bound and `read_file` is blocking, so the
+        // whole squirrel request runs off the async reactor.
+        let symbols = tokio::task::spawn_blocking(move || {
+            let service = squirrel::Service::new(&files, None);
+            service.local_code_intel(path)
+        })
+        .await
+        .map_err(|err| Status::unknown(format!("local code intel task failed: {err}")))?
+        .map_err(squirrel_status)?;
+
+        let chunks = chunk_local_code_intel(symbols.into_iter().map(convert_local_symbol));
+        let responses = chunks
+            .into_iter()
+            .map(|symbols| Ok(pb::LocalCodeIntelResponse { symbols }));
+        Ok(GrpcResponse::new(Box::pin(tokio_stream::iter(responses))))
     }
 
     async fn symbol_info(
         &self,
         _request: GrpcRequest<pb::SymbolInfoRequest>,
     ) -> Result<GrpcResponse<pb::SymbolInfoResponse>, Status> {
-        Err(Status::unimplemented("SymbolInfo is not implemented yet"))
+        Err(Status::unimplemented("symbol info is not implemented yet"))
     }
 
     async fn healthz(
@@ -236,6 +258,92 @@ fn convert_symbol(symbol: store::Symbol) -> pb::search_response::Symbol {
         signature: symbol.signature,
         file_limited: symbol.file_limited,
     }
+}
+
+/// `squirrel.readFileFunc` backed by gitserver. Only valid on a blocking
+/// thread (it drives the async client with `Handle::block_on`).
+struct BlockingFileSource {
+    gitserver: Arc<dyn GitserverReader>,
+}
+
+impl squirrel::FileSource for BlockingFileSource {
+    fn read_file(&self, path: &squirrel::RepoCommitPath) -> Result<Vec<u8>, String> {
+        tokio::runtime::Handle::current().block_on(self.gitserver.read_file(
+            &path.repo,
+            &path.commit,
+            &path.path,
+        ))
+    }
+}
+
+fn internal_repo_commit_path(path: Option<pb::RepoCommitPath>) -> squirrel::RepoCommitPath {
+    path.map(|path| squirrel::RepoCommitPath {
+        repo: path.repo,
+        commit: path.commit,
+        path: path.path,
+    })
+    .unwrap_or_default()
+}
+
+fn convert_range(range: squirrel::Range) -> pb::Range {
+    pb::Range {
+        row: range.row as i32,
+        column: range.column as i32,
+        length: range.length as i32,
+    }
+}
+
+fn convert_local_symbol(symbol: squirrel::Symbol) -> pb::local_code_intel_response::Symbol {
+    pb::local_code_intel_response::Symbol {
+        name: symbol.name,
+        hover: symbol.hover,
+        def: Some(convert_range(symbol.def)),
+        refs: symbol.refs.into_iter().map(convert_range).collect(),
+    }
+}
+
+fn squirrel_status(err: squirrel::Error) -> Status {
+    let message = err.to_string();
+    match err {
+        squirrel::Error::UnrecognizedFileExtension => Status::invalid_argument(message),
+        squirrel::Error::UnsupportedLanguage => Status::unimplemented(message),
+        squirrel::Error::Message(_) => Status::unknown(message),
+    }
+}
+
+/// Baseline `internal/grpc/chunk` maximum message size.
+const MAX_MESSAGE_SIZE: usize = 1024 * 1024;
+
+/// Group symbols into protobuf messages under 1 MiB, mirroring
+/// `chunk.Chunker.Send`/`Flush` (including the empty-chunk edge case).
+fn chunk_local_code_intel(
+    symbols: impl Iterator<Item = pb::local_code_intel_response::Symbol>,
+) -> Vec<Vec<pb::local_code_intel_response::Symbol>> {
+    use prost::Message;
+
+    let mut chunks = Vec::new();
+    let mut buffer = Vec::new();
+    let mut size_bytes = 0usize;
+
+    for symbol in symbols {
+        if size_bytes == 0 {
+            buffer.clear();
+        }
+
+        let item_size = symbol.encoded_len();
+        if item_size + size_bytes >= MAX_MESSAGE_SIZE {
+            chunks.push(std::mem::take(&mut buffer));
+            size_bytes = 0;
+        }
+
+        buffer.push(symbol);
+        size_bytes += item_size;
+    }
+
+    if size_bytes != 0 {
+        chunks.push(buffer);
+    }
+    chunks
 }
 
 fn http_response(req: Request<Incoming>) -> Response<tonic::body::BoxBody> {
