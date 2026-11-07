@@ -1,0 +1,56 @@
+{
+  "expected": {
+    "files": [
+      {
+        "path": "java1/src/sub/Sample.java",
+        "status": "added"
+      },
+      {
+        "path": "java1/src/sub/Sample2.java",
+        "status": "added"
+      },
+      {
+        "path": "java1/src/sub/sub2/Sample3.java",
+        "status": "added"
+      },
+      {
+        "path": "python/example.py",
+        "status": "added"
+      },
+      {
+        "path": "python/example2.py",
+        "status": "added"
+      },
+      {
+        "path": "python/sub/example3.py",
+        "status": "added"
+      },
+      {
+        "path": "starlark/BUILD",
+        "status": "added"
+      },
+      {
+        "path": "starlark/BUILD.bazel",
+        "status": "added"
+      },
+      {
+        "path": "starlark/WORKSPACE",
+        "status": "added"
+      },
+      {
+        "path": "starlark/bzl_library.bzl",
+        "status": "added"
+      },
+      {
+        "path": "starlark/sample.bzl",
+        "status": "added"
+      }
+    ]
+  },
+  "request": {
+    "head": "5abdba2559d350afdf6b4dcbf32f5edaadcbdda1",
+    "repo_name": "test/symbols-fixture"
+  },
+  "rpc": "changed_files",
+  "service": "gitserver"
+}

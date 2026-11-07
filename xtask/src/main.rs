@@ -16,6 +16,7 @@ use std::process::ExitCode;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
+use sg_proto::gitserver as gpb;
 use sg_proto::searcher as spb;
 use sg_proto::symbols as pb;
 
@@ -224,12 +225,34 @@ impl Rpc {
     }
 }
 
+/// Read-path gitserver RPCs covered by the first M9 fixtures.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GitserverRpc {
+    Archive,
+    ReadFile,
+    ChangedFiles,
+}
+
+impl GitserverRpc {
+    fn parse(name: &str) -> Result<Self, String> {
+        match name {
+            "archive" => Ok(Self::Archive),
+            "read_file" => Ok(Self::ReadFile),
+            "changed_files" => Ok(Self::ChangedFiles),
+            other => Err(format!(
+                "unknown gitserver rpc {other:?} (archive, read_file, changed_files)"
+            )),
+        }
+    }
+}
+
 /// Which service a fixture targets. `searcher` has a single streaming RPC, so
 /// its `rpc` is fixed rather than an enum.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum FixtureService {
     Symbols(Rpc),
     Searcher,
+    Gitserver(GitserverRpc),
 }
 
 impl FixtureService {
@@ -237,6 +260,7 @@ impl FixtureService {
         match self {
             Self::Symbols(_) => "symbols",
             Self::Searcher => "searcher",
+            Self::Gitserver(_) => "gitserver",
         }
     }
 }
@@ -273,9 +297,10 @@ fn load_fixture(path: &Path) -> Result<FixtureCase, String> {
             }
             FixtureService::Searcher
         }
+        "gitserver" => FixtureService::Gitserver(GitserverRpc::parse(rpc)?),
         other => {
             return Err(format!(
-                "{}: unsupported service {other:?} (symbols or searcher)",
+                "{}: unsupported service {other:?} (symbols, searcher or gitserver)",
                 path.display()
             ))
         }
@@ -713,6 +738,98 @@ fn normalize_searcher_response(messages: &[spb::SearchResponse]) -> Value {
 }
 
 // ---------------------------------------------------------------------------
+// gitserver request/response JSON
+// ---------------------------------------------------------------------------
+
+fn gitserver_archive_request(value: &Value) -> Result<gpb::ArchiveRequest, String> {
+    let format = match value.get("format").and_then(Value::as_str) {
+        None | Some("zip") => gpb::ArchiveFormat::Zip as i32,
+        Some("tar") => gpb::ArchiveFormat::Tar as i32,
+        Some(other) => return Err(format!("request: unknown archive format {other:?}")),
+    };
+    Ok(gpb::ArchiveRequest {
+        repo: string(value, "repo")?,
+        treeish: string(value, "treeish")?,
+        format,
+        paths: strings(value, "paths")?
+            .into_iter()
+            .map(String::into_bytes)
+            .collect(),
+    })
+}
+
+fn gitserver_read_file_request(value: &Value) -> Result<gpb::ReadFileRequest, String> {
+    Ok(gpb::ReadFileRequest {
+        repo_name: string(value, "repo_name")?,
+        commit: string(value, "commit")?,
+        path: string(value, "path")?.into_bytes(),
+    })
+}
+
+fn gitserver_changed_files_request(value: &Value) -> Result<gpb::ChangedFilesRequest, String> {
+    let base = match value.get("base") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(text)) => Some(text.clone().into_bytes()),
+        Some(_) => return Err("request: base must be a string".to_owned()),
+    };
+    Ok(gpb::ChangedFilesRequest {
+        repo_name: string(value, "repo_name")?,
+        base,
+        head: string(value, "head")?.into_bytes(),
+    })
+}
+
+/// Archive bytes are compared by digest: stream chunk boundaries depend on
+/// buffer sizes and are not part of the contract.
+fn normalize_archive(chunks: &[gpb::ArchiveResponse]) -> Value {
+    let mut hasher = Sha256::new();
+    let mut size = 0usize;
+    for chunk in chunks {
+        hasher.update(&chunk.data);
+        size += chunk.data.len();
+    }
+    json!({
+        "sha256": format!("{:x}", hasher.finalize()),
+        "size_bytes": size,
+    })
+}
+
+fn normalize_read_file(chunks: &[gpb::ReadFileResponse]) -> Value {
+    let mut data = Vec::new();
+    for chunk in chunks {
+        data.extend_from_slice(&chunk.data);
+    }
+    json!({
+        "data": String::from_utf8_lossy(&data),
+        "size_bytes": data.len(),
+    })
+}
+
+fn normalize_changed_files(chunks: &[gpb::ChangedFilesResponse]) -> Value {
+    let mut files: Vec<(String, &'static str)> = chunks
+        .iter()
+        .flat_map(|chunk| chunk.files.iter())
+        .map(|file| {
+            let status = match gpb::changed_file::Status::try_from(file.status) {
+                Ok(gpb::changed_file::Status::Added) => "added",
+                Ok(gpb::changed_file::Status::Modified) => "modified",
+                Ok(gpb::changed_file::Status::Deleted) => "deleted",
+                Ok(gpb::changed_file::Status::TypeChanged) => "type_changed",
+                Ok(gpb::changed_file::Status::Unspecified) | Err(_) => "unspecified",
+            };
+            (String::from_utf8_lossy(&file.path).into_owned(), status)
+        })
+        .collect();
+    files.sort();
+    json!({
+        "files": files
+            .into_iter()
+            .map(|(path, status)| json!({"path": path, "status": status}))
+            .collect::<Vec<_>>(),
+    })
+}
+
+// ---------------------------------------------------------------------------
 // RPC calls
 // ---------------------------------------------------------------------------
 
@@ -797,6 +914,63 @@ async fn call_searcher(
     Ok(normalize_searcher_response(&messages))
 }
 
+async fn call_gitserver(
+    client: &mut gpb::gitserver_service_client::GitserverServiceClient<tonic::transport::Channel>,
+    rpc: GitserverRpc,
+    request: &Value,
+) -> Result<Value, String> {
+    match rpc {
+        GitserverRpc::Archive => {
+            let mut stream = client
+                .archive(gitserver_archive_request(request)?)
+                .await
+                .map_err(|err| format!("Archive RPC failed: {err}"))?
+                .into_inner();
+            let mut messages = Vec::new();
+            while let Some(message) = stream
+                .message()
+                .await
+                .map_err(|err| format!("Archive stream failed: {err}"))?
+            {
+                messages.push(message);
+            }
+            Ok(normalize_archive(&messages))
+        }
+        GitserverRpc::ReadFile => {
+            let mut stream = client
+                .read_file(gitserver_read_file_request(request)?)
+                .await
+                .map_err(|err| format!("ReadFile RPC failed: {err}"))?
+                .into_inner();
+            let mut messages = Vec::new();
+            while let Some(message) = stream
+                .message()
+                .await
+                .map_err(|err| format!("ReadFile stream failed: {err}"))?
+            {
+                messages.push(message);
+            }
+            Ok(normalize_read_file(&messages))
+        }
+        GitserverRpc::ChangedFiles => {
+            let mut stream = client
+                .changed_files(gitserver_changed_files_request(request)?)
+                .await
+                .map_err(|err| format!("ChangedFiles RPC failed: {err}"))?
+                .into_inner();
+            let mut messages = Vec::new();
+            while let Some(message) = stream
+                .message()
+                .await
+                .map_err(|err| format!("ChangedFiles stream failed: {err}"))?
+            {
+                messages.push(message);
+            }
+            Ok(normalize_changed_files(&messages))
+        }
+    }
+}
+
 /// Replay every fixture against one endpoint. All cases must belong to
 /// `service`; callers pass that same name from `--service`.
 async fn evaluate(service: &str, addr: &str, cases: &[FixtureCase]) -> Result<Vec<Value>, String> {
@@ -834,9 +1008,24 @@ async fn evaluate(service: &str, addr: &str, cases: &[FixtureCase]) -> Result<Ve
                 results.push(call_searcher(&mut client, &case.request).await?);
             }
         }
+        "gitserver" => {
+            let mut client =
+                gpb::gitserver_service_client::GitserverServiceClient::connect(addr.to_owned())
+                    .await
+                    .map_err(|err| format!("connect {addr}: {err}"))?;
+            for case in cases {
+                let FixtureService::Gitserver(rpc) = case.service else {
+                    return Err(format!(
+                        "{}: fixture targets symbols or searcher, not gitserver",
+                        case.path.display()
+                    ));
+                };
+                results.push(call_gitserver(&mut client, rpc, &case.request).await?);
+            }
+        }
         other => {
             return Err(format!(
-                "unsupported service {other:?} (symbols or searcher)"
+                "unsupported service {other:?} (symbols, searcher or gitserver)"
             ))
         }
     }
@@ -850,6 +1039,7 @@ async fn evaluate(service: &str, addr: &str, cases: &[FixtureCase]) -> Result<Ve
 fn default_addr(service: &str) -> &'static str {
     match service {
         "searcher" => "http://127.0.0.1:3181",
+        "gitserver" => "http://127.0.0.1:3178",
         _ => "http://127.0.0.1:3184",
     }
 }
@@ -875,9 +1065,9 @@ fn load_cases(fixture_dir: &Path, service: &str) -> Result<Vec<FixtureCase>, Str
 async fn diff(args: &[String]) -> Result<(), String> {
     let args = parse_args(args)?;
     let service = required(&args, "service")?;
-    if !matches!(service, "symbols" | "searcher") {
+    if !matches!(service, "symbols" | "searcher" | "gitserver") {
         return Err(format!(
-            "diff: unsupported service {service:?} (symbols or searcher)"
+            "diff: unsupported service {service:?} (symbols, searcher or gitserver)"
         ));
     }
     let fixture_dir = PathBuf::from(required(&args, "fixture")?);
@@ -916,9 +1106,9 @@ async fn diff(args: &[String]) -> Result<(), String> {
 async fn record(args: &[String]) -> Result<(), String> {
     let args = parse_args(args)?;
     let service = required(&args, "service")?;
-    if !matches!(service, "symbols" | "searcher") {
+    if !matches!(service, "symbols" | "searcher" | "gitserver") {
         return Err(format!(
-            "record: unsupported service {service:?} (symbols or searcher)"
+            "record: unsupported service {service:?} (symbols, searcher or gitserver)"
         ));
     }
     let fixture_dir = PathBuf::from(required(&args, "fixture")?);
@@ -1030,5 +1220,58 @@ mod tests {
             and.children[1].value,
             Some(spb::query_node::Value::Or(_))
         ));
+    }
+
+    #[test]
+    fn hashes_archive_chunks_independent_of_boundaries() {
+        let chunk = |data: &[u8]| gpb::ArchiveResponse {
+            data: data.to_vec(),
+        };
+        let split = [chunk(b"hello "), chunk(b"world")];
+        let whole = [chunk(b"hello world")];
+        assert_eq!(normalize_archive(&split), normalize_archive(&whole));
+        assert_eq!(normalize_archive(&whole)["size_bytes"], json!(11));
+    }
+
+    #[test]
+    fn sorts_changed_files_and_names_statuses() {
+        let messages = vec![gpb::ChangedFilesResponse {
+            files: vec![
+                gpb::ChangedFile {
+                    path: b"b.txt".to_vec(),
+                    status: gpb::changed_file::Status::Deleted as i32,
+                },
+                gpb::ChangedFile {
+                    path: b"a.txt".to_vec(),
+                    status: gpb::changed_file::Status::Added as i32,
+                },
+            ],
+        }];
+        let normalized = normalize_changed_files(&messages);
+        assert_eq!(normalized["files"][0]["path"], json!("a.txt"));
+        assert_eq!(normalized["files"][0]["status"], json!("added"));
+        assert_eq!(normalized["files"][1]["status"], json!("deleted"));
+    }
+
+    #[test]
+    fn parses_gitserver_requests() {
+        let request = gitserver_archive_request(&json!({
+            "repo": "r", "treeish": "c", "format": "tar", "paths": ["a/"],
+        }))
+        .expect("archive request");
+        assert_eq!(request.format, gpb::ArchiveFormat::Tar as i32);
+        assert_eq!(request.paths, vec![b"a/".to_vec()]);
+
+        let request = gitserver_changed_files_request(&json!({
+            "repo_name": "r", "base": "b", "head": "h",
+        }))
+        .expect("changed files request");
+        assert_eq!(request.base, Some(b"b".to_vec()));
+
+        let request = gitserver_changed_files_request(&json!({
+            "repo_name": "r", "head": "h",
+        }))
+        .expect("changed files request");
+        assert_eq!(request.base, None);
     }
 }

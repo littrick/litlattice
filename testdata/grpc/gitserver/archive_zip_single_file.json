@@ -1,0 +1,16 @@
+{
+  "expected": {
+    "sha256": "31122ad2ac0110a3afb29a45cc9ddd0f7e4894212c4c6ec8e251cef5def35fa7",
+    "size_bytes": 2188
+  },
+  "request": {
+    "format": "zip",
+    "paths": [
+      "python/example.py"
+    ],
+    "repo": "test/symbols-fixture",
+    "treeish": "5abdba2559d350afdf6b4dcbf32f5edaadcbdda1"
+  },
+  "rpc": "archive",
+  "service": "gitserver"
+}

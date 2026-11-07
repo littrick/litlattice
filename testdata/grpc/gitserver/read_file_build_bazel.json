@@ -1,0 +1,13 @@
+{
+  "expected": {
+    "data": "#                          vvvvvvvvvvvvv bzl_library ref\nload(\"//:bzl_library.bzl\", \"bzl_library\")\n",
+    "size_bytes": 99
+  },
+  "request": {
+    "commit": "5abdba2559d350afdf6b4dcbf32f5edaadcbdda1",
+    "path": "starlark/BUILD.bazel",
+    "repo_name": "test/symbols-fixture"
+  },
+  "rpc": "read_file",
+  "service": "gitserver"
+}

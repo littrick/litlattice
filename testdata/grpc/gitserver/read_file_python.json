@@ -1,0 +1,13 @@
+{
+  "expected": {
+    "data": "#   v py.f def\n#     v py.f.x def\ndef f(x):\n\n    #   v py.f.g def\n    def g():\n        y = 5\n\n    if True:\n        #   v py.f.x ref\n        y = x  # < \"y\" py.f.y def\n    else:\n        l1 = 3  # < \"l1\" py.f.l1 def\n\n    #   v py.f.i def\n    for i in range(10):\n        #    v py.f.i ref\n        l2 = i  # < \"l2\" py.f.l2 def\n\n    while False:\n        l3 = 3  # < \"l3\" py.f.l3 def\n\n    try:\n        l4 = 3  # < \"l4\" py.f.l4 def\n        #               v py.f.e def\n    except Exception as e:\n        l5 = 3  # < \"l5\" py.f.l5 def\n        #   v py.f.e ref\n        _ = e\n\n    #                        vvvv py.f.file def\n    with open(\"file.txt\") as file:\n        #     vvvv py.f.file fef\n        print(file)\n\n    #          vvv py.f.lam def\n    #               vvv py.f.lam ref\n    _ = lambda lam: lam\n\n    #   v py.f.y ref\n    #       vv py.f.l1 ref\n    #            vv py.f.l2 ref\n    #                 vv py.f.l3 ref\n    #                      vv py.f.l4 ref\n    #                           vv py.f.l5 ref\n    #                                v py.f.g ref\n    _ = y + l1 + l2 + l3 + l4 + l5 + g()\n\n    #                     vvv recursive.foo ref,nodef\n    recursive = recursive.foo\n\n\n#     vv py.C1 def\nclass C1:\n    x = 5  # < \"x\" py.C1.x def\n\n    def __init__(self, y):\n        #    v py.C1.y def\n        self.y = y\n\n    def f(self):\n        #    v py.C1.x ref\n        #             v py.C1.g ref\n        self.x = self.g()\n\n    #   v py.C1.g def\n    def g(self):\n        #           v py.C1.y ref\n        return self.y\n\n\nclass C2(C1):\n    y = C1()\n\n    def f(self, c1: C1):\n        c = c1\n        #           v py.C1.g ref\n        #                   v py.C1.x ref\n        return self.g() + c.x\n\n\ndef newC1() -> C1:\n    return C1()\n\n\n#           v py.C1.x ref\n_ = newC1().x\n\n#        v py.C1.x ref\n#                   v py.C1.x ref\n_ = C1().x + C2().y.x\n\nif False:\n    f(3)  # < \"f\" py.f ref\n",
+    "size_bytes": 1890
+  },
+  "request": {
+    "commit": "5abdba2559d350afdf6b4dcbf32f5edaadcbdda1",
+    "path": "python/example.py",
+    "repo_name": "test/symbols-fixture"
+  },
+  "rpc": "read_file",
+  "service": "gitserver"
+}

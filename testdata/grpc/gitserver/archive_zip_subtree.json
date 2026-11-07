@@ -1,0 +1,17 @@
+{
+  "expected": {
+    "sha256": "769f84d2b8552a91ca0073d12cd73e62d5eaa7882e2faf9d5a4988b220d94e30",
+    "size_bytes": 4374
+  },
+  "request": {
+    "format": "zip",
+    "paths": [
+      "python/",
+      "starlark/"
+    ],
+    "repo": "test/symbols-fixture",
+    "treeish": "5abdba2559d350afdf6b4dcbf32f5edaadcbdda1"
+  },
+  "rpc": "archive",
+  "service": "gitserver"
+}

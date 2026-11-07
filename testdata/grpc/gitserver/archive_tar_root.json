@@ -1,0 +1,14 @@
+{
+  "expected": {
+    "sha256": "7da5dd649b9a748d8da4950363e44302134a0722104882375feda83d245d417c",
+    "size_bytes": 30720
+  },
+  "request": {
+    "format": "tar",
+    "paths": [],
+    "repo": "test/symbols-fixture",
+    "treeish": "5abdba2559d350afdf6b4dcbf32f5edaadcbdda1"
+  },
+  "rpc": "archive",
+  "service": "gitserver"
+}
