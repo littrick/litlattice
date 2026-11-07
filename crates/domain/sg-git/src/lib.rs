@@ -195,23 +195,26 @@ impl GitserverClient {
             path: path.as_bytes().to_vec(),
         };
 
+        let error = |status: tonic::Status| {
+            let message = format!("read file {repo}@{commit}:{path}: {status}");
+            if status.code() == tonic::Code::NotFound {
+                Error::NotFound(message)
+            } else {
+                Error::Message(message)
+            }
+        };
+
         let mut response = client
             .read_file(request)
             .await
-            .map_err(|status| {
-                let message = format!("read file {repo}@{commit}:{path}: {status}");
-                if status.code() == tonic::Code::NotFound {
-                    Error::NotFound(message)
-                } else {
-                    Error::Message(message)
-                }
-            })?
+            .map_err(error)?
             .into_inner();
 
+        // gitserver reports a missing file or commit as the first stream
+        // message, not as the RPC status (the baseline's `NewFileReader` reads
+        // the first message for exactly this reason).
         let mut data = Vec::new();
-        while let Some(chunk) = response.message().await.map_err(|status| {
-            Error::Message(format!("read file {repo}@{commit}:{path}: {status}"))
-        })? {
+        while let Some(chunk) = response.message().await.map_err(error)? {
             data.extend_from_slice(&chunk.data);
         }
         Ok(data)
