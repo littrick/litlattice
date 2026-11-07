@@ -1,0 +1,51 @@
+{
+  "citext_cast": "admin",
+  "citext_raw": {
+    "ok": true,
+    "value": "admin"
+  },
+  "commenter_select": 1,
+  "roundtrip": [
+    {
+      "arr_text": "{a,\"b,c\",NULL}",
+      "big": 9007199254740993,
+      "bin_hex": "00ff10",
+      "js": {
+        "a": "x",
+        "b": 2,
+        "nested": {
+          "k": [
+            1,
+            null,
+            "é"
+          ]
+        }
+      },
+      "num": "12345678901234567890.123456789",
+      "ts": "2024-03-01T10:34:56.123456Z",
+      "txt": null
+    },
+    {
+      "arr_text": null,
+      "big": null,
+      "bin_hex": null,
+      "js": null,
+      "num": null,
+      "ts": "2024-03-01T10:34:56.123456Z",
+      "txt": null
+    }
+  ],
+  "session": {
+    "datestyle": "ISO, MDY",
+    "timezone": "Etc/UTC"
+  },
+  "user": {
+    "created_at": "2026-11-07T13:56:25.553432Z",
+    "deleted_at": null,
+    "display_name": "",
+    "id": 1,
+    "site_admin": true,
+    "updated_at": "2026-11-07T13:56:25.553432Z",
+    "username": "admin"
+  }
+}
