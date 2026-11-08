@@ -36,6 +36,7 @@ use sg_db::external_service_repos::{
 };
 use sg_db::external_services::{ExternalService, ExternalServiceStore};
 use sg_extsvc::{HttpGetter, ModifiedRepo, Repo, RepoSyncDiff, Source, SourceInfo, SourceService};
+use sg_keyring::Keyring;
 use sg_licensing::PrivateRepositories;
 
 use crate::metrics::{sync_error_reason, Metrics, OWNER_SITE, OWNER_UNDEFINED};
@@ -83,31 +84,36 @@ pub trait SourceFactory: Send + Sync {
 /// `repos.NewSource` for the kinds `sg-extsvc` implements (`OTHER`).
 pub struct ExtsvcSourceFactory {
     http: Option<Arc<dyn HttpGetter>>,
+    /// `database.ExternalServices.getEncryptionKey()`: the ring is read on
+    /// every source construction, so a rebuilt ring applies immediately.
+    keyring: Arc<Keyring>,
 }
 
 impl ExtsvcSourceFactory {
-    pub fn new(http: Option<Arc<dyn HttpGetter>>) -> Self {
-        Self { http }
+    pub fn new(http: Option<Arc<dyn HttpGetter>>, keyring: Arc<Keyring>) -> Self {
+        Self { http, keyring }
     }
 }
 
 #[async_trait]
 impl SourceFactory for ExtsvcSourceFactory {
     async fn source(&self, service: &ExternalService) -> Result<Box<dyn Source>, String> {
-        // The baseline decrypts with the frontend keyring (`keyring.Init`
-        // reads the site configuration); this slice only handles plaintext
-        // configurations, which is what `sourcegraph` dev deployments use.
-        if !service.encryption_key_id.is_empty() {
-            return Err(format!(
-                "external service id={} config error: encrypted configurations are not supported",
-                service.id
-            ));
-        }
+        // `svc.Config.Decrypt(ctx)` with the ring's `externalServiceKey`.
+        // Plaintext configurations (`encryption_key_id == ""`) pass through
+        // unchanged; a missing or mismatched key is reported with the
+        // baseline's `external service id=%d config error: …` wording.
+        let config = sg_encryption::maybe_decrypt(
+            self.keyring.external_service_key().as_deref(),
+            &service.config,
+            &service.encryption_key_id,
+        )
+        .await
+        .map_err(|err| format!("external service id={} config error: {err}", service.id))?;
         let source_service = SourceService {
             id: service.id,
             kind: service.kind.clone(),
             display_name: service.display_name.clone(),
-            config: service.config.clone(),
+            config,
             encryption_key_id: service.encryption_key_id.clone(),
             unrestricted: service.unrestricted,
         };
@@ -524,8 +530,7 @@ impl Syncer {
             1 => {
                 let mut repo = stored_to_repo(&stored[0]);
                 let was_deleted = repo.deleted;
-                self.update_repo_license_hook(tx, &repo, sourced)
-                    .await?;
+                self.update_repo_license_hook(tx, &repo, sourced).await?;
                 let modified = repo.update(sourced);
 
                 if modified.is_empty() {

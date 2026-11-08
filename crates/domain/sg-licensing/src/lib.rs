@@ -259,8 +259,8 @@ pub fn parse_signed_key(text: &str, public_key: &RsaPublicKey) -> Result<Info, S
     let raw = URL_SAFE_NO_PAD
         .decode(compact.as_bytes())
         .map_err(|err| format!("license key is not valid base64: {err}"))?;
-    let signed: SignedKey =
-        serde_json::from_slice(&raw).map_err(|err| format!("license key is not valid JSON: {err}"))?;
+    let signed: SignedKey = serde_json::from_slice(&raw)
+        .map_err(|err| format!("license key is not valid JSON: {err}"))?;
     let info: Info = serde_json::from_slice(&signed.info)
         .map_err(|err| format!("license claims are not valid JSON: {err}"))?;
 
@@ -330,8 +330,8 @@ impl<'a> WireReader<'a> {
         if self.rest.len() < 4 {
             return Err("SSH key material is truncated".to_owned());
         }
-        let len = u32::from_be_bytes([self.rest[0], self.rest[1], self.rest[2], self.rest[3]])
-            as usize;
+        let len =
+            u32::from_be_bytes([self.rest[0], self.rest[1], self.rest[2], self.rest[3]]) as usize;
         self.rest = &self.rest[4..];
         if self.rest.len() < len {
             return Err("SSH key material is truncated".to_owned());
@@ -407,9 +407,8 @@ mod tests {
         let raw = URL_SAFE_NO_PAD.decode(key).unwrap();
         let mut envelope: serde_json::Value = serde_json::from_slice(&raw).unwrap();
         // Re-encode different claims without re-signing them.
-        envelope["info"] = serde_json::Value::String(
-            STANDARD.encode(br#"{"t":["plan:enterprise-1"]}"#),
-        );
+        envelope["info"] =
+            serde_json::Value::String(STANDARD.encode(br#"{"t":["plan:enterprise-1"]}"#));
         let tampered = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&envelope).unwrap());
         assert!(parse_signed_key(&tampered, &public).is_err());
     }

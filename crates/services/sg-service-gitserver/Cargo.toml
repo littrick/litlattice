@@ -13,6 +13,7 @@ sg-db = { path = "../../data/sg-db" }
 sg-encryption = { path = "../../domain/sg-encryption" }
 sg-git = { path = "../../domain/sg-git" }
 sg-http = { path = "../../net/sg-http" }
+sg-keyring = { path = "../../domain/sg-keyring" }
 sg-metrics = { path = "../../base/sg-metrics" }
 sg-proto = { path = "../../net/sg-proto" }
 async-trait = { workspace = true }

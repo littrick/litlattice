@@ -1,14 +1,18 @@
-//! Port of `internal/encryption/keyring` as far as gitserver uses it.
+//! Port of `internal/encryption/keyring` as far as the services in this
+//! workspace use it.
 //!
 //! `shared.Main` calls `keyring.Init`, which builds every configured key and
-//! fails startup when one cannot be created. gitserver only reads
-//! `externalServiceKey` (via `database.ExternalServices.getEncryptionKey`), so
-//! only that entry is constructed.
+//! fails startup when one cannot be created. Only the `externalServiceKey`
+//! entry (via `database.ExternalServices.getEncryptionKey`) is read by
+//! gitserver's remote-URL lookup and by repo-updater's source factory, so only
+//! that entry is constructed.
 //!
 //! [`watch`] mirrors `keyring.Init`'s `conf.Watch`: the baseline compares the
 //! `EncryptionKeys` *pointer*, so every configuration replacement rebuilds the
 //! ring. A rebuild failure panics in the Go process; here the error is
-//! returned to the service, which logs it and exits (see `lib.rs`).
+//! returned to the caller, which logs it and exits. Each process that calls
+//! [`init`] must decide how to fail (see the gitserver and repo-updater
+//! services).
 
 use std::sync::{Arc, RwLock};
 

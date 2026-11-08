@@ -11,11 +11,11 @@ use std::sync::Arc;
 
 use crate::cloneurl;
 use crate::git::GitError;
-use crate::keyring::Keyring;
 use crate::update::RemoteUrlSource;
 use async_trait::async_trait;
 use sg_db::external_services::ExternalServiceStore;
 use sg_db::repos::RepoStore;
+use sg_keyring::Keyring;
 
 /// `db.Repos()` / `db.ExternalServices()` backed [`RemoteUrlSource`].
 pub struct DbRemoteUrlSource {

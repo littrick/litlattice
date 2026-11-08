@@ -7,10 +7,10 @@
 //! is the only source that needs no code-host API. Other kinds plug into the
 //! same [`Source`] trait; the syncer is source-agnostic.
 //!
-//! Encrypted external-service configs (`encryption_key_id != ''`) are
-//! rejected here: decryption needs the frontend's keyring (`keyring.Init`
-//! reads the site configuration, not environment variables), which is
-//! covered separately.
+//! Sources take the plaintext configuration: the repo-updater source factory
+//! decrypts `external_services.config` with the keyring built from site
+//! configuration before calling [`new_source`], like `svc.Config.Decrypt(ctx)`
+//! in the baseline.
 
 pub mod exclude;
 pub mod other;

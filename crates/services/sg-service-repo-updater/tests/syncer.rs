@@ -79,13 +79,23 @@ fn syncer(
     Syncer,
     tokio::sync::broadcast::Receiver<sg_extsvc::RepoSyncDiff>,
 ) {
+    syncer_with(pool, Arc::new(sg_keyring::Keyring::default()))
+}
+
+fn syncer_with(
+    pool: &PgPool,
+    keyring: Arc<sg_keyring::Keyring>,
+) -> (
+    Syncer,
+    tokio::sync::broadcast::Receiver<sg_extsvc::RepoSyncDiff>,
+) {
     let (tx, rx) = tokio::sync::broadcast::channel(64);
     let syncer = Syncer::new(
         ExternalServiceStore::new(pool.clone()),
         ExternalServiceReposStore::new(pool.clone()),
         // `OTHER` sources configured with explicit clone URLs never touch
         // the HTTP client.
-        Arc::new(ExtsvcSourceFactory::new(None)),
+        Arc::new(ExtsvcSourceFactory::new(None, keyring)),
         Some(tx),
         Arc::new(SystemClock),
         Arc::new(Metrics::new()),
@@ -337,7 +347,10 @@ async fn emits_syncer_and_source_metrics() {
     let syncer = Syncer::new(
         ExternalServiceStore::new(pool.clone()),
         ExternalServiceReposStore::new(pool.clone()),
-        Arc::new(ExtsvcSourceFactory::new(None)),
+        Arc::new(ExtsvcSourceFactory::new(
+            None,
+            Arc::new(sg_keyring::Keyring::default()),
+        )),
         None,
         Arc::new(SystemClock),
         Arc::clone(&metrics),
@@ -424,7 +437,10 @@ async fn emits_store_metrics_for_create_update_and_delete() {
         ExternalServiceReposStore::new(pool.clone()).with_observer(
             Arc::clone(&metrics) as Arc<dyn sg_db::external_service_repos::StoreObserver>
         ),
-        Arc::new(ExtsvcSourceFactory::new(None)),
+        Arc::new(ExtsvcSourceFactory::new(
+            None,
+            Arc::new(sg_keyring::Keyring::default()),
+        )),
         None,
         Arc::new(SystemClock),
         Arc::clone(&metrics),
@@ -547,9 +563,12 @@ async fn license_hook_rejects_private_repos_beyond_the_free_plan() {
 
     // `unrestricted = false`: the `OTHER` source marks its repos private
     // (`internal/repos/other.go`).
-    let service_id =
-        insert_service_with_unrestricted(&pool, &format!(r#"{{"url":"{base}","repos":["/r1.git"]}}"#), false)
-            .await;
+    let service_id = insert_service_with_unrestricted(
+        &pool,
+        &format!(r#"{{"url":"{base}","repos":["/r1.git"]}}"#),
+        false,
+    )
+    .await;
 
     let (syncer, _diffs) = syncer(&pool);
     let err = syncer
@@ -578,4 +597,95 @@ async fn license_hook_rejects_private_repos_beyond_the_free_plan() {
         .any(|(name, _)| name.ends_with("/r1")));
 
     cleanup(&pool, service_id, &suffix).await;
+}
+
+/// `svc.Config.Decrypt(ctx)` with `keyring.Default().ExternalServiceKey`: an
+/// encrypted configuration is decrypted before the source parses it, and a
+/// missing key is reported with the baseline's `key mismatch` message.
+#[tokio::test]
+async fn decrypts_encrypted_external_service_configs() {
+    let Some(pool) = test_pool().await else {
+        return;
+    };
+    let suffix = unique_suffix();
+    let base = format!("https://{suffix}.example.com");
+
+    // `encryption.keys.externalServiceKey = {type: mounted, filepath}`. The
+    // Go-compatible envelope format is covered by `sg-encryption`'s fixtures.
+    let dir = std::env::temp_dir().join(format!("sg-keyring-{suffix}"));
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    let path = dir.join("external-service-key");
+    std::fs::write(&path, [7u8; 32]).expect("write secret");
+    let site = sg_config::SiteConfiguration::parse(&format!(
+        r#"{{"encryption.keys": {{"externalServiceKey": {{"type": "mounted",
+            "keyname": "extsvc", "filepath": "{}"}}}}}}"#,
+        path.display()
+    ))
+    .expect("site configuration");
+    let keyring = sg_keyring::init(&site).await.expect("keyring");
+    let key = keyring
+        .external_service_key()
+        .expect("external service key");
+
+    let plaintext = format!(r#"{{"url":"{base}","repos":["/r1.git"]}}"#);
+    let ciphertext = key
+        .encrypt(plaintext.as_bytes())
+        .await
+        .expect("encrypt config");
+    let key_id = key.version().await.expect("key version").json();
+    let ciphertext = String::from_utf8(ciphertext).expect("base64 envelope");
+
+    let insert_encrypted = |config: String, key_id: String| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar(
+                "INSERT INTO external_services(kind, display_name, config, encryption_key_id, \
+                 unrestricted) VALUES ('OTHER', 'other-sync-test', $1, $2, true) RETURNING id",
+            )
+            .bind(config)
+            .bind(key_id)
+            .fetch_one(&pool)
+            .await
+            .expect("insert encrypted external service")
+        }
+    };
+
+    // The configured key decrypts the stored envelope.
+    let service_id = insert_encrypted(ciphertext.clone(), key_id.clone()).await;
+    let (keyed, _diffs) = syncer_with(&pool, Arc::clone(&keyring));
+    keyed
+        .sync_external_service(
+            service_id,
+            Duration::from_secs(60),
+            &NoopProgressRecorder,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("encrypted config syncs");
+    let names = repo_names(&pool, &suffix).await;
+    assert_eq!(names, vec![(format!("{suffix}.example.com/r1"), false)]);
+
+    // Without a key in site-config the sync fails before touching the source.
+    let unkeyed_id = insert_encrypted(ciphertext, key_id).await;
+    let (unkeyed, _diffs) = syncer(&pool);
+    let err = unkeyed
+        .sync_external_service(
+            unkeyed_id,
+            Duration::from_secs(60),
+            &NoopProgressRecorder,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect_err("encrypted config without a key");
+    assert_eq!(
+        err,
+        format!(
+            "external service id={unkeyed_id} config error: key mismatch: value is encrypted \
+             but no encryption key available in site-config"
+        )
+    );
+
+    cleanup(&pool, service_id, &suffix).await;
+    cleanup(&pool, unkeyed_id, &suffix).await;
+    let _ = std::fs::remove_dir_all(&dir);
 }

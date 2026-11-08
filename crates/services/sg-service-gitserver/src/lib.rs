@@ -34,7 +34,6 @@ pub mod git;
 pub mod gitservice;
 pub mod grpc;
 pub mod janitor;
-pub mod keyring;
 pub mod limiter;
 pub mod locker;
 pub mod memobs;
@@ -183,7 +182,7 @@ impl Service for GitserverService {
         // `shared.Main` → `keyring.Init`: a configured key that cannot be
         // constructed fails startup. The ring is replaced in place by the
         // `conf.Watch` equivalent below.
-        let keyring = keyring::init(&unified.site).await.map_err(|err| {
+        let keyring = sg_keyring::init(&unified.site).await.map_err(|err| {
             ServiceError::with_source("initializing keyring", std::io::Error::other(err))
         })?;
 
@@ -337,7 +336,8 @@ impl Service for GitserverService {
             let live = Arc::clone(&live);
             let shutdown = ctx.shutdown.clone();
             background.spawn(async move {
-                if let Err(err) = keyring::watch(keyring, live, built_generation, shutdown).await {
+                if let Err(err) = sg_keyring::watch(keyring, live, built_generation, shutdown).await
+                {
                     // The baseline panics inside the watch callback, which
                     // terminates the process with exit status 2.
                     tracing::error!(error = %err, "creating encryption keyring");

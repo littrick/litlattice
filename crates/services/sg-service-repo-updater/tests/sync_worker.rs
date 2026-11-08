@@ -68,7 +68,10 @@ async fn worker_runs_a_queued_job_to_completion() {
         ExternalServiceReposStore::new(pool.clone()).with_observer(
             Arc::clone(&metrics) as Arc<dyn sg_db::external_service_repos::StoreObserver>
         ),
-        Arc::new(ExtsvcSourceFactory::new(None)),
+        Arc::new(ExtsvcSourceFactory::new(
+            None,
+            Arc::new(sg_keyring::Keyring::default()),
+        )),
         None,
         Arc::new(SystemClock),
         Arc::clone(&metrics),

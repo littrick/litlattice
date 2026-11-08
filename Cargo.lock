@@ -3575,6 +3575,18 @@ name = "sg-httpcli"
 version = "0.1.0"
 
 [[package]]
+name = "sg-keyring"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "sg-config",
+ "sg-encryption",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
 name = "sg-licensing"
 version = "0.1.0"
 dependencies = [
@@ -3654,6 +3666,7 @@ dependencies = [
  "sg-encryption",
  "sg-git",
  "sg-http",
+ "sg-keyring",
  "sg-metrics",
  "sg-proto",
  "sha2 0.10.9",
@@ -3688,9 +3701,11 @@ dependencies = [
  "sg-config",
  "sg-core",
  "sg-db",
+ "sg-encryption",
  "sg-extsvc",
  "sg-git",
  "sg-http",
+ "sg-keyring",
  "sg-licensing",
  "sg-metrics",
  "sg-proto",

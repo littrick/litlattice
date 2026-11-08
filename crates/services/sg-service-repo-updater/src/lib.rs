@@ -136,6 +136,16 @@ impl Service for RepoUpdaterService {
             })?;
         let live = Arc::new(sg_config::LiveConfig::new((*unified).clone()));
 
+        // `shared.Main` → `keyring.Init`, before the database is opened. A
+        // configured key that cannot be constructed fails startup with the
+        // baseline's wrapped message.
+        let keyring = sg_keyring::init(&unified.site).await.map_err(|err| {
+            ServiceError::with_source(
+                "initializing encryption keyring",
+                std::io::Error::other(err),
+            )
+        })?;
+
         let dsn = unified.service_connections.postgres_dsn.clone();
         if dsn.is_empty() {
             return Err(ServiceError::new(
@@ -191,10 +201,11 @@ impl Service for RepoUpdaterService {
         ));
 
         // `repos.NewSyncer` + `repos.NewSourcer`. `OTHER` fetches src-expose
-        // listings over HTTP; code-host kinds are not implemented yet.
+        // listings over HTTP; code-host kinds are not implemented yet. The
+        // factory decrypts `external_services.config` with the keyring.
         let http: Arc<dyn sg_extsvc::HttpGetter> =
             Arc::new(HttpClientGetter(sg_http::HttpClient::new()));
-        let source_factory = Arc::new(ExtsvcSourceFactory::new(Some(http)));
+        let source_factory = Arc::new(ExtsvcSourceFactory::new(Some(http), Arc::clone(&keyring)));
         // The relay below subscribes before any sync runs, so no diff is
         // dropped. The buffer only matters when the relay lags.
         let (diff_tx, _) = tokio::sync::broadcast::channel(64);
@@ -296,6 +307,23 @@ impl Service for RepoUpdaterService {
                 sg_config::ConfigWatcher::new(Arc::clone(&config_client), Arc::clone(&live));
             let shutdown = ctx.shutdown.clone();
             tasks.spawn(async move { watcher.run(shutdown).await });
+        }
+        {
+            // `keyring.Init`'s `conf.Watch` callback: rebuild the ring in place
+            // on every configuration replacement.
+            let built_generation = live.generation();
+            let keyring = Arc::clone(&keyring);
+            let live = Arc::clone(&live);
+            let shutdown = ctx.shutdown.clone();
+            tasks.spawn(async move {
+                if let Err(err) = sg_keyring::watch(keyring, live, built_generation, shutdown).await
+                {
+                    // The baseline panics inside the watch callback, which
+                    // terminates the process with exit status 2.
+                    tracing::error!(error = %err, "creating encryption keyring");
+                    std::process::exit(2);
+                }
+            });
         }
 
         // `watchSyncer`: feed sync diffs into the update scheduler unless

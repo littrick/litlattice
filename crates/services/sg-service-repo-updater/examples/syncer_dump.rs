@@ -146,7 +146,10 @@ async fn main() {
     let syncer = Syncer::new(
         ExternalServiceStore::new(pool.clone()),
         ExternalServiceReposStore::new(pool.clone()),
-        Arc::new(ExtsvcSourceFactory::new(None)),
+        Arc::new(ExtsvcSourceFactory::new(
+            None,
+            Arc::new(sg_keyring::Keyring::default()),
+        )),
         None,
         Arc::new(SystemClock),
         Arc::new(Metrics::new()),

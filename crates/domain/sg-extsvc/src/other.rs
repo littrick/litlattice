@@ -76,14 +76,10 @@ pub struct OtherSource {
 }
 
 impl OtherSource {
-    /// `repos.NewOtherSource`.
+    /// `repos.NewOtherSource`. The caller passes the configuration with
+    /// `svc.Config.Decrypt(ctx)` already applied (see the repo-updater
+    /// source factory), so `service.config` is plaintext here.
     pub fn new(service: SourceService, http: Option<Arc<dyn HttpGetter>>) -> Result<Self, String> {
-        if !service.encryption_key_id.is_empty() {
-            return Err(format!(
-                "external service id={} config error: encrypted external service configs are not supported",
-                service.id
-            ));
-        }
         let decoded = sg_config::strip_jsonc(&service.config);
         let conn: OtherConnection = serde_json::from_str(&decoded)
             .map_err(|err| format!("external service id={} config error: {err}", service.id))?;
