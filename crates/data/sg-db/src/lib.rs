@@ -13,6 +13,7 @@ pub mod external_service_sync_jobs;
 pub mod external_services;
 pub mod feature_flags;
 pub mod gitserver_repos;
+pub mod permission_sync_jobs;
 pub mod repo_statistics;
 pub mod repos;
 pub mod repoupdater_state;
