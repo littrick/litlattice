@@ -127,6 +127,21 @@ pub struct FetchOutcome {
 /// <refspecs...>` with `GIT_DIR` set and `GIT_LFS_SKIP_SMUDGE=1` (see issue
 /// #7322: skip LFS content in repositories with Git LFS configured).
 pub async fn fetch_remote(git_dir: &Path, remote_url: &str) -> Result<FetchOutcome, GitError> {
+    fetch_remote_with(git_dir, remote_url, &mut |_| {}).await
+}
+
+/// [`fetch_remote`] while reporting progress lines, like the baseline
+/// `readFetchProgress`: every `\r`/`\n`-terminated, whitespace-trimmed,
+/// non-empty line of the command's output is passed to `on_progress`.
+///
+/// git writes its `--progress` output to stderr; stdout is only read into the
+/// merged output. Both are drained concurrently so a full pipe cannot stall
+/// the child.
+pub async fn fetch_remote_with(
+    git_dir: &Path,
+    remote_url: &str,
+    on_progress: &mut (dyn FnMut(&str) + Send),
+) -> Result<FetchOutcome, GitError> {
     let mut command = Command::new("git");
     command
         .arg("-c")
@@ -151,16 +166,89 @@ pub async fn fetch_remote(git_dir: &Path, remote_url: &str) -> Result<FetchOutco
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    let output = command
-        .output()
-        .await
+    let mut child = command
+        .spawn()
         .map_err(|err| GitError::Message(format!("failed to start command: {err}")))?;
-    let mut merged = output.stdout;
-    merged.extend_from_slice(&output.stderr);
+    let mut stdout = child.stdout.take().expect("stdout is piped");
+    let mut stderr = child.stderr.take().expect("stderr is piped");
+
+    let read_stdout = async {
+        let mut buffer = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut stdout, &mut buffer)
+            .await
+            .map(|_| buffer)
+    };
+    let read_stderr = async {
+        let mut buffer = Vec::new();
+        let mut scanner = LineScanner::default();
+        let mut chunk = [0u8; 4096];
+        loop {
+            let read = tokio::io::AsyncReadExt::read(&mut stderr, &mut chunk).await?;
+            if read == 0 {
+                break;
+            }
+            buffer.extend_from_slice(&chunk[..read]);
+            scanner.push(&chunk[..read], on_progress);
+        }
+        scanner.finish(on_progress);
+        Ok::<Vec<u8>, std::io::Error>(buffer)
+    };
+
+    let (stdout_buffer, stderr_buffer) = tokio::join!(read_stdout, read_stderr);
+    let stdout_buffer = stdout_buffer
+        .map_err(|err| GitError::Message(format!("failed to read fetch output: {err}")))?;
+    let stderr_buffer = stderr_buffer
+        .map_err(|err| GitError::Message(format!("failed to read fetch output: {err}")))?;
+
+    let status = child
+        .wait()
+        .await
+        .map_err(|err| GitError::Message(format!("failed to wait for git: {err}")))?;
+
+    // Keep the baseline's ordering: read stdout in full first, then stderr.
+    let mut merged = stdout_buffer;
+    merged.extend_from_slice(&stderr_buffer);
     Ok(FetchOutcome {
-        exit_status: output.status.code().unwrap_or(-1),
+        exit_status: status.code().unwrap_or(-1),
         output: merged,
     })
+}
+
+/// Splits a byte stream on `\r` and `\n`, emitting whitespace-trimmed,
+/// non-empty tokens (`bufio.Scanner` with the baseline's `scanCRLF`).
+#[derive(Default)]
+struct LineScanner {
+    buffer: Vec<u8>,
+}
+
+impl LineScanner {
+    fn push(&mut self, data: &[u8], on_line: &mut (dyn FnMut(&str) + Send)) {
+        self.buffer.extend_from_slice(data);
+        let mut consumed = 0;
+        for (index, byte) in self.buffer.iter().enumerate() {
+            if *byte == b'\r' || *byte == b'\n' {
+                let token = String::from_utf8_lossy(&self.buffer[consumed..index]);
+                let token = token.trim();
+                if !token.is_empty() {
+                    on_line(token);
+                }
+                consumed = index + 1;
+            }
+        }
+        if consumed > 0 {
+            self.buffer.drain(..consumed);
+        }
+    }
+
+    /// The final, unterminated line at EOF.
+    fn finish(&mut self, on_line: &mut (dyn FnMut(&str) + Send)) {
+        let token = String::from_utf8_lossy(&self.buffer);
+        let token = token.trim();
+        if !token.is_empty() {
+            on_line(token);
+        }
+        self.buffer.clear();
+    }
 }
 
 /// Port of `setHEAD`: pick the remote's default branch, falling back to
@@ -268,18 +356,30 @@ pub async fn clone_repo(
     remote_url: &str,
     progress: &mut Vec<u8>,
 ) -> Result<(), GitError> {
+    clone_repo_with(git_dir, remote_url, progress, &mut |_| {}).await
+}
+
+/// [`clone_repo`] reporting every syncer message and fetch progress line, the
+/// way `readFetchProgress` turns the progress pipe into lock statuses.
+pub async fn clone_repo_with(
+    git_dir: &Path,
+    remote_url: &str,
+    progress: &mut Vec<u8>,
+    on_progress: &mut (dyn FnMut(&str) + Send),
+) -> Result<(), GitError> {
     std::fs::create_dir_all(git_dir)
         .map_err(|err| GitError::Message(format!("clone failed to create tmp dir: {err}")))?;
 
-    try_write(progress, "Creating bare repo\n");
+    emit(progress, on_progress, "Creating bare repo\n");
     make_bare_repo(git_dir).await?;
-    try_write(
+    emit(
         progress,
+        on_progress,
         &format!("Created bare repo at {}\n", git_dir.display()),
     );
 
-    try_write(progress, "Fetching remote contents\n");
-    let outcome = fetch_remote(git_dir, remote_url).await?;
+    emit(progress, on_progress, "Fetching remote contents\n");
+    let outcome = fetch_remote_with(git_dir, remote_url, on_progress).await?;
     progress.extend_from_slice(&outcome.output);
     if outcome.exit_status != 0 {
         return Err(GitError::Message(format!(
@@ -287,19 +387,52 @@ pub async fn clone_repo(
             outcome.exit_status
         )));
     }
-    try_write(progress, "Fetched remote contents\n");
+    emit(progress, on_progress, "Fetched remote contents\n");
 
-    try_write(progress, "Setting local HEAD to remote HEAD\n");
+    emit(progress, on_progress, "Setting local HEAD to remote HEAD\n");
     set_head(git_dir, remote_url).await?;
-    try_write(progress, "Finished setting local HEAD to remote HEAD\n");
+    emit(
+        progress,
+        on_progress,
+        "Finished setting local HEAD to remote HEAD\n",
+    );
 
     Ok(())
 }
 
-fn try_write(progress: &mut Vec<u8>, message: &str) {
-    // `Vec` writes cannot fail; this mirrors `tryWrite`, which logs and
-    // continues on writer errors.
+fn emit(progress: &mut Vec<u8>, on_progress: &mut (dyn FnMut(&str) + Send), message: &str) {
     let _ = progress.write_all(message.as_bytes());
+    on_progress(message.trim_end());
+}
+
+/// Port of `gitRepoSyncer.Fetch`: fetch into an existing repository, then
+/// point `HEAD` at the remote's default branch. Progress is reported the same
+/// way as during a clone.
+pub async fn fetch_repo_with(
+    git_dir: &Path,
+    remote_url: &str,
+    progress: &mut Vec<u8>,
+    on_progress: &mut (dyn FnMut(&str) + Send),
+) -> Result<(), GitError> {
+    emit(progress, on_progress, "Fetching remote contents\n");
+    let outcome = fetch_remote_with(git_dir, remote_url, on_progress).await?;
+    progress.extend_from_slice(&outcome.output);
+    if outcome.exit_status != 0 {
+        return Err(GitError::Message(format!(
+            "exit code: {}, failed to fetch from remote",
+            outcome.exit_status
+        )));
+    }
+    emit(progress, on_progress, "Fetched remote contents\n");
+
+    emit(progress, on_progress, "Setting local HEAD to remote HEAD\n");
+    set_head(git_dir, remote_url).await?;
+    emit(
+        progress,
+        on_progress,
+        "Finished setting local HEAD to remote HEAD\n",
+    );
+    Ok(())
 }
 
 /// The temp path a clone is staged in before being renamed into the repo
@@ -400,6 +533,28 @@ mod tests {
         assert_eq!(
             std::fs::read(&head).expect("read"),
             b"ref: refs/heads/master"
+        );
+    }
+
+    #[test]
+    fn scans_progress_lines_like_the_baseline() {
+        let mut lines = Vec::new();
+        let mut on_line = |line: &str| lines.push(line.to_owned());
+        let mut scanner = LineScanner::default();
+        scanner.push(
+            b"Receiving objects: 1%\rReceiving objects: 2%",
+            &mut on_line,
+        );
+        scanner.push(b"\n  \r\nWriting objects: 100%\npartial", &mut on_line);
+        scanner.finish(&mut on_line);
+        assert_eq!(
+            lines,
+            vec![
+                "Receiving objects: 1%",
+                "Receiving objects: 2%",
+                "Writing objects: 100%",
+                "partial",
+            ]
         );
     }
 

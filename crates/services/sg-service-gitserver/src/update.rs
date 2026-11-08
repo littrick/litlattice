@@ -218,7 +218,7 @@ impl UpdateBackend for LocalBackend {
     async fn clone(
         &self,
         repo: &str,
-        _lock: &RepositoryLock,
+        lock: &RepositoryLock,
         _cancelled: &CancellationToken,
     ) -> Result<(), GitError> {
         // `cloneRepo` returns success without touching the disk for the
@@ -242,8 +242,12 @@ impl UpdateBackend for LocalBackend {
         let _cleanup = crate::fs::TempDirCleanup(tmp_dir.clone());
         let tmp_path = crate::vcssyncer::clone_tmp_path(&tmp_dir);
 
+        // `readFetchProgress`: every syncer message and git progress line
+        // becomes the lock status shown by `RepoCloneProgress`.
         let mut progress = Vec::new();
-        crate::vcssyncer::clone_repo(&tmp_path, &remote_url, &mut progress).await?;
+        let mut on_progress = |line: &str| lock.set_status(line);
+        crate::vcssyncer::clone_repo_with(&tmp_path, &remote_url, &mut progress, &mut on_progress)
+            .await?;
 
         crate::postfetch::post_fetch_actions(&tmp_path, repo).await?;
 
@@ -258,22 +262,17 @@ impl UpdateBackend for LocalBackend {
     async fn fetch(
         &self,
         repo: &str,
-        _lock: &RepositoryLock,
+        lock: &RepositoryLock,
         _cancelled: &CancellationToken,
     ) -> Result<(), GitError> {
         let git_dir = self.git_dir(repo)?;
         let remote_url = self.remote_url(repo).await?;
 
-        let outcome = crate::vcssyncer::fetch_remote(&git_dir, &remote_url).await?;
-        if outcome.exit_status != 0 {
-            return Err(GitError::Message(format!(
-                "failed to fetch repo {:?} with output {:?}",
-                repo,
-                String::from_utf8_lossy(&outcome.output)
-            )));
-        }
+        let mut progress = Vec::new();
+        let mut on_progress = |line: &str| lock.set_status(line);
+        crate::vcssyncer::fetch_repo_with(&git_dir, &remote_url, &mut progress, &mut on_progress)
+            .await?;
 
-        crate::vcssyncer::set_head(&git_dir, &remote_url).await?;
         crate::postfetch::post_fetch_actions(&git_dir, repo).await?;
         Ok(())
     }
@@ -591,6 +590,11 @@ mod tests {
 
         backend.clone(repo, &lock, &token).await.expect("clone");
         assert!(backend.repo_cloned(repo).await.expect("repo cloned"));
+        // Progress lines from the syncer became the lock status.
+        assert_eq!(
+            locker.status(repo).as_deref(),
+            Some("Finished setting local HEAD to remote HEAD")
+        );
 
         let git_dir = crate::repo::repo_dir(&repos_dir, repo).expect("git dir");
         assert_eq!(
@@ -643,6 +647,10 @@ mod tests {
         );
 
         backend.fetch(repo, &lock, &token).await.expect("fetch");
+        assert_eq!(
+            locker.status(repo).as_deref(),
+            Some("Finished setting local HEAD to remote HEAD")
+        );
         assert_eq!(
             git_output(&git_dir, &["rev-parse", "refs/heads/trunk"]),
             git_output(&origin, &["rev-parse", "refs/heads/trunk"])
