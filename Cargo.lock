@@ -3759,7 +3759,10 @@ dependencies = [
 name = "sg-bin-worker"
 version = "0.1.0"
 dependencies = [
+ "sg-core",
+ "sg-log",
  "sg-service-worker",
+ "tokio",
 ]
 
 [[package]]
@@ -4141,7 +4144,19 @@ dependencies = [
 name = "sg-service-worker"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
+ "http 1.5.0",
+ "http-body-util",
+ "hyper 1.12.0",
+ "sg-config",
  "sg-core",
+ "sg-db",
+ "sg-http",
+ "sg-keyring",
+ "tokio",
+ "tokio-util",
+ "tonic 0.12.3",
+ "tracing",
 ]
 
 [[package]]
