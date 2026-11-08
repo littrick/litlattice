@@ -266,11 +266,22 @@ ORDER BY repo.id
 }
 
 /// `api.ExternalRepoSpec`: the code-host identity of a repository.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ExternalRepoSpec {
     pub id: String,
     pub service_type: String,
     pub service_id: String,
+}
+
+impl std::fmt::Display for ExternalRepoSpec {
+    /// Matches Go's `%v` on `api.ExternalRepoSpec`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{{{} {} {}}}",
+            self.id, self.service_type, self.service_id
+        )
+    }
 }
 
 impl RepoStore {

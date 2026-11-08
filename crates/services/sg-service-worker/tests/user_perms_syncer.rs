@@ -48,6 +48,7 @@ impl UserPermsFetcher for FakeFetcher {
                 repo_perms.insert(9732, vec![9832, 9833]);
                 UserPermsFetch {
                     repo_perms,
+                    sub_repo_perms: BTreeMap::new(),
                     statuses: vec![success(), success()],
                     error: None,
                 }
@@ -57,12 +58,14 @@ impl UserPermsFetcher for FakeFetcher {
                 repo_perms.insert(9733, vec![9834]);
                 UserPermsFetch {
                     repo_perms,
+                    sub_repo_perms: BTreeMap::new(),
                     statuses: vec![success()],
                     error: None,
                 }
             }
             9835 => UserPermsFetch {
                 repo_perms: BTreeMap::new(),
+                sub_repo_perms: BTreeMap::new(),
                 statuses: vec![CodeHostState::new_provider_status(
                     "https://github.com/",
                     "github",
@@ -73,6 +76,7 @@ impl UserPermsFetcher for FakeFetcher {
             },
             9836 => UserPermsFetch {
                 repo_perms: BTreeMap::new(),
+                sub_repo_perms: BTreeMap::new(),
                 statuses: vec![success()],
                 error: None,
             },

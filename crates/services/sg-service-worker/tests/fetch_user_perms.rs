@@ -84,6 +84,7 @@ impl AuthzProvider for FuProvider {
                 exacts: vec!["a-exact1".into(), "a-exact2".into(), "a-public".into()],
                 include_contains: vec!["a-cont%".into()],
                 exclude_contains: vec!["a-cont%bar".into()],
+                ..Default::default()
             },
             "a2" => {
                 return Err(UserPermsError::Unauthorized {

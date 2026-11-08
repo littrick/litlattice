@@ -29,6 +29,7 @@ pub mod repo_statistics;
 pub mod repos;
 pub mod reposcheduler;
 pub mod repoupdater_state;
+pub mod sub_repo_perms;
 pub mod syntactic_indexing_jobs;
 pub mod telemetry_events;
 pub mod user_emails;

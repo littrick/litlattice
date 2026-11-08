@@ -27,13 +27,16 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use sg_db::perms_store::{fetch_repos_by_external_account, CodeHostState};
 use sg_db::repos::{ExternalRepoSpec, RepoStore};
+use sg_db::sub_repo_perms::{
+    get_by_user_and_service, get_by_user_and_service_with_ips, SubRepoPermsError,
+};
 use sg_db::user_external_accounts::{self, ExternalAccountsListOptions};
 use sg_db::users::UserRecord;
 use sqlx::postgres::PgPool;
 
 use super::perms_syncer::{
-    AuthzProvider, ExternalUserPermissions, FetchPermsOptions, ProviderRegistry, UserPermsError,
-    UserPermsFetch, UserPermsFetcher,
+    AuthzProvider, ExternalUserPermissions, FetchPermsOptions, ProviderRegistry, SubRepoUpsert,
+    UserPermsError, UserPermsFetch, UserPermsFetcher,
 };
 
 /// `extsvc.TypeGitLab`.
@@ -200,6 +203,9 @@ impl UserPermsFetcher for ExternalAccountPermsFetcher {
                 continue;
             };
 
+            let mut sub_repo_perms_map: std::collections::BTreeMap<String, SubRepoUpsert> =
+                std::collections::BTreeMap::new();
+
             let (ext_perms, fetch_error) = match provider.fetch_user_perms(account, opts).await {
                 Ok(perms) => {
                     results.statuses.push(CodeHostState::new_provider_status(
@@ -252,6 +258,57 @@ impl UserPermsFetcher for ExternalAccountPermsFetcher {
                         // temporarily revoking access on an intermittent
                         // error.
                         ext_perms = Some(ExternalUserPermissions::default());
+
+                        // Retain previously synced sub-repository permissions.
+                        match get_by_user_and_service_with_ips(
+                            &self.pool,
+                            user.id,
+                            provider.service_type(),
+                            provider.service_id(),
+                            false,
+                        )
+                        .await
+                        {
+                            Ok(perms) => {
+                                for (spec, perms) in perms {
+                                    sub_repo_perms_map
+                                        .insert(spec.id, SubRepoUpsert::WithIps(perms));
+                                }
+                            }
+                            Err(SubRepoPermsError::IpsNotSynced) => {
+                                // Rows written before IP-aware syncing: carry
+                                // them through the path-only store.
+                                match get_by_user_and_service(
+                                    &self.pool,
+                                    user.id,
+                                    provider.service_type(),
+                                    provider.service_id(),
+                                )
+                                .await
+                                {
+                                    Ok(perms) => {
+                                        for (spec, perms) in perms {
+                                            sub_repo_perms_map
+                                                .insert(spec.id, SubRepoUpsert::Paths(perms));
+                                        }
+                                    }
+                                    Err(err) => {
+                                        results.error = Some(format!(
+                                            "fetching existing sub-repo permissions: {err}"
+                                        ));
+                                        return results;
+                                    }
+                                }
+                            }
+                            Err(err) => {
+                                results.error = Some(format!(
+                                    "fetching existing sub-repo permissions with IPs: {err}"
+                                ));
+                                return results;
+                            }
+                        }
+
+                        // Load the last synced repositories for this account.
                         let current_repos =
                             match fetch_repos_by_external_account(&self.pool, account.id).await {
                                 Ok(repos) => repos,
@@ -281,6 +338,12 @@ impl UserPermsFetcher for ExternalAccountPermsFetcher {
                 }
             } else {
                 // Happy path.
+                if let Some(perms) = &ext_perms {
+                    for (repo_id, perms) in &perms.sub_repo_permissions {
+                        sub_repo_perms_map
+                            .insert(repo_id.clone(), SubRepoUpsert::WithIps(perms.clone()));
+                    }
+                }
                 if let Err(err) =
                     user_external_accounts::touch_last_valid(&self.pool, account.id).await
                 {
@@ -315,7 +378,18 @@ impl UserPermsFetcher for ExternalAccountPermsFetcher {
                 }
             };
 
-            // Sub-repository permissions would be recorded here (not ported).
+            // Record any sub-repository permissions (before include/exclude
+            // matches, like the baseline).
+            for (repo_id, upsert) in sub_repo_perms_map {
+                results.sub_repo_perms.insert(
+                    ExternalRepoSpec {
+                        id: repo_id,
+                        service_type: provider.service_type().to_owned(),
+                        service_id: provider.service_id().to_owned(),
+                    },
+                    upsert,
+                );
+            }
 
             let include_specs: Vec<ExternalRepoSpec> = perms
                 .include_contains

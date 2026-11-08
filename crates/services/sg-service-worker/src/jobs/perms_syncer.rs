@@ -32,7 +32,10 @@ use sg_db::perms_store::{
     CodeHostState, SetPermissionsResult, UserIdWithExternalAccountId, PERM_READ, SOURCE_REPO_SYNC,
     SOURCE_USER_SYNC,
 };
-use sg_db::repos::RepoStore;
+use sg_db::repos::{ExternalRepoSpec, RepoStore};
+use sg_db::sub_repo_perms::{
+    upsert_with_spec, upsert_with_spec_with_ips, SubRepoPermissions, SubRepoPermissionsWithIps,
+};
 use sg_db::user_external_accounts::{ExternalAccount, ExternalAccountSpec};
 use sg_db::users::{get_by_id as get_user_by_id, UserRecord};
 use sqlx::postgres::PgPool;
@@ -79,6 +82,17 @@ pub struct ExternalUserPermissions {
     pub exacts: Vec<String>,
     pub include_contains: Vec<String>,
     pub exclude_contains: Vec<String>,
+    /// Keyed by external repository ID.
+    pub sub_repo_permissions: BTreeMap<String, SubRepoPermissionsWithIps>,
+}
+
+/// One sub-repository permission write, preserving whether the provider
+/// supplied IP addresses. The temporary-error retention path falls back to the
+/// path-only store when the existing rows predate IP syncing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SubRepoUpsert {
+    Paths(SubRepoPermissions),
+    WithIps(SubRepoPermissionsWithIps),
 }
 
 /// The `FetchUserPerms` error classes the syncer branches on
@@ -180,6 +194,7 @@ pub struct RepoSyncOutcome {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct UserPermsFetch {
     pub repo_perms: BTreeMap<i32, Vec<i32>>,
+    pub sub_repo_perms: BTreeMap<ExternalRepoSpec, SubRepoUpsert>,
     pub statuses: Vec<CodeHostState>,
     pub error: Option<String>,
 }
@@ -491,6 +506,26 @@ impl PermsSyncer {
             }
         }
         outcome.result = Some(result);
+
+        // Set sub-repository permissions (the baseline does this after the
+        // per-account repository writes and before the final lock).
+        for (spec, upsert) in &fetched.sub_repo_perms {
+            let write = match upsert {
+                SubRepoUpsert::Paths(perms) => {
+                    upsert_with_spec(&self.pool, user_id, spec, perms).await
+                }
+                SubRepoUpsert::WithIps(perms) => {
+                    upsert_with_spec_with_ips(&self.pool, user_id, spec, perms).await
+                }
+            };
+            if let Err(err) = write {
+                outcome.error = Some(format!(
+                    "upserting sub repo perms {spec} for user {:?} (id: {}): {err}",
+                    user.username, user.id
+                ));
+                return outcome;
+            }
+        }
 
         // Mirrors the baseline's second acquisition of `permsUpdateLock`
         // around the metrics/logging block (no database writes there).
