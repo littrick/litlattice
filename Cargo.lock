@@ -3839,7 +3839,10 @@ dependencies = [
 name = "sg-config"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "prost-types 0.13.5",
+ "ring",
+ "serde",
  "serde_json",
  "sg-proto",
  "tokio",
@@ -3871,6 +3874,7 @@ dependencies = [
  "thiserror 1.0.69",
  "time",
  "tokio",
+ "uuid",
 ]
 
 [[package]]

@@ -28,6 +28,8 @@ pub mod repos;
 pub mod repoupdater_state;
 pub mod telemetry_events;
 pub mod user_emails;
+pub mod user_external_accounts;
+pub mod users;
 pub mod worker_queue;
 pub mod zoekt_repos;
 

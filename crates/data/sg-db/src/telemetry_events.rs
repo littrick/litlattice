@@ -59,6 +59,19 @@ pub async fn bulk_insert_event_logs(
     pool: &PgPool,
     rows: &[EventLogRow],
 ) -> Result<(), sqlx::Error> {
+    bulk_insert_event_logs_on(pool, rows).await
+}
+
+/// [`bulk_insert_event_logs`] against any executor, so the user-deletion
+/// transaction in [`crate::users::hard_delete_list`] can write its events
+/// through the same statement.
+pub async fn bulk_insert_event_logs_on<'e, E>(
+    executor: E,
+    rows: &[EventLogRow],
+) -> Result<(), sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
     if rows.is_empty() {
         return Ok(());
     }
@@ -92,7 +105,7 @@ pub async fn bulk_insert_event_logs(
             .push_bind(&row.billing_event_id);
     });
 
-    builder.build().execute(pool).await?;
+    builder.build().execute(executor).await?;
     Ok(())
 }
 

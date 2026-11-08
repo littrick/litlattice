@@ -8,6 +8,9 @@ publish.workspace = true
 
 [dependencies]
 sg-proto = { path = "../../net/sg-proto" }
+base64 = { workspace = true }
+ring = "0.17"
+serde = { workspace = true }
 tonic = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }

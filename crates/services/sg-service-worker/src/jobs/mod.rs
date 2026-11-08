@@ -36,6 +36,7 @@ use crate::framework::BackgroundRoutine;
 use crate::registry;
 
 pub mod adminanalytics;
+pub mod auth_sourcegraph_operator_cleaner;
 pub mod batches;
 pub mod codeintel_metrics_reporter;
 pub mod codeintel_package_filter_applicator;
@@ -161,6 +162,9 @@ pub fn all_jobs() -> Vec<(&'static str, Arc<dyn Job>)> {
         .map(|&name| {
             let job: Arc<dyn Job> = match name {
                 "aggregated-users-statistics" => Arc::new(users::AggregatedUsersStatistics),
+                "auth-sourcegraph-operator-cleaner" => {
+                    Arc::new(auth_sourcegraph_operator_cleaner::SourcegraphOperatorCleaner::new())
+                }
                 "batches-janitor" => Arc::new(batches::BatchesJanitor::new()),
                 "cody-gateway-usage-check" => Arc::new(codygateway::CodyGatewayUsageCheck),
                 "cody-llm-token-counter" => Arc::new(completions::CodyLlmTokenCounter),

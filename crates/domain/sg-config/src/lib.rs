@@ -21,6 +21,8 @@
 //! changes, replaces the [`LiveConfig`] snapshot and wakes every
 //! `conf.Watch`-style consumer.
 
+pub mod cloud;
+
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
