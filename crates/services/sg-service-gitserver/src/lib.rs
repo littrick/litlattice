@@ -23,6 +23,7 @@ pub mod debug;
 mod details;
 pub mod diff;
 pub mod disk;
+pub mod frontendconfig;
 pub mod fs;
 pub mod git;
 pub mod gitservice;
@@ -35,6 +36,7 @@ mod mux;
 pub mod postfetch;
 pub mod progress;
 pub mod repo;
+pub mod repositoryservice;
 pub mod search;
 pub mod trace;
 pub mod update;
@@ -129,6 +131,31 @@ impl Service for GitserverService {
             .clone()
             .ok_or_else(|| ServiceError::new("gitserver listen address was not loaded"))?;
 
+        // `shared.Main` blocks in `conf.Get()` (via `getDB`) until the frontend
+        // has provided the initial configuration, and fails when the database
+        // DSN is missing. Mirror that before binding the port.
+        let config_client = sg_config::ConfigClient::from_env();
+        let unified = frontendconfig::wait_for_initial_config(&config_client, &ctx.shutdown)
+            .await
+            .ok_or_else(|| {
+                ServiceError::new("gitserver stopped while waiting for the frontend configuration")
+            })?;
+        let dsn = unified.service_connections.postgres_dsn.clone();
+        if dsn.is_empty() {
+            return Err(ServiceError::new(
+                "postgres_dsn is not configured by the frontend",
+            ));
+        }
+        let pool = sg_db::connect(&dsn, 10)
+            .await
+            .map_err(|err| ServiceError::with_source("connecting to the frontend database", err))?;
+        let store = Arc::new(sg_db::gitserver_repos::GitserverReposStore::new(pool));
+        tracing::info!(
+            addr = config_client.addr(),
+            postgres = !dsn.is_empty(),
+            "loaded the frontend configuration"
+        );
+
         let listener = sg_http::listen(&addr)
             .await
             .map_err(|err| ServiceError::with_source(format!("failed to listen on {addr}"), err))?;
@@ -141,8 +168,18 @@ impl Service for GitserverService {
             tasks: tasks.clone(),
             locker: locker::RepositoryLocker::new(),
         };
+        let repository_service = repositoryservice::RepositoryService {
+            repos_dir: Arc::new(config.repos_dir.clone()),
+            store: Some(store),
+            hostname: config.external_address.clone(),
+        };
         let routes = tonic::service::Routes::new(
             gpb::gitserver_service_server::GitserverServiceServer::new(grpc),
+        )
+        .add_service(
+            gpb::gitserver_repository_service_server::GitserverRepositoryServiceServer::new(
+                repository_service,
+            ),
         );
         let git_service = GitService {
             repos_dir: Arc::new(config.repos_dir.clone()),

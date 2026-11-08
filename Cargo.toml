@@ -50,6 +50,7 @@ tree-sitter-javascript = { path = "vendor/tree-sitter-javascript" }
 tree-sitter-typescript = { path = "vendor/tree-sitter-typescript" }
 tree-sitter-cpp = { path = "vendor/tree-sitter-cpp" }
 tree-sitter-ruby = { path = "vendor/tree-sitter-ruby" }
+base64 = "0.22"
 bytes = "1"
 flate2 = "1"
 http = "1"

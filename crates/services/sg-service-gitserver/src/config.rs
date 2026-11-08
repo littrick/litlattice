@@ -8,6 +8,17 @@ use sg_core::{ConfigError, EnvReader};
 pub struct GitserverConfig {
     pub repos_dir: PathBuf,
     pub listen_addr: String,
+    /// `GITSERVER_EXTERNAL_ADDR`: the `gitserver_repos.shard_id` and the name
+    /// this instance is known by in `SRC_GIT_SERVERS`.
+    pub external_address: String,
+}
+
+/// Port of `internal/hostname.Get`: `HOSTNAME` when set (the env registry
+/// entry is registered by the caller), otherwise the OS hostname.
+fn os_hostname() -> String {
+    std::fs::read_to_string("/proc/sys/kernel/hostname")
+        .map(|value| value.trim_end_matches('\n').to_owned())
+        .unwrap_or_default()
 }
 
 impl GitserverConfig {
@@ -42,9 +53,22 @@ impl GitserverConfig {
             listen_addr
         };
 
+        let hostname_override = env.get("HOSTNAME", "", "Hostname override");
+        let hostname = if hostname_override.is_empty() {
+            os_hostname()
+        } else {
+            hostname_override
+        };
+        let external_address = env.get(
+            "GITSERVER_EXTERNAL_ADDR",
+            &hostname,
+            "The name of this gitserver as it would appear in SRC_GIT_SERVERS.",
+        );
+
         Ok(Self {
             repos_dir: PathBuf::from(repos_dir),
             listen_addr: override_addr.unwrap_or(listen_addr),
+            external_address,
         })
     }
 

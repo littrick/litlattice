@@ -10,8 +10,10 @@
 # must read the same repositories: point the Rust binary at the same
 # SRC_REPOS_DIR (read-only use is fine).
 #
-# Rust side, for example:
+# Rust side, for example (the gitserver waits for the frontend configuration
+# before listening, like the Go binary):
 #   SRC_REPOS_DIR=/home/developer/ws/test_ws/run/repos \
+#   SRC_FRONTEND_INTERNAL=127.0.0.1:3090 \
 #   SG_GITSERVER_ADDR=127.0.0.1:13178 target/debug/gitserver
 
 set -euo pipefail
