@@ -1,0 +1,1020 @@
+#![forbid(unsafe_code)]
+
+//! Store operations used by the `codeintel-upload-janitor` worker job
+//! (`internal/codeintel/uploads/internal/store`):
+//!
+//! * `DeleteUploadsWithoutRepository`, `DeleteUploadsStuckUploading`,
+//!   `SoftDeleteExpiredUploads`, `SoftDeleteExpiredUploadsViaTraversal`;
+//! * `DeleteOldAuditLogs`, `ReconcileCandidates`,
+//!   `GetUploadsByIDsAllowDeleted` (ids only), `HardDeleteUploadsByIDs`;
+//! * `DeleteAutoIndexJobsWithoutRepository`, `ExpireFailedRecords`;
+//! * `GetStaleSourcedCommits` / `DeleteSourcedCommits` /
+//!   `UpdateSourcedCommits` and `ProcessSourcedCommits` /
+//!   `ProcessStaleSourcedCommits`.
+//!
+//! Every SQL string is copied from the baseline store; migrations stay owned
+//! by the Go `migrator`. Two deliberate equivalences:
+//!
+//! * The janitor runs with an internal actor, so `database.AuthzQueryConds`
+//!   contributes `TRUE` and is omitted.
+//! * `GetUploads(state="deleted", AllowExpired, AllowDeletedRepo)` is
+//!   specialised to [`get_deleted_upload_ids`]: the janitor only reads the
+//!   identifiers, and the fixed options collapse to
+//!   `u.state = 'deleted' AND repo.blocked IS NULL` (no `NOT u.expired`, no
+//!   `repo.deleted_at` condition).
+//!
+//! `basestore.SetLocal("codeintel.lsif_uploads_audit.reason", ...)` returns
+//! `ErrNotInTransaction` unless the handle is in a transaction; the baseline
+//! ignores that error. The audit reason is therefore only set by the
+//! functions that run inside a transaction (deleted repository, soft deletes,
+//! stale index commits), which is what this module reproduces.
+
+use std::time::Duration;
+
+use sqlx::postgres::{PgPool, PgTransaction};
+use sqlx::types::time::OffsetDateTime;
+use sqlx::Row;
+
+/// `deletedRepositoryGracePeriod` (30 minutes).
+pub const DELETED_REPOSITORY_GRACE_PERIOD: Duration = Duration::from_secs(30 * 60);
+
+/// `codeintel.lsif_uploads_audit.reason` (read by the audit trigger).
+const AUDIT_REASON_GUC: &str = "codeintel.lsif_uploads_audit.reason";
+
+/// `SourcedCommits`: a repository and the commits sourced from it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourcedCommits {
+    pub repository_id: i64,
+    pub repository_name: String,
+    pub commits: Vec<String>,
+}
+
+/// The `shouldDelete` callback of `ProcessSourcedCommits` and
+/// `ProcessStaleSourcedCommits` (a gitserver `ResolveRevision` check in the
+/// job).
+#[async_trait::async_trait]
+pub trait CommitDeleter: Send + Sync {
+    async fn should_delete(
+        &self,
+        repository_id: i64,
+        repository_name: &str,
+        commit: &str,
+    ) -> Result<bool, String>;
+}
+
+/// `store.DeleteUploadsWithoutRepository`. Returns `(totalCount, count)`.
+pub async fn delete_uploads_without_repository(
+    pool: &PgPool,
+    now: OffsetDateTime,
+) -> Result<(i64, i64), sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    set_audit_reason(
+        &mut tx,
+        "upload associated with repository not known to this instance",
+    )
+    .await?;
+
+    let rows = sqlx::query(DELETE_UPLOADS_WITHOUT_REPOSITORY_QUERY)
+        .bind(now)
+        .bind(DELETED_REPOSITORY_GRACE_PERIOD.as_secs() as i64)
+        .fetch_all(&mut *tx)
+        .await?;
+
+    let (total, count) = scan_counts_with_total_count(&rows);
+    tx.commit().await?;
+    Ok((total, count))
+}
+
+/// `store.DeleteUploadsStuckUploading`.
+pub async fn delete_uploads_stuck_uploading(
+    pool: &PgPool,
+    uploaded_before: OffsetDateTime,
+) -> Result<(i64, i64), sqlx::Error> {
+    let row = sqlx::query(DELETE_UPLOADS_STUCK_UPLOADING_QUERY)
+        .bind(uploaded_before)
+        .fetch_one(pool)
+        .await?;
+    let count: i64 = row.try_get(0)?;
+    Ok((count, count))
+}
+
+/// `store.SoftDeleteExpiredUploads`. Returns `(scannedCount, alteredCount)`.
+pub async fn soft_delete_expired_uploads(
+    pool: &PgPool,
+    batch_size: i64,
+) -> Result<(i64, i64), sqlx::Error> {
+    // `DEBUG_PRECISE_CODE_INTEL_SOFT_DELETE_BAIL_OUT`
+    if !std::env::var("DEBUG_PRECISE_CODE_INTEL_SOFT_DELETE_BAIL_OUT")
+        .unwrap_or_default()
+        .is_empty()
+    {
+        return Ok((0, 0));
+    }
+
+    let mut tx = pool.begin().await?;
+    set_audit_reason(&mut tx, "soft-deleting expired uploads").await?;
+
+    let rows = sqlx::query(SOFT_DELETE_EXPIRED_UPLOADS_QUERY)
+        .bind(batch_size)
+        .fetch_all(&mut *tx)
+        .await?;
+    let (scanned, count, repositories) = scan_counts_and_repositories(&rows);
+    mark_repositories_dirty(&mut tx, &repositories).await?;
+    tx.commit().await?;
+    Ok((scanned, count))
+}
+
+/// `store.SoftDeleteExpiredUploadsViaTraversal`.
+pub async fn soft_delete_expired_uploads_via_traversal(
+    pool: &PgPool,
+    traversal_limit: i64,
+) -> Result<(i64, i64), sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    set_audit_reason(
+        &mut tx,
+        "soft-deleting expired uploads (via graph traversal)",
+    )
+    .await?;
+
+    let rows = sqlx::query(SOFT_DELETE_EXPIRED_UPLOADS_VIA_TRAVERSAL_QUERY)
+        .bind(traversal_limit)
+        .bind(traversal_limit)
+        .fetch_all(&mut *tx)
+        .await?;
+    let (scanned, count, repositories) = scan_counts_and_repositories(&rows);
+    mark_repositories_dirty(&mut tx, &repositories).await?;
+    tx.commit().await?;
+    Ok((scanned, count))
+}
+
+/// `store.DeleteOldAuditLogs`.
+pub async fn delete_old_audit_logs(
+    pool: &PgPool,
+    max_age: Duration,
+    now: OffsetDateTime,
+) -> Result<(i64, i64), sqlx::Error> {
+    let row = sqlx::query(DELETE_OLD_AUDIT_LOGS_QUERY)
+        .bind(now)
+        .bind(max_age.as_secs() as i64)
+        .fetch_one(pool)
+        .await?;
+    let count: i64 = row.try_get(0)?;
+    Ok((count, count))
+}
+
+/// `store.ReconcileCandidates` (frontend schema).
+pub async fn reconcile_candidates(pool: &PgPool, batch_size: i64) -> Result<Vec<i64>, sqlx::Error> {
+    let rows = sqlx::query(RECONCILE_CANDIDATES_QUERY)
+        .bind(batch_size)
+        .fetch_all(pool)
+        .await?;
+    Ok(rows
+        .iter()
+        .map(|row| i64::from(row.get::<i32, _>(0)))
+        .collect())
+}
+
+/// `store.GetUploadsByIDsAllowDeleted` reduced to the identifiers the
+/// reconciler needs.
+pub async fn existing_upload_ids(pool: &PgPool, ids: &[i64]) -> Result<Vec<i64>, sqlx::Error> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let rows = sqlx::query(EXISTING_UPLOAD_IDS_QUERY)
+        .bind(ids)
+        .fetch_all(pool)
+        .await?;
+    Ok(rows
+        .iter()
+        .map(|row| i64::from(row.get::<i32, _>(0)))
+        .collect())
+}
+
+/// `store.HardDeleteUploadsByIDs`.
+pub async fn hard_delete_uploads_by_ids(pool: &PgPool, ids: &[i64]) -> Result<(), sqlx::Error> {
+    if ids.is_empty() {
+        return Ok(());
+    }
+    sqlx::query(HARD_DELETE_UPLOADS_BY_IDS_QUERY)
+        .bind(ids)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// `store.GetUploads` specialised to `state = 'deleted'` (see the module
+/// documentation). Returns `(ids, totalCount)`.
+pub async fn get_deleted_upload_ids(
+    pool: &PgPool,
+    limit: i64,
+) -> Result<(Vec<i64>, i64), sqlx::Error> {
+    let rows = sqlx::query(GET_DELETED_UPLOAD_IDS_QUERY)
+        .bind(limit)
+        .fetch_all(pool)
+        .await?;
+    let ids = rows
+        .iter()
+        .map(|row| i64::from(row.get::<i32, _>(0)))
+        .collect();
+    let row = sqlx::query(GET_DELETED_UPLOADS_COUNT_QUERY)
+        .fetch_one(pool)
+        .await?;
+    let total: i64 = row.try_get(0)?;
+    Ok((ids, total))
+}
+
+/// `store.DeleteAutoIndexJobsWithoutRepository`.
+pub async fn delete_auto_index_jobs_without_repository(
+    pool: &PgPool,
+    now: OffsetDateTime,
+) -> Result<(i64, i64), sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    let rows = sqlx::query(DELETE_INDEXES_WITHOUT_REPOSITORY_QUERY)
+        .bind(now)
+        .bind(DELETED_REPOSITORY_GRACE_PERIOD.as_secs() as i64)
+        .fetch_all(&mut *tx)
+        .await?;
+    let (total, count) = scan_counts_with_total_count(&rows);
+    tx.commit().await?;
+    Ok((total, count))
+}
+
+/// `store.ExpireFailedRecords`. Returns `(scanned, deleted)`.
+pub async fn expire_failed_records(
+    pool: &PgPool,
+    batch_size: i64,
+    failed_index_max_age: Duration,
+    now: OffsetDateTime,
+) -> Result<(i64, i64), sqlx::Error> {
+    let row = sqlx::query(EXPIRE_FAILED_RECORDS_QUERY)
+        .bind(now)
+        .bind(failed_index_max_age.as_secs() as i64)
+        .bind(batch_size)
+        .fetch_one(pool)
+        .await?;
+    Ok((row.try_get(0)?, row.try_get(1)?))
+}
+
+/// `store.GetStaleSourcedCommits`: upload-sourced commits ordered by
+/// repository id, then commit.
+pub async fn get_stale_sourced_commits(
+    pool: &PgPool,
+    minimum_time_since_last_check: Duration,
+    limit: i64,
+    now: OffsetDateTime,
+) -> Result<Vec<SourcedCommits>, sqlx::Error> {
+    let rows = sqlx::query(GET_STALE_SOURCED_COMMITS_QUERY)
+        .bind(now)
+        .bind(minimum_time_since_last_check.as_secs() as i64)
+        .bind(limit)
+        .fetch_all(pool)
+        .await?;
+    Ok(scan_sourced_commits(&rows))
+}
+
+/// `store.UpdateSourcedCommits`: bumps `commit_last_checked_at` for every
+/// upload of the given repository and commit.
+pub async fn update_sourced_commits(
+    pool: &PgPool,
+    repository_id: i64,
+    commit: &str,
+    now: OffsetDateTime,
+) -> Result<i64, sqlx::Error> {
+    let row = sqlx::query(UPDATE_SOURCED_COMMITS_QUERY)
+        .bind(repository_id)
+        .bind(commit)
+        .bind(now)
+        .fetch_one(pool)
+        .await?;
+    row.try_get(0)
+}
+
+/// `store.DeleteSourcedCommits`. Returns `(uploadsUpdated, uploadsDeleted)`.
+pub async fn delete_sourced_commits(
+    pool: &PgPool,
+    repository_id: i64,
+    commit: &str,
+    maximum_commit_lag: Duration,
+    now: OffsetDateTime,
+) -> Result<(i64, i64), sqlx::Error> {
+    let row = sqlx::query(DELETE_SOURCED_COMMITS_QUERY)
+        .bind(repository_id)
+        .bind(commit)
+        .bind(now)
+        .bind(maximum_commit_lag.as_secs() as i64)
+        .bind(now)
+        .fetch_one(pool)
+        .await?;
+    Ok((row.try_get(0)?, row.try_get(1)?))
+}
+
+/// `store.ProcessSourcedCommits` (uploads). Returns `(numCommits,
+/// numUploadsDeleted)`.
+pub async fn process_sourced_commits(
+    pool: &PgPool,
+    minimum_time_since_last_check: Duration,
+    commit_resolver_maximum_commit_lag: Duration,
+    limit: i64,
+    deleter: &dyn CommitDeleter,
+    now: OffsetDateTime,
+) -> Result<(i64, i64), String> {
+    let sourced_uploads =
+        get_stale_sourced_commits(pool, minimum_time_since_last_check, limit, now)
+            .await
+            .map_err(|err| err.to_string())?;
+
+    let mut num_deleted = 0;
+    let mut num_commits = 0;
+    for sourced in &sourced_uploads {
+        for commit in &sourced.commits {
+            num_commits += 1;
+
+            let should_delete = deleter
+                .should_delete(sourced.repository_id, &sourced.repository_name, commit)
+                .await?;
+
+            if should_delete {
+                let (_, uploads_deleted) = delete_sourced_commits(
+                    pool,
+                    sourced.repository_id,
+                    commit,
+                    commit_resolver_maximum_commit_lag,
+                    now,
+                )
+                .await
+                .map_err(|err| err.to_string())?;
+                num_deleted += uploads_deleted;
+            }
+
+            update_sourced_commits(pool, sourced.repository_id, commit, now)
+                .await
+                .map_err(|err| err.to_string())?;
+        }
+    }
+
+    Ok((num_commits, num_deleted))
+}
+
+/// `store.ProcessStaleSourcedCommits` (indexes). The whole scan runs in one
+/// transaction, exactly like the baseline, so the per-repository index
+/// updates are serialised with the candidate read.
+pub async fn process_stale_sourced_commits(
+    pool: &PgPool,
+    minimum_time_since_last_check: Duration,
+    commit_resolver_batch_size: i64,
+    deleter: &dyn CommitDeleter,
+    now: OffsetDateTime,
+) -> Result<(i64, i64), String> {
+    let mut tx = pool.begin().await.map_err(|err| err.to_string())?;
+
+    let rows = sqlx::query(STALE_INDEX_SOURCED_COMMITS_QUERY)
+        .bind(now)
+        .bind(minimum_time_since_last_check.as_secs() as i64)
+        .bind(commit_resolver_batch_size)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|err| err.to_string())?;
+    let stale_indexes = scan_sourced_commits(&rows);
+
+    let mut total_deleted = 0;
+    for sourced in &stale_indexes {
+        let mut keep = Vec::new();
+        let mut remove = Vec::new();
+        for commit in &sourced.commits {
+            if deleter
+                .should_delete(sourced.repository_id, &sourced.repository_name, commit)
+                .await?
+            {
+                remove.push(commit.clone());
+            } else {
+                keep.push(commit.clone());
+            }
+        }
+
+        set_audit_reason_tx(&mut tx, "upload associated with unknown commit")
+            .await
+            .map_err(|err| err.to_string())?;
+
+        let row = sqlx::query(UPDATE_SOURCED_COMMITS_QUERY2)
+            .bind(sourced.repository_id)
+            .bind(&keep)
+            .bind(&remove)
+            .bind(now)
+            .bind(&keep)
+            .bind(&remove)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|err| err.to_string())?;
+        total_deleted += row.try_get::<i64, _>(0).map_err(|err| err.to_string())?;
+    }
+
+    tx.commit().await.map_err(|err| err.to_string())?;
+    Ok((stale_indexes.len() as i64, total_deleted))
+}
+
+//
+//
+
+async fn set_audit_reason(tx: &mut PgTransaction<'_>, reason: &str) -> Result<(), sqlx::Error> {
+    set_audit_reason_tx(tx, reason).await
+}
+
+async fn set_audit_reason_tx(tx: &mut PgTransaction<'_>, reason: &str) -> Result<(), sqlx::Error> {
+    // `SET LOCAL "key" TO "value"`; the parameterised form is equivalent and
+    // avoids quoting issues with the reason text.
+    sqlx::query("SELECT set_config($1, $2, true)")
+        .bind(AUDIT_REASON_GUC)
+        .bind(reason)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
+/// `SELECT setRepositoryAsDirtyWithTx` for every affected repository (the
+/// baseline iterates over the map, so the order does not matter).
+async fn mark_repositories_dirty(
+    tx: &mut PgTransaction<'_>,
+    repositories: &[i64],
+) -> Result<(), sqlx::Error> {
+    for repository_id in repositories {
+        sqlx::query(SET_REPOSITORY_AS_DIRTY_QUERY)
+            .bind(repository_id)
+            .execute(&mut **tx)
+            .await?;
+    }
+    Ok(())
+}
+
+/// `scanCountsWithTotalCount` / `scanCountsAndTotalCount`: `(total, id,
+/// count)` rows. The total column repeats on every row.
+fn scan_counts_with_total_count(rows: &[sqlx::postgres::PgRow]) -> (i64, i64) {
+    let mut total = 0;
+    let mut count = 0;
+    for row in rows {
+        total = row.get::<i64, _>(0);
+        count += row.get::<i64, _>(2);
+    }
+    (total, count)
+}
+
+/// Same plus the distinct repository ids (for `setRepositoryAsDirty`).
+fn scan_counts_and_repositories(rows: &[sqlx::postgres::PgRow]) -> (i64, i64, Vec<i64>) {
+    let mut total = 0;
+    let mut count = 0;
+    let mut repositories = Vec::new();
+    for row in rows {
+        total = row.get::<i64, _>(0);
+        let repository_id = i64::from(row.get::<i32, _>(1));
+        if !repositories.contains(&repository_id) {
+            repositories.push(repository_id);
+        }
+        count += row.get::<i64, _>(2);
+    }
+    (total, count, repositories)
+}
+
+/// `scanSourcedCommits`: group by repository id, commits sorted, repositories
+/// sorted by id.
+fn scan_sourced_commits(rows: &[sqlx::postgres::PgRow]) -> Vec<SourcedCommits> {
+    let mut result: Vec<SourcedCommits> = Vec::new();
+    for row in rows {
+        let repository_id: i64 = i64::from(row.get::<i32, _>(0));
+        let repository_name: String = row.get(1);
+        let commit: String = row.get(2);
+
+        match result
+            .iter_mut()
+            .find(|entry| entry.repository_id == repository_id)
+        {
+            Some(entry) => entry.commits.push(commit),
+            None => result.push(SourcedCommits {
+                repository_id,
+                repository_name,
+                commits: vec![commit],
+            }),
+        }
+    }
+    for entry in &mut result {
+        entry.commits.sort();
+    }
+    result.sort_by_key(|entry| entry.repository_id);
+    result
+}
+
+//
+// The SQL below is transcribed from
+// `internal/codeintel/uploads/internal/store/{cleanup,expiration,uploads}.go`.
+//
+
+const DELETE_UPLOADS_WITHOUT_REPOSITORY_QUERY: &str = r#"
+WITH
+candidates AS (
+	SELECT u.id
+	FROM repo r
+	JOIN lsif_uploads u ON u.repository_id = r.id
+	WHERE
+		$1 - r.deleted_at >= $2 * interval '1 second' OR
+		r.blocked IS NOT NULL
+
+	ORDER BY u.id FOR UPDATE
+),
+deleted AS (
+	UPDATE lsif_uploads u
+	SET state = 'deleted'
+	WHERE u.id IN (SELECT id FROM candidates)
+	RETURNING u.id, u.repository_id
+)
+SELECT (SELECT COUNT(*) FROM candidates), d.repository_id, COUNT(*) FROM deleted d GROUP BY d.repository_id
+"#;
+
+const DELETE_UPLOADS_STUCK_UPLOADING_QUERY: &str = r#"
+WITH
+candidates AS (
+	SELECT u.id
+	FROM lsif_uploads u
+	WHERE u.state = 'uploading' AND u.uploaded_at < $1
+
+	ORDER BY u.id FOR UPDATE
+),
+deleted AS (
+	UPDATE lsif_uploads u
+	SET state = 'deleted'
+	WHERE id IN (SELECT id FROM candidates)
+	RETURNING u.repository_id
+)
+SELECT COUNT(*) FROM deleted
+"#;
+
+const SOFT_DELETE_EXPIRED_UPLOADS_QUERY: &str = r#"
+WITH
+
+expired_uploads AS (
+	SELECT u.id
+	FROM lsif_uploads u
+	WHERE u.state = 'completed' AND u.expired
+	ORDER BY u.last_referenced_scan_at NULLS FIRST, u.finished_at, u.id
+	LIMIT $1
+),
+
+packages_defined_by_target_uploads AS (
+	SELECT p.scheme, p.manager, p.name, p.version
+	FROM lsif_packages p
+	WHERE p.dump_id IN (SELECT id FROM expired_uploads)
+),
+
+ranked_uploads_providing_packages AS (
+	SELECT
+		u.id,
+		p.scheme,
+		p.manager,
+		p.name,
+		p.version,
+		rank() OVER (
+			PARTITION BY
+				p.scheme, p.manager, p.name, p.version,
+				u.repository_id, u.indexer, u.root
+			ORDER BY
+				(SELECT cd.committed_at FROM codeintel_commit_dates cd WHERE cd.repository_id = u.repository_id AND cd.commit_bytea = decode(u.commit, 'hex')) NULLS LAST,
+				u.id
+		) AS rank
+	FROM lsif_uploads u
+	LEFT JOIN lsif_packages p ON p.dump_id = u.id
+	WHERE
+		(
+			u.id = ANY (SELECT id FROM expired_uploads) OR
+
+			(p.scheme, p.manager, p.name, p.version) IN (
+				SELECT p.scheme, p.manager, p.name, p.version
+				FROM packages_defined_by_target_uploads p
+			)
+		) AND
+
+		u.state = 'completed'
+),
+
+referenced_uploads_providing_package_canonically AS (
+	SELECT ru.id
+	FROM ranked_uploads_providing_packages ru
+	WHERE
+		ru.id IN (SELECT id FROM expired_uploads) AND
+
+		ru.rank = 1 AND
+
+		EXISTS (
+			SELECT 1
+			FROM lsif_references r
+			WHERE
+				r.scheme = ru.scheme AND
+				r.manager = ru.manager AND
+				r.name = ru.name AND
+				r.version = ru.version AND
+				r.dump_id != ru.id
+		)
+),
+
+candidates AS (
+	SELECT u.id
+	FROM lsif_uploads u
+	WHERE
+		u.id IN (SELECT id FROM expired_uploads) AND
+		NOT EXISTS (
+			SELECT 1
+			FROM referenced_uploads_providing_package_canonically pkg_refcount
+			WHERE pkg_refcount.id = u.id
+		)
+),
+locked_uploads AS (
+	SELECT u.id
+	FROM lsif_uploads u
+	WHERE u.id IN (SELECT id FROM expired_uploads)
+	ORDER BY u.id FOR UPDATE
+),
+updated AS (
+	UPDATE lsif_uploads u
+
+	SET
+		last_referenced_scan_at = NOW(),
+
+		state = CASE WHEN u.id IN (SELECT id FROM candidates) THEN 'deleting' ELSE 'completed' END
+	WHERE u.id IN (SELECT id FROM locked_uploads)
+	RETURNING u.id, u.repository_id, u.state
+)
+
+SELECT (SELECT COUNT(*) FROM expired_uploads), u.repository_id, COUNT(*) FROM updated u WHERE u.state = 'deleting' GROUP BY u.repository_id
+"#;
+
+const SOFT_DELETE_EXPIRED_UPLOADS_VIA_TRAVERSAL_QUERY: &str = r#"
+WITH RECURSIVE
+
+root_upload_and_packages AS (
+	SELECT * FROM (
+		SELECT
+			u.id,
+			u.expired,
+			u.last_traversal_scan_at,
+			u.finished_at,
+			p.scheme,
+			p.manager,
+			p.name,
+			p.version,
+			rank() OVER (
+				PARTITION BY
+					p.scheme, p.manager, p.name, p.version,
+					u.repository_id, u.indexer, u.root
+				ORDER BY
+					(SELECT cd.committed_at FROM codeintel_commit_dates cd WHERE cd.repository_id = u.repository_id AND cd.commit_bytea = decode(u.commit, 'hex')) NULLS LAST,
+					u.id
+			) AS rank
+		FROM lsif_uploads u
+		LEFT JOIN lsif_packages p ON p.dump_id = u.id
+		WHERE u.state = 'completed' AND u.expired
+	) s
+
+	WHERE s.rank = 1 AND EXISTS (
+		SELECT 1
+		FROM lsif_references r
+		WHERE
+			r.scheme = s.scheme AND
+			r.manager = s.manager AND
+			r.name = s.name AND
+			r.version = s.version AND
+			r.dump_id != s.id
+		)
+	ORDER BY s.last_traversal_scan_at NULLS FIRST, s.finished_at, s.id
+	LIMIT 1
+),
+
+transitive_dependents(id, expired, scheme, manager, name, version) AS MATERIALIZED (
+	(
+		SELECT up.id, up.expired, up.scheme, up.manager, up.name, up.version FROM root_upload_and_packages up
+	) UNION (
+		SELECT s.id, s.expired, s.scheme, s.manager, s.name, s.version
+		FROM (
+			SELECT
+				u.id,
+				u.expired,
+				p.scheme,
+				p.manager,
+				p.name,
+				p.version,
+				rank() OVER (
+					PARTITION BY
+						p.scheme, p.manager, p.name, p.version,
+						u.repository_id, u.indexer, u.root
+					ORDER BY
+						(SELECT cd.committed_at FROM codeintel_commit_dates cd WHERE cd.repository_id = u.repository_id AND cd.commit_bytea = decode(u.commit, 'hex')) NULLS LAST,
+						u.id
+				) AS rank
+			FROM transitive_dependents d
+			JOIN lsif_references r ON
+				r.scheme = d.scheme AND
+				r.manager = d.manager AND
+				r.name = d.name AND
+				r.version = d.version AND
+				r.dump_id != d.id
+			JOIN lsif_uploads u ON u.id = r.dump_id
+			JOIN lsif_packages p ON p.dump_id = u.id
+			WHERE
+				u.state = 'completed' AND
+				d.expired
+		) s
+
+		WHERE s.rank = 1
+	)
+),
+
+candidates AS (
+	SELECT * FROM transitive_dependents d
+	LIMIT ($1 + 1)
+),
+locked_uploads AS (
+	SELECT u.id
+	FROM lsif_uploads u
+	WHERE u.id IN (SELECT id FROM candidates)
+	ORDER BY u.id FOR UPDATE
+),
+updated AS (
+	UPDATE lsif_uploads u
+
+	SET
+		last_traversal_scan_at = NOW(),
+
+		state = CASE
+			WHEN (SELECT bool_and(d.expired) AND COUNT(*) <= $2 FROM candidates d) THEN 'deleting'
+			ELSE 'completed'
+		END
+	WHERE u.id IN (SELECT id FROM locked_uploads)
+	RETURNING u.id, u.repository_id, u.state
+)
+
+SELECT (SELECT COUNT(*) FROM candidates), u.repository_id, COUNT(*) FROM updated u WHERE u.state = 'deleting' GROUP BY u.repository_id
+"#;
+
+const SET_REPOSITORY_AS_DIRTY_QUERY: &str = r#"
+INSERT INTO lsif_dirty_repositories (repository_id, dirty_token, update_token)
+VALUES ($1, 1, 0)
+ON CONFLICT (repository_id) DO UPDATE SET
+    dirty_token = lsif_dirty_repositories.dirty_token + 1,
+    set_dirty_at = CASE
+        WHEN lsif_dirty_repositories.update_token = lsif_dirty_repositories.dirty_token THEN NOW()
+        ELSE lsif_dirty_repositories.set_dirty_at
+    END
+"#;
+
+const DELETE_OLD_AUDIT_LOGS_QUERY: &str = r#"
+WITH deleted AS (
+	DELETE FROM lsif_uploads_audit_logs
+	WHERE $1 - log_timestamp > ($2 * '1 second'::interval)
+	RETURNING upload_id
+)
+SELECT count(*) FROM deleted
+"#;
+
+const RECONCILE_CANDIDATES_QUERY: &str = r#"
+WITH
+candidates AS (
+	SELECT u.id
+	FROM lsif_uploads u
+	WHERE u.state = 'completed'
+	ORDER BY u.last_reconcile_at DESC NULLS FIRST, u.id
+	LIMIT $1
+),
+locked_candidates AS (
+	SELECT u.id
+	FROM lsif_uploads u
+	WHERE id = ANY(SELECT id FROM candidates)
+	ORDER BY u.id
+	FOR UPDATE
+)
+UPDATE lsif_uploads
+SET last_reconcile_at = NOW()
+WHERE id = ANY(SELECT id FROM locked_candidates)
+RETURNING id
+"#;
+
+const EXISTING_UPLOAD_IDS_QUERY: &str = r#"
+SELECT u.id
+FROM lsif_dumps_with_repository_name u
+WHERE u.state != 'deleted' AND u.id = ANY($1)
+"#;
+
+const HARD_DELETE_UPLOADS_BY_IDS_QUERY: &str = r#"
+WITH
+locked_uploads AS (
+	SELECT u.id, u.associated_index_id
+	FROM lsif_uploads u
+	WHERE u.id = ANY($1)
+	ORDER BY u.id FOR UPDATE
+),
+delete_uploads AS (
+	DELETE FROM lsif_uploads WHERE id IN (SELECT id FROM locked_uploads)
+),
+locked_indexes AS (
+	SELECT u.id
+	FROM lsif_indexes U
+	WHERE u.id IN (SELECT associated_index_id FROM locked_uploads)
+	ORDER BY u.id FOR UPDATE
+)
+DELETE FROM lsif_indexes WHERE id IN (SELECT id FROM locked_indexes)
+"#;
+
+const GET_DELETED_UPLOAD_IDS_QUERY: &str = r#"
+SELECT u.id
+FROM lsif_uploads u
+JOIN repo ON repo.id = u.repository_id
+WHERE u.state = 'deleted' AND repo.blocked IS NULL
+ORDER BY u.uploaded_at DESC, u.id
+LIMIT $1
+"#;
+
+const GET_DELETED_UPLOADS_COUNT_QUERY: &str = r#"
+SELECT COUNT(*) AS count
+FROM lsif_uploads u
+JOIN repo ON repo.id = u.repository_id
+WHERE u.state = 'deleted' AND repo.blocked IS NULL
+"#;
+
+const DELETE_INDEXES_WITHOUT_REPOSITORY_QUERY: &str = r#"
+WITH
+candidates AS (
+	SELECT u.id
+	FROM repo r
+	JOIN lsif_indexes u ON u.repository_id = r.id
+	WHERE
+		$1 - r.deleted_at >= $2 * interval '1 second' OR
+		r.blocked IS NOT NULL
+
+	ORDER BY u.id FOR UPDATE
+),
+deleted AS (
+	DELETE FROM lsif_indexes u
+	WHERE id IN (SELECT id FROM candidates)
+	RETURNING u.id, u.repository_id
+)
+SELECT (SELECT COUNT(*) FROM candidates), d.repository_id, COUNT(*) FROM deleted d GROUP BY d.repository_id
+"#;
+
+const EXPIRE_FAILED_RECORDS_QUERY: &str = r#"
+WITH
+ranked_indexes AS (
+	SELECT
+		u.*,
+		RANK() OVER (
+			PARTITION BY
+				repository_id,
+				root,
+				indexer
+			ORDER BY
+				finished_at DESC
+		) AS rank
+	FROM lsif_indexes u
+	WHERE
+		u.state = 'failed' AND
+		$1 - u.finished_at >= $2 * interval '1 second'
+),
+locked_indexes AS (
+	SELECT i.id
+	FROM lsif_indexes i
+	JOIN ranked_indexes ri ON ri.id = i.id
+
+	WHERE ri.rank != 1 OR EXISTS (
+		SELECT 1
+		FROM lsif_indexes i2
+		WHERE
+			i2.state = 'completed' AND
+			i2.finished_at > i.finished_at AND
+			i2.repository_id = i.repository_id AND
+			i2.root = i.root AND
+			i2.indexer = i.indexer
+	)
+	ORDER BY i.id
+	FOR UPDATE SKIP LOCKED
+	LIMIT $3
+),
+del AS (
+	DELETE FROM lsif_indexes
+	WHERE id IN (SELECT id FROM locked_indexes)
+	RETURNING 1
+)
+SELECT
+	(SELECT COUNT(*) FROM ranked_indexes),
+	(SELECT COUNT(*) FROM del)
+"#;
+
+const GET_STALE_SOURCED_COMMITS_QUERY: &str = r#"
+WITH
+	candidates AS (
+SELECT
+	repository_id,
+	commit,
+	MAX(commit_last_checked_at) as max_last_checked_at
+FROM lsif_uploads
+WHERE
+	state NOT IN ('deleted', 'deleting') AND
+	($1 - commit_last_checked_at > ($2 * '1 second'::interval)) IS DISTINCT FROM FALSE
+GROUP BY repository_id, commit
+)
+SELECT r.id, r.name, c.commit
+FROM candidates c
+JOIN repo r ON r.id = c.repository_id
+ORDER BY MIN(c.max_last_checked_at) OVER (PARTITION BY c.repository_id), c.commit
+LIMIT $3
+"#;
+
+const UPDATE_SOURCED_COMMITS_QUERY: &str = r#"
+WITH
+candidate_uploads AS (
+SELECT u.id, u.state, u.uploaded_at
+FROM lsif_uploads u
+WHERE u.repository_id = $1 AND u.commit = $2
+
+ORDER BY u.id FOR UPDATE
+),
+update_uploads AS (
+	UPDATE lsif_uploads u
+	SET commit_last_checked_at = $3
+	WHERE id IN (SELECT id FROM candidate_uploads)
+	RETURNING 1
+)
+SELECT
+	(SELECT COUNT(*) FROM update_uploads) AS num_uploads
+"#;
+
+const DELETE_SOURCED_COMMITS_QUERY: &str = r#"
+WITH
+candidate_uploads AS (
+SELECT u.id, u.state, u.uploaded_at
+FROM lsif_uploads u
+WHERE u.repository_id = $1 AND u.commit = $2
+
+ORDER BY u.id FOR UPDATE
+),
+tagged_candidate_uploads AS (
+SELECT
+	u.*,
+	(u.state IN ('uploading', 'queued', 'processing') AND $3 - u.uploaded_at <= ($4 * '1 second'::interval)) AS protected
+FROM candidate_uploads u
+),
+update_uploads AS (
+	UPDATE lsif_uploads u
+	SET commit_last_checked_at = $5
+	WHERE EXISTS (SELECT 1 FROM tagged_candidate_uploads tu WHERE tu.id = u.id AND tu.protected)
+	RETURNING 1
+),
+delete_uploads AS (
+	UPDATE lsif_uploads u
+	SET state = CASE WHEN u.state = 'completed' THEN 'deleting' ELSE 'deleted' END
+	WHERE EXISTS (SELECT 1 FROM tagged_candidate_uploads tu WHERE tu.id = u.id AND NOT tu.protected)
+	RETURNING 1
+)
+SELECT
+	(SELECT COUNT(*) FROM update_uploads) AS num_uploads_updated,
+	(SELECT COUNT(*) FROM delete_uploads) AS num_uploads_deleted
+"#;
+
+const STALE_INDEX_SOURCED_COMMITS_QUERY: &str = r#"
+WITH candidates AS (
+	SELECT
+		repository_id,
+		commit,
+		MAX(commit_last_checked_at) as max_last_checked_at
+	FROM lsif_indexes
+	WHERE
+		state NOT IN ('deleted', 'deleting') AND
+		($1 - commit_last_checked_at > ($2 * '1 second'::interval)) IS DISTINCT FROM FALSE
+	GROUP BY repository_id, commit
+)
+SELECT r.id, r.name, c.commit
+FROM candidates c
+JOIN repo r ON r.id = c.repository_id
+ORDER BY MIN(c.max_last_checked_at) OVER (PARTITION BY c.repository_id), c.commit
+LIMIT $3
+"#;
+
+const UPDATE_SOURCED_COMMITS_QUERY2: &str = r#"
+WITH
+candidate_indexes AS (
+	SELECT u.id
+	FROM lsif_indexes u
+	WHERE
+		u.repository_id = $1 AND
+		(
+			u.commit = ANY($2) OR
+			u.commit = ANY($3)
+		)
+
+	ORDER BY u.id FOR UPDATE
+),
+update_indexes AS (
+	UPDATE lsif_indexes
+	SET commit_last_checked_at = $4
+	WHERE id IN (SELECT id FROM candidate_indexes WHERE commit = ANY($5))
+	RETURNING 1
+),
+delete_indexes AS (
+	DELETE FROM lsif_indexes
+	WHERE id IN (SELECT id FROM candidate_indexes WHERE commit = ANY($6))
+	RETURNING 1
+)
+SELECT COUNT(*) FROM delete_indexes
+"#;

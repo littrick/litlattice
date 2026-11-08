@@ -36,6 +36,7 @@ use crate::framework::BackgroundRoutine;
 use crate::registry;
 
 pub mod batches;
+pub mod codeintel_upload_janitor;
 pub mod codeintel_uploadstore_expirer;
 pub mod encryption;
 pub mod eventlogs;
@@ -155,6 +156,9 @@ pub fn all_jobs() -> Vec<(&'static str, Arc<dyn Job>)> {
                 "executors-multiqueue-metrics-reporter" => Arc::new(
                     executors_multiqueue_metrics::ExecutorsMultiqueueMetricsReporter::new(),
                 ),
+                "codeintel-upload-janitor" => {
+                    Arc::new(codeintel_upload_janitor::UploadJanitor::new())
+                }
                 "codeintel-uploadstore-expirer" => {
                     Arc::new(codeintel_uploadstore_expirer::UploadStoreExpirer::new())
                 }

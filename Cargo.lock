@@ -3863,6 +3863,7 @@ dependencies = [
 name = "sg-db"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "serde",
  "serde_json",
  "sqlx",
@@ -4243,6 +4244,7 @@ dependencies = [
  "sg-db",
  "sg-encryption",
  "sg-extsvc",
+ "sg-git",
  "sg-http",
  "sg-keyring",
  "sg-metrics",
