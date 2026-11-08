@@ -325,6 +325,13 @@ impl SiteConfiguration {
         self.bool_field("disableAutoCodeHostSyncs")
     }
 
+    /// `siteConfig.authz.enforceForSiteAdmins`: whether site admins are
+    /// subject to repository permissions (`UserIDsWithNoPerms` filters them
+    /// out by default).
+    pub fn authz_enforce_for_site_admins(&self) -> bool {
+        self.bool_field("authz.enforceForSiteAdmins")
+    }
+
     /// `conf.Get().BatchChangesRolloutWindows`
     /// (`schema.BatchChangeRolloutWindow`): the raw
     /// `batchChanges.rolloutWindows` value. Absent and `null` both mean "no

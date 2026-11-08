@@ -250,6 +250,24 @@ pub fn check_private_repositories(license_key: &str) -> PrivateRepositories {
     private_repositories_for(&info)
 }
 
+/// `licensing.Check(licensing.FeatureACLs)`: whether background permissions
+/// syncing is licensed. An empty key falls back to the free plan (`free-1`),
+/// which does not include the feature; an unparseable key deactivates it.
+pub fn check_acls(license_key: &str) -> bool {
+    let info = match configured_license_info(license_key) {
+        Ok(info) => info,
+        Err(_) => return false,
+    };
+    acls_for(&info)
+}
+
+/// `BasicFeature("acls").Check`: an explicit `acls` tag grants the feature,
+/// otherwise `internal/licensing/data.go` enables it for every plan except
+/// the free plans (`free-0`, `free-1`).
+fn acls_for(info: &Info) -> bool {
+    info.has_tag("acls") || !matches!(info.plan(), Plan::Free0 | Plan::Free1 | Plan::Unknown)
+}
+
 fn private_repositories_for(info: &Info) -> PrivateRepositories {
     // `FeaturePrivateRepositories.Check`: an explicit tag grants unrestricted
     // private repositories, otherwise the plan's configuration applies.
@@ -496,6 +514,41 @@ mod tests {
             PrivateRepositories::Limited(1).error_message(),
             "maximum number of private repositories included in license (1) reached"
         );
+    }
+
+    #[test]
+    fn acls_follow_the_plan_table() {
+        // No configured key: the implicit free-1 plan has no ACLs.
+        assert!(!check_acls(""));
+        // Unparseable keys deactivate the feature (`Check` returns an error).
+        assert!(!check_acls("not a key"));
+
+        let plan = |tag: &str| Info {
+            tags: vec![tag.to_owned()],
+            ..Info::default()
+        };
+        assert!(!acls_for(&plan("plan:free-0")));
+        assert!(!acls_for(&plan("plan:free-1")));
+        for tag in [
+            "plan:old-enterprise-0",
+            "plan:team-0",
+            "plan:enterprise-0",
+            "plan:enterprise-1",
+            "plan:enterprise-air-gap-0",
+            "plan:cody-enterprise-0",
+            "plan:code-ai-enterprise-0",
+        ] {
+            assert!(acls_for(&plan(tag)), "{tag}");
+        }
+        // An explicit `acls` tag overrides the free plan, like
+        // `BasicFeature.Check`'s tag check.
+        assert!(acls_for(&Info {
+            tags: vec!["plan:free-1".to_owned(), "acls".to_owned()],
+            ..Info::default()
+        }));
+        // No plan tag at all: `PlanFromTags` falls back to the old enterprise
+        // plan, which includes ACLs.
+        assert!(acls_for(&Info::default()));
     }
 
     #[test]

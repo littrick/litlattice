@@ -233,6 +233,9 @@ pub fn all_jobs() -> Vec<(&'static str, Arc<dyn Job>)> {
                     Arc::new(perforce_changelist_mapper::PerforceChangelistMappingJob::new())
                 }
                 "permission-sync-job-cleaner" => Arc::new(permissions::PermissionSyncJobCleaner),
+                "permission-sync-job-scheduler" => {
+                    Arc::new(permissions::PermissionSyncJobScheduler)
+                }
                 "rate-limit-config" => Arc::new(ratelimit::RateLimitConfigJob::new()),
                 "refresh-analytics-cache" => Arc::new(adminanalytics::RefreshAnalyticsCacheJob),
                 "repo-embedding-janitor" => {
