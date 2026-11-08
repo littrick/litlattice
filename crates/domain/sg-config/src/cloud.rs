@@ -225,7 +225,7 @@ fn read_ssh_string<'a>(blob: &'a [u8], offset: &mut usize) -> Result<&'a [u8], S
 mod tests {
     use super::*;
     use ring::rand::SystemRandom;
-    use ring::signature::Ed25519KeyPair;
+    use ring::signature::{Ed25519KeyPair, KeyPair};
 
     fn signed_document(site_config: &str, key_pair: &Ed25519KeyPair) -> String {
         let signature = key_pair.sign(site_config.as_bytes());
