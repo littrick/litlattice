@@ -23,7 +23,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use sg_core::{parse_go_duration, ConfigError, EnvReader};
+use sg_core::{ConfigError, EnvReader};
 use sg_db::OffsetDateTime;
 use sg_metrics::prometheus::core::{Collector, Desc};
 use sg_metrics::prometheus::proto::{
@@ -34,7 +34,7 @@ use sg_redis::KeyValue;
 use tokio::runtime::RuntimeFlavor;
 use tokio_util::sync::CancellationToken;
 
-use super::{Job, JobConfig, JobDeps};
+use super::{get_interval, Job, JobConfig, JobDeps};
 use crate::config::combine_errors;
 use crate::framework::periodic::{Handler, HandlerError, PeriodicRoutine};
 use crate::framework::BackgroundRoutine;
@@ -136,25 +136,6 @@ impl JobConfig for JanitorConfig {
         match combine_errors(&errs) {
             Some(message) => Err(ConfigError::new(message)),
             None => Ok(()),
-        }
-    }
-}
-
-/// `BaseConfig.GetInterval`: parse `time.ParseDuration`, record
-/// `invalid duration %q for %s: %s` and return zero on failure.
-fn get_interval(
-    env: &mut EnvReader,
-    name: &str,
-    default: &str,
-    description: &str,
-    errors: &mut Vec<String>,
-) -> Duration {
-    let raw = env.get(name, default, description);
-    match parse_go_duration(&raw) {
-        Ok(duration) => duration,
-        Err(message) => {
-            errors.push(format!("invalid duration {raw:?} for {name}: {message}"));
-            Duration::ZERO
         }
     }
 }

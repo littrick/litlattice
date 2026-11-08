@@ -35,6 +35,7 @@ use crate::config::WorkerConfigs;
 use crate::framework::BackgroundRoutine;
 use crate::registry;
 
+pub mod encryption;
 pub mod eventlogs;
 pub mod executors;
 pub mod executors_metrics;
@@ -70,6 +71,26 @@ pub struct JobDeps {
     /// `keyring.Init`'s ring; `database.ExternalServices` reads
     /// `keyring.Default().ExternalServiceKey` when it decrypts a config.
     pub keyring: Arc<sg_keyring::Keyring>,
+}
+
+/// `BaseConfig.GetInterval`: parse `time.ParseDuration`, record
+/// `invalid duration %q for %s: %s` and return zero on failure. Shared by
+/// every job whose config declares an interval.
+pub(crate) fn get_interval(
+    env: &mut EnvReader,
+    name: &str,
+    default: &str,
+    description: &str,
+    errors: &mut Vec<String>,
+) -> std::time::Duration {
+    let raw = env.get(name, default, description);
+    match sg_core::parse_go_duration(&raw) {
+        Ok(duration) => duration,
+        Err(message) => {
+            errors.push(format!("invalid duration {raw:?} for {name}: {message}"));
+            std::time::Duration::ZERO
+        }
+    }
 }
 
 /// `cmd/worker/job.Job`.
@@ -130,6 +151,7 @@ pub fn all_jobs() -> Vec<(&'static str, Arc<dyn Job>)> {
                 "executors-multiqueue-metrics-reporter" => Arc::new(
                     executors_multiqueue_metrics::ExecutorsMultiqueueMetricsReporter::new(),
                 ),
+                "record-encrypter" => Arc::new(encryption::RecordEncrypterJob::new()),
                 "gitserver-metrics" => Arc::new(gitserver::GitserverMetrics),
                 "permission-sync-job-cleaner" => Arc::new(permissions::PermissionSyncJobCleaner),
                 "rate-limit-config" => Arc::new(ratelimit::RateLimitConfigJob::new()),

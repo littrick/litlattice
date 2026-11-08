@@ -2,10 +2,14 @@
 //! workspace use it.
 //!
 //! `shared.Main` calls `keyring.Init`, which builds every configured key and
-//! fails startup when one cannot be created. Only the `externalServiceKey`
-//! entry (via `database.ExternalServices.getEncryptionKey`) is read by
-//! gitserver's remote-URL lookup and by repo-updater's source factory, so only
-//! that entry is constructed.
+//! fails startup when one cannot be created. gitserver's remote-URL lookup and
+//! repo-updater's source factory read `externalServiceKey`; the worker's
+//! `record-encrypter` job reads the remaining entries.
+//!
+//! `NewRing` in the baseline never assigns `OutboundWebhookKey` even when
+//! `encryption.keys.outboundWebhookKey` is configured (the loop is missing a
+//! branch). The Rust ring reproduces that: [`Keyring::outbound_webhook_key`]
+//! always returns `None` (docs/modules/06_worker.md §24 records the erratum).
 //!
 //! [`watch`] mirrors `keyring.Init`'s `conf.Watch`: the baseline compares the
 //! `EncryptionKeys` *pointer*, so every configuration replacement rebuilds the
@@ -13,6 +17,9 @@
 //! returned to the caller, which logs it and exits. Each process that calls
 //! [`init`] must decide how to fail (see the gitserver and repo-updater
 //! services).
+//!
+//! The `encryption.cache` LRU wrapper (`EnableCache`/`CacheSize`) is not
+//! ported: it only changes decryption latency, not values.
 
 use std::sync::{Arc, RwLock};
 
@@ -20,38 +27,81 @@ use sg_config::{EncryptionKeyConfig, LiveConfig, SiteConfiguration};
 use sg_encryption::{awskms, cloudkms, Key, MountedKey, MountedKeyConfig, NoopKey};
 use tokio_util::sync::CancellationToken;
 
+/// `keyring.Ring`: the keys configured by `encryption.keys`.
+#[derive(Default)]
+pub struct Ring {
+    pub batch_changes_credential_key: Option<Arc<dyn Key>>,
+    pub external_service_key: Option<Arc<dyn Key>>,
+    pub github_app_key: Option<Arc<dyn Key>>,
+    /// Never populated: the baseline `NewRing` has no branch for
+    /// `outboundWebhookKey` (see the module docs).
+    pub outbound_webhook_key: Option<Arc<dyn Key>>,
+    pub user_external_account_key: Option<Arc<dyn Key>>,
+    pub webhook_key: Option<Arc<dyn Key>>,
+    pub webhook_log_key: Option<Arc<dyn Key>>,
+    pub executor_secret_key: Option<Arc<dyn Key>>,
+}
+
 /// `keyring.Ring` + `keyring.Default()`: the keys shared by every read path.
 /// `getEncryptionKey` reads the current ring on each access, so replacing it
-/// takes effect for subsequent external-service lookups.
+/// takes effect for subsequent lookups.
 #[derive(Default)]
 pub struct Keyring {
+    batch_changes_credential_key: RwLock<Option<Arc<dyn Key>>>,
     external_service_key: RwLock<Option<Arc<dyn Key>>>,
+    github_app_key: RwLock<Option<Arc<dyn Key>>>,
+    outbound_webhook_key: RwLock<Option<Arc<dyn Key>>>,
+    user_external_account_key: RwLock<Option<Arc<dyn Key>>>,
+    webhook_key: RwLock<Option<Arc<dyn Key>>>,
+    webhook_log_key: RwLock<Option<Arc<dyn Key>>>,
+    executor_secret_key: RwLock<Option<Arc<dyn Key>>>,
+}
+
+macro_rules! key_accessor {
+    ($name:ident) => {
+        /// `keyring.Default().<Entry>`.
+        pub fn $name(&self) -> Option<Arc<dyn Key>> {
+            self.$name.read().expect("keyring lock poisoned").clone()
+        }
+    };
 }
 
 impl Keyring {
-    /// `keyring.Default().ExternalServiceKey`.
-    pub fn external_service_key(&self) -> Option<Arc<dyn Key>> {
-        self.external_service_key
-            .read()
-            .expect("keyring lock poisoned")
-            .clone()
-    }
+    key_accessor!(batch_changes_credential_key);
+    key_accessor!(external_service_key);
+    key_accessor!(github_app_key);
+    key_accessor!(outbound_webhook_key);
+    key_accessor!(user_external_account_key);
+    key_accessor!(webhook_key);
+    key_accessor!(webhook_log_key);
+    key_accessor!(executor_secret_key);
 
     /// `defaultRing = *newRing`.
-    fn replace(&self, key: Option<Arc<dyn Key>>) {
-        *self
-            .external_service_key
-            .write()
-            .expect("keyring lock poisoned") = key;
+    fn replace(&self, ring: Ring) {
+        let lock = |slot: &RwLock<Option<Arc<dyn Key>>>, key| {
+            *slot.write().expect("keyring lock poisoned") = key;
+        };
+        lock(
+            &self.batch_changes_credential_key,
+            ring.batch_changes_credential_key,
+        );
+        lock(&self.external_service_key, ring.external_service_key);
+        lock(&self.github_app_key, ring.github_app_key);
+        lock(&self.outbound_webhook_key, ring.outbound_webhook_key);
+        lock(
+            &self.user_external_account_key,
+            ring.user_external_account_key,
+        );
+        lock(&self.webhook_key, ring.webhook_key);
+        lock(&self.webhook_log_key, ring.webhook_log_key);
+        lock(&self.executor_secret_key, ring.executor_secret_key);
     }
 }
 
-/// `keyring.Init`'s initial `NewRing`: build the `externalServiceKey` from
-/// `encryption.keys.externalServiceKey`. `Ok(None)` when the site config does
-/// not configure the keyring.
+/// `keyring.Init`'s initial `NewRing`.
 pub async fn init(site: &SiteConfiguration) -> Result<Arc<Keyring>, String> {
     let keyring = Keyring::default();
-    keyring.replace(external_service_key(site).await?);
+    keyring.replace(new_ring(site).await?);
     Ok(Arc::new(keyring))
 }
 
@@ -67,7 +117,7 @@ pub async fn watch(
     // `conf.Watch` invokes the callback immediately; skip the rebuild when the
     // configuration has not been replaced since `init` built the ring.
     if *changes.borrow() != built_generation {
-        keyring.replace(external_service_key(&live.current().site).await?);
+        keyring.replace(new_ring(&live.current().site).await?);
     }
 
     loop {
@@ -81,20 +131,44 @@ pub async fn watch(
         }
         // Go rebuilds for *any* config change: `newConfig == config` compares
         // pointers, and `conf.Get()` hands out a fresh `EncryptionKeys`.
-        keyring.replace(external_service_key(&live.current().site).await?);
+        keyring.replace(new_ring(&live.current().site).await?);
         tracing::info!("rebuilt the encryption keyring");
     }
 }
 
-/// The `externalServiceKey` entry of `encryption.keys`.
-async fn external_service_key(site: &SiteConfiguration) -> Result<Option<Arc<dyn Key>>, String> {
+/// `keyring.NewRing`: build every configured key. A configuration without
+/// `encryption.keys` yields an empty ring (the baseline returns `nil`).
+///
+/// The baseline builds entries in this order: `batchChangesCredentialKey`,
+/// `externalServiceKey`, `gitHubAppKey`, `userExternalAccountKey`,
+/// `webhookKey`, `webhookLogKey`, `executorSecretKey`. It has no branch for
+/// `outboundWebhookKey`, so that entry stays `None`.
+async fn new_ring(site: &SiteConfiguration) -> Result<Ring, String> {
     let Some(keys) = site.encryption_keys() else {
-        return Ok(None);
+        return Ok(Ring::default());
     };
-    let Some(key) = keys.external_service_key else {
-        return Ok(None);
-    };
-    Ok(Some(new_key(&key).await?))
+
+    let mut ring = Ring::default();
+    macro_rules! build {
+        ($field:ident, $config:expr) => {
+            if let Some(config) = $config {
+                ring.$field = Some(new_key(&config).await?);
+            }
+        };
+    }
+    build!(
+        batch_changes_credential_key,
+        keys.batch_changes_credential_key
+    );
+    build!(external_service_key, keys.external_service_key);
+    build!(github_app_key, keys.github_app_key);
+    build!(user_external_account_key, keys.user_external_account_key);
+    build!(webhook_key, keys.webhook_key);
+    build!(webhook_log_key, keys.webhook_log_key);
+    build!(executor_secret_key, keys.executor_secret_key);
+    // `keys.outbound_webhook_key` is intentionally not read (baseline bug).
+
+    Ok(ring)
 }
 
 /// `keyring.NewKey`. The cache wrapper (`encryption.cache`) is not used by
@@ -146,6 +220,46 @@ mod tests {
     async fn no_encryption_configuration_means_no_key() {
         let keyring = init(&SiteConfiguration::default()).await.expect("none");
         assert!(keyring.external_service_key().is_none());
+    }
+
+    #[tokio::test]
+    async fn builds_every_configured_key_except_outbound_webhooks() {
+        let site = SiteConfiguration::parse(
+            r#"{"encryption.keys": {
+                "batchChangesCredentialKey": {"type": "noop"},
+                "externalServiceKey": {"type": "noop"},
+                "gitHubAppKey": {"type": "noop"},
+                "outboundWebhookKey": {"type": "noop"},
+                "userExternalAccountKey": {"type": "noop"},
+                "webhookKey": {"type": "noop"},
+                "webhookLogKey": {"type": "noop"},
+                "executorSecretKey": {"type": "noop"}
+            }}"#,
+        )
+        .expect("parse");
+        let keyring = init(&site).await.expect("noop ring");
+        assert!(keyring.batch_changes_credential_key().is_some());
+        assert!(keyring.external_service_key().is_some());
+        assert!(keyring.github_app_key().is_some());
+        assert!(keyring.user_external_account_key().is_some());
+        assert!(keyring.webhook_key().is_some());
+        assert!(keyring.webhook_log_key().is_some());
+        assert!(keyring.executor_secret_key().is_some());
+        // `NewRing` never assigns `OutboundWebhookKey` in the baseline.
+        assert!(keyring.outbound_webhook_key().is_none());
+    }
+
+    #[tokio::test]
+    async fn every_configured_key_is_validated_at_startup() {
+        let site = SiteConfiguration::parse(
+            r#"{"encryption.keys": {
+                "externalServiceKey": {"type": "noop"},
+                "userExternalAccountKey": {"type": "mystery"}
+            }}"#,
+        )
+        .expect("parse");
+        let err = init(&site).await.err().expect("unknown type");
+        assert!(err.starts_with("couldn't configure key: "), "{err}");
     }
 
     #[tokio::test]
