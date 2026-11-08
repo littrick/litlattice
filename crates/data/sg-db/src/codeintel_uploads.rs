@@ -10,7 +10,9 @@
 //! * `DeleteAutoIndexJobsWithoutRepository`, `ExpireFailedRecords`;
 //! * `GetStaleSourcedCommits` / `DeleteSourcedCommits` /
 //!   `UpdateSourcedCommits` and `ProcessSourcedCommits` /
-//!   `ProcessStaleSourcedCommits`.
+//!   `ProcessStaleSourcedCommits`;
+//! * `SourcedCommitsWithoutCommittedAt` / `UpdateCommittedAt` /
+//!   `SetRepositoryAsDirty` (the `codeintel-upload-backfiller` job).
 //!
 //! Every SQL string is copied from the baseline store; migrations stay owned
 //! by the Go `migrator`. Two deliberate equivalences:
@@ -31,7 +33,7 @@
 
 use std::time::Duration;
 
-use sqlx::postgres::{PgPool, PgTransaction};
+use sqlx::postgres::{PgConnection, PgPool, PgTransaction};
 use sqlx::types::time::OffsetDateTime;
 use sqlx::Row;
 
@@ -287,6 +289,50 @@ pub async fn update_sourced_commits(
         .fetch_one(pool)
         .await?;
     row.try_get(0)
+}
+
+/// `store.SourcedCommitsWithoutCommittedAt`: completed uploads whose
+/// `codeintel_commit_dates` row is missing, grouped by repository. The
+/// backfiller reads it inside its transaction (`store.WithTransaction`).
+pub async fn sourced_commits_without_committed_at(
+    conn: &mut PgConnection,
+    batch_size: i64,
+) -> Result<Vec<SourcedCommits>, sqlx::Error> {
+    let rows = sqlx::query(SOURCED_COMMITS_WITHOUT_COMMITTED_AT_QUERY)
+        .bind(batch_size)
+        .fetch_all(&mut *conn)
+        .await?;
+    Ok(scan_sourced_commits(&rows))
+}
+
+/// `store.UpdateCommittedAt`: records the commit date for all uploads
+/// attached to the repository and commit (`ON CONFLICT DO NOTHING`).
+pub async fn update_committed_at(
+    conn: &mut PgConnection,
+    repository_id: i64,
+    commit: &str,
+    commit_date_string: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(UPDATE_COMMITTED_AT_QUERY)
+        .bind(repository_id)
+        .bind(commit)
+        .bind(commit_date_string)
+        .execute(&mut *conn)
+        .await?;
+    Ok(())
+}
+
+/// `store.SetRepositoryAsDirty` (`setRepositoryAsDirtyWithTx`): bumps the
+/// dirty token inside the caller's transaction.
+pub async fn set_repository_as_dirty(
+    conn: &mut PgConnection,
+    repository_id: i64,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(SET_REPOSITORY_AS_DIRTY_QUERY)
+        .bind(repository_id)
+        .execute(&mut *conn)
+        .await?;
+    Ok(())
 }
 
 /// `store.DeleteSourcedCommits`. Returns `(uploadsUpdated, uploadsDeleted)`.
@@ -759,6 +805,21 @@ ON CONFLICT (repository_id) DO UPDATE SET
         WHEN lsif_dirty_repositories.update_token = lsif_dirty_repositories.dirty_token THEN NOW()
         ELSE lsif_dirty_repositories.set_dirty_at
     END
+"#;
+
+const SOURCED_COMMITS_WITHOUT_COMMITTED_AT_QUERY: &str = r#"
+SELECT u.repository_id, r.name, u.commit
+FROM lsif_uploads u
+JOIN repo r ON r.id = u.repository_id
+LEFT JOIN codeintel_commit_dates cd ON cd.repository_id = u.repository_id AND cd.commit_bytea = decode(u.commit, 'hex')
+WHERE u.state = 'completed' AND cd.committed_at IS NULL
+GROUP BY u.repository_id, r.name, u.commit
+ORDER BY repository_id, commit
+LIMIT $1
+"#;
+
+const UPDATE_COMMITTED_AT_QUERY: &str = r#"
+INSERT INTO codeintel_commit_dates(repository_id, commit_bytea, committed_at) VALUES ($1, decode($2, 'hex'), $3::timestamptz) ON CONFLICT DO NOTHING
 "#;
 
 const DELETE_OLD_AUDIT_LOGS_QUERY: &str = r#"
