@@ -16,7 +16,7 @@ use sg_db::external_services::ExternalServiceStore;
 use sg_service_repo_updater::metrics::Metrics;
 use sg_service_repo_updater::scheduler::SystemClock;
 use sg_service_repo_updater::syncer::{
-    ExtsvcSourceFactory, NoopProgressRecorder, SyncProgress, Syncer,
+    ExtsvcSourceFactory, NoopProgressRecorder, StaticLicenseKey, SyncProgress, Syncer,
 };
 use sqlx::postgres::PgPool;
 use tokio_util::sync::CancellationToken;
@@ -38,11 +38,18 @@ async fn test_pool() -> Option<PgPool> {
 }
 
 async fn insert_service(pool: &PgPool, config: &str) -> i64 {
+    insert_service_with_unrestricted(pool, config, true).await
+}
+
+/// `unrestricted = true` makes the `OTHER` source yield public repositories;
+/// `false` yields private ones (`internal/repos/other.go`).
+async fn insert_service_with_unrestricted(pool: &PgPool, config: &str, unrestricted: bool) -> i64 {
     sqlx::query_scalar(
-        "INSERT INTO external_services(kind, display_name, config) \
-         VALUES ('OTHER', 'other-sync-test', $1) RETURNING id",
+        "INSERT INTO external_services(kind, display_name, config, unrestricted) \
+         VALUES ('OTHER', 'other-sync-test', $1, $2) RETURNING id",
     )
     .bind(config)
+    .bind(unrestricted)
     .fetch_one(pool)
     .await
     .expect("insert external service")
@@ -82,6 +89,8 @@ fn syncer(
         Some(tx),
         Arc::new(SystemClock),
         Arc::new(Metrics::new()),
+        // No license key: the free plan's private-repository limit applies.
+        Arc::new(StaticLicenseKey::default()),
     );
     (syncer, rx)
 }
@@ -332,6 +341,7 @@ async fn emits_syncer_and_source_metrics() {
         None,
         Arc::new(SystemClock),
         Arc::clone(&metrics),
+        Arc::new(StaticLicenseKey::default()),
     );
     syncer
         .sync_external_service(
@@ -418,6 +428,7 @@ async fn emits_store_metrics_for_create_update_and_delete() {
         None,
         Arc::new(SystemClock),
         Arc::clone(&metrics),
+        Arc::new(StaticLicenseKey::default()),
     );
     let token = CancellationToken::new();
     let min = Duration::from_secs(60);
@@ -512,6 +523,59 @@ async fn emits_store_metrics_for_create_update_and_delete() {
     ] {
         assert_eq!(family.with_label_values(&[]).get(), 0.0);
     }
+
+    cleanup(&pool, service_id, &suffix).await;
+}
+
+/// `CreateRepoLicenseHook` with no license key configured: the implicit free
+/// plan (`free-1`) allows a single private repository, and the baseline's
+/// `LicenseError` does not abort the delete phase.
+#[tokio::test]
+async fn license_hook_rejects_private_repos_beyond_the_free_plan() {
+    let Some(pool) = test_pool().await else {
+        return;
+    };
+    let suffix = unique_suffix();
+    let base = format!("https://{suffix}.example.com");
+    // Occupy the free plan's single private-repository slot so the sourced
+    // private repo is rejected regardless of what else is in the database.
+    sqlx::query("INSERT INTO repo(name, private) VALUES ($1, true)")
+        .bind(format!("placeholder-{suffix}.example.com/private"))
+        .execute(&pool)
+        .await
+        .expect("placeholder private repo");
+
+    // `unrestricted = false`: the `OTHER` source marks its repos private
+    // (`internal/repos/other.go`).
+    let service_id =
+        insert_service_with_unrestricted(&pool, &format!(r#"{{"url":"{base}","repos":["/r1.git"]}}"#), false)
+            .await;
+
+    let (syncer, _diffs) = syncer(&pool);
+    let err = syncer
+        .sync_external_service(
+            service_id,
+            Duration::from_secs(60),
+            &NoopProgressRecorder,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect_err("private repo must be rejected");
+    assert_eq!(
+        err,
+        format!(
+            "syncer: failed to update repo {suffix}.example.com/r1: \
+             maximum number of private repositories included in license (1) reached"
+        )
+    );
+
+    // The repo was never created. The delete phase still ran (a license error
+    // is the one error kind that does not abort it), but the service owns no
+    // previous repos, so nothing was deleted.
+    assert!(!repo_names(&pool, &suffix)
+        .await
+        .iter()
+        .any(|(name, _)| name.ends_with("/r1")));
 
     cleanup(&pool, service_id, &suffix).await;
 }

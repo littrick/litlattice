@@ -14,9 +14,10 @@
 //!   `ErrUnauthorized`/`ErrForbidden`/`ErrAccountSuspended` and license
 //!   errors; without those types any error aborts the delete phase, which is
 //!   what the baseline does for non-warning plain errors.
-//! - The license hooks (`CreateRepoLicenseHook`/`UpdateRepoLicenseHook`) are
-//!   not implemented: this deployment has no license service, so the hooks
-//!   return `nil` in the baseline's OSS mode.
+//! - The license hooks (`CreateRepoLicenseHook`/`UpdateRepoLicenseHook`) run
+//!   against the license key in the live site configuration, like the
+//!   baseline; with no key configured the free plan's one-private-repository
+//!   limit applies. `licensing.IsLicenseValid()`'s Redis flag is not read.
 //! - `dotcom.SourcegraphDotComMode()` is always false, so the private-repo
 //!   guard never fires.
 //! - `Synced` is a `tokio::sync::broadcast` channel rather than Go's blocking
@@ -35,6 +36,7 @@ use sg_db::external_service_repos::{
 };
 use sg_db::external_services::{ExternalService, ExternalServiceStore};
 use sg_extsvc::{HttpGetter, ModifiedRepo, Repo, RepoSyncDiff, Source, SourceInfo, SourceService};
+use sg_licensing::PrivateRepositories;
 
 use crate::metrics::{sync_error_reason, Metrics, OWNER_SITE, OWNER_UNDEFINED};
 use crate::scheduler::Clock;
@@ -113,6 +115,65 @@ impl SourceFactory for ExtsvcSourceFactory {
     }
 }
 
+/// Source of the site configuration's `licenseKey`
+/// (`conf.Get().LicenseKey`).
+pub trait LicenseKeySource: Send + Sync {
+    fn license_key(&self) -> String;
+}
+
+impl LicenseKeySource for sg_config::LiveConfig {
+    fn license_key(&self) -> String {
+        self.current().site.license_key()
+    }
+}
+
+/// A fixed license key, for tests and callers without a live configuration.
+/// The empty key is the "no license configured" case (the free plan).
+#[derive(Debug, Clone, Default)]
+pub struct StaticLicenseKey(pub String);
+
+impl LicenseKeySource for StaticLicenseKey {
+    fn license_key(&self) -> String {
+        self.0.clone()
+    }
+}
+
+/// A per-repo sync failure. `license` marks the baseline's `LicenseError`,
+/// which does not abort the delete phase (unlike every other error).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyncError {
+    pub message: String,
+    pub license: bool,
+}
+
+impl SyncError {
+    fn other(message: String) -> Self {
+        Self {
+            message,
+            license: false,
+        }
+    }
+
+    fn license(message: String) -> Self {
+        Self {
+            message,
+            license: true,
+        }
+    }
+}
+
+impl std::fmt::Display for SyncError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl From<String> for SyncError {
+    fn from(message: String) -> Self {
+        Self::other(message)
+    }
+}
+
 /// `repos.Syncer`.
 pub struct Syncer {
     external_services: ExternalServiceStore,
@@ -122,6 +183,7 @@ pub struct Syncer {
     synced: Option<broadcast::Sender<RepoSyncDiff>>,
     clock: Arc<dyn Clock>,
     metrics: Arc<Metrics>,
+    license: Arc<dyn LicenseKeySource>,
 }
 
 impl Syncer {
@@ -132,6 +194,7 @@ impl Syncer {
         synced: Option<broadcast::Sender<RepoSyncDiff>>,
         clock: Arc<dyn Clock>,
         metrics: Arc<Metrics>,
+        license: Arc<dyn LicenseKeySource>,
     ) -> Self {
         Self {
             external_services,
@@ -140,6 +203,7 @@ impl Syncer {
             synced,
             clock,
             metrics,
+            license,
         }
     }
 
@@ -317,7 +381,12 @@ impl Syncer {
                 Err(err) => {
                     sync_progress.errors += 1;
                     tracing::error!(repo = %sourced.name, error = %err, "failed to sync, skipping");
-                    errors.push(err);
+                    // The baseline only skips the delete phase for license
+                    // errors; every other per-repo error aborts it.
+                    if !err.license {
+                        abort_deletion = true;
+                    }
+                    errors.push(err.message);
                 }
             }
         }
@@ -371,12 +440,12 @@ impl Syncer {
         &self,
         svc: &ExternalService,
         sourced: &Repo,
-    ) -> Result<RepoSyncDiff, String> {
+    ) -> Result<RepoSyncDiff, SyncError> {
         let mut tx = self
             .store
             .begin()
             .await
-            .map_err(|err| format!("syncer: opening transaction: {err}"))?;
+            .map_err(|err| SyncError::other(format!("syncer: opening transaction: {err}")))?;
 
         let diff = self.sync_one_tx(&mut tx, svc, sourced).await?;
 
@@ -388,7 +457,7 @@ impl Syncer {
         // the database when it reacts to the diff.
         tx.commit()
             .await
-            .map_err(|err| format!("syncer: committing transaction: {err}"))?;
+            .map_err(|err| SyncError::other(format!("syncer: committing transaction: {err}")))?;
 
         if let Some(sender) = &self.synced {
             if !diff.is_empty() {
@@ -406,7 +475,7 @@ impl Syncer {
         tx: &mut sg_db::external_service_repos::RepoTransaction<'_>,
         svc: &ExternalService,
         sourced: &Repo,
-    ) -> Result<RepoSyncDiff, String> {
+    ) -> Result<RepoSyncDiff, SyncError> {
         let mut diff = RepoSyncDiff::default();
 
         let stored = tx
@@ -434,10 +503,14 @@ impl Syncer {
                     }
                 }
                 let Some(conflicting) = conflicting else {
-                    return Err("syncer: naming conflict without a conflicting repo".to_owned());
+                    return Err(SyncError::other(
+                        "syncer: naming conflict without a conflicting repo".to_owned(),
+                    ));
                 };
                 let Some(existing) = existing else {
-                    return Err("syncer: naming conflict without a matching repo".to_owned());
+                    return Err(SyncError::other(
+                        "syncer: naming conflict without a matching repo".to_owned(),
+                    ));
                 };
                 tx.delete_conflicting(conflicting.id)
                     .await
@@ -451,6 +524,8 @@ impl Syncer {
             1 => {
                 let mut repo = stored_to_repo(&stored[0]);
                 let was_deleted = repo.deleted;
+                self.update_repo_license_hook(tx, &repo, sourced)
+                    .await?;
                 let modified = repo.update(sourced);
 
                 if modified.is_empty() {
@@ -463,10 +538,10 @@ impl Syncer {
                         .map(|src| src.clone_url.clone())
                         .unwrap_or_default();
                     if clone_url.is_empty() {
-                        return Err(format!(
+                        return Err(SyncError::other(format!(
                             "UpdateExternalServiceRepo: repo {:?} missing source info for external service",
                             repo.name
-                        ));
+                        )));
                     }
                     let write = repo_to_write(&repo);
                     tx.update(svc.id, repo.id, &write, &clone_url)
@@ -483,19 +558,20 @@ impl Syncer {
                 }
             }
             0 => {
+                self.create_repo_license_hook(tx, sourced).await?;
                 let urn = svc_urn(svc);
                 let source = sourced.sources.get(&urn);
                 let Some(source) = source else {
-                    return Err(format!(
+                    return Err(SyncError::other(format!(
                         "CreateExternalServiceRepo: repo {:?} missing source info for external service",
                         sourced.name
-                    ));
+                    )));
                 };
                 if source.clone_url.is_empty() {
-                    return Err(format!(
+                    return Err(SyncError::other(format!(
                         "CreateExternalServiceRepo: repo (ID={:?}) missing CloneURL for external service",
                         source.id
-                    ));
+                    )));
                 }
                 let write = repo_to_write(sourced);
                 let outcome =
@@ -514,14 +590,90 @@ impl Syncer {
                 diff.added.push(created);
             }
             n => {
-                return Err(format!(
+                return Err(SyncError::other(format!(
                     "syncer: unexpected number of repos for {:?}: {n}",
                     sourced.name
-                ));
+                )));
             }
         }
 
         Ok(diff)
+    }
+
+    /// `CreateRepoLicenseHook`: a public repository never counts against the
+    /// license; a private one is rejected once the license's private
+    /// repositories are exhausted.
+    async fn create_repo_license_hook(
+        &self,
+        tx: &mut sg_db::external_service_repos::RepoTransaction<'_>,
+        sourced: &Repo,
+    ) -> Result<(), SyncError> {
+        if !sourced.private {
+            return Ok(());
+        }
+        match sg_licensing::check_private_repositories(&self.license.license_key()) {
+            PrivateRepositories::Unrestricted => Ok(()),
+            PrivateRepositories::Limited(max) => {
+                let count = tx
+                    .count_private()
+                    .await
+                    .map_err(|err| license_hook_error(sourced, &err.to_string()))?;
+                if count >= max as i64 {
+                    Err(license_hook_error(
+                        sourced,
+                        &PrivateRepositories::Limited(max).error_message(),
+                    ))
+                } else {
+                    Ok(())
+                }
+            }
+            PrivateRepositories::NotActivated => Err(license_hook_error(
+                sourced,
+                &PrivateRepositories::NotActivated.error_message(),
+            )),
+        }
+    }
+
+    /// `UpdateRepoLicenseHook`: only reviving a deleted private repository or
+    /// turning a public one private consumes a new slot; an update that
+    /// leaves a private repository private does not.
+    async fn update_repo_license_hook(
+        &self,
+        tx: &mut sg_db::external_service_repos::RepoTransaction<'_>,
+        existing: &Repo,
+        sourced: &Repo,
+    ) -> Result<(), SyncError> {
+        // `!newRepo.Private || !newRepo.DeletedAt.IsZero()`: sourced repos are
+        // never deleted, so the second condition only matters for callers
+        // that pass a deleted repo.
+        if !sourced.private || sourced.deleted {
+            return Ok(());
+        }
+        match sg_licensing::check_private_repositories(&self.license.license_key()) {
+            PrivateRepositories::Unrestricted => Ok(()),
+            PrivateRepositories::Limited(max) => {
+                let count = tx
+                    .count_private()
+                    .await
+                    .map_err(|err| license_hook_error(sourced, &err.to_string()))?;
+                // `Count > max`: over the limit. `Count == max`: only a repo
+                // that consumes a new slot (revived or public→private) is
+                // rejected; one that is already private may stay private.
+                let consumes_new_slot = existing.deleted || !existing.private;
+                if count > max as i64 || (count == max as i64 && consumes_new_slot) {
+                    Err(license_hook_error(
+                        sourced,
+                        &PrivateRepositories::Limited(max).error_message(),
+                    ))
+                } else {
+                    Ok(())
+                }
+            }
+            PrivateRepositories::NotActivated => Err(license_hook_error(
+                sourced,
+                &PrivateRepositories::NotActivated.error_message(),
+            )),
+        }
     }
 
     /// `Syncer.notifyDeleted`: the deleted repos are published by id only.
@@ -542,6 +694,16 @@ impl Syncer {
             let _ = sender.send(diff);
         }
     }
+}
+
+/// The baseline wraps every license-hook failure (including the count query
+/// error) in `LicenseError{errors.Wrapf(err, "syncer: failed to update repo %s",
+/// sourced.Name)}` — note that it says `update` on the create path too.
+fn license_hook_error(sourced: &Repo, message: &str) -> SyncError {
+    SyncError::license(format!(
+        "syncer: failed to update repo {}: {message}",
+        sourced.name
+    ))
 }
 
 /// `extsvc.URN` for an external service.

@@ -341,6 +341,15 @@ WHERE
         rows.into_iter().map(row_to_stored_repo).collect()
     }
 
+    /// `RepoStore.Count(ReposListOptions{OnlyPrivate: true})`: the number of
+    /// live private repositories, counted inside the transaction so the
+    /// license hook sees writes made earlier in the same sync.
+    pub async fn count_private(&mut self) -> Result<i64, sqlx::Error> {
+        sqlx::query_scalar("SELECT COUNT(*) FROM repo WHERE private AND deleted_at IS NULL")
+            .fetch_one(&mut **self.tx())
+            .await
+    }
+
     /// `CreateExternalServiceRepo` (and the caller-reported `Added` diff).
     pub async fn create(
         &mut self,

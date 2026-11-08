@@ -205,6 +205,9 @@ impl Service for RepoUpdaterService {
             Some(diff_tx.clone()),
             Arc::new(SystemClock),
             Arc::clone(&metrics),
+            // `conf.Get().LicenseKey`: re-read on every sync, so a site
+            // configuration change applies without a restart.
+            Arc::clone(&live) as Arc<dyn syncer::LicenseKeySource>,
         ));
         let sync_worker = Arc::new(
             SyncWorker::new(

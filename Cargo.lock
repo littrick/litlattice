@@ -3575,6 +3575,18 @@ name = "sg-httpcli"
 version = "0.1.0"
 
 [[package]]
+name = "sg-licensing"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "rand 0.8.8",
+ "rsa",
+ "serde",
+ "serde_json",
+ "sha1",
+]
+
+[[package]]
 name = "sg-log"
 version = "0.1.0"
 dependencies = [
@@ -3679,6 +3691,7 @@ dependencies = [
  "sg-extsvc",
  "sg-git",
  "sg-http",
+ "sg-licensing",
  "sg-metrics",
  "sg-proto",
  "sqlx",

@@ -297,6 +297,16 @@ impl SiteConfiguration {
         self.bool_field("disableAutoCodeHostSyncs")
     }
 
+    /// `conf.Get().LicenseKey`: the product license key from the site
+    /// configuration. Empty when the instance runs without a license.
+    pub fn license_key(&self) -> String {
+        self.raw
+            .get("licenseKey")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_owned()
+    }
+
     /// `conf.RepoListUpdateInterval`: `siteConfig.repoListUpdateInterval`
     /// minutes, defaulting to 1 minute. A negative value has no valid
     /// behaviour in the baseline (the periodic goroutine would receive a
@@ -970,6 +980,16 @@ mod tests {
             .collect()
         );
         assert_eq!(unified.service_connections, raw.service_connections);
+    }
+
+    #[test]
+    fn reads_the_license_key() {
+        let site = SiteConfiguration::parse(r#"{"licenseKey": "abc def"}"#).expect("parse");
+        assert_eq!(site.license_key(), "abc def");
+        assert_eq!(SiteConfiguration::default().license_key(), "");
+        // Non-string values are ignored, like the JSON accessor helpers.
+        let site = SiteConfiguration::parse(r#"{"licenseKey": 42}"#).expect("parse");
+        assert_eq!(site.license_key(), "");
     }
 
     #[test]

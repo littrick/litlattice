@@ -16,7 +16,7 @@ use sg_db::external_services::ExternalServiceStore;
 use sg_service_repo_updater::metrics::Metrics;
 use sg_service_repo_updater::scheduler::SystemClock;
 use sg_service_repo_updater::sync_worker::SyncWorker;
-use sg_service_repo_updater::syncer::{ExtsvcSourceFactory, Syncer};
+use sg_service_repo_updater::syncer::{ExtsvcSourceFactory, StaticLicenseKey, Syncer};
 use sqlx::postgres::PgPool;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
@@ -40,8 +40,8 @@ async fn worker_runs_a_queued_job_to_completion() {
     let suffix = unique_suffix();
     let base = format!("https://{suffix}.example.com");
     let service_id: i64 = sqlx::query_scalar(
-        "INSERT INTO external_services(kind, display_name, config) \
-         VALUES ('OTHER', 'worker-test', $1) RETURNING id",
+        "INSERT INTO external_services(kind, display_name, config, unrestricted) \
+         VALUES ('OTHER', 'worker-test', $1, true) RETURNING id",
     )
     .bind(format!(r#"{{"url":"{base}","repos":["/r1.git"]}}"#))
     .fetch_one(&pool)
@@ -72,6 +72,8 @@ async fn worker_runs_a_queued_job_to_completion() {
         None,
         Arc::new(SystemClock),
         Arc::clone(&metrics),
+        // No license key: the free plan's private-repository limit applies.
+        Arc::new(StaticLicenseKey::default()),
     ));
     let worker = Arc::new(
         SyncWorker::new(

@@ -16,7 +16,7 @@ use sg_db::external_services::ExternalServiceStore;
 use sg_service_repo_updater::metrics::Metrics;
 use sg_service_repo_updater::scheduler::SystemClock;
 use sg_service_repo_updater::syncer::{
-    ExtsvcSourceFactory, ProgressRecorder, SyncProgress, Syncer,
+    ExtsvcSourceFactory, ProgressRecorder, StaticLicenseKey, SyncProgress, Syncer,
 };
 use sqlx::postgres::PgPool;
 use tokio_util::sync::CancellationToken;
@@ -150,6 +150,7 @@ async fn main() {
         None,
         Arc::new(SystemClock),
         Arc::new(Metrics::new()),
+        Arc::new(StaticLicenseKey::default()),
     );
     let token = CancellationToken::new();
 

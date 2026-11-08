@@ -1,0 +1,17 @@
+[package]
+name = "sg-licensing"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+base64 = { workspace = true }
+rsa = "0.9"
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha1 = { version = "0.10", features = ["oid"] }
+
+[dev-dependencies]
+rand = "0.8"
