@@ -4227,6 +4227,8 @@ dependencies = [
  "sg-config",
  "sg-core",
  "sg-db",
+ "sg-encryption",
+ "sg-extsvc",
  "sg-http",
  "sg-keyring",
  "sg-metrics",

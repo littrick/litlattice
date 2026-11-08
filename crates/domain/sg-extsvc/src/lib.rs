@@ -14,6 +14,7 @@
 
 pub mod exclude;
 pub mod other;
+pub mod ratelimit;
 pub mod reposource;
 
 use std::collections::BTreeMap;

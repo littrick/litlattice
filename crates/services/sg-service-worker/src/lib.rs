@@ -160,7 +160,7 @@ impl Service for WorkerService {
             })?;
 
         // `keyring.Init(ctx)` reads `EncryptionKeys` from site config.
-        let _keyring = sg_keyring::init(&unified.site).await.map_err(|err| {
+        let keyring = sg_keyring::init(&unified.site).await.map_err(|err| {
             ServiceError::with_source("initializing keyring", std::io::Error::other(err))
         })?;
 
@@ -197,6 +197,7 @@ impl Service for WorkerService {
         let deps = JobDeps {
             frontend: frontend_pool,
             live_config,
+            keyring,
         };
         let routines = jobs::create_background_routines(&deps, &self.jobs, &config)
             .await

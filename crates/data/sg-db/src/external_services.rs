@@ -87,16 +87,7 @@ WHERE id = $1 AND deleted_at IS NULL
         .await?
         .ok_or(ExternalServiceError::NotFound { id })?;
 
-        Ok(ExternalService {
-            id: row.try_get("id")?,
-            kind: row.try_get("kind")?,
-            display_name: row.try_get("display_name")?,
-            config: row.try_get("config")?,
-            encryption_key_id: row.try_get("encryption_key_id")?,
-            last_sync_at: row.try_get("last_sync_at")?,
-            next_sync_at: row.try_get("next_sync_at")?,
-            unrestricted: row.try_get("unrestricted")?,
-        })
+        service_from_row(row)
     }
 
     /// `ExternalServices().Update` restricted to the sync timestamps (the only
@@ -126,6 +117,24 @@ WHERE id = $1 AND deleted_at IS NULL
         Ok(())
     }
 
+    /// `ExternalServices().List(ctx, ExternalServicesListOptions{})`: every
+    /// live service, newest first (`List` defaults `OrderByDirection` to
+    /// `DESC`). Used by the worker's `rate-limit-config` job.
+    pub async fn list(&self) -> Result<Vec<ExternalService>, ExternalServiceError> {
+        let rows = sqlx::query(
+            r#"
+SELECT id, kind, display_name, config, encryption_key_id,
+       last_sync_at, next_sync_at, unrestricted
+FROM external_services
+WHERE deleted_at IS NULL
+ORDER BY id DESC
+"#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(service_from_row).collect()
+    }
+
     /// All live external services, oldest first. Used by the syncer scheduler
     /// equivalent and the debug state dump.
     pub async fn list_all(&self) -> Result<Vec<ExternalService>, ExternalServiceError> {
@@ -140,21 +149,21 @@ ORDER BY id
         )
         .fetch_all(&self.pool)
         .await?;
-        rows.into_iter()
-            .map(|row| {
-                Ok(ExternalService {
-                    id: row.try_get("id")?,
-                    kind: row.try_get("kind")?,
-                    display_name: row.try_get("display_name")?,
-                    config: row.try_get("config")?,
-                    encryption_key_id: row.try_get("encryption_key_id")?,
-                    last_sync_at: row.try_get("last_sync_at")?,
-                    next_sync_at: row.try_get("next_sync_at")?,
-                    unrestricted: row.try_get("unrestricted")?,
-                })
-            })
-            .collect()
+        rows.into_iter().map(service_from_row).collect()
     }
+}
+
+fn service_from_row(row: sqlx::postgres::PgRow) -> Result<ExternalService, ExternalServiceError> {
+    Ok(ExternalService {
+        id: row.try_get("id")?,
+        kind: row.try_get("kind")?,
+        display_name: row.try_get("display_name")?,
+        config: row.try_get("config")?,
+        encryption_key_id: row.try_get("encryption_key_id")?,
+        last_sync_at: row.try_get("last_sync_at")?,
+        next_sync_at: row.try_get("next_sync_at")?,
+        unrestricted: row.try_get("unrestricted")?,
+    })
 }
 
 #[cfg(test)]

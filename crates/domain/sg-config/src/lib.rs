@@ -279,6 +279,15 @@ impl SiteConfiguration {
         }
     }
 
+    /// `siteConfig.gitMaxCodehostRequestsPerSecond` (`*int`): the maximum
+    /// number of remote code host git operations per second per gitserver.
+    /// `None` is the baseline's nil pointer ("unlimited", `-1`).
+    pub fn git_max_codehost_requests_per_second(&self) -> Option<i64> {
+        self.raw
+            .get("gitMaxCodehostRequestsPerSecond")
+            .and_then(serde_json::Value::as_i64)
+    }
+
     /// `conf.GitMaxConcurrentClones`: `siteConfig.gitMaxConcurrentClones`,
     /// defaulting to 5 when unset or non-positive.
     pub fn git_max_concurrent_clones(&self) -> usize {

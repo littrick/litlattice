@@ -27,6 +27,7 @@ async fn gitserver_metrics_matches_go_harness() {
     let deps = JobDeps {
         frontend: sg_db::connect(&dsn, 2).await.expect("connect database"),
         live_config: Arc::new(LiveConfig::new(Unified::default())),
+        keyring: Arc::new(sg_keyring::Keyring::default()),
     };
 
     let routines = GitserverMetrics

@@ -155,6 +155,7 @@ mod tests {
                 .connect_lazy("postgres://unused@127.0.0.1:1/unused")
                 .expect("lazy pool"),
             live_config: Arc::new(LiveConfig::new(Unified::default())),
+            keyring: Arc::new(sg_keyring::Keyring::default()),
         }
     }
 

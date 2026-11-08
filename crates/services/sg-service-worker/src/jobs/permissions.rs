@@ -151,6 +151,7 @@ mod tests {
                 .connect_lazy("postgres://unused@localhost/unused")
                 .expect("lazy pool"),
             live_config: Arc::new(LiveConfig::new(sg_config::Unified::default())),
+            keyring: Arc::new(sg_keyring::Keyring::default()),
         };
         let routines = PermissionSyncJobCleaner
             .routines(&deps, CancellationToken::new())
