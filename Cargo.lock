@@ -4237,6 +4237,8 @@ dependencies = [
  "http 1.5.0",
  "http-body-util",
  "hyper 1.12.0",
+ "prost 0.13.5",
+ "prost-types 0.13.5",
  "serde",
  "serde_json",
  "sg-codeintel",
@@ -4248,8 +4250,10 @@ dependencies = [
  "sg-git",
  "sg-http",
  "sg-keyring",
+ "sg-licensing",
  "sg-metrics",
  "sg-objectstorage",
+ "sg-proto",
  "sg-rcache",
  "sg-redis",
  "sg-zoekt",
@@ -4260,6 +4264,7 @@ dependencies = [
  "tokio-util",
  "tonic 0.12.3",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -5349,6 +5354,7 @@ version = "1.29.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4a06f08a856b009bc7bbaf7d3e79808595d032dd19074c0c2ef26e49e03e6bdc"
 dependencies = [
+ "getrandom 0.4.3",
  "js-sys",
  "wasm-bindgen",
 ]

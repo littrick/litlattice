@@ -29,3 +29,7 @@ pub mod symbols {
 pub mod repoupdater {
     tonic::include_proto!("repoupdater.v1");
 }
+
+pub mod telemetrygateway {
+    tonic::include_proto!("telemetrygateway.v1");
+}

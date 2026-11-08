@@ -24,6 +24,7 @@ pub mod repo_embeddings;
 pub mod repo_statistics;
 pub mod repos;
 pub mod repoupdater_state;
+pub mod telemetry_events;
 pub mod worker_queue;
 pub mod zoekt_repos;
 

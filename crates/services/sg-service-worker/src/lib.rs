@@ -38,6 +38,7 @@ pub mod framework;
 pub mod health;
 pub mod jobs;
 pub mod registry;
+pub mod telemetry;
 
 use config::WorkerConfigs;
 use framework::recorder::Recorder;

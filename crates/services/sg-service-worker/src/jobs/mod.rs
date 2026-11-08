@@ -43,6 +43,7 @@ pub mod codeintel_upload_backfiller;
 pub mod codeintel_upload_janitor;
 pub mod codeintel_uploadstore_expirer;
 pub mod codygateway;
+pub mod completions;
 pub mod encryption;
 pub mod eventlogs;
 pub mod executors;
@@ -156,6 +157,7 @@ pub fn all_jobs() -> Vec<(&'static str, Arc<dyn Job>)> {
                 "aggregated-users-statistics" => Arc::new(users::AggregatedUsersStatistics),
                 "batches-janitor" => Arc::new(batches::BatchesJanitor::new()),
                 "cody-gateway-usage-check" => Arc::new(codygateway::CodyGatewayUsageCheck),
+                "cody-llm-token-counter" => Arc::new(completions::CodyLlmTokenCounter),
                 "event-logs-janitor" => Arc::new(eventlogs::EventLogsJanitor),
                 "executors-janitor" => Arc::new(executors::ExecutorsJanitor::new()),
                 "executors-metricsserver" => {

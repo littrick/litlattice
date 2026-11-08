@@ -16,8 +16,10 @@ sg-extsvc = { path = "../../domain/sg-extsvc" }
 sg-git = { path = "../../domain/sg-git" }
 sg-http = { path = "../../net/sg-http" }
 sg-keyring = { path = "../../domain/sg-keyring" }
+sg-licensing = { path = "../../domain/sg-licensing" }
 sg-metrics = { path = "../../base/sg-metrics" }
 sg-objectstorage = { path = "../../data/sg-objectstorage" }
+sg-proto = { path = "../../net/sg-proto" }
 sg-rcache = { path = "../../data/sg-rcache" }
 sg-redis = { path = "../../data/sg-redis" }
 sg-zoekt = { path = "../../domain/sg-zoekt" }
@@ -27,6 +29,8 @@ flate2 = { workspace = true }
 http = { workspace = true }
 http-body-util = { workspace = true }
 hyper = { workspace = true }
+prost = { workspace = true }
+prost-types = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
@@ -36,3 +40,4 @@ tokio = { workspace = true }
 tokio-util = { workspace = true }
 tonic = { workspace = true }
 tracing = { workspace = true }
+uuid = { workspace = true }
