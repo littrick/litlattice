@@ -47,6 +47,8 @@ fn run() -> Result<(), String> {
         "contract" => contract(&rest),
         "diff" => diff(&rest),
         "record" => record(&rest),
+        "replay-write" => replay_write(&rest),
+        "canary" => canary(&rest),
         "-h" | "--help" | "help" => {
             println!("{}", usage());
             Ok(())
@@ -66,6 +68,10 @@ commands:
                                   replay fixtures and compare normalized responses
   record --service symbols|searcher --fixture DIR --addr URL
                                   store normalized responses into fixtures
+  replay-write --addr URL --repo NAME --phase clone|fetch|delete
+                                  run one gitserver write scenario and print it
+                                  as normalized JSON (for scripts/gitserver)
+  canary --addr URL --repo NAME   health check: clone progress, HEAD, repo list
 "
     .to_owned()
 }
@@ -2132,6 +2138,290 @@ async fn record(args: &[String]) -> Result<(), String> {
         println!("RECORDED {}", relative(&case.path));
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// replay-write / canary
+// ---------------------------------------------------------------------------
+
+type GitClient = gpb::gitserver_service_client::GitserverServiceClient<tonic::transport::Channel>;
+type RepositoryClient = gpb::gitserver_repository_service_client::GitserverRepositoryServiceClient<
+    tonic::transport::Channel,
+>;
+
+/// Normalized `ListRepositoriesResponse` restricted to the scenario repository:
+/// the instances use different `SRC_REPOS_DIR`s, so unrelated repositories on
+/// either shard would otherwise make the reports differ. Paths are relative to
+/// the data dir, so they do not leak those directories.
+fn normalize_repository_list(response: &gpb::ListRepositoriesResponse, repo: &str) -> Value {
+    let mut repositories = response
+        .repositories
+        .iter()
+        .filter(|repository| repository.name == repo)
+        .map(|repository| {
+            json!({
+                "path": String::from_utf8_lossy(&repository.path),
+                "name": repository.name,
+            })
+        })
+        .collect::<Vec<_>>();
+    repositories.sort_by(|left, right| {
+        left["path"]
+            .as_str()
+            .unwrap_or_default()
+            .cmp(right["path"].as_str().unwrap_or_default())
+    });
+    json!({
+        "repositories": repositories,
+        "next_page_token": response.next_page_token,
+    })
+}
+
+/// `last_fetched` is the wall-clock fetch time and differs between runs; only
+/// its presence is part of the replay. `last_changed` comes from the
+/// `sg_refhash_v2` mtime, which is deterministic (the latest commit time) while
+/// the file is created by the first clone, so it is compared by value there.
+fn normalize_fetch_response(
+    response: &gpb::FetchRepositoryResponse,
+    exact_last_changed: bool,
+) -> Value {
+    let last_changed = response.last_changed.as_ref().map(|time| time.seconds);
+    json!({
+        "last_fetched_present": response.last_fetched.is_some(),
+        "last_changed": if exact_last_changed {
+            json!(last_changed)
+        } else {
+            json!(last_changed.is_some())
+        },
+    })
+}
+
+fn normalize_clone_progress(response: &gpb::RepoCloneProgressResponse) -> Value {
+    json!({
+        "cloned": response.cloned,
+        "clone_in_progress": response.clone_in_progress,
+        // A finished clone has an empty progress message in both
+        // implementations; a running one is inherently timing-dependent.
+        "clone_progress_present": !response.clone_progress.is_empty(),
+    })
+}
+
+async fn fetch_repository(client: &mut RepositoryClient, repo: &str, exact: bool) -> Value {
+    match client
+        .fetch_repository(gpb::FetchRepositoryRequest {
+            repo_name: repo.to_owned(),
+        })
+        .await
+    {
+        Ok(response) => normalize_fetch_response(&response.into_inner(), exact),
+        Err(status) => normalize_status(&status),
+    }
+}
+
+async fn clone_progress(client: &mut GitClient, repo: &str) -> Value {
+    match client
+        .repo_clone_progress(gpb::RepoCloneProgressRequest {
+            repo_name: repo.to_owned(),
+        })
+        .await
+    {
+        Ok(response) => normalize_clone_progress(&response.into_inner()),
+        Err(status) => normalize_status(&status),
+    }
+}
+
+async fn resolve_head(client: &mut GitClient, repo: &str) -> Value {
+    match client
+        .resolve_revision(gpb::ResolveRevisionRequest {
+            repo_name: repo.to_owned(),
+            rev_spec: b"HEAD".to_vec(),
+            ensure_revision: None,
+        })
+        .await
+    {
+        Ok(response) => json!({"commit_sha": response.into_inner().commit_sha}),
+        Err(status) => normalize_status(&status),
+    }
+}
+
+/// `RevAtTime` goes through the Go process's in-process LRU cache
+/// (`revAtTimeCache`); replaying it here checks that both implementations
+/// resolve the same commit while the disk repository is shared with a cache.
+async fn rev_at_time_now(client: &mut GitClient, repo: &str) -> Value {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or_default();
+    match client
+        .rev_at_time(gpb::RevAtTimeRequest {
+            repo_name: repo.to_owned(),
+            rev_spec: b"HEAD".to_vec(),
+            time: Some(prost_types::Timestamp {
+                seconds: now,
+                nanos: 0,
+            }),
+        })
+        .await
+    {
+        Ok(response) => json!({"commit_sha": response.into_inner().commit_sha}),
+        Err(status) => normalize_status(&status),
+    }
+}
+
+async fn list_repositories(client: &mut RepositoryClient, repo: &str) -> Value {
+    match client
+        .list_repositories(gpb::ListRepositoriesRequest {
+            page_size: 1000,
+            page_token: String::new(),
+        })
+        .await
+    {
+        Ok(response) => normalize_repository_list(&response.into_inner(), repo),
+        Err(status) => normalize_status(&status),
+    }
+}
+
+/// One end of the write-path differential (M9.4). The script drives both
+/// gitservers through the same phases against one shared database and remote,
+/// then compares the normalized reports:
+///
+/// - `clone`: list, clone via `FetchRepository`, clone progress, resolved HEAD,
+///   `RevAtTime`, an idempotent second fetch, and the list again.
+/// - `fetch`: fetch after the remote gained a commit, then resolve.
+/// - `delete`: `DeleteRepository`, then progress/list/resolve afterwards.
+#[tokio::main]
+async fn replay_write(args: &[String]) -> Result<(), String> {
+    let args = parse_args(args)?;
+    let addr = required(&args, "addr")?.to_owned();
+    let repo = required(&args, "repo")?.to_owned();
+    let phase = args.get("phase").map(String::as_str).unwrap_or("clone");
+    if !matches!(phase, "clone" | "fetch" | "delete") {
+        return Err(format!(
+            "replay-write: unknown --phase {phase:?} (clone, fetch or delete)"
+        ));
+    }
+
+    let mut git = GitClient::connect(addr.clone())
+        .await
+        .map_err(|err| format!("connect {addr}: {err}"))?;
+    let mut repositories = RepositoryClient::connect(addr.clone())
+        .await
+        .map_err(|err| format!("connect {addr}: {err}"))?;
+
+    let mut steps: Vec<Value> = Vec::new();
+    let mut push = |name: &str, value: Value| steps.push(json!({"step": name, "result": value}));
+
+    match phase {
+        "clone" => {
+            push(
+                "list-before",
+                list_repositories(&mut repositories, &repo).await,
+            );
+            push(
+                "fetch-clone",
+                fetch_repository(&mut repositories, &repo, true).await,
+            );
+            push("clone-progress", clone_progress(&mut git, &repo).await);
+            push("resolve-head", resolve_head(&mut git, &repo).await);
+            push("rev-at-time-now", rev_at_time_now(&mut git, &repo).await);
+            // The second fetch is a no-op for the ref set, so `sg_refhash_v2`
+            // keeps its deterministic mtime.
+            push(
+                "fetch-idempotent",
+                fetch_repository(&mut repositories, &repo, true).await,
+            );
+            push(
+                "list-after",
+                list_repositories(&mut repositories, &repo).await,
+            );
+        }
+        "fetch" => {
+            // `last_changed` is the wall-clock mtime now that the ref set grew.
+            push(
+                "fetch-updated",
+                fetch_repository(&mut repositories, &repo, false).await,
+            );
+            push("resolve-head", resolve_head(&mut git, &repo).await);
+            push("rev-at-time-now", rev_at_time_now(&mut git, &repo).await);
+            push(
+                "list-after",
+                list_repositories(&mut repositories, &repo).await,
+            );
+        }
+        "delete" => {
+            push(
+                "delete",
+                match repositories
+                    .delete_repository(gpb::DeleteRepositoryRequest {
+                        repo_name: repo.clone(),
+                    })
+                    .await
+                {
+                    Ok(_) => json!({}),
+                    Err(status) => normalize_status(&status),
+                },
+            );
+            push("clone-progress", clone_progress(&mut git, &repo).await);
+            push(
+                "list-after",
+                list_repositories(&mut repositories, &repo).await,
+            );
+            push("resolve-head", resolve_head(&mut git, &repo).await);
+        }
+        _ => unreachable!("phase validated above"),
+    }
+
+    let report = json!({"phase": phase, "repo": repo, "steps": steps});
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&report)
+            .map_err(|err| format!("serialize replay report: {err}"))?
+    );
+    Ok(())
+}
+
+/// Read-only readiness probe for a gitserver instance, used by the rollout
+/// script before switching traffic to it (and before rolling back).
+#[tokio::main]
+async fn canary(args: &[String]) -> Result<(), String> {
+    let args = parse_args(args)?;
+    let addr = required(&args, "addr")?.to_owned();
+    let repo = required(&args, "repo")?.to_owned();
+
+    let mut git = GitClient::connect(addr.clone())
+        .await
+        .map_err(|err| format!("connect {addr}: {err}"))?;
+    let mut repositories = RepositoryClient::connect(addr.clone())
+        .await
+        .map_err(|err| format!("connect {addr}: {err}"))?;
+
+    let clone_progress = clone_progress(&mut git, &repo).await;
+    let resolve_head = resolve_head(&mut git, &repo).await;
+    let list = list_repositories(&mut repositories, &repo).await;
+
+    // A canary passes when the repository is cloned and HEAD resolves; the
+    // list is reported for diagnostics but an empty shard is not an error.
+    let cloned = clone_progress["cloned"].as_bool().unwrap_or(false);
+    let resolved = resolve_head.get("commit_sha").is_some();
+    let report = json!({
+        "addr": addr,
+        "repo": repo,
+        "ok": cloned && resolved,
+        "clone_progress": clone_progress,
+        "resolve_head": resolve_head,
+        "list": list,
+    });
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&report).map_err(|err| format!("serialize canary: {err}"))?
+    );
+    if cloned && resolved {
+        Ok(())
+    } else {
+        Err(format!(
+            "canary failed for {addr}: repo {repo:?} is not cloned or HEAD does not resolve"
+        ))
+    }
 }
 
 fn relative(path: &Path) -> String {
