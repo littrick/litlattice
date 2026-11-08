@@ -56,6 +56,7 @@ pub mod permissions;
 pub mod ratelimit;
 pub mod repo_embedding_janitor;
 pub mod repostatistics;
+pub mod usage_telemetry;
 pub mod users;
 pub mod webhooks;
 pub mod zoektrepos;
@@ -167,6 +168,9 @@ pub fn all_jobs() -> Vec<(&'static str, Arc<dyn Job>)> {
                 "executors-multiqueue-metrics-reporter" => Arc::new(
                     executors_multiqueue_metrics::ExecutorsMultiqueueMetricsReporter::new(),
                 ),
+                "export-usage-telemetry" => {
+                    Arc::new(usage_telemetry::ExportUsageTelemetryJob::new())
+                }
                 "codeintel-metrics-reporter" => {
                     Arc::new(codeintel_metrics_reporter::CodeIntelMetricsReporter::new())
                 }

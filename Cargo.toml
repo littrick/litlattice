@@ -51,6 +51,11 @@ aws-sdk-s3 = "1"
 crc = "3"
 google-cloud-auth = "1"
 google-cloud-kms-v1 = "1"
+# `export-usage-telemetry` publishes to Pub/Sub over its REST API (the Go
+# baseline uses the gRPC Pub/Sub client). The features stay minimal: the
+# credential provider supplied by `google-cloud-auth` already enables the
+# shared TLS stack.
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
 # tree-sitter grammars vendored from the exact parser sources used by the Go
 # baseline (github.com/smacker/go-tree-sitter @ 233c2f923ac7). Published crate
 # versions track different grammar commits, so runtimes must not be swapped.

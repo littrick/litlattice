@@ -13,6 +13,7 @@ pub mod codeintel_codegraph;
 pub mod codeintel_dependencies;
 pub mod codeintel_policies;
 pub mod codeintel_uploads;
+pub mod event_logs;
 pub mod executor_heartbeats;
 pub mod external_service_repos;
 pub mod external_service_sync_jobs;
@@ -26,6 +27,7 @@ pub mod repo_statistics;
 pub mod repos;
 pub mod repoupdater_state;
 pub mod telemetry_events;
+pub mod user_emails;
 pub mod worker_queue;
 pub mod zoekt_repos;
 
