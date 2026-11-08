@@ -78,6 +78,12 @@ impl GitserverReposStore {
         Self { pool }
     }
 
+    /// The underlying pool, for stores and tests that need the same
+    /// connection (e.g. creating a `repo` row before exercising the store).
+    pub fn pool(&self) -> &PgPool {
+        &self.pool
+    }
+
     /// `SetCloneStatus`: clears `corrupted_at`, stores the status and shard,
     /// and only writes when the status actually changes.
     pub async fn set_clone_status(

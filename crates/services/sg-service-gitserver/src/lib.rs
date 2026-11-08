@@ -33,6 +33,7 @@ pub mod memobs;
 pub mod metrics;
 mod mux;
 pub mod postfetch;
+pub mod progress;
 pub mod repo;
 pub mod search;
 pub mod trace;

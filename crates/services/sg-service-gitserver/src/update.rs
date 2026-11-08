@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use sg_db::gitserver_repos::{CloneStatus, GitserverReposStore};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
@@ -20,6 +21,7 @@ use crate::git::GitError;
 use crate::limiter::{AcquireError, MutableLimiter};
 use crate::locker::{RepositoryLock, RepositoryLocker};
 use crate::metrics;
+use crate::progress::LinebasedWriter;
 
 /// The operations `repoUpdateOrClone` performs on the repository. The real
 /// implementation will use `vcssyncer` (clone/fetch) and the filesystem
@@ -179,12 +181,15 @@ pub trait RemoteUrlSource: Send + Sync {
 /// The real [`UpdateBackend`]: clones and fetches repositories on disk the way
 /// `gitRepoSyncer`/`cloneRepo`/`doRepoUpdate` do.
 ///
-/// Still missing from the baseline path: `gitserver_repos` clone status and
-/// last-output writes, the fast-forward/`RepoSyncState` DB update, and the
-/// progress stream (the syncer writes progress into a buffer that is dropped).
+/// Still missing from the baseline path: the fast-forward/`RepoSyncState` DB
+/// update, command timeouts, and URL redaction/credential handling.
 pub struct LocalBackend {
     pub repos_dir: PathBuf,
     pub remote_urls: Arc<dyn RemoteUrlSource>,
+    /// `db.GitserverRepos()`; `None` when running without a database (tests).
+    pub store: Option<Arc<GitserverReposStore>>,
+    /// `s.hostname`, stored as `gitserver_repos.shard_id`.
+    pub shard_id: String,
 }
 
 impl LocalBackend {
@@ -202,6 +207,42 @@ impl LocalBackend {
                 err.message()
             ))
         })
+    }
+
+    /// `SetCloneStatus`: failures are logged, never fatal (baseline).
+    async fn set_clone_status(&self, repo: &str, status: CloneStatus) {
+        let Some(store) = &self.store else {
+            return;
+        };
+        if let Err(err) = store.set_clone_status(repo, status, &self.shard_id).await {
+            tracing::error!(repo, error = %err, "setting clone status in DB");
+        }
+    }
+
+    /// `SetLastOutput`: failures are logged, never fatal (baseline).
+    async fn set_last_output(&self, repo: &str, output: &str) {
+        let Some(store) = &self.store else {
+            return;
+        };
+        if let Err(err) = store.set_last_output(repo, output).await {
+            tracing::error!(repo, error = %err, "setting last output in DB");
+        }
+    }
+}
+
+/// Writes every progress token into the update output and, when it is not
+/// blank, into the lock status (`readFetchProgress`).
+fn progress_handler<'a>(
+    output: &'a mut LinebasedWriter,
+    lock: &'a RepositoryLock,
+) -> impl FnMut(&[u8]) + Send + 'a {
+    move |token: &[u8]| {
+        output.write(token);
+        let line = String::from_utf8_lossy(token);
+        let line = line.trim();
+        if !line.is_empty() {
+            lock.set_status(line);
+        }
     }
 }
 
@@ -236,27 +277,27 @@ impl UpdateBackend for LocalBackend {
             )));
         }
 
-        let remote_url = self.remote_url(repo).await?;
         let tmp_dir = crate::fs::temp_dir(&self.repos_dir, "clone-")
             .map_err(|err| io_error("clone failed to create tmp dir", err))?;
         let _cleanup = crate::fs::TempDirCleanup(tmp_dir.clone());
-        let tmp_path = crate::vcssyncer::clone_tmp_path(&tmp_dir);
 
-        // `readFetchProgress`: every syncer message and git progress line
-        // becomes the lock status shown by `RepoCloneProgress`.
-        let mut progress = Vec::new();
-        let mut on_progress = |line: &str| lock.set_status(line);
-        crate::vcssyncer::clone_repo_with(&tmp_path, &remote_url, &mut progress, &mut on_progress)
-            .await?;
+        self.set_clone_status(repo, CloneStatus::Cloning).await;
+        let result = self.clone_into(repo, &dst, &tmp_dir, lock).await;
 
-        crate::postfetch::post_fetch_actions(&tmp_path, repo).await?;
+        // `defer`: recompute the on-disk state and store it, regardless of the
+        // clone outcome. The baseline uses `context.Background()` here.
+        let cloned = crate::fs::repo_cloned(&self.repos_dir, repo).unwrap_or_else(|err| {
+            tracing::error!(repo, error = %err, "failed to check if repo is cloned");
+            false
+        });
+        let status = if cloned {
+            CloneStatus::Cloned
+        } else {
+            CloneStatus::NotCloned
+        };
+        self.set_clone_status(repo, status).await;
 
-        let parent = dst.parent().unwrap_or_else(|| Path::new("."));
-        std::fs::create_dir_all(parent)
-            .map_err(|err| io_error("failed to create repository directory", err))?;
-        crate::postfetch::rename_and_sync(&tmp_path, &dst)
-            .map_err(|err| io_error("failed to rename cloned repository", err))?;
-        Ok(())
+        result
     }
 
     async fn fetch(
@@ -266,25 +307,99 @@ impl UpdateBackend for LocalBackend {
         _cancelled: &CancellationToken,
     ) -> Result<(), GitError> {
         let git_dir = self.git_dir(repo)?;
-        let remote_url = self.remote_url(repo).await?;
 
-        let mut progress = Vec::new();
-        let mut on_progress = |line: &str| lock.set_status(line);
-        crate::vcssyncer::fetch_repo_with(&git_dir, &remote_url, &mut progress, &mut on_progress)
+        // The remote lookup happens before the progress pipe in the baseline's
+        // `syncer.Fetch`, but the error is still wrapped with the (empty)
+        // output. `SetLastOutput` runs even when the lookup fails.
+        let remote_url = self.remote_url(repo).await;
+        let mut output = LinebasedWriter::new();
+        let result = match remote_url {
+            Ok(remote_url) => {
+                let mut on_progress = progress_handler(&mut output, lock);
+                crate::vcssyncer::fetch_repo_with(&git_dir, &remote_url, &mut on_progress).await
+            }
+            Err(err) => Err(err),
+        };
+
+        self.set_last_output(repo, &output.to_string_lossy()).await;
+        result.map_err(|err| {
+            GitError::Message(format!(
+                "failed to fetch repo {:?} with output {:?}: {}",
+                repo,
+                output.to_string_lossy(),
+                err.message()
+            ))
+        })?;
+
+        crate::postfetch::post_fetch_actions(&git_dir, repo, self.store.as_deref(), &self.shard_id)
             .await?;
-
-        crate::postfetch::post_fetch_actions(&git_dir, repo).await?;
         Ok(())
     }
 
     async fn set_last_error(&self, repo: &str, error: &str) {
-        // `SetLastError` needs `gitserver_repos`; until then the update log is
-        // the only place the error is visible, matching the baseline's log line.
         if error.is_empty() {
             tracing::debug!(repo, "repo update succeeded");
         } else {
             tracing::warn!(repo, error, "repo update failed");
         }
+        let Some(store) = &self.store else {
+            return;
+        };
+        if let Err(err) = store.set_last_error(repo, error, &self.shard_id).await {
+            tracing::error!(repo, error = %err, "setting last error in DB");
+        }
+    }
+}
+
+impl LocalBackend {
+    /// The rest of `cloneRepo` after the status bookkeeping: fetch into the
+    /// staging directory, run the post-fetch actions, and rename into place.
+    async fn clone_into(
+        &self,
+        repo: &str,
+        dst: &Path,
+        tmp_dir: &Path,
+        lock: &RepositoryLock,
+    ) -> Result<(), GitError> {
+        let tmp_path = crate::vcssyncer::clone_tmp_path(tmp_dir);
+
+        // The remote lookup is part of `syncer.Clone` in the baseline, so its
+        // failure is wrapped with the (possibly empty) clone output too.
+        let remote_url = self.remote_url(repo).await;
+        let mut output = LinebasedWriter::new();
+        let result = match remote_url {
+            Ok(remote_url) => {
+                let mut on_progress = progress_handler(&mut output, lock);
+                crate::vcssyncer::clone_repo_with(&tmp_path, &remote_url, &mut on_progress).await
+            }
+            Err(err) => Err(err),
+        };
+
+        // Best-effort update the output of the clone, even on failure.
+        self.set_last_output(repo, &output.to_string_lossy()).await;
+        if let Err(err) = result {
+            // Baseline: `errors.Wrapf(cloneErr, "clone failed. Output: %s", output)`.
+            return Err(GitError::Message(format!(
+                "clone failed. Output: {}: {}",
+                output.to_string_lossy(),
+                err.message()
+            )));
+        }
+
+        crate::postfetch::post_fetch_actions(
+            &tmp_path,
+            repo,
+            self.store.as_deref(),
+            &self.shard_id,
+        )
+        .await?;
+
+        let parent = dst.parent().unwrap_or_else(|| Path::new("."));
+        std::fs::create_dir_all(parent)
+            .map_err(|err| io_error("failed to create repository directory", err))?;
+        crate::postfetch::rename_and_sync(&tmp_path, dst)
+            .map_err(|err| io_error("failed to rename cloned repository", err))?;
+        Ok(())
     }
 }
 
@@ -571,6 +686,8 @@ mod tests {
                 repo.to_owned(),
                 origin.to_str().expect("utf8").to_owned(),
             )]))),
+            store: None,
+            shard_id: "test-shard".to_owned(),
         }
     }
 
@@ -666,6 +783,8 @@ mod tests {
         let backend = LocalBackend {
             repos_dir: repos_dir.clone(),
             remote_urls: Arc::new(StaticUrls(HashMap::new())),
+            store: None,
+            shard_id: "test-shard".to_owned(),
         };
         let repo = "github.com/sourcegraphtest/alwayscloningtest";
         let locker = RepositoryLocker::new();
@@ -684,6 +803,8 @@ mod tests {
         let backend = LocalBackend {
             repos_dir,
             remote_urls: Arc::new(StaticUrls(HashMap::new())),
+            store: None,
+            shard_id: "test-shard".to_owned(),
         };
         let locker = RepositoryLocker::new();
         let lock = locker.try_acquire("example.com/x", "test").expect("lock");
@@ -691,9 +812,135 @@ mod tests {
             .clone("example.com/x", &lock, &CancellationToken::new())
             .await
             .expect_err("unknown remote");
-        assert_eq!(
-            err.message(),
-            "failed to get remote URL source for \"example.com/x\": no remote URL for example.com/x"
+        let message = err.message();
+        assert!(
+            message.contains(
+                "failed to get remote URL source for \"example.com/x\": \
+                 no remote URL for example.com/x"
+            ),
+            "unexpected error: {message}"
         );
+        assert!(
+            message.starts_with("clone failed. Output: "),
+            "unexpected error: {message}"
+        );
+    }
+
+    /// Exercises the `gitserver_repos` writes of `cloneRepo`/`doRepoUpdate`
+    /// against the local baseline database when `SG_TEST_DATABASE_DSN` is set.
+    #[tokio::test]
+    async fn local_backend_persists_repo_state_when_a_database_is_configured() {
+        let Ok(dsn) = std::env::var("SG_TEST_DATABASE_DSN") else {
+            eprintln!("SG_TEST_DATABASE_DSN unset; skipping");
+            return;
+        };
+        let pool = sg_db::connect(&dsn, 2).await.expect("connect");
+        let store = Arc::new(GitserverReposStore::new(pool.clone()));
+
+        let name = format!(
+            "gitserver-write-{}.example.com/repo",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        );
+        sqlx::query("INSERT INTO repo(name) VALUES ($1)")
+            .bind(&name)
+            .execute(store.pool())
+            .await
+            .expect("insert repo");
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (origin, work) = source_repo(tmp.path());
+        let repos_dir = tmp.path().join("repos");
+        std::fs::create_dir_all(&repos_dir).expect("mkdir");
+        let mut backend = local_backend(&repos_dir, &name, &origin);
+        backend.store = Some(Arc::clone(&store));
+        let locker = RepositoryLocker::new();
+        let lock = locker.try_acquire(&name, "test").expect("lock");
+        let token = CancellationToken::new();
+
+        let result = async {
+            backend.clone(&name, &lock, &token).await.expect("clone");
+
+            let repo = store.get_by_name(&name).await.expect("get").expect("row");
+            assert_eq!(repo.clone_status, CloneStatus::Cloned);
+            assert_eq!(repo.shard_id, "test-shard");
+            assert!(
+                repo.repo_size_bytes.unwrap_or(0) > 0,
+                "repo size was not recorded"
+            );
+            // The clone progress stream was stored verbatim.
+            let output = store
+                .get_last_sync_output(&name)
+                .await
+                .expect("output")
+                .expect("output recorded");
+            assert!(
+                output.contains("Finished setting local HEAD to remote HEAD"),
+                "unexpected clone output: {output:?}"
+            );
+
+            // `repo_update_or_clone`'s deferred `SetLastError`.
+            backend.set_last_error(&name, "boom").await;
+            assert_eq!(
+                store
+                    .get_by_name(&name)
+                    .await
+                    .expect("get")
+                    .expect("row")
+                    .last_error
+                    .as_deref(),
+                Some("boom")
+            );
+            backend.set_last_error(&name, "").await;
+            assert_eq!(
+                store
+                    .get_by_name(&name)
+                    .await
+                    .expect("get")
+                    .expect("row")
+                    .last_error,
+                None
+            );
+
+            // A fetch refreshes the size and output, and keeps the repo cloned.
+            std::fs::write(work.join("b.txt"), b"world\n").expect("write");
+            git(&work, &["add", "b.txt"]);
+            git(
+                &work,
+                &[
+                    "-c",
+                    "user.name=test",
+                    "-c",
+                    "user.email=test@example.com",
+                    "commit",
+                    "-q",
+                    "-m",
+                    "second",
+                ],
+            );
+            git(
+                &work,
+                &[
+                    "push",
+                    "-q",
+                    origin.to_str().expect("utf8"),
+                    "HEAD:refs/heads/trunk",
+                ],
+            );
+            backend.fetch(&name, &lock, &token).await.expect("fetch");
+            let repo = store.get_by_name(&name).await.expect("get").expect("row");
+            assert_eq!(repo.clone_status, CloneStatus::Cloned);
+            assert!(repo.repo_size_bytes.unwrap_or(0) > 0);
+        }
+        .await;
+
+        sqlx::query("DELETE FROM repo WHERE name = $1")
+            .bind(&name)
+            .execute(store.pool())
+            .await
+            .expect("cleanup");
+        result
     }
 }

@@ -114,34 +114,26 @@ fn apply_remote_env(command: &mut Command, _remote_url: &str) {
     command.env("GIT_HTTP_USER_AGENT", "git/Sourcegraph-Bot");
 }
 
-/// One `git fetch` execution: exit status plus the merged output (stdout then
-/// stderr; the baseline interleaves both through a synchronized writer, which
-/// only matters for progress display).
-pub struct FetchOutcome {
-    pub exit_status: i32,
-    pub output: Vec<u8>,
-}
-
 /// Port of `runFetchCommand` for the default command shape: `git -c
 /// credential.helper= -c protocol.version=2 fetch --progress --prune <url>
 /// <refspecs...>` with `GIT_DIR` set and `GIT_LFS_SKIP_SMUDGE=1` (see issue
 /// #7322: skip LFS content in repositories with Git LFS configured).
-pub async fn fetch_remote(git_dir: &Path, remote_url: &str) -> Result<FetchOutcome, GitError> {
+pub async fn fetch_remote(git_dir: &Path, remote_url: &str) -> Result<i32, GitError> {
     fetch_remote_with(git_dir, remote_url, &mut |_| {}).await
 }
 
-/// [`fetch_remote`] while reporting progress lines, like the baseline
-/// `readFetchProgress`: every `\r`/`\n`-terminated, whitespace-trimmed,
-/// non-empty line of the command's output is passed to `on_progress`.
+/// [`fetch_remote`] while reporting the command's output line by line.
 ///
-/// git writes its `--progress` output to stderr; stdout is only read into the
-/// merged output. Both are drained concurrently so a full pipe cannot stall
-/// the child.
+/// Both stdout and stderr are split with `scanLinesWithCRLF` (the token keeps
+/// its `\r`/`\n` delimiter) and passed to `on_progress`, matching
+/// `executil.RunCommandWriteOutput`. The baseline interleaves the two streams
+/// through a synchronized writer; here they are drained concurrently and
+/// tokens may arrive in either order, which only affects display.
 pub async fn fetch_remote_with(
     git_dir: &Path,
     remote_url: &str,
-    on_progress: &mut (dyn FnMut(&str) + Send),
-) -> Result<FetchOutcome, GitError> {
+    on_progress: &mut (dyn FnMut(&[u8]) + Send),
+) -> Result<i32, GitError> {
     let mut command = Command::new("git");
     command
         .arg("-c")
@@ -172,66 +164,65 @@ pub async fn fetch_remote_with(
     let mut stdout = child.stdout.take().expect("stdout is piped");
     let mut stderr = child.stderr.take().expect("stderr is piped");
 
-    let read_stdout = async {
-        let mut buffer = Vec::new();
-        tokio::io::AsyncReadExt::read_to_end(&mut stdout, &mut buffer)
-            .await
-            .map(|_| buffer)
-    };
-    let read_stderr = async {
-        let mut buffer = Vec::new();
-        let mut scanner = LineScanner::default();
-        let mut chunk = [0u8; 4096];
-        loop {
-            let read = tokio::io::AsyncReadExt::read(&mut stderr, &mut chunk).await?;
-            if read == 0 {
-                break;
-            }
-            buffer.extend_from_slice(&chunk[..read]);
-            scanner.push(&chunk[..read], on_progress);
-        }
-        scanner.finish(on_progress);
-        Ok::<Vec<u8>, std::io::Error>(buffer)
-    };
-
-    let (stdout_buffer, stderr_buffer) = tokio::join!(read_stdout, read_stderr);
-    let stdout_buffer = stdout_buffer
+    // The baseline serializes stdout and stderr through a synchronized writer;
+    // a mutex around the callback gives the same guarantee (it is only held
+    // for the synchronous call, never across an await).
+    let on_progress = std::sync::Mutex::new(on_progress);
+    let read_stdout = scan_stream(&mut stdout, &on_progress);
+    let read_stderr = scan_stream(&mut stderr, &on_progress);
+    let (stdout_result, stderr_result) = tokio::join!(read_stdout, read_stderr);
+    stdout_result
         .map_err(|err| GitError::Message(format!("failed to read fetch output: {err}")))?;
-    let stderr_buffer = stderr_buffer
+    stderr_result
         .map_err(|err| GitError::Message(format!("failed to read fetch output: {err}")))?;
 
     let status = child
         .wait()
         .await
         .map_err(|err| GitError::Message(format!("failed to wait for git: {err}")))?;
-
-    // Keep the baseline's ordering: read stdout in full first, then stderr.
-    let mut merged = stdout_buffer;
-    merged.extend_from_slice(&stderr_buffer);
-    Ok(FetchOutcome {
-        exit_status: status.code().unwrap_or(-1),
-        output: merged,
-    })
+    Ok(status.code().unwrap_or(-1))
 }
 
-/// Splits a byte stream on `\r` and `\n`, emitting whitespace-trimmed,
-/// non-empty tokens (`bufio.Scanner` with the baseline's `scanCRLF`).
+/// Progress callback shared by the stdout and stderr readers.
+type SharedProgress<'a> = std::sync::Mutex<&'a mut (dyn FnMut(&[u8]) + Send)>;
+
+/// Drain one child pipe through a [`LineScanner`]. The callback is shared
+/// with the other pipe through a mutex (see the call site).
+async fn scan_stream(
+    stream: &mut (impl tokio::io::AsyncRead + Unpin),
+    on_line: &SharedProgress<'_>,
+) -> std::io::Result<()> {
+    let mut scanner = LineScanner::default();
+    let mut chunk = [0u8; 4096];
+    loop {
+        let read = tokio::io::AsyncReadExt::read(stream, &mut chunk).await?;
+        if read == 0 {
+            break;
+        }
+        let mut guard = on_line.lock().unwrap_or_else(|err| err.into_inner());
+        scanner.push(&chunk[..read], &mut *guard);
+        drop(guard);
+    }
+    let mut guard = on_line.lock().unwrap_or_else(|err| err.into_inner());
+    scanner.finish(&mut *guard);
+    Ok(())
+}
+
+/// Splits a byte stream on `\r` and `\n` (`scanLinesWithCRLF`): every token
+/// keeps its delimiter. Unlike `readFetchProgress`, no trimming or filtering
+/// happens here; consumers that display the line do that themselves.
 #[derive(Default)]
 struct LineScanner {
     buffer: Vec<u8>,
 }
 
 impl LineScanner {
-    fn push(&mut self, data: &[u8], on_line: &mut (dyn FnMut(&str) + Send)) {
+    fn push(&mut self, data: &[u8], on_line: &mut (dyn FnMut(&[u8]) + Send)) {
         self.buffer.extend_from_slice(data);
         let mut consumed = 0;
-        for (index, byte) in self.buffer.iter().enumerate() {
-            if *byte == b'\r' || *byte == b'\n' {
-                let token = String::from_utf8_lossy(&self.buffer[consumed..index]);
-                let token = token.trim();
-                if !token.is_empty() {
-                    on_line(token);
-                }
+        for index in 0..self.buffer.len() {
+            if self.buffer[index] == b'\r' || self.buffer[index] == b'\n' {
+                on_line(&self.buffer[consumed..=index]);
                 consumed = index + 1;
             }
         }
@@ -241,11 +232,9 @@ impl LineScanner {
     }
 
     /// The final, unterminated line at EOF.
-    fn finish(&mut self, on_line: &mut (dyn FnMut(&str) + Send)) {
-        let token = String::from_utf8_lossy(&self.buffer);
-        let token = token.trim();
-        if !token.is_empty() {
-            on_line(token);
+    fn finish(&mut self, on_line: &mut (dyn FnMut(&[u8]) + Send)) {
+        if !self.buffer.is_empty() {
+            on_line(&self.buffer);
         }
         self.buffer.clear();
     }
@@ -349,60 +338,51 @@ async fn run_bare(git_dir: &Path, args: &[&str], remote: bool) -> Result<Output,
 }
 
 /// Port of `gitRepoSyncer.Clone`: `git init --bare`, fetch all refspecs from
-/// the remote into the temporary directory, then set `HEAD`. Progress lines
-/// are appended to `progress`; write failures are ignored (`tryWrite`).
+/// the remote into the temporary directory, then set `HEAD`. Every syncer
+/// message and git output line is passed to `on_progress` (`tryWrite`).
 pub async fn clone_repo(
     git_dir: &Path,
     remote_url: &str,
-    progress: &mut Vec<u8>,
+    on_progress: &mut (dyn FnMut(&[u8]) + Send),
 ) -> Result<(), GitError> {
-    clone_repo_with(git_dir, remote_url, progress, &mut |_| {}).await
+    clone_repo_with(git_dir, remote_url, on_progress).await
 }
 
-/// [`clone_repo`] reporting every syncer message and fetch progress line, the
-/// way `readFetchProgress` turns the progress pipe into lock statuses.
+/// [`clone_repo`]: syncer messages and fetch output are reported the way
+/// `readFetchProgress` turns the progress pipe into lock statuses.
 pub async fn clone_repo_with(
     git_dir: &Path,
     remote_url: &str,
-    progress: &mut Vec<u8>,
-    on_progress: &mut (dyn FnMut(&str) + Send),
+    on_progress: &mut (dyn FnMut(&[u8]) + Send),
 ) -> Result<(), GitError> {
     std::fs::create_dir_all(git_dir)
         .map_err(|err| GitError::Message(format!("clone failed to create tmp dir: {err}")))?;
 
-    emit(progress, on_progress, "Creating bare repo\n");
+    emit(on_progress, "Creating bare repo\n");
     make_bare_repo(git_dir).await?;
     emit(
-        progress,
         on_progress,
         &format!("Created bare repo at {}\n", git_dir.display()),
     );
 
-    emit(progress, on_progress, "Fetching remote contents\n");
-    let outcome = fetch_remote_with(git_dir, remote_url, on_progress).await?;
-    progress.extend_from_slice(&outcome.output);
-    if outcome.exit_status != 0 {
+    emit(on_progress, "Fetching remote contents\n");
+    let exit_status = fetch_remote_with(git_dir, remote_url, on_progress).await?;
+    if exit_status != 0 {
         return Err(GitError::Message(format!(
-            "failed to fetch: exit status {}",
-            outcome.exit_status
+            "failed to fetch: exit status {exit_status}"
         )));
     }
-    emit(progress, on_progress, "Fetched remote contents\n");
+    emit(on_progress, "Fetched remote contents\n");
 
-    emit(progress, on_progress, "Setting local HEAD to remote HEAD\n");
+    emit(on_progress, "Setting local HEAD to remote HEAD\n");
     set_head(git_dir, remote_url).await?;
-    emit(
-        progress,
-        on_progress,
-        "Finished setting local HEAD to remote HEAD\n",
-    );
+    emit(on_progress, "Finished setting local HEAD to remote HEAD\n");
 
     Ok(())
 }
 
-fn emit(progress: &mut Vec<u8>, on_progress: &mut (dyn FnMut(&str) + Send), message: &str) {
-    let _ = progress.write_all(message.as_bytes());
-    on_progress(message.trim_end());
+fn emit(on_progress: &mut (dyn FnMut(&[u8]) + Send), message: &str) {
+    on_progress(message.as_bytes());
 }
 
 /// Port of `gitRepoSyncer.Fetch`: fetch into an existing repository, then
@@ -411,27 +391,20 @@ fn emit(progress: &mut Vec<u8>, on_progress: &mut (dyn FnMut(&str) + Send), mess
 pub async fn fetch_repo_with(
     git_dir: &Path,
     remote_url: &str,
-    progress: &mut Vec<u8>,
-    on_progress: &mut (dyn FnMut(&str) + Send),
+    on_progress: &mut (dyn FnMut(&[u8]) + Send),
 ) -> Result<(), GitError> {
-    emit(progress, on_progress, "Fetching remote contents\n");
-    let outcome = fetch_remote_with(git_dir, remote_url, on_progress).await?;
-    progress.extend_from_slice(&outcome.output);
-    if outcome.exit_status != 0 {
+    emit(on_progress, "Fetching remote contents\n");
+    let exit_status = fetch_remote_with(git_dir, remote_url, on_progress).await?;
+    if exit_status != 0 {
         return Err(GitError::Message(format!(
-            "exit code: {}, failed to fetch from remote",
-            outcome.exit_status
+            "exit code: {exit_status}, failed to fetch from remote"
         )));
     }
-    emit(progress, on_progress, "Fetched remote contents\n");
+    emit(on_progress, "Fetched remote contents\n");
 
-    emit(progress, on_progress, "Setting local HEAD to remote HEAD\n");
+    emit(on_progress, "Setting local HEAD to remote HEAD\n");
     set_head(git_dir, remote_url).await?;
-    emit(
-        progress,
-        on_progress,
-        "Finished setting local HEAD to remote HEAD\n",
-    );
+    emit(on_progress, "Finished setting local HEAD to remote HEAD\n");
     Ok(())
 }
 
@@ -538,8 +511,8 @@ mod tests {
 
     #[test]
     fn scans_progress_lines_like_the_baseline() {
-        let mut lines = Vec::new();
-        let mut on_line = |line: &str| lines.push(line.to_owned());
+        let mut lines: Vec<Vec<u8>> = Vec::new();
+        let mut on_line = |line: &[u8]| lines.push(line.to_vec());
         let mut scanner = LineScanner::default();
         scanner.push(
             b"Receiving objects: 1%\rReceiving objects: 2%",
@@ -547,13 +520,17 @@ mod tests {
         );
         scanner.push(b"\n  \r\nWriting objects: 100%\npartial", &mut on_line);
         scanner.finish(&mut on_line);
+        // Tokens keep their delimiter (`scanLinesWithCRLF`); the consumer
+        // trims them before using them as a lock status.
         assert_eq!(
             lines,
             vec![
-                "Receiving objects: 1%",
-                "Receiving objects: 2%",
-                "Writing objects: 100%",
-                "partial",
+                b"Receiving objects: 1%\r".to_vec(),
+                b"Receiving objects: 2%\n".to_vec(),
+                b"  \r".to_vec(),
+                b"\n".to_vec(),
+                b"Writing objects: 100%\n".to_vec(),
+                b"partial".to_vec(),
             ]
         );
     }
@@ -581,8 +558,9 @@ mod tests {
         let tmp_dir = tmp.path().join("clone-1");
         let git_dir = clone_tmp_path(&tmp_dir);
         let mut progress = Vec::new();
+        let mut on_progress = |line: &[u8]| progress.extend_from_slice(line);
 
-        clone_repo(&git_dir, origin.to_str().expect("utf8"), &mut progress)
+        clone_repo(&git_dir, origin.to_str().expect("utf8"), &mut on_progress)
             .await
             .expect("clone");
 
@@ -616,7 +594,8 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let git_dir = tmp.path().join("clone-2").join(".git");
         let mut progress = Vec::new();
-        let err = clone_repo(&git_dir, "/does/not/exist", &mut progress)
+        let mut on_progress = |line: &[u8]| progress.extend_from_slice(line);
+        let err = clone_repo(&git_dir, "/does/not/exist", &mut on_progress)
             .await
             .expect_err("missing remote");
         match err {

@@ -11,6 +11,8 @@ use std::io::Write;
 use std::path::Path;
 use std::time::SystemTime;
 
+use sg_db::gitserver_repos::GitserverReposStore;
+
 use crate::git::{GitError, GitRepo};
 
 /// Port of `fileutil.UpdateFileIfDifferent`: write `content` to `path` unless
@@ -239,9 +241,16 @@ pub async fn remove_bad_refs(git_dir: &Path) -> Result<(), GitError> {
 }
 
 /// Port of `postRepoFetchActions`: run after a clone or fetch, accumulating as
-/// many successful steps as possible. `SetRepoSize` is skipped until the
-/// `gitserver_repos` backend exists.
-pub async fn post_fetch_actions(git_dir: &Path, repo: &str) -> Result<(), GitError> {
+/// many successful steps as possible.
+///
+/// `SetRepoSize` is skipped when no `gitserver_repos` store is configured
+/// (tests without a database); production callers pass the store and shard ID.
+pub async fn post_fetch_actions(
+    git_dir: &Path,
+    repo: &str,
+    store: Option<&GitserverReposStore>,
+    shard_id: &str,
+) -> Result<(), GitError> {
     let mut errors: Vec<String> = Vec::new();
 
     if let Err(err) = remove_bad_refs(git_dir).await {
@@ -274,6 +283,18 @@ pub async fn post_fetch_actions(git_dir: &Path, repo: &str) -> Result<(), GitErr
             "failed to update last changed time: {}",
             err.message()
         ));
+    }
+
+    // Successfully updated, best-effort calculation of the repo size.
+    match crate::fs::dir_size(git_dir) {
+        Err(err) => errors.push(format!("failed to calculate repo size: {err}")),
+        Ok(size) => {
+            if let Some(store) = store {
+                if let Err(err) = store.set_repo_size(repo, size, shard_id).await {
+                    errors.push(format!("failed to set repo size: {err}"));
+                }
+            }
+        }
     }
 
     if errors.is_empty() {

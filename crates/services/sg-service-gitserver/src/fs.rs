@@ -53,6 +53,45 @@ pub fn temp_dir(repos_dir: &Path, prefix: &str) -> std::io::Result<PathBuf> {
     ))
 }
 
+/// Port of `DirSize`/`dirSize`: the total size in bytes of the regular files
+/// under `dir`. `BestEffortWalk` ignores unreadable entries, so only a failure
+/// on the root itself is reported. The directory must be absolute.
+pub fn dir_size(dir: &Path) -> std::io::Result<i64> {
+    if !dir.is_absolute() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "dir must be absolute",
+        ));
+    }
+    let mut size = 0i64;
+    walk_sizes(dir, &mut size)?;
+    Ok(size)
+}
+
+fn walk_sizes(dir: &Path, size: &mut i64) -> std::io::Result<()> {
+    // `filepath.WalkDir` never follows symlinks; `read_dir` entries and
+    // `DirEntry::metadata` are lstat-like on Unix.
+    let entries = std::fs::read_dir(dir)?;
+    for entry in entries {
+        // Unreadable entries are skipped (`BestEffortWalk`).
+        let Ok(entry) = entry else { continue };
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_dir() {
+            // A directory that cannot be read is skipped, like WalkDir's
+            // per-entry error being swallowed.
+            let _ = walk_sizes(&entry.path(), size);
+            continue;
+        }
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        *size += metadata.len() as i64;
+    }
+    Ok(())
+}
+
 /// Removes a staging directory when dropped (`defer os.RemoveAll(tmpDir)`).
 pub struct TempDirCleanup(pub PathBuf);
 
@@ -76,6 +115,30 @@ mod tests {
         std::fs::create_dir_all(&git_dir).expect("mkdir");
         std::fs::write(git_dir.join("HEAD"), b"ref: refs/heads/main").expect("write");
         assert!(repo_cloned(repos_dir, "example.com/owner/repo").expect("query"));
+    }
+
+    #[test]
+    fn sums_regular_file_sizes_without_following_symlinks() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("repo.git");
+        std::fs::create_dir_all(root.join("objects")).expect("mkdir");
+        std::fs::write(root.join("HEAD"), b"ref: refs/heads/main").expect("write");
+        std::fs::write(root.join("objects").join("blob"), b"12345").expect("write");
+        // A symlink is counted by its own (lstat) size, not the target's.
+        std::os::unix::fs::symlink(root.join("objects").join("blob"), root.join("link"))
+            .expect("symlink");
+
+        let size = dir_size(&root).expect("size");
+        let head = std::fs::metadata(root.join("HEAD")).expect("stat").len() as i64;
+        let blob = 5i64;
+        let link = std::fs::symlink_metadata(root.join("link"))
+            .expect("lstat")
+            .len() as i64;
+        assert_eq!(size, head + blob + link);
+
+        // Relative paths are rejected like `realGitserverFS.DirSize`.
+        let err = dir_size(Path::new("relative")).expect_err("relative");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
     }
 
     #[test]
