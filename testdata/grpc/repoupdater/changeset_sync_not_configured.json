@@ -1,0 +1,10 @@
+{
+  "expected": {},
+  "request": {
+    "ids": [
+      1
+    ]
+  },
+  "rpc": "enqueue_changeset_sync",
+  "service": "repoupdater"
+}

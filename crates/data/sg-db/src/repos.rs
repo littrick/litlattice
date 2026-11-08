@@ -118,6 +118,44 @@ LIMIT 1
     }
 }
 
+/// Minimal repository identity used by repo-updater's RPCs
+/// (`Repos.List` with `Names`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepoName {
+    pub id: i32,
+    pub name: String,
+}
+
+impl RepoStore {
+    /// `Repos.List` restricted to exact names. Soft-deleted repositories are
+    /// excluded like the baseline default; blocked repositories are included
+    /// (the repo-updater RPCs only care about identity).
+    pub async fn list_by_names(&self, names: &[String]) -> Result<Vec<RepoName>, sqlx::Error> {
+        if names.is_empty() {
+            return Ok(Vec::new());
+        }
+        let rows = sqlx::query(
+            r#"
+SELECT id, name
+FROM repo
+WHERE deleted_at IS NULL AND name = ANY($1::citext[])
+ORDER BY id
+"#,
+        )
+        .bind(names)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(RepoName {
+                    id: row.try_get("id")?,
+                    name: row.try_get("name")?,
+                })
+            })
+            .collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

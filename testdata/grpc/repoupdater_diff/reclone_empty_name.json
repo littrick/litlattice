@@ -1,0 +1,13 @@
+{
+  "expected": {
+    "error": {
+      "code": "invalid_argument",
+      "message": "repo_name must be specified"
+    }
+  },
+  "request": {
+    "repo_name": ""
+  },
+  "rpc": "reclone_repository",
+  "service": "repoupdater"
+}

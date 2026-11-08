@@ -1,0 +1,11 @@
+{
+  "expected": {
+    "queue": null,
+    "schedule": null
+  },
+  "request": {
+    "id": 987654
+  },
+  "rpc": "repo_update_scheduler_info",
+  "service": "repoupdater"
+}

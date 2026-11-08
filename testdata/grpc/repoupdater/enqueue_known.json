@@ -1,0 +1,11 @@
+{
+  "expected": {
+    "id": 999001,
+    "name": "rustdiff.example.com/owner/repo"
+  },
+  "request": {
+    "repo": "rustdiff.example.com/owner/repo"
+  },
+  "rpc": "enqueue_repo_update",
+  "service": "repoupdater"
+}

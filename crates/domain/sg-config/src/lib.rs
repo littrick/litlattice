@@ -292,6 +292,27 @@ impl SiteConfiguration {
         }
     }
 
+    /// `conf.Unified.GitUpdateInterval`: `siteConfig.gitUpdateInterval` rules.
+    /// Each rule is a repo-name pattern (Go `regexp`) and an interval in
+    /// minutes; the scheduler uses the first match.
+    pub fn git_update_interval(&self) -> Vec<GitUpdateIntervalRule> {
+        self.raw
+            .get("gitUpdateInterval")
+            .and_then(serde_json::Value::as_array)
+            .map(|rules| {
+                rules
+                    .iter()
+                    .filter_map(|rule| {
+                        Some(GitUpdateIntervalRule {
+                            pattern: rule.get("pattern")?.as_str()?.to_owned(),
+                            interval_minutes: rule.get("interval")?.as_i64()?,
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// `experimentalFeatures`.
     pub fn experimental_features(&self) -> Option<&serde_json::Value> {
         self.raw.get("experimentalFeatures")
@@ -431,6 +452,13 @@ fn parse_encryption_key(value: &serde_json::Value) -> Option<EncryptionKeyConfig
         "noop" => EncryptionKeyConfig::Noop,
         _ => EncryptionKeyConfig::Unknown(value.clone()),
     })
+}
+
+/// One `siteConfig.gitUpdateInterval` entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitUpdateIntervalRule {
+    pub pattern: String,
+    pub interval_minutes: i64,
 }
 
 /// Port of `conf.Unified`.

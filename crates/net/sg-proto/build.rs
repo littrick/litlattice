@@ -4,6 +4,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "proto/searcher/v1/searcher.proto",
         "proto/gitserver/v1/gitserver.proto",
         "proto/internalapi/v1/internalapi.proto",
+        "proto/repoupdater/v1/repoupdater.proto",
     ];
 
     tonic_build::configure()

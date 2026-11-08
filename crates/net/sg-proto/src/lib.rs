@@ -25,3 +25,7 @@ pub mod searcher {
 pub mod symbols {
     tonic::include_proto!("symbols.v1");
 }
+
+pub mod repoupdater {
+    tonic::include_proto!("repoupdater.v1");
+}

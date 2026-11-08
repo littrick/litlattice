@@ -1,0 +1,13 @@
+{
+  "expected": {
+    "error": {
+      "code": "invalid_argument",
+      "message": "no ids provided"
+    }
+  },
+  "request": {
+    "ids": []
+  },
+  "rpc": "enqueue_changeset_sync",
+  "service": "repoupdater"
+}

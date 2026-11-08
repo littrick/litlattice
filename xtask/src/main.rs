@@ -18,13 +18,14 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 use sg_proto::gitserver as gpb;
+use sg_proto::repoupdater as rpb;
 use sg_proto::searcher as spb;
 use sg_proto::symbols as pb;
 
 /// Baseline commit the snapshot was taken from.
 const BASELINE_COMMIT: &str = "c864f15af264f0f456a6d8a83290b5c940715349";
 
-const PROTO_SERVICES: &[&str] = &["symbols", "searcher", "gitserver"];
+const PROTO_SERVICES: &[&str] = &["symbols", "searcher", "gitserver", "repoupdater"];
 
 fn main() -> ExitCode {
     match run() {
@@ -201,6 +202,17 @@ fn contract(_args: &[String]) -> Result<(), String> {
             return Err(format!("gitserver proto is missing rpc {rpc}"));
         }
     }
+    let repoupdater = read_proto(&snapshot.join("repoupdater/v1/repoupdater.proto"))?;
+    for rpc in [
+        "RepoUpdateSchedulerInfo",
+        "EnqueueRepoUpdate",
+        "RecloneRepository",
+        "EnqueueChangesetSync",
+    ] {
+        if !repoupdater.contains(&format!("rpc {rpc}(")) {
+            return Err(format!("repoupdater proto is missing rpc {rpc}"));
+        }
+    }
 
     println!("contract: proto snapshot and gRPC surface OK");
     Ok(())
@@ -302,6 +314,7 @@ enum FixtureService {
     Symbols(Rpc),
     Searcher,
     Gitserver(GitserverRpc),
+    Repoupdater(RepoUpdaterRpc),
 }
 
 impl FixtureService {
@@ -310,6 +323,7 @@ impl FixtureService {
             Self::Symbols(_) => "symbols",
             Self::Searcher => "searcher",
             Self::Gitserver(_) => "gitserver",
+            Self::Repoupdater(_) => "repoupdater",
         }
     }
 }
@@ -347,9 +361,10 @@ fn load_fixture(path: &Path) -> Result<FixtureCase, String> {
             FixtureService::Searcher
         }
         "gitserver" => FixtureService::Gitserver(GitserverRpc::parse(rpc)?),
+        "repoupdater" => FixtureService::Repoupdater(RepoUpdaterRpc::parse(rpc)?),
         other => {
             return Err(format!(
-                "{}: unsupported service {other:?} (symbols, searcher or gitserver)",
+                "{}: unsupported service {other:?} (symbols, searcher, gitserver or repoupdater)",
                 path.display()
             ))
         }
@@ -1571,6 +1586,106 @@ async fn call_searcher(
     Ok(normalize_searcher_response(&messages))
 }
 
+/// `repoupdater.v1.RepoUpdaterService` RPCs.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RepoUpdaterRpc {
+    SchedulerInfo,
+    EnqueueRepoUpdate,
+    RecloneRepository,
+    EnqueueChangesetSync,
+}
+
+impl RepoUpdaterRpc {
+    fn parse(name: &str) -> Result<Self, String> {
+        match name {
+            "repo_update_scheduler_info" => Ok(Self::SchedulerInfo),
+            "enqueue_repo_update" => Ok(Self::EnqueueRepoUpdate),
+            "reclone_repository" => Ok(Self::RecloneRepository),
+            "enqueue_changeset_sync" => Ok(Self::EnqueueChangesetSync),
+            other => Err(format!("unknown repoupdater rpc {other:?}")),
+        }
+    }
+}
+
+fn normalize_scheduler_info(response: &rpb::RepoUpdateSchedulerInfoResponse) -> Value {
+    let schedule = response.schedule.as_ref().map(|schedule| {
+        json!({
+            "index": schedule.index,
+            "total": schedule.total,
+            "interval_seconds": schedule.interval_seconds,
+            "due": schedule.due.as_ref().map(|due| json!({
+                "seconds": due.seconds,
+                "nanos": due.nanos,
+            })),
+        })
+    });
+    let queue = response.queue.as_ref().map(|queue| {
+        json!({
+            "index": queue.index,
+            "total": queue.total,
+            "updating": queue.updating,
+            "priority": queue.priority,
+        })
+    });
+    json!({"schedule": schedule, "queue": queue})
+}
+
+async fn call_repoupdater(
+    client: &mut rpb::repo_updater_service_client::RepoUpdaterServiceClient<
+        tonic::transport::Channel,
+    >,
+    rpc: RepoUpdaterRpc,
+    request: &Value,
+) -> Result<Value, tonic::Status> {
+    match rpc {
+        RepoUpdaterRpc::SchedulerInfo => {
+            let id = request
+                .get("id")
+                .and_then(Value::as_i64)
+                .unwrap_or_default() as i32;
+            let response = client
+                .repo_update_scheduler_info(rpb::RepoUpdateSchedulerInfoRequest { id })
+                .await?
+                .into_inner();
+            Ok(normalize_scheduler_info(&response))
+        }
+        RepoUpdaterRpc::EnqueueRepoUpdate => {
+            let repo = request
+                .get("repo")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned();
+            let response = client
+                .enqueue_repo_update(rpb::EnqueueRepoUpdateRequest { repo })
+                .await?
+                .into_inner();
+            Ok(json!({"id": response.id, "name": response.name}))
+        }
+        RepoUpdaterRpc::RecloneRepository => {
+            let repo_name = request
+                .get("repo_name")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned();
+            client
+                .reclone_repository(rpb::RecloneRepositoryRequest { repo_name })
+                .await?;
+            Ok(json!({}))
+        }
+        RepoUpdaterRpc::EnqueueChangesetSync => {
+            let ids = request
+                .get("ids")
+                .and_then(Value::as_array)
+                .map(|ids| ids.iter().filter_map(Value::as_i64).collect())
+                .unwrap_or_default();
+            client
+                .enqueue_changeset_sync(rpb::EnqueueChangesetSyncRequest { ids })
+                .await?;
+            Ok(json!({}))
+        }
+    }
+}
+
 /// Why a gitserver replay produced no response: an RPC status (frozen in the
 /// fixture as `{"error": {...}}`) or a fixture bug (surfaced as a hard error).
 enum GitserverFailure {
@@ -2031,9 +2146,28 @@ async fn evaluate(service: &str, addr: &str, cases: &[FixtureCase]) -> Result<Ve
                 }
             }
         }
+        "repoupdater" => {
+            let mut client = rpb::repo_updater_service_client::RepoUpdaterServiceClient::connect(
+                addr.to_owned(),
+            )
+            .await
+            .map_err(|err| format!("connect {addr}: {err}"))?;
+            for case in cases {
+                let FixtureService::Repoupdater(rpc) = case.service else {
+                    return Err(format!(
+                        "{}: fixture targets another service, not repoupdater",
+                        case.path.display()
+                    ));
+                };
+                match call_repoupdater(&mut client, rpc, &case.request).await {
+                    Ok(value) => results.push(value),
+                    Err(status) => results.push(normalize_status(&status)),
+                }
+            }
+        }
         other => {
             return Err(format!(
-                "unsupported service {other:?} (symbols, searcher or gitserver)"
+                "unsupported service {other:?} (symbols, searcher, gitserver or repoupdater)"
             ))
         }
     }
@@ -2048,6 +2182,7 @@ fn default_addr(service: &str) -> &'static str {
     match service {
         "searcher" => "http://127.0.0.1:3181",
         "gitserver" => "http://127.0.0.1:3178",
+        "repoupdater" => "http://127.0.0.1:3182",
         _ => "http://127.0.0.1:3184",
     }
 }
@@ -2073,9 +2208,12 @@ fn load_cases(fixture_dir: &Path, service: &str) -> Result<Vec<FixtureCase>, Str
 async fn diff(args: &[String]) -> Result<(), String> {
     let args = parse_args(args)?;
     let service = required(&args, "service")?;
-    if !matches!(service, "symbols" | "searcher" | "gitserver") {
+    if !matches!(
+        service,
+        "symbols" | "searcher" | "gitserver" | "repoupdater"
+    ) {
         return Err(format!(
-            "diff: unsupported service {service:?} (symbols, searcher or gitserver)"
+            "diff: unsupported service {service:?} (symbols, searcher, gitserver or repoupdater)"
         ));
     }
     let fixture_dir = PathBuf::from(required(&args, "fixture")?);
@@ -2114,9 +2252,12 @@ async fn diff(args: &[String]) -> Result<(), String> {
 async fn record(args: &[String]) -> Result<(), String> {
     let args = parse_args(args)?;
     let service = required(&args, "service")?;
-    if !matches!(service, "symbols" | "searcher" | "gitserver") {
+    if !matches!(
+        service,
+        "symbols" | "searcher" | "gitserver" | "repoupdater"
+    ) {
         return Err(format!(
-            "record: unsupported service {service:?} (symbols, searcher or gitserver)"
+            "record: unsupported service {service:?} (symbols, searcher, gitserver or repoupdater)"
         ));
     }
     let fixture_dir = PathBuf::from(required(&args, "fixture")?);

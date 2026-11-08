@@ -1,0 +1,13 @@
+{
+  "expected": {
+    "error": {
+      "code": "not_found",
+      "message": "repo \"github.com/example/missing\" not found in store"
+    }
+  },
+  "request": {
+    "repo": "github.com/example/missing"
+  },
+  "rpc": "enqueue_repo_update",
+  "service": "repoupdater"
+}

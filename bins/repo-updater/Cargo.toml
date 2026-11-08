@@ -11,4 +11,7 @@ name = "repo-updater"
 path = "src/main.rs"
 
 [dependencies]
+sg-core = { path = "../../crates/base/sg-core" }
+sg-log = { path = "../../crates/base/sg-log" }
 sg-service-repo-updater = { path = "../../crates/services/sg-service-repo-updater" }
+tokio = { workspace = true }

@@ -19,3 +19,29 @@ pub async fn connect(dsn: &str, max_connections: u32) -> Result<PgPool, sqlx::Er
         .connect(dsn)
         .await
 }
+
+pub use sqlx::types::time::OffsetDateTime;
+
+/// Convert a database timestamp to a [`std::time::SystemTime`]. Used by
+/// services whose scheduling decisions are expressed in terms of "time since
+/// last fetch/changed" (the repo-updater scheduler).
+pub fn offset_to_system_time(time: OffsetDateTime) -> std::time::SystemTime {
+    use std::time::{Duration, UNIX_EPOCH};
+    let total_nanos =
+        i128::from(time.unix_timestamp()) * 1_000_000_000 + i128::from(time.nanosecond());
+    if total_nanos >= 0 {
+        UNIX_EPOCH + Duration::from_nanos(total_nanos as u64)
+    } else {
+        UNIX_EPOCH - Duration::from_nanos((-total_nanos) as u64)
+    }
+}
+
+/// Inverse of [`offset_to_system_time`].
+pub fn system_time_to_offset(time: std::time::SystemTime) -> OffsetDateTime {
+    let total_nanos: i128 = match time.duration_since(std::time::UNIX_EPOCH) {
+        Ok(after) => after.as_nanos() as i128,
+        Err(before) => -(before.duration().as_nanos() as i128),
+    };
+    OffsetDateTime::from_unix_timestamp_nanos(total_nanos)
+        .expect("SystemTime is within OffsetDateTime's range")
+}
