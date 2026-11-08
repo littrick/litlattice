@@ -111,6 +111,18 @@ impl UploadQueueStore {
     /// is kept for parity with the generic store (it is disabled by the
     /// `$2 > 0` guard).
     pub async fn dequeue(&self, worker_hostname: &str) -> Result<Option<Upload>, sqlx::Error> {
+        self.dequeue_with_budget(worker_hostname, None).await
+    }
+
+    /// `Dequeue` with the upload processor's `PreDequeue` budget condition:
+    /// the baseline appends `(upload_size IS NULL OR upload_size <= <budget>)`
+    /// to the candidate query (`job_worker_handler.go`'s `PreDequeue`).
+    /// `None` behaves like a handler without the hook.
+    pub async fn dequeue_with_budget(
+        &self,
+        worker_hostname: &str,
+        max_upload_size: Option<i64>,
+    ) -> Result<Option<Upload>, sqlx::Error> {
         let now = OffsetDateTime::now_utc();
         let retry_after_seconds: i64 = 0;
 
@@ -136,6 +148,7 @@ WITH potential_candidates AS (
 				$1 - u.finished_at > ($2 * '1 second'::interval)
 			)
 		)
+		AND ($4::bigint IS NULL OR u.upload_size IS NULL OR u.upload_size <= $4)
 	ORDER BY
 		u.associated_index_id IS NULL DESC,
 		COALESCE(u.process_after, u.uploaded_at),
@@ -208,6 +221,7 @@ WHERE
         .bind(now)
         .bind(retry_after_seconds)
         .bind(worker_hostname)
+        .bind(max_upload_size)
         .fetch_optional(&self.pool)
         .await?;
 

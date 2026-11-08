@@ -8,9 +8,11 @@
 //! connections, the upload-store configuration, and the `/healthz` server on
 //! `:3188`.
 //!
-//! Not yet covered (later slices): the upload queue (`dbworker` store
-//! semantics), the upload processor (SCIP parsing and code-graph writes) and
-//! the stalled-upload resetter.
+//! 9.7b adds the upload queue (`dbworker` store semantics) and the stalled
+//! upload resetter; 9.7c adds the `workerutil.Worker` loop. Not yet covered
+//! (later slices): the upload processor (object storage fetch, SCIP parsing
+//! and code-graph writes), which is why the loop is not started by the
+//! service yet.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -27,6 +29,7 @@ use tokio_util::task::TaskTracker;
 
 pub mod config;
 pub mod queue;
+pub mod worker;
 
 use config::PreciseWorkerConfig;
 
@@ -161,9 +164,10 @@ impl Service for PreciseWorkerService {
             "serving precise-code-intel-worker health endpoint"
         );
         // `processor.NewUploadResetter` + `workerutil.Worker`: the resetter
-        // loop is part of this slice; the dequeue/handler loop arrives with
-        // the SCIP processor (9.7c) so the Rust process cannot consume uploads
-        // before it can process them.
+        // loop is part of this slice; the worker loop is implemented in
+        // `worker.rs` but is not started until the upload processor exists
+        // (9.7d), so the Rust process cannot consume uploads before it can
+        // process them.
         let queue_store = Arc::new(queue::UploadQueueStore::new(frontend_pool));
         let tasks = TaskTracker::new();
         {
