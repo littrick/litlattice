@@ -19,11 +19,11 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use sg_config::{LiveConfig, ServiceConnections, Unified};
 use sg_core::EnvReader;
-use sg_service_worker::jobs::codeintel_upload_expirer::matcher::{
-    GetCommitError, MatcherCommit, MatcherGit, MatcherRef, PolicyMatcher, RefType,
-};
 use sg_service_worker::jobs::codeintel_upload_expirer::{
     handle_expired_uploads_batch, UploadExpirer,
+};
+use sg_service_worker::jobs::policies_matcher::{
+    Extractor, GetCommitError, MatcherCommit, MatcherGit, MatcherRef, PolicyMatcher, RefType,
 };
 use sg_service_worker::jobs::{Job, JobConfig, JobDeps};
 use sqlx::postgres::{PgPool, PgPoolOptions};
@@ -184,7 +184,7 @@ async fn upload_expirer_matches_go_harness() {
         .expect("codeintel pool");
 
     let fake_git = FakeGit;
-    let matcher = PolicyMatcher::new(&fake_git, true, false);
+    let matcher = PolicyMatcher::new(&fake_git, Extractor::Retention, true, false);
     let settings = config.settings();
 
     for round in 1..=2 {

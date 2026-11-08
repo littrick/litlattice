@@ -1,11 +1,12 @@
 #![forbid(unsafe_code)]
 
 //! `internal/codeintel/policies/matcher.go`: the configuration-policy matcher
-//! used by the upload expirer (`policies.NewMatcher(gitserverClient,
-//! policies.RetentionExtractor, true, false)`).
+//! used by the upload expirer (`RetentionExtractor`, tip-of-default-branch,
+//! no created-date filter) and the syntactic indexing scheduler
+//! (`IndexingExtractor`, no tip match, created-date filter).
 //!
 //! [`PolicyMatcher::commits_described_by_policy`] returns the set of commits
-//! in a repository that are described by at least one data-retention policy,
+//! in a repository that are described by at least one configuration policy,
 //! together with the matching policy metadata. The three matching arms are
 //! exactly the baseline's:
 //!
@@ -22,15 +23,15 @@
 //!
 //! `filter_by_created_date` is `false` for data retention (the policy
 //! duration is compared against the *upload* date by the expirer, not against
-//! the commit date), so the date filters in this module are dead code on the
-//! production path; they are kept for fidelity and for future users of the
-//! matcher (auto-indexing passes `true`).
+//! the commit date) and `true` for auto-indexing/syntactic indexing, where
+//! the date filters below drop commits older than the policy duration.
 //!
 //! The baseline iterates Go maps in `matchCommitsOnBranch`, so ties between
 //! two branches matched by the same intermediate-commit policy are
 //! non-deterministic there; this port uses a `BTreeMap` and is deterministic.
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use sg_codeintel::glob::Glob;
@@ -114,21 +115,45 @@ pub struct PolicyMatch {
     pub committed_at: OffsetDateTime,
 }
 
-/// `policies.RetentionExtractor`: `(RetentionDuration,
-/// RetainIntermediateCommits)`.
-pub fn retention_extractor(policy: &ConfigurationPolicy) -> (Option<Duration>, bool) {
-    // `optionalDuration`: hours → `time.Duration`; `NULL` stays `nil` (a
-    // stored `0` is a real zero duration).
-    let duration = policy
-        .retention_duration_hours
-        .map(|hours| Duration::hours(i64::from(hours)));
-    (duration, policy.retain_intermediate_commits)
+/// `policies.Extractor`: which policy fields supply the max age and the
+/// intermediate-commit flag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Extractor {
+    /// `policies.RetentionExtractor`: `(RetentionDuration,
+    /// RetainIntermediateCommits)`.
+    Retention,
+    /// `policies.IndexingExtractor`: `(IndexCommitMaxAge,
+    /// IndexIntermediateCommits)`.
+    Indexing,
 }
 
-/// `policies.Matcher` (`includeTipOfDefaultBranch`/`filterByCreatedDate`
-/// supplied by the constructor).
+impl Extractor {
+    /// `(maxAge, includeIntermediateCommits)` for one policy.
+    fn extract(self, policy: &ConfigurationPolicy) -> (Option<Duration>, bool) {
+        // `optionalDuration`: hours → `time.Duration`; `NULL` stays `nil` (a
+        // stored `0` is a real zero duration).
+        match self {
+            Self::Retention => (
+                policy
+                    .retention_duration_hours
+                    .map(|hours| Duration::hours(i64::from(hours))),
+                policy.retain_intermediate_commits,
+            ),
+            Self::Indexing => (
+                policy
+                    .index_commit_max_age_hours
+                    .map(|hours| Duration::hours(i64::from(hours))),
+                policy.index_intermediate_commits,
+            ),
+        }
+    }
+}
+
+/// `policies.matcher` (`extractor`, `includeTipOfDefaultBranch` and
+/// `filterByCreatedDate` supplied by the constructor).
 pub struct PolicyMatcher<'a, G: MatcherGit + ?Sized> {
     git: &'a G,
+    extractor: Extractor,
     include_tip_of_default_branch: bool,
     filter_by_created_date: bool,
 }
@@ -144,11 +169,13 @@ impl<'a, G: MatcherGit + ?Sized> PolicyMatcher<'a, G> {
     /// `policies.NewMatcher`.
     pub fn new(
         git: &'a G,
+        extractor: Extractor,
         include_tip_of_default_branch: bool,
         filter_by_created_date: bool,
     ) -> Self {
         Self {
             git,
+            extractor,
             include_tip_of_default_branch,
             filter_by_created_date,
         }
@@ -223,7 +250,7 @@ impl<'a, G: MatcherGit + ?Sized> PolicyMatcher<'a, G> {
             {
                 continue;
             }
-            let (policy_duration, _) = retention_extractor(policy);
+            let (policy_duration, _) = self.extractor.extract(policy);
             commit_map
                 .entry(git_ref.commit.clone())
                 .or_default()
@@ -264,7 +291,7 @@ impl<'a, G: MatcherGit + ?Sized> PolicyMatcher<'a, G> {
             {
                 continue;
             }
-            let (policy_duration, _) = retention_extractor(policy);
+            let (policy_duration, include_intermediate_commits) = self.extractor.extract(policy);
             commit_map
                 .entry(git_ref.commit.clone())
                 .or_default()
@@ -275,7 +302,7 @@ impl<'a, G: MatcherGit + ?Sized> PolicyMatcher<'a, G> {
                     committed_at: git_ref.created_at,
                 });
 
-            if retention_extractor(policy).1 {
+            if include_intermediate_commits {
                 let meta = branch_requests
                     .entry(git_ref.short_name.clone())
                     .or_insert_with(|| BranchRequestMeta {
@@ -373,7 +400,7 @@ impl<'a, G: MatcherGit + ?Sized> PolicyMatcher<'a, G> {
                 Err(GetCommitError::Other(err)) => return Err(err),
             };
 
-            let (policy_duration, _) = retention_extractor(policy);
+            let (policy_duration, _) = self.extractor.extract(policy);
             if self.filter_by_created_date {
                 if let Some(duration) = policy_duration {
                     if now - commit.committer_date > duration {
@@ -415,7 +442,7 @@ impl<'a, G: MatcherGit + ?Sized> PolicyMatcher<'a, G> {
             return false;
         }
         if self.filter_by_created_date {
-            if let (Some(duration), true) = (retention_extractor(policy).0, true) {
+            if let Some(duration) = self.extractor.extract(policy).0 {
                 if now - git_ref.created_at > duration {
                     return false;
                 }
@@ -460,4 +487,97 @@ fn get_max_age(
         }
     }
     max_duration.map(|duration| now - duration)
+}
+/// [`MatcherGit`] over the shared [`sg_git::GitserverClient`].
+pub struct GitserverGit {
+    client: Arc<sg_git::GitserverClient>,
+}
+
+impl GitserverGit {
+    pub fn new(client: Arc<sg_git::GitserverClient>) -> Self {
+        Self { client }
+    }
+}
+
+/// `(*timestamppb.Timestamp)(nil).AsTime()` is the Unix epoch; the matcher
+/// only compares dates and subtracts them from `now`.
+fn timestamp_to_offset(timestamp: Option<prost_types::Timestamp>) -> OffsetDateTime {
+    let Some(timestamp) = timestamp else {
+        return OffsetDateTime::UNIX_EPOCH;
+    };
+    OffsetDateTime::from_unix_timestamp(timestamp.seconds)
+        .map(|value| value + time::Duration::nanoseconds(i64::from(timestamp.nanos)))
+        .unwrap_or(OffsetDateTime::UNIX_EPOCH)
+}
+
+fn offset_to_timestamp(value: OffsetDateTime) -> prost_types::Timestamp {
+    prost_types::Timestamp {
+        seconds: value.unix_timestamp(),
+        nanos: value.nanosecond() as i32,
+    }
+}
+
+#[async_trait]
+impl MatcherGit for GitserverGit {
+    async fn list_refs(
+        &self,
+        repo: &str,
+        points_at_commit: &[String],
+    ) -> Result<Vec<MatcherRef>, String> {
+        let refs = self
+            .client
+            .list_refs(repo, true, true, points_at_commit, None)
+            .await
+            .map_err(|err| err.to_string())?;
+        Ok(refs
+            .into_iter()
+            .map(|git_ref| MatcherRef {
+                short_name: git_ref.short_name,
+                commit: git_ref.target_commit,
+                created_at: timestamp_to_offset(git_ref.created_at),
+                ref_type: match git_ref.ref_type {
+                    sg_git::RefType::Tag => RefType::Tag,
+                    sg_git::RefType::Branch => RefType::Branch,
+                    sg_git::RefType::Unknown => RefType::Unknown,
+                },
+                is_head: git_ref.is_head,
+            })
+            .collect())
+    }
+
+    async fn get_commit(&self, repo: &str, commit: &str) -> Result<MatcherCommit, GetCommitError> {
+        match self.client.get_commit(repo, commit).await {
+            Ok(commit) => Ok(MatcherCommit {
+                id: commit.oid,
+                committer_date: timestamp_to_offset(commit.committer_date),
+            }),
+            Err(err) if err.is_revision_not_found() => Err(GetCommitError::RevisionNotFound),
+            Err(err) => Err(GetCommitError::Other(err.to_string())),
+        }
+    }
+
+    async fn commits(
+        &self,
+        repo: &str,
+        ranges: &[String],
+        after: Option<OffsetDateTime>,
+    ) -> Result<Vec<MatcherCommit>, String> {
+        let options = sg_git::CommitsOptions {
+            ranges: ranges.to_vec(),
+            after: after.map(offset_to_timestamp),
+            ..Default::default()
+        };
+        let commits = self
+            .client
+            .commits(repo, &options)
+            .await
+            .map_err(|err| err.to_string())?;
+        Ok(commits
+            .into_iter()
+            .map(|commit| MatcherCommit {
+                id: commit.oid,
+                committer_date: timestamp_to_offset(commit.committer_date),
+            })
+            .collect())
+    }
 }

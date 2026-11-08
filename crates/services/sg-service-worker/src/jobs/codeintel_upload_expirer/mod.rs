@@ -21,7 +21,7 @@
 //!    `lsif_last_retention_scan`;
 //! 2. for every claimed repository, `buildCommitMap` pages through
 //!    `GetConfigurationPolicies(RepositoryID, ForDataRetention=true)` and
-//!    asks the [`matcher::PolicyMatcher`] (`RetentionExtractor`,
+//!    asks the [`PolicyMatcher`](super::policies_matcher::PolicyMatcher) (`RetentionExtractor`,
 //!    `includeTipOfDefaultBranch=true`, `filterByCreatedDate=false`) which
 //!    commits are described by a retention policy;
 //! 3. `GetUploads(state=completed, InCommitGraph, AllowExpired=false,
@@ -46,8 +46,6 @@
 //! the RED metrics/spans and log lines. The baseline runs with the internal
 //! actor; the Rust SQL has no authz condition.
 
-pub mod matcher;
-
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -61,9 +59,7 @@ use sg_db::OffsetDateTime;
 use sqlx::PgPool;
 use tokio_util::sync::CancellationToken;
 
-use self::matcher::{
-    GetCommitError, MatcherCommit, MatcherGit, MatcherRef, PolicyMatch, PolicyMatcher, RefType,
-};
+use super::policies_matcher::{Extractor, GitserverGit, MatcherGit, PolicyMatch, PolicyMatcher};
 use super::{get_interval, Job, JobConfig, JobDeps};
 use crate::config::combine_errors;
 use crate::framework::periodic::{Handler, HandlerError, PeriodicRoutine};
@@ -341,100 +337,6 @@ fn choose_fallback(names: &[&str]) -> String {
         .to_owned()
 }
 
-/// [`MatcherGit`] over the shared [`sg_git::GitserverClient`].
-pub struct GitserverGit {
-    client: Arc<sg_git::GitserverClient>,
-}
-
-impl GitserverGit {
-    pub fn new(client: Arc<sg_git::GitserverClient>) -> Self {
-        Self { client }
-    }
-}
-
-/// `(*timestamppb.Timestamp)(nil).AsTime()` is the Unix epoch; the matcher
-/// only compares dates and subtracts them from `now`.
-fn timestamp_to_offset(timestamp: Option<prost_types::Timestamp>) -> OffsetDateTime {
-    let Some(timestamp) = timestamp else {
-        return OffsetDateTime::UNIX_EPOCH;
-    };
-    OffsetDateTime::from_unix_timestamp(timestamp.seconds)
-        .map(|value| value + time::Duration::nanoseconds(i64::from(timestamp.nanos)))
-        .unwrap_or(OffsetDateTime::UNIX_EPOCH)
-}
-
-fn offset_to_timestamp(value: OffsetDateTime) -> prost_types::Timestamp {
-    prost_types::Timestamp {
-        seconds: value.unix_timestamp(),
-        nanos: value.nanosecond() as i32,
-    }
-}
-
-#[async_trait]
-impl MatcherGit for GitserverGit {
-    async fn list_refs(
-        &self,
-        repo: &str,
-        points_at_commit: &[String],
-    ) -> Result<Vec<MatcherRef>, String> {
-        let refs = self
-            .client
-            .list_refs(repo, true, true, points_at_commit, None)
-            .await
-            .map_err(|err| err.to_string())?;
-        Ok(refs
-            .into_iter()
-            .map(|git_ref| MatcherRef {
-                short_name: git_ref.short_name,
-                commit: git_ref.target_commit,
-                created_at: timestamp_to_offset(git_ref.created_at),
-                ref_type: match git_ref.ref_type {
-                    sg_git::RefType::Tag => RefType::Tag,
-                    sg_git::RefType::Branch => RefType::Branch,
-                    sg_git::RefType::Unknown => RefType::Unknown,
-                },
-                is_head: git_ref.is_head,
-            })
-            .collect())
-    }
-
-    async fn get_commit(&self, repo: &str, commit: &str) -> Result<MatcherCommit, GetCommitError> {
-        match self.client.get_commit(repo, commit).await {
-            Ok(commit) => Ok(MatcherCommit {
-                id: commit.oid,
-                committer_date: timestamp_to_offset(commit.committer_date),
-            }),
-            Err(err) if err.is_revision_not_found() => Err(GetCommitError::RevisionNotFound),
-            Err(err) => Err(GetCommitError::Other(err.to_string())),
-        }
-    }
-
-    async fn commits(
-        &self,
-        repo: &str,
-        ranges: &[String],
-        after: Option<OffsetDateTime>,
-    ) -> Result<Vec<MatcherCommit>, String> {
-        let options = sg_git::CommitsOptions {
-            ranges: ranges.to_vec(),
-            after: after.map(offset_to_timestamp),
-            ..Default::default()
-        };
-        let commits = self
-            .client
-            .commits(repo, &options)
-            .await
-            .map_err(|err| err.to_string())?;
-        Ok(commits
-            .into_iter()
-            .map(|commit| MatcherCommit {
-                id: commit.oid,
-                committer_date: timestamp_to_offset(commit.committer_date),
-            })
-            .collect())
-    }
-}
-
 /// `uploadExpirerJob`.
 pub struct UploadExpirer {
     config: Arc<ExpirerConfig>,
@@ -521,7 +423,7 @@ struct ExpirerHandler {
 #[async_trait]
 impl Handler for ExpirerHandler {
     async fn handle(&self, _ctx: CancellationToken) -> Result<(), HandlerError> {
-        let matcher = PolicyMatcher::new(&*self.deps.git, true, false);
+        let matcher = PolicyMatcher::new(&*self.deps.git, Extractor::Retention, true, false);
         handle_expired_uploads_batch(
             &self.deps.codeintel,
             &self.deps.frontend,

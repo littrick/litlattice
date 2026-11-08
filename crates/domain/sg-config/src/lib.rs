@@ -397,6 +397,18 @@ impl SiteConfiguration {
             .unwrap_or(false)
     }
 
+    /// `experimentalFeatures.codeintelSyntacticIndexingEnabled`: the gate the
+    /// syntactic indexing scheduler checks on every invocation
+    /// (`conf.Get().ExperimentalFeatures.CodeintelSyntacticIndexingEnabled`).
+    /// Unset/null or a non-boolean disables it, like the baseline's nil
+    /// pointer check.
+    pub fn codeintel_syntactic_indexing_enabled(&self) -> bool {
+        self.experimental_features()
+            .and_then(|features| features.get("codeintelSyntacticIndexingEnabled"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+    }
+
     /// `conf.Get().LicenseKey`: the product license key from the site
     /// configuration. Empty when the instance runs without a license.
     pub fn license_key(&self) -> String {

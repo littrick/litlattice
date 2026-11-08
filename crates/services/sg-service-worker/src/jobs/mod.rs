@@ -41,6 +41,7 @@ pub mod batches;
 pub mod codeintel_metrics_reporter;
 pub mod codeintel_package_filter_applicator;
 pub mod codeintel_policies_repository_matcher;
+pub mod codeintel_syntactic_indexing_scheduler;
 pub mod codeintel_upload_backfiller;
 pub mod codeintel_upload_expirer;
 pub mod codeintel_upload_janitor;
@@ -59,6 +60,7 @@ pub mod licensecheck;
 pub mod outbound_webhooks;
 pub mod perforce_changelist_mapper;
 pub mod permissions;
+pub mod policies_matcher;
 pub mod ratelimit;
 pub mod repo_embedding_janitor;
 pub mod repo_embedding_scheduler;
@@ -189,6 +191,9 @@ pub fn all_jobs() -> Vec<(&'static str, Arc<dyn Job>)> {
                 }
                 "codeintel-policies-repository-matcher" => Arc::new(
                     codeintel_policies_repository_matcher::PoliciesRepositoryMatcher::new(),
+                ),
+                "codeintel-syntactic-indexing-scheduler" => Arc::new(
+                    codeintel_syntactic_indexing_scheduler::SyntacticIndexingScheduler::new(),
                 ),
                 "codeintel-upload-backfiller" => {
                     Arc::new(codeintel_upload_backfiller::UploadBackfiller::new())
