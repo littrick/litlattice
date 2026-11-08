@@ -204,11 +204,7 @@ impl GitserverClient {
             }
         };
 
-        let mut response = client
-            .read_file(request)
-            .await
-            .map_err(error)?
-            .into_inner();
+        let mut response = client.read_file(request).await.map_err(error)?.into_inner();
 
         // gitserver reports a missing file or commit as the first stream
         // message, not as the RPC status (the baseline's `NewFileReader` reads

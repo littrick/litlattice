@@ -210,6 +210,10 @@ mod tests {
     #[tokio::test]
     async fn binds_go_style_wildcard_addresses() {
         let listener = listen(":0").await.expect("bind :0");
-        assert!(listener.local_addr().expect("local addr").ip().is_unspecified());
+        assert!(listener
+            .local_addr()
+            .expect("local addr")
+            .ip()
+            .is_unspecified());
     }
 }

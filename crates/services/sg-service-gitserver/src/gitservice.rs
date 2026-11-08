@@ -67,7 +67,7 @@ impl GitService {
         }
 
         let mut repo = "";
-        let mut svc = "";
+        let mut svc: &'static str = "";
         for suffix in ["/info/refs", "/git-upload-pack"] {
             if let Some(stripped) = path.strip_suffix(suffix) {
                 svc = suffix;
@@ -100,6 +100,11 @@ impl GitService {
             ),
             "/git-upload-pack" => (RESULT_CONTENT_TYPE, None),
             _ => {
+                // The baseline installs the trace hook before the `switch` on
+                // `svc`, so an unexpected subpath is still observed with
+                // `type=""` and `error="true"`.
+                drop(crate::metrics::gitservice_started(svc));
+                // The error label is set by the guard's drop.
                 return error_response(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     &format!(
@@ -175,6 +180,9 @@ impl GitService {
         }
         let rate_limit = max_egress_bytes_per_second();
         let args = Arc::new(args);
+        // Created after the repository stat and gzip validation, matching the
+        // baseline `Trace` install point.
+        let guard = crate::metrics::gitservice_started(svc);
         self.tasks.spawn(async move {
             if let Some(advertisement) = advertisement {
                 if tx.send(Frame::data(advertisement)).await.is_err() {
@@ -202,7 +210,7 @@ impl GitService {
                     return;
                 }
             };
-            serve_child(
+            let success = serve_child(
                 child,
                 buffered,
                 body,
@@ -213,6 +221,11 @@ impl GitService {
                 args,
             )
             .await;
+            if success {
+                if let Some(guard) = guard {
+                    guard.success();
+                }
+            }
         });
 
         let stream = ReceiverStream::new(rx).map(Ok::<_, io::Error>);
@@ -236,7 +249,7 @@ async fn serve_child(
     tx: mpsc::Sender<Frame<Bytes>>,
     rate_limit: Option<i64>,
     args: Arc<Vec<String>>,
-) {
+) -> bool {
     let stdin = child.stdin.take();
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
@@ -251,10 +264,10 @@ async fn serve_child(
     let status = child.wait().await;
     if write_result.is_err() || read_result.is_err() {
         let _ = child.start_kill();
-        return;
+        return false;
     }
     match status {
-        Ok(status) if status.success() => {}
+        Ok(status) if status.success() => true,
         Ok(status) => {
             tracing::error!(
                 args = %go_quote_slice(&args),
@@ -267,6 +280,7 @@ async fn serve_child(
                 go_quote_slice(&args),
             );
             let _ = tx.send(Frame::data(Bytes::from(text))).await;
+            false
         }
         Err(err) => {
             let _ = tx
@@ -275,6 +289,7 @@ async fn serve_child(
                     go_quote_slice(&args)
                 ))))
                 .await;
+            false
         }
     }
 }

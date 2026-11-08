@@ -10,10 +10,12 @@
 #
 # Only the families the Rust server registers are compared: the Go process
 # also exports families from packages it links but the read path never
-# touches (client-side counters, `go_*`/`process_*`), and vector families it
-# has already observed through earlier test traffic. Values are compared only
-# for the scrape-time disk gauges; counters legitimately differ because the Go
-# process has been serving traffic.
+# touches (client-side counters, `go_*`/`process_*`). Families whose children
+# are created lazily by traffic (`exec_*`, `gitservice_*`, `search_*`) are
+# checked structurally (type, help, label names, bucket boundaries) after the
+# fixture and git-service suites have run against both servers. Values are
+# compared only for the scrape-time disk gauges; counters legitimately differ
+# because the two processes have served different amounts of traffic.
 
 set -euo pipefail
 
@@ -86,6 +88,15 @@ EXPECTED = {
     "src_disk_space_total_bytes",
 }
 
+# Families that only exist once the process has served matching traffic.
+TRAFFIC = {
+    "src_gitserver_exec_running",
+    "src_gitserver_exec_duration_seconds",
+    "src_gitserver_gitservice_running",
+    "src_gitserver_gitservice_duration_seconds",
+    "src_gitserver_search_duration_seconds",
+}
+
 # Gauges whose label set is compared verbatim.
 DISK = {
     "src_gitserver_disk_space_available",
@@ -141,11 +152,16 @@ if missing:
 else:
     print(f"PASS rust exposes all {len(EXPECTED)} expected families")
 
-extra = rust.keys() - EXPECTED
+extra = rust.keys() - EXPECTED - TRAFFIC
 if extra:
     fail(f"rust exposes unexpected families: {sorted(extra)}")
 
-for name in sorted(EXPECTED & rust.keys()):
+absent = TRAFFIC - rust.keys()
+if absent:
+    print(f"SKIP traffic-only families not yet exercised: {sorted(absent)}")
+
+compared = (EXPECTED | TRAFFIC) & rust.keys()
+for name in sorted(compared):
     if name not in go:
         fail(f"{name}: not registered by the Go server")
         continue
@@ -155,6 +171,55 @@ for name in sorted(EXPECTED & rust.keys()):
         fail(f"{name}: help Rust={rust[name]['help']!r} Go={go[name]['help']!r}")
     else:
         print(f"PASS {name} ({rust[name]['type']}, help matches)")
+
+
+def sample_key(sample):
+    return sample.rsplit(" ", 1)[0]
+
+
+def label_names(samples):
+    names = set()
+    for sample in samples:
+        key = sample_key(sample)
+        if "{" not in key:
+            continue
+        for pair in key.split("{", 1)[1].rstrip("}").split(","):
+            names.add(pair.split("=", 1)[0])
+    return names
+
+
+def bucket_bounds(samples):
+    bounds = set()
+    for sample in samples:
+        key = sample_key(sample)
+        if "_bucket{" not in key:
+            continue
+        for pair in key.split("{", 1)[1].rstrip("}").split(","):
+            if pair.startswith("le="):
+                bounds.add(pair[3:])
+    return bounds
+
+
+for name in sorted(compared & go.keys()):
+    rust_labels = label_names(rust[name]["samples"])
+    go_labels = label_names(go[name]["samples"])
+    if rust_labels != go_labels:
+        fail(f"{name}: labels Rust={sorted(rust_labels)} Go={sorted(go_labels)}")
+        continue
+    if rust[name]["type"] == "histogram":
+        rust_bounds = bucket_bounds(rust[name]["samples"])
+        go_bounds = bucket_bounds(go[name]["samples"])
+        if rust_bounds != go_bounds:
+            fail(
+                f"{name}: buckets Rust={sorted(rust_bounds)} "
+                f"Go={sorted(go_bounds)}"
+            )
+            continue
+        print(f"PASS {name} (labels {sorted(rust_labels)}, "
+              f"{len(rust_bounds)} buckets match)")
+    else:
+        print(f"PASS {name} (labels {sorted(rust_labels)})")
+
 
 def series(samples):
     parsed = {}

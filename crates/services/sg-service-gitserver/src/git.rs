@@ -5,6 +5,7 @@
 //! happens when a repository is broken.
 
 use std::ffi::{OsStr, OsString};
+use std::ops::{Deref, DerefMut};
 use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -12,6 +13,7 @@ use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt};
 use tokio::process::{Child, Command};
 
+use crate::metrics;
 use crate::repo::clean_path_bytes;
 
 /// Go `streamio.WriteBufferSize`: the largest slice handed to a stream send.
@@ -35,6 +37,46 @@ impl GitError {
             Self::FileNotFound => "file not found".to_owned(),
             Self::Message(message) => message,
         }
+    }
+}
+
+/// A spawned `git` child plus the baseline `exec_*` measurement for that
+/// execution (`gitcli.cmdReader`): the running gauge and duration are updated
+/// when the child is waited on, or when the last handle to it is dropped.
+pub struct GitChild {
+    child: Child,
+    _exec: Option<metrics::ExecGuard>,
+}
+
+impl GitChild {
+    fn new(child: Child, args: &[OsString]) -> Self {
+        Self {
+            child,
+            _exec: metrics::exec_started(args),
+        }
+    }
+
+    /// Like [`Child::wait_with_output`], keeping the execution measurement
+    /// alive until the child exits.
+    pub async fn wait_with_output(self) -> std::io::Result<std::process::Output> {
+        let GitChild { child, _exec } = self;
+        let output = child.wait_with_output().await;
+        drop(_exec);
+        output
+    }
+}
+
+impl Deref for GitChild {
+    type Target = Child;
+
+    fn deref(&self) -> &Child {
+        &self.child
+    }
+}
+
+impl DerefMut for GitChild {
+    fn deref_mut(&mut self) -> &mut Child {
+        &mut self.child
     }
 }
 
@@ -256,10 +298,16 @@ impl GitRepo {
     }
 
     async fn output(&self, args: &[OsString]) -> Result<std::process::Output, GitError> {
-        self.command(args)
-            .output()
-            .await
-            .map_err(|err| GitError::Message(format!("failed to run git: {err}")))
+        let exec = metrics::exec_started(args);
+        match self.command(args).output().await {
+            Ok(output) => Ok(output),
+            Err(err) => {
+                if let Some(exec) = exec {
+                    exec.failed_to_start();
+                }
+                Err(GitError::Message(format!("failed to run git: {err}")))
+            }
+        }
     }
 
     /// `git cat-file -t -- <spec>`; exit 128 with the baseline's stderr
@@ -396,7 +444,7 @@ impl GitRepo {
         format: &str,
         treeish: &str,
         paths: &[Vec<u8>],
-    ) -> Result<Child, GitError> {
+    ) -> Result<GitChild, GitError> {
         if treeish.starts_with('-') {
             return Err(GitError::Message(format!(
                 "invalid git revision spec {treeish:?} (begins with '-')"
@@ -423,6 +471,7 @@ impl GitRepo {
 
         self.command(&args)
             .spawn()
+            .map(|child| GitChild::new(child, &args))
             .map_err(|err| GitError::Message(format!("failed to run git archive: {err}")))
     }
 
@@ -430,7 +479,7 @@ impl GitRepo {
     ///
     /// A gitlink (submodule, mode 160000) reads as an empty file, like the
     /// baseline.
-    pub async fn read_file(&self, commit: &str, path: &[u8]) -> Result<Option<Child>, GitError> {
+    pub async fn read_file(&self, commit: &str, path: &[u8]) -> Result<Option<GitChild>, GitError> {
         // Baseline `EnsureAbsoluteCommit`: `ReadFile` refuses to run git on
         // relative revisions (the expensive resolution cannot be cached).
         if !is_absolute_revision(commit) {
@@ -477,13 +526,15 @@ impl GitRepo {
             return Ok(None);
         }
 
+        let args: Vec<OsString> = vec![
+            "cat-file".into(),
+            "-p".into(),
+            OsStr::from_bytes(oid).to_owned(),
+        ];
         let child = self
-            .command(&[
-                "cat-file".into(),
-                "-p".into(),
-                OsStr::from_bytes(oid).to_owned(),
-            ])
+            .command(&args)
             .spawn()
+            .map(|child| GitChild::new(child, &args))
             .map_err(|err| GitError::Message(format!("failed to run git cat-file: {err}")))?;
         Ok(Some(child))
     }
@@ -799,7 +850,7 @@ impl GitRepo {
         inter_hunk_context: u32,
         context_lines: u32,
         paths: &[Vec<u8>],
-    ) -> Result<Child, GitError> {
+    ) -> Result<GitChild, GitError> {
         let mut base_oid = self.resolve_revision(base).await?;
         let head_oid = self.resolve_revision(head).await?;
         // Go re-checks the resolved OIDs before handing them to git.
@@ -828,12 +879,13 @@ impl GitRepo {
         }
         self.command(&args)
             .spawn()
+            .map(|child| GitChild::new(child, &args))
             .map_err(|err| GitError::Message(format!("failed to run git diff-tree: {err}")))
     }
 
     /// Baseline `CommitLog`: spawn `git log` with the shared NUL format; the
     /// caller parses records with [`pump_commit_log`].
-    pub async fn commit_log(&self, options: &CommitLogOptions) -> Result<Child, GitError> {
+    pub async fn commit_log(&self, options: &CommitLogOptions) -> Result<GitChild, GitError> {
         for range in &options.ranges {
             if range.first() == Some(&b'-') {
                 return Err(GitError::Message(format!(
@@ -894,6 +946,7 @@ impl GitRepo {
 
         self.command(&args)
             .spawn()
+            .map(|child| GitChild::new(child, &args))
             .map_err(|err| GitError::Message(format!("failed to run git log: {err}")))
     }
 
@@ -1056,7 +1109,7 @@ impl GitRepo {
         path: &[u8],
         ignore_whitespace: bool,
         range: Option<BlameRange>,
-    ) -> Result<Child, GitError> {
+    ) -> Result<GitChild, GitError> {
         check_spec_arg_safety(commit)?;
         self.blob_oid(commit, path).await?;
 
@@ -1076,6 +1129,7 @@ impl GitRepo {
 
         self.command(&args)
             .spawn()
+            .map(|child| GitChild::new(child, &args))
             .map_err(|err| GitError::Message(format!("failed to run git blame: {err}")))
     }
 
@@ -1721,7 +1775,7 @@ fn civil_from_days(days: i64) -> (i64, i64, i64) {
 /// then. Baseline error mapping: exit 128 with a bad-revision marker becomes
 /// `RevisionNotFound`; an empty repository ends the stream cleanly.
 pub async fn pump_commit_log<F, Fut>(
-    mut child: Child,
+    mut child: GitChild,
     spec: String,
     mut send: F,
 ) -> Result<(), GitError>
@@ -1825,7 +1879,7 @@ where
 ///
 /// The baseline's `blameHunkReader` ignores the child's exit status: a failed
 /// `git blame` (after the blob check) produces an empty stream, not an error.
-pub async fn pump_blame<F, Fut>(mut child: Child, mut send: F) -> Result<(), GitError>
+pub async fn pump_blame<F, Fut>(mut child: GitChild, mut send: F) -> Result<(), GitError>
 where
     F: FnMut(BlameHunk) -> Fut,
     Fut: std::future::Future<Output = bool>,
@@ -2016,7 +2070,7 @@ fn unquote_go_string(bytes: &[u8]) -> Option<Vec<u8>> {
 ///
 /// `send` resolves to false once the client went away; the child is killed
 /// then. Errors from the child are returned only when no data was produced.
-pub async fn pump_stdout<F, Fut>(mut child: Child, mut send: F) -> Result<(), String>
+pub async fn pump_stdout<F, Fut>(mut child: GitChild, mut send: F) -> Result<(), String>
 where
     F: FnMut(Vec<u8>) -> Fut,
     Fut: std::future::Future<Output = bool>,

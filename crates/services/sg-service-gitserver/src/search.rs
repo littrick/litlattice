@@ -1050,6 +1050,7 @@ impl<'a> LazyCommit<'a> {
 /// written one at a time; the echoed `ENDOFPATCH` marker delimits each patch.
 struct DiffFetcher {
     _child: Child,
+    _exec: Option<crate::metrics::ExecGuard>,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
     stderr: Option<tokio::process::ChildStderr>,
@@ -1074,14 +1075,24 @@ impl DiffFetcher {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
-        let mut child = command
-            .spawn()
-            .map_err(|err| SearchError::Message(format!("failed to run git diff-tree: {err}")))?;
+        let exec = crate::metrics::exec_started(&[OsString::from("diff-tree")]);
+        let mut child = match command.spawn() {
+            Ok(child) => child,
+            Err(err) => {
+                if let Some(exec) = exec {
+                    exec.failed_to_start();
+                }
+                return Err(SearchError::Message(format!(
+                    "failed to run git diff-tree: {err}"
+                )));
+            }
+        };
         let stdin = child.stdin.take().expect("git diff-tree stdin is piped");
         let stdout = child.stdout.take().expect("git diff-tree stdout is piped");
         let stderr = child.stderr.take();
         Ok(Self {
             _child: child,
+            _exec: exec,
             stdin,
             stdout: BufReader::new(stdout),
             stderr,
@@ -1664,6 +1675,10 @@ where
     F: FnMut(gpb::CommitMatch) -> Fut,
     Fut: std::future::Future<Output = bool>,
 {
+    // `searchWithObservability`: running gauge, duration on every outcome and
+    // the latency histogram on the first match.
+    let mut search_guard = crate::metrics::search_started();
+
     // Baseline `doSearch`: `Limit == 0` means no limit.
     let limit = if request.limit == 0 {
         i64::from(i32::MAX)
@@ -1676,10 +1691,19 @@ where
     let include_modified_files =
         request.include_modified_files || match_tree.has_diff_modifies_file();
 
-    let mut child = repo
-        .command(&search_log_args(&request.revisions, include_modified_files))
-        .spawn()
-        .map_err(|err| SearchError::Message(format!("failed to run git log: {err}")))?;
+    let log_args = search_log_args(&request.revisions, include_modified_files);
+    let exec = crate::metrics::exec_started(&log_args);
+    let mut child = match repo.command(&log_args).spawn() {
+        Ok(child) => child,
+        Err(err) => {
+            if let Some(exec) = exec {
+                exec.failed_to_start();
+            }
+            return Err(SearchError::Message(format!(
+                "failed to run git log: {err}"
+            )));
+        }
+    };
 
     // Drain stderr concurrently so a chatty `git log` cannot fill the pipe.
     let mut stderr = child
@@ -1727,6 +1751,9 @@ where
                     // every remaining commit, but drops the matches.
                     if sent < limit {
                         sent += match_count(&commit_match);
+                        if let Some(guard) = search_guard.as_mut() {
+                            guard.first_match();
+                        }
                         keep_going = on_match(commit_match).await;
                     }
                 }
@@ -1751,6 +1778,10 @@ where
     // therefore ends as a successful, empty search. Keep the stderr reader
     // joined so the pipe is drained, but its contents cannot change the result.
     let _ = stderr_task.await;
+
+    if let Some(guard) = search_guard.take() {
+        guard.finish(false);
+    }
 
     // Baseline quirk: `doSearch` is
     // `return hitLimit.Load(), searcher.Search(ctx, limitedOnMatch)`.

@@ -221,9 +221,16 @@ impl Collector for DiskCollector {
     }
 }
 
-/// The gauge the echo loop updates.
+/// Metric handles the read path updates.
 pub struct Metrics {
     echo_duration: Gauge,
+    exec_running: GaugeVec,
+    exec_duration: HistogramVec,
+    gitservice_running: GaugeVec,
+    gitservice_duration: HistogramVec,
+    search_running: Gauge,
+    search_duration: HistogramVec,
+    search_latency: Histogram,
 }
 
 impl Metrics {
@@ -324,14 +331,14 @@ impl Metrics {
         );
 
         // `cmd/gitserver/internal/gitservice.go`
-        let _gitservice_duration = histogram_vec(
+        let gitservice_duration = histogram_vec(
             registry,
             "src_gitserver_gitservice_duration_seconds",
             "A histogram of latencies for the git service (upload-pack for internal clones) endpoint.",
             &["type", "error"],
             gitservice_buckets(),
         );
-        let _gitservice_running = gauge_vec(
+        let gitservice_running = gauge_vec(
             registry,
             "src_gitserver_gitservice_running",
             "A histogram of latencies for the git service (upload-pack for internal clones) endpoint.",
@@ -339,19 +346,19 @@ impl Metrics {
         );
 
         // `cmd/gitserver/internal/search.go`
-        let _search_running = gauge(
+        let search_running = gauge(
             registry,
             "src_gitserver_search_running",
             "number of gitserver.Search running concurrently.",
         );
-        let _search_duration = histogram_vec(
+        let search_duration = histogram_vec(
             registry,
             "src_gitserver_search_duration_seconds",
             "gitserver.Search duration in seconds.",
             &["error"],
             vec![0.01, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0],
         );
-        let _search_latency = histogram(
+        let search_latency = histogram(
             registry,
             "src_gitserver_search_latency_seconds",
             "gitserver.Search latency (time until first result is sent) in seconds.",
@@ -386,13 +393,13 @@ impl Metrics {
         );
 
         // `cmd/gitserver/internal/git/gitcli`
-        let _exec_running = gauge_vec(
+        let exec_running = gauge_vec(
             registry,
             "src_gitserver_exec_running",
             "number of gitserver.GitCommand running concurrently.",
             &["cmd"],
         );
-        let _exec_duration = histogram_vec(
+        let exec_duration = histogram_vec(
             registry,
             "src_gitserver_exec_duration_seconds",
             "gitserver.GitCommand latencies in seconds.",
@@ -485,17 +492,199 @@ impl Metrics {
             ),
         );
 
-        Self { echo_duration }
+        Self {
+            echo_duration,
+            exec_running,
+            exec_duration,
+            gitservice_running,
+            gitservice_duration,
+            search_running,
+            search_duration,
+            search_latency,
+        }
     }
 
     /// Register every family on the process-wide registry, once.
     pub fn global(repos_dir: &Path) -> &'static Metrics {
-        static METRICS: OnceLock<Metrics> = OnceLock::new();
         METRICS.get_or_init(|| Metrics::new(sg_metrics::registry(), repos_dir))
+    }
+
+    /// The process-wide metrics, when the service has started (unit tests and
+    /// helper code run without them and record nothing).
+    pub fn global_opt() -> Option<&'static Metrics> {
+        METRICS.get()
     }
 
     pub fn echo_observed(&self, seconds: f64) {
         self.echo_duration.set(seconds);
+    }
+
+    fn exec_started(&'static self, cmd: &str) -> ExecGuard {
+        self.exec_running.with_label_values(&[cmd]).inc();
+        ExecGuard {
+            metrics: self,
+            cmd: cmd.to_owned(),
+            started: Instant::now(),
+            armed: true,
+        }
+    }
+
+    fn search_started(&self) {
+        self.search_running.inc();
+    }
+
+    fn search_finished(&self, seconds: f64, failed: bool) {
+        self.search_duration
+            .with_label_values(&[if failed { "true" } else { "false" }])
+            .observe(seconds);
+        self.search_running.dec();
+    }
+
+    fn search_latency_observed(&self, seconds: f64) {
+        self.search_latency.observe(seconds);
+    }
+
+    fn gitservice_started(&'static self, svc: &'static str) -> GitserviceGuard {
+        self.gitservice_running.with_label_values(&[svc]).inc();
+        GitserviceGuard {
+            metrics: self,
+            svc,
+            started: Instant::now(),
+            error: true,
+        }
+    }
+}
+
+static METRICS: OnceLock<Metrics> = OnceLock::new();
+
+/// Records one `git` execution for the baseline `exec_*` metrics: the
+/// running gauge is incremented when the child starts and the duration is
+/// observed when the guard is dropped (after the child is waited on or
+/// killed). `None` when the service has not started (unit tests).
+pub fn exec_started(args: &[std::ffi::OsString]) -> Option<ExecGuard> {
+    let cmd = args.first()?.to_string_lossy();
+    Some(Metrics::global_opt()?.exec_started(&cmd))
+}
+
+/// Records one `git` upload-pack service request for the baseline
+/// `gitservice_*` metrics: the running gauge is incremented when the trace
+/// starts and the duration is observed with the final error label when the
+/// guard is dropped. `None` when the service has not started (unit tests).
+pub fn gitservice_started(svc: &'static str) -> Option<GitserviceGuard> {
+    Some(Metrics::global_opt()?.gitservice_started(svc))
+}
+
+pub struct ExecGuard {
+    metrics: &'static Metrics,
+    cmd: String,
+    started: Instant,
+    armed: bool,
+}
+
+impl ExecGuard {
+    /// The child never started: Go returns before incrementing the gauge, so
+    /// undo the increment and record nothing.
+    pub fn failed_to_start(mut self) {
+        self.armed = false;
+        self.metrics
+            .exec_running
+            .with_label_values(&[&self.cmd])
+            .dec();
+    }
+}
+
+impl Drop for ExecGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.metrics
+                .exec_running
+                .with_label_values(&[&self.cmd])
+                .dec();
+            self.metrics
+                .exec_duration
+                .with_label_values(&[&self.cmd])
+                .observe(self.started.elapsed().as_secs_f64());
+        }
+    }
+}
+
+/// One `gitservice.ServeHTTP` call. Defaults to the failing outcome so an
+/// aborted stream is labelled like the baseline's cancelled `cmd.Run`.
+pub struct GitserviceGuard {
+    metrics: &'static Metrics,
+    svc: &'static str,
+    started: Instant,
+    error: bool,
+}
+
+impl GitserviceGuard {
+    pub fn success(mut self) {
+        self.error = false;
+    }
+}
+
+impl Drop for GitserviceGuard {
+    fn drop(&mut self) {
+        self.metrics
+            .gitservice_running
+            .with_label_values(&[self.svc])
+            .dec();
+        self.metrics
+            .gitservice_duration
+            .with_label_values(&[self.svc, if self.error { "true" } else { "false" }])
+            .observe(self.started.elapsed().as_secs_f64());
+    }
+}
+
+/// Start measuring one `Search`. Returns the finish callback, which observes
+/// `search_duration_seconds{error}` and, on the first match, the latency
+/// histogram.
+pub fn search_started() -> Option<SearchGuard> {
+    let metrics = Metrics::global_opt()?;
+    metrics.search_started();
+    Some(SearchGuard {
+        metrics,
+        started: Instant::now(),
+        latency_observed: false,
+        finished: false,
+    })
+}
+
+pub struct SearchGuard {
+    metrics: &'static Metrics,
+    started: Instant,
+    latency_observed: bool,
+    finished: bool,
+}
+
+impl SearchGuard {
+    /// `searchLatency` is observed once, when the first result is ready.
+    pub fn first_match(&mut self) {
+        if !self.latency_observed {
+            self.latency_observed = true;
+            self.metrics
+                .search_latency_observed(self.started.elapsed().as_secs_f64());
+        }
+    }
+
+    pub fn finish(mut self, failed: bool) {
+        self.record(failed);
+    }
+
+    fn record(&mut self, failed: bool) {
+        if !self.finished {
+            self.finished = true;
+            self.metrics
+                .search_finished(self.started.elapsed().as_secs_f64(), failed);
+        }
+    }
+}
+
+impl Drop for SearchGuard {
+    fn drop(&mut self) {
+        // An aborted search (task cancelled) still decrements the gauge,
+        // like the baseline's deferred end.
+        self.record(true);
     }
 }
 
