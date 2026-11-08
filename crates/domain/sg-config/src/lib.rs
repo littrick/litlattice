@@ -288,6 +288,23 @@ impl SiteConfiguration {
             .and_then(serde_json::Value::as_i64)
     }
 
+    /// `conf.CodeIntelAutoIndexingPolicyRepositoryMatchLimit`: the
+    /// `codeIntelAutoIndexing.policyRepositoryMatchLimit` site setting. The
+    /// baseline field is a `*int` with a dotted JSON key; a missing value or
+    /// anything below `-1` means `-1` (unlimited). Note the baseline would
+    /// reject a non-integer value while parsing the whole site configuration;
+    /// this accessor simply treats it as unset (see `06_worker.md` §33).
+    pub fn codeintel_autoindexing_policy_repository_match_limit(&self) -> i64 {
+        match self
+            .raw
+            .get("codeIntelAutoIndexing.policyRepositoryMatchLimit")
+            .and_then(serde_json::Value::as_i64)
+        {
+            Some(value) if value >= -1 => value,
+            _ => -1,
+        }
+    }
+
     /// `conf.GitMaxConcurrentClones`: `siteConfig.gitMaxConcurrentClones`,
     /// defaulting to 5 when unset or non-positive.
     pub fn git_max_concurrent_clones(&self) -> usize {

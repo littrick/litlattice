@@ -38,6 +38,7 @@ use crate::registry;
 pub mod batches;
 pub mod codeintel_metrics_reporter;
 pub mod codeintel_package_filter_applicator;
+pub mod codeintel_policies_repository_matcher;
 pub mod codeintel_upload_backfiller;
 pub mod codeintel_upload_janitor;
 pub mod codeintel_uploadstore_expirer;
@@ -165,6 +166,9 @@ pub fn all_jobs() -> Vec<(&'static str, Arc<dyn Job>)> {
                 "codeintel-package-filter-applicator" => {
                     Arc::new(codeintel_package_filter_applicator::PackageFilterApplicator::new())
                 }
+                "codeintel-policies-repository-matcher" => Arc::new(
+                    codeintel_policies_repository_matcher::PoliciesRepositoryMatcher::new(),
+                ),
                 "codeintel-upload-backfiller" => {
                     Arc::new(codeintel_upload_backfiller::UploadBackfiller::new())
                 }
