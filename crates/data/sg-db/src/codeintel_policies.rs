@@ -61,50 +61,212 @@ pub async fn select_policies_for_repository_membership_update(
         .await
         .map_err(|err| err.to_string())?;
 
-    rows.into_iter()
-        .map(|row| {
-            let repository_patterns: Option<Vec<String>> = row
-                .try_get("repository_patterns")
-                .map_err(|err| err.to_string())?;
-            Ok(ConfigurationPolicy {
-                id: row.try_get("id").map_err(|err| err.to_string())?,
-                repository_id: row
-                    .try_get("repository_id")
-                    .map_err(|err| err.to_string())?,
-                // `optionalSlice`: an empty array is `nil` too.
-                repository_patterns: repository_patterns.filter(|values| !values.is_empty()),
-                name: row.try_get("name").map_err(|err| err.to_string())?,
-                policy_type: row.try_get("type").map_err(|err| err.to_string())?,
-                pattern: row.try_get("pattern").map_err(|err| err.to_string())?,
-                protected: row.try_get("protected").map_err(|err| err.to_string())?,
-                retention_enabled: row
-                    .try_get("retention_enabled")
-                    .map_err(|err| err.to_string())?,
-                retention_duration_hours: row
-                    .try_get("retention_duration_hours")
-                    .map_err(|err| err.to_string())?,
-                retain_intermediate_commits: row
-                    .try_get("retain_intermediate_commits")
-                    .map_err(|err| err.to_string())?,
-                indexing_enabled: row
-                    .try_get("indexing_enabled")
-                    .map_err(|err| err.to_string())?,
-                syntactic_indexing_enabled: row
-                    .try_get("syntactic_indexing_enabled")
-                    .map_err(|err| err.to_string())?,
-                index_commit_max_age_hours: row
-                    .try_get("index_commit_max_age_hours")
-                    .map_err(|err| err.to_string())?,
-                index_intermediate_commits: row
-                    .try_get("index_intermediate_commits")
-                    .map_err(|err| err.to_string())?,
-                embeddings_enabled: row
-                    .try_get("embeddings_enabled")
-                    .map_err(|err| err.to_string())?,
-            })
-        })
-        .collect()
+    rows.iter()
+        .map(scan_configuration_policy)
+        .collect::<Result<_, String>>()
 }
+
+/// `scanConfigurationPolicy`: every query in this module selects the same
+/// columns.
+fn scan_configuration_policy(row: &sqlx::postgres::PgRow) -> Result<ConfigurationPolicy, String> {
+    let repository_patterns: Option<Vec<String>> = row
+        .try_get("repository_patterns")
+        .map_err(|err| err.to_string())?;
+    Ok(ConfigurationPolicy {
+        id: row.try_get("id").map_err(|err| err.to_string())?,
+        repository_id: row
+            .try_get("repository_id")
+            .map_err(|err| err.to_string())?,
+        // `optionalSlice`: an empty array is `nil` too.
+        repository_patterns: repository_patterns.filter(|values| !values.is_empty()),
+        name: row.try_get("name").map_err(|err| err.to_string())?,
+        policy_type: row.try_get("type").map_err(|err| err.to_string())?,
+        pattern: row.try_get("pattern").map_err(|err| err.to_string())?,
+        protected: row.try_get("protected").map_err(|err| err.to_string())?,
+        retention_enabled: row
+            .try_get("retention_enabled")
+            .map_err(|err| err.to_string())?,
+        retention_duration_hours: row
+            .try_get("retention_duration_hours")
+            .map_err(|err| err.to_string())?,
+        retain_intermediate_commits: row
+            .try_get("retain_intermediate_commits")
+            .map_err(|err| err.to_string())?,
+        indexing_enabled: row
+            .try_get("indexing_enabled")
+            .map_err(|err| err.to_string())?,
+        syntactic_indexing_enabled: row
+            .try_get("syntactic_indexing_enabled")
+            .map_err(|err| err.to_string())?,
+        index_commit_max_age_hours: row
+            .try_get("index_commit_max_age_hours")
+            .map_err(|err| err.to_string())?,
+        index_intermediate_commits: row
+            .try_get("index_intermediate_commits")
+            .map_err(|err| err.to_string())?,
+        embeddings_enabled: row
+            .try_get("embeddings_enabled")
+            .map_err(|err| err.to_string())?,
+    })
+}
+
+/// `shared.GetConfigurationPoliciesOptions`: the filter set of
+/// `Store.GetConfigurationPolicies`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GetConfigurationPoliciesOptions {
+    /// `0` disables the repository filter.
+    pub repository_id: i32,
+    pub term: String,
+    pub protected: Option<bool>,
+    pub for_data_retention: Option<bool>,
+    pub for_precise_indexing: Option<bool>,
+    pub for_syntactic_indexing: Option<bool>,
+    pub for_embeddings: Option<bool>,
+    pub limit: i64,
+    pub offset: i64,
+}
+
+/// `Store.GetConfigurationPolicies`: returns `(policies, totalCount)`.
+///
+/// The conditions, the `LEFT JOIN repo`, the `ORDER BY p.name` and the
+/// unbounded tie-break behaviour are copied from
+/// `internal/codeintel/policies/internal/store/configurations.go`. The select
+/// and count queries run in one transaction (one snapshot), like the
+/// baseline's `WithTransact`.
+pub async fn get_configuration_policies(
+    pool: &PgPool,
+    opts: &GetConfigurationPoliciesOptions,
+) -> Result<(Vec<ConfigurationPolicy>, i64), String> {
+    let (condition, binds) = configuration_policy_condition(opts);
+
+    let mut tx = pool.begin().await.map_err(|err| err.to_string())?;
+
+    let count_query = format!(
+        "SELECT COUNT(*)\nFROM lsif_configuration_policies p\nLEFT JOIN repo ON repo.id = p.repository_id\nWHERE {condition}"
+    );
+    let mut count = sqlx::query(&count_query);
+    for bind in &binds {
+        count = bind_value(count, bind.clone());
+    }
+    let row = count
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|err| err.to_string())?;
+    let total_count: i64 = row.try_get(0).map_err(|err| err.to_string())?;
+
+    // `getConfigurationPoliciesLimitedQuery`: LIMIT/OFFSET are inlined like
+    // sqlf's integer parameters.
+    let select_query = format!(
+        "{GET_CONFIGURATION_POLICIES_SELECT}WHERE {condition}\nORDER BY p.name\nLIMIT {} OFFSET {}",
+        opts.limit, opts.offset
+    );
+    let mut select = sqlx::query(&select_query);
+    for bind in &binds {
+        select = bind_value(select, bind.clone());
+    }
+    let rows = select
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|err| err.to_string())?;
+    let policies = rows
+        .iter()
+        .map(scan_configuration_policy)
+        .collect::<Result<Vec<_>, String>>()?;
+
+    tx.commit().await.map_err(|err| err.to_string())?;
+    Ok((policies, total_count))
+}
+
+/// A bound parameter, typed like the Go value `sqlf` binds: the repository id
+/// is an `int` (compared against `integer` columns), the search term a
+/// string.
+#[derive(Debug, Clone)]
+enum BindValue {
+    Int(i32),
+    Text(String),
+}
+
+fn bind_value<'q>(
+    query: sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments>,
+    value: BindValue,
+) -> sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments> {
+    match value {
+        BindValue::Int(value) => query.bind(value),
+        BindValue::Text(value) => query.bind(value),
+    }
+}
+
+/// `makeConfigurationPolicySearchCondition` + the option conditions of
+/// `GetConfigurationPolicies`. Only the repository id and the search term are
+/// bound; the boolean filters are inlined like the baseline.
+fn configuration_policy_condition(
+    opts: &GetConfigurationPoliciesOptions,
+) -> (String, Vec<BindValue>) {
+    let mut conds = Vec::new();
+    let mut binds = Vec::new();
+
+    if opts.repository_id != 0 {
+        let first = binds.len() + 1;
+        binds.push(BindValue::Int(opts.repository_id));
+        let second = binds.len() + 1;
+        binds.push(BindValue::Int(opts.repository_id));
+        conds.push(format!(
+            r#"(
+			(p.repository_id IS NULL AND p.repository_patterns IS NULL) OR
+			p.repository_id = ${first} OR
+			EXISTS (
+				SELECT 1
+				FROM lsif_configuration_policies_repository_pattern_lookup l
+				WHERE l.policy_id = p.id AND l.repo_id = ${second}
+			)
+		)"#
+        ));
+    }
+    if !opts.term.is_empty() {
+        let placeholder = binds.len() + 1;
+        binds.push(BindValue::Text(format!("%{}%", opts.term)));
+        conds.push(format!("(p.name ILIKE ${placeholder})"));
+    }
+    for (value, column) in [
+        (opts.protected, "p.protected"),
+        (opts.for_data_retention, "p.retention_enabled"),
+        (opts.for_precise_indexing, "p.indexing_enabled"),
+        (opts.for_syntactic_indexing, "p.syntactic_indexing_enabled"),
+        (opts.for_embeddings, "p.embeddings_enabled"),
+    ] {
+        match value {
+            Some(true) => conds.push(column.to_owned()),
+            Some(false) => conds.push(format!("NOT {column}")),
+            None => {}
+        }
+    }
+
+    if conds.is_empty() {
+        ("TRUE".to_owned(), binds)
+    } else {
+        (conds.join(" AND "), binds)
+    }
+}
+
+const GET_CONFIGURATION_POLICIES_SELECT: &str = r#"SELECT
+	p.id,
+	p.repository_id,
+	p.repository_patterns,
+	p.name,
+	p.type,
+	p.pattern,
+	p.protected,
+	p.retention_enabled,
+	p.retention_duration_hours,
+	p.retain_intermediate_commits,
+	p.indexing_enabled,
+	p.syntactic_indexing_enabled,
+	p.index_commit_max_age_hours,
+	p.index_intermediate_commits,
+	p.embeddings_enabled
+FROM lsif_configuration_policies p
+LEFT JOIN repo ON repo.id = p.repository_id
+"#;
 
 /// `Store.UpdateReposMatchingPatterns`: returns `(num_inserted, num_deleted)`
 /// like the statement's final `SELECT` (the baseline ignores both).

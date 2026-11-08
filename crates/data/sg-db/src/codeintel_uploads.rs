@@ -225,6 +225,117 @@ pub async fn get_deleted_upload_ids(
     Ok((ids, total))
 }
 
+/// One upload returned by [`get_uploads_for_expiration`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExpirationUpload {
+    pub id: i32,
+    pub uploaded_at: OffsetDateTime,
+}
+
+/// `store.SetRepositoriesForRetentionScan`: claims a batch of repositories
+/// that have completed uploads and a fresh commit graph, skipping any that
+/// were claimed within `process_delay`. Returns the claimed repository
+/// identifiers.
+pub async fn set_repositories_for_retention_scan(
+    pool: &PgPool,
+    process_delay: std::time::Duration,
+    limit: i64,
+    now: OffsetDateTime,
+) -> Result<Vec<i32>, sqlx::Error> {
+    // `sqlf.Sprintf(repositoryIDsForRetentionScanQuery, now,
+    // int(processDelay/time.Second), limit, now, now)`: the delay (seconds)
+    // and the limit are inlined by sqlf; the three timestamps are values.
+    let query = REPOSITORY_IDS_FOR_RETENTION_SCAN_QUERY
+        .replace("{delay_seconds}", &process_delay.as_secs().to_string())
+        .replace("{limit}", &limit.to_string());
+    let rows = sqlx::query(&query)
+        .bind(now)
+        .bind(now)
+        .bind(now)
+        .fetch_all(pool)
+        .await?;
+    Ok(rows.iter().map(|row| row.get::<i32, _>(0)).collect())
+}
+
+/// `store.GetUploads` specialised to the expirer's options: completed,
+/// non-expired uploads of one repository that are present in the commit graph
+/// (`finished_at < lsif_dirty_repositories.updated_at`) and were not scanned
+/// after `last_retention_scan_before`. The projection is narrowed to the two
+/// fields `isUploadProtectedByPolicy` reads; the `left join (uploadRankQuery)`
+/// and the `visible_at_tip` projection of the baseline select cannot change
+/// the row set (the rank subquery only covers `state = 'queued'` rows) and are
+/// therefore omitted.
+pub async fn get_uploads_for_expiration(
+    pool: &PgPool,
+    repository_id: i32,
+    limit: i64,
+    last_retention_scan_before: OffsetDateTime,
+) -> Result<Vec<ExpirationUpload>, sqlx::Error> {
+    let rows = sqlx::query(GET_UPLOADS_FOR_EXPIRATION_QUERY)
+        .bind(repository_id)
+        .bind(last_retention_scan_before)
+        .bind(limit)
+        .fetch_all(pool)
+        .await?;
+    Ok(rows
+        .iter()
+        .map(|row| ExpirationUpload {
+            id: row.get(0),
+            uploaded_at: row.get(1),
+        })
+        .collect())
+}
+
+/// `store.GetCommitsVisibleToUpload`: returns `(commits, nextToken)` where
+/// `nextToken` is the last commit of the page (when the page is non-empty).
+pub async fn get_commits_visible_to_upload(
+    pool: &PgPool,
+    upload_id: i64,
+    limit: i64,
+    token: Option<&str>,
+) -> Result<(Vec<String>, Option<String>), sqlx::Error> {
+    let after = token.unwrap_or("");
+    let query = COMMITS_VISIBLE_TO_UPLOAD_QUERY.replace("{limit}", &limit.to_string());
+    let rows = sqlx::query(&query)
+        .bind(upload_id.to_string())
+        .bind(after)
+        .fetch_all(pool)
+        .await?;
+    let commits: Vec<String> = rows.iter().map(|row| row.get(0)).collect();
+    let next_token = commits.last().cloned();
+    Ok((commits, next_token))
+}
+
+/// `store.UpdateUploadRetention`: stamps `last_retention_scan_at` on the
+/// protected uploads and sets `expired = TRUE` on the expired ones, in a
+/// single transaction. The identifiers are sorted first so the two `UPDATE`s
+/// take row locks in a deterministic order (the baseline does the same).
+pub async fn update_upload_retention(
+    pool: &PgPool,
+    protected_ids: &mut [i32],
+    expired_ids: &mut [i32],
+) -> Result<(), sqlx::Error> {
+    protected_ids.sort_unstable();
+    expired_ids.sort_unstable();
+
+    let mut tx = pool.begin().await?;
+    if !protected_ids.is_empty() {
+        sqlx::query("UPDATE lsif_uploads SET last_retention_scan_at = $1 WHERE id = ANY($2)")
+            .bind(sqlx::types::time::OffsetDateTime::now_utc())
+            .bind(&*protected_ids)
+            .execute(&mut *tx)
+            .await?;
+    }
+    if !expired_ids.is_empty() {
+        sqlx::query("UPDATE lsif_uploads SET expired = TRUE WHERE id = ANY($1)")
+            .bind(&*expired_ids)
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
 /// `store.DeleteAutoIndexJobsWithoutRepository`.
 pub async fn delete_auto_index_jobs_without_repository(
     pool: &PgPool,
@@ -1078,4 +1189,82 @@ delete_indexes AS (
 	RETURNING 1
 )
 SELECT COUNT(*) FROM delete_indexes
+"#;
+
+/// `repositoryIDsForRetentionScanQuery` (the expirer's
+/// `SetRepositoriesForRetentionScan`). `{delay_seconds}` and `{limit}` are
+/// inlined like sqlf's integer parameters; the three timestamps are bound.
+const REPOSITORY_IDS_FOR_RETENTION_SCAN_QUERY: &str = r#"
+WITH candidate_repositories AS (
+	SELECT DISTINCT u.repository_id AS id
+	FROM lsif_uploads u
+	WHERE u.state = 'completed'
+),
+repositories AS (
+	SELECT cr.id
+	FROM candidate_repositories cr
+	LEFT JOIN lsif_last_retention_scan lrs ON lrs.repository_id = cr.id
+	JOIN lsif_dirty_repositories dr ON dr.repository_id = cr.id
+
+	-- Ignore records that have been checked recently. Note this condition is
+	-- true for a null last_retention_scan_at (which has never been checked).
+	WHERE ($1 - lrs.last_retention_scan_at > ({delay_seconds} * '1 second'::interval)) IS DISTINCT FROM FALSE
+	AND dr.update_token = dr.dirty_token
+	ORDER BY
+		lrs.last_retention_scan_at NULLS FIRST,
+		cr.id -- tie breaker
+	LIMIT {limit}
+)
+INSERT INTO lsif_last_retention_scan (repository_id, last_retention_scan_at)
+SELECT r.id, $2::timestamp FROM repositories r
+ON CONFLICT (repository_id) DO UPDATE
+SET last_retention_scan_at = $3
+RETURNING repository_id
+"#;
+
+/// `store.GetUploads`' conditions for the expirer's option set (see
+/// [`get_uploads_for_expiration`]).
+const GET_UPLOADS_FOR_EXPIRATION_QUERY: &str = r#"
+SELECT u.id, u.uploaded_at
+FROM lsif_uploads u
+JOIN repo ON repo.id = u.repository_id
+WHERE
+	u.repository_id = $1 AND
+	u.state = 'completed' AND
+	u.finished_at < (SELECT updated_at FROM lsif_dirty_repositories ldr WHERE ldr.repository_id = u.repository_id) AND
+	(u.last_retention_scan_at IS NULL OR u.last_retention_scan_at < $2) AND
+	NOT u.expired AND
+	repo.deleted_at IS NULL AND
+	repo.blocked IS NULL
+ORDER BY uploaded_at, id DESC
+LIMIT $3 OFFSET 0
+"#;
+
+/// `commitsVisibleToUploadQuery`. The upload identifier is compared against
+/// the JSONB key (`nu.uploads ? %s`), hence the text bind.
+const COMMITS_VISIBLE_TO_UPLOAD_QUERY: &str = r#"
+WITH
+direct_commits AS (
+	SELECT nu.repository_id, nu.commit_bytea
+	FROM lsif_nearest_uploads nu
+	WHERE nu.uploads ? $1
+),
+linked_commits AS (
+	SELECT ul.commit_bytea
+	FROM direct_commits dc
+	JOIN lsif_nearest_uploads_links ul
+	ON
+		ul.repository_id = dc.repository_id AND
+		ul.ancestor_commit_bytea = dc.commit_bytea
+),
+combined_commits AS (
+	SELECT dc.commit_bytea FROM direct_commits dc
+	UNION ALL
+	SELECT lc.commit_bytea FROM linked_commits lc
+)
+SELECT encode(c.commit_bytea, 'hex') as commit
+FROM combined_commits c
+WHERE decode($2, 'hex') < c.commit_bytea
+ORDER BY c.commit_bytea
+LIMIT {limit}
 "#;

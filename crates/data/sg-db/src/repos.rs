@@ -118,6 +118,68 @@ LIMIT 1
     }
 }
 
+impl RepoStore {
+    /// `Repos().Get(id)`: `listRepos` with `IDs: [id]`, `Limit: 1`,
+    /// `IncludeBlocked: true`. Soft-deleted repositories are excluded by the
+    /// default conditions; blocked repositories are returned (the baseline
+    /// returns them together with a `BlockedRepoError`, which the caller
+    /// checks via [`Repo::blocked`]).
+    pub async fn get_by_id(&self, id: i32) -> Result<Option<Repo>, sqlx::Error> {
+        let row = sqlx::query(
+            r#"
+SELECT
+	r.id,
+	r.name,
+	r.external_service_type,
+	r.external_service_id,
+	r.metadata,
+	r.uri,
+	r.blocked,
+	(
+		SELECT json_agg(
+			json_build_object(
+				'CloneURL', esr.clone_url,
+				'ID', esr.external_service_id,
+				'Kind', LOWER(svcs.kind)
+			)
+		)
+		FROM external_service_repos AS esr
+		JOIN external_services AS svcs ON esr.external_service_id = svcs.id
+		WHERE esr.repo_id = r.id AND svcs.deleted_at IS NULL
+	) AS sources
+FROM repo r
+WHERE r.id = $1 AND r.deleted_at IS NULL
+LIMIT 1
+"#,
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+
+        let sources: Option<serde_json::Value> = row.try_get("sources")?;
+        let sources = match sources {
+            Some(value) => {
+                serde_json::from_value(value).map_err(|err| sqlx::Error::Decode(Box::new(err)))?
+            }
+            None => Vec::new(),
+        };
+
+        Ok(Some(Repo {
+            id: row.try_get("id")?,
+            name: row.try_get("name")?,
+            external_service_type: row.try_get("external_service_type")?,
+            external_service_id: row.try_get("external_service_id")?,
+            metadata: row.try_get("metadata")?,
+            uri: row.try_get("uri")?,
+            blocked: row.try_get("blocked")?,
+            sources,
+        }))
+    }
+}
+
 /// Minimal repository identity used by repo-updater's RPCs
 /// (`Repos.List` with `Names`).
 #[derive(Debug, Clone, PartialEq, Eq)]
