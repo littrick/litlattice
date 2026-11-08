@@ -1,0 +1,16 @@
+{
+  "expected": {
+    "limit_hit": false,
+    "matches": []
+  },
+  "request": {
+    "query": {
+      "boolean": {
+        "value": false
+      }
+    },
+    "repo": "test/git-refs-fixture"
+  },
+  "rpc": "search",
+  "service": "gitserver"
+}

@@ -249,6 +249,7 @@ enum GitserverRpc {
     Blame,
     DiskInfo,
     RepoCloneProgress,
+    Search,
 }
 
 impl GitserverRpc {
@@ -275,12 +276,13 @@ impl GitserverRpc {
             "blame" => Ok(Self::Blame),
             "disk_info" => Ok(Self::DiskInfo),
             "repo_clone_progress" => Ok(Self::RepoCloneProgress),
+            "search" => Ok(Self::Search),
             other => Err(format!(
                 "unknown gitserver rpc {other:?} (archive, read_file, changed_files, \
                  resolve_revision, get_object, default_branch, merge_base, stat, read_dir, \
                  list_refs, get_commit, rev_at_time, raw_diff, commit_log, \
                  merge_base_octopus, contributor_counts, first_ever_commit, behind_ahead, \
-                 blame, disk_info, repo_clone_progress)"
+                 blame, disk_info, repo_clone_progress, search)"
             )),
         }
     }
@@ -1130,6 +1132,101 @@ fn gitserver_repo_clone_progress_request(
     })
 }
 
+fn gitserver_search_request(value: &Value) -> Result<gpb::SearchRequest, String> {
+    Ok(gpb::SearchRequest {
+        repo: optional_string(value, "repo")?,
+        revisions: strings(value, "revisions")?
+            .into_iter()
+            .map(|rev_spec| gpb::RevisionSpecifier { rev_spec })
+            .collect(),
+        limit: value.get("limit").and_then(Value::as_i64).unwrap_or(0),
+        include_diff: value
+            .get("include_diff")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        include_modified_files: value
+            .get("include_modified_files")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        query: match value.get("query") {
+            None | Some(Value::Null) => None,
+            Some(node) => Some(gitserver_query_node(node)?),
+        },
+    })
+}
+
+/// `{"author_matches": {"expr": …, "ignore_case": …}}` and friends.
+fn gitserver_query_node(value: &Value) -> Result<gpb::QueryNode, String> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| "request: query node must be an object".to_owned())?;
+    let node = if let Some(node) = object.get("author_matches") {
+        let (expr, ignore_case) = gitserver_regexp_fields(node)?;
+        gpb::query_node::Value::AuthorMatches(gpb::AuthorMatchesNode { expr, ignore_case })
+    } else if let Some(node) = object.get("committer_matches") {
+        let (expr, ignore_case) = gitserver_regexp_fields(node)?;
+        gpb::query_node::Value::CommitterMatches(gpb::CommitterMatchesNode { expr, ignore_case })
+    } else if let Some(node) = object.get("commit_before") {
+        gpb::query_node::Value::CommitBefore(gpb::CommitBeforeNode {
+            timestamp: optional_timestamp(node, "timestamp")?,
+        })
+    } else if let Some(node) = object.get("commit_after") {
+        gpb::query_node::Value::CommitAfter(gpb::CommitAfterNode {
+            timestamp: optional_timestamp(node, "timestamp")?,
+        })
+    } else if let Some(node) = object.get("message_matches") {
+        let (expr, ignore_case) = gitserver_regexp_fields(node)?;
+        gpb::query_node::Value::MessageMatches(gpb::MessageMatchesNode { expr, ignore_case })
+    } else if let Some(node) = object.get("diff_matches") {
+        let (expr, ignore_case) = gitserver_regexp_fields(node)?;
+        gpb::query_node::Value::DiffMatches(gpb::DiffMatchesNode { expr, ignore_case })
+    } else if let Some(node) = object.get("diff_modifies_file") {
+        let (expr, ignore_case) = gitserver_regexp_fields(node)?;
+        gpb::query_node::Value::DiffModifiesFile(gpb::DiffModifiesFileNode { expr, ignore_case })
+    } else if let Some(node) = object.get("boolean") {
+        gpb::query_node::Value::Boolean(gpb::BooleanNode {
+            value: node.get("value").and_then(Value::as_bool).unwrap_or(false),
+        })
+    } else if let Some(node) = object.get("operator") {
+        gpb::query_node::Value::Operator(gitserver_operator_node(node)?)
+    } else {
+        return Err("request: empty query node".to_owned());
+    };
+    Ok(gpb::QueryNode { value: Some(node) })
+}
+
+fn gitserver_regexp_fields(value: &Value) -> Result<(String, bool), String> {
+    Ok((
+        string(value, "expr")?,
+        value
+            .get("ignore_case")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+    ))
+}
+
+fn gitserver_operator_node(value: &Value) -> Result<gpb::OperatorNode, String> {
+    let kind = match string(value, "kind")?.as_str() {
+        "and" => gpb::OperatorKind::And,
+        "or" => gpb::OperatorKind::Or,
+        "not" => gpb::OperatorKind::Not,
+        "unspecified" => gpb::OperatorKind::Unspecified,
+        other => return Err(format!("request: unknown operator kind {other:?}")),
+    };
+    let operands = match value.get("operands") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::Array(items)) => items
+            .iter()
+            .map(gitserver_query_node)
+            .collect::<Result<Vec<_>, _>>()?,
+        Some(_) => return Err("request: operands must be an array".to_owned()),
+    };
+    Ok(gpb::OperatorNode {
+        kind: kind as i32,
+        operands,
+    })
+}
+
 fn gitserver_blame_request(value: &Value) -> Result<gpb::BlameRequest, String> {
     let range = match value.get("range") {
         None | Some(Value::Null) => None,
@@ -1269,6 +1366,67 @@ fn normalize_blame(chunks: &[gpb::BlameResponse]) -> Value {
             .filter_map(|chunk| chunk.hunk.as_ref())
             .map(normalize_blame_hunk)
             .collect::<Vec<_>>(),
+    })
+}
+
+fn normalize_search(chunks: &[gpb::SearchResponse]) -> Value {
+    let mut matches = Vec::new();
+    let mut limit_hit = Value::Null;
+    for chunk in chunks {
+        match &chunk.message {
+            Some(gpb::search_response::Message::Match(message)) => {
+                matches.push(normalize_commit_match(message));
+            }
+            Some(gpb::search_response::Message::LimitHit(hit)) => {
+                limit_hit = Value::Bool(*hit);
+            }
+            None => {}
+        }
+    }
+    json!({"matches": matches, "limit_hit": limit_hit})
+}
+
+fn normalize_commit_match(commit_match: &gpb::CommitMatch) -> Value {
+    json!({
+        "oid": commit_match.oid,
+        "author": commit_match.author.as_ref().map(normalize_search_signature),
+        "committer": commit_match.committer.as_ref().map(normalize_search_signature),
+        "parents": commit_match.parents,
+        "refs": commit_match.refs,
+        "source_refs": commit_match.source_refs,
+        "message": commit_match.message.as_ref().map(normalize_matched_string),
+        "diff": commit_match.diff.as_ref().map(normalize_matched_string),
+        "modified_files": commit_match.modified_files,
+    })
+}
+
+fn normalize_search_signature(signature: &gpb::commit_match::Signature) -> Value {
+    json!({
+        "name": signature.name,
+        "email": signature.email,
+        "date": signature.date.as_ref().map(normalize_timestamp),
+    })
+}
+
+fn normalize_matched_string(matched: &gpb::commit_match::MatchedString) -> Value {
+    json!({
+        "content": matched.content,
+        "ranges": matched
+            .ranges
+            .iter()
+            .map(|range| json!({
+                "start": range.start.as_ref().map(normalize_location),
+                "end": range.end.as_ref().map(normalize_location),
+            }))
+            .collect::<Vec<_>>(),
+    })
+}
+
+fn normalize_location(location: &gpb::commit_match::Location) -> Value {
+    json!({
+        "offset": location.offset,
+        "line": location.line,
+        "column": location.column,
     })
 }
 
@@ -1682,6 +1840,17 @@ async fn call_gitserver(
                 "clone_in_progress": response.clone_in_progress,
                 "clone_progress": response.clone_progress,
             }))
+        }
+        GitserverRpc::Search => {
+            let mut stream = client
+                .search(gitserver_search_request(request).map_err(GitserverFailure::Fixture)?)
+                .await?
+                .into_inner();
+            let mut messages = Vec::new();
+            while let Some(message) = stream.message().await? {
+                messages.push(message);
+            }
+            Ok(normalize_search(&messages))
         }
         GitserverRpc::ChangedFiles => {
             let mut stream = client

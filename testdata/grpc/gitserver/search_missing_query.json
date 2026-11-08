@@ -1,0 +1,13 @@
+{
+  "expected": {
+    "error": {
+      "code": "invalid_argument",
+      "message": "unknown query node type <nil>"
+    }
+  },
+  "request": {
+    "repo": "test/blame-fixture"
+  },
+  "rpc": "search",
+  "service": "gitserver"
+}

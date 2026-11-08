@@ -1,0 +1,19 @@
+{
+  "expected": {
+    "limit_hit": false,
+    "matches": []
+  },
+  "request": {
+    "query": {
+      "boolean": {
+        "value": true
+      }
+    },
+    "repo": "test/blame-fixture",
+    "revisions": [
+      "does-not-exist"
+    ]
+  },
+  "rpc": "search",
+  "service": "gitserver"
+}

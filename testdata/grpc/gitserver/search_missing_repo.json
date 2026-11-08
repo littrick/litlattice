@@ -1,0 +1,18 @@
+{
+  "expected": {
+    "error": {
+      "code": "not_found",
+      "message": "repo not found"
+    }
+  },
+  "request": {
+    "query": {
+      "boolean": {
+        "value": true
+      }
+    },
+    "repo": "test/missing-search-fixture"
+  },
+  "rpc": "search",
+  "service": "gitserver"
+}

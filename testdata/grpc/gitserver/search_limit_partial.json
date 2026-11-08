@@ -1,0 +1,142 @@
+{
+  "expected": {
+    "limit_hit": false,
+    "matches": [
+      {
+        "author": {
+          "date": {
+            "nanos": 0,
+            "seconds": 1717372800
+          },
+          "email": "charlie@example.com",
+          "name": "Charlie Writer"
+        },
+        "committer": {
+          "date": {
+            "nanos": 0,
+            "seconds": 1717372800
+          },
+          "email": "charlie@example.com",
+          "name": "Charlie Writer"
+        },
+        "diff": {
+          "content": "",
+          "ranges": []
+        },
+        "message": {
+          "content": "whitespace only change",
+          "ranges": [
+            {
+              "end": {
+                "column": 3,
+                "line": 0,
+                "offset": 3
+              },
+              "start": {
+                "column": 2,
+                "line": 0,
+                "offset": 2
+              }
+            }
+          ]
+        },
+        "modified_files": [],
+        "oid": "c13428b72681e539b30ca2358a65c223beb56d74",
+        "parents": [
+          "44ee0ae4a49f454514ace8e6ca81bfdbf4303412"
+        ],
+        "refs": [
+          "HEAD -> refs/heads/main"
+        ],
+        "source_refs": [
+          "HEAD"
+        ]
+      },
+      {
+        "author": {
+          "date": {
+            "nanos": 0,
+            "seconds": 1714608000
+          },
+          "email": "bravo@example.com",
+          "name": "Bravo Writer"
+        },
+        "committer": {
+          "date": {
+            "nanos": 0,
+            "seconds": 1714608000
+          },
+          "email": "bravo@example.com",
+          "name": "Bravo Writer"
+        },
+        "diff": {
+          "content": "",
+          "ranges": []
+        },
+        "message": {
+          "content": "rewrite first and last lines",
+          "ranges": [
+            {
+              "end": {
+                "column": 5,
+                "line": 0,
+                "offset": 5
+              },
+              "start": {
+                "column": 4,
+                "line": 0,
+                "offset": 4
+              }
+            },
+            {
+              "end": {
+                "column": 10,
+                "line": 0,
+                "offset": 10
+              },
+              "start": {
+                "column": 9,
+                "line": 0,
+                "offset": 9
+              }
+            },
+            {
+              "end": {
+                "column": 25,
+                "line": 0,
+                "offset": 25
+              },
+              "start": {
+                "column": 24,
+                "line": 0,
+                "offset": 24
+              }
+            }
+          ]
+        },
+        "modified_files": [],
+        "oid": "44ee0ae4a49f454514ace8e6ca81bfdbf4303412",
+        "parents": [
+          "241c2f444340443b88aa2c476522953f9bf512d9"
+        ],
+        "refs": [
+          ""
+        ],
+        "source_refs": [
+          "HEAD"
+        ]
+      }
+    ]
+  },
+  "request": {
+    "limit": 2,
+    "query": {
+      "message_matches": {
+        "expr": "i"
+      }
+    },
+    "repo": "test/blame-fixture"
+  },
+  "rpc": "search",
+  "service": "gitserver"
+}

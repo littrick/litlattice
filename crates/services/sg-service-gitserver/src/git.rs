@@ -239,7 +239,9 @@ impl GitRepo {
         }
     }
 
-    fn command(&self, args: &[OsString]) -> Command {
+    /// `git` with `cwd = $GIT_DIR` and `GIT_DIR` set. Shared with the commit
+    /// search, which runs `git log` against the same directory.
+    pub(crate) fn command(&self, args: &[OsString]) -> Command {
         let mut command = Command::new("git");
         command
             .args(args)

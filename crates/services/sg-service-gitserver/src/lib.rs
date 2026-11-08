@@ -24,6 +24,7 @@ pub mod git;
 pub mod gitservice;
 pub mod grpc;
 pub mod repo;
+pub mod search;
 
 use config::GitserverConfig;
 use gitservice::GitService;

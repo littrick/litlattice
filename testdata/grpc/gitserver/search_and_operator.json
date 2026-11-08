@@ -1,0 +1,77 @@
+{
+  "expected": {
+    "limit_hit": false,
+    "matches": [
+      {
+        "author": {
+          "date": {
+            "nanos": 0,
+            "seconds": 1711929600
+          },
+          "email": "alpha@example.com",
+          "name": "Alpha Writer"
+        },
+        "committer": {
+          "date": {
+            "nanos": 0,
+            "seconds": 1711929600
+          },
+          "email": "alpha@example.com",
+          "name": "Alpha Writer"
+        },
+        "diff": {
+          "content": "",
+          "ranges": []
+        },
+        "message": {
+          "content": "root commit",
+          "ranges": [
+            {
+              "end": {
+                "column": 4,
+                "line": 0,
+                "offset": 4
+              },
+              "start": {
+                "column": 0,
+                "line": 0,
+                "offset": 0
+              }
+            }
+          ]
+        },
+        "modified_files": [],
+        "oid": "241c2f444340443b88aa2c476522953f9bf512d9",
+        "parents": [],
+        "refs": [
+          ""
+        ],
+        "source_refs": [
+          "HEAD"
+        ]
+      }
+    ]
+  },
+  "request": {
+    "query": {
+      "operator": {
+        "kind": "and",
+        "operands": [
+          {
+            "author_matches": {
+              "expr": "alpha"
+            }
+          },
+          {
+            "message_matches": {
+              "expr": "root"
+            }
+          }
+        ]
+      }
+    },
+    "repo": "test/blame-fixture"
+  },
+  "rpc": "search",
+  "service": "gitserver"
+}

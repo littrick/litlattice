@@ -1,0 +1,94 @@
+{
+  "expected": {
+    "limit_hit": false,
+    "matches": [
+      {
+        "author": {
+          "date": {
+            "nanos": 0,
+            "seconds": 1706832000
+          },
+          "email": "fixture@example.com",
+          "name": "Fixture Author"
+        },
+        "committer": {
+          "date": {
+            "nanos": 0,
+            "seconds": 1706832000
+          },
+          "email": "fixture@example.com",
+          "name": "Fixture Author"
+        },
+        "diff": {
+          "content": "",
+          "ranges": []
+        },
+        "message": {
+          "content": "second commit",
+          "ranges": []
+        },
+        "modified_files": [],
+        "oid": "2e6511bf87f7e6f0af1afb6247e39b1ddf5cc799",
+        "parents": [
+          "1a65c506a93996f8dccdfe52216bf3909de71d9d"
+        ],
+        "refs": [
+          "HEAD -> refs/heads/main",
+          "tag: refs/tags/v2.0",
+          "refs/heads/feature"
+        ],
+        "source_refs": [
+          "HEAD"
+        ]
+      },
+      {
+        "author": {
+          "date": {
+            "nanos": 0,
+            "seconds": 1704067200
+          },
+          "email": "fixture@example.com",
+          "name": "Fixture Author"
+        },
+        "committer": {
+          "date": {
+            "nanos": 0,
+            "seconds": 1704067200
+          },
+          "email": "fixture@example.com",
+          "name": "Fixture Author"
+        },
+        "diff": {
+          "content": "",
+          "ranges": []
+        },
+        "message": {
+          "content": "root commit",
+          "ranges": []
+        },
+        "modified_files": [],
+        "oid": "1a65c506a93996f8dccdfe52216bf3909de71d9d",
+        "parents": [],
+        "refs": [
+          "tag: refs/tags/v1.0",
+          "tag: refs/tags/lightweight",
+          "refs/heads/dev"
+        ],
+        "source_refs": [
+          "HEAD"
+        ]
+      }
+    ]
+  },
+  "request": {
+    "query": {
+      "boolean": {
+        "value": true
+      }
+    },
+    "repo": "test/git-refs-fixture",
+    "revisions": []
+  },
+  "rpc": "search",
+  "service": "gitserver"
+}

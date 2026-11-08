@@ -3,8 +3,9 @@
 //! Implemented so far: `Archive`, `ReadFile`, `ChangedFiles`, `ResolveRevision`,
 //! `GetObject`, `DefaultBranch`, `MergeBase`, `MergeBaseOctopus`, `Stat`,
 //! `ReadDir`, `ListRefs`, `GetCommit`, `RevAtTime`, `RawDiff`, `CommitLog`,
-//! `ContributorCounts`, `FirstEverCommit`, `BehindAhead`, `Blame`, `DiskInfo`
-//! and `RepoCloneProgress` (M9.2). Every other RPC returns `UNIMPLEMENTED`.
+//! `ContributorCounts`, `FirstEverCommit`, `BehindAhead`, `Blame`, `DiskInfo`,
+//! `RepoCloneProgress` and non-diff `Search` (M9.2). Every other RPC returns
+//! `UNIMPLEMENTED`.
 
 use std::pin::Pin;
 use std::sync::Arc;
@@ -23,6 +24,7 @@ use crate::git::{
     CHUNK_MESSAGE_SIZE,
 };
 use crate::repo::{normalize_repo, repo_dir};
+use crate::search::{self, SearchError};
 
 type Stream<T> = Pin<Box<dyn tokio_stream::Stream<Item = Result<T, Status>> + Send>>;
 
@@ -349,14 +351,60 @@ impl gpb::gitserver_service_server::GitserverService for Grpc {
         Err(unimplemented("list_gitolite"))
     }
 
-    type SearchStream =
-        Pin<Box<dyn tokio_stream::Stream<Item = Result<gpb::SearchResponse, Status>> + Send>>;
+    type SearchStream = Stream<gpb::SearchResponse>;
 
     async fn search(
         &self,
-        _request: GrpcRequest<gpb::SearchRequest>,
+        request: GrpcRequest<gpb::SearchRequest>,
     ) -> Result<GrpcResponse<Self::SearchStream>, Status> {
-        Err(unimplemented("search"))
+        let request = request.into_inner();
+        // `SearchRequestFromProto` runs before the `repo` check, so a broken
+        // query tree is reported even when the repository is missing.
+        let args = search::SearchRequest::from_proto(&request)
+            .map_err(|err| Status::invalid_argument(err.to_string()))?;
+        if request.repo.is_empty() {
+            return Err(Status::invalid_argument("repo must be specified"));
+        }
+        let repo = self.repo(&request.repo)?;
+
+        let tasks = self.tasks.clone();
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<gpb::SearchResponse, Status>>(64);
+        self.tasks.spawn(async move {
+            let sender = tx.clone();
+            let result = search::search(&repo, &args, &tasks, |commit_match| {
+                let sender = sender.clone();
+                async move {
+                    sender
+                        .send(Ok(gpb::SearchResponse {
+                            message: Some(gpb::search_response::Message::Match(commit_match)),
+                        }))
+                        .await
+                        .is_ok()
+                }
+            })
+            .await;
+            match result {
+                // The baseline always terminates a successful stream with
+                // `limit_hit`, even when nothing matched.
+                Ok(limit_hit) => {
+                    let _ = tx
+                        .send(Ok(gpb::SearchResponse {
+                            message: Some(gpb::search_response::Message::LimitHit(limit_hit)),
+                        }))
+                        .await;
+                }
+                Err(SearchError::Unsupported(message)) => {
+                    let _ = tx.send(Err(Status::unimplemented(message))).await;
+                }
+                Err(SearchError::InvalidArgument(message)) => {
+                    let _ = tx.send(Err(Status::invalid_argument(message))).await;
+                }
+                Err(SearchError::Message(message)) => {
+                    let _ = tx.send(Err(Status::unknown(message))).await;
+                }
+            }
+        });
+        Ok(GrpcResponse::new(Box::pin(ReceiverStream::new(rx))))
     }
 
     async fn repo_clone_progress(

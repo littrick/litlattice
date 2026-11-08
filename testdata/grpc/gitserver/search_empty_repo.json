@@ -1,0 +1,18 @@
+{
+  "expected": {
+    "error": {
+      "code": "invalid_argument",
+      "message": "repo must be specified"
+    }
+  },
+  "request": {
+    "query": {
+      "boolean": {
+        "value": true
+      }
+    },
+    "repo": ""
+  },
+  "rpc": "search",
+  "service": "gitserver"
+}

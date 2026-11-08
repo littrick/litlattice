@@ -1,0 +1,19 @@
+{
+  "expected": {
+    "error": {
+      "code": "invalid_argument",
+      "message": "unknown operator kind OPERATOR_KIND_UNSPECIFIED"
+    }
+  },
+  "request": {
+    "query": {
+      "operator": {
+        "kind": "unspecified",
+        "operands": []
+      }
+    },
+    "repo": "test/blame-fixture"
+  },
+  "rpc": "search",
+  "service": "gitserver"
+}
