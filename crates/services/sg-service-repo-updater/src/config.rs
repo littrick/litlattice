@@ -16,6 +16,11 @@ pub struct RepoUpdaterConfig {
     /// `DISABLE_REPO_PURGE`; the baseline only treats a parseable `true` as
     /// disabling the purger.
     pub disable_repo_purge: bool,
+    /// `DISABLE_BATCH_CHANGES` (`batches.IsEnabled()`): Batch Changes is
+    /// disabled only when `strconv.ParseBool` accepts the value as true. Read
+    /// with `os.Getenv` semantics, so `<NAME>_<process>` overrides do not
+    /// apply.
+    pub disable_batch_changes: bool,
 }
 
 impl RepoUpdaterConfig {
@@ -56,10 +61,18 @@ impl RepoUpdaterConfig {
             )
             .eq_ignore_ascii_case("true");
 
+        // `batches.IsEnabled()`: `os.Getenv` + `strconv.ParseBool`, ignoring
+        // parse errors.
+        let disable_batch_changes = std::env::var("DISABLE_BATCH_CHANGES")
+            .ok()
+            .and_then(|raw| parse_strconv_bool(&raw))
+            .unwrap_or(false);
+
         Ok(Self {
             listen_addr,
             prof_addr,
             disable_repo_purge,
+            disable_batch_changes,
         })
     }
 
@@ -70,6 +83,16 @@ impl RepoUpdaterConfig {
             ));
         }
         Ok(())
+    }
+}
+
+/// `strconv.ParseBool` accepted spellings, ignoring parse errors like
+/// `batches.IsEnabled`.
+fn parse_strconv_bool(value: &str) -> Option<bool> {
+    match value {
+        "1" | "t" | "T" | "TRUE" | "true" | "True" => Some(true),
+        "0" | "f" | "F" | "FALSE" | "false" | "False" => Some(false),
+        _ => None,
     }
 }
 

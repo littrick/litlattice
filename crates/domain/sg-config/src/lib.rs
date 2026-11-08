@@ -297,6 +297,17 @@ impl SiteConfiguration {
         self.bool_field("disableAutoCodeHostSyncs")
     }
 
+    /// `experimentalFeatures.batchChanges.enablePerforce`: whether Perforce is
+    /// a supported Batch Changes code host
+    /// (`batches/types.GetSupportedExternalServices`).
+    pub fn batch_changes_enable_perforce(&self) -> bool {
+        self.experimental_features()
+            .and_then(|features| features.get("batchChanges"))
+            .and_then(|batch_changes| batch_changes.get("enablePerforce"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+    }
+
     /// `conf.Get().LicenseKey`: the product license key from the site
     /// configuration. Empty when the instance runs without a license.
     pub fn license_key(&self) -> String {

@@ -25,6 +25,7 @@ use sg_config::{ConfigClient, Unified};
 use sg_core::{ConfigError, EnvReader, Service, ServiceContext, ServiceError};
 use sg_proto::repoupdater as pb;
 
+pub mod changeset_sync;
 pub mod config;
 pub mod debug;
 pub mod gitserver;
@@ -37,10 +38,11 @@ pub mod sync_worker;
 pub mod syncer;
 pub mod uncloned;
 
+use changeset_sync::{ChangesetSyncerMetrics, SyncRegistry};
 use config::RepoUpdaterConfig;
 use debug::DebugContext;
 use gitserver::{GitserverRepoClient, ScopedGitserverClient};
-use grpc::RepoUpdaterGrpc;
+use grpc::{ChangesetSyncEnqueuer, RepoUpdaterGrpc};
 use metrics::Metrics;
 use purge::PurgeWorker;
 use scheduler::{RepoUpdateClient, SystemClock, UpdateScheduler};
@@ -168,7 +170,7 @@ impl Service for RepoUpdaterService {
                 .with_observer(
                     Arc::clone(&metrics) as Arc<dyn sg_db::external_service_repos::StoreObserver>
                 );
-        let sync_jobs = sg_db::external_service_sync_jobs::SyncJobsStore::new(pool);
+        let sync_jobs = sg_db::external_service_sync_jobs::SyncJobsStore::new(pool.clone());
 
         let git_servers = unified.service_connections.git_servers.clone();
 
@@ -248,14 +250,37 @@ impl Service for RepoUpdaterService {
             Arc::clone(&live),
         ));
 
+        let tasks = TaskTracker::new();
+
+        // `batches.IsEnabled()` gates the whole Batch Changes registry: with
+        // `DISABLE_BATCH_CHANGES` set, `EnqueueChangesetSync` reports
+        // `changeset syncer is not configured`, like the baseline.
+        let mut changeset_registry: Option<Arc<SyncRegistry>> = None;
+        let mut changeset_priority: Option<(
+            Arc<SyncRegistry>,
+            tokio::sync::mpsc::Receiver<Vec<i64>>,
+        )> = None;
+        if !config.disable_batch_changes {
+            let batches_store = Arc::new(sg_db::batches::BatchesStore::new(pool));
+            let (registry, priority_rx) = SyncRegistry::new(
+                batches_store,
+                Arc::new(SystemClock),
+                Arc::new(ChangesetSyncerMetrics::new()),
+                Arc::clone(&live),
+                tasks.clone(),
+            );
+            let registry = Arc::new(registry);
+            changeset_priority = Some((Arc::clone(&registry), priority_rx));
+            changeset_registry = Some(registry);
+        }
+
         let grpc = RepoUpdaterGrpc {
             scheduler: Arc::clone(&scheduler),
             repos: Arc::new(DbRepoNameStore::new((*repo_store).clone())),
             gitserver: reclone_gitserver,
-            // Batch Changes is a separate (enterprise) subsystem; without it
-            // the RPC reports `changeset syncer is not configured`, matching
-            // the baseline with `batches.IsEnabled() == false`.
-            changeset_sync: None,
+            changeset_sync: changeset_registry
+                .clone()
+                .map(|registry| registry as Arc<dyn ChangesetSyncEnqueuer>),
         };
 
         let addr = config.listen_addr.clone();
@@ -286,7 +311,6 @@ impl Service for RepoUpdaterService {
         ctx.ready.mark_ready();
         sg_metrics::register_service_metadata(sg_metrics::VERSION);
 
-        let tasks = TaskTracker::new();
         {
             let scheduler = Arc::clone(&scheduler);
             tasks.spawn(async move { scheduler.hydrate().await });
@@ -327,11 +351,14 @@ impl Service for RepoUpdaterService {
         }
 
         // `watchSyncer`: feed sync diffs into the update scheduler unless
-        // `disableAutoGitUpdates` is set (checked per diff, like the baseline).
+        // `disableAutoGitUpdates` is set (checked per diff, like the
+        // baseline), and enqueue changeset syncs for archived/unarchived
+        // repos whenever the Batch Changes registry exists.
         {
             let mut diffs = diff_tx.subscribe();
             let scheduler = Arc::clone(&scheduler);
             let live = Arc::clone(&live);
+            let changeset_registry = changeset_registry.clone();
             let shutdown = ctx.shutdown.clone();
             tasks.spawn(async move {
                 loop {
@@ -351,8 +378,36 @@ impl Service for RepoUpdaterService {
                     if !live.current().site.disable_auto_git_updates() {
                         scheduler.update_from_diff(&diff);
                     }
+                    if let Some(registry) = changeset_registry.as_ref() {
+                        let repositories: Vec<i32> = diff
+                            .modified
+                            .iter()
+                            .filter(|modified| {
+                                modified
+                                    .modified
+                                    .contains(sg_extsvc::RepoModifiedFields::ARCHIVED)
+                            })
+                            .map(|modified| modified.repo.id)
+                            .collect();
+                        if !repositories.is_empty() {
+                            if let Err(err) =
+                                registry.enqueue_changeset_syncs_for_repos(&repositories).await
+                            {
+                                tracing::warn!(
+                                    error = %err,
+                                    "error enqueuing changeset syncs for archived and unarchived repos"
+                                );
+                            }
+                        }
+                    }
                 }
             });
+        }
+
+        // `server.ChangesetSyncRegistry` as a background routine: initial
+        // code-host sync, priority dispatcher and the one-minute loop.
+        if let Some((registry, priority_rx)) = changeset_priority {
+            registry.spawn(priority_rx, ctx.shutdown.clone());
         }
 
         // `syncer.Routines`: enqueue loop, dequeue loops, heartbeat,
