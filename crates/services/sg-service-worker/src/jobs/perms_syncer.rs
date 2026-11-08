@@ -33,6 +33,7 @@ use sg_db::perms_store::{
     SOURCE_USER_SYNC,
 };
 use sg_db::repos::RepoStore;
+use sg_db::user_external_accounts::{ExternalAccount, ExternalAccountSpec};
 use sg_db::users::{get_by_id as get_user_by_id, UserRecord};
 use sqlx::postgres::PgPool;
 use sqlx::types::time::OffsetDateTime;
@@ -71,7 +72,59 @@ pub enum FetchError {
     },
 }
 
-/// `authz.Provider` subset used by the repository-centric sync.
+/// `authz.ExternalUserPermissions`, without the sub-repository map (see
+/// [`UserPermsFetcher`] for the sub-repository gap).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ExternalUserPermissions {
+    pub exacts: Vec<String>,
+    pub include_contains: Vec<String>,
+    pub exclude_contains: Vec<String>,
+}
+
+/// The `FetchUserPerms` error classes the syncer branches on
+/// (`errcode.IsUnauthorized` / `IsForbidden` / `IsAccountSuspended` /
+/// `IsTemporary`, `authz.ErrUnimplemented`, everything else).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UserPermsError {
+    Unauthorized {
+        message: String,
+    },
+    Forbidden {
+        message: String,
+    },
+    AccountSuspended {
+        message: String,
+    },
+    /// `errcode.IsTemporary`: previously synced permissions are retained.
+    Temporary {
+        message: String,
+    },
+    Unimplemented {
+        message: String,
+    },
+    /// Any other error; like the baseline the provider may return the partial
+    /// permissions it managed to fetch alongside the error.
+    Failed {
+        message: String,
+        partial: Option<ExternalUserPermissions>,
+    },
+}
+
+impl UserPermsError {
+    /// The error text used for the provider status and the wrapped error.
+    pub fn message(&self) -> &str {
+        match self {
+            Self::Unauthorized { message }
+            | Self::Forbidden { message }
+            | Self::AccountSuspended { message }
+            | Self::Temporary { message }
+            | Self::Unimplemented { message }
+            | Self::Failed { message, .. } => message,
+        }
+    }
+}
+
+/// `authz.Provider` subset used by the syncer.
 #[async_trait]
 pub trait AuthzProvider: Send + Sync {
     /// `ServiceType`, e.g. `github`.
@@ -86,6 +139,24 @@ pub trait AuthzProvider: Send + Sync {
         repo: &FetchRepo,
         opts: &FetchPermsOptions,
     ) -> Result<Vec<String>, FetchError>;
+    /// `FetchAccount`: the provider-specific account identity for a user.
+    /// `Ok(None)` means the provider cannot determine one (not a failure).
+    async fn fetch_account(
+        &self,
+        _user: &UserRecord,
+    ) -> Result<Option<ExternalAccountSpec>, String> {
+        Ok(None)
+    }
+    /// `FetchUserPerms`: private repositories the account can read.
+    async fn fetch_user_perms(
+        &self,
+        _account: &ExternalAccount,
+        _opts: &FetchPermsOptions,
+    ) -> Result<Option<ExternalUserPermissions>, UserPermsError> {
+        Err(UserPermsError::Unimplemented {
+            message: "FetchUserPerms is not implemented".to_owned(),
+        })
+    }
 }
 
 /// `providers.ProvidersFromConfig` as seen by the syncer. The registry is

@@ -265,6 +265,98 @@ ORDER BY repo.id
     }
 }
 
+/// `api.ExternalRepoSpec`: the code-host identity of a repository.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternalRepoSpec {
+    pub id: String,
+    pub service_type: String,
+    pub service_id: String,
+}
+
+impl RepoStore {
+    /// `ListMinimalRepos(ctx, ReposListOptions{ExternalRepos: specs,
+    /// OnlyPrivate: true})`: exact matches of `(external_id,
+    /// external_service_type, external_service_id)`, ordered by id.
+    ///
+    /// The syncer chunks `specs` into groups of 10000 to stay below the
+    /// Postgres bind-parameter limit. Like the baseline, the same repository
+    /// may appear more than once when a spec is repeated.
+    pub async fn list_private_repos_by_external_specs(
+        &self,
+        specs: &[ExternalRepoSpec],
+    ) -> Result<Vec<i32>, sqlx::Error> {
+        if specs.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut query = sqlx::QueryBuilder::new(
+            "SELECT id FROM repo WHERE deleted_at IS NULL AND blocked IS NULL AND private AND (",
+        );
+        for (i, spec) in specs.iter().enumerate() {
+            if i > 0 {
+                query.push(" OR ");
+            }
+            query
+                .push("(external_id = ")
+                .push_bind(spec.id.clone())
+                .push(" AND external_service_type = ")
+                .push_bind(spec.service_type.clone())
+                .push(" AND external_service_id = ")
+                .push_bind(spec.service_id.clone())
+                .push(")");
+        }
+        query.push(") ORDER BY id");
+        let rows = query.build().fetch_all(&self.pool).await?;
+        rows.iter().map(|row| row.try_get("id")).collect()
+    }
+
+    /// `ListMinimalRepos(ctx, ReposListOptions{ExternalRepoIncludeContains,
+    /// ExternalRepoExcludeContains, OnlyPrivate: true})`: private repositories
+    /// whose external id matches every exclusion and at least one inclusion
+    /// (`SIMILAR TO`, i.e. a POSIX regex), ordered by id.
+    ///
+    /// The baseline only calls this when at least one inclusion exists;
+    /// exclusions are relative to inclusions.
+    pub async fn list_private_repos_by_external_contains(
+        &self,
+        includes: &[ExternalRepoSpec],
+        excludes: &[ExternalRepoSpec],
+    ) -> Result<Vec<i32>, sqlx::Error> {
+        if includes.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut query = sqlx::QueryBuilder::new(
+            "SELECT id FROM repo WHERE deleted_at IS NULL AND blocked IS NULL AND private AND (",
+        );
+        for (i, spec) in includes.iter().enumerate() {
+            if i > 0 {
+                query.push(" OR ");
+            }
+            query
+                .push("(external_id SIMILAR TO ")
+                .push_bind(spec.id.clone())
+                .push(" AND external_service_type = ")
+                .push_bind(spec.service_type.clone())
+                .push(" AND external_service_id = ")
+                .push_bind(spec.service_id.clone())
+                .push(")");
+        }
+        query.push(")");
+        for spec in excludes {
+            query
+                .push(" AND (external_id NOT SIMILAR TO ")
+                .push_bind(spec.id.clone())
+                .push(" AND external_service_type = ")
+                .push_bind(spec.service_type.clone())
+                .push(" AND external_service_id = ")
+                .push_bind(spec.service_id.clone())
+                .push(")");
+        }
+        query.push(" ORDER BY id");
+        let rows = query.build().fetch_all(&self.pool).await?;
+        rows.iter().map(|row| row.try_get("id")).collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

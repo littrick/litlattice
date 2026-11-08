@@ -80,3 +80,249 @@ pub async fn hard_delete(pool: &PgPool, ids: &[i32], service_type: &str) -> Resu
         not_found: false,
     })
 }
+
+/// One full `user_external_accounts` row as `Database.UserExternalAccounts().List`
+/// returns it (`extsvc.Account`, without the encrypted account data).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternalAccount {
+    pub id: i32,
+    pub user_id: i32,
+    pub service_type: String,
+    pub service_id: String,
+    pub client_id: String,
+    pub account_id: String,
+    /// `expired_at IS NOT NULL` (the timestamp itself is not exposed).
+    pub expired: bool,
+}
+
+/// `database.ExternalAccountsListOptions`, restricted to the fields the
+/// permission syncer and the authz provider lookup use.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ExternalAccountsListOptions {
+    pub user_id: Option<i32>,
+    pub service_type: Option<String>,
+    pub service_id: Option<String>,
+    pub client_id: Option<String>,
+    pub account_id: Option<String>,
+    /// `expired_at IS NULL`.
+    pub exclude_expired: bool,
+    /// `expired_at IS NOT NULL`.
+    pub only_expired: bool,
+}
+
+fn account_from_row(row: &sqlx::postgres::PgRow) -> Result<ExternalAccount, sqlx::Error> {
+    Ok(ExternalAccount {
+        id: row.try_get("id")?,
+        user_id: row.try_get("user_id")?,
+        service_type: row.try_get("service_type")?,
+        service_id: row.try_get("service_id")?,
+        client_id: row.try_get("client_id")?,
+        account_id: row.try_get("account_id")?,
+        expired: row.try_get("expired")?,
+    })
+}
+
+/// `userExternalAccountsStore.List`. Live accounts only, ordered by id.
+pub async fn list(
+    pool: &PgPool,
+    opts: &ExternalAccountsListOptions,
+) -> Result<Vec<ExternalAccount>, sqlx::Error> {
+    let mut query = sqlx::QueryBuilder::new(
+        "SELECT id, user_id, service_type, service_id, client_id, account_id, \
+         (expired_at IS NOT NULL) AS expired \
+         FROM user_external_accounts WHERE deleted_at IS NULL",
+    );
+    if let Some(user_id) = opts.user_id {
+        query.push(" AND user_id = ").push_bind(user_id);
+    }
+    if let Some(service_type) = &opts.service_type {
+        query
+            .push(" AND service_type = ")
+            .push_bind(service_type.clone());
+    }
+    if let Some(service_id) = &opts.service_id {
+        query
+            .push(" AND service_id = ")
+            .push_bind(service_id.clone());
+    }
+    if let Some(client_id) = &opts.client_id {
+        query.push(" AND client_id = ").push_bind(client_id.clone());
+    }
+    if let Some(account_id) = &opts.account_id {
+        query
+            .push(" AND account_id = ")
+            .push_bind(account_id.clone());
+    }
+    if opts.exclude_expired {
+        query.push(" AND expired_at IS NULL");
+    }
+    if opts.only_expired {
+        query.push(" AND expired_at IS NOT NULL");
+    }
+    query.push(" ORDER BY id ASC");
+
+    let rows = query.build().fetch_all(pool).await?;
+    rows.iter().map(account_from_row).collect()
+}
+
+/// `extsvc.AccountSpec` as carried by `authz.Provider.FetchAccount`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternalAccountSpec {
+    pub service_type: String,
+    pub service_id: String,
+    pub client_id: String,
+    pub account_id: String,
+}
+
+/// `userExternalAccountsStore.Upsert` failure modes.
+#[derive(Debug)]
+pub enum UpsertError {
+    Database(sqlx::Error),
+    /// The account already belongs to a different user.
+    ConflictingUser {
+        existing_user_id: i32,
+        requested_user_id: i32,
+    },
+}
+
+impl std::fmt::Display for UpsertError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Database(err) => write!(f, "{err}"),
+            Self::ConflictingUser {
+                existing_user_id,
+                requested_user_id,
+            } => write!(
+                f,
+                "unable to change association of external account from user \
+                 {existing_user_id} to user {requested_user_id} (delete the external \
+                 account and then try again)"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for UpsertError {}
+
+impl From<sqlx::Error> for UpsertError {
+    fn from(err: sqlx::Error) -> Self {
+        Self::Database(err)
+    }
+}
+
+/// `userExternalAccountsStore.Upsert`: insert the account when the
+/// `(service_type, service_id, client_id, account_id)` tuple is new, otherwise
+/// update its data and clear `expired_at`.
+///
+/// The account data columns are written empty: this port has no encryption
+/// keyring yet, and the permission syncer only consumes account identity. The
+/// baseline encrypts `auth_data`/`account_data` here.
+pub async fn upsert(
+    pool: &PgPool,
+    user_id: i32,
+    spec: &ExternalAccountSpec,
+) -> Result<ExternalAccount, UpsertError> {
+    let mut tx = pool.begin().await?;
+
+    let existing = sqlx::query(
+        r#"
+SELECT id, user_id
+FROM user_external_accounts
+WHERE service_type = $1
+  AND service_id = $2
+  AND client_id = $3
+  AND account_id = $4
+  AND deleted_at IS NULL
+"#,
+    )
+    .bind(&spec.service_type)
+    .bind(&spec.service_id)
+    .bind(&spec.client_id)
+    .bind(&spec.account_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+
+    let row = match existing {
+        Some(row) => {
+            let existing_user_id: i32 = row.try_get("user_id")?;
+            if existing_user_id != user_id {
+                return Err(UpsertError::ConflictingUser {
+                    existing_user_id,
+                    requested_user_id: user_id,
+                });
+            }
+            sqlx::query(
+                r#"
+UPDATE user_external_accounts
+SET auth_data = '',
+    account_data = '',
+    encryption_key_id = '',
+    updated_at = now(),
+    expired_at = NULL
+WHERE service_type = $1
+  AND service_id = $2
+  AND client_id = $3
+  AND account_id = $4
+  AND user_id = $5
+  AND deleted_at IS NULL
+RETURNING id, user_id, service_type, service_id, client_id, account_id,
+          (expired_at IS NOT NULL) AS expired
+"#,
+            )
+            .bind(&spec.service_type)
+            .bind(&spec.service_id)
+            .bind(&spec.client_id)
+            .bind(&spec.account_id)
+            .bind(user_id)
+            .fetch_one(&mut *tx)
+            .await?
+        }
+        None => {
+            sqlx::query(
+                r#"
+INSERT INTO user_external_accounts
+    (user_id, service_type, service_id, client_id, account_id,
+     auth_data, account_data, encryption_key_id)
+VALUES ($1, $2, $3, $4, $5, '', '', '')
+RETURNING id, user_id, service_type, service_id, client_id, account_id,
+          (expired_at IS NOT NULL) AS expired
+"#,
+            )
+            .bind(user_id)
+            .bind(&spec.service_type)
+            .bind(&spec.service_id)
+            .bind(&spec.client_id)
+            .bind(&spec.account_id)
+            .fetch_one(&mut *tx)
+            .await?
+        }
+    };
+
+    tx.commit().await?;
+    account_from_row(&row).map_err(UpsertError::Database)
+}
+
+/// `userExternalAccountsStore.TouchExpired`: mark the accounts expired.
+pub async fn touch_expired(pool: &PgPool, ids: &[i32]) -> Result<(), sqlx::Error> {
+    if ids.is_empty() {
+        return Ok(());
+    }
+    sqlx::query("UPDATE user_external_accounts SET expired_at = now() WHERE id = ANY($1)")
+        .bind(ids.to_vec())
+        .execute(pool)
+        .await
+        .map(|_| ())
+}
+
+/// `userExternalAccountsStore.TouchLastValid`: clear expiry and record the
+/// last successful validation.
+pub async fn touch_last_valid(pool: &PgPool, id: i32) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE user_external_accounts \
+         SET expired_at = NULL, last_valid_at = now() WHERE id = $1",
+    )
+    .bind(id)
+    .execute(pool)
+    .await
+    .map(|_| ())
+}

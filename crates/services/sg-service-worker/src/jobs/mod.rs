@@ -64,6 +64,7 @@ pub mod outbound_webhooks;
 pub mod perforce_changelist_mapper;
 pub mod permissions;
 pub mod perms_syncer;
+pub mod perms_syncer_fetch;
 pub mod policies_matcher;
 pub mod ratelimit;
 pub mod repo_embedding_janitor;

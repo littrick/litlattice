@@ -465,6 +465,25 @@ AND expired_at IS NULL
     Ok(user_ids)
 }
 
+/// `PermsStore.FetchReposByExternalAccount`: the repository IDs previously
+/// synced for one external account, in table order.
+pub async fn fetch_repos_by_external_account(
+    pool: &PgPool,
+    account_id: i32,
+) -> Result<Vec<i32>, sqlx::Error> {
+    let rows = sqlx::query(
+        r#"
+SELECT repo_id
+FROM user_repo_permissions
+WHERE user_external_account_id = $1
+"#,
+    )
+    .bind(account_id)
+    .fetch_all(pool)
+    .await?;
+    rows.iter().map(|row| row.try_get("repo_id")).collect()
+}
+
 /// `permissionSyncJobStore.SaveSyncResult`; `is_partial_success` is only set
 /// when the job finished successfully with both successful and failed code
 /// host statuses.
