@@ -35,6 +35,7 @@ use crate::config::WorkerConfigs;
 use crate::framework::BackgroundRoutine;
 use crate::registry;
 
+pub mod adminanalytics;
 pub mod batches;
 pub mod codeintel_metrics_reporter;
 pub mod codeintel_package_filter_applicator;
@@ -197,6 +198,9 @@ pub fn all_jobs() -> Vec<(&'static str, Arc<dyn Job>)> {
                 }
                 "permission-sync-job-cleaner" => Arc::new(permissions::PermissionSyncJobCleaner),
                 "rate-limit-config" => Arc::new(ratelimit::RateLimitConfigJob::new()),
+                "refresh-analytics-cache" => {
+                    Arc::new(adminanalytics::RefreshAnalyticsCacheJob)
+                }
                 "repo-embedding-janitor" => {
                     Arc::new(repo_embedding_janitor::RepoEmbeddingJanitor::new())
                 }
