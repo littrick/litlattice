@@ -8,10 +8,13 @@
 //! - `ListChangesets` with only `RepoIDs` set (`store/changesets.go`), used by
 //!   `EnqueueChangesetSyncsForRepos`;
 //! - `GetChangeset` with the syncer's preconditions (`store/changesets.go`),
-//!   used by `SyncChangeset`.
+//!   used by `SyncChangeset`;
+//! - `EnqueueNextScheduledChangeset` (`store/changesets.go`), the
+//!   `batches-scheduler` job's `scheduled` → `queued` transition.
 //!
 //! Migrations stay owned by the Go `migrator`; these queries never change the
-//! schema and never write.
+//! schema. The only write is the changeset state transition above, which is an
+//! existing M6 storage contract (`changesets.reconciler_state`).
 
 use sqlx::postgres::PgPool;
 use sqlx::types::time::OffsetDateTime;
@@ -290,5 +293,38 @@ LIMIT 1
         .await?;
 
         row.map(|row| row.try_get("repo_id")).transpose()
+    }
+
+    /// `Store.EnqueueNextScheduledChangeset`
+    /// (`store/changesets.go`): move the oldest `scheduled` changeset to
+    /// `queued` and return its id, or `None` for `store.ErrNoResults`.
+    ///
+    /// The baseline CTE selects by `updated_at ASC LIMIT 1` and updates the
+    /// matching row in a single statement; this is the same statement with
+    /// `RETURNING changesets.id` (the baseline scans the full row and treats
+    /// `ID == 0` as no results).
+    pub async fn enqueue_next_scheduled_changeset(
+        &self,
+    ) -> Result<Option<i64>, sqlx::Error> {
+        sqlx::query_scalar(
+            r#"
+WITH c AS (
+    SELECT *
+    FROM changesets
+    WHERE reconciler_state = $1
+    ORDER BY updated_at ASC
+    LIMIT 1
+)
+UPDATE changesets
+SET reconciler_state = $2
+FROM c
+WHERE c.id = changesets.id
+RETURNING changesets.id
+"#,
+        )
+        .bind("scheduled")
+        .bind("queued")
+        .fetch_optional(&self.pool)
+        .await
     }
 }

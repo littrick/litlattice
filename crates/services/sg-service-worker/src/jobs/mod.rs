@@ -38,6 +38,7 @@ use crate::registry;
 pub mod adminanalytics;
 pub mod auth_sourcegraph_operator_cleaner;
 pub mod batches;
+pub mod batches_scheduler;
 pub mod codehost_version_syncing;
 pub mod codeintel_metrics_reporter;
 pub mod codeintel_package_filter_applicator;
@@ -172,6 +173,7 @@ pub fn all_jobs() -> Vec<(&'static str, Arc<dyn Job>)> {
                     Arc::new(auth_sourcegraph_operator_cleaner::SourcegraphOperatorCleaner::new())
                 }
                 "batches-janitor" => Arc::new(batches::BatchesJanitor::new()),
+                "batches-scheduler" => Arc::new(batches_scheduler::BatchesScheduler::new()),
                 "cody-gateway-usage-check" => Arc::new(codygateway::CodyGatewayUsageCheck),
                 "cody-llm-token-counter" => Arc::new(completions::CodyLlmTokenCounter),
                 "event-logs-janitor" => Arc::new(eventlogs::EventLogsJanitor),

@@ -325,6 +325,15 @@ impl SiteConfiguration {
         self.bool_field("disableAutoCodeHostSyncs")
     }
 
+    /// `conf.Get().BatchChangesRolloutWindows`
+    /// (`schema.BatchChangeRolloutWindow`): the raw
+    /// `batchChanges.rolloutWindows` value. Absent and `null` both mean "no
+    /// windows", like the nil Go slice pointer. The scheduler parses the array
+    /// itself because `rate` is `any` in the schema.
+    pub fn batch_changes_rollout_windows(&self) -> Option<&serde_json::Value> {
+        self.raw.get("batchChanges.rolloutWindows")
+    }
+
     /// `experimentalFeatures.batchChanges.enablePerforce`: whether Perforce is
     /// a supported Batch Changes code host
     /// (`batches/types.GetSupportedExternalServices`).
