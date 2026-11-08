@@ -182,7 +182,9 @@ pub trait RemoteUrlSource: Send + Sync {
 /// `gitRepoSyncer`/`cloneRepo`/`doRepoUpdate` do.
 ///
 /// Still missing from the baseline path: the fast-forward/`RepoSyncState` DB
-/// update, command timeouts, and URL redaction/credential handling.
+/// update and command timeouts. The site-config remote URL lookup
+/// (`cloneurl`) is not ported; [`RemoteUrlSource`] provides the raw URL and
+/// parsing/redaction follow `vcs.ParseURL`.
 pub struct LocalBackend {
     pub repos_dir: PathBuf,
     pub remote_urls: Arc<dyn RemoteUrlSource>,
@@ -206,6 +208,16 @@ impl LocalBackend {
                 repo,
                 err.message()
             ))
+        })
+    }
+
+    /// Look up the remote URL and parse it like the baseline's
+    /// `RemoteURLSourceFunc` (`vcs.ParseURL`, wrapped with
+    /// `parsing remote URL %q`).
+    async fn parse_remote_url(&self, repo: &str) -> Result<crate::vcsurl::VcsUrl, GitError> {
+        let raw = self.remote_url(repo).await?;
+        crate::vcsurl::VcsUrl::parse(&raw).map_err(|err| {
+            GitError::Message(format!("parsing remote URL {raw:?}: {}", err.message()))
         })
     }
 
@@ -311,12 +323,12 @@ impl UpdateBackend for LocalBackend {
         // The remote lookup happens before the progress pipe in the baseline's
         // `syncer.Fetch`, but the error is still wrapped with the (empty)
         // output. `SetLastOutput` runs even when the lookup fails.
-        let remote_url = self.remote_url(repo).await;
+        let remote_url = self.parse_remote_url(repo).await;
         let mut output = LinebasedWriter::new();
         let result = match remote_url {
-            Ok(remote_url) => {
+            Ok(remote) => {
                 let mut on_progress = progress_handler(&mut output, lock);
-                crate::vcssyncer::fetch_repo_with(&git_dir, &remote_url, &mut on_progress).await
+                crate::vcssyncer::fetch_repo_with(&git_dir, &remote, &mut on_progress).await
             }
             Err(err) => Err(err),
         };
@@ -365,12 +377,12 @@ impl LocalBackend {
 
         // The remote lookup is part of `syncer.Clone` in the baseline, so its
         // failure is wrapped with the (possibly empty) clone output too.
-        let remote_url = self.remote_url(repo).await;
+        let remote_url = self.parse_remote_url(repo).await;
         let mut output = LinebasedWriter::new();
         let result = match remote_url {
-            Ok(remote_url) => {
+            Ok(remote) => {
                 let mut on_progress = progress_handler(&mut output, lock);
-                crate::vcssyncer::clone_repo_with(&tmp_path, &remote_url, &mut on_progress).await
+                crate::vcssyncer::clone_repo_with(&tmp_path, &remote, &mut on_progress).await
             }
             Err(err) => Err(err),
         };

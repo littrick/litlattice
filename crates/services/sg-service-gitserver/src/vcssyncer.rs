@@ -3,11 +3,11 @@
 //!
 //! The baseline does not run `git clone`: it initializes a bare repository and
 //! fetches the configured refspecs into it, then points `HEAD` at the remote's
-//! default branch. Only the git syncer is covered here; the HTTP/SSH remote
-//! URL lookup, custom fetch commands (site configuration), TLS settings, and
-//! credential redaction still come from the site/DB layer that is not ported.
-//! Remote URLs with inline credentials are therefore passed to git as-is; the
-//! baseline moves them into a credential helper instead.
+//! default branch. Only the git syncer is covered here; the site-config remote
+//! URL lookup (`cloneurl`) and custom fetch commands (site configuration) are
+//! not ported yet. URL parsing, credential handling, and output redaction do
+//! follow the baseline: credentials move from the command line into
+//! `GIT_SG_*` env vars, and progress output is redacted before it is written.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -18,6 +18,7 @@ use regex::Regex;
 use tokio::process::Command;
 
 use crate::git::GitError;
+use crate::vcsurl::{UrlRedactor, VcsUrl};
 
 /// The refspecs `runFetchCommand` uses when `SRC_GITSERVER_REFSPECS` is unset.
 const DEFAULT_REFSPECS: [&str; 7] = [
@@ -98,61 +99,118 @@ pub fn fetch_refspecs() -> Vec<String> {
     }
 }
 
-/// Port of `executil.ConfigureRemoteGitCommand`'s environment, minus the TLS
-/// and URL-credential handling that needs site configuration. The baseline
-/// also injects `-c credential.helper=` and `-c protocol.version=2` before
-/// the subcommand; callers build those explicitly.
-fn apply_remote_env(command: &mut Command, _remote_url: &str) {
+/// Port of `executil.ConfigureRemoteGitCommand` (minus the site-config TLS
+/// settings, which are not ported yet).
+///
+/// The baseline prepends `-c` options to `git`'s arguments and appends
+/// environment variables. When the remote URL carries a password and is not
+/// SSH, the URL argument loses its userinfo and an extra credential helper
+/// reads `GIT_SG_USERNAME`/`GIT_SG_PASSWORD` instead, so the secret does not
+/// appear in `ps` output.
+fn configure_remote_command(
+    args: &mut Vec<String>,
+    env: &mut Vec<(String, String)>,
+    remote: &VcsUrl,
+) {
     // Disable password prompts; the command is non-interactive.
-    command.env("GIT_ASKPASS", "true");
+    env.push(("GIT_ASKPASS".to_owned(), "true".to_owned()));
     // Suppress SSH host-key prompts and bound the connect time.
-    command.env(
-        "GIT_SSH_COMMAND",
-        "ssh -o BatchMode=yes -o ConnectTimeout=30",
-    );
+    env.push((
+        "GIT_SSH_COMMAND".to_owned(),
+        "ssh -o BatchMode=yes -o ConnectTimeout=30".to_owned(),
+    ));
     // Keep the `git/` prefix: GitHub breaks protocol v2 negotiation without it.
-    command.env("GIT_HTTP_USER_AGENT", "git/Sourcegraph-Bot");
+    env.push((
+        "GIT_HTTP_USER_AGENT".to_owned(),
+        "git/Sourcegraph-Bot".to_owned(),
+    ));
+
+    // Unset credential helpers because the command is non-interactive. Even
+    // when a second helper is added below, this is required so the original
+    // helper is not used as well.
+    let mut extra_args = vec!["-c".to_owned(), "credential.helper=".to_owned()];
+
+    if let Some(password) = remote.password().filter(|_| !remote.is_ssh()) {
+        // The baseline compares `arg == remoteURL.String()`; a URL copied
+        // verbatim from the remote source therefore matches.
+        let url_string = remote.to_string();
+        let mut has_creds = false;
+        for arg in args.iter_mut() {
+            if *arg == url_string {
+                *arg = remote.without_user();
+                has_creds = true;
+            }
+        }
+        if has_creds {
+            extra_args.push("-c".to_owned());
+            extra_args.push(
+                "credential.helper=!f() { echo \"username=$GIT_SG_USERNAME\\npassword=$GIT_SG_PASSWORD\"; }; f"
+                    .to_owned(),
+            );
+            env.push(("GIT_SG_USERNAME".to_owned(), remote.username().to_owned()));
+            env.push(("GIT_SG_PASSWORD".to_owned(), password.to_owned()));
+        }
+    }
+
+    // Protocol v2 for every command except `ls-remote`, where it hurts.
+    if args.len() > 1 && args[1] != "ls-remote" {
+        extra_args.push("-c".to_owned());
+        extra_args.push("protocol.version=2".to_owned());
+    }
+
+    if let Some((program, rest)) = args.split_first_mut() {
+        let mut configured = vec![std::mem::take(program)];
+        configured.append(&mut extra_args);
+        configured.extend(rest.iter().cloned());
+        *args = configured;
+    }
 }
 
-/// Port of `runFetchCommand` for the default command shape: `git -c
-/// credential.helper= -c protocol.version=2 fetch --progress --prune <url>
-/// <refspecs...>` with `GIT_DIR` set and `GIT_LFS_SKIP_SMUDGE=1` (see issue
-/// #7322: skip LFS content in repositories with Git LFS configured).
-pub async fn fetch_remote(git_dir: &Path, remote_url: &str) -> Result<i32, GitError> {
-    fetch_remote_with(git_dir, remote_url, &mut |_| {}).await
+/// Port of `runFetchCommand` for the default command shape:
+/// `git -c credential.helper= [-c credential.helper=…] -c protocol.version=2
+/// fetch --progress --prune <url> <refspecs...>` with `GIT_DIR` set and
+/// `GIT_LFS_SKIP_SMUDGE=1` (see issue #7322: skip LFS content in repositories
+/// with Git LFS configured).
+pub async fn fetch_remote(git_dir: &Path, remote: &VcsUrl) -> Result<i32, GitError> {
+    fetch_remote_with(git_dir, remote, &mut |_| {}).await
 }
 
 /// [`fetch_remote`] while reporting the command's output line by line.
 ///
 /// Both stdout and stderr are split with `scanLinesWithCRLF` (the token keeps
 /// its `\r`/`\n` delimiter) and passed to `on_progress`, matching
-/// `executil.RunCommandWriteOutput`. The baseline interleaves the two streams
-/// through a synchronized writer; here they are drained concurrently and
-/// tokens may arrive in either order, which only affects display.
+/// `executil.RunCommandWriteOutput`. Every token is redacted first, so the
+/// remote's credentials never reach `SetLastOutput` or the lock status. The
+/// baseline interleaves the two streams through a synchronized writer; here
+/// they are drained concurrently and tokens may arrive in either order, which
+/// only affects display.
 pub async fn fetch_remote_with(
     git_dir: &Path,
-    remote_url: &str,
+    remote: &VcsUrl,
     on_progress: &mut (dyn FnMut(&[u8]) + Send),
 ) -> Result<i32, GitError> {
-    let mut command = Command::new("git");
-    command
-        .arg("-c")
-        .arg("credential.helper=")
-        // Use protocol v2 for everything except `ls-remote`, like the baseline.
-        .arg("-c")
-        .arg("protocol.version=2")
-        .arg("fetch")
-        .arg("--progress")
-        .arg("--prune")
-        .arg(remote_url);
+    let mut args = vec![
+        "git".to_owned(),
+        "fetch".to_owned(),
+        "--progress".to_owned(),
+        "--prune".to_owned(),
+        remote.to_string(),
+    ];
     for refspec in fetch_refspecs() {
-        command.arg(refspec);
+        args.push(refspec);
     }
+    let mut env = Vec::new();
+    configure_remote_command(&mut args, &mut env, remote);
+
+    let mut command = Command::new(&args[0]);
     command
+        .args(&args[1..])
         .current_dir(git_dir)
         .env("GIT_DIR", git_dir)
         .env("GIT_LFS_SKIP_SMUDGE", "1");
-    apply_remote_env(&mut command, remote_url);
+    for (key, value) in &env {
+        command.env(key, value);
+    }
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -164,10 +222,17 @@ pub async fn fetch_remote_with(
     let mut stdout = child.stdout.take().expect("stdout is piped");
     let mut stderr = child.stderr.take().expect("stderr is piped");
 
+    // The baseline redacts each line before writing it out.
+    let redactor = UrlRedactor::new(remote);
+    let mut redact = |token: &[u8]| {
+        let text = String::from_utf8_lossy(token);
+        on_progress(redactor.redact(&text).as_bytes());
+    };
+
     // The baseline serializes stdout and stderr through a synchronized writer;
     // a mutex around the callback gives the same guarantee (it is only held
     // for the synchronous call, never across an await).
-    let on_progress = std::sync::Mutex::new(on_progress);
+    let on_progress = std::sync::Mutex::new(&mut redact as &mut (dyn FnMut(&[u8]) + Send));
     let read_stdout = scan_stream(&mut stdout, &on_progress);
     let read_stderr = scan_stream(&mut stderr, &on_progress);
     let (stdout_result, stderr_result) = tokio::join!(read_stdout, read_stderr);
@@ -242,7 +307,7 @@ impl LineScanner {
 
 /// Port of `setHEAD`: pick the remote's default branch, falling back to
 /// `master`, then to the first local branch, and point `HEAD` at it.
-pub async fn set_head(git_dir: &Path, remote_url: &str) -> Result<(), GitError> {
+pub async fn set_head(git_dir: &Path, remote: &VcsUrl) -> Result<(), GitError> {
     // `EnsureHEAD` failures are logged, not fatal, like the baseline.
     if let Err(err) = ensure_head(git_dir) {
         tracing::error!(
@@ -259,11 +324,13 @@ pub async fn set_head(git_dir: &Path, remote_url: &str) -> Result<(), GitError> 
     // `ConfigureRemoteGitCommand`, so it inherits neither the parent
     // environment nor (for local remotes) needs it. Mirror that: only
     // `GIT_DIR` plus the remote settings are exported.
-    let output = run_bare(git_dir, &["remote", "show", remote_url], true).await?;
+    let remote_string = remote.to_string();
+    let output = run_bare(git_dir, &["remote", "show", &remote_string], Some(remote)).await?;
     if !output.status.success() {
+        let redactor = UrlRedactor::new(remote);
         return Err(GitError::Message(format!(
             "failed to fetch remote info: {}",
-            String::from_utf8_lossy(&output.stderr).trim_end()
+            redactor.redact(String::from_utf8_lossy(&output.stderr).trim_end())
         )));
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -277,9 +344,9 @@ pub async fn set_head(git_dir: &Path, remote_url: &str) -> Result<(), GitError> 
     }
 
     // If the branch pointed to by HEAD does not exist, pick the first branch.
-    let check = run_bare(git_dir, &["rev-parse", &head_branch, "--"], false).await?;
+    let check = run_bare(git_dir, &["rev-parse", &head_branch, "--"], None).await?;
     if !check.status.success() {
-        let branches = run_bare(git_dir, &["branch"], false).await?;
+        let branches = run_bare(git_dir, &["branch"], None).await?;
         if !branches.status.success() {
             return Err(GitError::Message(format!(
                 "failed to list branches: {}",
@@ -298,7 +365,7 @@ pub async fn set_head(git_dir: &Path, remote_url: &str) -> Result<(), GitError> 
     }
 
     let target = format!("refs/heads/{head_branch}");
-    let output = run_bare(git_dir, &["symbolic-ref", "HEAD", &target], false).await?;
+    let output = run_bare(git_dir, &["symbolic-ref", "HEAD", &target], None).await?;
     if !output.status.success() {
         return Err(GitError::Message(format!(
             "Failed to set HEAD: {}",
@@ -315,21 +382,33 @@ fn head_branch_pattern() -> &'static Regex {
 }
 
 /// `git` in `git_dir` with `GIT_DIR` set and a cleared environment, matching
-/// `common.GitDir.Set` followed by an optional `ConfigureRemoteGitCommand`
-/// (which sees a non-nil `cmd.Env` and therefore does not inherit the
-/// parent process environment).
-async fn run_bare(git_dir: &Path, args: &[&str], remote: bool) -> Result<Output, GitError> {
-    let mut command = Command::new("git");
+/// `common.GitDir.Set` followed by an optional `ConfigureRemoteGitCommand`.
+/// The environment is cleared for determinism; only the variables the
+/// baseline would set for a remote command are added back.
+async fn run_bare(
+    git_dir: &Path,
+    args: &[&str],
+    remote: Option<&VcsUrl>,
+) -> Result<Output, GitError> {
+    let mut configured_args: Vec<String> = std::iter::once("git".to_owned())
+        .chain(args.iter().map(|arg| (*arg).to_owned()))
+        .collect();
+    let mut env = Vec::new();
+    if let Some(remote) = remote {
+        configure_remote_command(&mut configured_args, &mut env, remote);
+    }
+
+    let mut command = Command::new(&configured_args[0]);
     command
-        .args(args)
+        .args(&configured_args[1..])
         .current_dir(git_dir)
         .env_clear()
         .env("GIT_DIR", git_dir)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    if remote {
-        apply_remote_env(&mut command, "");
+    for (key, value) in &env {
+        command.env(key, value);
     }
     command
         .output()
@@ -342,17 +421,17 @@ async fn run_bare(git_dir: &Path, args: &[&str], remote: bool) -> Result<Output,
 /// message and git output line is passed to `on_progress` (`tryWrite`).
 pub async fn clone_repo(
     git_dir: &Path,
-    remote_url: &str,
+    remote: &VcsUrl,
     on_progress: &mut (dyn FnMut(&[u8]) + Send),
 ) -> Result<(), GitError> {
-    clone_repo_with(git_dir, remote_url, on_progress).await
+    clone_repo_with(git_dir, remote, on_progress).await
 }
 
 /// [`clone_repo`]: syncer messages and fetch output are reported the way
 /// `readFetchProgress` turns the progress pipe into lock statuses.
 pub async fn clone_repo_with(
     git_dir: &Path,
-    remote_url: &str,
+    remote: &VcsUrl,
     on_progress: &mut (dyn FnMut(&[u8]) + Send),
 ) -> Result<(), GitError> {
     std::fs::create_dir_all(git_dir)
@@ -366,7 +445,7 @@ pub async fn clone_repo_with(
     );
 
     emit(on_progress, "Fetching remote contents\n");
-    let exit_status = fetch_remote_with(git_dir, remote_url, on_progress).await?;
+    let exit_status = fetch_remote_with(git_dir, remote, on_progress).await?;
     if exit_status != 0 {
         return Err(GitError::Message(format!(
             "failed to fetch: exit status {exit_status}"
@@ -375,7 +454,7 @@ pub async fn clone_repo_with(
     emit(on_progress, "Fetched remote contents\n");
 
     emit(on_progress, "Setting local HEAD to remote HEAD\n");
-    set_head(git_dir, remote_url).await?;
+    set_head(git_dir, remote).await?;
     emit(on_progress, "Finished setting local HEAD to remote HEAD\n");
 
     Ok(())
@@ -390,11 +469,11 @@ fn emit(on_progress: &mut (dyn FnMut(&[u8]) + Send), message: &str) {
 /// way as during a clone.
 pub async fn fetch_repo_with(
     git_dir: &Path,
-    remote_url: &str,
+    remote: &VcsUrl,
     on_progress: &mut (dyn FnMut(&[u8]) + Send),
 ) -> Result<(), GitError> {
     emit(on_progress, "Fetching remote contents\n");
-    let exit_status = fetch_remote_with(git_dir, remote_url, on_progress).await?;
+    let exit_status = fetch_remote_with(git_dir, remote, on_progress).await?;
     if exit_status != 0 {
         return Err(GitError::Message(format!(
             "exit code: {exit_status}, failed to fetch from remote"
@@ -403,7 +482,7 @@ pub async fn fetch_repo_with(
     emit(on_progress, "Fetched remote contents\n");
 
     emit(on_progress, "Setting local HEAD to remote HEAD\n");
-    set_head(git_dir, remote_url).await?;
+    set_head(git_dir, remote).await?;
     emit(on_progress, "Finished setting local HEAD to remote HEAD\n");
     Ok(())
 }
@@ -560,7 +639,8 @@ mod tests {
         let mut progress = Vec::new();
         let mut on_progress = |line: &[u8]| progress.extend_from_slice(line);
 
-        clone_repo(&git_dir, origin.to_str().expect("utf8"), &mut on_progress)
+        let remote = VcsUrl::parse(origin.to_str().expect("utf8")).expect("parse");
+        clone_repo(&git_dir, &remote, &mut on_progress)
             .await
             .expect("clone");
 
@@ -589,13 +669,85 @@ mod tests {
         );
     }
 
+    #[test]
+    fn configures_remote_commands_like_the_baseline() {
+        // Credentials move from the argument list into the environment.
+        let remote = VcsUrl::parse("https://user:password@host.xz/org/repo.git").expect("parse");
+        let mut args = vec!["git".to_owned(), "fetch".to_owned(), remote.to_string()];
+        let mut env = Vec::new();
+        configure_remote_command(&mut args, &mut env, &remote);
+        assert_eq!(
+            args,
+            vec![
+                "git".to_owned(),
+                "-c".to_owned(),
+                "credential.helper=".to_owned(),
+                "-c".to_owned(),
+                "credential.helper=!f() { echo \"username=$GIT_SG_USERNAME\\npassword=$GIT_SG_PASSWORD\"; }; f".to_owned(),
+                "-c".to_owned(),
+                "protocol.version=2".to_owned(),
+                "fetch".to_owned(),
+                "https://host.xz/org/repo.git".to_owned(),
+            ]
+        );
+        assert!(env.contains(&("GIT_SG_USERNAME".to_owned(), "user".to_owned())));
+        assert!(env.contains(&("GIT_SG_PASSWORD".to_owned(), "password".to_owned())));
+        assert!(env.contains(&("GIT_ASKPASS".to_owned(), "true".to_owned())));
+
+        // `ls-remote` does not get protocol v2.
+        let mut args = vec!["git".to_owned(), "ls-remote".to_owned(), remote.to_string()];
+        let mut env = Vec::new();
+        configure_remote_command(&mut args, &mut env, &remote);
+        assert!(!args.iter().any(|arg| arg == "protocol.version=2"));
+
+        // SSH URLs keep their credentials out of the helper machinery.
+        let ssh = VcsUrl::parse("ssh://user:password@host.xz/org/repo.git").expect("parse");
+        let mut args = vec!["git".to_owned(), "fetch".to_owned(), ssh.to_string()];
+        let mut env = Vec::new();
+        configure_remote_command(&mut args, &mut env, &ssh);
+        assert!(args.contains(&ssh.to_string()));
+        assert!(!env.iter().any(|(key, _)| key.starts_with("GIT_SG_")));
+
+        // No password: the URL is left alone and no helper is added.
+        let plain = VcsUrl::parse("https://host.xz/org/repo.git").expect("parse");
+        let mut args = vec!["git".to_owned(), "fetch".to_owned(), plain.to_string()];
+        let mut env = Vec::new();
+        configure_remote_command(&mut args, &mut env, &plain);
+        assert!(args.contains(&plain.to_string()));
+        assert!(!env.iter().any(|(key, _)| key.starts_with("GIT_SG_")));
+    }
+
+    #[tokio::test]
+    async fn redacts_credentials_from_fetch_progress() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let git_dir = tmp.path().join("clone-3").join(".git");
+        // A remote URL with credentials that does not exist: git reports the
+        // URL in its error output, which must be redacted.
+        let remote = VcsUrl::parse("https://user:secret@127.0.0.1:1/org/repo.git").expect("parse");
+        let mut progress = Vec::new();
+        let mut on_progress = |line: &[u8]| progress.extend_from_slice(line);
+        clone_repo(&git_dir, &remote, &mut on_progress)
+            .await
+            .expect_err("unreachable remote");
+        let progress = String::from_utf8_lossy(&progress).into_owned();
+        // The credential never appears: it is passed through GIT_SG_PASSWORD
+        // and every progress token is redacted before it is written.
+        assert!(
+            !progress.contains("secret"),
+            "credential leaked: {progress}"
+        );
+        assert!(!progress.contains("user@"), "userinfo leaked: {progress}");
+        assert!(progress.contains("https://127.0.0.1:1/org/repo.git"));
+    }
+
     #[tokio::test]
     async fn reports_a_fetch_failure() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let git_dir = tmp.path().join("clone-2").join(".git");
         let mut progress = Vec::new();
         let mut on_progress = |line: &[u8]| progress.extend_from_slice(line);
-        let err = clone_repo(&git_dir, "/does/not/exist", &mut on_progress)
+        let remote = VcsUrl::parse("/does/not/exist").expect("parse");
+        let err = clone_repo(&git_dir, &remote, &mut on_progress)
             .await
             .expect_err("missing remote");
         match err {

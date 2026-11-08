@@ -39,6 +39,7 @@ pub mod search;
 pub mod trace;
 pub mod update;
 pub mod vcssyncer;
+pub mod vcsurl;
 
 use config::GitserverConfig;
 use gitservice::GitService;
