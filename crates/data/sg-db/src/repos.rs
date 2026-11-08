@@ -154,6 +154,34 @@ ORDER BY id
             })
             .collect()
     }
+
+    /// `Repos.ListMinimalRepos(ctx, ReposListOptions{NoCloned: true})`: the
+    /// repositories that gitserver has not finished cloning yet. The baseline
+    /// joins `gitserver_repos` and keeps `clone_status IN ('not_cloned',
+    /// 'cloning')`; soft-deleted and blocked repositories are excluded by the
+    /// default list conditions, and the result is ordered by id.
+    pub async fn list_uncloned(&self) -> Result<Vec<RepoName>, sqlx::Error> {
+        let rows = sqlx::query(
+            r#"
+SELECT repo.id, repo.name
+FROM repo
+JOIN gitserver_repos gr ON gr.repo_id = repo.id
+WHERE repo.deleted_at IS NULL AND repo.blocked IS NULL
+  AND gr.clone_status IN ('not_cloned', 'cloning')
+ORDER BY repo.id
+"#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(RepoName {
+                    id: row.try_get("id")?,
+                    name: row.try_get("name")?,
+                })
+            })
+            .collect()
+    }
 }
 
 #[cfg(test)]

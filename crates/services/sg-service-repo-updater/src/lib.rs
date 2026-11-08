@@ -35,6 +35,7 @@ pub mod scheduler;
 pub mod store;
 pub mod sync_worker;
 pub mod syncer;
+pub mod uncloned;
 
 use config::RepoUpdaterConfig;
 use debug::DebugContext;
@@ -46,6 +47,7 @@ use scheduler::{RepoUpdateClient, SystemClock, UpdateScheduler};
 use store::{DbRepoNameStore, DbSchedulerStore};
 use sync_worker::SyncWorker;
 use syncer::{ExtsvcSourceFactory, Syncer};
+use uncloned::UnclonedReposManager;
 
 /// `httpcli.Doer` adapter for the `OTHER` source's src-expose request.
 struct HttpClientGetter(sg_http::HttpClient);
@@ -200,6 +202,13 @@ impl Service for RepoUpdaterService {
             gitserver_client.clone() as Arc<dyn RepoUpdateClient>,
             Arc::clone(&live),
         ));
+        // `newUnclonedReposManager`: priority boost for repos gitserver has
+        // not cloned yet.
+        let uncloned_manager = Arc::new(UnclonedReposManager::new(
+            Arc::clone(&scheduler),
+            (*repo_store).clone(),
+            Arc::clone(&live),
+        ));
 
         let grpc = RepoUpdaterGrpc {
             scheduler: Arc::clone(&scheduler),
@@ -302,6 +311,9 @@ impl Service for RepoUpdaterService {
         } else {
             tracing::info!("repository purger is disabled via env DISABLE_REPO_PURGE");
         }
+
+        // `newUnclonedReposManager`: every 30s, prioritise uncloned repos.
+        uncloned_manager.spawn(ctx.shutdown.clone(), &tasks);
 
         if let Some(prof_addr) = config.prof_addr.clone() {
             let context = Arc::new(DebugContext {

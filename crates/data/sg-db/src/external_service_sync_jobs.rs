@@ -526,6 +526,133 @@ mod tests {
             .await
     }
 
+    /// The shared test database can hold sync jobs left behind by other tests
+    /// and by the differential harnesses, while `Dequeue`, `ResetStalled` and
+    /// `CleanupSyncJobs` work on the whole table (the baseline's tests each get
+    /// a fresh database). This parks foreign pending jobs out of reach for the
+    /// duration of a test and puts them back afterwards.
+    ///
+    /// External services are deliberately not touched: tests in this binary
+    /// that create services run concurrently, and mutating their rows would
+    /// race with their assertions. Foreign due services are instead handled by
+    /// `enqueues_due_services_without_duplicates`, which removes the jobs its
+    /// global enqueue creates for them.
+    ///
+    /// Parking is one-way on purpose: when a test panics the restore is
+    /// skipped, and the parked state is inert (not dequeueable, not resettable,
+    /// not cleanable) instead of poisoning the next test.
+    struct ParkedForeignWork {
+        pool: PgPool,
+        queued: Vec<(i32, Option<OffsetDateTime>)>,
+        finished: Vec<(i32, OffsetDateTime)>,
+        heartbeats: Vec<(i32, Option<OffsetDateTime>)>,
+    }
+
+    impl ParkedForeignWork {
+        async fn park(pool: &PgPool, own: &[i64]) -> Self {
+            // Queued jobs would otherwise be handed to `dequeue`.
+            let queued: Vec<(i32, Option<OffsetDateTime>)> = sqlx::query_as(
+                "SELECT id, process_after FROM external_service_sync_jobs \
+                 WHERE state = 'queued' AND NOT (external_service_id = ANY($1)) \
+                 AND (process_after IS NULL OR process_after <= clock_timestamp())",
+            )
+            .bind(own)
+            .fetch_all(pool)
+            .await
+            .expect("park queued jobs");
+            let queued_ids: Vec<i32> = queued.iter().map(|(id, _)| *id).collect();
+            sqlx::query(
+                "UPDATE external_service_sync_jobs \
+                 SET process_after = clock_timestamp() + interval '1 day' \
+                 WHERE id = ANY($1)",
+            )
+            .bind(&queued_ids)
+            .execute(pool)
+            .await
+            .expect("park queued jobs");
+
+            // A NULL `finished_at` hides a job from `cleanup_sync_jobs`.
+            let finished: Vec<(i32, OffsetDateTime)> = sqlx::query_as(
+                "SELECT id, finished_at FROM external_service_sync_jobs \
+                 WHERE state IN ('completed', 'failed', 'canceled') \
+                 AND finished_at IS NOT NULL \
+                 AND NOT (external_service_id = ANY($1))",
+            )
+            .bind(own)
+            .fetch_all(pool)
+            .await
+            .expect("park finished jobs");
+            let finished_ids: Vec<i32> = finished.iter().map(|(id, _)| *id).collect();
+            sqlx::query(
+                "UPDATE external_service_sync_jobs SET finished_at = NULL WHERE id = ANY($1)",
+            )
+            .bind(&finished_ids)
+            .execute(pool)
+            .await
+            .expect("park finished jobs");
+
+            // A fresh heartbeat keeps `reset_stalled` away from foreign work.
+            let heartbeats: Vec<(i32, Option<OffsetDateTime>)> = sqlx::query_as(
+                "SELECT id, last_heartbeat_at FROM external_service_sync_jobs \
+                 WHERE state = 'processing' AND NOT (external_service_id = ANY($1)) \
+                 AND (last_heartbeat_at IS NULL \
+                      OR last_heartbeat_at <= clock_timestamp() - interval '30 seconds')",
+            )
+            .bind(own)
+            .fetch_all(pool)
+            .await
+            .expect("park processing jobs");
+            let heartbeat_ids: Vec<i32> = heartbeats.iter().map(|(id, _)| *id).collect();
+            sqlx::query(
+                "UPDATE external_service_sync_jobs \
+                 SET last_heartbeat_at = clock_timestamp() \
+                 WHERE id = ANY($1)",
+            )
+            .bind(&heartbeat_ids)
+            .execute(pool)
+            .await
+            .expect("park processing jobs");
+
+            Self {
+                pool: pool.clone(),
+                queued,
+                finished,
+                heartbeats,
+            }
+        }
+
+        async fn restore(self) {
+            for (id, process_after) in &self.queued {
+                sqlx::query(
+                    "UPDATE external_service_sync_jobs SET process_after = $2 WHERE id = $1",
+                )
+                .bind(id)
+                .bind(process_after)
+                .execute(&self.pool)
+                .await
+                .expect("restore queued job");
+            }
+            for (id, finished_at) in &self.finished {
+                sqlx::query("UPDATE external_service_sync_jobs SET finished_at = $2 WHERE id = $1")
+                    .bind(id)
+                    .bind(finished_at)
+                    .execute(&self.pool)
+                    .await
+                    .expect("restore finished job");
+            }
+            for (id, heartbeat) in &self.heartbeats {
+                sqlx::query(
+                    "UPDATE external_service_sync_jobs SET last_heartbeat_at = $2 WHERE id = $1",
+                )
+                .bind(id)
+                .bind(heartbeat)
+                .execute(&self.pool)
+                .await
+                .expect("restore heartbeat");
+            }
+        }
+    }
+
     async fn insert_service(
         pool: &PgPool,
         suffix: u128,
@@ -564,6 +691,14 @@ mod tests {
         let due = insert_service(&pool, suffix, "OTHER", Some(hours_ago(1))).await;
         let phab = insert_service(&pool, suffix + 1, "PHABRICATOR", Some(hours_ago(1))).await;
         let future = insert_service(&pool, suffix + 2, "OTHER", Some(hours_ago(-24))).await;
+        let parked = ParkedForeignWork::park(&pool, &[due, phab, future]).await;
+        // `enqueue_sync_jobs` is table-wide; remember where the queue ended so
+        // the jobs it creates for foreign due services can be removed again.
+        let jobs_before: i32 =
+            sqlx::query_scalar("SELECT COALESCE(MAX(id), 0) FROM external_service_sync_jobs")
+                .fetch_one(&pool)
+                .await
+                .expect("max job id");
 
         let result = async {
             store.enqueue_sync_jobs().await.expect("enqueue");
@@ -583,11 +718,21 @@ mod tests {
         }
         .await;
 
+        sqlx::query(
+            "DELETE FROM external_service_sync_jobs \
+             WHERE id > $1 AND NOT (external_service_id = ANY($2))",
+        )
+        .bind(jobs_before)
+        .bind([due, phab, future])
+        .execute(&pool)
+        .await
+        .expect("cleanup foreign jobs");
         sqlx::query("DELETE FROM external_services WHERE id = ANY($1)")
             .bind([due, phab, future])
             .execute(&pool)
             .await
             .expect("cleanup");
+        parked.restore().await;
         result
     }
 
@@ -603,6 +748,7 @@ mod tests {
         let suffix = unique_suffix();
         let older = insert_service(&pool, suffix, "OTHER", Some(hours_ago(2))).await;
         let newer = insert_service(&pool, suffix + 1, "OTHER", Some(hours_ago(1))).await;
+        let parked = ParkedForeignWork::park(&pool, &[older, newer]).await;
 
         let result = async {
             // `enqueue_single_sync_job` keeps the queue scoped to this test;
@@ -675,6 +821,7 @@ mod tests {
             .execute(&pool)
             .await
             .expect("cleanup");
+        parked.restore().await;
         result
     }
 
@@ -689,6 +836,7 @@ mod tests {
         let store = SyncJobsStore::new(pool.clone());
         let suffix = unique_suffix();
         let service = insert_service(&pool, suffix, "OTHER", Some(hours_ago(1))).await;
+        let parked = ParkedForeignWork::park(&pool, &[service]).await;
 
         let result = async {
             store.enqueue_single_sync_job(service).await.expect("enqueue");
@@ -745,6 +893,7 @@ mod tests {
             .execute(&pool)
             .await
             .expect("cleanup");
+        parked.restore().await;
         result
     }
 
@@ -759,9 +908,15 @@ mod tests {
         let store = SyncJobsStore::new(pool.clone());
         let suffix = unique_suffix();
         let service = insert_service(&pool, suffix, "OTHER", Some(hours_ago(1))).await;
+        let parked = ParkedForeignWork::park(&pool, &[service]).await;
 
         let result = async {
-            store.enqueue_sync_jobs().await.expect("enqueue");
+            // Scope the queue to this test's service: `enqueue_sync_jobs` is
+            // table-wide and would also queue foreign due services.
+            store
+                .enqueue_single_sync_job(service)
+                .await
+                .expect("enqueue");
             let job = store.dequeue("worker").await.expect("dequeue").expect("job");
             store
                 .update_counters(
@@ -834,6 +989,7 @@ mod tests {
             .execute(&pool)
             .await
             .expect("cleanup");
+        parked.restore().await;
         result
     }
 }
