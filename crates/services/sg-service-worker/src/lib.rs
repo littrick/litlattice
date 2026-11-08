@@ -2,32 +2,40 @@
 
 //! `worker` service.
 //!
-//! This slice (9.8a) is the startup skeleton: the baseline framework
-//! configuration (`WORKER_JOB_ALLOWLIST` / `WORKER_JOB_BLOCKLIST` with their
-//! exact `safeSplit` / validation / precedence semantics), the sorted registry
-//! of the 56 compiled-in jobs, frontend configuration discovery, keyring
-//! initialization, the frontend database connection and the `/healthz` server
-//! on `:3189`.
+//! Ported so far:
 //!
-//! No job routines are started yet: `createBackgroundRoutines` returns an
-//! empty set. Later slices add the framework (`framework/`) and the job groups
-//! one by one; until a job is ported, the Rust worker runs only the health
-//! server, which is what the pilot differential exercises.
+//! * 9.8a — the startup skeleton: the baseline framework configuration
+//!   (`WORKER_JOB_ALLOWLIST` / `WORKER_JOB_BLOCKLIST` with their exact
+//!   `safeSplit` / validation / precedence semantics), the sorted registry of
+//!   the 56 compiled-in jobs, frontend configuration discovery, keyring
+//!   initialization, the frontend database connection and the `/healthz`
+//!   server on `:3189`;
+//! * 9.8b — `internal/goroutine.PeriodicGoroutine`, the `job.Job` /
+//!   `env.Config` contracts, `loadConfigs` / `validateConfigs` /
+//!   `createBackgroundRoutines` / `emitJobCountMetrics`, the live
+//!   configuration watcher and the first job (`webhook-log-janitor`).
+//!
+//! Jobs that are not ported yet fail startup when enabled; the pilot narrows
+//! `WORKER_JOB_ALLOWLIST` to the ported jobs.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use sg_config::ConfigClient;
+use sg_config::{ConfigClient, ConfigWatcher, LiveConfig};
 use sg_core::{ConfigError, EnvReader, Service, ServiceContext, ServiceError};
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 
 pub mod config;
+pub mod framework;
 pub mod health;
+pub mod jobs;
 pub mod registry;
 
 use config::WorkerConfigs;
+use jobs::{Job, JobDeps};
 
 pub const SERVICE_NAME: &str = "worker";
 
@@ -44,21 +52,34 @@ pub struct WorkerService {
     /// can listen on a side port while the Go binary keeps `:3189`.
     addr_override: Option<String>,
     config: Option<WorkerConfigs>,
+    jobs: Vec<(&'static str, Arc<dyn Job>)>,
+    /// `validateConfigs`'s error. `LoadConfig` stores it on a shadowed local
+    /// config that nothing reads; kept here so the differential harness can
+    /// show what the baseline discards.
+    job_config_error: Option<String>,
 }
 
 impl WorkerService {
     pub fn new() -> Self {
-        Self {
-            addr_override: None,
-            config: None,
-        }
+        Self::with_addr_override(None)
     }
 
     pub fn with_addr(addr: impl Into<String>) -> Self {
+        Self::with_addr_override(Some(addr.into()))
+    }
+
+    fn with_addr_override(addr_override: Option<String>) -> Self {
         Self {
-            addr_override: Some(addr.into()),
+            addr_override,
             config: None,
+            jobs: Vec::new(),
+            job_config_error: None,
         }
+    }
+
+    /// The per-job validation error, which the baseline never surfaces.
+    pub fn job_config_error(&self) -> Option<&str> {
+        self.job_config_error.as_deref()
     }
 }
 
@@ -81,7 +102,15 @@ impl Service for WorkerService {
             "false",
             "check that go-sqlite3 works then exit 0 if it's ok or 1 if not",
         );
-        self.config = Some(WorkerConfigs::load(env, self.addr_override.clone()));
+        // `loadConfigs`: the worker config first, then every job's configs
+        // (regardless of whether the job is enabled).
+        let config = WorkerConfigs::load(env, self.addr_override.clone());
+        let jobs = jobs::all_jobs();
+        jobs::load_configs(env, &jobs);
+        // `validateConfigs`; its error is discarded by the baseline (§1.1).
+        self.job_config_error = jobs::validate_configs(&jobs, &config);
+        self.config = Some(config);
+        self.jobs = jobs;
         Ok(())
     }
 
@@ -127,26 +156,62 @@ impl Service for WorkerService {
                 "postgres_dsn is not configured by the frontend",
             ));
         }
-        let _frontend_pool = sg_db::connect(&dsn, 10).await.map_err(|err| {
+        let frontend_pool = sg_db::connect(&dsn, 10).await.map_err(|err| {
             ServiceError::with_source("failed to create database connection", err)
         })?;
 
-        // `createBackgroundRoutines` has no ported job groups yet, so the
-        // routine set is empty. `authz.DefaultSubRepoPermsChecker`, the
-        // `src_worker_jobs` gauges and the `background-job-logger` recorder are
-        // added with the framework / job slices.
+        // `authz.DefaultSubRepoPermsChecker` is not ported yet: no ported job
+        // builds a sub-repo permissions client.
 
-        // `ready()`: all routines (here just the health server) are set up.
+        // `src_worker_jobs` gauges, emitted before the routines are built.
+        jobs::emit_job_count_metrics(&self.jobs, &config);
+
+        // The live configuration is seeded with the initial fetch above; the
+        // watcher replaces it when the frontend publishes a change.
+        let live_config = Arc::new(LiveConfig::new((*unified).clone()));
+        let tracker = TaskTracker::new();
+        {
+            let watcher = ConfigWatcher::new(Arc::clone(&config_client), Arc::clone(&live_config));
+            let watcher_shutdown = ctx.shutdown.clone();
+            tracker.spawn(async move { watcher.run(watcher_shutdown).await });
+        }
+
+        // `createBackgroundRoutines`: may take a while when jobs wait for
+        // external services / migrations.
+        let deps = JobDeps {
+            frontend: frontend_pool,
+            live_config,
+        };
+        let routines = jobs::create_background_routines(&deps, &self.jobs, &config)
+            .await
+            .map_err(ServiceError::new)?;
+        let routine_count = routines.len();
+        for routine in routines {
+            routine.spawn(&tracker, ctx.shutdown.clone());
+        }
+
+        // `ready()`: every routine is set up; the recorder
+        // (`background-job-logger`) is not ported yet.
         ctx.ready.mark_ready();
 
         tracing::info!(
             addr = config.listen_addr,
             jobs = registry::count(),
-            "serving worker health endpoint (no job routines ported yet)"
+            routines = routine_count,
+            "serving worker health endpoint"
         );
-        serve_health(&config.listen_addr, ctx.shutdown.clone())
+
+        let served = serve_health(&config.listen_addr, ctx.shutdown.clone())
             .await
-            .map_err(|err| ServiceError::with_source("serving HTTP", err))
+            .map_err(|err| ServiceError::with_source("serving HTTP", err));
+
+        // `MonitorBackgroundRoutines` returns once cancelled; drain every
+        // routine before the process exits.
+        ctx.shutdown.cancel();
+        tracker.close();
+        tracker.wait().await;
+
+        served
     }
 }
 

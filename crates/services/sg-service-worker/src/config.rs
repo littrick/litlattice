@@ -152,6 +152,23 @@ impl WorkerConfigs {
     pub fn should_run(&self, name: &str) -> bool {
         self.global.should_run(name)
     }
+
+    /// Test-only constructor: a package-level config with the given lists and
+    /// a default (empty, valid) returned config. Avoids touching the process
+    /// environment from tests that run in parallel with the ones above.
+    #[cfg(test)]
+    pub(crate) fn for_test(allowlist: &[&str], blocklist: &[&str]) -> Self {
+        Self {
+            returned: WorkerConfig::default(),
+            global: WorkerConfig {
+                names: registry::job_names(),
+                job_allowlist: allowlist.iter().map(|value| (*value).to_owned()).collect(),
+                job_blocklist: blocklist.iter().map(|value| (*value).to_owned()).collect(),
+                errs: Vec::new(),
+            },
+            listen_addr: format!(":{DEFAULT_PORT}"),
+        }
+    }
 }
 
 /// `safeSplit` is `strings.Split` but returns nil (not `[""]`) on empty input.
