@@ -83,23 +83,29 @@ async fn route(context: &DebugContext, req: Request<Incoming>) -> Response<tonic
             )
         }
         "/repo-updater-state" => {
-            // `repoUpdaterStatsHandler`: the baseline renders an HTML table
-            // unless `format=json`; this port always serves the JSON body
-            // (documented divergence). With `format=json` the output matches
-            // the baseline byte for byte: same field order, `null` for nil
-            // slices, and no trailing newline.
+            // `repoUpdaterStatsHandler`: the `repos` dumper renders an HTML
+            // table unless `format=json` is requested explicitly.
             let query = req.uri().query().unwrap_or_default();
             let want_dumper = query_param(query, "dumper").unwrap_or_default();
+            let want_format = query_param(query, "format").unwrap_or_default();
             if !matches!(want_dumper.as_str(), "" | "repos") {
                 // `dumps` stays nil when no dumper matches: `json.MarshalIndent`
                 // then writes `null`.
                 return text(StatusCode::OK, "application/json", "null");
             }
-            text(
-                StatusCode::OK,
-                "application/json",
-                state_json(&context.scheduler, &context.sync_jobs).await,
-            )
+            let dump = state_dump(&context.scheduler, &context.sync_jobs).await;
+            if want_format != "json" {
+                // `html/template.Execute` writes the body directly; net/http
+                // sniffs `text/html; charset=utf-8` from `<!doctype html>`.
+                return text(
+                    StatusCode::OK,
+                    "text/html; charset=utf-8",
+                    render_state_html(&dump),
+                );
+            }
+            // `json.MarshalIndent` output: same field order, `null` for nil
+            // slices, and no trailing newline.
+            text(StatusCode::OK, "application/json", state_json(&dump))
         }
         "/manual-purge" => manual_purge(context, req).await,
         "/" => text(StatusCode::OK, "text/html; charset=utf-8", INDEX_HTML),
@@ -207,10 +213,12 @@ struct QueueEntryDump {
 struct ScheduleEntryDump {
     #[serde(rename = "Repo")]
     repo: RepoDump,
-    #[serde(rename = "Interval")]
-    interval: i64,
-    #[serde(rename = "Due")]
-    due: String,
+    // `time.Duration` marshals as an integer number of nanoseconds; the HTML
+    // page prints Go's duration string instead.
+    #[serde(rename = "Interval", serialize_with = "serialize_nanos")]
+    interval: std::time::Duration,
+    #[serde(rename = "Due", serialize_with = "serialize_time")]
+    due: SystemTime,
 }
 
 #[derive(serde::Serialize)]
@@ -221,14 +229,14 @@ struct SyncJobDump {
     state: String,
     #[serde(rename = "FailureMessage")]
     failure_message: String,
-    #[serde(rename = "QueuedAt")]
-    queued_at: String,
-    #[serde(rename = "StartedAt")]
-    started_at: String,
-    #[serde(rename = "FinishedAt")]
-    finished_at: String,
-    #[serde(rename = "ProcessAfter")]
-    process_after: String,
+    #[serde(rename = "QueuedAt", serialize_with = "serialize_optional_time")]
+    queued_at: Option<sg_db::OffsetDateTime>,
+    #[serde(rename = "StartedAt", serialize_with = "serialize_optional_time")]
+    started_at: Option<sg_db::OffsetDateTime>,
+    #[serde(rename = "FinishedAt", serialize_with = "serialize_optional_time")]
+    finished_at: Option<sg_db::OffsetDateTime>,
+    #[serde(rename = "ProcessAfter", serialize_with = "serialize_optional_time")]
+    process_after: Option<sg_db::OffsetDateTime>,
     #[serde(rename = "NumResets")]
     num_resets: i32,
     #[serde(rename = "ExternalServiceID")]
@@ -268,7 +276,7 @@ fn non_empty<T>(values: Vec<T>) -> Option<Vec<T>> {
     (!values.is_empty()).then_some(values)
 }
 
-pub async fn state_json(scheduler: &UpdateScheduler, jobs: &SyncJobsStore) -> String {
+async fn state_dump(scheduler: &UpdateScheduler, jobs: &SyncJobsStore) -> StateDump {
     let queue: Vec<QueueEntryDump> = scheduler
         .debug_queue()
         .into_iter()
@@ -290,9 +298,8 @@ pub async fn state_json(scheduler: &UpdateScheduler, jobs: &SyncJobsStore) -> St
                 id: entry.repo.id,
                 name: entry.repo.name,
             },
-            // `time.Duration` marshals as an integer number of nanoseconds.
-            interval: entry.interval.as_nanos() as i64,
-            due: format_rfc3339(entry.due),
+            interval: entry.interval,
+            due: entry.due,
         })
         .collect();
 
@@ -306,10 +313,10 @@ pub async fn state_json(scheduler: &UpdateScheduler, jobs: &SyncJobsStore) -> St
                     id: job.id as i64,
                     state: job.state,
                     failure_message: job.failure_message.unwrap_or_default(),
-                    queued_at: format_optional_time(job.queued_at),
-                    started_at: format_optional_time(job.started_at),
-                    finished_at: format_optional_time(job.finished_at),
-                    process_after: format_optional_time(job.process_after),
+                    queued_at: job.queued_at,
+                    started_at: job.started_at,
+                    finished_at: job.finished_at,
+                    process_after: job.process_after,
                     num_resets: job.num_resets,
                     external_service_id: job.external_service_id,
                     num_failures: job.num_failures,
@@ -329,14 +336,40 @@ pub async fn state_json(scheduler: &UpdateScheduler, jobs: &SyncJobsStore) -> St
         }
     };
 
-    let dump = StateDump {
+    StateDump {
         name: "repos",
         update_queue: non_empty(queue),
         schedule: non_empty(schedule),
         sync_jobs,
-    };
-    // `json.MarshalIndent` writes no trailing newline.
+    }
+}
+
+/// `json.MarshalIndent` writes no trailing newline.
+fn state_json(dump: &StateDump) -> String {
     serde_json::to_string_pretty(&[dump]).expect("serialize debug dump")
+}
+
+/// `time.Duration` marshals as an integer number of nanoseconds.
+fn serialize_nanos<S: serde::Serializer>(
+    value: &std::time::Duration,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serializer.serialize_i64(value.as_nanos() as i64)
+}
+
+/// `time.Time` marshals with `FormatRFC3339Nano`.
+fn serialize_time<S: serde::Serializer>(
+    value: &SystemTime,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serializer.serialize_str(&format_rfc3339(*value))
+}
+
+fn serialize_optional_time<S: serde::Serializer>(
+    value: &Option<sg_db::OffsetDateTime>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serializer.serialize_str(&format_optional_time(*value))
 }
 
 /// Go's zero `time.Time` renders as `0001-01-01T00:00:00Z`.
@@ -447,9 +480,232 @@ fn go_parse_float(value: &str) -> Result<f64, String> {
     }
 }
 
-/// `FormatRFC3339Nano`-compatible rendering (UTC, trailing zeros trimmed).
-pub fn format_rfc3339(time: SystemTime) -> String {
-    let (seconds, nanos) = match time.duration_since(UNIX_EPOCH) {
+/// The `text/template` body of `state.html.tmpl`, shared verbatim with the
+/// baseline so the rendered whitespace cannot drift.
+const STATE_HTML_TEMPLATE: &str = include_str!("state.html.tmpl");
+
+/// One row of a `{{range}}` in `state.html.tmpl`.
+enum HtmlItem<'a> {
+    Schedule(&'a ScheduleEntryDump),
+    Queue(&'a QueueEntryDump),
+    Job(&'a SyncJobDump),
+}
+
+/// Render `state.html.tmpl` like `html/template.Execute`: literal text is
+/// copied verbatim, `{{range}}` bodies are repeated per item (or the
+/// `{{else}}` body when the slice is nil), and actions are HTML-escaped in
+/// text context.
+fn render_state_html(dump: &StateDump) -> String {
+    let mut output = String::new();
+    render_template(&mut output, STATE_HTML_TEMPLATE, None, dump);
+    output
+}
+
+fn render_template(
+    output: &mut String,
+    template: &str,
+    item: Option<&HtmlItem<'_>>,
+    dump: &StateDump,
+) {
+    let mut rest = template;
+    while let Some(start) = rest.find("{{") {
+        output.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        let Some(end) = after.find("}}") else {
+            output.push_str(&rest[start..]);
+            return;
+        };
+        let action = after[..end].trim();
+        let tail = &after[end + 2..];
+
+        if let Some(name) = action.strip_prefix("range $schedulerDump.") {
+            let (body, else_body, remainder) = split_range(tail);
+            match name {
+                "Schedule" => match &dump.schedule {
+                    Some(entries) => {
+                        for entry in entries {
+                            render_template(output, body, Some(&HtmlItem::Schedule(entry)), dump);
+                        }
+                    }
+                    None => render_else(output, else_body, dump),
+                },
+                "UpdateQueue" => match &dump.update_queue {
+                    Some(entries) => {
+                        for entry in entries {
+                            render_template(output, body, Some(&HtmlItem::Queue(entry)), dump);
+                        }
+                    }
+                    None => render_else(output, else_body, dump),
+                },
+                "SyncJobs" => match &dump.sync_jobs {
+                    Some(entries) => {
+                        for entry in entries {
+                            render_template(output, body, Some(&HtmlItem::Job(entry)), dump);
+                        }
+                    }
+                    None => render_else(output, else_body, dump),
+                },
+                _ => {}
+            }
+            rest = remainder;
+            continue;
+        }
+
+        output.push_str(&render_action(action, item));
+        rest = tail;
+    }
+    output.push_str(rest);
+}
+
+fn render_else(output: &mut String, else_body: Option<&str>, dump: &StateDump) {
+    if let Some(else_body) = else_body {
+        render_template(output, else_body, None, dump);
+    }
+}
+
+/// Split the text after a `{{range}}` action into (body, else body, rest).
+fn split_range(rest: &str) -> (&str, Option<&str>, &str) {
+    let end_start = rest.find("{{end}}").expect("range end");
+    match rest[..end_start].find("{{else}}") {
+        Some(else_start) => (
+            &rest[..else_start],
+            Some(&rest[else_start + "{{else}}".len()..end_start]),
+            &rest[end_start + "{{end}}".len()..],
+        ),
+        None => (
+            &rest[..end_start],
+            None,
+            &rest[end_start + "{{end}}".len()..],
+        ),
+    }
+}
+
+fn render_action(action: &str, item: Option<&HtmlItem<'_>>) -> String {
+    let Some(item) = item else {
+        // `{{$schedulerDump := .}}` emits nothing.
+        return String::new();
+    };
+    match item {
+        HtmlItem::Schedule(entry) => match action {
+            ".Repo.ID" => entry.repo.id.to_string(),
+            ".Repo.Name" => html_escape(&entry.repo.name),
+            "truncateDuration .Interval" => html_escape(&go_duration_string(entry.interval)),
+            ".Due.Format \"Mon, 02 Jan 2006 15:04:05 MST\"" => {
+                html_escape(&go_time_format(entry.due))
+            }
+            _ => String::new(),
+        },
+        HtmlItem::Queue(entry) => match action {
+            ".Repo.ID" => entry.repo.id.to_string(),
+            ".Repo.Name" => html_escape(&entry.repo.name),
+            ".Updating" => entry.updating.to_string(),
+            ".Priority" => entry.priority.to_string(),
+            ".Seq" => entry.seq.to_string(),
+            _ => String::new(),
+        },
+        HtmlItem::Job(job) => match action {
+            ".ExternalServiceID" => job.external_service_id.to_string(),
+            ".State" => html_escape(&job.state),
+            ".StartedAt" => html_escape(&go_optional_time_string(job.started_at)),
+            ".FinishedAt" => html_escape(&go_optional_time_string(job.finished_at)),
+            ".FailureMessage" => html_escape(&job.failure_message),
+            _ => String::new(),
+        },
+    }
+}
+
+/// `html/template`'s text-context escape table.
+fn html_escape(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        match character {
+            '\0' => escaped.push('\u{FFFD}'),
+            '"' => escaped.push_str("&#34;"),
+            '&' => escaped.push_str("&amp;"),
+            '\'' => escaped.push_str("&#39;"),
+            '+' => escaped.push_str("&#43;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            character => escaped.push(character),
+        }
+    }
+    escaped
+}
+
+/// `truncateDuration` applied by the template: `d.Truncate(time.Second)`
+/// followed by `time.Duration.String()`.
+fn go_duration_string(duration: std::time::Duration) -> String {
+    let seconds = duration.as_secs();
+    if seconds == 0 {
+        return "0s".to_owned();
+    }
+    let hours = seconds / 3600;
+    let minutes = (seconds % 3600) / 60;
+    let seconds = seconds % 60;
+    if hours > 0 {
+        format!("{hours}h{minutes}m{seconds}s")
+    } else if minutes > 0 {
+        format!("{minutes}m{seconds}s")
+    } else {
+        format!("{seconds}s")
+    }
+}
+
+/// `.Due.Format "Mon, 02 Jan 2006 15:04:05 MST"` (UTC).
+fn go_time_format(time: SystemTime) -> String {
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    const WEEKDAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+    let (seconds, _) = unix_parts(time);
+    let days = seconds.div_euclid(86_400);
+    let second_of_day = seconds.rem_euclid(86_400);
+    let (year, month, day) = civil_from_days(days);
+    let weekday = WEEKDAYS[(days + 4).rem_euclid(7) as usize];
+    format!(
+        "{weekday}, {day:02} {} {year:04} {:02}:{:02}:{:02} UTC",
+        MONTHS[(month - 1) as usize],
+        second_of_day / 3600,
+        (second_of_day % 3600) / 60,
+        second_of_day % 60
+    )
+}
+
+/// `time.Time.String()` in UTC: `2006-01-02 15:04:05.999999999 -0700 MST`.
+fn go_time_string(time: SystemTime) -> String {
+    let (seconds, nanos) = unix_parts(time);
+    let days = seconds.div_euclid(86_400);
+    let second_of_day = seconds.rem_euclid(86_400);
+    let (year, month, day) = civil_from_days(days);
+    let mut rendered = format!(
+        "{year:04}-{month:02}-{day:02} {:02}:{:02}:{:02}",
+        second_of_day / 3600,
+        (second_of_day % 3600) / 60,
+        second_of_day % 60
+    );
+    if nanos > 0 {
+        let mut fraction = format!("{nanos:09}");
+        while fraction.ends_with('0') {
+            fraction.pop();
+        }
+        rendered.push('.');
+        rendered.push_str(&fraction);
+    }
+    rendered.push_str(" +0000 UTC");
+    rendered
+}
+
+/// `{{.StartedAt}}` on a `time.Time`; the zero value matches Go.
+fn go_optional_time_string(time: Option<sg_db::OffsetDateTime>) -> String {
+    match time {
+        Some(time) => go_time_string(SystemTime::from(time)),
+        None => "0001-01-01 00:00:00 +0000 UTC".to_owned(),
+    }
+}
+
+/// Seconds since the Unix epoch and the sub-second nanoseconds.
+fn unix_parts(time: SystemTime) -> (i64, u32) {
+    match time.duration_since(UNIX_EPOCH) {
         Ok(after) => (after.as_secs() as i64, after.subsec_nanos()),
         Err(before) => {
             let duration = before.duration();
@@ -461,7 +717,12 @@ pub fn format_rfc3339(time: SystemTime) -> String {
             }
             (seconds, nanos as u32)
         }
-    };
+    }
+}
+
+/// `FormatRFC3339Nano`-compatible rendering (UTC, trailing zeros trimmed).
+pub fn format_rfc3339(time: SystemTime) -> String {
+    let (seconds, nanos) = unix_parts(time);
     let days = seconds.div_euclid(86_400);
     let second_of_day = seconds.rem_euclid(86_400);
     let (year, month, day) = civil_from_days(days);
@@ -575,6 +836,131 @@ mod tests {
                 ("limit".to_owned(), "1".to_owned()),
                 ("perSecond".to_owned(), "0.5".to_owned())
             ]
+        );
+    }
+
+    fn system_time(seconds: i64, nanos: u32) -> SystemTime {
+        UNIX_EPOCH + Duration::new(seconds as u64, nanos)
+    }
+
+    /// The same synthetic data `state_html_golden.go` renders with the real
+    /// `html/template`, including escaping and Go time/duration formats.
+    fn populated_dump() -> StateDump {
+        let repo = |id, name: &str| RepoDump {
+            id,
+            name: name.to_owned(),
+        };
+        StateDump {
+            name: "repos",
+            schedule: Some(vec![
+                ScheduleEntryDump {
+                    repo: repo(1, "example.com/owner/repo"),
+                    interval: Duration::from_secs(46 * 60 + 37),
+                    due: system_time(1794129846, 0),
+                },
+                ScheduleEntryDump {
+                    repo: repo(2, "a<b&c\"d'e+f.com/r"),
+                    interval: Duration::from_secs(3600),
+                    due: system_time(1794130245, 0),
+                },
+                ScheduleEntryDump {
+                    repo: repo(3, "unicode.example.com/é/r"),
+                    interval: Duration::ZERO,
+                    due: system_time(1798761600, 0),
+                },
+                ScheduleEntryDump {
+                    repo: repo(4, "seconds.example.com/r"),
+                    interval: Duration::from_secs(59),
+                    due: system_time(1794182399, 0),
+                },
+                ScheduleEntryDump {
+                    repo: repo(5, "long.example.com/r"),
+                    interval: Duration::from_secs(2 * 3600 + 3 * 60 + 4),
+                    due: system_time(1794096000, 0),
+                },
+            ]),
+            update_queue: Some(vec![
+                QueueEntryDump {
+                    repo: repo(5, "queue.example.com/a<b>"),
+                    updating: true,
+                    priority: 0,
+                    seq: 0,
+                },
+                QueueEntryDump {
+                    repo: repo(6, "queue.example.com/c&d"),
+                    updating: false,
+                    priority: -3,
+                    seq: 1_234_567_890_123,
+                },
+            ]),
+            sync_jobs: Some(vec![
+                SyncJobDump {
+                    id: 42,
+                    state: "completed".to_owned(),
+                    failure_message: "ok".to_owned(),
+                    queued_at: None,
+                    started_at: Some(sg_db::system_time_to_offset(system_time(1794128400, 0))),
+                    finished_at: Some(sg_db::system_time_to_offset(system_time(
+                        1794128462,
+                        987_654_321,
+                    ))),
+                    process_after: None,
+                    num_resets: 0,
+                    external_service_id: 7,
+                    num_failures: 0,
+                    cancel: false,
+                    repos_synced: 0,
+                    repo_sync_errors: 0,
+                    repos_added: 0,
+                    repos_deleted: 0,
+                    repos_modified: 0,
+                    repos_unmodified: 0,
+                },
+                SyncJobDump {
+                    id: 43,
+                    state: "errored".to_owned(),
+                    failure_message: "boom <script>&'\" +".to_owned(),
+                    queued_at: None,
+                    started_at: None,
+                    finished_at: None,
+                    process_after: None,
+                    num_resets: 0,
+                    external_service_id: 9,
+                    num_failures: 0,
+                    cancel: false,
+                    repos_synced: 0,
+                    repo_sync_errors: 0,
+                    repos_added: 0,
+                    repos_deleted: 0,
+                    repos_modified: 0,
+                    repos_unmodified: 0,
+                },
+            ]),
+        }
+    }
+
+    /// Byte-for-byte against `html/template` output captured from the
+    /// baseline template (see `testdata/state_html_populated.html`).
+    #[test]
+    fn renders_populated_state_html_like_the_baseline() {
+        assert_eq!(
+            render_state_html(&populated_dump()),
+            include_str!("../testdata/state_html_populated.html")
+        );
+    }
+
+    /// The `{{else}}` branches render when the slices are nil.
+    #[test]
+    fn renders_empty_state_html_like_the_baseline() {
+        let dump = StateDump {
+            name: "repos",
+            update_queue: None,
+            schedule: None,
+            sync_jobs: None,
+        };
+        assert_eq!(
+            render_state_html(&dump),
+            include_str!("../testdata/state_html_empty.html")
         );
     }
 

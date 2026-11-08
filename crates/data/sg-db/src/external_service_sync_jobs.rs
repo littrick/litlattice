@@ -465,12 +465,11 @@ WHERE
 SELECT
 	j.id, j.state, j.failure_message, j.queued_at, j.started_at, j.finished_at,
 	j.process_after, j.num_resets, j.num_failures, j.external_service_id,
-	v.next_sync_at, j.last_heartbeat_at, j.worker_hostname, j.cancel,
+	NULL::timestamptz AS next_sync_at, j.last_heartbeat_at, j.worker_hostname, j.cancel,
 	j.repos_synced, j.repo_sync_errors, j.repos_added, j.repos_deleted,
 	j.repos_modified, j.repos_unmodified
 FROM external_service_sync_jobs j
-JOIN external_service_sync_jobs_with_next_sync_at v ON v.id = j.id
-ORDER BY j.id
+ORDER BY j.started_at DESC
 "#,
         )
         .fetch_all(&self.pool)
