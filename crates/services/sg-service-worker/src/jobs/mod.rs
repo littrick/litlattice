@@ -36,6 +36,7 @@ use crate::framework::periodic::PeriodicRoutine;
 use crate::registry;
 
 pub mod eventlogs;
+pub mod gitserver;
 pub mod permissions;
 pub mod repostatistics;
 pub mod users;
@@ -115,6 +116,7 @@ pub fn all_jobs() -> Vec<(&'static str, Arc<dyn Job>)> {
             let job: Arc<dyn Job> = match name {
                 "aggregated-users-statistics" => Arc::new(users::AggregatedUsersStatistics),
                 "event-logs-janitor" => Arc::new(eventlogs::EventLogsJanitor),
+                "gitserver-metrics" => Arc::new(gitserver::GitserverMetrics),
                 "permission-sync-job-cleaner" => Arc::new(permissions::PermissionSyncJobCleaner),
                 "repo-statistics-compactor" => Arc::new(repostatistics::RepoStatisticsCompactor),
                 "repo-statistics-resetter" => Arc::new(repostatistics::RepoStatisticsResetter),

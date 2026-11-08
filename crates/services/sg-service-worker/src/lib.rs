@@ -29,6 +29,7 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
 pub mod config;
+pub mod debug;
 pub mod framework;
 pub mod health;
 pub mod jobs;
@@ -51,6 +52,8 @@ pub struct WorkerService {
     /// Rust-only rollout knob (not part of the baseline registry) so the pilot
     /// can listen on a side port while the Go binary keeps `:3189`.
     addr_override: Option<String>,
+    /// `SRC_PROF_HTTP`; `None` disables the debug server (baseline empty addr).
+    prof_addr: Option<String>,
     config: Option<WorkerConfigs>,
     jobs: Vec<(&'static str, Arc<dyn Job>)>,
     /// `validateConfigs`'s error. `LoadConfig` stores it on a shadowed local
@@ -71,6 +74,7 @@ impl WorkerService {
     fn with_addr_override(addr_override: Option<String>) -> Self {
         Self {
             addr_override,
+            prof_addr: None,
             config: None,
             jobs: Vec::new(),
             job_config_error: None,
@@ -102,6 +106,14 @@ impl Service for WorkerService {
             "false",
             "check that go-sqlite3 works then exit 0 if it's ok or 1 if not",
         );
+        // Registered by the baseline `internal/debugserver` init in every
+        // service binary; an empty value disables the server.
+        let prof_addr = env.get(
+            "SRC_PROF_HTTP",
+            debug::DEFAULT_ADDR,
+            "net/http/pprof http bind address.",
+        );
+        self.prof_addr = Some(prof_addr).filter(|addr| !addr.is_empty());
         // `loadConfigs`: the worker config first, then every job's configs
         // (regardless of whether the job is enabled).
         let config = WorkerConfigs::load(env, self.addr_override.clone());
@@ -193,6 +205,13 @@ impl Service for WorkerService {
         // `ready()`: every routine is set up; the recorder
         // (`background-job-logger`) is not ported yet.
         ctx.ready.mark_ready();
+
+        // `internal/debugserver`: exposes the process registry on
+        // `SRC_PROF_HTTP` (pprof and `/vars` are not ported).
+        if let Some(prof_addr) = self.prof_addr.clone() {
+            let shutdown = ctx.shutdown.clone();
+            tracker.spawn(async move { debug::serve(&prof_addr, shutdown).await });
+        }
 
         tracing::info!(
             addr = config.listen_addr,
