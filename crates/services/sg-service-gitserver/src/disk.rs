@@ -6,10 +6,12 @@
 //!
 //! * `total_space = Blocks * Bsize`
 //! * `free_space  = Bfree * Bsize`
+//! * `available_space = Bavail * Bsize` (`Available()`, used by metrics)
 //! * `percent_used = (total - free) / total * 100`, computed in `float32`.
 //!
-//! Note that Go uses `Bfree` (all free blocks), not `Bavail` (blocks
-//! available to unprivileged users), so reserved blocks count as used.
+//! Note that `DiskUsage`/`percent_used` use `Bfree` (all free blocks), while
+//! the disk metrics use `Bavail` (blocks available to unprivileged users),
+//! so reserved blocks count as used for the RPC but not for the gauges.
 
 use std::io;
 use std::path::Path;
@@ -19,6 +21,8 @@ use std::path::Path;
 pub struct DiskInfo {
     pub total_space: u64,
     pub free_space: u64,
+    /// `diskusage.Available()`: blocks available to unprivileged users.
+    pub available_space: u64,
     pub percent_used: f32,
 }
 
@@ -30,12 +34,14 @@ pub fn disk_usage(path: &Path) -> io::Result<DiskInfo> {
     let block_size = stat.f_bsize as u64;
     let total_space = stat.f_blocks as u64 * block_size;
     let free_space = stat.f_bfree as u64 * block_size;
+    let available_space = stat.f_bavail as u64 * block_size;
     let used = total_space - free_space;
     // Same operations (and `float32` rounding) as the Go baseline.
     let percent_used = (used as f32) / (total_space as f32) * 100.0;
     Ok(DiskInfo {
         total_space,
         free_space,
+        available_space,
         percent_used,
     })
 }
@@ -49,6 +55,7 @@ mod tests {
         let info = disk_usage(Path::new(env!("CARGO_MANIFEST_DIR"))).expect("statvfs");
         assert!(info.total_space > 0);
         assert!(info.free_space <= info.total_space);
+        assert!(info.available_space <= info.free_space);
         assert!(info.percent_used >= 0.0 && info.percent_used <= 100.0);
         let expected =
             ((info.total_space - info.free_space) as f32 / info.total_space as f32) * 100.0;

@@ -19,12 +19,14 @@ use sg_core::{ConfigError, EnvReader, Service, ServiceContext, ServiceError};
 use sg_proto::gitserver as gpb;
 
 pub mod config;
+pub mod debug;
 mod details;
 pub mod diff;
 pub mod disk;
 pub mod git;
 pub mod gitservice;
 pub mod grpc;
+pub mod metrics;
 mod mux;
 pub mod repo;
 pub mod search;
@@ -43,6 +45,9 @@ pub const DEFAULT_PORT: &str = "3178";
 
 pub struct GitserverService {
     addr: Option<String>,
+    /// `SRC_PROF_HTTP`; `None` disables the debug server (baseline noop
+    /// server).
+    prof_addr: Option<String>,
     config: Option<GitserverConfig>,
 }
 
@@ -50,6 +55,7 @@ impl GitserverService {
     pub fn new() -> Self {
         Self {
             addr: None,
+            prof_addr: None,
             config: None,
         }
     }
@@ -58,6 +64,7 @@ impl GitserverService {
     pub fn with_addr(addr: impl Into<String>) -> Self {
         Self {
             addr: Some(addr.into()),
+            prof_addr: None,
             config: None,
         }
     }
@@ -76,6 +83,14 @@ impl Service for GitserverService {
     }
 
     fn configure(&mut self, env: &mut EnvReader) -> Result<(), ConfigError> {
+        // Registered by the baseline `internal/debugserver` init; an empty
+        // value disables the server.
+        let prof_addr = env.get(
+            "SRC_PROF_HTTP",
+            debug::DEFAULT_ADDR,
+            "net/http/pprof http bind address.",
+        );
+        self.prof_addr = Some(prof_addr).filter(|addr| !addr.is_empty());
         let config = GitserverConfig::load(env, self.addr.clone())?;
         self.addr = Some(config.listen_addr.clone());
         self.config = Some(config);
@@ -134,8 +149,24 @@ impl Service for GitserverService {
         );
         ctx.ready.mark_ready();
         sg_metrics::register_service_metadata(sg_metrics::VERSION);
+        // Register every family up front: gauges and counters exist at zero
+        // from startup, like the Go process.
+        let metrics = metrics::Metrics::global(&config.repos_dir);
+
+        let mut background = tokio::task::JoinSet::new();
+        if let Some(prof_addr) = self.prof_addr.clone() {
+            let shutdown = ctx.shutdown.clone();
+            background.spawn(async move { debug::serve(&prof_addr, shutdown).await });
+        }
+        {
+            let shutdown = ctx.shutdown.clone();
+            background.spawn(async move { metrics::echo_loop(metrics, shutdown).await });
+        }
 
         let served = sg_http::serve(listener, routes, http, ctx.shutdown.clone()).await;
+        // The background tasks may outlive an early main-server failure.
+        ctx.shutdown.cancel();
+        while background.join_next().await.is_some() {}
         tasks.close();
         tokio::time::timeout(Duration::from_secs(30), tasks.wait())
             .await

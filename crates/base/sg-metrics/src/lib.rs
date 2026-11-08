@@ -62,8 +62,9 @@ pub fn render_default() -> String {
     render(registry())
 }
 
-/// Content type used by Go's `promhttp.Handler`.
-pub const CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
+/// Content type used by Go's `promhttp.Handler` (client_golang 1.19
+/// negotiates the `escaping=values` parameter on every response).
+pub const CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8; escaping=values";
 
 #[cfg(test)]
 mod tests {
