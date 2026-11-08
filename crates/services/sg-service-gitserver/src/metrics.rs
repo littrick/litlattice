@@ -238,6 +238,9 @@ pub struct Metrics {
     search_latency: Histogram,
     // `cmd/gitserver/internal/ensurerevision.go`
     ensure_revision: CounterVec,
+    // `cmd/gitserver/internal/statesyncer.go`
+    repo_sync_state: CounterVec,
+    repo_sync_state_upsert: CounterVec,
     // `cmd/gitserver/internal/server.go`: clone/repo-update accounting.
     clone_queue: Gauge,
     repo_cloned_count: Counter,
@@ -341,6 +344,20 @@ impl Metrics {
             &["status"],
         );
 
+        // `cmd/gitserver/internal/statesyncer.go`
+        let repo_sync_state = counter_vec(
+            registry,
+            "src_repo_sync_state_counter",
+            "Incremented each time we check the state of repo",
+            &["type"],
+        );
+        let repo_sync_state_upsert = counter_vec(
+            registry,
+            "src_repo_sync_state_upsert_counter",
+            "Incremented each time we upsert repo state in the database",
+            &["success"],
+        );
+
         // `cmd/gitserver/internal/gitservice.go`
         let gitservice_duration = histogram_vec(
             registry,
@@ -434,20 +451,6 @@ impl Metrics {
             "number of times a bad commit error is returned",
         );
 
-        // `cmd/gitserver/internal/statesyncer.go`
-        let _repo_sync_state = counter_vec(
-            registry,
-            "src_repo_sync_state_counter",
-            "Incremented each time we check the state of repo",
-            &["type"],
-        );
-        let _repo_state_upsert = counter_vec(
-            registry,
-            "src_repo_sync_state_upsert_counter",
-            "Incremented each time we upsert repo state in the database",
-            &["success"],
-        );
-
         // `cmd/gitserver/internal/vcssyncer/instrumented_syncer.go`
         let _is_cloneable_duration = histogram_vec(
             registry,
@@ -518,6 +521,8 @@ impl Metrics {
             search_duration,
             search_latency,
             ensure_revision,
+            repo_sync_state,
+            repo_sync_state_upsert,
             clone_queue,
             repo_cloned_count,
             repo_cloned_failed_count,
@@ -718,6 +723,24 @@ pub fn clone_succeeded() {
 pub fn ensure_revision(status: &str) {
     if let Some(metrics) = Metrics::global_opt() {
         metrics.ensure_revision.with_label_values(&[status]).inc();
+    }
+}
+
+/// `repoSyncStateCounter` (`src_repo_sync_state_counter{type}`).
+pub fn repo_sync_state(kind: &str) {
+    if let Some(metrics) = Metrics::global_opt() {
+        metrics.repo_sync_state.with_label_values(&[kind]).inc();
+    }
+}
+
+/// `repoStateUpsertCounter` (`src_repo_sync_state_upsert_counter{success}`).
+pub fn repo_sync_state_upsert(success: bool, count: usize) {
+    if let Some(metrics) = Metrics::global_opt() {
+        let label = if success { "true" } else { "false" };
+        metrics
+            .repo_sync_state_upsert
+            .with_label_values(&[label])
+            .inc_by(count as f64);
     }
 }
 

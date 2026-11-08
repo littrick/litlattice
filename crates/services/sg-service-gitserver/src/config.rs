@@ -1,8 +1,14 @@
 //! Environment registry entries owned by `cmd/gitserver/shared`.
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use sg_core::{ConfigError, EnvReader};
+
+/// `cmd/gitserver/shared/config.go` defaults.
+pub const DEFAULT_SYNC_REPO_STATE_INTERVAL: Duration = Duration::from_secs(10 * 60);
+pub const DEFAULT_SYNC_REPO_STATE_BATCH_SIZE: i64 = 500;
+pub const DEFAULT_SYNC_REPO_STATE_UPSERT_PER_SEC: i64 = 500;
 
 #[derive(Clone)]
 pub struct GitserverConfig {
@@ -11,6 +17,12 @@ pub struct GitserverConfig {
     /// `GITSERVER_EXTERNAL_ADDR`: the `gitserver_repos.shard_id` and the name
     /// this instance is known by in `SRC_GIT_SERVERS`.
     pub external_address: String,
+    /// `SRC_REPOS_SYNC_STATE_INTERVAL`.
+    pub sync_repo_state_interval: Duration,
+    /// `SRC_REPOS_SYNC_STATE_BATCH_SIZE`.
+    pub sync_repo_state_batch_size: i64,
+    /// `SRC_REPOS_SYNC_STATE_UPSERT_PER_SEC`.
+    pub sync_repo_state_update_per_second: i64,
 }
 
 /// Port of `internal/hostname.Get`: `HOSTNAME` when set (the env registry
@@ -65,10 +77,38 @@ impl GitserverConfig {
             "The name of this gitserver as it would appear in SRC_GIT_SERVERS.",
         );
 
+        // `env.GetInterval` / `env.GetInt`: malformed values fall back to
+        // the registered defaults.
+        let sync_repo_state_interval = crate::memobs::parse_go_duration(&env.get(
+            "SRC_REPOS_SYNC_STATE_INTERVAL",
+            "10m",
+            "Interval between state syncs",
+        ))
+        .unwrap_or(DEFAULT_SYNC_REPO_STATE_INTERVAL);
+        let sync_repo_state_batch_size = env
+            .get(
+                "SRC_REPOS_SYNC_STATE_BATCH_SIZE",
+                "500",
+                "Number of updates to perform per batch",
+            )
+            .parse()
+            .unwrap_or(DEFAULT_SYNC_REPO_STATE_BATCH_SIZE);
+        let sync_repo_state_update_per_second = env
+            .get(
+                "SRC_REPOS_SYNC_STATE_UPSERT_PER_SEC",
+                "500",
+                "The number of updated rows allowed per second across all gitserver instances",
+            )
+            .parse()
+            .unwrap_or(DEFAULT_SYNC_REPO_STATE_UPSERT_PER_SEC);
+
         Ok(Self {
             repos_dir: PathBuf::from(repos_dir),
             listen_addr: override_addr.unwrap_or(listen_addr),
             external_address,
+            sync_repo_state_interval,
+            sync_repo_state_batch_size,
+            sync_repo_state_update_per_second,
         })
     }
 

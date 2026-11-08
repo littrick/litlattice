@@ -266,6 +266,20 @@ impl SiteConfiguration {
         self.raw.get("experimentalFeatures")
     }
 
+    /// `experimentalFeatures.gitServerPinnedRepos`: repositories that must
+    /// stay on a specific gitserver, keyed by repo name.
+    pub fn git_server_pinned_repos(&self) -> std::collections::BTreeMap<String, String> {
+        self.experimental_features()
+            .and_then(|features| features.get("gitServerPinnedRepos"))
+            .and_then(serde_json::Value::as_object)
+            .map(|pins| {
+                pins.iter()
+                    .filter_map(|(repo, addr)| Some((repo.clone(), addr.as_str()?.to_owned())))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// `experimentalFeatures.customGitFetch`.
     pub fn custom_git_fetch(&self) -> Vec<CustomFetchMapping> {
         self.experimental_features()
@@ -615,6 +629,7 @@ mod tests {
                         "insecureSkipVerify": true,
                         "certificates": ["-----BEGIN CERTIFICATE-----"],
                     },
+                    "gitServerPinnedRepos": {"github.com/foo/bar": "gitserver-1:3178"},
                 },
             }"#
             .to_owned(),
@@ -646,6 +661,15 @@ mod tests {
                 certificates: vec!["-----BEGIN CERTIFICATE-----".to_owned()],
             }
         );
+        assert_eq!(
+            unified.site.git_server_pinned_repos(),
+            [(
+                "github.com/foo/bar".to_owned(),
+                "gitserver-1:3178".to_owned()
+            )]
+            .into_iter()
+            .collect()
+        );
         assert_eq!(unified.service_connections, raw.service_connections);
     }
 
@@ -659,6 +683,7 @@ mod tests {
             DEFAULT_GIT_LONG_COMMAND_TIMEOUT
         );
         assert!(unified.site.custom_git_fetch().is_empty());
+        assert!(unified.site.git_server_pinned_repos().is_empty());
         assert_eq!(unified.site.tls_external(), TlsExternal::default());
         assert_eq!(
             unified.site.git_max_concurrent_clones(),

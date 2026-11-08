@@ -38,6 +38,7 @@ rusqlite = { version = "0.32", features = ["bundled", "functions"] }
 regex = "1"
 regex-syntax = "0.8"
 sha2 = "0.10"
+md5 = "0.7"
 aes-gcm = "0.10"
 # tree-sitter grammars vendored from the exact parser sources used by the Go
 # baseline (github.com/smacker/go-tree-sitter @ 233c2f923ac7). Published crate

@@ -10,13 +10,15 @@ use sqlx::types::time::OffsetDateTime;
 use sqlx::Row;
 
 /// `types.CloneStatus` (`internal/types/types.go`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CloneStatus {
-    /// Any value the baseline does not recognize; never written back.
-    Unknown,
     NotCloned,
     Cloning,
     Cloned,
+    /// Any value the baseline does not recognize. Kept verbatim so
+    /// round-tripping a row (e.g. `Update` in the state syncer) does not
+    /// rewrite an unknown status.
+    Other(String),
 }
 
 impl CloneStatus {
@@ -25,16 +27,16 @@ impl CloneStatus {
             "not_cloned" => Self::NotCloned,
             "cloning" => Self::Cloning,
             "cloned" => Self::Cloned,
-            _ => Self::Unknown,
+            _ => Self::Other(value.to_owned()),
         }
     }
 
-    pub fn as_str(self) -> &'static str {
+    pub fn as_str(&self) -> &str {
         match self {
-            Self::Unknown => "",
             Self::NotCloned => "not_cloned",
             Self::Cloning => "cloning",
             Self::Cloned => "cloned",
+            Self::Other(value) => value,
         }
     }
 }
@@ -100,6 +102,42 @@ impl std::fmt::Display for GitserverRepoNotFound {
 }
 
 impl std::error::Error for GitserverRepoNotFound {}
+
+/// `IterateRepoGitserverStatusOptions`.
+#[derive(Debug, Clone, Default)]
+pub struct IterateRepoGitserverStatusOptions {
+    /// Only iterate over repos that have not been assigned to a shard.
+    pub only_without_shard: bool,
+    /// Also include soft-deleted repos (their names start with `DELETED-`).
+    pub include_deleted: bool,
+    pub batch_size: i64,
+    /// Last `repo_id` of the previous page.
+    pub next_cursor: i32,
+}
+
+/// `types.RepoGitserverStatus`.
+#[derive(Debug, Clone)]
+pub struct RepoGitserverStatus {
+    pub id: i32,
+    pub name: String,
+    pub gitserver_repo: GitserverRepo,
+}
+
+fn scan_gitserver_repo(row: &sqlx::postgres::PgRow) -> Result<GitserverRepo, sqlx::Error> {
+    Ok(GitserverRepo {
+        repo_id: row.try_get("repo_id")?,
+        name: row.try_get("name")?,
+        clone_status: CloneStatus::parse(row.try_get::<String, _>("clone_status")?.as_str()),
+        shard_id: row.try_get("shard_id")?,
+        last_error: row.try_get("last_error")?,
+        last_fetched: row.try_get("last_fetched")?,
+        last_changed: row.try_get("last_changed")?,
+        repo_size_bytes: row.try_get("repo_size_bytes")?,
+        updated_at: row.try_get("updated_at")?,
+        corrupted_at: row.try_get("corrupted_at")?,
+        corruption_logs: row.try_get("corruption_logs")?,
+    })
+}
 
 #[derive(Clone)]
 pub struct GitserverReposStore {
@@ -304,19 +342,122 @@ WHERE r.name = $1::citext
         let Some(row) = row else {
             return Ok(None);
         };
-        Ok(Some(GitserverRepo {
-            repo_id: row.try_get("repo_id")?,
-            name: row.try_get("name")?,
-            clone_status: CloneStatus::parse(row.try_get::<String, _>("clone_status")?.as_str()),
-            shard_id: row.try_get("shard_id")?,
-            last_error: row.try_get("last_error")?,
-            last_fetched: row.try_get("last_fetched")?,
-            last_changed: row.try_get("last_changed")?,
-            repo_size_bytes: row.try_get("repo_size_bytes")?,
-            updated_at: row.try_get("updated_at")?,
-            corrupted_at: row.try_get("corrupted_at")?,
-            corruption_logs: row.try_get("corruption_logs")?,
-        }))
+        Ok(Some(scan_gitserver_repo(&row)?))
+    }
+
+    /// `IterateRepoGitserverStatus`: page through `gitserver_repos` joined
+    /// with `repo`, ordered by `repo_id`. The returned cursor is the last
+    /// `repo_id` seen (0 when the page was empty).
+    pub async fn iterate_repo_gitserver_status(
+        &self,
+        options: &IterateRepoGitserverStatusOptions,
+    ) -> Result<(Vec<RepoGitserverStatus>, i32), sqlx::Error> {
+        let mut query = sqlx::QueryBuilder::new(
+            "SELECT \
+	gr.repo_id, \
+	repo.name, \
+	gr.clone_status, \
+	gr.shard_id, \
+	gr.last_error, \
+	gr.last_fetched, \
+	gr.last_changed, \
+	gr.repo_size_bytes, \
+	gr.updated_at, \
+	gr.corrupted_at, \
+	gr.corruption_logs \
+FROM gitserver_repos gr \
+JOIN repo ON gr.repo_id = repo.id \
+WHERE TRUE",
+        );
+        if !options.include_deleted {
+            query.push(" AND repo.deleted_at IS NULL");
+        }
+        if options.only_without_shard {
+            query.push(" AND gr.shard_id = ''");
+        }
+        if options.next_cursor > 0 {
+            query.push(" AND gr.repo_id > ");
+            query.push_bind(options.next_cursor);
+            query.push(" AND repo.id > ");
+            query.push_bind(options.next_cursor);
+        }
+        query.push(" ORDER BY gr.repo_id ASC");
+        if options.batch_size > 0 {
+            query.push(" LIMIT ");
+            query.push_bind(options.batch_size);
+        }
+
+        let rows = query.build().fetch_all(&self.pool).await?;
+        let mut next_cursor = 0;
+        let mut statuses = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let mut gitserver_repo = scan_gitserver_repo(row)?;
+            let name = row.try_get::<String, _>("name")?;
+            // The baseline scans `repo.name` into the status only; the
+            // embedded `GitserverRepo.Name` stays empty.
+            gitserver_repo.name = String::new();
+            next_cursor = gitserver_repo.repo_id;
+            statuses.push(RepoGitserverStatus {
+                id: gitserver_repo.repo_id,
+                name,
+                gitserver_repo,
+            });
+        }
+        Ok((statuses, next_cursor))
+    }
+
+    /// `Update`: upsert every column of the given rows in one statement. The
+    /// baseline locks the matching rows with `FOR UPDATE` and writes
+    /// `updated_at = NOW()`.
+    pub async fn update(&self, repos: &[GitserverRepo]) -> Result<(), sqlx::Error> {
+        if repos.is_empty() {
+            return Ok(());
+        }
+        let mut query = sqlx::QueryBuilder::new(
+            "WITH update_data AS (\
+	SELECT * FROM (VALUES ",
+        );
+        for (index, repo) in repos.iter().enumerate() {
+            if index > 0 {
+                query.push(", ");
+            }
+            query.push("(");
+            // Eight columns per row, matching the baseline's VALUES list.
+            query.push_bind(repo.repo_id).push(", ");
+            query
+                .push_bind(repo.clone_status.as_str().to_owned())
+                .push(", ");
+            query.push_bind(repo.shard_id.clone()).push(", ");
+            query.push_bind(repo.last_error.clone()).push(", ");
+            query.push_bind(repo.last_fetched).push(", ");
+            query.push_bind(repo.last_changed).push(", ");
+            query.push_bind(repo.corrupted_at).push(", ");
+            query.push_bind(repo.repo_size_bytes);
+            query.push(")");
+        }
+        query.push(
+            " ) AS tmp(repo_id, clone_status, shard_id, last_error, last_fetched, last_changed, corrupted_at, repo_size_bytes)), \
+locked_data AS (\
+	SELECT update_data.* \
+	FROM update_data \
+	JOIN gitserver_repos gr ON gr.repo_id = update_data.repo_id \
+	ORDER BY update_data.repo_id ASC \
+	FOR UPDATE OF gr\
+)\
+UPDATE gitserver_repos AS gr \
+SET \
+	clone_status = locked_data.clone_status, \
+	shard_id = locked_data.shard_id, \
+	last_error = locked_data.last_error, \
+	last_fetched = locked_data.last_fetched, \
+	last_changed = locked_data.last_changed, \
+	corrupted_at = locked_data.corrupted_at, \
+	repo_size_bytes = locked_data.repo_size_bytes, \
+	updated_at = NOW() \
+FROM locked_data \
+WHERE locked_data.repo_id = gr.repo_id",
+        );
+        query.build().execute(&self.pool).await.map(|_| ())
     }
 }
 
@@ -436,6 +577,112 @@ mod tests {
             .execute(&pool)
             .await
             .expect("cleanup");
+        result
+    }
+
+    /// `IterateRepoGitserverStatus` + `Update`, the state syncer's storage
+    /// contract: paging by `repo_id`, the deleted/shard filters, and the
+    /// batched CTE upsert.
+    #[tokio::test]
+    async fn iterates_and_updates_gitserver_repos() {
+        let Ok(dsn) = std::env::var("SG_TEST_DATABASE_DSN") else {
+            eprintln!("SG_TEST_DATABASE_DSN unset; skipping");
+            return;
+        };
+        let pool = crate::connect(&dsn, 2).await.expect("connect");
+        let store = GitserverReposStore::new(pool.clone());
+
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let names = [
+            format!("iterate-test-{suffix}.example.com/one"),
+            format!("iterate-test-{suffix}.example.com/two"),
+        ];
+        for name in &names {
+            sqlx::query("INSERT INTO repo(name) VALUES ($1)")
+                .bind(name)
+                .execute(&pool)
+                .await
+                .expect("insert repo");
+        }
+        // Only the first row is assigned to another shard, so
+        // `only_without_shard` keeps just the second one.
+        store
+            .set_clone_status(&names[0], CloneStatus::Cloned, "other-shard")
+            .await
+            .expect("assign shard");
+
+        let result = async {
+            let mut seen = Vec::new();
+            let mut options = IterateRepoGitserverStatusOptions {
+                include_deleted: true,
+                only_without_shard: true,
+                batch_size: 2,
+                next_cursor: 0,
+            };
+            loop {
+                let (repos, next_cursor) = store
+                    .iterate_repo_gitserver_status(&options)
+                    .await
+                    .expect("iterate");
+                seen.extend(repos);
+                if next_cursor == 0 {
+                    break;
+                }
+                options.next_cursor = next_cursor;
+            }
+            let status = seen
+                .iter()
+                .find(|status| status.name == names[1])
+                .expect("second repo is unassigned");
+            assert_eq!(status.gitserver_repo.repo_id, status.id);
+            // The embedded repo never carries the name, like the baseline.
+            assert_eq!(status.gitserver_repo.name, "");
+            assert_eq!(status.gitserver_repo.clone_status, CloneStatus::NotCloned);
+            assert_eq!(status.gitserver_repo.shard_id, "");
+            assert!(!seen.iter().any(|status| status.name == names[0]));
+
+            // Mark the row as corrupt and then let the syncer-style update
+            // move it to this shard with a cloned status.
+            sqlx::query(
+                "UPDATE gitserver_repos SET corrupted_at = NOW() \
+                 WHERE repo_id = (SELECT id FROM repo WHERE name = $1::citext)",
+            )
+            .bind(&names[1])
+            .execute(&pool)
+            .await
+            .expect("mark corrupt");
+            let mut updated = store
+                .get_by_name(&names[1])
+                .await
+                .expect("get")
+                .expect("row");
+            assert!(updated.corrupted_at.is_some());
+            updated.clone_status = CloneStatus::Cloned;
+            updated.shard_id = "this-shard".to_owned();
+            updated.corrupted_at = None;
+            store.update(&[updated]).await.expect("update");
+
+            let stored = store
+                .get_by_name(&names[1])
+                .await
+                .expect("get")
+                .expect("row");
+            assert_eq!(stored.clone_status, CloneStatus::Cloned);
+            assert_eq!(stored.shard_id, "this-shard");
+            assert_eq!(stored.corrupted_at, None);
+        }
+        .await;
+
+        for name in &names {
+            sqlx::query("DELETE FROM repo WHERE name = $1::citext")
+                .bind(name)
+                .execute(&pool)
+                .await
+                .expect("cleanup");
+        }
         result
     }
 }

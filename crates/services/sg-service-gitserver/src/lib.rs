@@ -18,6 +18,7 @@ use tokio_util::task::TaskTracker;
 use sg_core::{ConfigError, EnvReader, Service, ServiceContext, ServiceError};
 use sg_proto::gitserver as gpb;
 
+pub mod addrs;
 pub mod cloneurl;
 pub mod config;
 pub mod debug;
@@ -42,6 +43,7 @@ pub mod remoteurl;
 pub mod repo;
 pub mod repositoryservice;
 pub mod search;
+pub mod statesyncer;
 pub mod trace;
 pub mod update;
 pub mod vcssyncer;
@@ -216,10 +218,27 @@ impl Service for GitserverService {
         };
         let repository_service = repositoryservice::RepositoryService {
             repos_dir: Arc::new(config.repos_dir.clone()),
-            store: Some(store),
+            store: Some(Arc::clone(&store)),
             hostname: config.external_address.clone(),
             fetch: Some(fetch),
         };
+        // `NewRepoStateSyncer`: reconcile clone state with the database. The
+        // address set and pins are startup snapshots (the baseline re-reads
+        // them from `conf` on every run; the Rust config client has no
+        // watcher yet).
+        let state_syncer = Arc::new(statesyncer::RepoStateSyncer {
+            repos: Arc::clone(&store),
+            locker: Arc::clone(&locker),
+            repos_dir: Arc::new(config.repos_dir.clone()),
+            shard_id: config.external_address.clone(),
+            addresses: addrs::GitserverAddresses {
+                addresses: unified.service_connections.git_servers.clone(),
+                pinned_servers: unified.site.git_server_pinned_repos(),
+            },
+            interval: config.sync_repo_state_interval,
+            batch_size: config.sync_repo_state_batch_size,
+            per_second: config.sync_repo_state_update_per_second,
+        });
         let routes = tonic::service::Routes::new(
             gpb::gitserver_service_server::GitserverServiceServer::new(grpc),
         )
@@ -263,6 +282,10 @@ impl Service for GitserverService {
         {
             let shutdown = ctx.shutdown.clone();
             background.spawn(async move { metrics::echo_loop(metrics, shutdown).await });
+        }
+        {
+            let shutdown = ctx.shutdown.clone();
+            background.spawn(async move { state_syncer.run(shutdown).await });
         }
 
         let served = sg_http::serve(listener, routes, http, ctx.shutdown.clone()).await;
