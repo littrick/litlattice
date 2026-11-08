@@ -2,12 +2,11 @@
 
 //! Per-service debug endpoint (`SRC_PROF_HTTP`), equivalent to the baseline
 //! `internal/debugserver` plus the repo-updater-specific
-//! `/repo-updater-state` dumper.
+//! `/repo-updater-state` dumper and `/manual-purge`.
 //!
-//! The purge endpoints (`/manual-purge`) land with the purge slice; the Go
-//! server also exposes pprof, `/vars` and `/debug/requests`, which this pilot
-//! does not implement (it serves Prometheus `/metrics`, which monitoring
-//! scrapes).
+//! The Go server also exposes pprof, `/vars` and `/debug/requests`, which
+//! this pilot does not implement (it serves Prometheus `/metrics`, which
+//! monitoring scrapes).
 
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -16,7 +15,11 @@ use http::{header, Request, Response, StatusCode};
 use http_body_util::Full;
 use hyper::body::{Bytes, Incoming};
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 
+use sg_db::external_service_sync_jobs::SyncJobsStore;
+
+use crate::purge::PurgeWorker;
 use crate::scheduler::UpdateScheduler;
 
 /// Baseline `debugserver` default (`SRC_PROF_HTTP`).
@@ -27,9 +30,18 @@ const INDEX_HTML: &str =
 <body><a href=\"metrics\">Metrics</a><br>\
 <a href=\"repo-updater-state?format=json\">Repo Updater State</a><br></body></html>\n";
 
+/// The state the debug endpoints read.
+pub struct DebugContext {
+    pub scheduler: Arc<UpdateScheduler>,
+    pub sync_jobs: Arc<SyncJobsStore>,
+    pub purge: Arc<PurgeWorker>,
+    /// Structured-concurrency tracker for manual purges.
+    pub tasks: TaskTracker,
+}
+
 /// Bind `addr` and serve the debug HTTP surface until `shutdown` is cancelled.
 /// A bind error is logged and swallowed.
-pub async fn serve(addr: &str, scheduler: Arc<UpdateScheduler>, shutdown: CancellationToken) {
+pub async fn serve(addr: &str, context: Arc<DebugContext>, shutdown: CancellationToken) {
     let listener = match sg_http::listen(addr).await {
         Ok(listener) => listener,
         Err(err) => {
@@ -38,19 +50,19 @@ pub async fn serve(addr: &str, scheduler: Arc<UpdateScheduler>, shutdown: Cancel
         }
     };
     tracing::info!(addr, "debug server listening");
-    if let Err(err) = sg_http::serve_http(listener, handler(scheduler), shutdown).await {
+    if let Err(err) = sg_http::serve_http(listener, handler(context), shutdown).await {
         tracing::error!(addr, error = %err, "debug server failed");
     }
 }
 
-pub fn handler(scheduler: Arc<UpdateScheduler>) -> sg_http::HttpHandler {
+pub fn handler(context: Arc<DebugContext>) -> sg_http::HttpHandler {
     Arc::new(move |req: Request<Incoming>| {
-        let scheduler = Arc::clone(&scheduler);
-        Box::pin(async move { route(&scheduler, &req) })
+        let context = Arc::clone(&context);
+        Box::pin(async move { route(&context, &req).await })
     })
 }
 
-fn route(scheduler: &UpdateScheduler, req: &Request<Incoming>) -> Response<tonic::body::BoxBody> {
+async fn route(context: &DebugContext, req: &Request<Incoming>) -> Response<tonic::body::BoxBody> {
     match req.uri().path() {
         "/metrics" => text(
             StatusCode::OK,
@@ -70,8 +82,13 @@ fn route(scheduler: &UpdateScheduler, req: &Request<Incoming>) -> Response<tonic
             if dumper != "repos" {
                 return text(StatusCode::OK, "application/json", "[]");
             }
-            text(StatusCode::OK, "application/json", state_json(scheduler))
+            text(
+                StatusCode::OK,
+                "application/json",
+                state_json(&context.scheduler, &context.sync_jobs).await,
+            )
         }
+        "/manual-purge" => manual_purge(context, req.uri().query().unwrap_or_default()).await,
         "/" => text(StatusCode::OK, "text/html; charset=utf-8", INDEX_HTML),
         // Go's `http.NotFound`.
         _ => text(
@@ -82,8 +99,66 @@ fn route(scheduler: &UpdateScheduler, req: &Request<Incoming>) -> Response<tonic
     }
 }
 
-/// `UpdateScheduler.DebugDump` for the `repos` dumper.
-pub fn state_json(scheduler: &UpdateScheduler) -> String {
+/// `manualPurgeHandler`.
+async fn manual_purge(context: &DebugContext, query: &str) -> Response<tonic::body::BoxBody> {
+    // `r.FormValue("limit")` returns "" when the parameter is absent, and
+    // `strconv.Atoi("")` fails; both surface as `invalid limit: ...`.
+    let limit_param = query_param(query, "limit").unwrap_or_default();
+    let limit = match go_atoi(&limit_param) {
+        Ok(limit) => limit,
+        Err(err) => return bad_request(&format!("invalid limit: {err}")),
+    };
+    if limit <= 0 {
+        return bad_request("limit must be greater than 0");
+    }
+    if limit > 10000 {
+        return bad_request("limit must be less than 10000");
+    }
+
+    let mut per_second = 1.0;
+    if let Some(param) = query_param(query, "perSecond") {
+        if !param.is_empty() {
+            per_second = match go_parse_float(&param) {
+                Ok(value) => value,
+                Err(err) => return bad_request(&format!("invalid per second rate limit: {err}")),
+            };
+            if per_second <= 0.1 {
+                return bad_request(&format!(
+                    "invalid per second rate limit. Must be > 0.1, got {per_second:.6}"
+                ));
+            }
+        }
+    }
+
+    match context
+        .purge
+        .purge_oldest_repos(limit, per_second, &context.tasks)
+    {
+        Ok(()) => text(
+            StatusCode::OK,
+            "text/plain; charset=utf-8",
+            format!("manual purge started with limit of {limit} and rate of {per_second:.6}"),
+        ),
+        Err(err) => text(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "text/plain; charset=utf-8",
+            format!("starting manual purge: {err}\n"),
+        ),
+    }
+}
+
+fn bad_request(message: &str) -> Response<tonic::body::BoxBody> {
+    // `http.Error` writes text/plain and a trailing newline.
+    text(
+        StatusCode::BAD_REQUEST,
+        "text/plain; charset=utf-8",
+        format!("{message}\n"),
+    )
+}
+
+/// `UpdateScheduler.DebugDump` for the `repos` dumper, including
+/// `ExternalServices().GetSyncJobs`.
+pub async fn state_json(scheduler: &UpdateScheduler, jobs: &SyncJobsStore) -> String {
     let queue: Vec<serde_json::Value> = scheduler
         .debug_queue()
         .into_iter()
@@ -109,16 +184,58 @@ pub fn state_json(scheduler: &UpdateScheduler) -> String {
             })
         })
         .collect();
+
+    // A failed query leaves `SyncJobs` nil in the baseline, which marshals
+    // as `null`.
+    let sync_jobs = match jobs.list_sync_jobs().await {
+        Ok(jobs) => serde_json::Value::Array(
+            jobs.into_iter()
+                .map(|job| {
+                    serde_json::json!({
+                        "ID": job.id,
+                        "State": job.state,
+                        "FailureMessage": job.failure_message.unwrap_or_default(),
+                        "QueuedAt": format_optional_time(job.queued_at),
+                        "StartedAt": format_optional_time(job.started_at),
+                        "FinishedAt": format_optional_time(job.finished_at),
+                        "ProcessAfter": format_optional_time(job.process_after),
+                        "NumResets": job.num_resets,
+                        "ExternalServiceID": job.external_service_id,
+                        "NumFailures": job.num_failures,
+                        "Cancel": job.cancel,
+                        "ReposSynced": job.repos_synced,
+                        "RepoSyncErrors": job.repo_sync_errors,
+                        "ReposAdded": job.repos_added,
+                        "ReposDeleted": job.repos_deleted,
+                        "ReposModified": job.repos_modified,
+                        "ReposUnmodified": job.repos_unmodified,
+                    })
+                })
+                .collect(),
+        ),
+        Err(err) => {
+            tracing::warn!(error = %err, "getting external service sync jobs for debug page");
+            serde_json::Value::Null
+        }
+    };
+
     let dump = serde_json::json!([{
         "Name": "repos",
         "UpdateQueue": queue,
         "Schedule": schedule,
-        // `SyncJobs` requires the external-service syncer (later slice).
-        "SyncJobs": serde_json::Value::Null,
+        "SyncJobs": sync_jobs,
     }]);
     let mut rendered = serde_json::to_string_pretty(&dump).expect("serialize debug dump");
     rendered.push('\n');
     rendered
+}
+
+/// Go's zero `time.Time` renders as `0001-01-01T00:00:00Z`.
+fn format_optional_time(time: Option<sg_db::OffsetDateTime>) -> String {
+    match time {
+        Some(time) => format_rfc3339(SystemTime::from(time)),
+        None => "0001-01-01T00:00:00Z".to_owned(),
+    }
 }
 
 fn query_param(query: &str, name: &str) -> Option<String> {
@@ -130,6 +247,33 @@ fn query_param(query: &str, name: &str) -> Option<String> {
 
 fn percent_decode(value: &str) -> String {
     value.replace("%20", " ").replace('+', " ")
+}
+
+/// `strconv.Atoi` error strings, so `/manual-purge`'s messages match the
+/// baseline byte for byte.
+fn go_atoi(value: &str) -> Result<i64, String> {
+    match value.parse::<i64>() {
+        Ok(parsed) => Ok(parsed),
+        Err(err) => {
+            let reason = match err.kind() {
+                std::num::IntErrorKind::PosOverflow | std::num::IntErrorKind::NegOverflow => {
+                    "value out of range"
+                }
+                _ => "invalid syntax",
+            };
+            Err(format!("strconv.Atoi: parsing {value:?}: {reason}"))
+        }
+    }
+}
+
+/// `strconv.ParseFloat` error strings.
+fn go_parse_float(value: &str) -> Result<f64, String> {
+    match value.parse::<f64>() {
+        Ok(parsed) => Ok(parsed),
+        Err(_) => Err(format!(
+            "strconv.ParseFloat: parsing {value:?}: invalid syntax"
+        )),
+    }
 }
 
 /// `FormatRFC3339Nano`-compatible rendering (UTC, trailing zeros trimmed).
@@ -220,5 +364,32 @@ mod tests {
             Some("json")
         );
         assert_eq!(query_param("dumper=repos", "format"), None);
+    }
+
+    #[test]
+    fn go_numeric_errors_match_the_baseline() {
+        assert_eq!(
+            go_atoi("abc").unwrap_err(),
+            "strconv.Atoi: parsing \"abc\": invalid syntax"
+        );
+        assert_eq!(
+            go_atoi("").unwrap_err(),
+            "strconv.Atoi: parsing \"\": invalid syntax"
+        );
+        assert_eq!(
+            go_atoi("999999999999999999999999").unwrap_err(),
+            "strconv.Atoi: parsing \"999999999999999999999999\": value out of range"
+        );
+        assert_eq!(
+            go_parse_float("x").unwrap_err(),
+            "strconv.ParseFloat: parsing \"x\": invalid syntax"
+        );
+        assert_eq!(go_atoi("42").unwrap(), 42);
+        assert_eq!(go_parse_float("1.5").unwrap(), 1.5);
+    }
+
+    #[test]
+    fn missing_times_use_the_go_zero_value() {
+        assert_eq!(format_optional_time(None), "0001-01-01T00:00:00Z");
     }
 }

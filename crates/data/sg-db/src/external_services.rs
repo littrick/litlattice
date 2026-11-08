@@ -6,9 +6,11 @@
 //! keyring identified by `encryption_key_id` (`extsvc.NewEncryptedConfig`).
 
 use sqlx::postgres::PgPool;
+use sqlx::types::time::OffsetDateTime;
 use sqlx::Row;
 
-/// Subset of `types.ExternalService` used by the gitserver write path.
+/// Subset of `types.ExternalService` used by the gitserver write path and the
+/// repo-updater syncer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExternalService {
     pub id: i64,
@@ -18,6 +20,9 @@ pub struct ExternalService {
     pub config: String,
     /// `''` when the config is not encrypted.
     pub encryption_key_id: String,
+    pub last_sync_at: Option<sqlx::types::time::OffsetDateTime>,
+    pub next_sync_at: Option<sqlx::types::time::OffsetDateTime>,
+    pub unrestricted: bool,
 }
 
 /// Lookup failures. The baseline's `GetByID` returns
@@ -71,7 +76,8 @@ impl ExternalServiceStore {
     pub async fn get_by_id(&self, id: i64) -> Result<ExternalService, ExternalServiceError> {
         let row = sqlx::query(
             r#"
-SELECT id, kind, display_name, config, encryption_key_id
+SELECT id, kind, display_name, config, encryption_key_id,
+       last_sync_at, next_sync_at, unrestricted
 FROM external_services
 WHERE id = $1 AND deleted_at IS NULL
 "#,
@@ -87,7 +93,67 @@ WHERE id = $1 AND deleted_at IS NULL
             display_name: row.try_get("display_name")?,
             config: row.try_get("config")?,
             encryption_key_id: row.try_get("encryption_key_id")?,
+            last_sync_at: row.try_get("last_sync_at")?,
+            next_sync_at: row.try_get("next_sync_at")?,
+            unrestricted: row.try_get("unrestricted")?,
         })
+    }
+
+    /// `ExternalServices().Update` restricted to the sync timestamps (the only
+    /// `ExternalServiceUpdate` fields the syncer sets). The baseline bumps
+    /// `updated_at` and reports a missing/deleted service as not found.
+    pub async fn update_sync_timestamps(
+        &self,
+        id: i64,
+        last_sync_at: OffsetDateTime,
+        next_sync_at: OffsetDateTime,
+    ) -> Result<(), ExternalServiceError> {
+        let result = sqlx::query(
+            r#"
+UPDATE external_services
+SET last_sync_at = $2, next_sync_at = $3, updated_at = NOW()
+WHERE id = $1 AND deleted_at IS NULL
+"#,
+        )
+        .bind(id)
+        .bind(last_sync_at)
+        .bind(next_sync_at)
+        .execute(&self.pool)
+        .await?;
+        if result.rows_affected() == 0 {
+            return Err(ExternalServiceError::NotFound { id });
+        }
+        Ok(())
+    }
+
+    /// All live external services, oldest first. Used by the syncer scheduler
+    /// equivalent and the debug state dump.
+    pub async fn list_all(&self) -> Result<Vec<ExternalService>, ExternalServiceError> {
+        let rows = sqlx::query(
+            r#"
+SELECT id, kind, display_name, config, encryption_key_id,
+       last_sync_at, next_sync_at, unrestricted
+FROM external_services
+WHERE deleted_at IS NULL
+ORDER BY id
+"#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(ExternalService {
+                    id: row.try_get("id")?,
+                    kind: row.try_get("kind")?,
+                    display_name: row.try_get("display_name")?,
+                    config: row.try_get("config")?,
+                    encryption_key_id: row.try_get("encryption_key_id")?,
+                    last_sync_at: row.try_get("last_sync_at")?,
+                    next_sync_at: row.try_get("next_sync_at")?,
+                    unrestricted: row.try_get("unrestricted")?,
+                })
+            })
+            .collect()
     }
 }
 
@@ -121,6 +187,9 @@ mod tests {
                 display_name: "gh".to_owned(),
                 config: "{\"token\":\"secret\"}".to_owned(),
                 encryption_key_id: "key-1".to_owned(),
+                last_sync_at: None,
+                next_sync_at: None,
+                unrestricted: false,
             }
         );
 

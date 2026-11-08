@@ -292,6 +292,66 @@ impl SiteConfiguration {
         }
     }
 
+    /// `siteConfig.disableAutoCodeHostSyncs`.
+    pub fn disable_auto_code_host_syncs(&self) -> bool {
+        self.bool_field("disableAutoCodeHostSyncs")
+    }
+
+    /// `conf.RepoListUpdateInterval`: `siteConfig.repoListUpdateInterval`
+    /// minutes, defaulting to 1 minute. A negative value has no valid
+    /// behaviour in the baseline (the periodic goroutine would receive a
+    /// non-positive ticker interval), so it also falls back to the default.
+    pub fn repo_list_update_interval(&self) -> Duration {
+        match self
+            .raw
+            .get("repoListUpdateInterval")
+            .and_then(serde_json::Value::as_i64)
+        {
+            Some(minutes) if minutes > 0 => Duration::from_secs(minutes as u64 * 60),
+            _ => Duration::from_secs(60),
+        }
+    }
+
+    /// `conf.RepoConcurrentExternalServiceSyncers`:
+    /// `siteConfig.repoConcurrentExternalServiceSyncers`, defaulting to 3
+    /// when unset or non-positive.
+    pub fn repo_concurrent_external_service_syncers(&self) -> usize {
+        match self
+            .raw
+            .get("repoConcurrentExternalServiceSyncers")
+            .and_then(serde_json::Value::as_i64)
+        {
+            Some(value) if value > 0 => value as usize,
+            _ => 3,
+        }
+    }
+
+    /// `siteConfig.repoPurgeWorker`, defaulting to 15/60 minutes when the
+    /// section is absent (a present section with missing fields means 0,
+    /// which disables the worker like the baseline).
+    pub fn repo_purge_worker(&self) -> RepoPurgeWorkerConfig {
+        let Some(section) = self
+            .raw
+            .get("repoPurgeWorker")
+            .and_then(serde_json::Value::as_object)
+        else {
+            return RepoPurgeWorkerConfig {
+                interval_minutes: 15,
+                deleted_ttl_minutes: 60,
+            };
+        };
+        RepoPurgeWorkerConfig {
+            interval_minutes: section
+                .get("intervalMinutes")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(0),
+            deleted_ttl_minutes: section
+                .get("deletedTTLMinutes")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(0),
+        }
+    }
+
     /// `conf.Unified.GitUpdateInterval`: `siteConfig.gitUpdateInterval` rules.
     /// Each rule is a repo-name pattern (Go `regexp`) and an interval in
     /// minutes; the scheduler uses the first match.
@@ -459,6 +519,13 @@ fn parse_encryption_key(value: &serde_json::Value) -> Option<EncryptionKeyConfig
 pub struct GitUpdateIntervalRule {
     pub pattern: String,
     pub interval_minutes: i64,
+}
+
+/// `schema.RepoPurgeWorker`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RepoPurgeWorkerConfig {
+    pub interval_minutes: i64,
+    pub deleted_ttl_minutes: i64,
 }
 
 /// Port of `conf.Unified`.
@@ -730,7 +797,7 @@ pub fn parse_jsonc(input: &str) -> Result<serde_json::Value, serde_json::Error> 
 /// Remove JSONC comments and trailing commas before handing the text to
 /// `serde_json` (the baseline uses `internal/jsonc`, a JSON5-style
 /// preprocessor). Comment markers inside strings are preserved.
-fn strip_jsonc(input: &str) -> String {
+pub fn strip_jsonc(input: &str) -> String {
     let bytes = input.as_bytes();
     let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
     let mut index = 0;

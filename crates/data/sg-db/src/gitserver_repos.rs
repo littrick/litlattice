@@ -134,6 +134,15 @@ impl std::fmt::Display for GitserverRepoNotFound {
 
 impl std::error::Error for GitserverRepoNotFound {}
 
+/// `ListPurgableReposOptions`.
+#[derive(Debug, Clone, Default)]
+pub struct ListPurgableReposOptions {
+    /// Only purge repos deleted before this time. `None` skips the filter.
+    pub deleted_before: Option<OffsetDateTime>,
+    /// Optional row limit; repos are ordered by `deleted_at`, oldest first.
+    pub limit: Option<i64>,
+}
+
 /// `IterateRepoGitserverStatusOptions`.
 #[derive(Debug, Clone, Default)]
 pub struct IterateRepoGitserverStatusOptions {
@@ -469,6 +478,42 @@ AND
             updated += statement.execute(&self.pool).await?.rows_affected();
         }
         Ok(updated)
+    }
+
+    /// `ListPurgeableRepos` (`purgableReposQuery`): soft-deleted or blocked
+    /// repos that still have a clone on gitserver, oldest deletion first.
+    pub async fn list_purgeable_repos(
+        &self,
+        options: &ListPurgableReposOptions,
+    ) -> Result<Vec<String>, sqlx::Error> {
+        let mut query = sqlx::QueryBuilder::new(
+            "SELECT repo.name \
+             FROM repo \
+             JOIN gitserver_repos gr ON repo.id = gr.repo_id \
+             WHERE (",
+        );
+        match options.deleted_before {
+            Some(deleted_before) => {
+                query.push("deleted_at IS NOT NULL AND deleted_at < ");
+                query.push_bind(deleted_before);
+            }
+            None => {
+                query.push("deleted_at IS NOT NULL");
+            }
+        }
+        query.push(" OR repo.blocked IS NOT NULL) AND gr.clone_status = ");
+        query.push_bind(CloneStatus::Cloned.as_str().to_owned());
+        query.push(" ORDER BY deleted_at ASC");
+        if let Some(limit) = options.limit {
+            if limit > 0 {
+                query.push(" LIMIT ");
+                query.push_bind(limit);
+            }
+        }
+        let rows = query.build().fetch_all(&self.pool).await?;
+        rows.into_iter()
+            .map(|row| row.try_get::<String, _>("name"))
+            .collect()
     }
 
     /// `IterateRepoGitserverStatus`: page through `gitserver_repos` joined
@@ -809,6 +854,111 @@ mod tests {
                 .await
                 .expect("cleanup");
         }
+        result
+    }
+}
+
+#[cfg(test)]
+mod purge_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn lists_deleted_and_blocked_cloned_repos_for_purge() {
+        let Ok(dsn) = std::env::var("SG_TEST_DATABASE_DSN") else {
+            eprintln!("SG_TEST_DATABASE_DSN unset; skipping");
+            return;
+        };
+        let pool = crate::connect(&dsn, 2).await.expect("connect");
+        let store = GitserverReposStore::new(pool.clone());
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let deleted_old = format!("purge-test-{suffix}.example.com/old");
+        let deleted_new = format!("purge-test-{suffix}.example.com/new");
+        let blocked = format!("purge-test-{suffix}.example.com/blocked");
+        let deleted_not_cloned = format!("purge-test-{suffix}.example.com/not-cloned");
+
+        for name in [&deleted_old, &deleted_new, &blocked, &deleted_not_cloned] {
+            sqlx::query("INSERT INTO repo(name) VALUES ($1)")
+                .bind(name)
+                .execute(&pool)
+                .await
+                .expect("insert repo");
+            store
+                .set_clone_status(name, CloneStatus::Cloned, "shard-1")
+                .await
+                .expect("cloned");
+        }
+        sqlx::query(
+            "UPDATE repo SET deleted_at = clock_timestamp() - '2 hours'::interval WHERE name::text = $1",
+        )
+        .bind(&deleted_old)
+        .execute(&pool)
+        .await
+        .expect("delete old");
+        sqlx::query("UPDATE repo SET deleted_at = clock_timestamp() WHERE name::text = $1")
+            .bind(&deleted_new)
+            .execute(&pool)
+            .await
+            .expect("delete new");
+        sqlx::query("UPDATE repo SET blocked = '{\"reason\":\"dmca\"}' WHERE name::text = $1")
+            .bind(&blocked)
+            .execute(&pool)
+            .await
+            .expect("block");
+        sqlx::query("UPDATE repo SET deleted_at = clock_timestamp() WHERE name::text = $1")
+            .bind(&deleted_not_cloned)
+            .execute(&pool)
+            .await
+            .expect("delete not cloned");
+        store
+            .set_clone_status(&deleted_not_cloned, CloneStatus::NotCloned, "shard-1")
+            .await
+            .expect("not cloned");
+
+        let result = async {
+            let all = store
+                .list_purgeable_repos(&ListPurgableReposOptions::default())
+                .await
+                .expect("list");
+            assert_eq!(
+                all,
+                vec![deleted_old.clone(), deleted_new.clone(), blocked.clone(),],
+                "ordered by deleted_at; blocked repos have NULL deleted_at and sort last"
+            );
+
+            // DeletedBefore keeps only the older deletion, but blocked repos
+            // are always included (their deleted_at is NULL).
+            let cutoff = OffsetDateTime::now_utc() - time::Duration::hours(1);
+            let filtered = store
+                .list_purgeable_repos(&ListPurgableReposOptions {
+                    deleted_before: Some(cutoff),
+                    limit: None,
+                })
+                .await
+                .expect("filtered");
+            assert!(filtered.contains(&deleted_old));
+            assert!(filtered.contains(&blocked));
+            assert!(!filtered.contains(&deleted_new));
+            assert!(!filtered.contains(&deleted_not_cloned));
+
+            let limited = store
+                .list_purgeable_repos(&ListPurgableReposOptions {
+                    deleted_before: None,
+                    limit: Some(1),
+                })
+                .await
+                .expect("limited");
+            assert_eq!(limited, vec![deleted_old.clone()]);
+        }
+        .await;
+
+        sqlx::query("DELETE FROM repo WHERE name::text LIKE $1")
+            .bind(format!("%purge-test-{suffix}%"))
+            .execute(&pool)
+            .await
+            .expect("cleanup");
         result
     }
 }

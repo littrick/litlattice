@@ -362,6 +362,68 @@ impl UpdateScheduler {
         self.schedule.ids()
     }
 
+    /// `UpdateScheduler.UpdateFromDiff`: keep the schedule in sync with the
+    /// repositories an external service sync reported.
+    ///
+    /// - `Deleted`: remove from the schedule and the queue.
+    /// - `Added`: schedule and enqueue for an immediate clone/fetch.
+    /// - `Modified`: schedule; enqueue only when the name changed (a rename
+    ///   usually means a new clone URL).
+    /// - `Unmodified`: schedule (unless the stored repo is soft-deleted);
+    ///   never enqueue.
+    pub fn update_from_diff(&self, diff: &sg_extsvc::RepoSyncDiff) {
+        for repo in &diff.deleted {
+            self.remove_repo(repo);
+        }
+        for repo in &diff.added {
+            self.upsert_repo(repo, true);
+        }
+        for modified in &diff.modified {
+            self.upsert_repo(
+                &modified.repo,
+                modified
+                    .modified
+                    .contains(sg_extsvc::RepoModifiedFields::NAME),
+            );
+        }
+        for repo in &diff.unmodified {
+            if repo.deleted {
+                self.remove_repo(repo);
+                continue;
+            }
+            self.upsert_repo(repo, false);
+        }
+    }
+
+    /// `UpdateScheduler.upsert`.
+    fn upsert_repo(&self, repo: &sg_extsvc::Repo, enqueue: bool) {
+        let configured = ConfiguredRepo {
+            id: repo.id,
+            name: repo.name.clone(),
+        };
+        let updated = self.schedule.upsert(configured.clone());
+        tracing::debug!(repo = %repo.name, updated, "scheduler.schedule.upserted");
+        if !enqueue {
+            return;
+        }
+        let updated = self.queue.enqueue(configured, Priority::Low);
+        tracing::debug!(repo = %repo.name, updated, "scheduler.updateQueue.enqueued");
+    }
+
+    /// `UpdateScheduler.remove`.
+    fn remove_repo(&self, repo: &sg_extsvc::Repo) {
+        let configured = ConfiguredRepo {
+            id: repo.id,
+            name: repo.name.clone(),
+        };
+        if self.schedule.remove(&configured) {
+            tracing::debug!(repo = %repo.name, "scheduler.schedule.removed");
+        }
+        if self.queue.remove(&configured, false) {
+            tracing::debug!(repo = %repo.name, "scheduler.updateQueue.removed");
+        }
+    }
+
     pub fn debug_schedule(&self) -> Vec<schedule::ScheduledRepoUpdate> {
         self.schedule.snapshot()
     }
@@ -716,5 +778,68 @@ mod tests {
         assert!(interval >= Duration::from_secs(8 * 3600 * 95 / 100));
         assert!(interval <= Duration::from_secs(8 * 3600 * 105 / 100));
         assert_eq!(scheduler.list_repo_ids(), vec![1]);
+    }
+
+    #[test]
+    fn diffs_update_the_schedule_and_queue_like_the_baseline() {
+        let (scheduler, _clock) = scheduler(
+            Arc::new(FakeStore::default()),
+            Arc::new(FakeGitserver {
+                last_fetched: NOW,
+                last_changed: NOW,
+                fail: false,
+            }),
+            live_config("{}"),
+            NOW,
+        );
+
+        let repo = |id: i32, name: &str| sg_extsvc::Repo {
+            id,
+            name: name.to_owned(),
+            ..sg_extsvc::Repo::default()
+        };
+
+        let diff = sg_extsvc::RepoSyncDiff {
+            added: vec![repo(1, "github.com/o/added")],
+            modified: vec![sg_extsvc::ModifiedRepo {
+                repo: repo(2, "github.com/o/modified"),
+                modified: sg_extsvc::RepoModifiedFields::default(),
+            }],
+            unmodified: vec![repo(3, "github.com/o/unmodified")],
+            ..Default::default()
+        };
+        scheduler.update_from_diff(&diff);
+
+        // All three are scheduled.
+        let mut ids = scheduler.list_repo_ids();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![1, 2, 3]);
+        // Added and the (name-unchanged) modified repo... the baseline only
+        // enqueues added; modified without a name change is scheduled only.
+        assert!(scheduler.debug_queue().iter().any(|u| u.repo.id == 1));
+        assert!(!scheduler.debug_queue().iter().any(|u| u.repo.id == 2));
+        assert!(!scheduler.debug_queue().iter().any(|u| u.repo.id == 3));
+
+        // A name change enqueues the modified repo. `Repo::update` is the
+        // only way to build the NAME bit.
+        let mut stored = repo(2, "github.com/o/modified");
+        let changed = stored.update(&repo(2, "github.com/o/renamed"));
+        assert!(changed.contains(sg_extsvc::RepoModifiedFields::NAME));
+        scheduler.update_from_diff(&sg_extsvc::RepoSyncDiff {
+            modified: vec![sg_extsvc::ModifiedRepo {
+                repo: repo(2, "github.com/o/renamed"),
+                modified: changed,
+            }],
+            ..Default::default()
+        });
+        assert!(scheduler.debug_queue().iter().any(|u| u.repo.id == 2));
+
+        // Deleted repos leave both structures.
+        scheduler.update_from_diff(&sg_extsvc::RepoSyncDiff {
+            deleted: vec![repo(1, "github.com/o/added")],
+            ..Default::default()
+        });
+        assert!(!scheduler.list_repo_ids().contains(&1));
+        assert!(!scheduler.debug_queue().iter().any(|u| u.repo.id == 1));
     }
 }

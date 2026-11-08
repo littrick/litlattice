@@ -19,6 +19,10 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
+pub mod client;
+
+pub use client::HttpClient;
+
 use http::{Request, Response, Version};
 use hyper::body::Incoming;
 use hyper::service::service_fn;

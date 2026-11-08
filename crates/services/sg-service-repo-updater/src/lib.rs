@@ -5,11 +5,12 @@
 //!
 //! Covered by this slice: the scheduler (schedule heap, update queue,
 //! hydration from `gitserver_repos`, `FetchRepository` driving, interval
-//! heuristics), the single-instance gRPC listener (`:3182`), the debug
-//! `/repo-updater-state` dumper, and config propagation from the frontend.
+//! heuristics), external-service source syncing (`repos.Syncer` and its
+//! worker/resetter/janitor), scheduled repository purging, the single-instance
+//! gRPC listener (`:3182`), and the debug `/repo-updater-state` and
+//! `/manual-purge` endpoints.
 //!
-//! Not yet covered (later slices): external-service source syncing,
-//! `repos.Syncer` bridge, repository purge, Batch Changes sync registry.
+//! Not yet covered (later slices): Batch Changes sync registry.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -29,15 +30,32 @@ pub mod debug;
 pub mod gitserver;
 pub mod grpc;
 pub mod metrics;
+pub mod purge;
 pub mod scheduler;
 pub mod store;
+pub mod sync_worker;
+pub mod syncer;
 
 use config::RepoUpdaterConfig;
+use debug::DebugContext;
 use gitserver::GitserverRepoClient;
 use grpc::RepoUpdaterGrpc;
 use metrics::Metrics;
-use scheduler::{SystemClock, UpdateScheduler};
+use purge::PurgeWorker;
+use scheduler::{RepoUpdateClient, SystemClock, UpdateScheduler};
 use store::{DbRepoNameStore, DbSchedulerStore};
+use sync_worker::SyncWorker;
+use syncer::{ExtsvcSourceFactory, Syncer};
+
+/// `httpcli.Doer` adapter for the `OTHER` source's src-expose request.
+struct HttpClientGetter(sg_http::HttpClient);
+
+#[async_trait]
+impl sg_extsvc::HttpGetter for HttpClientGetter {
+    async fn get(&self, url: &str) -> Result<Vec<u8>, String> {
+        self.0.get(url).await
+    }
+}
 
 pub fn service_name() -> &'static str {
     "repo-updater"
@@ -127,7 +145,12 @@ impl Service for RepoUpdaterService {
             .map_err(|err| ServiceError::with_source("connecting to the frontend database", err))?;
 
         let repo_store = Arc::new(sg_db::repos::RepoStore::new(pool.clone()));
-        let gitserver_repos = sg_db::gitserver_repos::GitserverReposStore::new(pool);
+        let gitserver_repos = sg_db::gitserver_repos::GitserverReposStore::new(pool.clone());
+        let purge_gitserver_repos = sg_db::gitserver_repos::GitserverReposStore::new(pool.clone());
+        let external_services = sg_db::external_services::ExternalServiceStore::new(pool.clone());
+        let external_service_repos =
+            sg_db::external_service_repos::ExternalServiceReposStore::new(pool.clone());
+        let sync_jobs = sg_db::external_service_sync_jobs::SyncJobsStore::new(pool);
 
         let git_servers = unified.service_connections.git_servers.clone();
         let gitserver_client =
@@ -142,6 +165,40 @@ impl Service for RepoUpdaterService {
             gitserver_client.clone(),
             Arc::clone(&live),
             metrics,
+        ));
+
+        // `repos.NewSyncer` + `repos.NewSourcer`. `OTHER` fetches src-expose
+        // listings over HTTP; code-host kinds are not implemented yet.
+        let http: Arc<dyn sg_extsvc::HttpGetter> =
+            Arc::new(HttpClientGetter(sg_http::HttpClient::new()));
+        let source_factory = Arc::new(ExtsvcSourceFactory::new(Some(http)));
+        // The relay below subscribes before any sync runs, so no diff is
+        // dropped. The buffer only matters when the relay lags.
+        let (diff_tx, _) = tokio::sync::broadcast::channel(64);
+        let syncer = Arc::new(Syncer::new(
+            external_services,
+            external_service_repos,
+            source_factory,
+            Some(diff_tx.clone()),
+            Arc::new(SystemClock),
+        ));
+        let sync_worker = Arc::new(
+            SyncWorker::new(
+                sync_jobs.clone(),
+                Arc::clone(&syncer),
+                Arc::clone(&live),
+                sync_worker::hostname(),
+            )
+            .with_num_handlers(
+                live.current()
+                    .site
+                    .repo_concurrent_external_service_syncers(),
+            ),
+        );
+        let purge_worker = Arc::new(PurgeWorker::new(
+            purge_gitserver_repos,
+            gitserver_client.clone() as Arc<dyn RepoUpdateClient>,
+            Arc::clone(&live),
         ));
 
         let grpc = RepoUpdaterGrpc {
@@ -204,10 +261,57 @@ impl Service for RepoUpdaterService {
             let shutdown = ctx.shutdown.clone();
             tasks.spawn(async move { watcher.run(shutdown).await });
         }
-        if let Some(prof_addr) = config.prof_addr.clone() {
+
+        // `watchSyncer`: feed sync diffs into the update scheduler unless
+        // `disableAutoGitUpdates` is set (checked per diff, like the baseline).
+        {
+            let mut diffs = diff_tx.subscribe();
             let scheduler = Arc::clone(&scheduler);
+            let live = Arc::clone(&live);
             let shutdown = ctx.shutdown.clone();
-            tasks.spawn(async move { debug::serve(&prof_addr, scheduler, shutdown).await });
+            tasks.spawn(async move {
+                loop {
+                    let diff = tokio::select! {
+                        _ = shutdown.cancelled() => return,
+                        received = diffs.recv() => match received {
+                            Ok(diff) => diff,
+                            // The baseline's unbuffered channel cannot lag;
+                            // dropping a diff is the documented divergence.
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(lagged)) => {
+                                tracing::warn!(lagged, "dropping external service sync diffs");
+                                continue;
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                        },
+                    };
+                    if !live.current().site.disable_auto_git_updates() {
+                        scheduler.update_from_diff(&diff);
+                    }
+                }
+            });
+        }
+
+        // `syncer.Routines`: enqueue loop, dequeue loops, heartbeat,
+        // resetter and janitor.
+        Arc::clone(&sync_worker).spawn(&ctx.shutdown, &tasks);
+
+        // `purge.NewRepositoryPurgeWorker`, unless `DISABLE_REPO_PURGE` is
+        // set (parsed like `strconv.ParseBool`).
+        if !config.disable_repo_purge {
+            Arc::clone(&purge_worker).spawn(ctx.shutdown.clone(), &tasks);
+        } else {
+            tracing::info!("repository purger is disabled via env DISABLE_REPO_PURGE");
+        }
+
+        if let Some(prof_addr) = config.prof_addr.clone() {
+            let context = Arc::new(DebugContext {
+                scheduler: Arc::clone(&scheduler),
+                sync_jobs: Arc::new(sync_jobs),
+                purge: Arc::clone(&purge_worker),
+                tasks: tasks.clone(),
+            });
+            let shutdown = ctx.shutdown.clone();
+            tasks.spawn(async move { debug::serve(&prof_addr, context, shutdown).await });
         }
 
         let served = sg_http::serve(listener, routes, http, ctx.shutdown.clone()).await;

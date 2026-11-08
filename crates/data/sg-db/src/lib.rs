@@ -7,6 +7,8 @@
 
 use sqlx::postgres::{PgPool, PgPoolOptions};
 
+pub mod external_service_repos;
+pub mod external_service_sync_jobs;
 pub mod external_services;
 pub mod gitserver_repos;
 pub mod repos;

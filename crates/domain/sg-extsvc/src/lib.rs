@@ -1,5 +1,311 @@
 #![forbid(unsafe_code)]
 
-//! `sg-extsvc`: skeleton crate. Implementation lands in M7.
+//! `internal/extsvc` + `internal/repos/sources.go`: external services and the
+//! repositories they yield.
+//!
+//! This slice implements the `OTHER` kind (`internal/repos/other.go`), which
+//! is the only source that needs no code-host API. Other kinds plug into the
+//! same [`Source`] trait; the syncer is source-agnostic.
+//!
+//! Encrypted external-service configs (`encryption_key_id != ''`) are
+//! rejected here: decryption needs the frontend's keyring (`keyring.Init`
+//! reads the site configuration, not environment variables), which is
+//! covered separately.
 
-pub const CRATE_NAME: &str = "sg-extsvc";
+pub mod exclude;
+pub mod other;
+pub mod reposource;
+
+use std::collections::BTreeMap;
+
+use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
+
+/// `extsvc.KindOther`.
+pub const KIND_OTHER: &str = "OTHER";
+/// `extsvc.TypeOther` (lowercase, stored in `repo.external_service_type`).
+pub const TYPE_OTHER: &str = "other";
+
+/// `extsvc.URN`: `extsvc:<lowercased kind>:<id>`.
+pub fn urn(kind: &str, id: i64) -> String {
+    format!("extsvc:{}:{}", kind.to_lowercase(), id)
+}
+
+/// `api.ExternalRepoSpec`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExternalRepoSpec {
+    #[serde(rename = "ID")]
+    pub id: String,
+    #[serde(rename = "ServiceType")]
+    pub service_type: String,
+    #[serde(rename = "ServiceID")]
+    pub service_id: String,
+}
+
+impl ExternalRepoSpec {
+    /// `api.ExternalRepoSpec.Equal`.
+    pub fn equal(&self, other: &Self) -> bool {
+        !other.id.is_empty()
+            && !other.service_id.is_empty()
+            && !other.service_type.is_empty()
+            && self == other
+    }
+}
+
+/// `types.SourceInfo`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceInfo {
+    #[serde(rename = "ID")]
+    pub id: String,
+    #[serde(rename = "CloneURL")]
+    pub clone_url: String,
+}
+
+/// The `types.Repo` fields the syncer owns. Values not produced by a source
+/// stay at their zero value, exactly like the Go struct.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Repo {
+    /// `types.Repo.ID`; zero for a repo that has not been stored yet.
+    #[serde(default)]
+    pub id: i32,
+    /// `types.Repo.DeletedAt` reduced to `IsDeleted()`; only stored repos
+    /// carry it (sources never set it).
+    #[serde(default)]
+    pub deleted: bool,
+    pub name: String,
+    pub uri: String,
+    pub description: String,
+    pub external_repo: ExternalRepoSpec,
+    pub sources: BTreeMap<String, SourceInfo>,
+    /// `repo.metadata` (`extsvc.OtherRepoMetadata` for this source).
+    pub metadata: Option<serde_json::Value>,
+    pub archived: bool,
+    pub fork: bool,
+    pub stars: i32,
+    pub private: bool,
+}
+
+/// `types.RepoSyncDiff` plus the unmodified set, as produced by one sync.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RepoSyncDiff {
+    pub added: Vec<Repo>,
+    pub modified: Vec<ModifiedRepo>,
+    pub deleted: Vec<Repo>,
+    pub unmodified: Vec<Repo>,
+}
+
+impl RepoSyncDiff {
+    pub fn len(&self) -> usize {
+        self.added.len() + self.modified.len() + self.deleted.len() + self.unmodified.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// `types.RepoSyncDiff.Repos`: every repo in the diff.
+    pub fn repos(&self) -> Vec<&Repo> {
+        self.added
+            .iter()
+            .chain(self.modified.iter().map(|m| &m.repo))
+            .chain(self.deleted.iter())
+            .chain(self.unmodified.iter())
+            .collect()
+    }
+}
+
+/// The subset of `Repo.Update`'s bitmask that decides whether a repo changed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RepoModifiedFields(u32);
+
+impl RepoModifiedFields {
+    pub const NAME: u32 = 1 << 0;
+    pub const URI: u32 = 1 << 1;
+    pub const DESCRIPTION: u32 = 1 << 2;
+    pub const EXTERNAL_REPO: u32 = 1 << 3;
+    pub const ARCHIVED: u32 = 1 << 4;
+    pub const FORK: u32 = 1 << 5;
+    pub const PRIVATE: u32 = 1 << 6;
+    pub const STARS: u32 = 1 << 7;
+    pub const METADATA: u32 = 1 << 8;
+    pub const SOURCES: u32 = 1 << 9;
+
+    pub fn is_empty(&self) -> bool {
+        self.0 == 0
+    }
+
+    pub fn contains(&self, flag: u32) -> bool {
+        self.0 & flag != 0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ModifiedRepo {
+    pub repo: Repo,
+    pub modified: RepoModifiedFields,
+}
+
+impl Repo {
+    /// `types.Repo.Update`: copies the sourced values into the stored repo
+    /// and reports which fields changed.
+    pub fn update(&mut self, next: &Repo) -> RepoModifiedFields {
+        let mut modified = 0;
+        if self.name != next.name {
+            self.name = next.name.clone();
+            modified |= RepoModifiedFields::NAME;
+        }
+        if self.uri != next.uri {
+            self.uri = next.uri.clone();
+            modified |= RepoModifiedFields::URI;
+        }
+        if self.description != next.description {
+            self.description = next.description.clone();
+            modified |= RepoModifiedFields::DESCRIPTION;
+        }
+        if !next.external_repo.id.is_empty()
+            && !next.external_repo.service_id.is_empty()
+            && !next.external_repo.service_type.is_empty()
+            && self.external_repo != next.external_repo
+        {
+            self.external_repo = next.external_repo.clone();
+            modified |= RepoModifiedFields::EXTERNAL_REPO;
+        }
+        if self.archived != next.archived {
+            self.archived = next.archived;
+            modified |= RepoModifiedFields::ARCHIVED;
+        }
+        if self.fork != next.fork {
+            self.fork = next.fork;
+            modified |= RepoModifiedFields::FORK;
+        }
+        if self.private != next.private {
+            self.private = next.private;
+            modified |= RepoModifiedFields::PRIVATE;
+        }
+        if self.stars != next.stars {
+            self.stars = next.stars;
+            modified |= RepoModifiedFields::STARS;
+        }
+        if self.metadata != next.metadata {
+            self.metadata = next.metadata.clone();
+            modified |= RepoModifiedFields::METADATA;
+        }
+        for (urn, info) in &next.sources {
+            if self.sources.get(urn) != Some(info) {
+                self.sources.insert(urn.clone(), info.clone());
+                modified |= RepoModifiedFields::SOURCES;
+            }
+        }
+        RepoModifiedFields(modified)
+    }
+}
+
+/// One external service as the syncer consumes it (`types.ExternalService`
+/// with the config already decrypted).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceService {
+    pub id: i64,
+    pub kind: String,
+    pub display_name: String,
+    pub config: String,
+    pub encryption_key_id: String,
+    pub unrestricted: bool,
+}
+
+impl SourceService {
+    /// `types.ExternalService.URN`.
+    pub fn urn(&self) -> String {
+        urn(&self.kind, self.id)
+    }
+}
+
+/// `repos.SourceResult`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SourceResult {
+    pub repo: Option<Repo>,
+    pub err: Option<String>,
+}
+
+impl SourceResult {
+    pub fn repo(repo: Repo) -> Self {
+        Self {
+            repo: Some(repo),
+            err: None,
+        }
+    }
+
+    pub fn error(err: impl Into<String>) -> Self {
+        Self {
+            repo: None,
+            err: Some(err.into()),
+        }
+    }
+}
+
+/// `httpcli.Doer`, reduced to the GET the src-expose path needs.
+#[async_trait]
+pub trait HttpGetter: Send + Sync {
+    async fn get(&self, url: &str) -> Result<Vec<u8>, String>;
+}
+
+/// `repos.Source`.
+#[async_trait]
+pub trait Source: Send + Sync {
+    /// `Source.ListRepos`. The baseline streams over a channel; this slice
+    /// materialises the results because the `OTHER` source is config-bounded.
+    async fn list_repos(&self) -> Vec<SourceResult>;
+    /// `Source.CheckConnection`; `OTHER` always succeeds.
+    fn check_connection(&self) -> Result<(), String> {
+        Ok(())
+    }
+    /// `Source.ExternalServices`.
+    fn external_services(&self) -> Vec<SourceService>;
+}
+
+/// `repos.NewSource` for the kinds implemented so far.
+pub fn new_source(
+    service: SourceService,
+    http: Option<std::sync::Arc<dyn HttpGetter>>,
+) -> Result<Box<dyn Source>, String> {
+    if service.kind.eq_ignore_ascii_case(KIND_OTHER) {
+        Ok(Box::new(other::OtherSource::new(service, http)?))
+    } else {
+        Err(format!("cannot create source for kind {:?}", service.kind))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn urn_matches_the_baseline_format() {
+        assert_eq!(urn("OTHER", 42), "extsvc:other:42");
+    }
+
+    #[test]
+    fn update_reports_changed_fields() {
+        let mut stored = Repo {
+            name: "github.com/o/r".to_owned(),
+            uri: "old".to_owned(),
+            private: true,
+            metadata: Some(serde_json::json!({"RelativePath": "/a"})),
+            ..Repo::default()
+        };
+        let sourced = Repo {
+            name: "github.com/o/r".to_owned(),
+            uri: "new".to_owned(),
+            private: true,
+            metadata: Some(serde_json::json!({"RelativePath": "/a"})),
+            ..Repo::default()
+        };
+        let modified = stored.update(&sourced);
+        assert!(modified.contains(RepoModifiedFields::URI));
+        assert!(!modified.contains(RepoModifiedFields::NAME));
+        assert!(!modified.contains(RepoModifiedFields::METADATA));
+        assert_eq!(stored.uri, "new");
+
+        let unchanged = stored.update(&sourced);
+        assert!(unchanged.is_empty());
+    }
+}
