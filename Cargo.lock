@@ -4219,6 +4219,7 @@ name = "sg-service-worker"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "flate2",
  "http 1.5.0",
  "http-body-util",
  "hyper 1.12.0",

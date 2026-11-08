@@ -21,6 +21,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::{Job, JobDeps};
 use crate::framework::periodic::{Handler, HandlerError, PeriodicRoutine};
+use crate::framework::BackgroundRoutine;
 
 /// `max(ctx)`-free constant from the baseline: `1 * time.Hour`.
 pub const INTERVAL: Duration = Duration::from_secs(3600);
@@ -43,7 +44,7 @@ impl Job for WebhookLogJanitor {
         &self,
         deps: &JobDeps,
         _setup_ctx: CancellationToken,
-    ) -> Result<Vec<PeriodicRoutine>, String> {
+    ) -> Result<Vec<BackgroundRoutine>, String> {
         let handler = Arc::new(WebhookLogJanitorHandler {
             frontend: deps.frontend.clone(),
             live_config: Arc::clone(&deps.live_config),
@@ -52,7 +53,8 @@ impl Job for WebhookLogJanitor {
         Ok(vec![PeriodicRoutine::new(handler)
             .with_name(ROUTINE_NAME)
             .with_description(ROUTINE_DESCRIPTION)
-            .with_interval(INTERVAL)])
+            .with_interval(INTERVAL)
+            .into()])
     }
 }
 

@@ -33,13 +33,14 @@ use tokio_util::task::TaskTracker;
 
 pub mod config;
 pub mod debug;
+pub mod env;
 pub mod framework;
 pub mod health;
 pub mod jobs;
 pub mod registry;
 
 use config::WorkerConfigs;
-use framework::recorder::{Recordable, Recorder};
+use framework::recorder::Recorder;
 use jobs::{Job, JobDeps};
 
 pub const SERVICE_NAME: &str = "worker";
@@ -104,6 +105,9 @@ impl Service for WorkerService {
     }
 
     fn configure(&mut self, env: &mut EnvReader) -> Result<(), ConfigError> {
+        // `internal/env`'s package init: INSECURE_DEV is registered (and
+        // parsed) before any `Configure`.
+        env::register(env);
         // `sanitycheck.Pass()` registers SANITY_CHECK in every service binary.
         let _ = env.get(
             "SANITY_CHECK",
@@ -211,9 +215,13 @@ impl Service for WorkerService {
             Ok(kv) => {
                 let recorder = Recorder::new(Recorder::cache(kv), Recorder::process_name());
                 for routine in &routines {
-                    let recordable: Arc<dyn Recordable> =
-                        Arc::clone(routine) as Arc<dyn Recordable>;
-                    routine.register_recorder(Arc::clone(&recorder));
+                    // Only periodic routines are `recorder.Recordable`; the
+                    // httpserver-based routines are not registered by the
+                    // baseline either.
+                    let Some(recordable) = routine.recordable() else {
+                        continue;
+                    };
+                    recordable.register_recorder(Arc::clone(&recorder));
                     recorder.register(recordable);
                 }
                 recorder.registration_done().await;

@@ -26,6 +26,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::{Job, JobDeps};
 use crate::framework::periodic::{Handler, HandlerError, PeriodicRoutine};
+use crate::framework::BackgroundRoutine;
 
 pub const INTERVAL: Duration = Duration::from_secs(30 * 60);
 /// `context.WithTimeout(ctx, 5*time.Minute)` per reset attempt.
@@ -47,13 +48,14 @@ impl Job for RepoStatisticsCompactor {
         &self,
         deps: &JobDeps,
         _setup_ctx: CancellationToken,
-    ) -> Result<Vec<PeriodicRoutine>, String> {
+    ) -> Result<Vec<BackgroundRoutine>, String> {
         Ok(vec![PeriodicRoutine::new(Arc::new(CompactorHandler {
             pool: deps.frontend.clone(),
         }) as Arc<dyn Handler>)
         .with_name("repomgmt.statistics-compactor")
         .with_description("compacts repo statistics")
-        .with_interval(INTERVAL)])
+        .with_interval(INTERVAL)
+        .into()])
     }
 }
 
@@ -70,13 +72,14 @@ impl Job for RepoStatisticsResetter {
         &self,
         deps: &JobDeps,
         _setup_ctx: CancellationToken,
-    ) -> Result<Vec<PeriodicRoutine>, String> {
+    ) -> Result<Vec<BackgroundRoutine>, String> {
         Ok(vec![PeriodicRoutine::new(Arc::new(ResetterHandler {
             pool: deps.frontend.clone(),
         }) as Arc<dyn Handler>)
         .with_name("repomgmt.statistics-resetter")
         .with_description("resets repo statistics")
-        .with_interval(INTERVAL)])
+        .with_interval(INTERVAL)
+        .into()])
     }
 }
 

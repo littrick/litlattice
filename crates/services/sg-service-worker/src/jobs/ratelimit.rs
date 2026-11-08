@@ -37,6 +37,7 @@ use tokio_util::sync::CancellationToken;
 use super::{Job, JobDeps};
 use crate::config::combine_errors;
 use crate::framework::periodic::{Handler, HandlerError, PeriodicRoutine};
+use crate::framework::BackgroundRoutine;
 
 /// `ratelimit.tokenBucketGlobalPrefix`.
 pub const TOKEN_BUCKET_GLOBAL_PREFIX: &str = "v2:rate_limiters";
@@ -242,7 +243,7 @@ impl Job for RateLimitConfigJob {
         &self,
         deps: &JobDeps,
         _setup_ctx: CancellationToken,
-    ) -> Result<Vec<PeriodicRoutine>, String> {
+    ) -> Result<Vec<BackgroundRoutine>, String> {
         let handler = RateLimitConfigHandler::new(
             ExternalServiceStore::new(deps.frontend.clone()),
             Arc::clone(&deps.keyring),
@@ -255,7 +256,8 @@ impl Job for RateLimitConfigJob {
         Ok(vec![PeriodicRoutine::new(Arc::new(handler))
             .with_name(ROUTINE_NAME)
             .with_description(ROUTINE_DESCRIPTION)
-            .with_interval(ROUTINE_INTERVAL)])
+            .with_interval(ROUTINE_INTERVAL)
+            .into()])
     }
 }
 

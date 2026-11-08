@@ -37,6 +37,7 @@ use tokio_util::sync::CancellationToken;
 use super::{Job, JobConfig, JobDeps};
 use crate::config::combine_errors;
 use crate::framework::periodic::{Handler, HandlerError, PeriodicRoutine};
+use crate::framework::BackgroundRoutine;
 
 /// `executortypes.DequeueCachePrefix`.
 pub const DEQUEUE_CACHE_PREFIX: &str = "executor_multihandler_dequeues";
@@ -197,16 +198,18 @@ impl Job for ExecutorsJanitor {
         &self,
         deps: &JobDeps,
         _setup_ctx: CancellationToken,
-    ) -> Result<Vec<PeriodicRoutine>, String> {
+    ) -> Result<Vec<BackgroundRoutine>, String> {
         let config = self.config.snapshot();
 
-        let mut routines = vec![PeriodicRoutine::new(Arc::new(HeartbeatJanitorHandler {
-            pool: deps.frontend.clone(),
-            max_age: config.heartbeat_records_max_age,
-        }) as Arc<dyn Handler>)
-        .with_name(ROUTINE_HEARTBEAT_JANITOR)
-        .with_description(HEARTBEAT_DESCRIPTION)
-        .with_interval(config.cleanup_task_interval)];
+        let mut routines: Vec<BackgroundRoutine> =
+            vec![PeriodicRoutine::new(Arc::new(HeartbeatJanitorHandler {
+                pool: deps.frontend.clone(),
+                max_age: config.heartbeat_records_max_age,
+            }) as Arc<dyn Handler>)
+            .with_name(ROUTINE_HEARTBEAT_JANITOR)
+            .with_description(HEARTBEAT_DESCRIPTION)
+            .with_interval(config.cleanup_task_interval)
+            .into()];
 
         match KeyValue::connect(&sg_redis::cache_endpoint()).await {
             Ok(kv) => {
@@ -224,7 +227,8 @@ impl Job for ExecutorsJanitor {
                     )) as Arc<dyn Handler>)
                     .with_name(ROUTINE_CACHE_CLEANER)
                     .with_description(CLEANER_DESCRIPTION)
-                    .with_interval(config.cache_cleanup_interval),
+                    .with_interval(config.cache_cleanup_interval)
+                    .into(),
                 );
             }
             Err(err) => tracing::warn!(

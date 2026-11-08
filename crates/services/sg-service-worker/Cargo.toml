@@ -18,6 +18,7 @@ sg-metrics = { path = "../../base/sg-metrics" }
 sg-rcache = { path = "../../data/sg-rcache" }
 sg-redis = { path = "../../data/sg-redis" }
 async-trait = { workspace = true }
+flate2 = { workspace = true }
 http = { workspace = true }
 http-body-util = { workspace = true }
 hyper = { workspace = true }

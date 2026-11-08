@@ -21,6 +21,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::{Job, JobDeps};
 use crate::framework::periodic::{GetInterval, Handler, HandlerError, PeriodicRoutine};
+use crate::framework::BackgroundRoutine;
 
 pub const ROUTINE_NAME: &str = "auth.permission_sync_job_cleaner";
 pub const ROUTINE_DESCRIPTION: &str = "Cleans up completed or failed permissions sync jobs";
@@ -40,7 +41,7 @@ impl Job for PermissionSyncJobCleaner {
         &self,
         deps: &JobDeps,
         _setup_ctx: CancellationToken,
-    ) -> Result<Vec<PeriodicRoutine>, String> {
+    ) -> Result<Vec<BackgroundRoutine>, String> {
         let live_config = Arc::clone(&deps.live_config);
         let interval_config = Arc::clone(&live_config);
         let get_interval: GetInterval =
@@ -54,7 +55,8 @@ impl Job for PermissionSyncJobCleaner {
         )
         .with_name(ROUTINE_NAME)
         .with_description(ROUTINE_DESCRIPTION)
-        .with_interval_func(get_interval)])
+        .with_interval_func(get_interval)
+        .into()])
     }
 }
 

@@ -246,6 +246,20 @@ impl KeyValue {
     pub async fn keys(&self, pattern: &str) -> Result<Vec<String>, RedisError> {
         self.run(redis::cmd("KEYS").arg(self.key(pattern))).await
     }
+
+    /// `MGET` over fully-qualified keys (the ones `KEYS` returns, which already
+    /// include this handle's prefix). `None` is redigo's `redis.ErrNil` for a
+    /// key that disappeared between `KEYS` and `MGET`.
+    pub async fn mget(&self, keys: &[String]) -> Result<Vec<Value>, RedisError> {
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut cmd = redis::cmd("MGET");
+        for key in keys {
+            cmd.arg(key);
+        }
+        self.run(&mut cmd).await
+    }
 }
 
 /// `redisKeyValue.prefix + prefix + ":"` (`WithPrefix`).

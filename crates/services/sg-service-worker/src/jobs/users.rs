@@ -19,6 +19,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::{Job, JobDeps};
 use crate::framework::periodic::{Handler, HandlerError, PeriodicRoutine};
+use crate::framework::BackgroundRoutine;
 
 pub const FLAG_NAME: &str = "user_management_cache_disabled";
 pub const ROUTINE_NAME: &str = "update_aggregated_user_statistics";
@@ -61,7 +62,7 @@ impl Job for AggregatedUsersStatistics {
         &self,
         deps: &JobDeps,
         _setup_ctx: CancellationToken,
-    ) -> Result<Vec<PeriodicRoutine>, String> {
+    ) -> Result<Vec<BackgroundRoutine>, String> {
         Ok(vec![PeriodicRoutine::new(
             Arc::new(AggregatedUsersStatisticsHandler {
                 pool: deps.frontend.clone(),
@@ -70,7 +71,8 @@ impl Job for AggregatedUsersStatistics {
         .with_name(ROUTINE_NAME)
         .with_description(ROUTINE_DESCRIPTION)
         .with_interval(INTERVAL)
-        .with_initial_delay(INITIAL_DELAY)])
+        .with_initial_delay(INITIAL_DELAY)
+        .into()])
     }
 }
 

@@ -26,7 +26,7 @@ use tokio::runtime::RuntimeFlavor;
 use tokio_util::sync::CancellationToken;
 
 use super::{Job, JobDeps};
-use crate::framework::periodic::PeriodicRoutine;
+use crate::framework::BackgroundRoutine;
 
 /// `src_gitserver_repo_last_error_total` (`servermetrics.go`).
 pub const REPO_LAST_ERROR_TOTAL: &str = "src_gitserver_repo_last_error_total";
@@ -59,7 +59,7 @@ impl Job for GitserverMetrics {
         &self,
         deps: &JobDeps,
         _setup_ctx: CancellationToken,
-    ) -> Result<Vec<PeriodicRoutine>, String> {
+    ) -> Result<Vec<BackgroundRoutine>, String> {
         register_metrics(deps.frontend.clone());
         // `return nil, nil`: the job owns no routines.
         Ok(Vec::new())

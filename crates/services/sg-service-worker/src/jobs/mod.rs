@@ -32,11 +32,12 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::WorkerConfigs;
-use crate::framework::periodic::PeriodicRoutine;
+use crate::framework::BackgroundRoutine;
 use crate::registry;
 
 pub mod eventlogs;
 pub mod executors;
+pub mod executors_metrics;
 pub mod gitserver;
 pub mod permissions;
 pub mod ratelimit;
@@ -90,7 +91,7 @@ pub trait Job: Send + Sync {
         &self,
         deps: &JobDeps,
         setup_ctx: CancellationToken,
-    ) -> Result<Vec<PeriodicRoutine>, String>;
+    ) -> Result<Vec<BackgroundRoutine>, String>;
 }
 
 /// A registry name whose job group has not been ported yet. Its `routines`
@@ -105,7 +106,7 @@ impl Job for UnportedJob {
         &self,
         _deps: &JobDeps,
         _setup_ctx: CancellationToken,
-    ) -> Result<Vec<PeriodicRoutine>, String> {
+    ) -> Result<Vec<BackgroundRoutine>, String> {
         Err(format!(
             "job {:?} is not implemented by the Rust worker yet",
             self.name
@@ -122,6 +123,9 @@ pub fn all_jobs() -> Vec<(&'static str, Arc<dyn Job>)> {
                 "aggregated-users-statistics" => Arc::new(users::AggregatedUsersStatistics),
                 "event-logs-janitor" => Arc::new(eventlogs::EventLogsJanitor),
                 "executors-janitor" => Arc::new(executors::ExecutorsJanitor::new()),
+                "executors-metricsserver" => {
+                    Arc::new(executors_metrics::ExecutorsMetricsServer::new())
+                }
                 "gitserver-metrics" => Arc::new(gitserver::GitserverMetrics),
                 "permission-sync-job-cleaner" => Arc::new(permissions::PermissionSyncJobCleaner),
                 "rate-limit-config" => Arc::new(ratelimit::RateLimitConfigJob::new()),
@@ -198,7 +202,7 @@ pub async fn create_background_routines(
     deps: &JobDeps,
     jobs: &[(&'static str, Arc<dyn Job>)],
     worker: &WorkerConfigs,
-) -> Result<Vec<Arc<PeriodicRoutine>>, String> {
+) -> Result<Vec<Arc<BackgroundRoutine>>, String> {
     let setup_cancel = CancellationToken::new();
     let mut set = JoinSet::new();
     let mut names = HashMap::new();
@@ -297,7 +301,7 @@ mod tests {
             &self,
             _deps: &JobDeps,
             _setup_ctx: CancellationToken,
-        ) -> Result<Vec<PeriodicRoutine>, String> {
+        ) -> Result<Vec<BackgroundRoutine>, String> {
             Err("boom".to_owned())
         }
     }
@@ -326,7 +330,7 @@ mod tests {
             &self,
             _deps: &JobDeps,
             _setup_ctx: CancellationToken,
-        ) -> Result<Vec<PeriodicRoutine>, String> {
+        ) -> Result<Vec<BackgroundRoutine>, String> {
             Ok(Vec::new())
         }
     }

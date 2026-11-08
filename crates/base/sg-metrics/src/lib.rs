@@ -14,6 +14,8 @@ use prometheus::{Encoder, IntGaugeVec, Opts, Registry, TextEncoder};
 
 pub use prometheus;
 
+pub mod textfmt;
+
 /// Version reported by `src_service_metadata` for a development build
 /// (`version.Version()` in a `go build` without release variables).
 pub const VERSION: &str = "0.0.0+dev";

@@ -14,7 +14,7 @@ use async_trait::async_trait;
 use sg_config::LiveConfig;
 use sg_core::{ConfigError, EnvReader};
 use sg_service_worker::config::WorkerConfigs;
-use sg_service_worker::framework::periodic::PeriodicRoutine;
+use sg_service_worker::framework::BackgroundRoutine;
 use sg_service_worker::jobs::{
     create_background_routines, validate_configs, Job, JobConfig, JobDeps,
 };
@@ -35,7 +35,7 @@ impl Job for HarnessJob {
         &self,
         _deps: &JobDeps,
         _setup_ctx: CancellationToken,
-    ) -> Result<Vec<PeriodicRoutine>, String> {
+    ) -> Result<Vec<BackgroundRoutine>, String> {
         match &self.err {
             Some(err) => Err(err.clone()),
             None => Ok(Vec::new()),

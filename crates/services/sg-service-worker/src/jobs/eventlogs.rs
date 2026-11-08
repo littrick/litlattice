@@ -25,6 +25,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::{Job, JobDeps};
 use crate::framework::periodic::{Handler, HandlerError, PeriodicRoutine};
+use crate::framework::BackgroundRoutine;
 
 pub const EVENT_LOGS_RETENTION: Duration = Duration::from_secs(93 * 24 * 3600);
 pub const SECURITY_EVENT_LOGS_RETENTION: Duration = Duration::from_secs(30 * 24 * 3600);
@@ -48,7 +49,7 @@ impl Job for EventLogsJanitor {
         &self,
         deps: &JobDeps,
         _setup_ctx: CancellationToken,
-    ) -> Result<Vec<PeriodicRoutine>, String> {
+    ) -> Result<Vec<BackgroundRoutine>, String> {
         let pool = deps.frontend.clone();
         let live_config = Arc::clone(&deps.live_config);
 
@@ -58,14 +59,16 @@ impl Job for EventLogsJanitor {
             )
             .with_name("delete_old_event_logs")
             .with_description("deleting expired rows from event_logs table")
-            .with_interval(INTERVAL),
+            .with_interval(INTERVAL)
+            .into(),
             PeriodicRoutine::new(
                 Arc::new(DeleteOldSecurityEventLogs { pool, live_config }) as Arc<dyn Handler>
             )
             .with_name("delete_old_security_event_logs")
             .with_description("deleting expired rows from security_event_logs table")
             .with_interval(INTERVAL)
-            .with_initial_delay(INTERVAL),
+            .with_initial_delay(INTERVAL)
+            .into(),
         ])
     }
 }
