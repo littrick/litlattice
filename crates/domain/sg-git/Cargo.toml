@@ -11,6 +11,11 @@ sg-config = { path = "../sg-config" }
 sg-proto = { path = "../../net/sg-proto" }
 bytes = { workspace = true }
 md5 = { workspace = true }
+prost = { workspace = true }
+prost-types = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
 tonic = { workspace = true }
+
+[dev-dependencies]
+time = { workspace = true, features = ["formatting"] }

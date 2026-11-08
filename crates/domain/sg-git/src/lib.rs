@@ -16,6 +16,7 @@ use std::io;
 use std::pin::Pin;
 
 use bytes::Bytes;
+use prost::Message;
 use tokio::sync::Mutex;
 use tokio_stream::{Stream, StreamExt};
 
@@ -31,13 +32,39 @@ pub type TarByteStream = Pin<Box<dyn Stream<Item = io::Result<Bytes>> + Send>>;
 pub enum Error {
     /// The requested file or revision does not exist (gRPC `NotFound`).
     NotFound(String),
+    /// `gitdomain.RepoNotExistError`; `clone_in_progress` mirrors the
+    /// `RepoNotFoundPayload` detail.
+    RepoNotFound {
+        repo: String,
+        clone_in_progress: bool,
+    },
+    /// `gitdomain.RevisionNotFoundError` (`RevisionNotFoundPayload`).
+    RevisionNotFound { repo: String, spec: String },
     /// Any other failure.
     Message(String),
 }
 
 impl Error {
     pub fn is_not_found(&self) -> bool {
-        matches!(self, Self::NotFound(_))
+        matches!(
+            self,
+            Self::NotFound(_) | Self::RepoNotFound { .. } | Self::RevisionNotFound { .. }
+        )
+    }
+
+    /// `gitdomain.IsCloneInProgress`.
+    pub fn is_clone_in_progress(&self) -> bool {
+        matches!(
+            self,
+            Self::RepoNotFound {
+                clone_in_progress: true,
+                ..
+            }
+        )
+    }
+
+    pub fn is_revision_not_found(&self) -> bool {
+        matches!(self, Self::RevisionNotFound { .. })
     }
 }
 
@@ -45,6 +72,10 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::NotFound(message) | Self::Message(message) => f.write_str(message),
+            Self::RepoNotFound { repo, .. } => write!(f, "repo not found: {repo}"),
+            Self::RevisionNotFound { repo, spec } => {
+                write!(f, "revision not found: {repo}@{spec}")
+            }
         }
     }
 }
@@ -55,6 +86,29 @@ impl From<Error> for String {
     fn from(err: Error) -> Self {
         err.to_string()
     }
+}
+
+/// `gitdomain.Ref`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitRef {
+    pub name: String,
+    pub short_name: String,
+    pub target_commit: String,
+}
+
+/// `gitdomain.ProtoFileInfoToFS` keeps the full file info; only the name is
+/// used by the code-intel upload handler (`fs.FileInfo.Name`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileInfo {
+    pub name: String,
+}
+
+/// The subset of `gitdomain.Commit` the upload processor reads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Commit {
+    pub oid: String,
+    /// `commit.Committer.Date`; absent when the signature has no date.
+    pub committer_date: Option<prost_types::Timestamp>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -243,5 +297,211 @@ impl GitserverClient {
             Err(err) if err.is_not_found() => Ok(None),
             Err(err) => Err(err),
         }
+    }
+
+    /// `gitserver.Client.ResolveRevision`. `ensure_revision` maps to the
+    /// request's optional field (the baseline only sets it when true).
+    pub async fn resolve_revision(
+        &self,
+        repo: &str,
+        revspec: &str,
+        ensure_revision: bool,
+    ) -> Result<String, Error> {
+        let mut client = self.client_for(repo).await?;
+        let context = format!("resolve revision {repo}@{revspec}");
+        let response = client
+            .resolve_revision(pb::ResolveRevisionRequest {
+                repo_name: repo.to_owned(),
+                rev_spec: revspec.as_bytes().to_vec(),
+                ensure_revision: ensure_revision.then_some(true),
+            })
+            .await
+            .map_err(|status| translate_status(status, &context))?;
+        Ok(response.into_inner().commit_sha)
+    }
+
+    /// `gitserver.Client.GetDefaultBranch(repo, false)`; returns the full ref
+    /// name (`refs/heads/main`).
+    pub async fn default_branch(&self, repo: &str) -> Result<String, Error> {
+        let mut client = self.client_for(repo).await?;
+        let context = format!("default branch {repo}");
+        let response = client
+            .default_branch(pb::DefaultBranchRequest {
+                repo_name: repo.to_owned(),
+                short_ref: false,
+            })
+            .await
+            .map_err(|status| translate_status(status, &context))?;
+        Ok(response.into_inner().ref_name)
+    }
+
+    /// `gitserver.Client.ListRefs` (streaming response).
+    pub async fn list_refs(
+        &self,
+        repo: &str,
+        heads_only: bool,
+        tags_only: bool,
+        points_at_commit: &[String],
+        contains_sha: Option<&str>,
+    ) -> Result<Vec<GitRef>, Error> {
+        let mut client = self.client_for(repo).await?;
+        let context = format!("list refs {repo}");
+        let mut stream = client
+            .list_refs(pb::ListRefsRequest {
+                repo_name: repo.to_owned(),
+                heads_only,
+                tags_only,
+                points_at_commit: points_at_commit.to_vec(),
+                contains_sha: contains_sha.map(str::to_owned),
+            })
+            .await
+            .map_err(|status| translate_status(status, &context))?
+            .into_inner();
+
+        let mut refs = Vec::new();
+        while let Some(chunk) = stream
+            .message()
+            .await
+            .map_err(|status| translate_status(status, &context))?
+        {
+            for git_ref in chunk.refs {
+                refs.push(GitRef {
+                    name: String::from_utf8_lossy(&git_ref.ref_name).into_owned(),
+                    short_name: String::from_utf8_lossy(&git_ref.short_ref_name).into_owned(),
+                    target_commit: git_ref.target_commit,
+                });
+            }
+        }
+        Ok(refs)
+    }
+
+    /// `gitserver.Client.ReadDir`: the non-recursive first chunk. A missing
+    /// directory is reported as `FileNotFoundPayload` and maps to
+    /// [`Error::NotFound`] (the handler treats it like `os.IsNotExist`).
+    pub async fn read_dir(
+        &self,
+        repo: &str,
+        commit: &str,
+        path: &str,
+    ) -> Result<Vec<FileInfo>, Error> {
+        let mut client = self.client_for(repo).await?;
+        let context = format!("read dir {repo}@{commit}:{path}");
+        let mut stream = client
+            .read_dir(pb::ReadDirRequest {
+                repo_name: repo.to_owned(),
+                commit_sha: commit.to_owned(),
+                path: Some(path.as_bytes().to_vec()),
+                recursive: false,
+            })
+            .await
+            .map_err(|status| translate_status(status, &context))?
+            .into_inner();
+
+        let mut files = Vec::new();
+        while let Some(chunk) = stream
+            .message()
+            .await
+            .map_err(|status| translate_status(status, &context))?
+        {
+            for file_info in chunk.file_info {
+                files.push(FileInfo {
+                    name: String::from_utf8_lossy(&file_info.name).into_owned(),
+                });
+            }
+        }
+        Ok(files)
+    }
+
+    /// `gitserver.Client.GetCommit`.
+    pub async fn get_commit(&self, repo: &str, commit: &str) -> Result<Commit, Error> {
+        let mut client = self.client_for(repo).await?;
+        let context = format!("get commit {repo}@{commit}");
+        let response = client
+            .get_commit(pb::GetCommitRequest {
+                repo_name: repo.to_owned(),
+                commit: commit.to_owned(),
+                include_modified_files: false,
+            })
+            .await
+            .map_err(|status| translate_status(status, &context))?;
+        let commit = response.into_inner().commit.unwrap_or_default();
+        Ok(Commit {
+            oid: commit.oid,
+            committer_date: commit.committer.and_then(|committer| committer.date),
+        })
+    }
+}
+
+/// Translate a gRPC status into the baseline's `gitdomain` error types by
+/// decoding the `grpc-status-details-bin` payload (`internal/gitserver/errwrap.go`).
+fn translate_status(status: tonic::Status, context: &str) -> Error {
+    if let Ok(rpc) = payloads::RpcStatus::decode(status.details()) {
+        for any in &rpc.details {
+            if any
+                .type_url
+                .ends_with("gitserver.v1.RevisionNotFoundPayload")
+            {
+                if let Ok(payload) = payloads::RevisionNotFoundPayload::decode(any.value.as_slice())
+                {
+                    return Error::RevisionNotFound {
+                        repo: payload.repo,
+                        spec: payload.spec,
+                    };
+                }
+            }
+            if any.type_url.ends_with("gitserver.v1.RepoNotFoundPayload") {
+                if let Ok(payload) = payloads::RepoNotFoundPayload::decode(any.value.as_slice()) {
+                    return Error::RepoNotFound {
+                        repo: payload.repo,
+                        clone_in_progress: payload.clone_in_progress,
+                    };
+                }
+            }
+            if any.type_url.ends_with("gitserver.v1.FileNotFoundPayload") {
+                return Error::NotFound(status.message().to_owned());
+            }
+        }
+    }
+
+    let message = format!("{context}: {status}");
+    if status.code() == tonic::Code::NotFound {
+        Error::NotFound(message)
+    } else {
+        Error::Message(message)
+    }
+}
+
+/// Payloads carried in `grpc-status-details-bin` (`google.rpc.Status`). The
+/// gitserver crate has the server-side encoders; these are the client-side
+/// decoders.
+mod payloads {
+    use prost::Message;
+
+    #[derive(Clone, PartialEq, Message)]
+    pub struct RpcStatus {
+        #[prost(int32, tag = "1")]
+        pub code: i32,
+        #[prost(string, tag = "2")]
+        pub message: String,
+        #[prost(message, repeated, tag = "3")]
+        pub details: Vec<prost_types::Any>,
+    }
+
+    #[derive(Clone, PartialEq, Message)]
+    pub struct RepoNotFoundPayload {
+        #[prost(string, tag = "1")]
+        pub repo: String,
+        #[prost(bool, tag = "2")]
+        pub clone_in_progress: bool,
+        #[prost(string, tag = "3")]
+        pub clone_progress: String,
+    }
+
+    #[derive(Clone, PartialEq, Message)]
+    pub struct RevisionNotFoundPayload {
+        #[prost(string, tag = "1")]
+        pub repo: String,
+        #[prost(string, tag = "2")]
+        pub spec: String,
     }
 }

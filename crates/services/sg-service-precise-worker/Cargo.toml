@@ -10,14 +10,19 @@ publish.workspace = true
 sg-config = { path = "../../domain/sg-config" }
 sg-core = { path = "../../base/sg-core" }
 sg-db = { path = "../../data/sg-db" }
+sg-git = { path = "../../domain/sg-git" }
 sg-http = { path = "../../net/sg-http" }
 sg-keyring = { path = "../../domain/sg-keyring" }
+sg-objectstorage = { path = "../../data/sg-objectstorage" }
 async-trait = { workspace = true }
+flate2 = { workspace = true }
 http = { workspace = true }
 http-body-util = { workspace = true }
 hyper = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 sqlx = { workspace = true }
+tempfile = "3"
+time = { workspace = true, features = ["formatting"] }
 tonic = { workspace = true }
 tracing = { workspace = true }

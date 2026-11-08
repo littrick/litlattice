@@ -28,6 +28,7 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
 pub mod config;
+pub mod prelude;
 pub mod queue;
 pub mod worker;
 
@@ -148,12 +149,12 @@ impl Service for PreciseWorkerService {
         // `ready()`: migrations are done and the process accepts traffic.
         ctx.ready.mark_ready();
 
-        // `lsifuploadstore.New` + `initializeUploadStore`.
-        let upload_store = UploadStore::new(&config.upload_store)
-            .map_err(|message| ServiceError::new(format!("creating upload store: {message}")))?;
-        upload_store.init().await.map_err(|message| {
-            ServiceError::new(format!("initializing upload store: {message}"))
-        })?;
+        // `lsifuploadstore.New` + `initializeUploadStore` (S3/blobstore).
+        let _upload_store = initialize_upload_store(&config.upload_store)
+            .await
+            .map_err(|message| {
+                ServiceError::new(format!("initializing upload store: {message}"))
+            })?;
 
         // `httpserver.NewFromAddr(addr, ...)` with a `/healthz` handler.
         tracing::info!(
@@ -223,31 +224,43 @@ async fn resetter_loop(store: Arc<queue::UploadQueueStore>, shutdown: Cancellati
     }
 }
 
-/// `dbworker`/S3 are not part of this slice; the store either accepts its
-/// configuration (no bucket management, the baseline default) or reports that
-/// managing the bucket is not implemented.
-pub struct UploadStore {
-    config: config::UploadStoreConfig,
+/// `lsifuploadstore.New` for the S3-compatible backends. GCS is not
+/// implemented by the Rust worker yet; the baseline would accept it, so this
+/// is a documented difference (see docs/modules/07 §16).
+pub fn upload_storage_config(
+    config: &config::UploadStoreConfig,
+) -> Result<sg_objectstorage::StorageConfig, String> {
+    match config.backend.as_str() {
+        "s3" | "blobstore" => Ok(sg_objectstorage::StorageConfig {
+            backend: config.backend.clone(),
+            manage_bucket: config.manage_bucket,
+            bucket: config.bucket.clone(),
+            s3: sg_objectstorage::S3Config {
+                is_blobstore: false,
+                region: config.s3_region.clone(),
+                endpoint: config.s3_endpoint.clone(),
+                use_path_style: config.s3_use_path_style,
+                access_key_id: config.s3_access_key_id.clone(),
+                secret_access_key: config.s3_secret_access_key.clone(),
+                session_token: config.s3_session_token.clone(),
+            },
+        }
+        .normalize()),
+        "gcs" => Err("GCS upload storage is not implemented by the Rust worker".to_owned()),
+        other => Err(format!("unsupported upload backend {other:?}")),
+    }
 }
 
-impl UploadStore {
-    pub fn new(config: &config::UploadStoreConfig) -> Result<Self, String> {
-        Ok(Self {
-            config: config.clone(),
-        })
-    }
-
-    /// `initializeUploadStore`: `object.Storage.Init`. The S3/GCS `Init` only
-    /// touches the network when `ManageBucket` is set.
-    pub async fn init(&self) -> Result<(), String> {
-        if self.config.manage_bucket {
-            return Err(format!(
-                "managing the {} bucket is not implemented by the Rust worker",
-                self.config.backend
-            ));
-        }
-        Ok(())
-    }
+/// `initializeUploadStore`: `object.Storage.Init` (S3 only for now).
+pub async fn initialize_upload_store(
+    config: &config::UploadStoreConfig,
+) -> Result<sg_objectstorage::ObjectStore, String> {
+    let storage_config = upload_storage_config(config)?;
+    let store = sg_objectstorage::ObjectStore::new(storage_config)
+        .await
+        .map_err(|err| err.to_string())?;
+    store.init().await.map_err(|err| err.to_string())?;
+    Ok(store)
 }
 
 /// The baseline health server: `httpserver.NewHandler(nil)` installs exactly

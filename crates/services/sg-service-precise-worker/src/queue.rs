@@ -228,6 +228,57 @@ WHERE
         row.map(scan_upload).transpose()
     }
 
+    /// Fetch one upload record without changing its state. Used by the
+    /// handler prelude harness; the worker itself only sees records through
+    /// [`Self::dequeue`].
+    pub async fn get_upload(&self, id: i32) -> Result<Option<Upload>, sqlx::Error> {
+        let row = sqlx::query(
+            r#"
+SELECT
+	u.id,
+	u.commit,
+	u.root,
+	EXISTS (
+		SELECT 1
+		FROM lsif_uploads_visible_at_tip uvt
+		WHERE
+			uvt.repository_id = u.repository_id AND
+			uvt.upload_id = u.id AND
+			uvt.is_default_branch
+	) AS visible_at_tip,
+	u.uploaded_at,
+	u.state,
+	u.failure_message,
+	u.started_at,
+	u.finished_at,
+	u.process_after,
+	u.num_resets,
+	u.num_failures,
+	u.repository_id,
+	u.repository_name::text AS repository_name,
+	u.indexer,
+	u.indexer_version,
+	u.num_parts,
+	u.uploaded_parts,
+	u.upload_size,
+	u.associated_index_id,
+	u.content_type,
+	u.should_reindex,
+	NULL::integer AS rank,
+	u.uncompressed_size
+FROM
+	lsif_uploads_with_repository_name u
+WHERE
+	u.id = $1
+"#,
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        row.map(scan_upload).transpose()
+    }
+
     /// `dbworker/store.Store.Heartbeat`. Refreshes `last_heartbeat_at` for
     /// processing records and reports which ids are still known and which are
     /// flagged for cancellation.

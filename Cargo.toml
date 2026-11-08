@@ -47,6 +47,7 @@ aes-gcm = "0.10"
 aws-config = { version = "1", default-features = false, features = ["rt-tokio", "rustls"] }
 aws-runtime = "1"
 aws-sdk-kms = "1"
+aws-sdk-s3 = "1"
 crc = "3"
 google-cloud-auth = "1"
 google-cloud-kms-v1 = "1"
