@@ -8,8 +8,10 @@
 //! source needs — `GET <url>` returning the response body, with no status
 //! check, exactly like `internal/repos/other.go`'s `srcExpose`.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use http::{HeaderName, HeaderValue, Method};
 use http_body_util::{BodyExt, Full};
 use hyper::body::Bytes;
 use hyper_util::client::legacy::connect::HttpConnector;
@@ -19,6 +21,15 @@ use hyper_util::rt::TokioExecutor;
 #[derive(Clone)]
 pub struct HttpClient {
     client: Arc<Client<HttpConnector, Full<Bytes>>>,
+}
+
+/// The response subset the outbound webhook sender stores in its log.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HttpResponse {
+    pub status: u16,
+    /// Canonicalized header names, e.g. `Content-Type`; values in wire order.
+    pub headers: BTreeMap<String, Vec<String>>,
+    pub body: Vec<u8>,
 }
 
 impl HttpClient {
@@ -46,6 +57,68 @@ impl HttpClient {
             .map_err(|err| format!("failed to read response from {url}: {err}"))?;
         Ok(body.to_bytes().to_vec())
     }
+
+    /// `httpCli.Do(req)` for a `POST` with the given headers, returning the
+    /// status, headers and full body (the outbound webhook sender's shape).
+    pub async fn post(
+        &self,
+        url: &str,
+        headers: &[(String, String)],
+        body: Vec<u8>,
+    ) -> Result<HttpResponse, String> {
+        let mut builder = http::Request::builder().method(Method::POST).uri(url);
+        for (name, value) in headers {
+            let name = HeaderName::from_bytes(name.as_bytes())
+                .map_err(|err| format!("invalid header name {name:?}: {err}"))?;
+            let value = HeaderValue::from_str(value)
+                .map_err(|err| format!("invalid header value for {name}: {err}"))?;
+            builder = builder.header(name, value);
+        }
+        let request = builder
+            .body(Full::new(Bytes::from(body)))
+            .map_err(|err| format!("building request for {url}: {err}"))?;
+
+        let response = self
+            .client
+            .request(request)
+            .await
+            .map_err(|err| format!("sending request to {url}: {err}"))?;
+        let status = response.status().as_u16();
+
+        let mut collected: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for (name, value) in response.headers() {
+            let name = canonical_header_name(name.as_str());
+            let value = String::from_utf8_lossy(value.as_bytes()).into_owned();
+            collected.entry(name).or_default().push(value);
+        }
+
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .map_err(|err| format!("failed to read response from {url}: {err}"))?;
+        Ok(HttpResponse {
+            status,
+            headers: collected,
+            body: body.to_bytes().to_vec(),
+        })
+    }
+}
+
+/// `net/http`'s `CanonicalHeaderKey`: upper-case the first letter and every
+/// letter after a dash.
+fn canonical_header_name(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    let mut upper = true;
+    for byte in name.bytes() {
+        if upper && byte.is_ascii_alphabetic() {
+            out.push(char::from(byte.to_ascii_uppercase()));
+        } else {
+            out.push(char::from(byte));
+        }
+        upper = byte == b'-';
+    }
+    out
 }
 
 impl Default for HttpClient {

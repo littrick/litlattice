@@ -41,6 +41,7 @@ pub mod executors;
 pub mod executors_metrics;
 pub mod executors_multiqueue_metrics;
 pub mod gitserver;
+pub mod outbound_webhooks;
 pub mod permissions;
 pub mod ratelimit;
 pub mod repostatistics;
@@ -153,6 +154,9 @@ pub fn all_jobs() -> Vec<(&'static str, Arc<dyn Job>)> {
                 ),
                 "record-encrypter" => Arc::new(encryption::RecordEncrypterJob::new()),
                 "gitserver-metrics" => Arc::new(gitserver::GitserverMetrics),
+                "outbound-webhook-sender" => {
+                    Arc::new(outbound_webhooks::OutboundWebhookSender::new())
+                }
                 "permission-sync-job-cleaner" => Arc::new(permissions::PermissionSyncJobCleaner),
                 "rate-limit-config" => Arc::new(ratelimit::RateLimitConfigJob::new()),
                 "repo-statistics-compactor" => Arc::new(repostatistics::RepoStatisticsCompactor),

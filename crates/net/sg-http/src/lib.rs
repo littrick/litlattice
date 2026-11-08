@@ -21,7 +21,7 @@ use std::time::Duration;
 
 pub mod client;
 
-pub use client::HttpClient;
+pub use client::{HttpClient, HttpResponse};
 
 use http::{Request, Response, Version};
 use hyper::body::Incoming;
