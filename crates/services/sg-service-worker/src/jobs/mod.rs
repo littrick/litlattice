@@ -53,6 +53,7 @@ pub mod eventlogs;
 pub mod executors;
 pub mod executors_metrics;
 pub mod executors_multiqueue_metrics;
+pub mod github_apps_installation;
 pub mod gitserver;
 pub mod insights_data_retention;
 pub mod insights_query_runner;
@@ -208,6 +209,9 @@ pub fn all_jobs() -> Vec<(&'static str, Arc<dyn Job>)> {
                     Arc::new(codeintel_uploadstore_expirer::UploadStoreExpirer::new())
                 }
                 "record-encrypter" => Arc::new(encryption::RecordEncrypterJob::new()),
+                "github-apps-installation-validation-job" => {
+                    Arc::new(github_apps_installation::GitHubAppsInstallationValidation::new())
+                }
                 "gitserver-metrics" => Arc::new(gitserver::GitserverMetrics),
                 "insights-data-retention-job" => {
                     Arc::new(insights_data_retention::InsightsDataRetentionJob)
