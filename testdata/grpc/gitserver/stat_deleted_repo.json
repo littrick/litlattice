@@ -1,0 +1,18 @@
+{
+  "expected": {
+    "file_info": {
+      "blob_oid": "17bb768ed481b0978433eab2195fbe96b501f6a5",
+      "mode": 33188,
+      "name": "python/example.py",
+      "size": 1890,
+      "submodule": null
+    }
+  },
+  "request": {
+    "commit_sha": "5abdba2559d350afdf6b4dcbf32f5edaadcbdda1",
+    "path": "python/example.py",
+    "repo_name": "DELETED-1.2-test/symbols-fixture"
+  },
+  "rpc": "stat",
+  "service": "gitserver"
+}

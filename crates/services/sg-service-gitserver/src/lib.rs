@@ -25,6 +25,7 @@ pub mod disk;
 pub mod git;
 pub mod gitservice;
 pub mod grpc;
+mod mux;
 pub mod repo;
 pub mod search;
 
@@ -145,32 +146,57 @@ impl Service for GitserverService {
 
 /// Baseline `NewHTTPHandler`: `/ping` answers 200 with an empty body and
 /// `/git/` serves the smart Git HTTP transport.
+///
+/// The baseline registers both patterns on a `ServeMux`, which first cleans
+/// the escaped path and redirects when that changed it, then redirects the
+/// `/git` subtree root to `/git/`. `http.StripPrefix` passes the handler the
+/// decoded path.
 async fn http_response(
     service: GitService,
     req: Request<Incoming>,
 ) -> Response<tonic::body::BoxBody> {
+    let query = req.uri().query().map(str::to_owned);
     let path = req.uri().path().to_owned();
-    match path.as_str() {
+    let cleaned = mux::clean_path(&path);
+    if cleaned != path {
+        return mux::redirect(&req, &mux::cleaned_location(&cleaned, query.as_deref()));
+    }
+    if cleaned == "/git" {
+        // `ServeMux` appends the slash for the registered subtree.
+        return mux::redirect(&req, &mux::slash_location("/git/", query.as_deref()));
+    }
+    match cleaned.as_str() {
         "/ping" => {
             let mut response = Response::new(tonic::body::boxed(Full::new(Bytes::new())));
             *response.status_mut() = StatusCode::OK;
             response
         }
         _ => {
-            if let Some(stripped) = path.strip_prefix("/git/") {
-                // Go's `http.StripPrefix("/git", …)` keeps the leading slash.
-                let stripped = format!("/{stripped}");
-                return service.handle(req, &stripped).await;
+            if cleaned.starts_with("/git/") {
+                // `http.StripPrefix("/git", …)` keeps the leading slash and
+                // operates on the decoded path (`%2F` becomes `/`).
+                let decoded = mux::decode_path(&cleaned);
+                let stripped = decoded.strip_prefix("/git").unwrap_or(&decoded);
+                return service.handle(req, stripped).await;
             }
-            let mut response = Response::new(tonic::body::boxed(Full::new(Bytes::from_static(
-                b"404 page not found\n",
-            ))));
-            *response.status_mut() = StatusCode::NOT_FOUND;
-            response.headers_mut().insert(
-                header::CONTENT_TYPE,
-                header::HeaderValue::from_static("text/plain; charset=utf-8"),
-            );
-            response
+            not_found()
         }
     }
+}
+
+/// Go `http.NotFound`.
+fn not_found() -> Response<tonic::body::BoxBody> {
+    let mut response = Response::new(tonic::body::boxed(Full::new(Bytes::from_static(
+        b"404 page not found\n",
+    ))));
+    *response.status_mut() = StatusCode::NOT_FOUND;
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        header::HeaderValue::from_static("text/plain; charset=utf-8"),
+    );
+    response.headers_mut().insert(
+        header::HeaderName::from_static("x-content-type-options"),
+        header::HeaderValue::from_static("nosniff"),
+    );
+    response
 }

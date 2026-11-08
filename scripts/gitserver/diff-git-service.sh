@@ -29,15 +29,38 @@ fail() {
     failures=$((failures + 1))
 }
 
-# Compare status + body of a request against both servers.
+# Normalized subset of response headers. Volatile ones (Date, X-Trace,
+# Content-Length) are dropped; these are the ones the mux/handlers set.
+header_dump() {
+    python3 -I - "$1" <<'EOF'
+import sys
+
+wanted = {"location", "content-type", "x-content-type-options"}
+lines = []
+with open(sys.argv[1], encoding="latin-1") as handle:
+    for line in handle.read().splitlines():
+        name, sep, value = line.partition(":")
+        if sep and name.strip().lower() in wanted:
+            lines.append(f"{name.strip().lower()}: {value.strip()}")
+print("\n".join(sorted(lines)))
+EOF
+}
+
+# Compare status, mux-relevant headers and body of a request against both
+# servers. `--path-as-is` keeps curl from cleaning dot segments before the
+# request reaches the mux.
 compare_request() {
     local label=$1 path=$2
     shift 2
     local go_status rust_status
-    go_status=$(curl -s -o "$WORK/go.body" -w '%{http_code}' "$@" "$GO$path")
-    rust_status=$(curl -s -o "$WORK/rust.body" -w '%{http_code}' "$@" "$RUST$path")
+    go_status=$(curl -s --path-as-is -D "$WORK/go.head" -o "$WORK/go.body" -w '%{http_code}' "$@" "$GO$path")
+    rust_status=$(curl -s --path-as-is -D "$WORK/rust.head" -o "$WORK/rust.body" -w '%{http_code}' "$@" "$RUST$path")
+    header_dump "$WORK/go.head" >"$WORK/go.headers"
+    header_dump "$WORK/rust.head" >"$WORK/rust.headers"
     if [ "$go_status" != "$rust_status" ]; then
         fail "$label: status Go=$go_status Rust=$rust_status"
+    elif ! cmp -s "$WORK/go.headers" "$WORK/rust.headers"; then
+        fail "$label: headers differ (Go: $(tr '\n' ';' <"$WORK/go.headers") Rust: $(tr '\n' ';' <"$WORK/rust.headers"))"
     elif ! cmp -s "$WORK/go.body" "$WORK/rust.body"; then
         fail "$label: body differs"
     else
@@ -149,6 +172,31 @@ compare_request "unknown subpath" "/git/$REPO/nope"
 printf 'malformed' >"$WORK/bad.gz"
 compare_request "malformed gzip" "/git/$REPO/git-upload-pack" \
     -X POST -H 'Content-Encoding: gzip' --data-binary @"$WORK/bad.gz"
+
+# -------------------------------------------------- HTTP mux behavior
+# `ServeMux` cleans the escaped path and redirects, and redirects the `/git`
+# subtree root to `/git/`; `StripPrefix` then decodes the path.
+compare_request "exact /git redirects" "/git"
+compare_request "exact /git redirects with query" "/git?service=git-upload-pack"
+compare_request "path cleaning: repeated slash" "/git//$REPO/info/refs?service=git-upload-pack"
+compare_request "path cleaning: dot segment" "/git/./$REPO/info/refs?service=git-upload-pack"
+compare_request "path cleaning: dot-dot segment" "/git/../git/ping"
+compare_request "path cleaning: escaped space" "/git//a%20b/info/refs"
+compare_request "unknown path" "/nope"
+compare_request "ping with trailing slash" "/ping/"
+compare_request "deleted repo alias" "/git/DELETED-1.2-$REPO/info/refs?service=git-upload-pack"
+compare_request "percent-encoded repo separator" "/git/test%2Fgit-refs-fixture/info/refs?service=git-upload-pack"
+
+# HEAD gets the redirect headers (no HTML body).
+curl -s --path-as-is -I -o "$WORK/go.head" -w '%{http_code}' "$GO/git" >"$WORK/go.status"
+curl -s --path-as-is -I -o "$WORK/rust.head" -w '%{http_code}' "$RUST/git" >"$WORK/rust.status"
+header_dump "$WORK/go.head" >"$WORK/go.headers"
+header_dump "$WORK/rust.head" >"$WORK/rust.headers"
+if [ "$(cat "$WORK/go.status")" = "$(cat "$WORK/rust.status")" ] && cmp -s "$WORK/go.headers" "$WORK/rust.headers"; then
+    pass "HEAD /git redirect (status $(cat "$WORK/go.status"))"
+else
+    fail "HEAD /git redirect: status Go=$(cat "$WORK/go.status") Rust=$(cat "$WORK/rust.status") headers Go=$(tr '\n' ';' <"$WORK/go.headers") Rust=$(tr '\n' ';' <"$WORK/rust.headers")"
+fi
 
 if [ "$failures" -ne 0 ]; then
     printf 'diff-git-service: %d failure(s)\n' "$failures" >&2

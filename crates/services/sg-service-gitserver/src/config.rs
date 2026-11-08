@@ -18,7 +18,11 @@ impl GitserverConfig {
         }
 
         let insecure_dev = env
-            .get("INSECURE_DEV", "false", "Running in insecure dev (local laptop) mode")
+            .get(
+                "INSECURE_DEV",
+                "false",
+                "Running in insecure dev (local laptop) mode",
+            )
             .eq_ignore_ascii_case("true");
 
         // `env.GetOptional`: empty means "not set", then fall back to
