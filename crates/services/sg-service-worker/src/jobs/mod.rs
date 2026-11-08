@@ -38,6 +38,7 @@ use crate::registry;
 pub mod adminanalytics;
 pub mod auth_sourcegraph_operator_cleaner;
 pub mod batches;
+pub mod codehost_version_syncing;
 pub mod codeintel_metrics_reporter;
 pub mod codeintel_package_filter_applicator;
 pub mod codeintel_policies_repository_matcher;
@@ -183,6 +184,9 @@ pub fn all_jobs() -> Vec<(&'static str, Arc<dyn Job>)> {
                 ),
                 "export-usage-telemetry" => {
                     Arc::new(usage_telemetry::ExportUsageTelemetryJob::new())
+                }
+                "codehost-version-syncing" => {
+                    Arc::new(codehost_version_syncing::CodehostVersionSyncing::new())
                 }
                 "codeintel-metrics-reporter" => {
                     Arc::new(codeintel_metrics_reporter::CodeIntelMetricsReporter::new())
