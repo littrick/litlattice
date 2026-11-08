@@ -9,10 +9,10 @@
 //! `:3188`.
 //!
 //! 9.7b adds the upload queue (`dbworker` store semantics) and the stalled
-//! upload resetter; 9.7c adds the `workerutil.Worker` loop. Not yet covered
-//! (later slices): the upload processor (object storage fetch, SCIP parsing
-//! and code-graph writes), which is why the loop is not started by the
-//! service yet.
+//! upload resetter; 9.7c adds the `workerutil.Worker` loop; 9.7d-9.7f add the
+//! upload processor (object storage fetch, SCIP parsing, code-graph writes,
+//! the uploads-database completion transaction and delete-on-success), which
+//! the service now starts alongside the resetter.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -29,12 +29,14 @@ use tokio_util::task::TaskTracker;
 
 pub mod codegraph;
 pub mod config;
+pub mod handler;
 pub mod pathexistence;
 pub mod prelude;
 pub mod queue;
 pub mod ranges;
 pub mod scip_stream;
 pub mod trie;
+pub mod uploads_store;
 pub mod worker;
 
 use config::PreciseWorkerConfig;
@@ -147,7 +149,7 @@ impl Service for PreciseWorkerService {
                 "code_intel_postgres_dsn is not configured by the frontend",
             ));
         }
-        let _codeintel_pool = sg_db::connect(&codeintel_dsn, 10).await.map_err(|err| {
+        let codeintel_pool = sg_db::connect(&codeintel_dsn, 10).await.map_err(|err| {
             ServiceError::with_source("connecting to the codeintel database", err)
         })?;
 
@@ -155,11 +157,13 @@ impl Service for PreciseWorkerService {
         ctx.ready.mark_ready();
 
         // `lsifuploadstore.New` + `initializeUploadStore` (S3/blobstore).
-        let _upload_store = initialize_upload_store(&config.upload_store)
-            .await
-            .map_err(|message| {
-                ServiceError::new(format!("initializing upload store: {message}"))
-            })?;
+        let upload_store = Arc::new(
+            initialize_upload_store(&config.upload_store)
+                .await
+                .map_err(|message| {
+                    ServiceError::new(format!("initializing upload store: {message}"))
+                })?,
+        );
 
         // `httpserver.NewFromAddr(addr, ...)` with a `/healthz` handler.
         tracing::info!(
@@ -169,13 +173,39 @@ impl Service for PreciseWorkerService {
             budget = config.worker_budget,
             "serving precise-code-intel-worker health endpoint"
         );
-        // `processor.NewUploadResetter` + `workerutil.Worker`: the resetter
-        // loop is part of this slice; the worker loop is implemented in
-        // `worker.rs` but is not started until the upload processor exists
-        // (9.7d), so the Rust process cannot consume uploads before it can
-        // process them.
-        let queue_store = Arc::new(queue::UploadQueueStore::new(frontend_pool));
+        // `processor.NewUploadResetter` + `NewUploadProcessorWorker`.
+        let queue_store = Arc::new(queue::UploadQueueStore::new(frontend_pool.clone()));
+        // `gitserver.NewClient("codeintel")`: addresses come from the
+        // frontend configuration (`ServiceConnections.GitServers`).
+        let git = Arc::new(sg_git::GitserverClient::new(
+            unified.service_connections.git_servers.clone(),
+        ));
+        let handler = Arc::new(handler::UploadProcessorHandler::new(
+            handler::HandlerDeps {
+                prelude: prelude::PreludeDeps::new(
+                    frontend_pool.clone(),
+                    Arc::clone(&queue_store),
+                    git,
+                    Arc::clone(&upload_store),
+                ),
+                codeintel: codeintel_pool,
+            },
+            config.worker_budget,
+        ));
+        let worker = Arc::new(worker::UploadWorker::new(
+            Arc::clone(&queue_store),
+            handler,
+            worker::UploadWorkerOptions::for_service(
+                "precise_code_intel_upload_worker",
+                worker_hostname(),
+                config.worker_concurrency.max(1) as usize,
+                config.worker_poll_interval,
+                config.maximum_runtime_per_job,
+            ),
+        ));
+
         let tasks = TaskTracker::new();
+        worker.spawn(ctx.shutdown.clone(), &tasks);
         {
             let store = Arc::clone(&queue_store);
             let shutdown = ctx.shutdown.clone();
@@ -266,6 +296,19 @@ pub async fn initialize_upload_store(
         .map_err(|err| err.to_string())?;
     store.init().await.map_err(|err| err.to_string())?;
     Ok(store)
+}
+
+/// `hostname.Get`: `HOSTNAME` when set, otherwise the kernel hostname
+/// (`os.HostName()` on Linux).
+fn worker_hostname() -> String {
+    if let Ok(hostname) = std::env::var("HOSTNAME") {
+        if !hostname.is_empty() {
+            return hostname;
+        }
+    }
+    std::fs::read_to_string("/proc/sys/kernel/hostname")
+        .map(|hostname| hostname.trim().to_owned())
+        .unwrap_or_default()
 }
 
 /// The baseline health server: `httpserver.NewHandler(nil)` installs exactly

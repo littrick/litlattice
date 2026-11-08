@@ -17,10 +17,11 @@
 //!    `application/x-protobuf+scip` is the only accepted value).
 //! 6. `GetCommit` and `UpdateCommittedAt` (`codeintel_commit_dates`).
 //!
-//! The slice deliberately stops before `prepareSCIPDataStream`. The
-//! delete-on-success side effect of `withUploadData` therefore also waits for
-//! the SCIP writer (9.7e): this function must not delete the object it has
-//! not finished processing.
+//! This function stops before `prepareSCIPDataStream`; it returns the fetched
+//! payload so the handler can run the SCIP stage. The delete-on-success side
+//! effect of `withUploadData` belongs to the handler, which deletes the
+//! object only after the code graph and the uploads-database transaction have
+//! committed.
 
 use std::fmt;
 use std::io::{BufReader, Cursor, Read};
@@ -104,7 +105,7 @@ impl fmt::Display for PreludeError {
 
 impl std::error::Error for PreludeError {}
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub enum PreludeOutcome {
     /// `requeueIfCloningOrCommitUnknown` returned true.
     Requeued {
@@ -112,11 +113,14 @@ pub enum PreludeOutcome {
         after: OffsetDateTime,
     },
     /// Everything up to `UpdateCommittedAt` succeeded. The SCIP writer is the
-    /// next stage.
+    /// next stage and needs the repository name (gitserver calls), the
+    /// payload, and the upload's root.
     Ready {
         commit_date: OffsetDateTime,
         is_default_branch: bool,
         used_temp_file: bool,
+        repo_name: String,
+        data: UploadData,
     },
 }
 
@@ -236,6 +240,8 @@ pub async fn handle_raw_upload_prelude(
         commit_date,
         is_default_branch,
         used_temp_file,
+        repo_name,
+        data,
     })
 }
 
@@ -283,6 +289,7 @@ async fn default_branch_contains(
 /// a fresh decoder over the same bytes. Small uploads stay in memory; when the
 /// uncompressed size is (or may be) larger than
 /// [`UNCOMPRESSED_SIZE_LIMIT_BYTES`] they are spooled to a temporary file.
+#[derive(Debug)]
 pub struct UploadData {
     source: UploadDataSource,
     /// Whether the temporary-file branch was taken (`shouldWriteToDisk`).
@@ -291,6 +298,7 @@ pub struct UploadData {
     pub filename: String,
 }
 
+#[derive(Debug)]
 enum UploadDataSource {
     Memory(Arc<Vec<u8>>),
     /// Kept alive for as long as the data is needed; `reopen` gives each pass
@@ -301,7 +309,7 @@ enum UploadDataSource {
 /// A re-openable gzip payload: the Rust equivalent of the baseline's
 /// `gzipReadSeeker` whose `seekToStart` re-creates the gzip reader over the
 /// same bytes.
-pub trait GzipSource {
+pub trait GzipSource: Send + Sync {
     fn open_gzip(&self) -> std::io::Result<GzReader>;
 }
 
@@ -319,7 +327,7 @@ impl UploadData {
     /// `newGzipReadSeeker`: a gzip decoder positioned at the start of the
     /// upload. flate2 parses the gzip header lazily on the first read.
     pub fn open(&self) -> std::io::Result<GzReader> {
-        let inner: Box<dyn Read> = match &self.source {
+        let inner: Box<dyn Read + Send> = match &self.source {
             UploadDataSource::Memory(data) => Box::new(SharedCursor {
                 data: Arc::clone(data),
                 position: 0,
@@ -346,7 +354,7 @@ impl GzipSource for UploadData {
 }
 
 /// The decoder type returned by [`UploadData::open`].
-pub type GzReader = GzDecoder<Box<dyn Read>>;
+pub type GzReader = GzDecoder<Box<dyn Read + Send>>;
 
 /// A `Read` over a shared in-memory buffer with its own position, so each
 /// gzip pass gets an independent cursor without copying the payload.
