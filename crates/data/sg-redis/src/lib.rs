@@ -187,25 +187,37 @@ impl KeyValue {
             .await
     }
 
+    /// `HGET` with raw field bytes: license signatures are binary strings used
+    /// as hash fields (`licensing.maxusercount`). `None` is redigo's
+    /// `redis.ErrNil`.
+    pub async fn hget_bytes(
+        &self,
+        key: &str,
+        field: impl AsRef<[u8]>,
+    ) -> Result<Option<Vec<u8>>, RedisError> {
+        self.run(redis::cmd("HGET").arg(self.key(key)).arg(field.as_ref()))
+            .await
+    }
+
     pub async fn hset(
         &self,
         key: &str,
-        field: &str,
+        field: impl AsRef<[u8]>,
         value: impl AsRef<[u8]>,
     ) -> Result<(), RedisError> {
         let _: i64 = self
             .run(
                 redis::cmd("HSET")
                     .arg(self.key(key))
-                    .arg(field)
+                    .arg(field.as_ref())
                     .arg(value.as_ref()),
             )
             .await?;
         Ok(())
     }
 
-    pub async fn hdel(&self, key: &str, field: &str) -> Result<i64, RedisError> {
-        self.run(redis::cmd("HDEL").arg(self.key(key)).arg(field))
+    pub async fn hdel(&self, key: &str, field: impl AsRef<[u8]>) -> Result<i64, RedisError> {
+        self.run(redis::cmd("HDEL").arg(self.key(key)).arg(field.as_ref()))
             .await
     }
 

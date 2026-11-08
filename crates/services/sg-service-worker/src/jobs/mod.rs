@@ -50,6 +50,7 @@ pub mod executors;
 pub mod executors_metrics;
 pub mod executors_multiqueue_metrics;
 pub mod gitserver;
+pub mod licensecheck;
 pub mod outbound_webhooks;
 pub mod permissions;
 pub mod ratelimit;
@@ -186,6 +187,7 @@ pub fn all_jobs() -> Vec<(&'static str, Arc<dyn Job>)> {
                 }
                 "record-encrypter" => Arc::new(encryption::RecordEncrypterJob::new()),
                 "gitserver-metrics" => Arc::new(gitserver::GitserverMetrics),
+                "license-check" => Arc::new(licensecheck::LicenseCheckJob),
                 "outbound-webhook-sender" => {
                     Arc::new(outbound_webhooks::OutboundWebhookSender::new())
                 }

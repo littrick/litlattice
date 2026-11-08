@@ -65,6 +65,17 @@ impl Info {
         self.tags.iter().any(|t| t.trim() == tag)
     }
 
+    /// `Plan.IsFreePlan`: the `free-0` / `free-1` plans.
+    pub fn is_free_plan(&self) -> bool {
+        matches!(self.plan(), Plan::Free0 | Plan::Free1)
+    }
+
+    /// `BasicFeature("allow-air-gapped").Check(info)`: the plan includes the
+    /// feature, or the license carries the explicit tag.
+    pub fn allows_air_gapped(&self) -> bool {
+        self.plan() == Plan::AirGappedEnterprise || self.has_tag("allow-air-gapped")
+    }
+
     /// `PlanFromTags`: the first known `plan:` tag, defaulting to the old
     /// enterprise plan when no plan tag is present.
     pub fn plan(&self) -> Plan {
@@ -175,17 +186,55 @@ fn free_license_info() -> Info {
 /// `licensing.GetConfiguredProductLicenseInfo`: parse and verify the key from
 /// the site configuration, or fall back to the free license when it is empty.
 pub fn configured_license_info(license_key: &str) -> Result<Info, String> {
+    configured_license_info_with_signature(license_key).map(|(info, _)| info)
+}
+
+/// `licensing.GetConfiguredProductLicenseInfoWithSignature`: as
+/// [`configured_license_info`], plus the raw signature bytes. An empty key
+/// yields the free license and an empty signature (the baseline's
+/// `GetFreeLicenseInfo` returns `""`).
+pub fn configured_license_info_with_signature(
+    license_key: &str,
+) -> Result<(Info, Vec<u8>), String> {
     if license_key.is_empty() {
-        return Ok(free_license_info());
+        return Ok((free_license_info(), Vec::new()));
     }
     let key = public_key()?;
-    let info = parse_signed_key(license_key, &key)?;
+    let (info, signature) = parse_signed_key_with_signature(license_key, &key)?;
     if let Some(tag) = info.unknown_plan_tag() {
         return Err(format!(
             "The license has an unrecognizable plan in tag {tag:?}, please contact Sourcegraph support."
         ));
     }
-    Ok(info)
+    Ok((info, signature))
+}
+
+/// `licensing.LicenseCheckInterval`: how often an unchanged license key is
+/// re-checked against the license server.
+pub const LICENSE_CHECK_INTERVAL_SECS: i64 = 12 * 60 * 60;
+
+/// `licensing.LicenseValidityStoreKey`.
+pub const LICENSE_VALIDITY_STORE_KEY: &str = "licensing:is_license_valid";
+/// `licensing.LicenseInvalidReason`.
+pub const LICENSE_INVALID_REASON: &str = "licensing:license_invalid_reason";
+/// `licensing.MaxUsersKey` (`license_user_count:max`).
+pub const MAX_USERS_KEY: &str = "license_user_count:max";
+/// `licensing.MaxUsersTimeKey` (`license_user_count:max_time`).
+pub const MAX_USERS_TIME_KEY: &str = "license_user_count:max_time";
+
+/// `license.LicenseKeyBasedAccessTokenPrefix`.
+pub const LICENSE_KEY_ACCESS_TOKEN_PREFIX: &str = "slk_";
+
+/// `license.GenerateLicenseKeyBasedAccessToken`: `slk_` + hex(sha256(key)).
+pub fn license_key_based_access_token(license_key: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(license_key.as_bytes());
+    let mut token = String::with_capacity(LICENSE_KEY_ACCESS_TOKEN_PREFIX.len() + 64);
+    token.push_str(LICENSE_KEY_ACCESS_TOKEN_PREFIX);
+    for byte in digest {
+        token.push_str(&format!("{byte:02x}"));
+    }
+    token
 }
 
 /// `licensing.Check((&FeaturePrivateRepositories{}))` resolved to the effective
@@ -255,6 +304,16 @@ where
 /// JSON envelope, decode the claims and verify the SSH-RSA signature over the
 /// encoded claims.
 pub fn parse_signed_key(text: &str, public_key: &RsaPublicKey) -> Result<Info, String> {
+    parse_signed_key_with_signature(text, public_key).map(|(info, _)| info)
+}
+
+/// `license.ParseSignedKey`: as [`parse_signed_key`], also returning the raw
+/// signature blob (the baseline's `signature string`, used as the
+/// `license_user_count:max` hash field).
+pub fn parse_signed_key_with_signature(
+    text: &str,
+    public_key: &RsaPublicKey,
+) -> Result<(Info, Vec<u8>), String> {
     let compact: String = text.chars().filter(|c| !c.is_whitespace()).collect();
     let raw = URL_SAFE_NO_PAD
         .decode(compact.as_bytes())
@@ -275,7 +334,7 @@ pub fn parse_signed_key(text: &str, public_key: &RsaPublicKey) -> Result<Info, S
     VerifyingKey::<Sha1>::new(public_key.clone())
         .verify(&signed.info, &signature)
         .map_err(|err| format!("license signature verification failed: {err}"))?;
-    Ok(info)
+    Ok((info, signed.sig.blob))
 }
 
 /// The builtin verification key. The baseline panics if it cannot be parsed;
