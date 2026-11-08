@@ -10,6 +10,7 @@ publish.workspace = true
 sg-config = { path = "../../domain/sg-config" }
 sg-core = { path = "../../base/sg-core" }
 sg-db = { path = "../../data/sg-db" }
+sg-encryption = { path = "../../domain/sg-encryption" }
 sg-http = { path = "../../net/sg-http" }
 sg-metrics = { path = "../../base/sg-metrics" }
 sg-proto = { path = "../../net/sg-proto" }
@@ -25,6 +26,7 @@ prost = { workspace = true }
 prost-types = { workspace = true }
 regex = { workspace = true }
 rustix = { workspace = true }
+serde_json = { workspace = true }
 sha2 = { workspace = true }
 sqlx = { workspace = true }
 tempfile = "3"

@@ -30,6 +30,11 @@ pub struct Repo {
     pub external_service_id: Option<String>,
     /// `repo.metadata`: code-host specific repository metadata.
     pub metadata: serde_json::Value,
+    /// `repo.uri`: the repository's external identifier (used as a lookup
+    /// fallback by `GetByName`).
+    pub uri: Option<String>,
+    /// `repo.blocked`: `{"reason": "..."}` when the repository is blocked.
+    pub blocked: Option<serde_json::Value>,
     /// `repo.sources`; empty when no live external service references the repo.
     pub sources: Vec<SourceInfo>,
 }
@@ -49,8 +54,13 @@ impl RepoStore {
     }
 
     /// `Repos().GetByName`: soft-deleted repositories are not returned (the
-    /// baseline's `listRepos` defaults to `deleted_at IS NULL`), and `name` is
-    /// `citext`, so the comparison is case-insensitive.
+    /// baseline's `listRepos` defaults to `deleted_at IS NULL`). The name is
+    /// matched first and the `uri` column second (the baseline does two
+    /// queries because `uri` is not unique); both are `citext`, so the
+    /// comparison is case-insensitive. Blocked repositories are returned like
+    /// the baseline (`IncludeBlocked: true`); [`Repo::blocked`] lets the
+    /// caller produce the `BlockedRepoError` the baseline returns alongside
+    /// the repo.
     pub async fn get_by_name(&self, name: &str) -> Result<Option<Repo>, sqlx::Error> {
         let row = sqlx::query(
             r#"
@@ -60,6 +70,8 @@ SELECT
 	r.external_service_type,
 	r.external_service_id,
 	r.metadata,
+	r.uri,
+	r.blocked,
 	(
 		SELECT json_agg(
 			json_build_object(
@@ -73,7 +85,9 @@ SELECT
 		WHERE esr.repo_id = r.id AND svcs.deleted_at IS NULL
 	) AS sources
 FROM repo r
-WHERE r.name = $1::citext AND r.deleted_at IS NULL
+WHERE r.deleted_at IS NULL AND (r.name = $1::citext OR r.uri = $1::citext)
+ORDER BY (r.name = $1::citext) DESC, r.id
+LIMIT 1
 "#,
         )
         .bind(name)
@@ -97,6 +111,8 @@ WHERE r.name = $1::citext AND r.deleted_at IS NULL
             external_service_type: row.try_get("external_service_type")?,
             external_service_id: row.try_get("external_service_id")?,
             metadata: row.try_get("metadata")?,
+            uri: row.try_get("uri")?,
+            blocked: row.try_get("blocked")?,
             sources,
         }))
     }
@@ -126,11 +142,13 @@ mod tests {
                 .expect("clock")
                 .as_nanos()
         );
+        let uri = format!("{name}-uri");
         let repo_id: i32 = sqlx::query_scalar(
-            "INSERT INTO repo(name, external_service_type, external_service_id, external_id, metadata) \
-             VALUES ($1, 'github', '123', 'repo-1', $2) RETURNING id",
+            "INSERT INTO repo(name, uri, external_service_type, external_service_id, external_id, metadata) \
+             VALUES ($1, $2, 'github', '123', 'repo-1', $3) RETURNING id",
         )
         .bind(&name)
+        .bind(&uri)
         .bind(serde_json::json!({"URL": "https://example.com/o/r", "NameWithOwner": "o/r"}))
         .fetch_one(&pool)
         .await
@@ -169,6 +187,26 @@ mod tests {
                 clone_url: "https://example.com/o/r.git".to_owned(),
             }]
         );
+
+        assert_eq!(repo.uri.as_deref(), Some(uri.as_str()));
+        assert_eq!(repo.blocked, None);
+
+        // `GetByName` falls back to the `uri` column, case-insensitively.
+        let by_uri = store
+            .get_by_name(&uri.to_uppercase())
+            .await
+            .expect("get by uri")
+            .expect("row");
+        assert_eq!(by_uri.id, repo_id);
+
+        // A blocked repo is still returned; the caller raises the error.
+        sqlx::query(r#"UPDATE repo SET blocked = '{"reason": "dmca"}' WHERE id = $1"#)
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .expect("block");
+        let blocked = store.get_by_name(&name).await.expect("get").expect("row");
+        assert_eq!(blocked.blocked.as_ref().unwrap()["reason"], "dmca");
 
         // Soft-deleted repos are invisible.
         sqlx::query("UPDATE repo SET deleted_at = NOW() WHERE id = $1")

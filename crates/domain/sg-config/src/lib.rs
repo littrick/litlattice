@@ -31,6 +31,10 @@ pub const DEFAULT_FRONTEND_INTERNAL: &str = "sourcegraph-frontend-internal";
 /// `conf.defaultGitLongCommandTimeout`.
 pub const DEFAULT_GIT_LONG_COMMAND_TIMEOUT: Duration = Duration::from_secs(2 * 60 * 60);
 
+/// `conf.GitMaxConcurrentClones` default when the field is unset or
+/// non-positive.
+pub const DEFAULT_GIT_MAX_CONCURRENT_CLONES: usize = 5;
+
 #[derive(Debug)]
 pub enum ConfigError {
     /// The frontend could not be reached or answered with an error.
@@ -153,6 +157,44 @@ pub struct TlsExternal {
     pub certificates: Vec<String>,
 }
 
+/// `schema.MountedEncryptionKey`: a key read from an environment variable or a
+/// file. Exactly one of `env_var_name`/`filepath` must be set.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MountedEncryptionKeyConfig {
+    pub env_var_name: String,
+    pub filepath: String,
+    pub keyname: String,
+    pub version: String,
+}
+
+/// `schema.EncryptionKey`, a tagged union discriminated by `type`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum EncryptionKeyConfig {
+    Cloudkms(serde_json::Value),
+    Awskms(serde_json::Value),
+    Mounted(MountedEncryptionKeyConfig),
+    Noop,
+    /// An entry whose `type` is not one of the four known types. Go fails to
+    /// unmarshal such a site config; the Rust parser keeps the value so keyring
+    /// construction can report the baseline's `couldn't configure key` error.
+    Unknown(serde_json::Value),
+}
+
+/// `schema.EncryptionKeys` (`siteConfig.encryption.keys`).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct EncryptionKeysConfig {
+    pub batch_changes_credential_key: Option<EncryptionKeyConfig>,
+    pub cache_size: i64,
+    pub enable_cache: bool,
+    pub executor_secret_key: Option<EncryptionKeyConfig>,
+    pub external_service_key: Option<EncryptionKeyConfig>,
+    pub github_app_key: Option<EncryptionKeyConfig>,
+    pub outbound_webhook_key: Option<EncryptionKeyConfig>,
+    pub user_external_account_key: Option<EncryptionKeyConfig>,
+    pub webhook_key: Option<EncryptionKeyConfig>,
+    pub webhook_log_key: Option<EncryptionKeyConfig>,
+}
+
 /// The parsed site configuration (`conf.Unified.SiteConfiguration`), kept as
 /// JSON plus typed accessors for the fields the Rust services read.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -206,6 +248,19 @@ impl SiteConfiguration {
         }
     }
 
+    /// `conf.GitMaxConcurrentClones`: `siteConfig.gitMaxConcurrentClones`,
+    /// defaulting to 5 when unset or non-positive.
+    pub fn git_max_concurrent_clones(&self) -> usize {
+        match self
+            .raw
+            .get("gitMaxConcurrentClones")
+            .and_then(serde_json::Value::as_i64)
+        {
+            Some(value) if value > 0 => value as usize,
+            _ => DEFAULT_GIT_MAX_CONCURRENT_CLONES,
+        }
+    }
+
     /// `experimentalFeatures`.
     pub fn experimental_features(&self) -> Option<&serde_json::Value> {
         self.raw.get("experimentalFeatures")
@@ -234,6 +289,31 @@ impl SiteConfiguration {
             .unwrap_or_default()
     }
 
+    /// `conf.Get().EncryptionKeys`: the top-level `encryption.keys` object.
+    /// `None` when the site config does not configure encryption.
+    pub fn encryption_keys(&self) -> Option<EncryptionKeysConfig> {
+        let keys = self.raw.get("encryption.keys")?;
+        let key = |name: &str| keys.get(name).and_then(parse_encryption_key);
+        Some(EncryptionKeysConfig {
+            batch_changes_credential_key: key("batchChangesCredentialKey"),
+            cache_size: keys
+                .get("cacheSize")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(0),
+            enable_cache: keys
+                .get("enableCache")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
+            executor_secret_key: key("executorSecretKey"),
+            external_service_key: key("externalServiceKey"),
+            github_app_key: key("gitHubAppKey"),
+            outbound_webhook_key: key("outboundWebhookKey"),
+            user_external_account_key: key("userExternalAccountKey"),
+            webhook_key: key("webhookKey"),
+            webhook_log_key: key("webhookLogKey"),
+        })
+    }
+
     /// `experimentalFeatures.tlsExternal`.
     pub fn tls_external(&self) -> TlsExternal {
         let Some(tls) = self
@@ -260,6 +340,35 @@ impl SiteConfiguration {
                 .unwrap_or_default(),
         }
     }
+}
+
+/// `schema.EncryptionKey.UnmarshalJSON`: the `type` property selects the
+/// variant. The four known types become typed values; anything else keeps the
+/// raw value for the keyring to reject.
+fn parse_encryption_key(value: &serde_json::Value) -> Option<EncryptionKeyConfig> {
+    if !value.is_object() {
+        return None;
+    }
+    let key_type = value.get("type").and_then(serde_json::Value::as_str)?;
+    let string = |key: &str| {
+        value
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_owned()
+    };
+    Some(match key_type {
+        "awskms" => EncryptionKeyConfig::Awskms(value.clone()),
+        "cloudkms" => EncryptionKeyConfig::Cloudkms(value.clone()),
+        "mounted" => EncryptionKeyConfig::Mounted(MountedEncryptionKeyConfig {
+            env_var_name: string("envVarName"),
+            filepath: string("filepath"),
+            keyname: string("keyname"),
+            version: string("version"),
+        }),
+        "noop" => EncryptionKeyConfig::Noop,
+        _ => EncryptionKeyConfig::Unknown(value.clone()),
+    })
 }
 
 /// Port of `conf.Unified`.
@@ -365,6 +474,12 @@ pub fn normalize_address(raw: &str) -> String {
     } else {
         format!("{scheme}://{rest}")
     }
+}
+
+/// Parse the baseline's JSONC dialect (`internal/jsonc`): JSON with comments
+/// and trailing commas. Used for site config and external service configs.
+pub fn parse_jsonc(input: &str) -> Result<serde_json::Value, serde_json::Error> {
+    serde_json::from_str(&strip_jsonc(input))
 }
 
 /// Remove JSONC comments and trailing commas before handing the text to
@@ -545,6 +660,69 @@ mod tests {
         );
         assert!(unified.site.custom_git_fetch().is_empty());
         assert_eq!(unified.site.tls_external(), TlsExternal::default());
+        assert_eq!(
+            unified.site.git_max_concurrent_clones(),
+            DEFAULT_GIT_MAX_CONCURRENT_CLONES
+        );
+    }
+
+    #[test]
+    fn git_max_concurrent_clones_defaults_when_non_positive() {
+        for (data, want) in [
+            (r#"{"gitMaxConcurrentClones": 100}"#, 100),
+            (r#"{"gitMaxConcurrentClones": 0}"#, 5),
+            (r#"{"gitMaxConcurrentClones": -100}"#, 5),
+            (r#"{}"#, 5),
+        ] {
+            let site = SiteConfiguration::parse(data).expect("parse");
+            assert_eq!(site.git_max_concurrent_clones(), want, "{data}");
+        }
+    }
+
+    #[test]
+    fn parses_encryption_keys_from_the_dotted_site_config_key() {
+        let site = SiteConfiguration::parse(
+            r#"{
+                "encryption.keys": {
+                    "enableCache": true,
+                    "cacheSize": 1024,
+                    "externalServiceKey": {
+                        "type": "mounted",
+                        "keyname": "test-key",
+                        "version": "v1",
+                        "envVarName": "SG_KEY",
+                    },
+                    "webhookKey": {"type": "noop"},
+                    "gitHubAppKey": {"type": "awskms", "key": "arn"},
+                    "webhookLogKey": {"type": "mystery"},
+                },
+            }"#,
+        )
+        .expect("parse");
+        let keys = site.encryption_keys().expect("keys");
+        assert!(keys.enable_cache);
+        assert_eq!(keys.cache_size, 1024);
+        assert_eq!(
+            keys.external_service_key,
+            Some(EncryptionKeyConfig::Mounted(MountedEncryptionKeyConfig {
+                env_var_name: "SG_KEY".to_owned(),
+                filepath: String::new(),
+                keyname: "test-key".to_owned(),
+                version: "v1".to_owned(),
+            }))
+        );
+        assert_eq!(keys.webhook_key, Some(EncryptionKeyConfig::Noop));
+        assert!(matches!(
+            keys.github_app_key,
+            Some(EncryptionKeyConfig::Awskms(_))
+        ));
+        assert!(matches!(
+            keys.webhook_log_key,
+            Some(EncryptionKeyConfig::Unknown(_))
+        ));
+        assert_eq!(keys.batch_changes_credential_key, None);
+
+        assert_eq!(SiteConfiguration::default().encryption_keys(), None);
     }
 
     #[test]

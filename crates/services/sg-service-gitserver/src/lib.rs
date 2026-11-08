@@ -18,6 +18,7 @@ use tokio_util::task::TaskTracker;
 use sg_core::{ConfigError, EnvReader, Service, ServiceContext, ServiceError};
 use sg_proto::gitserver as gpb;
 
+pub mod cloneurl;
 pub mod config;
 pub mod debug;
 mod details;
@@ -28,6 +29,7 @@ pub mod fs;
 pub mod git;
 pub mod gitservice;
 pub mod grpc;
+pub mod keyring;
 pub mod limiter;
 pub mod locker;
 pub mod memobs;
@@ -35,6 +37,7 @@ pub mod metrics;
 mod mux;
 pub mod postfetch;
 pub mod progress;
+pub mod remoteurl;
 pub mod repo;
 pub mod repositoryservice;
 pub mod search;
@@ -149,7 +152,18 @@ impl Service for GitserverService {
         let pool = sg_db::connect(&dsn, 10)
             .await
             .map_err(|err| ServiceError::with_source("connecting to the frontend database", err))?;
-        let store = Arc::new(sg_db::gitserver_repos::GitserverReposStore::new(pool));
+        let store = Arc::new(sg_db::gitserver_repos::GitserverReposStore::new(
+            pool.clone(),
+        ));
+        let repo_store = Arc::new(sg_db::repos::RepoStore::new(pool.clone()));
+        let external_services = Arc::new(sg_db::external_services::ExternalServiceStore::new(pool));
+
+        // `shared.Main` → `keyring.Init`: a configured key that cannot be
+        // constructed fails startup.
+        let external_service_key = keyring::external_service_key(&unified.site).map_err(|err| {
+            ServiceError::with_source("initializing keyring", std::io::Error::other(err))
+        })?;
+
         tracing::info!(
             addr = config_client.addr(),
             postgres = !dsn.is_empty(),
@@ -163,15 +177,38 @@ impl Service for GitserverService {
         // `git` may be slow: the baseline allows 1m per command and 2h for
         // long commands; the RPC layer here has no deadline of its own yet.
         let tasks = TaskTracker::new();
+        let locker = locker::RepositoryLocker::new();
+        let remote_urls = Arc::new(remoteurl::DbRemoteUrlSource {
+            repos: repo_store,
+            external_services,
+            key: external_service_key,
+        });
+        let backend = Arc::new(update::LocalBackend {
+            repos_dir: config.repos_dir.clone(),
+            remote_urls,
+            store: Some(Arc::clone(&store)),
+            shard_id: config.external_address.clone(),
+        });
+        // `NewServer` builds the clone limiter from `conf.GitMaxConcurrentClones`
+        // and `conf.Watch` updates it when the site config changes. The Rust
+        // config client has no watcher yet, so the limit is fixed at startup.
+        let updater = Arc::new(update::UpdateServer {
+            locker: Arc::clone(&locker),
+            limiter: limiter::MutableLimiter::new(unified.site.git_max_concurrent_clones()),
+            backend,
+            cancelled: ctx.shutdown.clone(),
+        });
         let grpc = Grpc {
             repos_dir: Arc::new(config.repos_dir.clone()),
             tasks: tasks.clone(),
-            locker: locker::RepositoryLocker::new(),
+            locker: Arc::clone(&locker),
         };
         let repository_service = repositoryservice::RepositoryService {
             repos_dir: Arc::new(config.repos_dir.clone()),
             store: Some(store),
             hostname: config.external_address.clone(),
+            updater: Some(updater),
+            tasks: tasks.clone(),
         };
         let routes = tonic::service::Routes::new(
             gpb::gitserver_service_server::GitserverServiceServer::new(grpc),

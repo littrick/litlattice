@@ -106,12 +106,11 @@ pub fn repo_dir(repos_dir: &Path, name: &str) -> Option<PathBuf> {
 /// which is the date of the last successful fetch. A repository that has been
 /// cloned but never fetched has no `FETCH_HEAD`; the mtime of `HEAD` is used.
 pub fn repo_last_fetched(git_dir: &Path) -> std::io::Result<SystemTime> {
-    match std::fs::metadata(git_dir.join("FETCH_HEAD")) {
+    let path = git_dir.join("FETCH_HEAD");
+    match std::fs::metadata(&path) {
         Ok(metadata) => metadata.modified(),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            std::fs::metadata(git_dir.join("HEAD"))?.modified()
-        }
-        Err(err) => Err(err),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => stat_mtime(&git_dir.join("HEAD")),
+        Err(err) => Err(stat_error(&path, err)),
     }
 }
 
@@ -119,11 +118,30 @@ pub fn repo_last_fetched(git_dir: &Path) -> std::io::Result<SystemTime> {
 /// (written by `setLastChanged` after a fetch changed the ref set). Until that
 /// file exists it is the last-fetched time.
 pub fn repo_last_changed(git_dir: &Path) -> std::io::Result<SystemTime> {
-    match std::fs::metadata(git_dir.join("sg_refhash_v2")) {
+    let path = git_dir.join("sg_refhash_v2");
+    match std::fs::metadata(&path) {
         Ok(metadata) => metadata.modified(),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => repo_last_fetched(git_dir),
-        Err(err) => Err(err),
+        Err(err) => Err(stat_error(&path, err)),
     }
+}
+
+fn stat_mtime(path: &Path) -> std::io::Result<SystemTime> {
+    std::fs::metadata(path)
+        .map_err(|err| stat_error(path, err))?
+        .modified()
+}
+
+/// Go's `os.Stat` errors read `stat <path>: <reason>`; Rust's `io::Error`
+/// displays the opposite order and appends `(os error N)`, so translate the
+/// common reasons by hand.
+fn stat_error(path: &Path, err: std::io::Error) -> std::io::Error {
+    let reason = match err.kind() {
+        std::io::ErrorKind::NotFound => "no such file or directory",
+        std::io::ErrorKind::PermissionDenied => "permission denied",
+        _ => return std::io::Error::new(err.kind(), format!("stat {}: {err}", path.display())),
+    };
+    std::io::Error::new(err.kind(), format!("stat {}: {reason}", path.display()))
 }
 
 #[cfg(test)]
