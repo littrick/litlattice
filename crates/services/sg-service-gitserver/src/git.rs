@@ -470,6 +470,82 @@ impl GitRepo {
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
     }
 
+    /// Baseline `GitConfigBackend.Get` (`gitcli/config.go`): `git config
+    /// --get <key>`. Exit status 1 means the key is not set and yields an
+    /// empty string, not an error.
+    pub async fn config_get(&self, key: &str) -> Result<String, GitError> {
+        let op = metrics::backend_started("config-get", "Config.Get");
+        let result = self.config_get_inner(key).await;
+        if let Some(op) = op {
+            op.finish(result.as_ref().err());
+        }
+        result
+    }
+
+    async fn config_get_inner(&self, key: &str) -> Result<String, GitError> {
+        // `io.ReadAll` surfaces exit code 1 when the key is unset.
+        let output = self
+            .config_command(&["config".into(), "--get".into(), key.into()], &[1])
+            .await?;
+        if output.status.code() == Some(1) {
+            return Ok(String::new());
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+    }
+
+    /// Baseline `GitConfigBackend.Set`: `git config <key> <value>` in the
+    /// repository's local config.
+    pub async fn config_set(&self, key: &str, value: &str) -> Result<(), GitError> {
+        let op = metrics::backend_started("config-set", "Config.Set");
+        let result = self
+            .config_command(&["config".into(), key.into(), value.into()], &[])
+            .await
+            .map(|_| ());
+        if let Some(op) = op {
+            op.finish(result.as_ref().err());
+        }
+        result
+    }
+
+    /// Baseline `GitConfigBackend.Unset`: `git config --unset-all <key>`.
+    /// Exit status 5 means the key was not set and is not an error.
+    pub async fn config_unset(&self, key: &str) -> Result<(), GitError> {
+        let op = metrics::backend_started("config-unset", "Config.Unset");
+        let result = self
+            .config_command(&["config".into(), "--unset-all".into(), key.into()], &[5])
+            .await
+            .map(|_| ());
+        if let Some(op) = op {
+            op.finish(result.as_ref().err());
+        }
+        result
+    }
+
+    /// Run one `git config` invocation. `ok_exit_codes` lists non-zero statuses
+    /// the caller treats as success (`Get`: 1, `Unset`: 5). Failures use the
+    /// baseline `commandFailedError` text.
+    async fn config_command(
+        &self,
+        args: &[OsString],
+        ok_exit_codes: &[i32],
+    ) -> Result<std::process::Output, GitError> {
+        let output = self.output(args).await?;
+        let code = output.status.code();
+        if output.status.success() || code.is_some_and(|code| ok_exit_codes.contains(&code)) {
+            return Ok(output);
+        }
+        let rendered = args
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join(" ");
+        Err(GitError::Message(format!(
+            "git command [{rendered}] failed with status code {} (output: {:?})",
+            code.unwrap_or(-1),
+            String::from_utf8_lossy(&output.stderr)
+        )))
+    }
+
     /// Baseline `RevParseHead`, including the "HEAD does not point to
     /// anything" case of an empty repository.
     pub async fn rev_parse_head(&self) -> Result<String, GitError> {
@@ -3240,5 +3316,42 @@ mod tests {
                 .await,
             Err(GitError::RevisionNotFound(spec)) if spec == "nope"
         ));
+    }
+
+    #[tokio::test]
+    async fn gets_sets_and_unsets_repo_config() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (dir, _head) = fixture_repo(tmp.path());
+        let repo = GitRepo::new(dir);
+
+        // Unset keys read as an empty string, like `git config --get` exit 1.
+        assert_eq!(repo.config_get("sourcegraph.type").await.expect("get"), "");
+
+        repo.config_set("sourcegraph.type", "perforce")
+            .await
+            .expect("set");
+        assert_eq!(
+            repo.config_get("sourcegraph.type").await.expect("get"),
+            "perforce"
+        );
+
+        repo.config_unset("sourcegraph.type").await.expect("unset");
+        assert_eq!(repo.config_get("sourcegraph.type").await.expect("get"), "");
+        // Unsetting a key that is not set (exit 5) is not an error.
+        repo.config_unset("sourcegraph.type")
+            .await
+            .expect("unset missing");
+
+        // A key without a section fails `git config` validation and surfaces
+        // the baseline `commandFailedError` text.
+        let err = repo
+            .config_set("invalid", "1")
+            .await
+            .expect_err("invalid key");
+        assert!(
+            matches!(&err, GitError::Message(message)
+                if message.starts_with("git command [config invalid 1] failed with status code 2 (output: ")),
+            "unexpected error: {err:?}"
+        );
     }
 }
