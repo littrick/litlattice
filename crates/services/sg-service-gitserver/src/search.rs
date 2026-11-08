@@ -1048,9 +1048,12 @@ impl<'a> LazyCommit<'a> {
 
 /// A handle to a persistent `git diff-tree --stdin` subprocess. Hashes are
 /// written one at a time; the echoed `ENDOFPATCH` marker delimits each patch.
+///
+/// The baseline starts this subprocess with `exec.CommandContext` directly
+/// (`internal/search`), not through `gitcli`, so it records neither `exec_*`
+/// metrics nor memory observation.
 struct DiffFetcher {
     _child: Child,
-    _exec: Option<crate::metrics::ExecGuard>,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
     stderr: Option<tokio::process::ChildStderr>,
@@ -1075,13 +1078,9 @@ impl DiffFetcher {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
-        let exec = crate::metrics::exec_started(&[OsString::from("diff-tree")]);
         let mut child = match command.spawn() {
             Ok(child) => child,
             Err(err) => {
-                if let Some(exec) = exec {
-                    exec.failed_to_start();
-                }
                 return Err(SearchError::Message(format!(
                     "failed to run git diff-tree: {err}"
                 )));
@@ -1092,7 +1091,6 @@ impl DiffFetcher {
         let stderr = child.stderr.take();
         Ok(Self {
             _child: child,
-            _exec: exec,
             stdin,
             stdout: BufReader::new(stdout),
             stderr,
@@ -1692,13 +1690,11 @@ where
         request.include_modified_files || match_tree.has_diff_modifies_file();
 
     let log_args = search_log_args(&request.revisions, include_modified_files);
-    let exec = crate::metrics::exec_started(&log_args);
+    // `internal/search.CommitSearcher.feedBatches` spawns `git log` with
+    // `exec.CommandContext`, bypassing `gitcli`: no `exec_*` metrics.
     let mut child = match repo.command(&log_args).spawn() {
         Ok(child) => child,
         Err(err) => {
-            if let Some(exec) = exec {
-                exec.failed_to_start();
-            }
             return Err(SearchError::Message(format!(
                 "failed to run git log: {err}"
             )));
