@@ -275,7 +275,7 @@ impl UserPermsFetcher for ExternalAccountPermsFetcher {
                                         .insert(spec.id, SubRepoUpsert::WithIps(perms));
                                 }
                             }
-                            Err(SubRepoPermsError::IpsNotSynced) => {
+                            Err(SubRepoPermsError::IpsNotSynced(_)) => {
                                 // Rows written before IP-aware syncing: carry
                                 // them through the path-only store.
                                 match get_by_user_and_service(
