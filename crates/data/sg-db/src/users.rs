@@ -21,7 +21,7 @@ use std::fmt;
 use serde_json::{json, Value};
 use sqlx::postgres::PgConnection;
 use sqlx::types::time::OffsetDateTime;
-use sqlx::{PgPool, QueryBuilder};
+use sqlx::{PgPool, QueryBuilder, Row};
 
 use crate::telemetry_events::{bulk_insert_event_logs_on, EventLogRow};
 
@@ -386,4 +386,36 @@ pub async fn set_is_site_admin(
 
     tx.commit().await.map_err(DbError::database)?;
     Ok(())
+}
+
+/// Subset of `types.User` used by the user-centric permission sync
+/// (`database.Users().GetByID`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserRecord {
+    pub id: i32,
+    pub username: String,
+    pub created_at: OffsetDateTime,
+}
+
+/// `userStore.GetByID` without the site-admin/role fields: live users only.
+/// `Ok(None)` is the baseline's not-found error; callers decide whether that
+/// is fatal (the permission syncer wraps it as `get user`).
+pub async fn get_by_id(pool: &PgPool, id: i32) -> Result<Option<UserRecord>, sqlx::Error> {
+    let row = sqlx::query(
+        r#"
+SELECT id, username, created_at
+FROM users
+WHERE id = $1 AND deleted_at IS NULL
+LIMIT 1
+"#,
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(row.map(|row| UserRecord {
+        id: row.get("id"),
+        username: row.get("username"),
+        created_at: row.get("created_at"),
+    }))
 }

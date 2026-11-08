@@ -10,9 +10,10 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use sg_db::perms_store::SetPermissionsResult;
+use sg_db::users::UserRecord;
 use sg_service_worker::jobs::perms_syncer::{
     AuthzProvider, FetchError, FetchPermsOptions, FetchRepo, PermsSyncer, ProviderRegistry,
-    RepoSyncOutcome,
+    RepoSyncOutcome, UserPermsFetch, UserPermsFetcher,
 };
 use sqlx::postgres::{PgPool, PgPoolOptions};
 use sqlx::Row;
@@ -63,6 +64,20 @@ impl ProviderRegistry for FakeRegistry {
     }
 }
 
+struct NoUserFetcher;
+
+#[async_trait]
+impl UserPermsFetcher for NoUserFetcher {
+    async fn fetch_user_perms(
+        &self,
+        _user: &UserRecord,
+        _no_perms: bool,
+        _opts: &FetchPermsOptions,
+    ) -> UserPermsFetch {
+        UserPermsFetch::default()
+    }
+}
+
 #[tokio::test]
 async fn repo_perms_syncer() {
     let Ok(dsn) = std::env::var("SG_QTEST_DSN") else {
@@ -74,7 +89,11 @@ async fn repo_perms_syncer() {
         .connect(&dsn)
         .await
         .expect("connect");
-    let syncer = PermsSyncer::new(pool.clone(), Arc::new(FakeRegistry));
+    let syncer = PermsSyncer::new(
+        pool.clone(),
+        Arc::new(FakeRegistry),
+        Arc::new(NoUserFetcher),
+    );
 
     let ops: [(i32, bool, &str); 8] = [
         (9821, false, "normal"),

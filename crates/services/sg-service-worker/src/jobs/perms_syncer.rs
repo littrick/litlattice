@@ -22,16 +22,18 @@
 //! the other worker slices). The user-centric path (`syncUserPerms`) and the
 //! worker job registration are later slices.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use sg_db::perms_store::{
     get_latest_finished_sync_job, get_user_ids_by_external_accounts,
-    set_repo_pending_permissions_tx, set_repo_perms_tx, CodeHostState, SetPermissionsResult,
-    UserIdWithExternalAccountId, PERM_READ, SOURCE_REPO_SYNC,
+    set_repo_pending_permissions_tx, set_repo_perms_tx, set_user_external_account_perms,
+    CodeHostState, SetPermissionsResult, UserIdWithExternalAccountId, PERM_READ, SOURCE_REPO_SYNC,
+    SOURCE_USER_SYNC,
 };
 use sg_db::repos::RepoStore;
+use sg_db::users::{get_by_id as get_user_by_id, UserRecord};
 use sqlx::postgres::PgPool;
 use sqlx::types::time::OffsetDateTime;
 use tokio::sync::Mutex;
@@ -101,21 +103,62 @@ pub struct RepoSyncOutcome {
     pub error: Option<String>,
 }
 
-/// `permsSyncerImpl` for repository-centric sync.
+/// `fetchUserPermsViaExternalAccountsResults`, reduced to the values the
+/// `syncUserPerms` orchestration consumes: internal repository IDs per
+/// external account, the provider statuses and the fetch error.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct UserPermsFetch {
+    pub repo_perms: BTreeMap<i32, Vec<i32>>,
+    pub statuses: Vec<CodeHostState>,
+    pub error: Option<String>,
+}
+
+/// The user-centric half of `fetchUserPermsViaExternalAccounts`.
+///
+/// The concrete implementation (external-account listing, provider
+/// `FetchAccount`/`FetchUserPerms`, sub-repository permissions and the
+/// external-spec to internal-repo-ID lookup) is a later slice. Injecting it
+/// keeps the orchestration independently verifiable, exactly like a fake
+/// `authz.Provider` does for the repository-centric path.
+#[async_trait]
+pub trait UserPermsFetcher: Send + Sync {
+    async fn fetch_user_perms(
+        &self,
+        user: &UserRecord,
+        no_perms: bool,
+        opts: &FetchPermsOptions,
+    ) -> UserPermsFetch;
+}
+
+/// Result of one `syncUserPerms` call; mirrors [`RepoSyncOutcome`].
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct UserSyncOutcome {
+    pub result: Option<SetPermissionsResult>,
+    pub statuses: Vec<CodeHostState>,
+    pub error: Option<String>,
+}
+
+/// `permsSyncerImpl` for repository- and user-centric sync.
 pub struct PermsSyncer {
     pool: PgPool,
     repo_store: RepoStore,
     registry: Arc<dyn ProviderRegistry>,
+    user_fetcher: Arc<dyn UserPermsFetcher>,
     /// `permsUpdateLock`: only one permission-table write at a time.
     perms_update_lock: Mutex<()>,
 }
 
 impl PermsSyncer {
-    pub fn new(pool: PgPool, registry: Arc<dyn ProviderRegistry>) -> Self {
+    pub fn new(
+        pool: PgPool,
+        registry: Arc<dyn ProviderRegistry>,
+        user_fetcher: Arc<dyn UserPermsFetcher>,
+    ) -> Self {
         Self {
             repo_store: RepoStore::new(pool.clone()),
             pool,
             registry,
+            user_fetcher,
             perms_update_lock: Mutex::new(()),
         }
     }
@@ -305,5 +348,106 @@ impl PermsSyncer {
             ));
         }
         outcome
+    }
+
+    /// `permsSyncerImpl.syncUserPerms`: fetch the user's accessible private
+    /// repositories through [`UserPermsFetcher`], then replace
+    /// `user_repo_permissions` for every external account.
+    ///
+    /// Sub-repository permissions are not written by this slice: the fetcher
+    /// contract does not carry them yet (the baseline upserts
+    /// `sub_repo_permissions` between the fetch and the save loop).
+    pub async fn sync_user_perms(
+        &self,
+        user_id: i32,
+        no_perms: bool,
+        fetch_opts: FetchPermsOptions,
+    ) -> UserSyncOutcome {
+        let mut outcome = UserSyncOutcome::default();
+
+        let user = match get_user_by_id(&self.pool, user_id).await {
+            Ok(Some(user)) => user,
+            Ok(None) => {
+                outcome.error = Some(format!("get user: user not found: id={user_id}"));
+                return outcome;
+            }
+            Err(err) => {
+                outcome.error = Some(format!("get user: {err}"));
+                return outcome;
+            }
+        };
+
+        let fetched = self
+            .user_fetcher
+            .fetch_user_perms(&user, no_perms, &fetch_opts)
+            .await;
+        outcome.statuses = fetched.statuses;
+        if let Some(err) = fetched.error {
+            // The baseline drops the (nil) result on a fetch error.
+            outcome.error = Some(format!(
+                "fetch permissions via external accounts for user {:?} (id: {}): {err}",
+                user.username, user.id
+            ));
+            return outcome;
+        }
+
+        // The baseline logs and ignores errors from this lookup; it only feeds
+        // the consecutive-sync delay metric.
+        let _latest_sync_job = get_latest_finished_sync_job(&self.pool, Some(user_id), None, true)
+            .await
+            .unwrap_or(None);
+
+        let now = OffsetDateTime::now_utc();
+        let mut result = SetPermissionsResult::default();
+        for (account_id, repo_ids) in &fetched.repo_perms {
+            match self
+                .save_user_perms_for_account(user_id, *account_id, repo_ids, now)
+                .await
+            {
+                Ok(stats) => {
+                    result.added += stats.added;
+                    result.found += stats.found;
+                    result.removed += stats.removed;
+                }
+                Err(err) => {
+                    outcome.result = Some(result);
+                    outcome.error = Some(format!(
+                        "set user repo permissions for user {:?} (id: {}, external_account_id: {}): {err}",
+                        user.username, user.id, account_id
+                    ));
+                    return outcome;
+                }
+            }
+        }
+        outcome.result = Some(result);
+
+        // Mirrors the baseline's second acquisition of `permsUpdateLock`
+        // around the metrics/logging block (no database writes there).
+        let _guard = self.perms_update_lock.lock().await;
+        outcome
+    }
+
+    /// `permsSyncerImpl.saveUserPermsForAccount`: replace one external
+    /// account's `user_repo_permissions` rows. The baseline takes
+    /// `permsUpdateLock` around each account's write.
+    async fn save_user_perms_for_account(
+        &self,
+        user_id: i32,
+        account_id: i32,
+        repo_ids: &[i32],
+        now: OffsetDateTime,
+    ) -> Result<SetPermissionsResult, sqlx::Error> {
+        let _guard = self.perms_update_lock.lock().await;
+        set_user_external_account_perms(
+            &self.pool,
+            UserIdWithExternalAccountId {
+                user_id,
+                external_account_id: account_id,
+            },
+            repo_ids,
+            SOURCE_USER_SYNC,
+            now,
+        )
+        .await
     }
 }
