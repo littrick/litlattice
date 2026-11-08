@@ -3659,6 +3659,7 @@ dependencies = [
  "prost-types 0.13.5",
  "regex",
  "rustix",
+ "serde",
  "serde_json",
  "sg-config",
  "sg-core",

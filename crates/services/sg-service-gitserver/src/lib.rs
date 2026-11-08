@@ -42,6 +42,7 @@ pub mod memobs;
 pub mod metrics;
 mod mux;
 pub mod patch;
+pub mod perforce;
 pub mod postfetch;
 pub mod progress;
 pub mod remoteurl;
@@ -256,6 +257,9 @@ impl Service for GitserverService {
             fetch: Some(Arc::clone(&fetch)),
             cloneable: Some(cloneable),
             patch: Some(patch),
+            perforce: Some(Arc::new(perforce::PerforceService::new(
+                config.repos_dir.clone(),
+            ))),
         };
         let repository_service = repositoryservice::RepositoryService {
             repos_dir: Arc::new(config.repos_dir.clone()),

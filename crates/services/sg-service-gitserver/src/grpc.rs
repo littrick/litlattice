@@ -46,6 +46,8 @@ pub struct Grpc {
     /// `Server.CreateCommitFromPatch` (the write path); `None` only in unit
     /// tests.
     pub patch: Option<Arc<crate::patch::PatchService>>,
+    /// `Server`'s Perforce management RPCs; `None` only in unit tests.
+    pub perforce: Option<Arc<crate::perforce::PerforceService>>,
 }
 
 impl Grpc {
@@ -89,6 +91,32 @@ impl Grpc {
 /// `isAlwaysCloningTest`: `NormalizeRepo(name).Equal("github.com/sourcegraphtest/alwayscloningtest")`.
 pub(crate) fn is_always_cloning_test(name: &str) -> bool {
     normalize_repo(name).eq_ignore_ascii_case("github.com/sourcegraphtest/alwayscloningtest")
+}
+
+/// `req.GetConnectionDetails()`: a missing message reads as empty fields.
+fn connection_details(
+    details: Option<&gpb::PerforceConnectionDetails>,
+) -> crate::perforce::ConnectionDetails {
+    match details {
+        Some(details) => crate::perforce::ConnectionDetails {
+            p4port: details.p4port.clone(),
+            p4user: details.p4user.clone(),
+            p4passwd: details.p4passwd.clone(),
+        },
+        None => crate::perforce::ConnectionDetails::default(),
+    }
+}
+
+/// `(*perforce.Protect).ToProto`.
+fn protect_to_proto(protect: crate::perforce::PerforceProtect) -> gpb::PerforceProtect {
+    gpb::PerforceProtect {
+        level: protect.level,
+        entity_type: protect.entity_type,
+        entity_name: protect.entity_name,
+        r#match: protect.match_,
+        is_exclusion: protect.is_exclusion,
+        host: protect.host,
+    }
 }
 
 fn unimplemented(rpc: &str) -> Status {
@@ -638,58 +666,187 @@ impl gpb::gitserver_service_server::GitserverService for Grpc {
 
     async fn is_perforce_path_cloneable(
         &self,
-        _request: GrpcRequest<gpb::IsPerforcePathCloneableRequest>,
+        request: GrpcRequest<gpb::IsPerforcePathCloneableRequest>,
     ) -> Result<GrpcResponse<gpb::IsPerforcePathCloneableResponse>, Status> {
-        Err(unimplemented("is_perforce_path_cloneable"))
+        let request = request.into_inner();
+        if request.depot_path.is_empty() {
+            return Err(Status::invalid_argument("no DepotPath given"));
+        }
+        let Some(perforce) = self.perforce.as_deref() else {
+            return Err(unimplemented("is_perforce_path_cloneable"));
+        };
+        perforce
+            .is_depot_path_cloneable(
+                &connection_details(request.connection_details.as_ref()),
+                &request.depot_path,
+            )
+            .await
+            .map_err(|err| Status::not_found(err.message()))?;
+        Ok(GrpcResponse::new(gpb::IsPerforcePathCloneableResponse {}))
     }
 
     async fn check_perforce_credentials(
         &self,
-        _request: GrpcRequest<gpb::CheckPerforceCredentialsRequest>,
+        request: GrpcRequest<gpb::CheckPerforceCredentialsRequest>,
     ) -> Result<GrpcResponse<gpb::CheckPerforceCredentialsResponse>, Status> {
-        Err(unimplemented("check_perforce_credentials"))
+        let request = request.into_inner();
+        let Some(perforce) = self.perforce.as_deref() else {
+            return Err(unimplemented("check_perforce_credentials"));
+        };
+        perforce
+            .test_with_trust(&connection_details(request.connection_details.as_ref()))
+            .await
+            .map_err(|err| Status::invalid_argument(err.message()))?;
+        Ok(GrpcResponse::new(gpb::CheckPerforceCredentialsResponse {}))
     }
 
     async fn perforce_users(
         &self,
-        _request: GrpcRequest<gpb::PerforceUsersRequest>,
+        request: GrpcRequest<gpb::PerforceUsersRequest>,
     ) -> Result<GrpcResponse<gpb::PerforceUsersResponse>, Status> {
-        Err(unimplemented("perforce_users"))
+        let request = request.into_inner();
+        let Some(perforce) = self.perforce.as_deref() else {
+            return Err(unimplemented("perforce_users"));
+        };
+        let conn = connection_details(request.connection_details.as_ref());
+        perforce
+            .test_with_trust(&conn)
+            .await
+            .map_err(|err| Status::invalid_argument(err.message()))?;
+        let users = perforce
+            .users(&conn)
+            .await
+            .map_err(|err| Status::internal(err.message()))?;
+        Ok(GrpcResponse::new(gpb::PerforceUsersResponse {
+            users: users
+                .into_iter()
+                .map(|user| gpb::PerforceUser {
+                    username: user.username,
+                    email: user.email,
+                })
+                .collect(),
+        }))
     }
 
     async fn perforce_protects_for_user(
         &self,
-        _request: GrpcRequest<gpb::PerforceProtectsForUserRequest>,
+        request: GrpcRequest<gpb::PerforceProtectsForUserRequest>,
     ) -> Result<GrpcResponse<gpb::PerforceProtectsForUserResponse>, Status> {
-        Err(unimplemented("perforce_protects_for_user"))
+        let request = request.into_inner();
+        let Some(perforce) = self.perforce.as_deref() else {
+            return Err(unimplemented("perforce_protects_for_user"));
+        };
+        let conn = connection_details(request.connection_details.as_ref());
+        perforce
+            .test_with_trust(&conn)
+            .await
+            .map_err(|err| Status::invalid_argument(err.message()))?;
+        let protects = perforce
+            .protects_for_user(&conn, &request.username)
+            .await
+            .map_err(|err| Status::unknown(err.message()))?;
+        Ok(GrpcResponse::new(gpb::PerforceProtectsForUserResponse {
+            protects: protects.into_iter().map(protect_to_proto).collect(),
+        }))
     }
 
     async fn perforce_protects_for_depot(
         &self,
-        _request: GrpcRequest<gpb::PerforceProtectsForDepotRequest>,
+        request: GrpcRequest<gpb::PerforceProtectsForDepotRequest>,
     ) -> Result<GrpcResponse<gpb::PerforceProtectsForDepotResponse>, Status> {
-        Err(unimplemented("perforce_protects_for_depot"))
+        let request = request.into_inner();
+        let Some(perforce) = self.perforce.as_deref() else {
+            return Err(unimplemented("perforce_protects_for_depot"));
+        };
+        let conn = connection_details(request.connection_details.as_ref());
+        perforce
+            .test_with_trust(&conn)
+            .await
+            .map_err(|err| Status::invalid_argument(err.message()))?;
+        let protects = perforce
+            .protects_for_depot(&conn, &request.depot)
+            .await
+            .map_err(|err| Status::unknown(err.message()))?;
+        Ok(GrpcResponse::new(gpb::PerforceProtectsForDepotResponse {
+            protects: protects.into_iter().map(protect_to_proto).collect(),
+        }))
     }
 
     async fn perforce_group_members(
         &self,
-        _request: GrpcRequest<gpb::PerforceGroupMembersRequest>,
+        request: GrpcRequest<gpb::PerforceGroupMembersRequest>,
     ) -> Result<GrpcResponse<gpb::PerforceGroupMembersResponse>, Status> {
-        Err(unimplemented("perforce_group_members"))
+        let request = request.into_inner();
+        let Some(perforce) = self.perforce.as_deref() else {
+            return Err(unimplemented("perforce_group_members"));
+        };
+        let conn = connection_details(request.connection_details.as_ref());
+        perforce
+            .test_with_trust(&conn)
+            .await
+            .map_err(|err| Status::invalid_argument(err.message()))?;
+        let usernames = perforce
+            .group_members(&conn, &request.group)
+            .await
+            .map_err(|err| Status::unknown(err.message()))?;
+        Ok(GrpcResponse::new(gpb::PerforceGroupMembersResponse {
+            usernames,
+        }))
     }
 
     async fn is_perforce_super_user(
         &self,
-        _request: GrpcRequest<gpb::IsPerforceSuperUserRequest>,
+        request: GrpcRequest<gpb::IsPerforceSuperUserRequest>,
     ) -> Result<GrpcResponse<gpb::IsPerforceSuperUserResponse>, Status> {
-        Err(unimplemented("is_perforce_super_user"))
+        let request = request.into_inner();
+        let Some(perforce) = self.perforce.as_deref() else {
+            return Err(unimplemented("is_perforce_super_user"));
+        };
+        let conn = connection_details(request.connection_details.as_ref());
+        perforce
+            .test_with_trust(&conn)
+            .await
+            .map_err(|err| Status::invalid_argument(err.message()))?;
+        perforce.user_is_super_user(&conn).await.map_err(|err| {
+            if err.is_not_super_user() {
+                Status::invalid_argument(err.message())
+            } else {
+                Status::internal(err.message())
+            }
+        })?;
+        Ok(GrpcResponse::new(gpb::IsPerforceSuperUserResponse {}))
     }
 
     async fn perforce_get_changelist(
         &self,
-        _request: GrpcRequest<gpb::PerforceGetChangelistRequest>,
+        request: GrpcRequest<gpb::PerforceGetChangelistRequest>,
     ) -> Result<GrpcResponse<gpb::PerforceGetChangelistResponse>, Status> {
-        Err(unimplemented("perforce_get_changelist"))
+        let request = request.into_inner();
+        let Some(perforce) = self.perforce.as_deref() else {
+            return Err(unimplemented("perforce_get_changelist"));
+        };
+        let conn = connection_details(request.connection_details.as_ref());
+        perforce
+            .test_with_trust(&conn)
+            .await
+            .map_err(|err| Status::invalid_argument(err.message()))?;
+        let changelist = perforce
+            .changelist_by_id(&conn, &request.changelist_id)
+            .await
+            .map_err(|err| Status::unknown(err.message()))?;
+        Ok(GrpcResponse::new(gpb::PerforceGetChangelistResponse {
+            changelist: Some(gpb::PerforceChangelist {
+                id: changelist.id,
+                creation_date: Some(prost_types::Timestamp {
+                    seconds: changelist.creation_date_seconds,
+                    nanos: 0,
+                }),
+                state: changelist.state.as_proto(),
+                author: changelist.author,
+                title: changelist.title,
+                message: changelist.message,
+            }),
+        }))
     }
 
     async fn merge_base(
@@ -1399,6 +1556,7 @@ mod tests {
             fetch,
             cloneable: None,
             patch: None,
+            perforce: None,
         }
     }
 

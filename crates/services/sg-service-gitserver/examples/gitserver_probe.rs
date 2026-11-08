@@ -7,6 +7,18 @@
 //! cargo run --example gitserver_probe -- <addr> is-cloneable [repo]
 //! cargo run --example gitserver_probe -- <addr> list-gitolite [host]
 //! cargo run --example gitserver_probe -- <addr> create-commit <spec.json>
+//! cargo run --example gitserver_probe -- <addr> perforce <spec.json>
+//!
+//! The perforce spec is JSON:
+//!
+//! ```json
+//! {"op": "users", "p4port": "ok", "p4user": "alice", "p4passwd": "secret",
+//!  "depot_path": "//depot1/main", "username": "alice", "depot": "depot1",
+//!  "group": "devs", "changelist_id": "1234"}
+//! ```
+//!
+//! `op` is `cloneable`, `check-credentials`, `users`, `protects-user`,
+//! `protects-depot`, `group-members`, `super-user` or `changelist`.
 //! ```
 //!
 //! `is-cloneable` prints `code=<n> message=<msg>` or
@@ -215,8 +227,187 @@ async fn main() {
                 }
             }
         }
+        "perforce" => {
+            let spec: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&arg).expect("read perforce spec"))
+                    .expect("parse perforce spec");
+            let text = |key: &str| {
+                spec.get(key)
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned()
+            };
+            let conn = pb::PerforceConnectionDetails {
+                p4port: text("p4port"),
+                p4user: text("p4user"),
+                p4passwd: text("p4passwd"),
+            };
+            let print_error = |status: tonic::Status| {
+                println!(
+                    "code={} message={}",
+                    status.code() as i32,
+                    escape(status.message())
+                );
+            };
+            match text("op").as_str() {
+                "cloneable" => {
+                    match client
+                        .is_perforce_path_cloneable(pb::IsPerforcePathCloneableRequest {
+                            connection_details: Some(conn),
+                            depot_path: text("depot_path"),
+                        })
+                        .await
+                    {
+                        Ok(_) => println!("code=0"),
+                        Err(status) => print_error(status),
+                    }
+                }
+                "check-credentials" => {
+                    match client
+                        .check_perforce_credentials(pb::CheckPerforceCredentialsRequest {
+                            connection_details: Some(conn),
+                        })
+                        .await
+                    {
+                        Ok(_) => println!("code=0"),
+                        Err(status) => print_error(status),
+                    }
+                }
+                "users" => {
+                    match client
+                        .perforce_users(pb::PerforceUsersRequest {
+                            connection_details: Some(conn),
+                        })
+                        .await
+                    {
+                        Ok(response) => {
+                            let response = response.into_inner();
+                            println!("code=0 count={}", response.users.len());
+                            for user in response.users {
+                                println!("user={}|{}", escape(&user.username), escape(&user.email));
+                            }
+                        }
+                        Err(status) => print_error(status),
+                    }
+                }
+                "protects-user" => {
+                    match client
+                        .perforce_protects_for_user(pb::PerforceProtectsForUserRequest {
+                            connection_details: Some(conn),
+                            username: text("username"),
+                        })
+                        .await
+                    {
+                        Ok(response) => {
+                            let response = response.into_inner();
+                            println!("code=0 count={}", response.protects.len());
+                            for protect in response.protects {
+                                println!("{}", protect_line(&protect));
+                            }
+                        }
+                        Err(status) => print_error(status),
+                    }
+                }
+                "protects-depot" => {
+                    match client
+                        .perforce_protects_for_depot(pb::PerforceProtectsForDepotRequest {
+                            connection_details: Some(conn),
+                            depot: text("depot"),
+                        })
+                        .await
+                    {
+                        Ok(response) => {
+                            let response = response.into_inner();
+                            println!("code=0 count={}", response.protects.len());
+                            for protect in response.protects {
+                                println!("{}", protect_line(&protect));
+                            }
+                        }
+                        Err(status) => print_error(status),
+                    }
+                }
+                "group-members" => {
+                    match client
+                        .perforce_group_members(pb::PerforceGroupMembersRequest {
+                            connection_details: Some(conn),
+                            group: text("group"),
+                        })
+                        .await
+                    {
+                        Ok(response) => {
+                            let response = response.into_inner();
+                            println!("code=0 count={}", response.usernames.len());
+                            for username in response.usernames {
+                                println!("username={}", escape(&username));
+                            }
+                        }
+                        Err(status) => print_error(status),
+                    }
+                }
+                "super-user" => {
+                    match client
+                        .is_perforce_super_user(pb::IsPerforceSuperUserRequest {
+                            connection_details: Some(conn),
+                        })
+                        .await
+                    {
+                        Ok(_) => println!("code=0"),
+                        Err(status) => print_error(status),
+                    }
+                }
+                "changelist" => {
+                    match client
+                        .perforce_get_changelist(pb::PerforceGetChangelistRequest {
+                            connection_details: Some(conn),
+                            changelist_id: text("changelist_id"),
+                        })
+                        .await
+                    {
+                        Ok(response) => {
+                            let changelist = response.into_inner().changelist.unwrap_or_default();
+                            let (seconds, nanos) = changelist
+                                .creation_date
+                                .map(|date| (date.seconds, date.nanos))
+                                .unwrap_or_default();
+                            println!(
+                                "code=0 id={} seconds={} nanos={} state={} author={} title={} message={}",
+                                escape(&changelist.id),
+                                seconds,
+                                nanos,
+                                changelist.state,
+                                escape(&changelist.author),
+                                escape(&changelist.title),
+                                escape(&changelist.message),
+                            );
+                        }
+                        Err(status) => print_error(status),
+                    }
+                }
+                other => panic!("unknown perforce op {other}"),
+            }
+        }
         other => panic!("unknown command {other}"),
     }
+}
+
+fn protect_line(protect: &pb::PerforceProtect) -> String {
+    format!(
+        "protect={}|{}|{}|{}|{}|{}",
+        escape(&protect.level),
+        escape(&protect.entity_type),
+        escape(&protect.entity_name),
+        escape(&protect.r#match),
+        protect.is_exclusion,
+        escape(&protect.host),
+    )
+}
+
+/// Make multi-line error messages diffable line by line.
+fn escape(text: &str) -> String {
+    text.replace('\\', "\\\\")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+        .replace('\t', "\\t")
 }
 
 fn hex(bytes: &[u8]) -> String {
