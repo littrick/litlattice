@@ -60,6 +60,7 @@ pub mod perforce_changelist_mapper;
 pub mod permissions;
 pub mod ratelimit;
 pub mod repo_embedding_janitor;
+pub mod repo_embedding_scheduler;
 pub mod repostatistics;
 pub mod usage_telemetry;
 pub mod users;
@@ -217,6 +218,9 @@ pub fn all_jobs() -> Vec<(&'static str, Arc<dyn Job>)> {
                 "refresh-analytics-cache" => Arc::new(adminanalytics::RefreshAnalyticsCacheJob),
                 "repo-embedding-janitor" => {
                     Arc::new(repo_embedding_janitor::RepoEmbeddingJanitor::new())
+                }
+                "repo-embedding-scheduler" => {
+                    Arc::new(repo_embedding_scheduler::RepoEmbeddingScheduler::new())
                 }
                 "repo-statistics-compactor" => Arc::new(repostatistics::RepoStatisticsCompactor),
                 "repo-statistics-resetter" => Arc::new(repostatistics::RepoStatisticsResetter),

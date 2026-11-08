@@ -31,7 +31,7 @@ pub fn insecure_dev() -> bool {
 }
 
 /// `strconv.ParseBool`'s accepted spellings; everything else is an error.
-fn parse_go_bool(raw: &str) -> Result<bool, ()> {
+pub(crate) fn parse_go_bool(raw: &str) -> Result<bool, ()> {
     match raw {
         "1" | "t" | "T" | "true" | "TRUE" | "True" => Ok(true),
         "0" | "f" | "F" | "false" | "FALSE" | "False" => Ok(false),
