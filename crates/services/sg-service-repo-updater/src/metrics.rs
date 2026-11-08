@@ -54,6 +54,16 @@ pub struct Metrics {
     // `cmd/repo-updater/internal/purge/purge.go`.
     pub purge_success: Counter,
     pub purge_failed: Counter,
+    // `internal/gitserver/connection/addrs.go`. Registered in every process
+    // that imports `internal/gitserver`; repo-updater reaches gitserver
+    // through that package, so the families are part of its scrape.
+    pub gitserver_addr_for_repo_invoked: Counter,
+    pub gitserver_client_concurrent_requests: Gauge,
+    // `cmd/repo-updater/internal/gitserver/observability.go`
+    // (`metrics.NewREDMetrics` with `WithLabels("op", "scope")`).
+    pub gitserver_client_duration_seconds: HistogramVec,
+    pub gitserver_client_total: CounterVec,
+    pub gitserver_client_errors_total: CounterVec,
     // `mustRegisterMetrics` scrape-time gauges.
     pub external_services_total: Gauge,
     pub queued_sync_jobs_total: Gauge,
@@ -174,6 +184,41 @@ impl Metrics {
         )
         .expect("valid metric");
 
+        let gitserver_addr_for_repo_invoked = Counter::new(
+            "src_gitserver_addr_for_repo_invoked",
+            "Number of times gitserver.AddrForRepo was invoked",
+        )
+        .expect("valid metric");
+        let gitserver_client_concurrent_requests = Gauge::new(
+            "src_gitserver_client_concurrent_requests",
+            "Current number of concurrent requests running against gitserver client.",
+        )
+        .expect("valid metric");
+        let gitserver_client_duration_seconds = HistogramVec::new(
+            HistogramOpts::new(
+                "src_gitserver_repositoryservice_client_duration_seconds",
+                "Time in seconds spent performing successful gitserver_repositoryservice_client operations",
+            ),
+            &["op", "scope"],
+        )
+        .expect("valid metric");
+        let gitserver_client_total = CounterVec::new(
+            Opts::new(
+                "src_gitserver_repositoryservice_client_total",
+                "Total number of method invocations.",
+            ),
+            &["op", "scope"],
+        )
+        .expect("valid metric");
+        let gitserver_client_errors_total = CounterVec::new(
+            Opts::new(
+                "src_gitserver_repositoryservice_client_errors_total",
+                "Total number of gitserver_repositoryservice_client operations resulting in an unexpected error",
+            ),
+            &["op", "scope"],
+        )
+        .expect("valid metric");
+
         let external_services_total = Gauge::new(
             "src_repoupdater_external_services_total",
             "The total number of external services added",
@@ -223,6 +268,11 @@ impl Metrics {
             Box::new(source_errors_total.clone()),
             Box::new(purge_success.clone()),
             Box::new(purge_failed.clone()),
+            Box::new(gitserver_addr_for_repo_invoked.clone()),
+            Box::new(gitserver_client_concurrent_requests.clone()),
+            Box::new(gitserver_client_duration_seconds.clone()),
+            Box::new(gitserver_client_total.clone()),
+            Box::new(gitserver_client_errors_total.clone()),
             Box::new(external_services_total.clone()),
             Box::new(queued_sync_jobs_total.clone()),
             Box::new(completed_sync_jobs_total.clone()),
@@ -250,6 +300,11 @@ impl Metrics {
             source_errors_total,
             purge_success,
             purge_failed,
+            gitserver_addr_for_repo_invoked,
+            gitserver_client_concurrent_requests,
+            gitserver_client_duration_seconds,
+            gitserver_client_total,
+            gitserver_client_errors_total,
             external_services_total,
             queued_sync_jobs_total,
             completed_sync_jobs_total,
@@ -293,6 +348,27 @@ impl Metrics {
             self.source_repos_total
                 .with_label_values(&[])
                 .inc_by(count as f64);
+        }
+    }
+
+    /// `metrics.REDMetrics.Observe` for a gitserver repository-service call:
+    /// error → `errors_total++`, `total += 0` (creating the series), no
+    /// duration sample; success → one duration sample and `total++`.
+    pub fn observe_gitserver_client(&self, op: &str, scope: &str, seconds: f64, had_error: bool) {
+        if had_error {
+            self.gitserver_client_errors_total
+                .with_label_values(&[op, scope])
+                .inc();
+            self.gitserver_client_total
+                .with_label_values(&[op, scope])
+                .inc_by(0.0);
+        } else {
+            self.gitserver_client_duration_seconds
+                .with_label_values(&[op, scope])
+                .observe(seconds);
+            self.gitserver_client_total
+                .with_label_values(&[op, scope])
+                .inc();
         }
     }
 
@@ -479,6 +555,10 @@ mod tests {
         // source series.
         metrics.observe_source(0.1, 1, false);
         metrics.observe_source(0.1, 1, true);
+        metrics.gitserver_addr_for_repo_invoked.inc();
+        metrics.gitserver_client_concurrent_requests.set(0.0);
+        metrics.observe_gitserver_client("FetchRepository", "repoupdater.scheduler", 0.1, false);
+        metrics.observe_gitserver_client("DeleteRepository", "repoupdater.purgeworker", 0.1, true);
         metrics.purge_success.inc();
         metrics.purge_failed.inc();
         metrics.external_services_total.set(1.0);
@@ -510,6 +590,11 @@ mod tests {
             Box::new(metrics.source_errors_total.clone()),
             Box::new(metrics.purge_success.clone()),
             Box::new(metrics.purge_failed.clone()),
+            Box::new(metrics.gitserver_addr_for_repo_invoked.clone()),
+            Box::new(metrics.gitserver_client_concurrent_requests.clone()),
+            Box::new(metrics.gitserver_client_duration_seconds.clone()),
+            Box::new(metrics.gitserver_client_total.clone()),
+            Box::new(metrics.gitserver_client_errors_total.clone()),
             Box::new(metrics.external_services_total.clone()),
             Box::new(metrics.queued_sync_jobs_total.clone()),
             Box::new(metrics.completed_sync_jobs_total.clone()),
@@ -537,6 +622,11 @@ mod tests {
             "src_repoupdater_source_errors_total",
             "src_repoupdater_purge_success",
             "src_repoupdater_purge_failed",
+            "src_gitserver_addr_for_repo_invoked",
+            "src_gitserver_client_concurrent_requests",
+            "src_gitserver_repositoryservice_client_duration_seconds",
+            "src_gitserver_repositoryservice_client_total",
+            "src_gitserver_repositoryservice_client_errors_total",
             "src_repoupdater_external_services_total",
             "src_repoupdater_queued_sync_jobs_total",
             "src_repoupdater_completed_sync_jobs_total",
@@ -549,5 +639,44 @@ mod tests {
                 "missing family {family}"
             );
         }
+    }
+
+    #[test]
+    fn gitserver_client_red_metrics_match_the_observation_helper() {
+        let metrics = Metrics::new();
+        let labels = ["FetchRepository", "repoupdater.scheduler"];
+        metrics.observe_gitserver_client(labels[0], labels[1], 0.1, false);
+        assert_eq!(
+            metrics
+                .gitserver_client_total
+                .with_label_values(&labels)
+                .get(),
+            1.0
+        );
+        assert_eq!(
+            metrics
+                .gitserver_client_errors_total
+                .with_label_values(&labels)
+                .get(),
+            0.0
+        );
+
+        // Errors increment the error counter and `Add(0)` the count series;
+        // they are not observed in the duration histogram.
+        metrics.observe_gitserver_client(labels[0], labels[1], 0.5, true);
+        assert_eq!(
+            metrics
+                .gitserver_client_total
+                .with_label_values(&labels)
+                .get(),
+            1.0
+        );
+        assert_eq!(
+            metrics
+                .gitserver_client_errors_total
+                .with_label_values(&labels)
+                .get(),
+            1.0
+        );
     }
 }

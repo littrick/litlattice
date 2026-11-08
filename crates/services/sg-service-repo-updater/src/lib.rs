@@ -39,7 +39,7 @@ pub mod uncloned;
 
 use config::RepoUpdaterConfig;
 use debug::DebugContext;
-use gitserver::GitserverRepoClient;
+use gitserver::{GitserverRepoClient, ScopedGitserverClient};
 use grpc::RepoUpdaterGrpc;
 use metrics::Metrics;
 use purge::PurgeWorker;
@@ -155,16 +155,32 @@ impl Service for RepoUpdaterService {
         let sync_jobs = sg_db::external_service_sync_jobs::SyncJobsStore::new(pool);
 
         let git_servers = unified.service_connections.git_servers.clone();
-        let gitserver_client =
-            Arc::new(GitserverRepoClient::connect(&git_servers).map_err(|err| {
-                ServiceError::new(format!("configuring the gitserver client: {err}"))
-            })?);
 
         let metrics = Arc::new(Metrics::new());
+        // Addresses and pins are re-read from `live` on every call, matching
+        // `conf.Watch` in `internal/gitserver/connection`.
+        let gitserver_client = Arc::new(GitserverRepoClient::new(
+            Arc::clone(&live),
+            Arc::clone(&metrics),
+        ));
+        // `NewRepositoryServiceClient` is built once per caller so the
+        // `scope` label identifies it; the connection cache is shared.
+        let scheduler_gitserver: Arc<dyn RepoUpdateClient> = Arc::new(ScopedGitserverClient::new(
+            Arc::clone(&gitserver_client),
+            "repoupdater.scheduler",
+        ));
+        let purge_gitserver: Arc<dyn RepoUpdateClient> = Arc::new(ScopedGitserverClient::new(
+            Arc::clone(&gitserver_client),
+            "repoupdater.purgeworker",
+        ));
+        let reclone_gitserver: Arc<dyn RepoUpdateClient> = Arc::new(ScopedGitserverClient::new(
+            Arc::clone(&gitserver_client),
+            "repoupdater.reclone",
+        ));
         let scheduler = Arc::new(UpdateScheduler::new(
             Arc::new(SystemClock),
             Arc::new(DbSchedulerStore::new(gitserver_repos)),
-            gitserver_client.clone(),
+            scheduler_gitserver,
             Arc::clone(&live),
             Arc::clone(&metrics),
         ));
@@ -200,7 +216,7 @@ impl Service for RepoUpdaterService {
         );
         let purge_worker = Arc::new(PurgeWorker::new(
             purge_gitserver_repos,
-            gitserver_client.clone() as Arc<dyn RepoUpdateClient>,
+            purge_gitserver,
             Arc::clone(&live),
             Arc::clone(&metrics),
         ));
@@ -215,7 +231,7 @@ impl Service for RepoUpdaterService {
         let grpc = RepoUpdaterGrpc {
             scheduler: Arc::clone(&scheduler),
             repos: Arc::new(DbRepoNameStore::new((*repo_store).clone())),
-            gitserver: gitserver_client,
+            gitserver: reclone_gitserver,
             // Batch Changes is a separate (enterprise) subsystem; without it
             // the RPC reports `changeset syncer is not configured`, matching
             // the baseline with `batches.IsEnabled() == false`.

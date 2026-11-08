@@ -3539,6 +3539,8 @@ name = "sg-git"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "md5",
+ "sg-config",
  "sg-proto",
  "tokio",
  "tokio-stream",
@@ -3638,6 +3640,7 @@ dependencies = [
  "sg-core",
  "sg-db",
  "sg-encryption",
+ "sg-git",
  "sg-http",
  "sg-metrics",
  "sg-proto",
@@ -3674,6 +3677,7 @@ dependencies = [
  "sg-core",
  "sg-db",
  "sg-extsvc",
+ "sg-git",
  "sg-http",
  "sg-metrics",
  "sg-proto",

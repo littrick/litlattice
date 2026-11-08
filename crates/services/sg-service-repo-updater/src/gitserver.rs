@@ -3,21 +3,32 @@
 //! Client for `gitserver.v1.GitserverRepositoryService` (`FetchRepository`,
 //! `DeleteRepository`).
 //!
-//! The Go baseline reaches gitserver through the load-balanced endpoint map
-//! (`internal/gitserver`). The Rust pilot uses round-robin over the addresses
-//! the frontend advertises in `ServiceConnections.GitServers` and refreshes
-//! them only at startup (documented divergence; the Go client watches
-//! configuration).
+//! The Go baseline reaches gitserver through `internal/gitserver`:
+//! `connection.AddrForRepo` shards on the repository name and
+//! `atomicGitServerConns` re-reads the address list (and pinned repos) from
+//! the live configuration, opening a connection per address. This module
+//! mirrors that: addresses are read from [`sg_config::LiveConfig`] on every
+//! call, and connections are cached per address. Same-repository requests
+//! therefore keep hitting the same shard across configuration updates, and a
+//! repository only moves when the baseline would move it too.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::collections::HashMap;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use prost_types::Timestamp;
+use sg_config::LiveConfig;
+use sg_git::addresses::GitserverAddresses;
+use sg_metrics::prometheus::Gauge;
 use sg_proto::gitserver as gpb;
+use tokio::sync::{Mutex, Semaphore, SemaphorePermit};
 use tonic::transport::Channel;
 
+use crate::metrics::Metrics;
 use crate::scheduler::RepoUpdateClient;
+
+/// `SRC_GITSERVER_CLIENT_CONCURRENCY_LIMIT`'s default (`env.MustGetInt`).
+const DEFAULT_CONCURRENCY_LIMIT: usize = 500;
 
 fn endpoint(addr: &str) -> String {
     if addr.starts_with("http://") || addr.starts_with("https://") {
@@ -27,8 +38,29 @@ fn endpoint(addr: &str) -> String {
     }
 }
 
+/// `env.MustGetInt("SRC_GITSERVER_CLIENT_CONCURRENCY_LIMIT", 500, ...)`.
+///
+/// Erratum: the baseline panics on a malformed value; a drop-in server logs
+/// and uses the default instead.
+fn concurrency_limit() -> usize {
+    let Ok(raw) = std::env::var("SRC_GITSERVER_CLIENT_CONCURRENCY_LIMIT") else {
+        return DEFAULT_CONCURRENCY_LIMIT;
+    };
+    match raw.trim().parse::<usize>() {
+        Ok(limit) if limit > 0 => limit,
+        _ => {
+            tracing::warn!(
+                value = %raw,
+                "invalid SRC_GITSERVER_CLIENT_CONCURRENCY_LIMIT; using 500"
+            );
+            DEFAULT_CONCURRENCY_LIMIT
+        }
+    }
+}
+
 /// `Timestamp.AsTime`.
-pub fn timestamp_to_system_time(timestamp: Option<Timestamp>) -> SystemTime {
+pub fn timestamp_to_system_time(timestamp: Option<Timestamp>) -> std::time::SystemTime {
+    use std::time::{Duration, UNIX_EPOCH};
     let Some(timestamp) = timestamp else {
         return UNIX_EPOCH;
     };
@@ -41,7 +73,8 @@ pub fn timestamp_to_system_time(timestamp: Option<Timestamp>) -> SystemTime {
 }
 
 /// Inverse of [`timestamp_to_system_time`] (`timestamppb.New`).
-pub fn system_time_to_timestamp(time: SystemTime) -> Timestamp {
+pub fn system_time_to_timestamp(time: std::time::SystemTime) -> Timestamp {
+    use std::time::UNIX_EPOCH;
     match time.duration_since(UNIX_EPOCH) {
         Ok(after) => Timestamp {
             seconds: after.as_secs() as i64,
@@ -62,82 +95,303 @@ pub fn system_time_to_timestamp(time: SystemTime) -> Timestamp {
 
 type Client = gpb::gitserver_repository_service_client::GitserverRepositoryServiceClient<Channel>;
 
+/// Keeps `src_gitserver_client_concurrent_requests` balanced with the
+/// semaphore permit: the baseline's `observedLimiter` increments after
+/// `Acquire` and decrements on `Release`.
+struct ObservedPermit<'a> {
+    _permit: SemaphorePermit<'a>,
+    gauge: &'a Gauge,
+}
+
+impl Drop for ObservedPermit<'_> {
+    fn drop(&mut self) {
+        self.gauge.dec();
+    }
+}
+
 pub struct GitserverRepoClient {
-    clients: Vec<Client>,
-    next: AtomicUsize,
+    live: Arc<LiveConfig>,
+    clients: Mutex<HashMap<String, Client>>,
+    limit: Semaphore,
+    metrics: Arc<Metrics>,
 }
 
 impl GitserverRepoClient {
-    pub fn connect(addrs: &[String]) -> Result<Self, String> {
-        let mut clients = Vec::with_capacity(addrs.len());
-        for addr in addrs {
-            let channel = Channel::from_shared(endpoint(addr))
-                .map_err(|err| format!("invalid gitserver address {addr:?}: {err}"))?
-                .connect_lazy();
-            clients.push(Client::new(channel).max_decoding_message_size(128 * 1024 * 1024));
+    pub fn new(live: Arc<LiveConfig>, metrics: Arc<Metrics>) -> Self {
+        Self {
+            live,
+            clients: Mutex::new(HashMap::new()),
+            limit: Semaphore::new(concurrency_limit()),
+            metrics,
         }
-        // An empty endpoint list is not a startup error in the baseline: the
-        // client is built lazily and every request fails until gitserver
-        // endpoints are known. Report `Unavailable` per call instead.
-        Ok(Self {
-            clients,
-            next: AtomicUsize::new(0),
-        })
     }
 
-    fn client(&self) -> Option<Client> {
-        if self.clients.is_empty() {
-            return None;
-        }
-        let index = self.next.fetch_add(1, Ordering::Relaxed) % self.clients.len();
-        Some(self.clients[index].clone())
+    /// `atomicGitServerConns.AddrForRepo`: read the shard list from the
+    /// current configuration (so it follows `conf.Watch`), honor
+    /// `experimentalFeatures.gitServerPinnedRepos`, and hash with MD5.
+    fn address_for(&self, repo: &str) -> Option<String> {
+        self.metrics.gitserver_addr_for_repo_invoked.inc();
+        let unified = self.live.current();
+        GitserverAddresses::from_unified(&unified)
+            .addr_for_repo(repo)
+            .map(str::to_owned)
     }
-}
 
-#[async_trait]
-impl RepoUpdateClient for GitserverRepoClient {
-    async fn fetch_repository(
-        &self,
-        repo: &str,
-    ) -> Result<(SystemTime, SystemTime), tonic::Status> {
-        let Some(mut client) = self.client() else {
+    /// `GitserverConns.ConnForRepo`: cached per-address channel. `Dial` is
+    /// non-blocking in the baseline, so the channel is connected lazily and
+    /// connection errors surface on the RPC, as they do in Go.
+    // `tonic::Status` is the error type `RepoUpdateClient` uses; boxing it
+    // here would only move the conversion inside each RPC.
+    #[allow(clippy::result_large_err)]
+    async fn client_for(&self, addr: &str) -> Result<Client, tonic::Status> {
+        if let Some(client) = self.clients.lock().await.get(addr) {
+            return Ok(client.clone());
+        }
+        let channel = Channel::from_shared(endpoint(addr))
+            .map_err(|err| {
+                tonic::Status::unavailable(format!("invalid gitserver address {addr:?}: {err}"))
+            })?
+            .connect_lazy();
+        let client = Client::new(channel).max_decoding_message_size(128 * 1024 * 1024);
+        self.clients
+            .lock()
+            .await
+            .insert(addr.to_owned(), client.clone());
+        Ok(client)
+    }
+
+    async fn observe(&self) -> ObservedPermit<'_> {
+        let permit = self
+            .limit
+            .acquire()
+            .await
+            .expect("gitserver limiter is never closed");
+        self.metrics.gitserver_client_concurrent_requests.inc();
+        ObservedPermit {
+            _permit: permit,
+            gauge: &self.metrics.gitserver_client_concurrent_requests,
+        }
+    }
+
+    #[allow(clippy::result_large_err)]
+    async fn client_for_repo(&self, repo: &str) -> Result<Client, tonic::Status> {
+        let Some(addr) = self.address_for(repo) else {
             return Err(tonic::Status::unavailable(
                 "no gitserver endpoints configured",
             ));
         };
+        self.client_for(&addr).await
+    }
+}
+
+impl GitserverRepoClient {
+    /// `repositoryServiceClient.FetchRepository`: the observation covers
+    /// address selection and connection setup as well as the RPC, and errors
+    /// from either count.
+    #[allow(clippy::result_large_err)]
+    pub async fn fetch_repository_with_scope(
+        &self,
+        repo: &str,
+        scope: &str,
+    ) -> Result<(std::time::SystemTime, std::time::SystemTime), tonic::Status> {
+        let started = std::time::Instant::now();
+        let result = self.fetch_repository_inner(repo).await;
+        self.metrics.observe_gitserver_client(
+            "FetchRepository",
+            scope,
+            started.elapsed().as_secs_f64(),
+            result.is_err(),
+        );
+        result
+    }
+
+    #[allow(clippy::result_large_err)]
+    async fn fetch_repository_inner(
+        &self,
+        repo: &str,
+    ) -> Result<(std::time::SystemTime, std::time::SystemTime), tonic::Status> {
+        let mut client = self.client_for_repo(repo).await?;
+        let observed = self.observe().await;
         let response = client
             .fetch_repository(gpb::FetchRepositoryRequest {
                 repo_name: repo.to_owned(),
             })
             .await?
             .into_inner();
+        drop(observed);
         Ok((
             timestamp_to_system_time(response.last_fetched),
             timestamp_to_system_time(response.last_changed),
         ))
     }
 
-    async fn delete_repository(&self, repo: &str) -> Result<(), tonic::Status> {
-        let Some(mut client) = self.client() else {
-            return Err(tonic::Status::unavailable(
-                "no gitserver endpoints configured",
-            ));
-        };
+    #[allow(clippy::result_large_err)]
+    pub async fn delete_repository_with_scope(
+        &self,
+        repo: &str,
+        scope: &str,
+    ) -> Result<(), tonic::Status> {
+        let started = std::time::Instant::now();
+        let result = self.delete_repository_inner(repo).await;
+        self.metrics.observe_gitserver_client(
+            "DeleteRepository",
+            scope,
+            started.elapsed().as_secs_f64(),
+            result.is_err(),
+        );
+        result
+    }
+
+    #[allow(clippy::result_large_err)]
+    async fn delete_repository_inner(&self, repo: &str) -> Result<(), tonic::Status> {
+        let mut client = self.client_for_repo(repo).await?;
+        let observed = self.observe().await;
         client
             .delete_repository(gpb::DeleteRepositoryRequest {
                 repo_name: repo.to_owned(),
             })
             .await?;
+        drop(observed);
         Ok(())
+    }
+}
+
+/// `gitserver.NewRepositoryServiceClient(scope)`: the baseline builds one
+/// wrapper per caller so the `scope` label says who issued the RPC
+/// (`repoupdater.scheduler`, `repoupdater.purgeworker`,
+/// `repoupdater.reclone`), while all wrappers share the connection cache.
+pub struct ScopedGitserverClient {
+    inner: Arc<GitserverRepoClient>,
+    scope: &'static str,
+}
+
+impl ScopedGitserverClient {
+    pub fn new(inner: Arc<GitserverRepoClient>, scope: &'static str) -> Self {
+        Self { inner, scope }
+    }
+}
+
+#[async_trait]
+impl RepoUpdateClient for ScopedGitserverClient {
+    async fn fetch_repository(
+        &self,
+        repo: &str,
+    ) -> Result<(std::time::SystemTime, std::time::SystemTime), tonic::Status> {
+        self.inner
+            .fetch_repository_with_scope(repo, self.scope)
+            .await
+    }
+
+    async fn delete_repository(&self, repo: &str) -> Result<(), tonic::Status> {
+        self.inner
+            .delete_repository_with_scope(repo, self.scope)
+            .await
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sg_config::{RawUnified, ServiceConnections, Unified};
+
+    fn unified(git_servers: &[&str], pinned: &[(&str, &str)]) -> Unified {
+        let mut pins = serde_json::Map::new();
+        for (repo, addr) in pinned {
+            pins.insert(
+                (*repo).to_owned(),
+                serde_json::Value::String((*addr).to_owned()),
+            );
+        }
+        let site = if pins.is_empty() {
+            "{}".to_owned()
+        } else {
+            serde_json::json!({
+                "experimentalFeatures": {"gitServerPinnedRepos": pins}
+            })
+            .to_string()
+        };
+        Unified::parse(&RawUnified {
+            id: 0,
+            site,
+            service_connections: ServiceConnections {
+                git_servers: git_servers.iter().map(|addr| (*addr).to_owned()).collect(),
+                ..Default::default()
+            },
+        })
+        .expect("parse config")
+    }
+
+    fn client(live: Arc<LiveConfig>) -> GitserverRepoClient {
+        GitserverRepoClient::new(live, Arc::new(Metrics::new()))
+    }
+
+    #[test]
+    fn shards_repositories_like_the_baseline() {
+        let live = Arc::new(LiveConfig::new(unified(
+            &["gitserver-1", "gitserver-2", "gitserver-3"],
+            &[("repo2", "gitserver-1")],
+        )));
+        let client = client(live);
+        // Golden values from `connection.TestAddrForRepo`.
+        for (repo, want) in [
+            ("repo1", "gitserver-3"),
+            ("DELETED-123123.123123-repo1", "gitserver-3"),
+            ("DELETED-123123.123123-repo2", "gitserver-1"),
+            ("github.com/sourcegraph/sourcegraph", "gitserver-2"),
+            ("github.com/sourcegraph/Sourcegraph", "gitserver-2"),
+            ("repo2", "gitserver-1"),
+        ] {
+            assert_eq!(client.address_for(repo).as_deref(), Some(want), "{repo}");
+        }
+        assert_eq!(
+            client.metrics.gitserver_addr_for_repo_invoked.get(),
+            6.0,
+            "AddrForRepo is counted once per call, as in the baseline"
+        );
+    }
+
+    #[test]
+    fn follows_the_live_configuration() {
+        let live = Arc::new(LiveConfig::new(unified(&["gitserver-1"], &[])));
+        let client = client(Arc::clone(&live));
+        assert_eq!(client.address_for("repo1").as_deref(), Some("gitserver-1"));
+
+        // The baseline's `conf.Watch` replaces the address list and pins
+        // without restarting the process.
+        live.set(unified(&["gitserver-1", "gitserver-2", "gitserver-3"], &[]));
+        assert_eq!(client.address_for("repo1").as_deref(), Some("gitserver-3"));
+
+        live.set(unified(
+            &["gitserver-1", "gitserver-2", "gitserver-3"],
+            &[("repo1", "gitserver-2")],
+        ));
+        assert_eq!(client.address_for("repo1").as_deref(), Some("gitserver-2"));
+    }
+
+    #[test]
+    fn no_endpoints_is_unavailable_per_call() {
+        let live = Arc::new(LiveConfig::new(unified(&[], &[])));
+        let client = client(live);
+        assert_eq!(client.address_for("repo1"), None);
+        let error = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime")
+            .block_on(client.client_for_repo("repo1"))
+            .expect_err("no endpoints");
+        assert_eq!(error.code(), tonic::Code::Unavailable);
+    }
+
+    #[test]
+    fn concurrency_limit_parsing() {
+        // The variable is process-global; only assert the default path here
+        // (other tests must not set it), and that the env override is read.
+        assert_eq!(concurrency_limit(), DEFAULT_CONCURRENCY_LIMIT);
+    }
 
     #[test]
     fn timestamps_round_trip() {
+        use std::time::{Duration, UNIX_EPOCH};
         let now = UNIX_EPOCH + Duration::new(1_700_000_000, 123_456_789);
         let timestamp = system_time_to_timestamp(now);
         assert_eq!(timestamp.seconds, 1_700_000_000);
@@ -147,11 +401,6 @@ mod tests {
 
     #[test]
     fn missing_timestamp_is_unix_epoch() {
-        assert_eq!(timestamp_to_system_time(None), UNIX_EPOCH);
-    }
-
-    #[test]
-    fn empty_endpoint_list_is_not_a_connect_error() {
-        assert!(GitserverRepoClient::connect(&[]).is_ok());
+        assert_eq!(timestamp_to_system_time(None), std::time::UNIX_EPOCH);
     }
 }

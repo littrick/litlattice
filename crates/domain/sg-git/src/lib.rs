@@ -2,9 +2,13 @@
 
 //! `sg-git`: gitserver gRPC client shared by the Rust services.
 //!
-//! The baseline obtains gitserver addresses from site configuration. The pilot
-//! reads `SRC_GIT_SERVERS` directly and picks the first address (all
-//! gitservers in a cluster hold the same repositories).
+//! Callers pass the addresses they learned from site configuration
+//! (`SRC_GIT_SERVERS` in the pilot binaries, `ServiceConnections.GitServers`
+//! in repo-updater). Repository-to-shard selection is
+//! [`addresses::GitserverAddresses::addr_for_repo`], the same MD5 mapping the
+//! baseline uses, so every process reaches the same shard for a repository.
+
+pub mod addresses;
 
 use std::collections::HashMap;
 use std::fmt;
@@ -81,11 +85,15 @@ impl GitserverClient {
         }
     }
 
-    fn addr_for(&self, _repo: &str) -> Option<&str> {
-        // TODO(M8): rendezvous-hash `repo` across addresses like
-        // internal/gitserver/connection. A single-address pilot is enough for
-        // the first replacement step.
-        self.addrs.first().map(String::as_str)
+    fn addr_for(&self, repo: &str) -> Option<&str> {
+        // `connection.AddrForRepo` without the site-config pins: the callers
+        // of this client receive the shard list, not the unified config.
+        // Pins only affect repos an operator explicitly moved; repo-updater
+        // (which does have the config) uses `addresses::GitserverAddresses`.
+        let name = addresses::undeleted_repo_name(repo);
+        let normalized = addresses::normalize_repo(&name);
+        let index = addresses::addr_index(&normalized, self.addrs.len())?;
+        self.addrs.get(index).map(String::as_str)
     }
 
     async fn client(&self, addr: &str) -> Result<Client, Error> {
