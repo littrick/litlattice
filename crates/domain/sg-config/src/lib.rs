@@ -481,6 +481,18 @@ impl SiteConfiguration {
             .unwrap_or_default()
     }
 
+    /// `experimentalFeatures.perforceChangelistMapping == "enabled"`: the gate
+    /// the Perforce changelist mapper checks on every invocation
+    /// (`conf.Get().ExperimentalFeatures.PerforceChangelistMapping`). Any
+    /// value other than `enabled`, including unset/null, disables it.
+    pub fn perforce_changelist_mapping_enabled(&self) -> bool {
+        self.experimental_features()
+            .and_then(|features| features.get("perforceChangelistMapping"))
+            .and_then(serde_json::Value::as_str)
+            .map(|value| value == "enabled")
+            .unwrap_or(false)
+    }
+
     /// `experimentalFeatures`.
     pub fn experimental_features(&self) -> Option<&serde_json::Value> {
         self.raw.get("experimentalFeatures")

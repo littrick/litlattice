@@ -88,12 +88,26 @@ impl From<Error> for String {
     }
 }
 
+/// `gitdomain.RefType`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefType {
+    Unknown,
+    Branch,
+    Tag,
+}
+
 /// `gitdomain.Ref`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GitRef {
     pub name: String,
     pub short_name: String,
     pub target_commit: String,
+    pub ref_oid: String,
+    /// `gitdomain.Ref.CreatedDate`; absent (treated as the Unix epoch, like
+    /// `(*timestamppb.Timestamp)(nil).AsTime()`) when the server sent none.
+    pub created_at: Option<prost_types::Timestamp>,
+    pub ref_type: RefType,
+    pub is_head: bool,
 }
 
 /// `gitdomain.ProtoFileInfoToFS` keeps the full file info; only the name is
@@ -103,12 +117,40 @@ pub struct FileInfo {
     pub name: String,
 }
 
-/// The subset of `gitdomain.Commit` the upload processor reads.
+/// The subset of `gitdomain.Commit` the upload processor, the code-intel
+/// commit graph updater and the Perforce changelist mapper read.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Commit {
     pub oid: String,
+    /// `commit.Parents`, in the order gitserver reported them.
+    pub parents: Vec<String>,
     /// `commit.Committer.Date`; absent when the signature has no date.
     pub committer_date: Option<prost_types::Timestamp>,
+    /// `commit.Message`. gitserver sends it as bytes; Go converts it to a
+    /// string without validating UTF-8, so invalid sequences are replaced
+    /// here (`String::from_utf8_lossy`).
+    pub message: String,
+}
+
+/// `gitserver.CommitsOrder`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommitsOrder {
+    Default,
+    CommitDate,
+    TopoDate,
+}
+
+/// `gitserver.CommitsOptions`; only the fields the commit graph updater sets
+/// are represented, plus the validation `ToProto` performs.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CommitsOptions {
+    pub all_refs: bool,
+    pub ranges: Vec<String>,
+    pub after: Option<prost_types::Timestamp>,
+    pub before: Option<prost_types::Timestamp>,
+    pub max_commits: u32,
+    pub skip: u32,
+    pub order: Option<CommitsOrder>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -323,6 +365,13 @@ impl GitserverClient {
     /// `gitserver.Client.GetDefaultBranch(repo, false)`; returns the full ref
     /// name (`refs/heads/main`).
     pub async fn default_branch(&self, repo: &str) -> Result<String, Error> {
+        Ok(self.default_branch_commit(repo).await?.0)
+    }
+
+    /// `gitserver.Client.GetDefaultBranch(repo, false)` returning both the
+    /// full ref name and the commit it points at (the Perforce changelist
+    /// mapper needs the HEAD commit).
+    pub async fn default_branch_commit(&self, repo: &str) -> Result<(String, String), Error> {
         let mut client = self.client_for(repo).await?;
         let context = format!("default branch {repo}");
         let response = client
@@ -332,7 +381,8 @@ impl GitserverClient {
             })
             .await
             .map_err(|status| translate_status(status, &context))?;
-        Ok(response.into_inner().ref_name)
+        let response = response.into_inner();
+        Ok((response.ref_name, response.commit))
     }
 
     /// `gitserver.Client.ListRefs` (streaming response).
@@ -369,6 +419,14 @@ impl GitserverClient {
                     name: String::from_utf8_lossy(&git_ref.ref_name).into_owned(),
                     short_name: String::from_utf8_lossy(&git_ref.short_ref_name).into_owned(),
                     target_commit: git_ref.target_commit,
+                    ref_oid: git_ref.ref_oid,
+                    created_at: git_ref.created_at,
+                    ref_type: match pb::git_ref::RefType::try_from(git_ref.ref_type) {
+                        Ok(pb::git_ref::RefType::Branch) => RefType::Branch,
+                        Ok(pb::git_ref::RefType::Tag) => RefType::Tag,
+                        _ => RefType::Unknown,
+                    },
+                    is_head: git_ref.is_head,
                 });
             }
         }
@@ -425,10 +483,80 @@ impl GitserverClient {
             .await
             .map_err(|status| translate_status(status, &context))?;
         let commit = response.into_inner().commit.unwrap_or_default();
-        Ok(Commit {
-            oid: commit.oid,
-            committer_date: commit.committer.and_then(|committer| committer.date),
-        })
+        Ok(commit_from_proto(commit))
+    }
+
+    /// `gitserver.Client.Commits` (`CommitsOptions.ToProto` + a `CommitLog`
+    /// stream), reduced to the commit fields the code-intel commit graph
+    /// updater reads.
+    pub async fn commits(
+        &self,
+        repo: &str,
+        options: &CommitsOptions,
+    ) -> Result<Vec<Commit>, Error> {
+        // `CommitsOptions.ToProto`.
+        if !options.ranges.is_empty() && options.all_refs {
+            return Err(Error::Message(
+                "cannot specify both a range and AllRefs".to_owned(),
+            ));
+        }
+        if options.ranges.is_empty() && !options.all_refs {
+            return Err(Error::Message(
+                "must specify a range or AllRefs".to_owned(),
+            ));
+        }
+        let order = match options.order.unwrap_or(CommitsOrder::Default) {
+            CommitsOrder::Default => pb::commit_log_request::CommitLogOrder::Unspecified,
+            CommitsOrder::CommitDate => pb::commit_log_request::CommitLogOrder::CommitDate,
+            CommitsOrder::TopoDate => pb::commit_log_request::CommitLogOrder::TopoDate,
+        };
+
+        let mut client = self.client_for(repo).await?;
+        let context = format!("commits {repo}");
+        let mut stream = client
+            .commit_log(pb::CommitLogRequest {
+                repo_name: repo.to_owned(),
+                ranges: options.ranges.iter().map(|r| r.as_bytes().to_vec()).collect(),
+                all_refs: options.all_refs,
+                after: options.after,
+                before: options.before,
+                max_commits: options.max_commits,
+                skip: options.skip,
+                follow_only_first_parent: false,
+                include_modified_files: false,
+                order: order as i32,
+                message_query: Vec::new(),
+                author_query: Vec::new(),
+                path: Vec::new(),
+                follow_path_renames: false,
+            })
+            .await
+            .map_err(|status| translate_status(status, &context))?
+            .into_inner();
+
+        let mut commits = Vec::new();
+        while let Some(chunk) = stream
+            .message()
+            .await
+            .map_err(|status| translate_status(status, &context))?
+        {
+            for response in chunk.commits {
+                if let Some(commit) = response.commit {
+                    commits.push(commit_from_proto(commit));
+                }
+            }
+        }
+        Ok(commits)
+    }
+}
+
+/// `gitdomain.CommitFromProto`, reduced to the fields gitserver clients read.
+fn commit_from_proto(commit: pb::GitCommit) -> Commit {
+    Commit {
+        oid: commit.oid,
+        parents: commit.parents,
+        committer_date: commit.committer.and_then(|committer| committer.date),
+        message: String::from_utf8_lossy(&commit.message).into_owned(),
     }
 }
 
