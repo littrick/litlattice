@@ -90,6 +90,10 @@ EXPECTED = {
 
 # Families that only exist once the process has served matching traffic.
 TRAFFIC = {
+    "src_gitserver_backend_concurrent_operations",
+    "src_gitserver_backend_duration_seconds",
+    "src_gitserver_backend_total",
+    "src_gitserver_backend_errors_total",
     "src_gitserver_exec_running",
     "src_gitserver_exec_duration_seconds",
     "src_gitserver_gitservice_running",

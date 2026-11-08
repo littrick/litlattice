@@ -224,6 +224,10 @@ impl Collector for DiskCollector {
 /// Metric handles the read path updates.
 pub struct Metrics {
     echo_duration: Gauge,
+    backend_concurrent: GaugeVec,
+    backend_duration: HistogramVec,
+    backend_total: CounterVec,
+    backend_errors: CounterVec,
     exec_running: GaugeVec,
     exec_duration: HistogramVec,
     gitservice_running: GaugeVec,
@@ -366,26 +370,26 @@ impl Metrics {
         );
 
         // `cmd/gitserver/internal/git/observability.go`
-        let _backend_concurrent = gauge_vec(
+        let backend_concurrent = gauge_vec(
             registry,
             "src_gitserver_backend_concurrent_operations",
             "Concurrent operations handled by Gitserver backends.",
             &["op"],
         );
-        let _backend_duration = histogram_vec(
+        let backend_duration = histogram_vec(
             registry,
             "src_gitserver_backend_duration_seconds",
             "Time in seconds spent performing successful gitserver_backend operations",
             &["op"],
             default_buckets(),
         );
-        let _backend_total = counter_vec(
+        let backend_total = counter_vec(
             registry,
             "src_gitserver_backend_total",
             "Total number of method invocations.",
             &["op"],
         );
-        let _backend_errors = counter_vec(
+        let backend_errors = counter_vec(
             registry,
             "src_gitserver_backend_errors_total",
             "Total number of gitserver_backend operations resulting in an unexpected error",
@@ -494,6 +498,10 @@ impl Metrics {
 
         Self {
             echo_duration,
+            backend_concurrent,
+            backend_duration,
+            backend_total,
+            backend_errors,
             exec_running,
             exec_duration,
             gitservice_running,
@@ -556,6 +564,95 @@ impl Metrics {
 }
 
 static METRICS: OnceLock<Metrics> = OnceLock::new();
+
+/// Records one backend operation for the baseline RED metrics
+/// (`src_gitserver_backend_*`): the `op` label is the kebab-case operation
+/// name from `cmd/gitserver/internal/git/observability.go`, the concurrency
+/// gauge is held for the operation's lifetime, and the duration/count/error
+/// counters are updated when the guard is finished.
+pub struct BackendGuard {
+    metrics: &'static Metrics,
+    /// Kebab-case label used by the RED metrics (`total`, `duration`,
+    /// `errors_total`).
+    op: &'static str,
+    /// Method-name label used by the concurrency gauge.
+    concurrent: &'static str,
+    started: Instant,
+    finished: bool,
+}
+
+impl BackendGuard {
+    /// `observation.REDMetrics.Observe`: missing revisions and missing files
+    /// are filtered out of the metrics by the baseline `ErrorFilter`, so they
+    /// count as successes here; every other error increments the error
+    /// counter and never observes a duration.
+    pub fn finish(mut self, error: Option<&crate::git::GitError>) {
+        self.record(error);
+    }
+
+    fn record(&mut self, error: Option<&crate::git::GitError>) {
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+        self.metrics
+            .backend_concurrent
+            .with_label_values(&[self.concurrent])
+            .dec();
+        let filtered = matches!(
+            error,
+            None | Some(crate::git::GitError::RevisionNotFound(_))
+                | Some(crate::git::GitError::FileNotFound)
+        );
+        if filtered {
+            self.metrics
+                .backend_duration
+                .with_label_values(&[self.op])
+                .observe(self.started.elapsed().as_secs_f64());
+            self.metrics
+                .backend_total
+                .with_label_values(&[self.op])
+                .inc();
+        } else {
+            self.metrics
+                .backend_errors
+                .with_label_values(&[self.op])
+                .inc();
+            // `Count.Add(0)` creates the child series without counting a
+            // successful invocation.
+            self.metrics
+                .backend_total
+                .with_label_values(&[self.op])
+                .inc_by(0.0);
+        }
+    }
+}
+
+impl Drop for BackendGuard {
+    fn drop(&mut self) {
+        // Streaming operations finish when their child is dropped (the
+        // baseline records on iterator Close, which reports no error).
+        self.record(None);
+    }
+}
+
+/// Begin one backend operation; `None` when the service has not started.
+/// `op` is the kebab-case RED label, `concurrent` the method name used by the
+/// baseline concurrency gauge.
+pub fn backend_started(op: &'static str, concurrent: &'static str) -> Option<BackendGuard> {
+    let metrics = Metrics::global_opt()?;
+    metrics
+        .backend_concurrent
+        .with_label_values(&[concurrent])
+        .inc();
+    Some(BackendGuard {
+        metrics,
+        op,
+        concurrent,
+        started: Instant::now(),
+        finished: false,
+    })
+}
 
 /// Records one `git` execution for the baseline `exec_*` metrics: the
 /// running gauge is incremented when the child starts and the duration is

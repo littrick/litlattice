@@ -46,6 +46,7 @@ impl GitError {
 pub struct GitChild {
     child: Child,
     _exec: Option<metrics::ExecGuard>,
+    _backend: Option<metrics::BackendGuard>,
 }
 
 impl GitChild {
@@ -53,15 +54,27 @@ impl GitChild {
         Self {
             child,
             _exec: metrics::exec_started(args),
+            _backend: None,
         }
     }
 
-    /// Like [`Child::wait_with_output`], keeping the execution measurement
-    /// alive until the child exits.
+    /// Attach the backend RED measurement; it ends when the child is dropped.
+    fn with_backend(mut self, backend: Option<metrics::BackendGuard>) -> Self {
+        self._backend = backend;
+        self
+    }
+
+    /// Like [`Child::wait_with_output`], keeping the execution and backend
+    /// measurements alive until the child exits.
     pub async fn wait_with_output(self) -> std::io::Result<std::process::Output> {
-        let GitChild { child, _exec } = self;
+        let GitChild {
+            child,
+            _exec,
+            _backend,
+        } = self;
         let output = child.wait_with_output().await;
         drop(_exec);
+        drop(_backend);
         output
     }
 }
@@ -358,6 +371,15 @@ impl GitRepo {
     /// Baseline `ResolveRevision`: empty means `HEAD`; anything else is
     /// resolved through `<spec>^0` so that non-commit objects are rejected.
     pub async fn resolve_revision(&self, spec: &str) -> Result<String, GitError> {
+        let op = metrics::backend_started("resolve-revision", "ResolveRevision");
+        let result = self.resolve_revision_inner(spec).await;
+        if let Some(op) = op {
+            op.finish(result.as_ref().err());
+        }
+        result
+    }
+
+    async fn resolve_revision_inner(&self, spec: &str) -> Result<String, GitError> {
         let spec = if spec.is_empty() { "HEAD" } else { spec };
         let spec = if spec == "HEAD" {
             spec.to_owned()
@@ -375,6 +397,15 @@ impl GitRepo {
     /// Baseline `GetObject`: resolve the name, then report its object type.
     /// Returns the raw OID bytes (the proto field is `bytes`) and the type.
     pub async fn get_object(&self, name: &str) -> Result<(Vec<u8>, String), GitError> {
+        let op = metrics::backend_started("get-object", "GetObject");
+        let result = self.get_object_inner(name).await;
+        if let Some(op) = op {
+            op.finish(result.as_ref().err());
+        }
+        result
+    }
+
+    async fn get_object_inner(&self, name: &str) -> Result<(Vec<u8>, String), GitError> {
         if name.starts_with('-') {
             return Err(GitError::Message(format!(
                 "invalid git revision spec {name:?} (begins with '-')"
@@ -389,6 +420,15 @@ impl GitRepo {
 
     /// Baseline `SymbolicRefHead`. `short` asks git for the abbreviated ref.
     pub async fn symbolic_ref_head(&self, short: bool) -> Result<String, GitError> {
+        let op = metrics::backend_started("symbolic-ref-head", "SymbolicRefHead");
+        let result = self.symbolic_ref_head_inner(short).await;
+        if let Some(op) = op {
+            op.finish(result.as_ref().err());
+        }
+        result
+    }
+
+    async fn symbolic_ref_head_inner(&self, short: bool) -> Result<String, GitError> {
         let mut args: Vec<OsString> = vec!["symbolic-ref".into(), "HEAD".into()];
         if short {
             args.push("--short".into());
@@ -406,6 +446,15 @@ impl GitRepo {
     /// Baseline `RevParseHead`, including the "HEAD does not point to
     /// anything" case of an empty repository.
     pub async fn rev_parse_head(&self) -> Result<String, GitError> {
+        let op = metrics::backend_started("rev-parse-head", "RevParseHead");
+        let result = self.rev_parse_head_inner().await;
+        if let Some(op) = op {
+            op.finish(result.as_ref().err());
+        }
+        result
+    }
+
+    async fn rev_parse_head_inner(&self) -> Result<String, GitError> {
         let sha = self.rev_parse("HEAD").await?;
         if sha == "HEAD" {
             return Err(GitError::RevisionNotFound("HEAD".to_owned()));
@@ -416,6 +465,15 @@ impl GitRepo {
     /// Baseline `MergeBase`: exit 1 with empty stderr means "no merge base"
     /// and is reported as an empty SHA rather than an error.
     pub async fn merge_base(&self, base: &str, head: &str) -> Result<String, GitError> {
+        let op = metrics::backend_started("merge-base", "MergeBase");
+        let result = self.merge_base_inner(base, head).await;
+        if let Some(op) = op {
+            op.finish(result.as_ref().err());
+        }
+        result
+    }
+
+    async fn merge_base_inner(&self, base: &str, head: &str) -> Result<String, GitError> {
         let output = self
             .output(&["merge-base".into(), "--".into(), base.into(), head.into()])
             .await?;
@@ -440,6 +498,24 @@ impl GitRepo {
 
     /// Launch `git archive` and return the child; the caller pumps stdout.
     pub async fn archive(
+        &self,
+        format: &str,
+        treeish: &str,
+        paths: &[Vec<u8>],
+    ) -> Result<GitChild, GitError> {
+        let op = metrics::backend_started("archive-reader", "ArchiveReader");
+        match self.archive_inner(format, treeish, paths).await {
+            Ok(child) => Ok(child.with_backend(op)),
+            Err(err) => {
+                if let Some(op) = op {
+                    op.finish(Some(&err));
+                }
+                Err(err)
+            }
+        }
+    }
+
+    async fn archive_inner(
         &self,
         format: &str,
         treeish: &str,
@@ -480,6 +556,29 @@ impl GitRepo {
     /// A gitlink (submodule, mode 160000) reads as an empty file, like the
     /// baseline.
     pub async fn read_file(&self, commit: &str, path: &[u8]) -> Result<Option<GitChild>, GitError> {
+        let op = metrics::backend_started("read-file", "ReadFile");
+        match self.read_file_inner(commit, path).await {
+            Ok(Some(child)) => Ok(Some(child.with_backend(op))),
+            Ok(None) => {
+                if let Some(op) = op {
+                    op.finish(None);
+                }
+                Ok(None)
+            }
+            Err(err) => {
+                if let Some(op) = op {
+                    op.finish(Some(&err));
+                }
+                Err(err)
+            }
+        }
+    }
+
+    async fn read_file_inner(
+        &self,
+        commit: &str,
+        path: &[u8],
+    ) -> Result<Option<GitChild>, GitError> {
         // Baseline `EnsureAbsoluteCommit`: `ReadFile` refuses to run git on
         // relative revisions (the expensive resolution cannot be cached).
         if !is_absolute_revision(commit) {
@@ -546,6 +645,19 @@ impl GitRepo {
         base: Option<&[u8]>,
         head: &[u8],
     ) -> Result<Vec<(u8, Vec<u8>)>, GitError> {
+        let op = metrics::backend_started("changed-files", "ChangedFiles");
+        let result = self.changed_files_inner(base, head).await;
+        if let Some(op) = op {
+            op.finish(result.as_ref().err());
+        }
+        result
+    }
+
+    async fn changed_files_inner(
+        &self,
+        base: Option<&[u8]>,
+        head: &[u8],
+    ) -> Result<Vec<(u8, Vec<u8>)>, GitError> {
         let mut args: Vec<OsString> = vec![
             "diff-tree".into(),
             "-r".into(),
@@ -581,6 +693,15 @@ impl GitRepo {
     /// root tree resolved through `<commit>^{tree}` because `ls-tree` does not
     /// list the root itself.
     pub async fn stat(&self, commit: &str, path: &[u8]) -> Result<TreeEntry, GitError> {
+        let op = metrics::backend_started("stat", "Stat");
+        let result = self.stat_inner(commit, path).await;
+        if let Some(op) = op {
+            op.finish(result.as_ref().err());
+        }
+        result
+    }
+
+    async fn stat_inner(&self, commit: &str, path: &[u8]) -> Result<TreeEntry, GitError> {
         check_spec_arg_safety(commit)?;
         let path = stat_path(path);
         if path == b"." {
@@ -608,6 +729,20 @@ impl GitRepo {
     /// slash so `ls-tree` lists the directory's contents rather than the
     /// directory entry itself.
     pub async fn read_dir(
+        &self,
+        commit: &str,
+        path: &[u8],
+        recursive: bool,
+    ) -> Result<Vec<TreeEntry>, GitError> {
+        let op = metrics::backend_started("read-dir", "ReadDir");
+        let result = self.read_dir_inner(commit, path, recursive).await;
+        if let Some(op) = op {
+            op.finish(result.as_ref().err());
+        }
+        result
+    }
+
+    async fn read_dir_inner(
         &self,
         commit: &str,
         path: &[u8],
@@ -691,7 +826,7 @@ impl GitRepo {
     /// Baseline `gitModulesConfig`: `.gitmodules` at `commit`, empty when the
     /// file does not exist.
     async fn git_modules_config(&self, commit: &str) -> Result<GitModules, GitError> {
-        let child = match self.read_file(commit, b".gitmodules").await {
+        let child = match self.read_file_inner(commit, b".gitmodules").await {
             Ok(Some(child)) => child,
             // Absent file (or a submodule at that path) means no overrides.
             Ok(None) | Err(GitError::FileNotFound) => return Ok(GitModules::default()),
@@ -714,6 +849,23 @@ impl GitRepo {
     /// Baseline `ListRefs`: `for-each-ref` with the same sort keys, format and
     /// filters. Output order is git's and is preserved.
     pub async fn list_refs(
+        &self,
+        heads_only: bool,
+        tags_only: bool,
+        points_at_commit: &[String],
+        contains_sha: Option<&str>,
+    ) -> Result<Vec<GitRef>, GitError> {
+        let op = metrics::backend_started("list-refs", "ListRefs");
+        let result = self
+            .list_refs_inner(heads_only, tags_only, points_at_commit, contains_sha)
+            .await;
+        if let Some(op) = op {
+            op.finish(result.as_ref().err());
+        }
+        result
+    }
+
+    async fn list_refs_inner(
         &self,
         heads_only: bool,
         tags_only: bool,
@@ -783,6 +935,19 @@ impl GitRepo {
         commit: &str,
         include_modified_files: bool,
     ) -> Result<GitCommit, GitError> {
+        let op = metrics::backend_started("get-commit", "GetCommit");
+        let result = self.get_commit_inner(commit, include_modified_files).await;
+        if let Some(op) = op {
+            op.finish(result.as_ref().err());
+        }
+        result
+    }
+
+    async fn get_commit_inner(
+        &self,
+        commit: &str,
+        include_modified_files: bool,
+    ) -> Result<GitCommit, GitError> {
         check_spec_arg_safety(commit)?;
         let commit_id = self.rev_parse_commit(commit).await?;
 
@@ -820,7 +985,16 @@ impl GitRepo {
     /// newest commit whose committer time is before `before_seconds`. An empty
     /// result means no such ancestor exists.
     pub async fn rev_at_time(&self, spec: &str, before_seconds: i64) -> Result<String, GitError> {
-        let sha = self.resolve_revision(spec).await?;
+        let op = metrics::backend_started("rev-at-time", "RevAtTime");
+        let result = self.rev_at_time_inner(spec, before_seconds).await;
+        if let Some(op) = op {
+            op.finish(result.as_ref().err());
+        }
+        result
+    }
+
+    async fn rev_at_time_inner(&self, spec: &str, before_seconds: i64) -> Result<String, GitError> {
+        let sha = self.resolve_revision_inner(spec).await?;
         let output = self
             .output(&[
                 "log".into(),
@@ -851,13 +1025,44 @@ impl GitRepo {
         context_lines: u32,
         paths: &[Vec<u8>],
     ) -> Result<GitChild, GitError> {
-        let mut base_oid = self.resolve_revision(base).await?;
-        let head_oid = self.resolve_revision(head).await?;
+        let op = metrics::backend_started("raw-diff", "RawDiff");
+        match self
+            .raw_diff_inner(
+                base,
+                head,
+                comparison,
+                inter_hunk_context,
+                context_lines,
+                paths,
+            )
+            .await
+        {
+            Ok(child) => Ok(child.with_backend(op)),
+            Err(err) => {
+                if let Some(op) = op {
+                    op.finish(Some(&err));
+                }
+                Err(err)
+            }
+        }
+    }
+
+    async fn raw_diff_inner(
+        &self,
+        base: &str,
+        head: &str,
+        comparison: RawDiffComparison,
+        inter_hunk_context: u32,
+        context_lines: u32,
+        paths: &[Vec<u8>],
+    ) -> Result<GitChild, GitError> {
+        let mut base_oid = self.resolve_revision_inner(base).await?;
+        let head_oid = self.resolve_revision_inner(head).await?;
         // Go re-checks the resolved OIDs before handing them to git.
         check_spec_arg_safety(&base_oid)?;
         check_spec_arg_safety(&head_oid)?;
         if comparison == RawDiffComparison::Intersection {
-            base_oid = self.merge_base(&base_oid, &head_oid).await?;
+            base_oid = self.merge_base_inner(&base_oid, &head_oid).await?;
         }
 
         let mut args: Vec<OsString> = vec![
@@ -886,6 +1091,19 @@ impl GitRepo {
     /// Baseline `CommitLog`: spawn `git log` with the shared NUL format; the
     /// caller parses records with [`pump_commit_log`].
     pub async fn commit_log(&self, options: &CommitLogOptions) -> Result<GitChild, GitError> {
+        let op = metrics::backend_started("commit-log", "CommitLog");
+        match self.commit_log_inner(options).await {
+            Ok(child) => Ok(child.with_backend(op)),
+            Err(err) => {
+                if let Some(op) = op {
+                    op.finish(Some(&err));
+                }
+                Err(err)
+            }
+        }
+    }
+
+    async fn commit_log_inner(&self, options: &CommitLogOptions) -> Result<GitChild, GitError> {
         for range in &options.ranges {
             if range.first() == Some(&b'-') {
                 return Err(GitError::Message(format!(
@@ -954,6 +1172,15 @@ impl GitRepo {
     /// Exit 1 with empty stderr means there is no common base (empty SHA); an
     /// unresolvable revspec is reported as `RevisionNotFound`.
     pub async fn merge_base_octopus(&self, revspecs: &[String]) -> Result<String, GitError> {
+        let op = metrics::backend_started("merge-base-octopus", "MergeBaseOctopus");
+        let result = self.merge_base_octopus_inner(revspecs).await;
+        if let Some(op) = op {
+            op.finish(result.as_ref().err());
+        }
+        result
+    }
+
+    async fn merge_base_octopus_inner(&self, revspecs: &[String]) -> Result<String, GitError> {
         if revspecs.len() < 2 {
             return Err(GitError::Message(
                 "at least two revspecs must be given".to_owned(),
@@ -983,6 +1210,15 @@ impl GitRepo {
 
     /// Baseline `BehindAhead`: `git rev-list --count --left-right <left>...<right>`.
     pub async fn behind_ahead(&self, left: &str, right: &str) -> Result<BehindAhead, GitError> {
+        let op = metrics::backend_started("get-behind-ahead", "BehindAhead");
+        let result = self.behind_ahead_inner(left, right).await;
+        if let Some(op) = op {
+            op.finish(result.as_ref().err());
+        }
+        result
+    }
+
+    async fn behind_ahead_inner(&self, left: &str, right: &str) -> Result<BehindAhead, GitError> {
         check_spec_arg_safety(left)?;
         check_spec_arg_safety(right)?;
         let left = if left.is_empty() { "HEAD" } else { left };
@@ -1028,6 +1264,15 @@ impl GitRepo {
 
     /// Baseline `FirstEverCommit`: the root commit reachable from `HEAD`.
     pub async fn first_ever_commit(&self) -> Result<String, GitError> {
+        let op = metrics::backend_started("first-ever-commit", "FirstEverCommit");
+        let result = self.first_ever_commit_inner().await;
+        if let Some(op) = op {
+            op.finish(result.as_ref().err());
+        }
+        result
+    }
+
+    async fn first_ever_commit_inner(&self) -> Result<String, GitError> {
         let output = self
             .output(&[
                 "rev-list".into(),
@@ -1060,6 +1305,22 @@ impl GitRepo {
     /// Baseline `ContributorCounts`: `git shortlog --summary --numbered --email
     /// --no-merges --after=<unix> <range> -- <path>`.
     pub async fn contributor_counts(
+        &self,
+        range: &str,
+        after_seconds: i64,
+        path: &[u8],
+    ) -> Result<Vec<ContributorCount>, GitError> {
+        let op = metrics::backend_started("contributor-counts", "ContributorCounts");
+        let result = self
+            .contributor_counts_inner(range, after_seconds, path)
+            .await;
+        if let Some(op) = op {
+            op.finish(result.as_ref().err());
+        }
+        result
+    }
+
+    async fn contributor_counts_inner(
         &self,
         range: &str,
         after_seconds: i64,
@@ -1104,6 +1365,28 @@ impl GitRepo {
     /// with [`pump_blame`]. The blob is verified first, like the baseline's
     /// `getBlobOID`.
     pub async fn blame(
+        &self,
+        commit: &str,
+        path: &[u8],
+        ignore_whitespace: bool,
+        range: Option<BlameRange>,
+    ) -> Result<GitChild, GitError> {
+        let op = metrics::backend_started("blame", "Blame");
+        match self
+            .blame_inner(commit, path, ignore_whitespace, range)
+            .await
+        {
+            Ok(child) => Ok(child.with_backend(op)),
+            Err(err) => {
+                if let Some(op) = op {
+                    op.finish(Some(&err));
+                }
+                Err(err)
+            }
+        }
+    }
+
+    async fn blame_inner(
         &self,
         commit: &str,
         path: &[u8],
