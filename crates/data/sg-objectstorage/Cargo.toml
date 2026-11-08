@@ -11,6 +11,7 @@ aws-config = { workspace = true }
 aws-runtime = { workspace = true }
 aws-sdk-s3 = { workspace = true }
 tokio = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }

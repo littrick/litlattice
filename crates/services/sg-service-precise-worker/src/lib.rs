@@ -261,41 +261,19 @@ async fn resetter_loop(store: Arc<queue::UploadQueueStore>, shutdown: Cancellati
 
 /// `lsifuploadstore.New` for the S3-compatible backends. GCS is not
 /// implemented by the Rust worker yet; the baseline would accept it, so this
-/// is a documented difference (see docs/modules/07 §16).
+/// is a documented difference (see docs/modules/07 §16). The implementation is
+/// shared with the worker's `codeintel-uploadstore-expirer` job.
 pub fn upload_storage_config(
     config: &config::UploadStoreConfig,
 ) -> Result<sg_objectstorage::StorageConfig, String> {
-    match config.backend.as_str() {
-        "s3" | "blobstore" => Ok(sg_objectstorage::StorageConfig {
-            backend: config.backend.clone(),
-            manage_bucket: config.manage_bucket,
-            bucket: config.bucket.clone(),
-            s3: sg_objectstorage::S3Config {
-                is_blobstore: false,
-                region: config.s3_region.clone(),
-                endpoint: config.s3_endpoint.clone(),
-                use_path_style: config.s3_use_path_style,
-                access_key_id: config.s3_access_key_id.clone(),
-                secret_access_key: config.s3_secret_access_key.clone(),
-                session_token: config.s3_session_token.clone(),
-            },
-        }
-        .normalize()),
-        "gcs" => Err("GCS upload storage is not implemented by the Rust worker".to_owned()),
-        other => Err(format!("unsupported upload backend {other:?}")),
-    }
+    sg_codeintel::lsifuploadstore::storage_config(config)
 }
 
 /// `initializeUploadStore`: `object.Storage.Init` (S3 only for now).
 pub async fn initialize_upload_store(
     config: &config::UploadStoreConfig,
 ) -> Result<sg_objectstorage::ObjectStore, String> {
-    let storage_config = upload_storage_config(config)?;
-    let store = sg_objectstorage::ObjectStore::new(storage_config)
-        .await
-        .map_err(|err| err.to_string())?;
-    store.init().await.map_err(|err| err.to_string())?;
-    Ok(store)
+    sg_codeintel::lsifuploadstore::initialize_store(config).await
 }
 
 /// `hostname.Get`: `HOSTNAME` when set, otherwise the kernel hostname

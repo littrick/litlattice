@@ -36,6 +36,7 @@ use crate::framework::BackgroundRoutine;
 use crate::registry;
 
 pub mod batches;
+pub mod codeintel_uploadstore_expirer;
 pub mod encryption;
 pub mod eventlogs;
 pub mod executors;
@@ -154,6 +155,9 @@ pub fn all_jobs() -> Vec<(&'static str, Arc<dyn Job>)> {
                 "executors-multiqueue-metrics-reporter" => Arc::new(
                     executors_multiqueue_metrics::ExecutorsMultiqueueMetricsReporter::new(),
                 ),
+                "codeintel-uploadstore-expirer" => {
+                    Arc::new(codeintel_uploadstore_expirer::UploadStoreExpirer::new())
+                }
                 "record-encrypter" => Arc::new(encryption::RecordEncrypterJob::new()),
                 "gitserver-metrics" => Arc::new(gitserver::GitserverMetrics),
                 "outbound-webhook-sender" => {

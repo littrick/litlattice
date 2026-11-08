@@ -10,26 +10,9 @@ use sg_core::{parse_go_duration, ConfigError, EnvReader};
 /// `cmd/precise-code-intel-worker/shared`: `const addr = ":3188"`.
 pub const DEFAULT_PORT: &str = "3188";
 
-/// `lsifuploadstore.Config`, kept flat so the S3 and GCS branches can be
-/// validated exactly like the baseline.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UploadStoreConfig {
-    pub backend: String,
-    pub manage_bucket: bool,
-    pub bucket: String,
-    pub ttl: Duration,
-
-    pub s3_region: String,
-    pub s3_endpoint: String,
-    pub s3_use_path_style: bool,
-    pub s3_access_key_id: String,
-    pub s3_secret_access_key: String,
-    pub s3_session_token: String,
-
-    pub gcs_project_id: String,
-    pub gcs_credentials_file: String,
-    pub gcs_credentials_file_contents: String,
-}
+/// `lsifuploadstore.Config` lives in `sg-codeintel` because the worker's
+/// `codeintel-uploadstore-expirer` job reads the same variables.
+pub use sg_codeintel::lsifuploadstore::Config as UploadStoreConfig;
 
 #[derive(Debug, Clone)]
 pub struct PreciseWorkerConfig {
@@ -123,135 +106,6 @@ impl PreciseWorkerConfig {
     }
 }
 
-impl UploadStoreConfig {
-    fn load(env: &mut EnvReader, errors: &mut Vec<String>) -> Self {
-        let backend = env
-            .get(
-                "PRECISE_CODE_INTEL_UPLOAD_BACKEND",
-                "blobstore",
-                "The target file service for code intelligence uploads. S3, GCS, and Blobstore are supported.",
-            )
-            .to_lowercase();
-        let manage_bucket = get_bool_go(
-            env,
-            "PRECISE_CODE_INTEL_UPLOAD_MANAGE_BUCKET",
-            "false",
-            "Whether or not the client should manage the target bucket configuration.",
-            errors,
-        );
-        let bucket = get_required(
-            env,
-            "PRECISE_CODE_INTEL_UPLOAD_BUCKET",
-            "lsif-uploads",
-            "The name of the bucket to store LSIF uploads in.",
-            errors,
-        );
-        let ttl = get_duration(
-            env,
-            "PRECISE_CODE_INTEL_UPLOAD_TTL",
-            "168h",
-            "The maximum age of an upload before deletion.",
-            errors,
-        );
-
-        if !matches!(backend.as_str(), "blobstore" | "s3" | "gcs") {
-            errors.push(format!(
-                "invalid backend {:?} for PRECISE_CODE_INTEL_UPLOAD_BACKEND: must be S3, GCS, or Blobstore",
-                backend
-            ));
-        }
-
-        let mut config = Self {
-            backend,
-            manage_bucket,
-            bucket,
-            ttl,
-            s3_region: String::new(),
-            s3_endpoint: String::new(),
-            s3_use_path_style: false,
-            s3_access_key_id: String::new(),
-            s3_secret_access_key: String::new(),
-            s3_session_token: String::new(),
-            gcs_project_id: String::new(),
-            gcs_credentials_file: String::new(),
-            gcs_credentials_file_contents: String::new(),
-        };
-
-        if matches!(config.backend.as_str(), "blobstore" | "s3") {
-            config.s3_region = get_required(
-                env,
-                "PRECISE_CODE_INTEL_UPLOAD_AWS_REGION",
-                "us-east-1",
-                "The target AWS region.",
-                errors,
-            );
-            config.s3_endpoint = get_required(
-                env,
-                "PRECISE_CODE_INTEL_UPLOAD_AWS_ENDPOINT",
-                &blobstore_default_endpoint(),
-                "The target AWS endpoint.",
-                errors,
-            );
-            config.s3_use_path_style = get_bool_go(
-                env,
-                "PRECISE_CODE_INTEL_UPLOAD_AWS_USE_PATH_STYLE",
-                "false",
-                "Whether to use path calling (vs subdomain calling).",
-                errors,
-            );
-            let ec2_role_credentials = get_bool_go(
-                env,
-                "PRECISE_CODE_INTEL_UPLOAD_AWS_USE_EC2_ROLE_CREDENTIALS",
-                "false",
-                "Whether to use the EC2 metadata API, or use the provided static credentials.",
-                errors,
-            );
-
-            if !ec2_role_credentials {
-                config.s3_access_key_id = get_required(
-                    env,
-                    "PRECISE_CODE_INTEL_UPLOAD_AWS_ACCESS_KEY_ID",
-                    "AKIAIOSFODNN7EXAMPLE",
-                    "An AWS access key associated with a user with access to S3.",
-                    errors,
-                );
-                config.s3_secret_access_key = get_required(
-                    env,
-                    "PRECISE_CODE_INTEL_UPLOAD_AWS_SECRET_ACCESS_KEY",
-                    "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
-                    "An AWS secret key associated with a user with access to S3.",
-                    errors,
-                );
-                config.s3_session_token = env.get(
-                    "PRECISE_CODE_INTEL_UPLOAD_AWS_SESSION_TOKEN",
-                    "",
-                    "An optional AWS session token associated with a user with access to S3.",
-                );
-            }
-        } else if config.backend == "gcs" {
-            config.gcs_project_id = get_required(
-                env,
-                "PRECISE_CODE_INTEL_UPLOAD_GCP_PROJECT_ID",
-                "",
-                "The project containing the GCS bucket.",
-                errors,
-            );
-            config.gcs_credentials_file = env.get(
-                "PRECISE_CODE_INTEL_UPLOAD_GOOGLE_APPLICATION_CREDENTIALS_FILE",
-                "",
-                "The path to a service account key file with access to GCS.",
-            );
-            config.gcs_credentials_file_contents = env.get(
-                "PRECISE_CODE_INTEL_UPLOAD_GOOGLE_APPLICATION_CREDENTIALS_FILE_CONTENT",
-                "",
-                "The contents of a service account key file with access to GCS.",
-            );
-        }
-
-        config
-    }
-}
-
 /// Format a [`ConfigError`] message like `lib/errors.Append` (cockroachdb's
 /// multierror `Format`): a single error prints bare, several print
 /// `N errors occurred:` followed by one tab-star bullet each.
@@ -269,38 +123,6 @@ fn combine_errors(worker_errors: &[String], store_errors: &[String]) -> Option<S
             Some(message)
         }
     }
-}
-
-/// `deploy.BlobstoreDefaultEndpoint`: the single-container deployment listens
-/// on loopback, everything else expects the `blobstore` host.
-fn blobstore_default_endpoint() -> String {
-    let deploy_type = std::env::var("DEPLOY_TYPE").unwrap_or_default();
-    let deploy_type = if deploy_type.is_empty() {
-        "kubernetes".to_owned()
-    } else {
-        deploy_type
-    };
-    if deploy_type == "docker-container" {
-        "http://127.0.0.1:9000".to_owned()
-    } else {
-        "http://blobstore:9000".to_owned()
-    }
-}
-
-/// `BaseConfig.Get`: an empty value is an error and does not fall back to the
-/// default.
-fn get_required(
-    env: &mut EnvReader,
-    name: &str,
-    default: &str,
-    description: &str,
-    errors: &mut Vec<String>,
-) -> String {
-    let raw = env.get(name, default, description);
-    if raw.is_empty() {
-        errors.push(format!("invalid value \"\" for {name}: no value supplied"));
-    }
-    raw
 }
 
 /// `BaseConfig.GetInt`.
@@ -338,35 +160,6 @@ fn get_duration(
             errors.push(format!("invalid duration {raw:?} for {name}: {message}"));
             Duration::ZERO
         }
-    }
-}
-
-/// `BaseConfig.GetBool` (`strconv.ParseBool`, unlike `env.GetBool`).
-fn get_bool_go(
-    env: &mut EnvReader,
-    name: &str,
-    default: &str,
-    description: &str,
-    errors: &mut Vec<String>,
-) -> bool {
-    let raw = env.get(name, default, description);
-    match parse_strconv_bool(&raw) {
-        Some(value) => value,
-        None => {
-            errors.push(format!(
-                "invalid bool {raw:?} for {name}: strconv.ParseBool: parsing {raw:?}: invalid syntax"
-            ));
-            false
-        }
-    }
-}
-
-/// `strconv.ParseBool` accepted spellings.
-fn parse_strconv_bool(value: &str) -> Option<bool> {
-    match value {
-        "1" | "t" | "T" | "TRUE" | "true" | "True" => Some(true),
-        "0" | "f" | "F" | "FALSE" | "false" | "False" => Some(false),
-        _ => None,
     }
 }
 

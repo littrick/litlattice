@@ -1,0 +1,12 @@
+[package]
+name = "sg-codeintel"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+sg-core = { path = "../../base/sg-core" }
+sg-objectstorage = { path = "../../data/sg-objectstorage" }
+tokio = { workspace = true }

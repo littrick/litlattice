@@ -16,16 +16,20 @@
 //!   `io.Pipe`; the retry-on-connection-reset logic is documented as a
 //!   difference, see `docs/modules/07_precise-code-intel-worker.md`).
 //! - [`ObjectStore::delete`] is `s3Store.Delete`.
+//! - [`ObjectStore::list_objects`] and [`ObjectStore::expire_objects`] are
+//!   `ListObjectsV2` pagination and `s3Store.ExpireObjects` (used by the
+//!   `codeintel-uploadstore-expirer` worker job).
 //!
-//! Only the operations the upload processor needs are implemented here; list,
-//! upload and compose land with the workers that use them.
+//! Only the operations the current workers need are implemented here.
 
 use std::fmt;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use aws_sdk_s3::config::{BehaviorVersion, Credentials, Region};
 use aws_sdk_s3::error::SdkError;
 use aws_sdk_s3::operation::create_bucket::CreateBucketError;
 use aws_sdk_s3::primitives::ByteStream;
+use aws_sdk_s3::types::{Delete, ObjectIdentifier};
 use aws_sdk_s3::Client;
 
 /// Re-exported so callers can build request bodies without depending on the
@@ -76,6 +80,10 @@ pub enum Error {
     UploadObject(String),
     /// `failed to delete object: ...`
     DeleteObject(String),
+    /// `failed to list objects: ...`
+    ListObjects(String),
+    /// `failed to delete objects: ...`
+    DeleteObjects(String),
 }
 
 impl fmt::Display for Error {
@@ -85,6 +93,8 @@ impl fmt::Display for Error {
             Self::GetObject(message) => write!(f, "failed to get object: {message}"),
             Self::UploadObject(message) => write!(f, "failed to upload object: {message}"),
             Self::DeleteObject(message) => write!(f, "failed to delete object: {message}"),
+            Self::ListObjects(message) => write!(f, "failed to list objects: {message}"),
+            Self::DeleteObjects(message) => write!(f, "failed to delete objects: {message}"),
         }
     }
 }
@@ -209,6 +219,133 @@ impl ObjectStore {
             .map_err(|err| Error::DeleteObject(err.to_string()))?;
         Ok(())
     }
+
+    /// `ListObjectsV2` pagination: every object whose key starts with `prefix`
+    /// with its `LastModified` as a Unix timestamp.
+    pub async fn list_objects(&self, prefix: &str) -> Result<Vec<ObjectInfo>, Error> {
+        let mut objects = Vec::new();
+        let mut token: Option<String> = None;
+        loop {
+            let mut request = self
+                .client
+                .list_objects_v2()
+                .bucket(&self.bucket)
+                .prefix(prefix);
+            if let Some(token) = token.as_deref() {
+                request = request.continuation_token(token);
+            }
+            let page = request
+                .send()
+                .await
+                .map_err(|err| Error::ListObjects(err.to_string()))?;
+            for object in page.contents() {
+                objects.push(ObjectInfo {
+                    key: object.key().unwrap_or_default().to_owned(),
+                    last_modified_secs: object.last_modified().map(|value| value.secs()),
+                });
+            }
+            match page.next_continuation_token() {
+                Some(next) if !next.is_empty() => token = Some(next.to_owned()),
+                _ => break,
+            }
+        }
+        Ok(objects)
+    }
+
+    /// `s3Store.ExpireObjects`: delete every object under `prefix` whose
+    /// `LastModified` is at least `max_age` old. Deletions are flushed in
+    /// batches of 1000 with `DeleteObjects`.
+    ///
+    /// Baseline error handling is preserved: a pagination error stops the scan
+    /// and a failed flush keeps its batch for the next flush, and both are
+    /// logged rather than returned (the routine retries on its next run).
+    pub async fn expire_objects(&self, prefix: &str, max_age: Duration) -> Result<(), Error> {
+        let now_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_secs() as i64)
+            .unwrap_or_default();
+        let max_age_secs = max_age.as_secs() as i64;
+        let mut to_delete: Vec<ObjectIdentifier> = Vec::new();
+        let mut token: Option<String> = None;
+
+        loop {
+            let mut request = self
+                .client
+                .list_objects_v2()
+                .bucket(&self.bucket)
+                .prefix(prefix);
+            if let Some(token) = token.as_deref() {
+                request = request.continuation_token(token);
+            }
+            let page = match request.send().await {
+                Ok(page) => page,
+                Err(err) => {
+                    tracing::error!(error = %err, bucket = %self.bucket, "Failed to paginate S3 bucket");
+                    break; // we'll try again later
+                }
+            };
+            for object in page.contents() {
+                let Some(last_modified) = object.last_modified() else {
+                    continue;
+                };
+                if now_secs - last_modified.secs() >= max_age_secs {
+                    if let Some(key) = object.key() {
+                        to_delete.push(
+                            ObjectIdentifier::builder()
+                                .key(key)
+                                .build()
+                                .expect("key is set"),
+                        );
+                        if to_delete.len() >= 1000 {
+                            self.flush_deletes(&mut to_delete).await;
+                        }
+                    }
+                }
+            }
+            match page.next_continuation_token() {
+                Some(next) if !next.is_empty() => token = Some(next.to_owned()),
+                _ => break,
+            }
+        }
+        if !to_delete.is_empty() {
+            self.flush_deletes(&mut to_delete).await;
+        }
+        Ok(())
+    }
+
+    /// The baseline's `flush` closure: on success the batch is cleared, on
+    /// failure it is kept for the next flush.
+    async fn flush_deletes(&self, to_delete: &mut Vec<ObjectIdentifier>) {
+        let mut builder = Delete::builder();
+        builder = builder.set_objects(Some(to_delete.clone()));
+        let delete = match builder.build() {
+            Ok(delete) => delete,
+            Err(err) => {
+                tracing::error!(error = %err, bucket = %self.bucket, "Failed to delete objects in S3 bucket");
+                return;
+            }
+        };
+        match self
+            .client
+            .delete_objects()
+            .bucket(&self.bucket)
+            .delete(delete)
+            .send()
+            .await
+        {
+            Ok(_) => to_delete.clear(),
+            Err(err) => {
+                tracing::error!(error = %err, bucket = %self.bucket, "Failed to delete objects in S3 bucket");
+            }
+        }
+    }
+}
+
+/// A `ListObjectsV2` entry: the key and its `LastModified` (Unix seconds).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectInfo {
+    pub key: String,
+    pub last_modified_secs: Option<i64>,
 }
 
 /// `errors.HasType[*s3types.BucketAlreadyExists] || HasType[OwnedByYou]`.

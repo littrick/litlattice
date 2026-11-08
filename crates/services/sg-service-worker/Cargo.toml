@@ -7,6 +7,7 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+sg-codeintel = { path = "../../domain/sg-codeintel" }
 sg-config = { path = "../../domain/sg-config" }
 sg-core = { path = "../../base/sg-core" }
 sg-db = { path = "../../data/sg-db" }
@@ -15,6 +16,7 @@ sg-extsvc = { path = "../../domain/sg-extsvc" }
 sg-http = { path = "../../net/sg-http" }
 sg-keyring = { path = "../../domain/sg-keyring" }
 sg-metrics = { path = "../../base/sg-metrics" }
+sg-objectstorage = { path = "../../data/sg-objectstorage" }
 sg-rcache = { path = "../../data/sg-rcache" }
 sg-redis = { path = "../../data/sg-redis" }
 async-trait = { workspace = true }

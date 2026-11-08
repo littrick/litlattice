@@ -3826,6 +3826,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "sg-codeintel"
+version = "0.1.0"
+dependencies = [
+ "sg-core",
+ "sg-objectstorage",
+ "tokio",
+]
+
+[[package]]
 name = "sg-config"
 version = "0.1.0"
 dependencies = [
@@ -3998,6 +4007,7 @@ dependencies = [
  "aws-runtime",
  "aws-sdk-s3",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -4094,6 +4104,7 @@ dependencies = [
  "http 1.5.0",
  "http-body-util",
  "hyper 1.12.0",
+ "sg-codeintel",
  "sg-config",
  "sg-core",
  "sg-db",
@@ -4226,6 +4237,7 @@ dependencies = [
  "hyper 1.12.0",
  "serde",
  "serde_json",
+ "sg-codeintel",
  "sg-config",
  "sg-core",
  "sg-db",
@@ -4234,6 +4246,7 @@ dependencies = [
  "sg-http",
  "sg-keyring",
  "sg-metrics",
+ "sg-objectstorage",
  "sg-rcache",
  "sg-redis",
  "sha2 0.10.9",
