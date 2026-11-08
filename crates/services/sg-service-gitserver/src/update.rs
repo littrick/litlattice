@@ -181,10 +181,16 @@ pub trait RemoteUrlSource: Send + Sync {
 /// The real [`UpdateBackend`]: clones and fetches repositories on disk the way
 /// `gitRepoSyncer`/`cloneRepo`/`doRepoUpdate` do.
 ///
-/// Still missing from the baseline path: the fast-forward/`RepoSyncState` DB
-/// update and command timeouts. The remote URL comes from
-/// [`RemoteUrlSource`] (the service uses [`crate::remoteurl::DbRemoteUrlSource`],
-/// which ports `cloneurl`), and parsing/redaction follow `vcs.ParseURL`.
+/// Still missing from the baseline path: the command timeouts (`git` may be
+/// slow, so the baseline allows 1m per command and 2h for long commands). The
+/// remote URL comes from [`RemoteUrlSource`] (the service uses
+/// [`crate::remoteurl::DbRemoteUrlSource`], which ports `cloneurl`), and
+/// parsing/redaction follow `vcs.ParseURL`.
+///
+/// Erratum: earlier revisions of this comment claimed a fast-forward /
+/// `RepoSyncState` update was part of the baseline path. There is no such
+/// logic in `cmd/gitserver`; the clone state is persisted by
+/// [`crate::fetchservice::FetchService`] and the janitor.
 pub struct LocalBackend {
     pub repos_dir: PathBuf,
     pub remote_urls: Arc<dyn RemoteUrlSource>,
@@ -192,6 +198,8 @@ pub struct LocalBackend {
     pub store: Option<Arc<GitserverReposStore>>,
     /// `s.hostname`, stored as `gitserver_repos.shard_id`.
     pub shard_id: String,
+    /// `executil.tlsExternal` settings for clone/fetch commands.
+    pub tls: crate::tlsexternal::TlsConfig,
 }
 
 impl LocalBackend {
@@ -327,7 +335,8 @@ impl UpdateBackend for LocalBackend {
         let result = match remote_url {
             Ok(remote) => {
                 let mut on_progress = progress_handler(&mut output, lock);
-                crate::vcssyncer::fetch_repo_with(&git_dir, &remote, &mut on_progress).await
+                crate::vcssyncer::fetch_repo_with(&git_dir, &remote, &self.tls, &mut on_progress)
+                    .await
             }
             // `syncer.Fetch`: `errors.Wrapf(err, "exit code: %d, failed to fetch from remote", exitCode)`.
             Err(err) => Err(GitError::Message(format!(
@@ -385,7 +394,8 @@ impl LocalBackend {
         let result = match remote_url {
             Ok(remote) => {
                 let mut on_progress = progress_handler(&mut output, lock);
-                crate::vcssyncer::clone_repo_with(&tmp_path, &remote, &mut on_progress).await
+                crate::vcssyncer::clone_repo_with(&tmp_path, &remote, &self.tls, &mut on_progress)
+                    .await
             }
             // `syncer.Clone`: `errors.Wrapf(err, "failed to fetch: exit status %d", exitCode)`.
             Err(err) => Err(GitError::Message(format!(
@@ -707,6 +717,7 @@ mod tests {
             )]))),
             store: None,
             shard_id: "test-shard".to_owned(),
+            tls: crate::tlsexternal::TlsConfig::default(),
         }
     }
 
@@ -804,6 +815,7 @@ mod tests {
             remote_urls: Arc::new(StaticUrls(HashMap::new())),
             store: None,
             shard_id: "test-shard".to_owned(),
+            tls: crate::tlsexternal::TlsConfig::default(),
         };
         let repo = "github.com/sourcegraphtest/alwayscloningtest";
         let locker = RepositoryLocker::new();
@@ -824,6 +836,7 @@ mod tests {
             remote_urls: Arc::new(StaticUrls(HashMap::new())),
             store: None,
             shard_id: "test-shard".to_owned(),
+            tls: crate::tlsexternal::TlsConfig::default(),
         };
         let locker = RepositoryLocker::new();
         let lock = locker.try_acquire("example.com/x", "test").expect("lock");

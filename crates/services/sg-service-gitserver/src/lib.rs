@@ -19,6 +19,7 @@ use sg_core::{ConfigError, EnvReader, Service, ServiceContext, ServiceError};
 use sg_proto::gitserver as gpb;
 
 pub mod addrs;
+pub mod cacert;
 pub mod cloneurl;
 pub mod config;
 pub mod debug;
@@ -44,6 +45,7 @@ pub mod repo;
 pub mod repositoryservice;
 pub mod search;
 pub mod statesyncer;
+pub mod tlsexternal;
 pub mod trace;
 pub mod update;
 pub mod vcssyncer;
@@ -191,6 +193,7 @@ impl Service for GitserverService {
             remote_urls,
             store: Some(Arc::clone(&store)),
             shard_id: config.external_address.clone(),
+            tls: tlsexternal::TlsConfig::from_site(&unified.site),
         });
         // `NewServer` builds the clone limiter from `conf.GitMaxConcurrentClones`
         // and `conf.Watch` updates it when the site config changes. The Rust
