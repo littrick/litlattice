@@ -52,6 +52,7 @@ pub mod executors_metrics;
 pub mod executors_multiqueue_metrics;
 pub mod gitserver;
 pub mod insights_data_retention;
+pub mod insights_query_runner;
 pub mod licensecheck;
 pub mod outbound_webhooks;
 pub mod permissions;
@@ -195,6 +196,9 @@ pub fn all_jobs() -> Vec<(&'static str, Arc<dyn Job>)> {
                 "gitserver-metrics" => Arc::new(gitserver::GitserverMetrics),
                 "insights-data-retention-job" => {
                     Arc::new(insights_data_retention::InsightsDataRetentionJob)
+                }
+                "insights-query-runner-job" => {
+                    Arc::new(insights_query_runner::InsightsQueryRunnerJob)
                 }
                 "license-check" => Arc::new(licensecheck::LicenseCheckJob),
                 "outbound-webhook-sender" => {

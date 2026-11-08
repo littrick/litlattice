@@ -354,6 +354,47 @@ impl SiteConfiguration {
             .unwrap_or(0)
     }
 
+    /// `conf.Get().InsightsQueryWorkerConcurrency`: the top-level
+    /// `insights.query.worker.concurrency` site configuration field (note the
+    /// dotted JSON key). `worker.NewWorker` treats `<= 0` as "unset" and falls
+    /// back to 5.
+    pub fn insights_query_worker_concurrency(&self) -> i64 {
+        self.raw
+            .get("insights.query.worker.concurrency")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(0)
+    }
+
+    /// `conf.Get().InsightsQueryWorkerRateLimit`: the top-level
+    /// `insights.query.worker.rateLimit` site configuration field. `None`
+    /// (unset/null) means the background limiter's default of 20 queries/s.
+    pub fn insights_query_worker_rate_limit(&self) -> Option<f64> {
+        self.raw
+            .get("insights.query.worker.rateLimit")
+            .and_then(serde_json::Value::as_f64)
+    }
+
+    /// `conf.Get().InsightsQueryWorkerRateLimitBurst`: the top-level
+    /// `insights.query.worker.rateLimitBurst` site configuration field.
+    /// `<= 0` means the background limiter's default burst of 20.
+    pub fn insights_query_worker_rate_limit_burst(&self) -> i64 {
+        self.raw
+            .get("insights.query.worker.rateLimitBurst")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(0)
+    }
+
+    /// `experimentalFeatures.subRepoPermissions.enabled`: the sub-repository
+    /// permissions opt-in that gates `authz.DefaultSubRepoPermsChecker`
+    /// (`subrepoperms.NewSubRepoPermsClient` watches this field).
+    pub fn sub_repo_permissions_enabled(&self) -> bool {
+        self.experimental_features()
+            .and_then(|features| features.get("subRepoPermissions"))
+            .and_then(|sub_repo| sub_repo.get("enabled"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+    }
+
     /// `conf.Get().LicenseKey`: the product license key from the site
     /// configuration. Empty when the instance runs without a license.
     pub fn license_key(&self) -> String {

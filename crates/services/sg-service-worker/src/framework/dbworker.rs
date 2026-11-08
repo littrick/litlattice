@@ -116,6 +116,14 @@ pub trait DbWorkerStore: Send + Sync + 'static {
 #[async_trait]
 pub trait DbWorkerHandler<S: DbWorkerStore>: Send + Sync + 'static {
     async fn handle(&self, ctx: CancellationToken, record: &S::Record) -> Result<(), String>;
+
+    /// `workerutil.NonRetryableError`: a failed record whose error implements
+    /// this is marked failed instead of errored (`mark_failed` rather than
+    /// `mark_errored`). The baseline's `insights.queryRunner` terminal
+    /// streaming error is the only ported user.
+    fn non_retryable(&self, _failure_message: &str) -> bool {
+        false
+    }
 }
 
 /// The store operation `dbworker.Resetter` drives.
@@ -320,7 +328,7 @@ impl<S: DbWorkerStore, H: DbWorkerHandler<S>> WorkerRoutine<S, H> {
 
                 if let Err(handle_err) = result {
                     tracing::error!(error = %handle_err, "Failed to finalize record");
-                    let marked = if token.is_cancelled() {
+                    let marked = if token.is_cancelled() || handler.non_retryable(&handle_err) {
                         store.mark_failed(&record, &handle_err).await
                     } else {
                         store.mark_errored(&record, &handle_err).await
