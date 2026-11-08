@@ -23,6 +23,7 @@ pub mod debug;
 mod details;
 pub mod diff;
 pub mod disk;
+pub mod fs;
 pub mod git;
 pub mod gitservice;
 pub mod grpc;

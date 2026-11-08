@@ -53,7 +53,7 @@ impl Grpc {
 }
 
 /// `isAlwaysCloningTest`: `NormalizeRepo(name).Equal("github.com/sourcegraphtest/alwayscloningtest")`.
-fn is_always_cloning_test(name: &str) -> bool {
+pub(crate) fn is_always_cloning_test(name: &str) -> bool {
     normalize_repo(name).eq_ignore_ascii_case("github.com/sourcegraphtest/alwayscloningtest")
 }
 

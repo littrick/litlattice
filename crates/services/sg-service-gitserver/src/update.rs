@@ -9,6 +9,7 @@
 //! goroutine), release the lock, and record the last error.
 
 use std::fmt;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -164,6 +165,127 @@ impl UpdateServer {
                 })?;
         }
         Ok(())
+    }
+}
+
+/// Where a repository's remote URL comes from. In the baseline this is the
+/// external-service/site-config lookup (`getVCSSyncer`); the Rust site-config
+/// client is not ported yet, so callers provide it explicitly.
+#[async_trait]
+pub trait RemoteUrlSource: Send + Sync {
+    async fn remote_url(&self, repo: &str) -> Result<String, GitError>;
+}
+
+/// The real [`UpdateBackend`]: clones and fetches repositories on disk the way
+/// `gitRepoSyncer`/`cloneRepo`/`doRepoUpdate` do.
+///
+/// Still missing from the baseline path: `gitserver_repos` clone status and
+/// last-output writes, the fast-forward/`RepoSyncState` DB update, and the
+/// progress stream (the syncer writes progress into a buffer that is dropped).
+pub struct LocalBackend {
+    pub repos_dir: PathBuf,
+    pub remote_urls: Arc<dyn RemoteUrlSource>,
+}
+
+impl LocalBackend {
+    fn git_dir(&self, repo: &str) -> Result<PathBuf, GitError> {
+        crate::repo::repo_dir(&self.repos_dir, repo).ok_or_else(|| {
+            GitError::Message(format!("repository name {:?} escapes the repos dir", repo))
+        })
+    }
+
+    async fn remote_url(&self, repo: &str) -> Result<String, GitError> {
+        self.remote_urls.remote_url(repo).await.map_err(|err| {
+            GitError::Message(format!(
+                "failed to get remote URL source for {:?}: {}",
+                repo,
+                err.message()
+            ))
+        })
+    }
+}
+
+fn io_error(context: &str, err: std::io::Error) -> GitError {
+    GitError::Message(format!("{context}: {err}"))
+}
+
+#[async_trait]
+impl UpdateBackend for LocalBackend {
+    async fn repo_cloned(&self, repo: &str) -> Result<bool, GitError> {
+        crate::fs::repo_cloned(&self.repos_dir, repo).map_err(|err| io_error("repo cloned", err))
+    }
+
+    async fn clone(
+        &self,
+        repo: &str,
+        _lock: &RepositoryLock,
+        _cancelled: &CancellationToken,
+    ) -> Result<(), GitError> {
+        // `cloneRepo` returns success without touching the disk for the
+        // always-cloning test repository.
+        if crate::grpc::is_always_cloning_test(repo) {
+            return Ok(());
+        }
+
+        let dst = self.git_dir(repo)?;
+        if std::fs::metadata(&dst).is_ok() {
+            // Baseline `&os.PathError{Op: "cloneRepo", Path, Err: os.ErrExist}`.
+            return Err(GitError::Message(format!(
+                "cloneRepo {}: file exists",
+                dst.display()
+            )));
+        }
+
+        let remote_url = self.remote_url(repo).await?;
+        let tmp_dir = crate::fs::temp_dir(&self.repos_dir, "clone-")
+            .map_err(|err| io_error("clone failed to create tmp dir", err))?;
+        let _cleanup = crate::fs::TempDirCleanup(tmp_dir.clone());
+        let tmp_path = crate::vcssyncer::clone_tmp_path(&tmp_dir);
+
+        let mut progress = Vec::new();
+        crate::vcssyncer::clone_repo(&tmp_path, &remote_url, &mut progress).await?;
+
+        crate::postfetch::post_fetch_actions(&tmp_path, repo).await?;
+
+        let parent = dst.parent().unwrap_or_else(|| Path::new("."));
+        std::fs::create_dir_all(parent)
+            .map_err(|err| io_error("failed to create repository directory", err))?;
+        crate::postfetch::rename_and_sync(&tmp_path, &dst)
+            .map_err(|err| io_error("failed to rename cloned repository", err))?;
+        Ok(())
+    }
+
+    async fn fetch(
+        &self,
+        repo: &str,
+        _lock: &RepositoryLock,
+        _cancelled: &CancellationToken,
+    ) -> Result<(), GitError> {
+        let git_dir = self.git_dir(repo)?;
+        let remote_url = self.remote_url(repo).await?;
+
+        let outcome = crate::vcssyncer::fetch_remote(&git_dir, &remote_url).await?;
+        if outcome.exit_status != 0 {
+            return Err(GitError::Message(format!(
+                "failed to fetch repo {:?} with output {:?}",
+                repo,
+                String::from_utf8_lossy(&outcome.output)
+            )));
+        }
+
+        crate::vcssyncer::set_head(&git_dir, &remote_url).await?;
+        crate::postfetch::post_fetch_actions(&git_dir, repo).await?;
+        Ok(())
+    }
+
+    async fn set_last_error(&self, repo: &str, error: &str) {
+        // `SetLastError` needs `gitserver_repos`; until then the update log is
+        // the only place the error is visible, matching the baseline's log line.
+        if error.is_empty() {
+            tracing::debug!(repo, "repo update succeeded");
+        } else {
+            tracing::warn!(repo, error, "repo update failed");
+        }
     }
 }
 
@@ -359,5 +481,211 @@ mod tests {
         );
         assert_eq!(server.locker.status("github.com/owner/repo"), None);
         assert!(fake.calls().is_empty());
+    }
+
+    // --- LocalBackend: the on-disk implementation -------------------------
+
+    use std::collections::HashMap;
+
+    struct StaticUrls(HashMap<String, String>);
+
+    #[async_trait]
+    impl RemoteUrlSource for StaticUrls {
+        async fn remote_url(&self, repo: &str) -> Result<String, GitError> {
+            self.0
+                .get(repo)
+                .cloned()
+                .ok_or_else(|| GitError::Message(format!("no remote URL for {repo}")))
+        }
+    }
+
+    fn git(dir: &Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .status()
+            .expect("run git");
+        assert!(status.success(), "git {args:?} failed");
+    }
+
+    fn git_output(dir: &Path, args: &[&str]) -> String {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .expect("run git");
+        assert!(output.status.success(), "git {args:?} failed");
+        String::from_utf8(output.stdout)
+            .expect("utf8")
+            .trim()
+            .to_owned()
+    }
+
+    /// A bare origin with one commit on `trunk`, plus the work tree used to
+    /// push further commits.
+    fn source_repo(root: &Path) -> (PathBuf, PathBuf) {
+        let origin = root.join("origin.git");
+        std::fs::create_dir_all(&origin).expect("mkdir");
+        git(&origin, &["init", "--bare", "-q", "--initial-branch=trunk"]);
+
+        let work = root.join("work");
+        git(
+            root,
+            &[
+                "init",
+                "-q",
+                "--initial-branch=trunk",
+                work.to_str().unwrap(),
+            ],
+        );
+        std::fs::write(work.join("a.txt"), b"hello\n").expect("write");
+        git(&work, &["add", "a.txt"]);
+        git(
+            &work,
+            &[
+                "-c",
+                "user.name=test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "-q",
+                "-m",
+                "first",
+            ],
+        );
+        git(
+            &work,
+            &[
+                "push",
+                "-q",
+                origin.to_str().unwrap(),
+                "HEAD:refs/heads/trunk",
+            ],
+        );
+        (origin, work)
+    }
+
+    fn local_backend(repos_dir: &Path, repo: &str, origin: &Path) -> LocalBackend {
+        LocalBackend {
+            repos_dir: repos_dir.to_path_buf(),
+            remote_urls: Arc::new(StaticUrls(HashMap::from([(
+                repo.to_owned(),
+                origin.to_str().expect("utf8").to_owned(),
+            )]))),
+        }
+    }
+
+    #[tokio::test]
+    async fn local_backend_clones_and_fetches_from_a_remote() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (origin, work) = source_repo(tmp.path());
+        let repos_dir = tmp.path().join("repos");
+        std::fs::create_dir_all(&repos_dir).expect("mkdir");
+        let repo = "example.com/owner/repo";
+        let backend = local_backend(&repos_dir, repo, &origin);
+        let locker = RepositoryLocker::new();
+        let lock = locker.try_acquire(repo, "test").expect("lock");
+        let token = CancellationToken::new();
+
+        assert!(!backend.repo_cloned(repo).await.expect("repo cloned"));
+
+        backend.clone(repo, &lock, &token).await.expect("clone");
+        assert!(backend.repo_cloned(repo).await.expect("repo cloned"));
+
+        let git_dir = crate::repo::repo_dir(&repos_dir, repo).expect("git dir");
+        assert_eq!(
+            git_output(&git_dir, &["symbolic-ref", "HEAD"]),
+            "refs/heads/trunk"
+        );
+        // Post-fetch bookkeeping ran: ref hash stamp, managed attributes,
+        // repository type, and no leftover staging directory.
+        assert!(git_dir.join("sg_refhash_v2").exists());
+        assert!(git_dir.join("info").join("attributes").exists());
+        assert_eq!(git_output(&git_dir, &["config", "sourcegraph.type"]), "git");
+        let staging = std::fs::read_dir(repos_dir.join(".tmp")).expect("read .tmp");
+        assert_eq!(staging.count(), 0, "staging directory left behind");
+
+        // A second clone must not clobber the existing repository.
+        let err = backend
+            .clone(repo, &lock, &token)
+            .await
+            .expect_err("already cloned");
+        let message = err.message();
+        assert!(
+            message.contains("file exists"),
+            "unexpected error: {message}"
+        );
+
+        // Fetch picks up a new commit from the remote.
+        std::fs::write(work.join("b.txt"), b"world\n").expect("write");
+        git(&work, &["add", "b.txt"]);
+        git(
+            &work,
+            &[
+                "-c",
+                "user.name=test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "-q",
+                "-m",
+                "second",
+            ],
+        );
+        git(
+            &work,
+            &[
+                "push",
+                "-q",
+                origin.to_str().unwrap(),
+                "HEAD:refs/heads/trunk",
+            ],
+        );
+
+        backend.fetch(repo, &lock, &token).await.expect("fetch");
+        assert_eq!(
+            git_output(&git_dir, &["rev-parse", "refs/heads/trunk"]),
+            git_output(&origin, &["rev-parse", "refs/heads/trunk"])
+        );
+    }
+
+    #[tokio::test]
+    async fn local_backend_skips_the_always_cloning_repo() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repos_dir = tmp.path().join("repos");
+        std::fs::create_dir_all(&repos_dir).expect("mkdir");
+        // No remote URL is registered: the special case must not look it up.
+        let backend = LocalBackend {
+            repos_dir: repos_dir.clone(),
+            remote_urls: Arc::new(StaticUrls(HashMap::new())),
+        };
+        let repo = "github.com/sourcegraphtest/alwayscloningtest";
+        let locker = RepositoryLocker::new();
+        let lock = locker.try_acquire(repo, "test").expect("lock");
+        let token = CancellationToken::new();
+
+        backend.clone(repo, &lock, &token).await.expect("noop");
+        assert!(!backend.repo_cloned(repo).await.expect("repo cloned"));
+    }
+
+    #[tokio::test]
+    async fn local_backend_reports_an_unknown_remote() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repos_dir = tmp.path().join("repos");
+        std::fs::create_dir_all(&repos_dir).expect("mkdir");
+        let backend = LocalBackend {
+            repos_dir,
+            remote_urls: Arc::new(StaticUrls(HashMap::new())),
+        };
+        let locker = RepositoryLocker::new();
+        let lock = locker.try_acquire("example.com/x", "test").expect("lock");
+        let err = backend
+            .clone("example.com/x", &lock, &CancellationToken::new())
+            .await
+            .expect_err("unknown remote");
+        assert_eq!(
+            err.message(),
+            "failed to get remote URL source for \"example.com/x\": no remote URL for example.com/x"
+        );
     }
 }

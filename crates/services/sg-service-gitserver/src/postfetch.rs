@@ -49,7 +49,7 @@ pub fn update_file_if_different(path: &Path, content: &[u8]) -> std::io::Result<
 
 /// Port of `fileutil.RenameAndSync` (posix): rename, then fsync the new
 /// parent directory so the rename survives a crash.
-fn rename_and_sync(old_path: &Path, new_path: &Path) -> std::io::Result<()> {
+pub(crate) fn rename_and_sync(old_path: &Path, new_path: &Path) -> std::io::Result<()> {
     std::fs::rename(old_path, new_path).map_err(|err| {
         std::io::Error::new(
             err.kind(),
@@ -118,6 +118,169 @@ pub async fn set_last_changed(git_dir: &Path, backend: &GitRepo) -> Result<(), G
     }
 
     Ok(())
+}
+
+/// Which side owns `git gc --auto` (baseline `gitGCMode`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GcMode {
+    /// Neither janitor nor `sg maintenance`: leave git's configuration alone.
+    GitAutoGc,
+    /// Git gc runs from the janitor; `gc.auto` must be unset so a fetch does
+    /// not trigger a concurrent gc.
+    JanitorAutoGc,
+    /// `sg maintenance` owns repacking; keep `git gc --auto` disabled.
+    Maintenance,
+}
+
+/// `SRC_ENABLE_GC_AUTO` / `SRC_ENABLE_SG_MAINTENANCE`, with the baseline's
+/// `strconv.ParseBool` semantics (unparseable values are false).
+pub fn gc_mode() -> GcMode {
+    fn parse(value: Option<String>, default: &str) -> bool {
+        let raw = value.unwrap_or_else(|| default.to_owned());
+        matches!(raw.to_ascii_lowercase().as_str(), "1" | "t" | "true")
+    }
+
+    let enable_gc_auto = parse(std::env::var("SRC_ENABLE_GC_AUTO").ok(), "true");
+    let enable_sg_maintenance = parse(std::env::var("SRC_ENABLE_SG_MAINTENANCE").ok(), "false");
+    if enable_gc_auto && !enable_sg_maintenance {
+        GcMode::JanitorAutoGc
+    } else if enable_sg_maintenance && !enable_gc_auto {
+        GcMode::Maintenance
+    } else {
+        GcMode::GitAutoGc
+    }
+}
+
+/// `gitSetAutoGC`: unset `gc.auto` when the janitor manages gc, disable it
+/// when `sg maintenance` does, and leave it alone otherwise.
+async fn set_auto_gc(backend: &GitRepo) -> Result<(), GitError> {
+    match gc_mode() {
+        GcMode::GitAutoGc | GcMode::JanitorAutoGc => backend.config_unset("gc.auto").await,
+        GcMode::Maintenance => backend.config_set("gc.auto", "0").await,
+    }
+}
+
+/// Port of `SetGitAttributes`: write `info/attributes` so `git archive` keeps
+/// every file (`.gitattributes` `export-ignore` otherwise drops files).
+pub fn set_git_attributes(git_dir: &Path) -> std::io::Result<()> {
+    let info_dir = git_dir.join("info");
+    match std::fs::create_dir(&info_dir) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(err) => {
+            return Err(std::io::Error::new(
+                err.kind(),
+                format!("failed to set git attributes: {err}"),
+            ))
+        }
+    }
+
+    update_file_if_different(
+        &info_dir.join("attributes"),
+        b"# Managed by Sourcegraph gitserver.\n\n# We want every file to be present in git archive.\n* -export-ignore\n",
+    )
+    .map(|_| ())
+    .map_err(|err| {
+        std::io::Error::new(
+            err.kind(),
+            format!("failed to set git attributes: {err}"),
+        )
+    })
+}
+
+/// The refs `RemoveBadRefs` deletes: every case variant of `HEAD`.
+fn bad_refs() -> Vec<String> {
+    (0u8..(1 << 4))
+        .map(|bits| {
+            let mut name: Vec<u8> = b"HEAD".to_vec();
+            for (index, byte) in name.iter_mut().enumerate() {
+                if bits & (1 << index) != 0 {
+                    *byte = byte.to_ascii_lowercase();
+                }
+            }
+            String::from_utf8(name).expect("ascii")
+        })
+        .collect()
+}
+
+/// Port of `RemoveBadRefs`: delete branches/tags named like `HEAD` so git
+/// stops warning about ambiguous refnames. Exit code 1 ("none of them exist")
+/// is the expected case and not an error.
+pub async fn remove_bad_refs(git_dir: &Path) -> Result<(), GitError> {
+    let refs = bad_refs();
+    let mut errors: Vec<String> = Vec::new();
+    // `branch -D` force-deletes; `tag` only has the lowercase `-d`.
+    for (subcommand, flag) in [("branch", "-D"), ("tag", "-d")] {
+        let mut args = vec![subcommand, flag];
+        args.extend(refs.iter().map(String::as_str));
+        let output = tokio::process::Command::new("git")
+            .args(&args)
+            .current_dir(git_dir)
+            .env("GIT_DIR", git_dir)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .await
+            .map_err(|err| GitError::Message(format!("failed to run git: {err}")))?;
+        // `dir.Set` inherits the parent environment, so no `env_clear` here.
+        match output.status.code() {
+            Some(1) | Some(0) => {}
+            _ => errors.push(
+                String::from_utf8_lossy(&output.stderr)
+                    .trim_end()
+                    .to_owned(),
+            ),
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(GitError::Message(errors.join("\n")))
+    }
+}
+
+/// Port of `postRepoFetchActions`: run after a clone or fetch, accumulating as
+/// many successful steps as possible. `SetRepoSize` is skipped until the
+/// `gitserver_repos` backend exists.
+pub async fn post_fetch_actions(git_dir: &Path, repo: &str) -> Result<(), GitError> {
+    let mut errors: Vec<String> = Vec::new();
+
+    if let Err(err) = remove_bad_refs(git_dir).await {
+        errors.push(format!(
+            "failed to remove bad refs for repo {:?}: {}",
+            repo,
+            err.message()
+        ));
+    }
+
+    let backend = GitRepo::new(git_dir);
+    if let Err(err) = backend.config_set("sourcegraph.type", "git").await {
+        errors.push(format!(
+            "failed to set repository type for repo {:?}: {}",
+            repo,
+            err.message()
+        ));
+    }
+
+    if let Err(err) = set_git_attributes(git_dir) {
+        errors.push(format!("setting git attributes: {err}"));
+    }
+
+    if let Err(err) = set_auto_gc(&backend).await {
+        errors.push(format!("setting git gc mode: {}", err.message()));
+    }
+
+    if let Err(err) = set_last_changed(git_dir, &backend).await {
+        errors.push(format!(
+            "failed to update last changed time: {}",
+            err.message()
+        ));
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(GitError::Message(errors.join("\n")))
+    }
 }
 
 #[cfg(test)]
