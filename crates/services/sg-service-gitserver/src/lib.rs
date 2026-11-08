@@ -30,6 +30,7 @@ pub mod metrics;
 mod mux;
 pub mod repo;
 pub mod search;
+pub mod trace;
 
 use config::GitserverConfig;
 use gitservice::GitService;
@@ -139,7 +140,14 @@ impl Service for GitserverService {
         };
         let http: sg_http::HttpHandler = Arc::new(move |req: Request<Incoming>| {
             let service = git_service.clone();
-            Box::pin(async move { http_response(service, req).await })
+            Box::pin(async move {
+                // `instrumentation.HTTPMiddleware` + `trace.HTTPMiddleware`:
+                // every plain-HTTP response carries the request's trace IDs.
+                let trace = trace::TraceIds::from_headers(req.headers());
+                let mut response = http_response(service, req).await;
+                trace.apply(response.headers_mut());
+                response
+            })
         });
 
         tracing::info!(

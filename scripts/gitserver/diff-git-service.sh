@@ -198,6 +198,77 @@ else
     fail "HEAD /git redirect: status Go=$(cat "$WORK/go.status") Rust=$(cat "$WORK/rust.status") headers Go=$(tr '\n' ';' <"$WORK/go.headers") Rust=$(tr '\n' ';' <"$WORK/rust.headers")"
 fi
 
+# X-Trace headers (instrumentation.HTTPMiddleware + trace.HTTPMiddleware).
+# Values are random per request, so compare formats, the empty X-Trace-URL,
+# and the W3C traceparent continuation.
+header_value() {
+    awk -v key="$1" '{
+        line = $0
+        sub(/\r$/, "", line)
+        pos = index(line, ":")
+        if (pos == 0) next
+        name = substr(line, 1, pos - 1)
+        value = substr(line, pos + 1)
+        gsub(/^[ \t]+/, "", value)
+        gsub(/[ \t]+$/, "", value)
+        if (tolower(name) == tolower(key)) { print value; exit }
+    }' "$2"
+}
+
+trace_head() { # out, curl args..., url
+    local out=$1
+    shift
+    curl -s -D "$out" -o /dev/null "$@"
+}
+
+for pair in "go:$GO" "rust:$RUST"; do
+    name=${pair%%:*}
+    base=${pair#*:}
+    trace_head "$WORK/$name.trace" "$base/ping"
+    trace=$(header_value "X-Trace" "$WORK/$name.trace")
+    span=$(header_value "X-Trace-Span" "$WORK/$name.trace")
+    url=$(header_value "X-Trace-Url" "$WORK/$name.trace")
+    if [[ "$trace" =~ ^[0-9a-f]{32}$ ]] && [ "$trace" != "00000000000000000000000000000000" ] \
+        && [[ "$span" =~ ^[0-9a-f]{16}$ ]] && [ "$url" = "" ]; then
+        pass "$name X-Trace headers (32/16 hex, empty URL)"
+    else
+        fail "$name X-Trace headers: trace='$trace' span='$span' url='$url'"
+    fi
+done
+
+parent=11111111111111111111111111111111
+for pair in "go:$GO" "rust:$RUST"; do
+    name=${pair%%:*}
+    base=${pair#*:}
+    trace_head "$WORK/$name.parent" -H "traceparent: 00-$parent-2222222222222222-01" "$base/ping"
+    trace=$(header_value "X-Trace" "$WORK/$name.parent")
+    if [ "$trace" = "$parent" ]; then
+        pass "$name continues a valid traceparent"
+    else
+        fail "$name traceparent: got '$trace', want '$parent'"
+    fi
+    trace_head "$WORK/$name.invalid" -H "traceparent: 00-00000000000000000000000000000000-2222222222222222-01" "$base/ping"
+    trace=$(header_value "X-Trace" "$WORK/$name.invalid")
+    if [[ "$trace" =~ ^[0-9a-f]{32}$ ]] && [ "$trace" != "00000000000000000000000000000000" ]; then
+        pass "$name ignores an invalid traceparent"
+    else
+        fail "$name invalid traceparent: got '$trace'"
+    fi
+done
+
+# Redirects run through the same middleware chain.
+for pair in "go:$GO" "rust:$RUST"; do
+    name=${pair%%:*}
+    base=${pair#*:}
+    trace_head "$WORK/$name.redirect" "$base/git"
+    trace=$(header_value "X-Trace" "$WORK/$name.redirect")
+    if [[ "$trace" =~ ^[0-9a-f]{32}$ ]]; then
+        pass "$name redirect carries X-Trace"
+    else
+        fail "$name redirect X-Trace: got '$trace'"
+    fi
+done
+
 if [ "$failures" -ne 0 ]; then
     printf 'diff-git-service: %d failure(s)\n' "$failures" >&2
     exit 1
