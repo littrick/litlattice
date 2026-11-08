@@ -35,6 +35,8 @@ use crate::config::WorkerConfigs;
 use crate::framework::periodic::PeriodicRoutine;
 use crate::registry;
 
+pub mod eventlogs;
+pub mod repostatistics;
 pub mod webhooks;
 
 /// `env.Config`: a configuration struct owned by a job.
@@ -109,6 +111,9 @@ pub fn all_jobs() -> Vec<(&'static str, Arc<dyn Job>)> {
         .iter()
         .map(|&name| {
             let job: Arc<dyn Job> = match name {
+                "event-logs-janitor" => Arc::new(eventlogs::EventLogsJanitor),
+                "repo-statistics-compactor" => Arc::new(repostatistics::RepoStatisticsCompactor),
+                "repo-statistics-resetter" => Arc::new(repostatistics::RepoStatisticsResetter),
                 "webhook-log-janitor" => Arc::new(webhooks::WebhookLogJanitor),
                 _ => Arc::new(UnportedJob { name }),
             };

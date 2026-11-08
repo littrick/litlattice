@@ -173,6 +173,10 @@ impl PeriodicRoutine {
         (self.get_interval)()
     }
 
+    pub fn initial_delay(&self) -> Duration {
+        self.initial_delay
+    }
+
     pub fn concurrency(&self) -> usize {
         (self.get_concurrency)()
     }
