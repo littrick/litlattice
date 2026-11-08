@@ -1,0 +1,18 @@
+[package]
+name = "sg-scip"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+# The generated `scip.rs` carries the upstream proto comments verbatim; their
+# code samples are not Rust and must not be compiled as doctests.
+doctest = false
+
+[dependencies]
+prost = { workspace = true }
+
+[build-dependencies]
+prost-build = { workspace = true }

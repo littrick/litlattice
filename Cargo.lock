@@ -3952,6 +3952,14 @@ name = "sg-redis"
 version = "0.1.0"
 
 [[package]]
+name = "sg-scip"
+version = "0.1.0"
+dependencies = [
+ "prost 0.13.5",
+ "prost-build",
+]
+
+[[package]]
 name = "sg-search-query"
 version = "0.1.0"
 
@@ -4016,6 +4024,8 @@ dependencies = [
  "sg-http",
  "sg-keyring",
  "sg-objectstorage",
+ "sg-scip",
+ "sha2 0.10.9",
  "sqlx",
  "tempfile",
  "time",

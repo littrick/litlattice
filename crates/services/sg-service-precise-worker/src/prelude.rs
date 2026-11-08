@@ -24,10 +24,11 @@
 
 use std::fmt;
 use std::io::{BufReader, Cursor, Read};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
 
-use flate2::bufread::GzDecoder;
+use flate2::read::GzDecoder;
 use sqlx::PgPool;
 use time::format_description::well_known::Rfc3339;
 use time::{Duration, OffsetDateTime};
@@ -180,11 +181,10 @@ pub async fn handle_raw_upload_prelude(
     // 3. `defaultBranchContains`.
     let is_default_branch = default_branch_contains(deps, &repo_name, &upload.commit).await?;
 
-    // 4. `withUploadData` (read + gzip header validation).
-    let (gzip_error, used_temp_file) = read_upload_data(deps, upload).await?;
-    if let Some(err) = gzip_error {
-        return Err(err);
-    }
+    // 4. `withUploadData` (read + gzip header validation). The payload is
+    // returned for the SCIP stage; this slice drops it after validation.
+    let data = read_upload_data(deps, upload).await?;
+    let used_temp_file = data.used_temp_file;
 
     // 5. Content-type validation (inside the baseline's callback).
     if upload.content_type == LSIF_CONTENT_TYPE {
@@ -275,19 +275,103 @@ async fn default_branch_contains(
     Ok(refs.iter().any(|git_ref| git_ref.name == default_branch))
 }
 
-/// The reader chosen by `withUploadData` for the payload.
-enum GzipSource {
-    Memory(Cursor<Vec<u8>>),
-    File(std::fs::File, String),
+/// The raw upload payload, kept so the SCIP stage can decompress it in
+/// multiple passes.
+///
+/// This replaces the baseline's `gzipReadSeeker` + `seekToStart`: instead of
+/// seeking one gzip decoder to zero, every pass calls [`UploadData::open`] for
+/// a fresh decoder over the same bytes. Small uploads stay in memory; when the
+/// uncompressed size is (or may be) larger than
+/// [`UNCOMPRESSED_SIZE_LIMIT_BYTES`] they are spooled to a temporary file.
+pub struct UploadData {
+    source: UploadDataSource,
+    /// Whether the temporary-file branch was taken (`shouldWriteToDisk`).
+    pub used_temp_file: bool,
+    /// `upload-<id>.lsif.gz`: the object-store key, used by delete-on-success.
+    pub filename: String,
 }
 
-/// Mirrors `withUploadData`'s read + size-decision logic and returns the gzip
-/// header validation error (if any) plus whether the temporary-file branch was
-/// taken. The payload itself is dropped: this slice only validates it.
-async fn read_upload_data(
-    deps: &PreludeDeps,
-    upload: &Upload,
-) -> Result<(Option<PreludeError>, bool), PreludeError> {
+enum UploadDataSource {
+    Memory(Arc<Vec<u8>>),
+    /// Kept alive for as long as the data is needed; `reopen` gives each pass
+    /// an independent handle positioned at zero.
+    Temp(tempfile::NamedTempFile),
+}
+
+/// A re-openable gzip payload: the Rust equivalent of the baseline's
+/// `gzipReadSeeker` whose `seekToStart` re-creates the gzip reader over the
+/// same bytes.
+pub trait GzipSource {
+    fn open_gzip(&self) -> std::io::Result<GzReader>;
+}
+
+impl UploadData {
+    /// An in-memory payload, for callers (and tests) that already hold the
+    /// gzip bytes.
+    pub fn from_bytes(data: Vec<u8>) -> Self {
+        Self {
+            source: UploadDataSource::Memory(Arc::new(data)),
+            used_temp_file: false,
+            filename: String::new(),
+        }
+    }
+
+    /// `newGzipReadSeeker`: a gzip decoder positioned at the start of the
+    /// upload. flate2 parses the gzip header lazily on the first read.
+    pub fn open(&self) -> std::io::Result<GzReader> {
+        let inner: Box<dyn Read> = match &self.source {
+            UploadDataSource::Memory(data) => Box::new(SharedCursor {
+                data: Arc::clone(data),
+                position: 0,
+            }),
+            UploadDataSource::Temp(file) => Box::new(BufReader::new(file.reopen()?)),
+        };
+        Ok(GzDecoder::new(inner))
+    }
+
+    /// The temporary file path, when the payload was spooled to disk. Used for
+    /// the baseline's `failed to decompress file %q` error message.
+    pub fn temp_path(&self) -> Option<PathBuf> {
+        match &self.source {
+            UploadDataSource::Temp(file) => Some(file.path().to_path_buf()),
+            UploadDataSource::Memory(_) => None,
+        }
+    }
+}
+
+impl GzipSource for UploadData {
+    fn open_gzip(&self) -> std::io::Result<GzReader> {
+        self.open()
+    }
+}
+
+/// The decoder type returned by [`UploadData::open`].
+pub type GzReader = GzDecoder<Box<dyn Read>>;
+
+/// A `Read` over a shared in-memory buffer with its own position, so each
+/// gzip pass gets an independent cursor without copying the payload.
+struct SharedCursor {
+    data: Arc<Vec<u8>>,
+    position: usize,
+}
+
+impl Read for SharedCursor {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.position >= self.data.len() {
+            return Ok(0);
+        }
+        let remaining = &self.data[self.position..];
+        let count = remaining.len().min(buf.len());
+        buf[..count].copy_from_slice(&remaining[..count]);
+        self.position += count;
+        Ok(count)
+    }
+}
+
+/// `withUploadData`'s read + size-decision logic, including gzip header
+/// validation (`newGzipReadSeeker`), but without the callback: the payload is
+/// returned so the SCIP stage can read it again.
+async fn read_upload_data(deps: &PreludeDeps, upload: &Upload) -> Result<UploadData, PreludeError> {
     let filename = format!("upload-{}.lsif.gz", upload.id);
     let body = deps
         .upload_store
@@ -352,24 +436,35 @@ async fn read_upload_data(
                 PreludeError::TempFile(format!("failed to copy buffer to temporary file: {err}"))
             })?;
         }
-        // Reopen to read from the start (the baseline seeks to 0).
-        let reopened = std::fs::File::open(named.path())
-            .map_err(|err| PreludeError::TempFile(format!("failed to seek to start: {err}")))?;
-        GzipSource::File(reopened, named.path().display().to_string())
+        // The handle written above starts at EOF; `UploadData::open` reopens
+        // the file, which positions the reader at zero (the baseline's
+        // `Seek(0, io.SeekStart)`).
+        UploadDataSource::Temp(named)
     } else {
-        GzipSource::Memory(Cursor::new(buffer.unwrap_or_default()))
+        UploadDataSource::Memory(Arc::new(buffer.unwrap_or_default()))
+    };
+
+    let data = UploadData {
+        source,
+        used_temp_file,
+        filename,
     };
 
     // `newGzipReadSeeker`: reading the header is where a corrupt payload fails.
     // flate2 parses the gzip header on the first read, so read one byte.
-    let gzip_error = match source {
-        GzipSource::Memory(cursor) => gzip_header_error(GzDecoder::new(cursor), None),
-        GzipSource::File(file, path) => {
-            gzip_header_error(GzDecoder::new(BufReader::new(file)), Some(&path))
-        }
-    };
+    let reader = data.open().map_err(|err| match data.temp_path() {
+        Some(path) => PreludeError::Decompress(format!(
+            "failed to decompress file {:?}: {err}",
+            path.display().to_string()
+        )),
+        None => PreludeError::Decompress(err.to_string()),
+    })?;
+    let path = data.temp_path().map(|path| path.display().to_string());
+    if let Some(err) = gzip_header_error(reader, path.as_deref()) {
+        return Err(err);
+    }
 
-    Ok((gzip_error, used_temp_file))
+    Ok(data)
 }
 
 /// `uncompressedSizeLimitBytes` is a `var` in the baseline for tests.

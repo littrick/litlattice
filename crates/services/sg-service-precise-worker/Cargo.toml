@@ -14,6 +14,7 @@ sg-git = { path = "../../domain/sg-git" }
 sg-http = { path = "../../net/sg-http" }
 sg-keyring = { path = "../../domain/sg-keyring" }
 sg-objectstorage = { path = "../../data/sg-objectstorage" }
+sg-scip = { path = "../../domain/sg-scip" }
 async-trait = { workspace = true }
 flate2 = { workspace = true }
 http = { workspace = true }
@@ -26,3 +27,6 @@ tempfile = "3"
 time = { workspace = true, features = ["formatting"] }
 tonic = { workspace = true }
 tracing = { workspace = true }
+
+[dev-dependencies]
+sha2 = { workspace = true }
