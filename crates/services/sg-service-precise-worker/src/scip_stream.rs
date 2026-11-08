@@ -29,11 +29,11 @@ use std::io::Read;
 use sg_scip::scip::{Document, Metadata, SymbolInformation};
 use sg_scip::{
     canonicalize_document as scip_canonicalize_document, is_local_symbol, package_from_symbol,
-    parse_streaming, IndexVisitor, Package, ParseError,
+    parse_streaming, IndexEvent, IndexVisitor, Package, ParseError, StreamingReader,
 };
 
 use crate::pathexistence::{DirectoryChildren, ExistenceChecker};
-use crate::prelude::GzipSource;
+use crate::prelude::{GzReader, GzipSource};
 
 /// `scip.SymbolRole_Definition`.
 const SYMBOL_ROLE_DEFINITION: i32 = 0x1;
@@ -271,138 +271,177 @@ impl DocumentOneShotIterator {
     pub fn visit_all_documents<E>(
         &self,
         packages: &mut ProcessedPackageData,
-        do_it: impl FnMut(&ProcessedScipDocument) -> Result<(), E>,
+        mut do_it: impl FnMut(&ProcessedScipDocument) -> Result<(), E>,
     ) -> Result<(), VisitAllDocumentsError<E>> {
-        let mut reader = self
-            .data
-            .open_gzip()
-            .map_err(VisitAllDocumentsError::Open)?;
+        let mut iterator = self.second_pass().map_err(VisitAllDocumentsError::Open)?;
 
-        let mut visitor = SecondPassVisitor {
-            ignore_paths: &self.ignore_paths,
-            first_pass: &self.first_pass,
-            repeated_documents_by_path: HashMap::new(),
-            package_set: HashMap::new(),
-            outer_error: None,
-            do_it,
-        };
-
-        let parse_result = parse_streaming(&mut reader, &mut visitor);
-        if let Err(err) = &parse_result {
-            // The baseline logs a warning here: a parse failure that was not
-            // caught on the first pass is not returned to the caller.
-            let _ = err;
+        let mut outer_error = None;
+        while let Some(document) = iterator.next_document() {
+            // The baseline still calls the callback for later documents after
+            // a failure; only the failed document's packages are skipped.
+            if let Err(err) = do_it(&document) {
+                outer_error = Some(err);
+                continue;
+            }
+            iterator.record_packages(&document.document);
         }
-
-        let SecondPassVisitor {
-            package_set,
-            outer_error,
-            ..
-        } = visitor;
 
         if let Some(err) = outer_error {
             return Err(VisitAllDocumentsError::Callback(err));
         }
 
         // Separate the packages we define from the packages we only reference.
-        // The order is unspecified until `ProcessedPackageData::Normalize`.
-        for (package, has_definition) in package_set {
-            if has_definition {
-                packages.packages.push(package);
-            } else {
-                packages
-                    .package_references
-                    .push(PackageReference { package });
-            }
-        }
+        iterator.finish(packages);
 
         Ok(())
     }
+
+    /// Open the second pass as a pull iterator. Callers whose per-document
+    /// work is asynchronous (the code-graph writer's `InsertDocument`) await
+    /// between [`SecondPassIter::next_document`] calls; the synchronous
+    /// direction of the baseline (a callback visitor) is
+    /// [`Self::visit_all_documents`].
+    pub fn second_pass(&self) -> std::io::Result<SecondPassIter<'_>> {
+        Ok(SecondPassIter {
+            stream: StreamingReader::new(self.data.open_gzip()?),
+            ignore_paths: &self.ignore_paths,
+            first_pass: &self.first_pass,
+            repeated_documents_by_path: HashMap::new(),
+            package_set: HashMap::new(),
+        })
+    }
 }
 
-/// The second-pass visitor. Mirrors the closure in `VisitAllDocuments`,
-/// including its error handling: after a callback error it keeps parsing but
-/// still records packages for documents the callback accepted.
-struct SecondPassVisitor<'a, E, D> {
+/// Pull-based second pass. See [`DocumentOneShotIterator::second_pass`].
+pub struct SecondPassIter<'a> {
+    stream: StreamingReader<GzReader>,
     ignore_paths: &'a HashSet<String>,
     first_pass: &'a FirstPassResult,
     repeated_documents_by_path: HashMap<String, Vec<Document>>,
     package_set: HashMap<Package, bool>,
-    outer_error: Option<E>,
-    do_it: D,
 }
 
-impl<E, D> IndexVisitor for SecondPassVisitor<'_, E, D>
-where
-    D: FnMut(&ProcessedScipDocument) -> Result<(), E>,
-{
-    fn visit_document(&mut self, mut document: Document) {
-        let path = document.relative_path.clone();
-        if self.ignore_paths.contains(&path) {
-            return;
-        }
-
-        if let Some(&document_count) = self.first_pass.document_count_by_path.get(&path) {
-            if document_count > 1 {
-                let same_path_documents = self
-                    .repeated_documents_by_path
-                    .entry(path.clone())
-                    .or_default();
-                same_path_documents.push(document);
-                if same_path_documents.len() != document_count {
-                    // Wait for the remaining documents with this path.
-                    return;
-                }
-
-                let same_path_documents = self
-                    .repeated_documents_by_path
-                    .remove(&path)
-                    .unwrap_or_default();
-                let flattened = flatten_documents(same_path_documents);
-                if flattened.len() != 1 {
-                    // The baseline logs a warning and skips the document.
-                    return;
-                }
-                document = flattened.into_iter().next().expect("one document");
-            }
-        }
-
-        let processed = process_document(document, &self.first_pass.external_symbols_by_name);
-
-        if let Err(err) = (self.do_it)(&processed) {
-            self.outer_error = Some(err);
-            return;
-        }
-
-        // Stash the unique packages of each symbol name in the document. An
-        // occurrence that defines the symbol marks the package as defined
-        // rather than merely referenced. NOTE: `processed.document` is the
-        // canonicalized document, including injected external symbols, which
-        // is what the baseline reads here as well.
-        for symbol in &processed.document.symbols {
-            if let Some(package) = package_from_symbol(&symbol.symbol) {
-                self.package_set.entry(package).or_insert(false);
-            }
-
-            for relationship in &symbol.relationships {
-                if let Some(package) = package_from_symbol(&relationship.symbol) {
-                    self.package_set.entry(package).or_insert(false);
-                }
-            }
-        }
-
-        for occurrence in &processed.document.occurrences {
-            if occurrence.symbol.is_empty() || is_local_symbol(&occurrence.symbol) {
+impl SecondPassIter<'_> {
+    /// Yield the next processed (canonicalized) document, or `None` at the
+    /// end of the index. A parse failure is swallowed exactly like the
+    /// baseline's warning-only handling.
+    pub fn next_document(&mut self) -> Option<ProcessedScipDocument> {
+        loop {
+            let event = match self.stream.next_event() {
+                Ok(Some(event)) => event,
+                Ok(None) | Err(_) => return None,
+            };
+            let IndexEvent::Document(document) = event else {
                 continue;
+            };
+
+            let Some(document) = accept_document(
+                self.ignore_paths,
+                self.first_pass,
+                &mut self.repeated_documents_by_path,
+                document,
+            ) else {
+                continue;
+            };
+
+            return Some(process_document(
+                document,
+                &self.first_pass.external_symbols_by_name,
+            ));
+        }
+    }
+
+    /// Record the packages of a document the caller accepted.
+    pub fn record_packages(&mut self, document: &Document) {
+        aggregate_packages(&mut self.package_set, document);
+    }
+
+    /// Split the accumulated packages into definitions and references.
+    pub fn finish(self, packages: &mut ProcessedPackageData) {
+        finish_packages(self.package_set, packages);
+    }
+}
+
+/// Apply the ignore-path and repeated-document rules of the second pass.
+/// Returns the document to hand to the writer callback, or `None` when it is
+/// skipped (ignored path, or still waiting for the other documents sharing its
+/// path).
+fn accept_document(
+    ignore_paths: &HashSet<String>,
+    first_pass: &FirstPassResult,
+    repeated_documents_by_path: &mut HashMap<String, Vec<Document>>,
+    mut document: Document,
+) -> Option<Document> {
+    let path = document.relative_path.clone();
+    if ignore_paths.contains(&path) {
+        return None;
+    }
+
+    if let Some(&document_count) = first_pass.document_count_by_path.get(&path) {
+        if document_count > 1 {
+            let same_path_documents = repeated_documents_by_path.entry(path.clone()).or_default();
+            same_path_documents.push(document);
+            if same_path_documents.len() != document_count {
+                // Wait for the remaining documents with this path.
+                return None;
             }
 
-            if let Some(package) = package_from_symbol(&occurrence.symbol) {
-                if occurrence.symbol_roles & SYMBOL_ROLE_DEFINITION > 0 {
-                    self.package_set.insert(package, true);
-                } else {
-                    self.package_set.entry(package).or_insert(false);
-                }
+            let same_path_documents = repeated_documents_by_path.remove(&path).unwrap_or_default();
+            let flattened = flatten_documents(same_path_documents);
+            if flattened.len() != 1 {
+                // The baseline logs a warning and skips the document.
+                return None;
             }
+            document = flattened.into_iter().next().expect("one document");
+        }
+    }
+
+    Some(document)
+}
+
+/// Stash the unique packages of each symbol name in the document. An
+/// occurrence that defines the symbol marks the package as defined rather than
+/// merely referenced. NOTE: the callback receives the canonicalized document,
+/// including injected external symbols, which is what the baseline reads here
+/// as well.
+fn aggregate_packages(package_set: &mut HashMap<Package, bool>, document: &Document) {
+    for symbol in &document.symbols {
+        if let Some(package) = package_from_symbol(&symbol.symbol) {
+            package_set.entry(package).or_insert(false);
+        }
+
+        for relationship in &symbol.relationships {
+            if let Some(package) = package_from_symbol(&relationship.symbol) {
+                package_set.entry(package).or_insert(false);
+            }
+        }
+    }
+
+    for occurrence in &document.occurrences {
+        if occurrence.symbol.is_empty() || is_local_symbol(&occurrence.symbol) {
+            continue;
+        }
+
+        if let Some(package) = package_from_symbol(&occurrence.symbol) {
+            if occurrence.symbol_roles & SYMBOL_ROLE_DEFINITION > 0 {
+                package_set.insert(package, true);
+            } else {
+                package_set.entry(package).or_insert(false);
+            }
+        }
+    }
+}
+
+/// Split the accumulated package set into defined packages and references.
+fn finish_packages(package_set: HashMap<Package, bool>, packages: &mut ProcessedPackageData) {
+    // The order is unspecified until `ProcessedPackageData::Normalize`.
+    for (package, has_definition) in package_set {
+        if has_definition {
+            packages.packages.push(package);
+        } else {
+            packages
+                .package_references
+                .push(PackageReference { package });
         }
     }
 }

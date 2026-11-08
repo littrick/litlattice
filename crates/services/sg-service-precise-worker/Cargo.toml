@@ -22,11 +22,10 @@ http-body-util = { workspace = true }
 hyper = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
+sha2 = { workspace = true }
 sqlx = { workspace = true }
 tempfile = "3"
+thiserror = { workspace = true }
 time = { workspace = true, features = ["formatting"] }
 tonic = { workspace = true }
 tracing = { workspace = true }
-
-[dev-dependencies]
-sha2 = { workspace = true }

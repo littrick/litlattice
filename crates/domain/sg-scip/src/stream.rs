@@ -52,18 +52,36 @@ const EXTERNAL_SYMBOLS_FIELD_NUMBER: u32 = 3;
 
 const MAX_VARINT_BYTES: usize = 10;
 
-/// `IndexVisitor.ParseStreaming`.
-pub fn parse_streaming<R: Read>(
-    reader: &mut R,
-    visitor: &mut impl IndexVisitor,
-) -> Result<(), ParseError> {
-    let mut data = Vec::new();
+/// One top-level `Index` field, already decoded.
+#[derive(Debug, Clone, PartialEq)]
+pub enum IndexEvent {
+    Metadata(Metadata),
+    Document(Document),
+    ExternalSymbol(SymbolInformation),
+}
 
-    loop {
-        let Some(tag) = read_one(reader)
+/// Pull-based counterpart of [`IndexVisitor`]: yields one decoded top-level
+/// field per call. The code-graph writer needs this because its per-document
+/// callback awaits database writes, which the visitor pattern cannot express.
+pub struct StreamingReader<R> {
+    reader: R,
+    data: Vec<u8>,
+}
+
+impl<R: Read> StreamingReader<R> {
+    pub fn new(reader: R) -> Self {
+        Self {
+            reader,
+            data: Vec::new(),
+        }
+    }
+
+    /// Read the next top-level field, or `None` at a clean EOF.
+    pub fn next_event(&mut self) -> Result<Option<IndexEvent>, ParseError> {
+        let Some(tag) = read_one(&mut self.reader)
             .map_err(|err| ParseError::new(format!("failed to read from index reader: {err}")))?
         else {
-            return Ok(());
+            return Ok(None);
         };
 
         // `protowire.ConsumeTag` over a single byte rejects continuation bits
@@ -84,50 +102,69 @@ pub fn parse_streaming<R: Read>(
                     )));
                 }
 
-                let data_len = read_varint(reader).map_err(|err| {
+                let data_len = read_varint(&mut self.reader).map_err(|err| {
                     ParseError::new(format!(
                         "failed to read length for {}: {err}",
                         field_name(field_number)
                     ))
                 })? as usize;
 
-                data.resize(data_len, 0);
+                self.data.resize(data_len, 0);
                 if data_len > 0 {
-                    reader.read_exact(&mut data).map_err(|err| {
+                    self.reader.read_exact(&mut self.data).map_err(|err| {
                         ParseError::new(format!(
                             "expected to read {data_len} bytes based on LEN: {err}"
                         ))
                     })?;
                 }
 
-                match field_number {
-                    METADATA_FIELD_NUMBER => {
-                        let metadata = Metadata::decode(data.as_slice()).map_err(|err| {
+                let event = match field_number {
+                    METADATA_FIELD_NUMBER => Metadata::decode(self.data.as_slice())
+                        .map(IndexEvent::Metadata)
+                        .map_err(|err| {
                             ParseError::new(format!("failed to read metadata: {err}"))
-                        })?;
-                        visitor.visit_metadata(metadata);
-                    }
-                    DOCUMENTS_FIELD_NUMBER => {
-                        let document = Document::decode(data.as_slice()).map_err(|err| {
+                        })?,
+                    DOCUMENTS_FIELD_NUMBER => Document::decode(self.data.as_slice())
+                        .map(IndexEvent::Document)
+                        .map_err(|err| {
                             ParseError::new(format!("failed to read documents: {err}"))
-                        })?;
-                        visitor.visit_document(document);
-                    }
-                    _ => {
-                        let symbol = SymbolInformation::decode(data.as_slice()).map_err(|err| {
+                        })?,
+                    _ => SymbolInformation::decode(self.data.as_slice())
+                        .map(IndexEvent::ExternalSymbol)
+                        .map_err(|err| {
                             ParseError::new(format!("failed to read external_symbols: {err}"))
-                        })?;
-                        visitor.visit_external_symbol(symbol);
-                    }
-                }
+                        })?,
+                };
+                Ok(Some(event))
             }
-            other => {
-                return Err(ParseError::new(format!(
-                    "added new field with number: {other} in scip.Index but forgot to update streaming parser"
-                )));
-            }
+            other => Err(ParseError::new(format!(
+                "added new field with number: {other} in scip.Index but forgot to update streaming parser"
+            ))),
         }
     }
+}
+
+impl<R> StreamingReader<R> {
+    /// Consume the reader, returning the underlying stream.
+    pub fn into_inner(self) -> R {
+        self.reader
+    }
+}
+
+/// `IndexVisitor.ParseStreaming`.
+pub fn parse_streaming<R: Read>(
+    reader: &mut R,
+    visitor: &mut impl IndexVisitor,
+) -> Result<(), ParseError> {
+    let mut stream = StreamingReader::new(reader);
+    while let Some(event) = stream.next_event()? {
+        match event {
+            IndexEvent::Metadata(metadata) => visitor.visit_metadata(metadata),
+            IndexEvent::Document(document) => visitor.visit_document(document),
+            IndexEvent::ExternalSymbol(symbol) => visitor.visit_external_symbol(symbol),
+        }
+    }
+    Ok(())
 }
 
 fn field_name(field_number: u32) -> &'static str {

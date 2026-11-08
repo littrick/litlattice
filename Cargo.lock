@@ -4028,6 +4028,7 @@ dependencies = [
  "sha2 0.10.9",
  "sqlx",
  "tempfile",
+ "thiserror 1.0.69",
  "time",
  "tokio",
  "tokio-util",

@@ -27,11 +27,14 @@ use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
+pub mod codegraph;
 pub mod config;
 pub mod pathexistence;
 pub mod prelude;
 pub mod queue;
+pub mod ranges;
 pub mod scip_stream;
+pub mod trie;
 pub mod worker;
 
 use config::PreciseWorkerConfig;

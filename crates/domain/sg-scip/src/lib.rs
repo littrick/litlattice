@@ -32,5 +32,5 @@ pub use scip::*;
 
 pub use canonicalize::canonicalize_document;
 pub use position::{Position, Range};
-pub use stream::{parse_streaming, IndexVisitor, ParseError};
+pub use stream::{parse_streaming, IndexEvent, IndexVisitor, ParseError, StreamingReader};
 pub use symbol::{is_local_symbol, package_from_symbol, Package};
