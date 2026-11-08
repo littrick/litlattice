@@ -2,13 +2,15 @@
 
 //! Query-to-regexp compilation and file matching (`matchtree.go`).
 //!
-//! Literal-substring pruning and the zoekt query conversion are not ported
-//! here: the former is a pure optimization, the latter is only needed by the
-//! indexed/hybrid path.
+//! Literal-substring pruning is not ported here: it is a pure optimization.
+//! The zoekt query conversion ([`MatchTree::to_zoekt_query`]) feeds hybrid
+//! search (`hybrid.rs`).
 
 use std::fmt;
 
 use regex::bytes::{Regex, RegexBuilder};
+
+use sg_zoekt::query::{Query as ZoektQuery, ZOEKT_SCORE_BOOST};
 
 use crate::protocol::{PatternNode, QueryNode};
 
@@ -28,9 +30,11 @@ pub enum MatchTree {
 #[derive(Debug, Clone)]
 pub struct RegexMatchTree {
     regex: Regex,
+    /// The baseline lower-cases instead of relying on the regex engine's
+    /// case-insensitive flag; zoekt needs to know the original setting.
+    ignore_case: bool,
     is_negated: bool,
-    /// Only used by the indexed/zoekt path (M8.7).
-    #[allow(dead_code)]
+    /// Baseline `boost`: wrap the zoekt query in `Boost`.
     boost: bool,
 }
 
@@ -89,9 +93,68 @@ impl MatchTree {
     pub fn is_all(&self) -> bool {
         matches!(self, Self::All)
     }
+
+    /// Baseline `ToZoektQuery`: represent this tree as a zoekt query.
+    ///
+    /// The regexp string is the one our `regex` engine compiled (the baseline
+    /// sends the equivalent Go syntax string); zoekt parses it with its own
+    /// engine, so a pattern accepted here but rejected there surfaces as a
+    /// zoekt search error, which hybrid search treats as a fallback.
+    pub fn to_zoekt_query(&self, match_content: bool, match_path: bool) -> ZoektQuery {
+        match self {
+            Self::All => ZoektQuery::Const(true),
+            Self::Regex(tree) => tree.to_zoekt_query(match_content, match_path),
+            Self::And(children) => ZoektQuery::And(
+                children
+                    .iter()
+                    .map(|child| child.to_zoekt_query(match_content, match_path))
+                    .collect(),
+            ),
+            Self::Or(children) => ZoektQuery::Or(
+                children
+                    .iter()
+                    .map(|child| child.to_zoekt_query(match_content, match_path))
+                    .collect(),
+            ),
+        }
+    }
 }
 
 impl RegexMatchTree {
+    fn to_zoekt_query(&self, match_content: bool, match_path: bool) -> ZoektQuery {
+        let case_sensitive = !self.ignore_case;
+        let regexp = |content: bool, file_name: bool| ZoektQuery::Regexp {
+            regexp: self.regex.as_str().to_owned(),
+            file_name,
+            content,
+            case_sensitive,
+        };
+
+        let mut result = if match_content && match_path {
+            ZoektQuery::or(vec![
+                self.negate_if_needed(regexp(true, false)),
+                self.negate_if_needed(regexp(false, true)),
+            ])
+        } else {
+            self.negate_if_needed(regexp(match_content, match_path))
+        };
+        if self.boost {
+            result = ZoektQuery::Boost {
+                child: Box::new(result),
+                boost: ZOEKT_SCORE_BOOST,
+            };
+        }
+        result
+    }
+
+    fn negate_if_needed(&self, query: ZoektQuery) -> ZoektQuery {
+        if self.is_negated {
+            ZoektQuery::negate(query)
+        } else {
+            query
+        }
+    }
+
     fn matches_file(&self, content: &[u8], limit: usize) -> Vec<MatchRange> {
         if limit == 0 {
             return Vec::new();
@@ -161,6 +224,7 @@ fn to_regexp_tree(node: &PatternNode, is_case_sensitive: bool) -> Result<MatchTr
 
     Ok(MatchTree::Regex(RegexMatchTree {
         regex,
+        ignore_case: !is_case_sensitive,
         is_negated: node.is_negated,
         boost: node.boost,
     }))
@@ -272,6 +336,85 @@ mod tests {
     #[test]
     fn rejects_invalid_regexps() {
         assert!(to_match_tree(&pattern("(", true, false), true).is_err());
+    }
+
+    #[test]
+    fn converts_to_a_zoekt_query() {
+        use sg_zoekt::query::Query as ZoektQuery;
+
+        let tree = to_match_tree(&pattern("needle", false, false), true).expect("tree");
+        assert_eq!(
+            tree.to_zoekt_query(true, false),
+            ZoektQuery::Regexp {
+                regexp: "needle".to_owned(),
+                file_name: false,
+                content: true,
+                case_sensitive: true,
+            }
+        );
+
+        // Content and path matching uses an OR of two regexps.
+        let query = tree.to_zoekt_query(true, true);
+        let ZoektQuery::Or(children) = query else {
+            panic!("expected OR, got {query:?}");
+        };
+        assert_eq!(children.len(), 2);
+        assert!(matches!(
+            &children[0],
+            ZoektQuery::Regexp {
+                content: true,
+                file_name: false,
+                ..
+            }
+        ));
+        assert!(matches!(
+            &children[1],
+            ZoektQuery::Regexp {
+                content: false,
+                file_name: true,
+                ..
+            }
+        ));
+
+        // Negation wraps the child.
+        let negated = to_match_tree(&pattern("skip", false, true), true).expect("tree");
+        let query = negated.to_zoekt_query(true, false);
+        let ZoektQuery::Not(child) = query else {
+            panic!("expected NOT, got {query:?}");
+        };
+        assert!(matches!(child.as_ref(), ZoektQuery::Regexp { .. }));
+
+        // Boost wraps the regexp.
+        let mut node = pattern("boosted", false, false);
+        if let QueryNode::Pattern(pattern) = &mut node {
+            pattern.boost = true;
+        }
+        let tree = to_match_tree(&node, true).expect("tree");
+        let query = tree.to_zoekt_query(true, false);
+        let ZoektQuery::Boost { boost, .. } = query else {
+            panic!("expected BOOST, got {query:?}");
+        };
+        assert_eq!(boost, ZOEKT_SCORE_BOOST);
+    }
+
+    #[test]
+    fn zoekt_queries_keep_case_insensitivity() {
+        use sg_zoekt::query::Query as ZoektQuery;
+
+        let tree = to_match_tree(&pattern("Needle", false, false), false).expect("tree");
+        let query = tree.to_zoekt_query(true, false);
+        let ZoektQuery::Regexp {
+            regexp,
+            case_sensitive,
+            ..
+        } = query
+        else {
+            panic!("expected regexp");
+        };
+        // The pattern carries the inline flag; zoekt is told it is
+        // case-insensitive so it does not prune case-folded ngrams.
+        assert_eq!(regexp, "(?i:Needle)");
+        assert!(!case_sensitive);
     }
 
     #[test]

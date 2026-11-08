@@ -5,17 +5,21 @@
 //! Unindexed regexp search compiles the query, prepares the archive through
 //! [`Store`], and runs the worker-pool scan in [`RegexSearch`]. Structural
 //! requests narrow the archive with an approximate regexp pass and stream
-//! comby results. Hybrid/zoekt offload is not wired yet; without it every
-//! request searches the whole archive, which is the baseline fallback when
-//! indexed search is unavailable.
+//! comby results. When a zoekt endpoint and a gitserver diff source are
+//! configured, hybrid search ([`crate::hybrid`]) first streams the unchanged
+//! part of the repository from zoekt and the archive is narrowed to the
+//! changed paths; otherwise the whole archive is searched, which is also the
+//! baseline fallback when indexed search is unavailable.
 
 use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::hybrid::{hybrid, ChangedFilesProvider, HybridOutcome, IndexedSearcher};
 use crate::langmatch::to_lang_matcher;
 use crate::matchtree::to_match_tree;
+use crate::metrics::Metrics;
 use crate::pathmatch::to_path_matcher;
 use crate::protocol::Request;
 use crate::regex_search::{RegexSearch, SearchError};
@@ -37,6 +41,9 @@ pub enum ServiceError {
     Search(SearchError),
     /// Structural search failed (comby or candidate scan).
     Structural(StructuralError),
+    /// Hybrid search failed (zoekt or gitserver); the baseline returns the
+    /// wrapped error and does not fall back.
+    Hybrid(String),
 }
 
 impl std::fmt::Display for ServiceError {
@@ -49,6 +56,7 @@ impl std::fmt::Display for ServiceError {
             | Self::Archive(StoreError::Temporary(message)) => f.write_str(message),
             Self::Search(err) => err.fmt(f),
             Self::Structural(err) => err.fmt(f),
+            Self::Hybrid(message) => f.write_str(message),
         }
     }
 }
@@ -77,6 +85,10 @@ impl From<StructuralError> for ServiceError {
 pub struct SearchService {
     store: Arc<Store>,
     comby_path: PathBuf,
+    indexed: Option<Arc<dyn IndexedSearcher>>,
+    changed_files: Option<Arc<dyn ChangedFilesProvider>>,
+    max_total_paths_length: usize,
+    disable_hybrid_search: bool,
 }
 
 impl SearchService {
@@ -84,12 +96,40 @@ impl SearchService {
         Self {
             store,
             comby_path: crate::structural_search::default_comby_path(),
+            indexed: None,
+            changed_files: None,
+            max_total_paths_length: 100_000,
+            disable_hybrid_search: false,
         }
     }
 
     /// Test hook: run a different comby executable.
     pub fn with_comby_path(mut self, path: impl Into<PathBuf>) -> Self {
         self.comby_path = path.into();
+        self
+    }
+
+    /// The zoekt endpoint(s) hybrid search offloads to.
+    pub fn with_indexed(mut self, indexed: Arc<dyn IndexedSearcher>) -> Self {
+        self.indexed = Some(indexed);
+        self
+    }
+
+    /// The gitserver diff source hybrid search classifies changed files with.
+    pub fn with_changed_files(mut self, changed_files: Arc<dyn ChangedFilesProvider>) -> Self {
+        self.changed_files = Some(changed_files);
+        self
+    }
+
+    /// `MAX_TOTAL_PATHS_LENGTH` (`Config.MaxTotalGitArchivePathsLength`).
+    pub fn with_max_total_paths_length(mut self, max_total_paths_length: usize) -> Self {
+        self.max_total_paths_length = max_total_paths_length;
+        self
+    }
+
+    /// `DISABLE_HYBRID_SEARCH`.
+    pub fn with_disable_hybrid_search(mut self, disable: bool) -> Self {
+        self.disable_hybrid_search = disable;
         self
     }
 
@@ -152,10 +192,45 @@ impl SearchService {
         let path_matcher = to_path_matcher(&request.pattern_info)
             .map_err(|err| ServiceError::BadRequest(err.to_string()))?;
 
-        // No hybrid search yet: the whole archive is unsearched.
+        // Hybrid search: stream the unchanged paths from zoekt and search the
+        // remaining archive. A failed hybrid search fails the request; an
+        // unavailable index falls back to the whole archive.
+        let mut paths: Vec<String> = Vec::new();
+        if !self.disable_hybrid_search {
+            if let (Some(indexed), Some(changed_files)) = (&self.indexed, &self.changed_files) {
+                let cancel_token = sender.cancel_token();
+                match hybrid(
+                    indexed.as_ref(),
+                    changed_files.as_ref(),
+                    request,
+                    self.max_total_paths_length,
+                    &sender,
+                    Metrics::global(),
+                    &cancel_token,
+                )
+                .await
+                {
+                    Err(err) => return Err(ServiceError::Hybrid(err.to_string())),
+                    Ok(HybridOutcome { ok: false, .. }) => {
+                        // Fall back to searching the whole archive.
+                    }
+                    Ok(HybridOutcome {
+                        unsearched,
+                        ok: true,
+                    }) => {
+                        if unsearched.is_empty() {
+                            // Indexed search did it all.
+                            return Ok(());
+                        }
+                        paths = unsearched;
+                    }
+                }
+            }
+        }
+
         let (_path, zip) = self
             .store
-            .get_zip_file(&request.repo, &request.commit, &[], fetch_timeout)
+            .get_zip_file(&request.repo, &request.commit, &paths, fetch_timeout)
             .await?;
 
         let pattern_matches_content = request.pattern_info.pattern_matches_content;

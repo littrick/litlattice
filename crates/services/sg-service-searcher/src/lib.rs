@@ -24,6 +24,7 @@ pub mod chunk;
 pub mod config;
 pub mod debug;
 pub mod filter;
+pub mod hybrid;
 pub mod langmatch;
 pub mod matchtree;
 pub mod metrics;
@@ -64,6 +65,10 @@ pub struct SearcherService {
     cache_dir: Option<std::path::PathBuf>,
     /// Test hook: replaces the `comby` executable found on `PATH`.
     comby_path: Option<std::path::PathBuf>,
+    /// Test hook: replaces the zoekt endpoint(s) used by hybrid search.
+    indexed: Option<Arc<dyn hybrid::IndexedSearcher>>,
+    /// Test hook: replaces the gitserver diff source used by hybrid search.
+    changed_files: Option<Arc<dyn hybrid::ChangedFilesProvider>>,
 }
 
 impl SearcherService {
@@ -75,6 +80,8 @@ impl SearcherService {
             fetcher: None,
             cache_dir: None,
             comby_path: None,
+            indexed: None,
+            changed_files: None,
         }
     }
 
@@ -87,6 +94,8 @@ impl SearcherService {
             fetcher: None,
             cache_dir: None,
             comby_path: None,
+            indexed: None,
+            changed_files: None,
         }
     }
 
@@ -105,6 +114,22 @@ impl SearcherService {
     /// Test hook: run a different comby executable.
     pub fn with_comby_path(mut self, path: impl Into<std::path::PathBuf>) -> Self {
         self.comby_path = Some(path.into());
+        self
+    }
+
+    /// Test hook: serve hybrid search from `indexed` instead of zoekt.
+    pub fn with_indexed(mut self, indexed: Arc<dyn hybrid::IndexedSearcher>) -> Self {
+        self.indexed = Some(indexed);
+        self
+    }
+
+    /// Test hook: classify changed files through `changed_files` instead of
+    /// gitserver.
+    pub fn with_changed_files(
+        mut self,
+        changed_files: Arc<dyn hybrid::ChangedFilesProvider>,
+    ) -> Self {
+        self.changed_files = Some(changed_files);
         self
     }
 }
@@ -179,10 +204,35 @@ impl Service for SearcherService {
             ctx.shutdown.clone(),
         );
         store.start();
-        let mut search_service = SearchService::new(Arc::clone(&store));
+        let mut search_service = SearchService::new(Arc::clone(&store))
+            .with_max_total_paths_length(config.max_total_paths_length)
+            .with_disable_hybrid_search(config.disable_hybrid_search);
         if let Some(comby_path) = self.comby_path.clone() {
             search_service = search_service.with_comby_path(comby_path);
         }
+
+        // Hybrid search needs both a zoekt endpoint and a gitserver diff
+        // source. Without a zoekt endpoint every request searches the whole
+        // archive, the same fallback a deployment without indexed search uses.
+        let indexed = match self.indexed.clone() {
+            Some(indexed) => Some(indexed),
+            None if !config.disable_hybrid_search && !config.zoekt_addrs.is_empty() => {
+                let pool = hybrid::ZoektPool::new(&config.zoekt_addrs)
+                    .map_err(|err| ServiceError::with_source("invalid zoekt endpoint", err))?;
+                Some(Arc::new(pool) as Arc<dyn hybrid::IndexedSearcher>)
+            }
+            None => None,
+        };
+        let hybrid_enabled = indexed.is_some();
+        if let Some(indexed) = indexed {
+            search_service = search_service.with_indexed(indexed);
+        }
+        let changed_files = match self.changed_files.clone() {
+            Some(provider) => provider,
+            None => Arc::new(sg_git::GitserverClient::new(config.gitserver_addrs.clone()))
+                as Arc<dyn hybrid::ChangedFilesProvider>,
+        };
+        search_service = search_service.with_changed_files(changed_files);
         let search_service = Arc::new(search_service);
 
         let listener = sg_http::listen(self.addr.as_str()).await.map_err(|err| {
@@ -205,6 +255,8 @@ impl Service for SearcherService {
             addr = %self.addr,
             cache_dir = %config.cache_dir.display(),
             gitservers = ?config.gitserver_addrs,
+            zoekts = ?config.zoekt_addrs,
+            hybrid_enabled,
             "searcher listening"
         );
         ctx.ready.mark_ready();
@@ -360,9 +412,12 @@ mod tests {
 
     use super::*;
 
-    /// In-memory gitserver serving one fixed tar archive.
+    /// In-memory gitserver serving a fixed set of files, narrowed to the
+    /// requested paths like `git archive <treeish> -- <paths>`.
     struct FakeFetcher {
-        tar: Vec<u8>,
+        files: Vec<(String, Vec<u8>)>,
+        /// Paths of every `Archive` request, for hybrid search assertions.
+        requested_paths: std::sync::Mutex<Vec<Vec<String>>>,
     }
 
     #[async_trait]
@@ -371,10 +426,20 @@ mod tests {
             &self,
             _repo: &str,
             _commit: &str,
-            _paths: &[String],
+            paths: &[String],
         ) -> Result<TarByteStream, String> {
+            self.requested_paths
+                .lock()
+                .expect("requested paths")
+                .push(paths.to_vec());
             let (sender, receiver) = tokio::sync::mpsc::channel(4);
-            let tar = self.tar.clone();
+            let selected: Vec<(&str, &[u8])> = self
+                .files
+                .iter()
+                .filter(|(name, _)| paths.is_empty() || paths.contains(name))
+                .map(|(name, data)| (name.as_str(), data.as_slice()))
+                .collect();
+            let tar = make_tar(&selected);
             tokio::task::spawn(async move {
                 for chunk in tar.chunks(7) {
                     let _ = sender.send(Ok(Bytes::copy_from_slice(chunk))).await;
@@ -407,9 +472,17 @@ mod tests {
     }
 
     fn fetcher(files: &[(&str, &[u8])]) -> Arc<dyn ArchiveFetcher> {
-        Arc::new(FakeFetcher {
-            tar: make_tar(files),
-        })
+        Arc::new(fake_fetcher(files))
+    }
+
+    fn fake_fetcher(files: &[(&str, &[u8])]) -> FakeFetcher {
+        FakeFetcher {
+            files: files
+                .iter()
+                .map(|(name, data)| ((*name).to_owned(), data.to_vec()))
+                .collect(),
+            requested_paths: std::sync::Mutex::new(Vec::new()),
+        }
     }
 
     /// Executable that prints a fixed comby JSON-lines result.
@@ -636,6 +709,175 @@ mod tests {
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].path, b"a.go");
         assert!(!done.expect("done").limit_hit);
+
+        shutdown.cancel();
+        server.await.expect("server task").expect("clean stop");
+    }
+
+    /// zoekt stand-in for the hybrid end-to-end test.
+    struct FakeZoekt {
+        commit: String,
+        chunks: Vec<sg_zoekt::types::SearchChunk>,
+    }
+
+    #[async_trait]
+    impl hybrid::IndexedSearcher for FakeZoekt {
+        async fn list(
+            &self,
+            _query: sg_zoekt::query::Query,
+            _options: sg_zoekt::types::ListOptions,
+        ) -> Result<sg_zoekt::types::ListResponse, sg_zoekt::client::Error> {
+            let mut response = sg_zoekt::types::ListResponse::default();
+            response.repos_map.insert(
+                7,
+                sg_zoekt::types::MinimalRepoListEntry {
+                    has_symbols: false,
+                    branches: vec![sg_zoekt::types::RepositoryBranch {
+                        name: "HEAD".to_owned(),
+                        version: self.commit.clone(),
+                    }],
+                    index_time_unix: 0,
+                },
+            );
+            Ok(response)
+        }
+
+        async fn stream_search(
+            &self,
+            _query: sg_zoekt::query::Query,
+            _options: sg_zoekt::types::SearchOptions,
+            _cancel: CancellationToken,
+            on_chunk: &mut (dyn FnMut(sg_zoekt::types::SearchChunk) + Send),
+        ) -> Result<(), sg_zoekt::client::Error> {
+            for chunk in &self.chunks {
+                on_chunk(chunk.clone());
+            }
+            Ok(())
+        }
+    }
+
+    struct FakeDiff;
+
+    #[async_trait]
+    impl hybrid::ChangedFilesProvider for FakeDiff {
+        async fn changed_files(
+            &self,
+            _repo: &str,
+            _base: &str,
+            _head: &str,
+        ) -> Result<Vec<sg_git::ChangedFile>, sg_git::Error> {
+            Ok(vec![sg_git::ChangedFile {
+                path: "b.go".to_owned(),
+                status: sg_git::ChangeStatus::Modified,
+            }])
+        }
+    }
+
+    fn zoekt_match(path: &str, version: &str) -> sg_zoekt::types::SearchChunk {
+        use sg_zoekt::types::{ChunkMatch, FileMatch, Location, Range};
+
+        sg_zoekt::types::SearchChunk {
+            files: vec![FileMatch {
+                file_name: path.as_bytes().to_vec(),
+                language: "Go".to_owned(),
+                version: version.to_owned(),
+                chunk_matches: vec![ChunkMatch {
+                    content: b"needle\n".to_vec(),
+                    content_start: Location {
+                        byte_offset: 0,
+                        line_number: 1,
+                        column: 1,
+                    },
+                    file_name: false,
+                    ranges: vec![Range {
+                        start: Location {
+                            byte_offset: 0,
+                            line_number: 1,
+                            column: 1,
+                        },
+                        end: Location {
+                            byte_offset: 6,
+                            line_number: 1,
+                            column: 7,
+                        },
+                    }],
+                    score: 0.0,
+                }],
+                ..FileMatch::default()
+            }],
+            crashes: 0,
+        }
+    }
+
+    async fn start_with_hybrid(
+        fetcher: Arc<dyn ArchiveFetcher>,
+        indexed: Arc<dyn hybrid::IndexedSearcher>,
+        changed_files: Arc<dyn hybrid::ChangedFilesProvider>,
+    ) -> (
+        std::net::SocketAddr,
+        tempfile::TempDir,
+        CancellationToken,
+        tokio::task::JoinHandle<Result<(), ServiceError>>,
+    ) {
+        let addr = probe_addr();
+        let cache = tempfile::tempdir().expect("cache dir");
+        let shutdown = CancellationToken::new();
+        let ready = ReadyHandle::new();
+        let ctx = context(shutdown.clone(), ready.clone());
+
+        let service = SearcherService::with_addr(addr.to_string())
+            .with_fetcher(fetcher)
+            .with_cache_dir(cache.path())
+            .with_indexed(indexed)
+            .with_changed_files(changed_files);
+        let mut service = Box::new(service);
+        let mut env = EnvReader::new();
+        service.configure(&mut env).expect("configure");
+        let server = tokio::spawn(async move { service.start(ctx).await });
+        ready.wait_ready().await;
+        (addr, cache, shutdown, server)
+    }
+
+    #[tokio::test]
+    async fn hybrid_search_streams_indexed_files_and_narrows_the_archive() {
+        let fetcher = Arc::new(fake_fetcher(&[
+            ("a.go", b"needle in indexed file\n"),
+            ("b.go", b"needle in changed file\n"),
+            ("c.go", b"needle in untouched file\n"),
+        ]));
+        let indexed = Arc::new(FakeZoekt {
+            commit: "aaaa".to_owned(),
+            chunks: vec![zoekt_match("a.go", "aaaa")],
+        });
+
+        let (addr, _cache, shutdown, server) = start_with_hybrid(
+            Arc::clone(&fetcher) as Arc<dyn ArchiveFetcher>,
+            indexed,
+            Arc::new(FakeDiff),
+        )
+        .await;
+
+        let mut client = connect(addr).await;
+        let mut stream = client
+            .search(request("needle", 0))
+            .await
+            .expect("search")
+            .into_inner();
+
+        let mut paths = Vec::new();
+        while let Some(message) = stream.next().await {
+            if let Some(pb::search_response::Message::FileMatch(file_match)) =
+                message.expect("ok").message
+            {
+                paths.push(String::from_utf8_lossy(&file_match.path).into_owned());
+            }
+        }
+        paths.sort();
+        // a.go came from zoekt; b.go is the only archive path searched.
+        assert_eq!(paths, vec!["a.go".to_owned(), "b.go".to_owned()]);
+
+        let requested = fetcher.requested_paths.lock().expect("paths").clone();
+        assert_eq!(requested, vec![vec!["b.go".to_owned()]]);
 
         shutdown.cancel();
         server.await.expect("server task").expect("clean stop");

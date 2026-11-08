@@ -18,6 +18,11 @@ pub struct SearcherConfig {
     pub disable_hybrid_search: bool,
     pub exhaustive_request_logging_enabled: bool,
     pub gitserver_addrs: Vec<String>,
+    /// zoekt-webserver addresses for hybrid search. The Go baseline reads
+    /// these from the frontend's `ServiceConnections.Zoekts`; the Rust pilot
+    /// reads them from the environment (see `docs/modules/04_searcher.md`).
+    /// Empty disables hybrid search.
+    pub zoekt_addrs: Vec<String>,
 }
 
 impl SearcherConfig {
@@ -116,6 +121,37 @@ impl SearcherConfig {
             .map(str::to_owned)
             .collect();
 
+        // `SRC_ZOEKT_SERVERS` is the Rust pilot's explicit override; otherwise
+        // read the variables the frontend uses to build
+        // `ServiceConnections.Zoekts` (`computeIndexedEndpoints`).
+        let zoekt_addrs = {
+            let explicit = env.get(
+                "SRC_ZOEKT_SERVERS",
+                "",
+                "comma separated list of zoekt-webserver addresses (Rust pilot reads this directly)",
+            );
+            let addresses = if explicit.trim().is_empty() {
+                let indexed = env.get(
+                    "INDEXED_SEARCH_SERVERS",
+                    "",
+                    "comma separated list of indexed-search addresses (frontend configuration)",
+                );
+                if indexed.trim().is_empty() {
+                    env.get("ZOEKT_HOST", "", "deprecated single indexed-search address")
+                } else {
+                    indexed
+                }
+            } else {
+                explicit
+            };
+            addresses
+                .split([',', ' '])
+                .map(str::trim)
+                .filter(|addr| !addr.is_empty())
+                .map(str::to_owned)
+                .collect()
+        };
+
         if !errors.is_empty() {
             return Err(ConfigError::new(errors.join("; ")));
         }
@@ -129,6 +165,7 @@ impl SearcherConfig {
             disable_hybrid_search,
             exhaustive_request_logging_enabled,
             gitserver_addrs,
+            zoekt_addrs,
         })
     }
 
@@ -263,5 +300,20 @@ mod tests {
         assert_eq!(config.max_total_paths_length, 100_000);
         assert!(!config.disable_hybrid_search);
         assert!(!config.exhaustive_request_logging_enabled);
+        // With no zoekt configured, hybrid search is disabled.
+        let _ = &config.zoekt_addrs;
     }
+
+    #[test]
+    fn reads_zoekt_addresses_from_the_environment() {
+        // `EnvReader::get` reads the process environment; guard the mutation.
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        std::env::set_var("SRC_ZOEKT_SERVERS", "zoekt-0:6070, zoekt-1:6070");
+        let mut env = EnvReader::new();
+        let config = SearcherConfig::load(&mut env).expect("load");
+        std::env::remove_var("SRC_ZOEKT_SERVERS");
+        assert_eq!(config.zoekt_addrs, vec!["zoekt-0:6070", "zoekt-1:6070"]);
+    }
+
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 }

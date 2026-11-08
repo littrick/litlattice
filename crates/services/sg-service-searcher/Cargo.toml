@@ -12,6 +12,7 @@ sg-git = { path = "../../domain/sg-git" }
 sg-http = { path = "../../net/sg-http" }
 sg-metrics = { path = "../../base/sg-metrics" }
 sg-proto = { path = "../../net/sg-proto" }
+sg-zoekt = { path = "../../domain/sg-zoekt" }
 async-trait = { workspace = true }
 bytes = { workspace = true }
 http = { workspace = true }

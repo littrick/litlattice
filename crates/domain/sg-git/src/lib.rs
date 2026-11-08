@@ -154,18 +154,23 @@ impl GitserverClient {
             head: head.as_bytes().to_vec(),
         };
 
+        let error = |status: tonic::Status| {
+            let message = format!("changed files {repo} {base}..{head}: {status}");
+            if status.code() == tonic::Code::NotFound {
+                Error::NotFound(message)
+            } else {
+                Error::Message(message)
+            }
+        };
+
         let mut response = client
             .changed_files(request)
             .await
-            .map_err(|status| {
-                Error::Message(format!("changed files {repo} {base}..{head}: {status}"))
-            })?
+            .map_err(error)?
             .into_inner();
 
         let mut files = Vec::new();
-        while let Some(chunk) = response.message().await.map_err(|status| {
-            Error::Message(format!("changed files {repo} {base}..{head}: {status}"))
-        })? {
+        while let Some(chunk) = response.message().await.map_err(error)? {
             for file in chunk.files {
                 let status = match pb::changed_file::Status::try_from(file.status) {
                     Ok(pb::changed_file::Status::Added) => ChangeStatus::Added,

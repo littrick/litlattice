@@ -6,4 +6,18 @@ rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 
+[lib]
+# The vendored zoekt protos carry Apache license headers with ASCII diagrams
+# that rustdoc parses as doctests.
+doctest = false
+
 [dependencies]
+prost = { workspace = true }
+prost-types = { workspace = true }
+roaring = "0.10"
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tonic = { workspace = true }
+
+[build-dependencies]
+tonic-build = { workspace = true }
