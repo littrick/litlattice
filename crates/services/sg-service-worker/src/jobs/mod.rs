@@ -35,6 +35,7 @@ use crate::config::WorkerConfigs;
 use crate::framework::BackgroundRoutine;
 use crate::registry;
 
+pub mod batches;
 pub mod encryption;
 pub mod eventlogs;
 pub mod executors;
@@ -144,6 +145,7 @@ pub fn all_jobs() -> Vec<(&'static str, Arc<dyn Job>)> {
         .map(|&name| {
             let job: Arc<dyn Job> = match name {
                 "aggregated-users-statistics" => Arc::new(users::AggregatedUsersStatistics),
+                "batches-janitor" => Arc::new(batches::BatchesJanitor::new()),
                 "event-logs-janitor" => Arc::new(eventlogs::EventLogsJanitor),
                 "executors-janitor" => Arc::new(executors::ExecutorsJanitor::new()),
                 "executors-metricsserver" => {
