@@ -11,8 +11,8 @@
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use http::{header, Request, Response, StatusCode};
-use http_body_util::Full;
+use http::{header, Method, Request, Response, StatusCode};
+use http_body_util::{BodyExt, Full};
 use hyper::body::{Bytes, Incoming};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
@@ -61,12 +61,14 @@ pub async fn serve(addr: &str, context: Arc<DebugContext>, shutdown: Cancellatio
 pub fn handler(context: Arc<DebugContext>) -> sg_http::HttpHandler {
     Arc::new(move |req: Request<Incoming>| {
         let context = Arc::clone(&context);
-        Box::pin(async move { route(&context, &req).await })
+        Box::pin(async move { route(&context, req).await })
     })
 }
 
-async fn route(context: &DebugContext, req: &Request<Incoming>) -> Response<tonic::body::BoxBody> {
-    match req.uri().path() {
+async fn route(context: &DebugContext, req: Request<Incoming>) -> Response<tonic::body::BoxBody> {
+    // Owned so the request can be moved into `manual_purge` for its body.
+    let path = req.uri().path().to_owned();
+    match path.as_str() {
         "/metrics" => {
             // The baseline registers the state families as `GaugeFunc`s, so
             // each scrape recomputes them from the database.
@@ -81,17 +83,17 @@ async fn route(context: &DebugContext, req: &Request<Incoming>) -> Response<toni
             )
         }
         "/repo-updater-state" => {
-            // `repoUpdaterStatsHandler`: JSON is the only non-HTML rendering
-            // implemented here; `format=json` is what the baseline's UI and
-            // debug tooling request.
+            // `repoUpdaterStatsHandler`: the baseline renders an HTML table
+            // unless `format=json`; this port always serves the JSON body
+            // (documented divergence). With `format=json` the output matches
+            // the baseline byte for byte: same field order, `null` for nil
+            // slices, and no trailing newline.
             let query = req.uri().query().unwrap_or_default();
-            // The baseline renders an HTML table unless `format=json`;
-            // serving the JSON body in both cases keeps the endpoint
-            // machine-readable (documented divergence).
-            let want_dumper = query_param(query, "dumper");
-            let dumper = want_dumper.unwrap_or_else(|| "repos".to_owned());
-            if dumper != "repos" {
-                return text(StatusCode::OK, "application/json", "[]");
+            let want_dumper = query_param(query, "dumper").unwrap_or_default();
+            if !matches!(want_dumper.as_str(), "" | "repos") {
+                // `dumps` stays nil when no dumper matches: `json.MarshalIndent`
+                // then writes `null`.
+                return text(StatusCode::OK, "application/json", "null");
             }
             text(
                 StatusCode::OK,
@@ -99,44 +101,52 @@ async fn route(context: &DebugContext, req: &Request<Incoming>) -> Response<toni
                 state_json(&context.scheduler, &context.sync_jobs).await,
             )
         }
-        "/manual-purge" => manual_purge(context, req.uri().query().unwrap_or_default()).await,
+        "/manual-purge" => manual_purge(context, req).await,
         "/" => text(StatusCode::OK, "text/html; charset=utf-8", INDEX_HTML),
         // Go's `http.NotFound`.
-        _ => text(
-            StatusCode::NOT_FOUND,
-            "text/plain; charset=utf-8",
-            "404 page not found\n",
-        ),
+        _ => go_error(StatusCode::NOT_FOUND, "404 page not found"),
     }
 }
 
-/// `manualPurgeHandler`.
-async fn manual_purge(context: &DebugContext, query: &str) -> Response<tonic::body::BoxBody> {
+/// `manualPurgeHandler`. `r.FormValue` reads the URL query and, for
+/// `POST`/`PUT`/`PATCH` with an urlencoded body, the body too (body values
+/// come first, like `net/http`'s `r.Form`).
+async fn manual_purge(
+    context: &DebugContext,
+    req: Request<Incoming>,
+) -> Response<tonic::body::BoxBody> {
+    let params = form_params(req).await;
+    let limit_param = form_value(&params, "limit").unwrap_or_default();
     // `r.FormValue("limit")` returns "" when the parameter is absent, and
     // `strconv.Atoi("")` fails; both surface as `invalid limit: ...`.
-    let limit_param = query_param(query, "limit").unwrap_or_default();
     let limit = match go_atoi(&limit_param) {
         Ok(limit) => limit,
-        Err(err) => return bad_request(&format!("invalid limit: {err}")),
+        Err(err) => return go_error(StatusCode::BAD_REQUEST, &format!("invalid limit: {err}")),
     };
     if limit <= 0 {
-        return bad_request("limit must be greater than 0");
+        return go_error(StatusCode::BAD_REQUEST, "limit must be greater than 0");
     }
     if limit > 10000 {
-        return bad_request("limit must be less than 10000");
+        return go_error(StatusCode::BAD_REQUEST, "limit must be less than 10000");
     }
 
     let mut per_second = 1.0;
-    if let Some(param) = query_param(query, "perSecond") {
+    if let Some(param) = form_value(&params, "perSecond") {
         if !param.is_empty() {
             per_second = match go_parse_float(&param) {
                 Ok(value) => value,
-                Err(err) => return bad_request(&format!("invalid per second rate limit: {err}")),
+                Err(err) => {
+                    return go_error(
+                        StatusCode::BAD_REQUEST,
+                        &format!("invalid per second rate limit: {err}"),
+                    );
+                }
             };
             if per_second <= 0.1 {
-                return bad_request(&format!(
-                    "invalid per second rate limit. Must be > 0.1, got {per_second:.6}"
-                ));
+                return go_error(
+                    StatusCode::BAD_REQUEST,
+                    &format!("invalid per second rate limit. Must be > 0.1, got {per_second:.6}"),
+                );
             }
         }
     }
@@ -158,87 +168,175 @@ async fn manual_purge(context: &DebugContext, query: &str) -> Response<tonic::bo
     }
 }
 
-fn bad_request(message: &str) -> Response<tonic::body::BoxBody> {
-    // `http.Error` writes text/plain and a trailing newline.
-    text(
-        StatusCode::BAD_REQUEST,
-        "text/plain; charset=utf-8",
-        format!("{message}\n"),
-    )
+/// `http.Error`: text/plain, `X-Content-Type-Options: nosniff`, and a
+/// trailing newline.
+fn go_error(status: StatusCode, message: &str) -> Response<tonic::body::BoxBody> {
+    let mut response = text(status, "text/plain; charset=utf-8", format!("{message}\n"));
+    response.headers_mut().insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        header::HeaderValue::from_static("nosniff"),
+    );
+    response
 }
 
 /// `UpdateScheduler.DebugDump` for the `repos` dumper, including
-/// `ExternalServices().GetSyncJobs`.
+/// `ExternalServices().GetSyncJobs`. The structs below mirror the Go types
+/// (`struct{Name; UpdateQueue; Schedule; SyncJobs}` and its members) so the
+/// JSON field order and `null`-for-nil-slice behavior are identical.
+#[derive(serde::Serialize)]
+struct RepoDump {
+    #[serde(rename = "ID")]
+    id: i32,
+    #[serde(rename = "Name")]
+    name: String,
+}
+
+#[derive(serde::Serialize)]
+struct QueueEntryDump {
+    #[serde(rename = "Repo")]
+    repo: RepoDump,
+    #[serde(rename = "Priority")]
+    priority: i32,
+    #[serde(rename = "Seq")]
+    seq: u64,
+    #[serde(rename = "Updating")]
+    updating: bool,
+}
+
+#[derive(serde::Serialize)]
+struct ScheduleEntryDump {
+    #[serde(rename = "Repo")]
+    repo: RepoDump,
+    #[serde(rename = "Interval")]
+    interval: i64,
+    #[serde(rename = "Due")]
+    due: String,
+}
+
+#[derive(serde::Serialize)]
+struct SyncJobDump {
+    #[serde(rename = "ID")]
+    id: i64,
+    #[serde(rename = "State")]
+    state: String,
+    #[serde(rename = "FailureMessage")]
+    failure_message: String,
+    #[serde(rename = "QueuedAt")]
+    queued_at: String,
+    #[serde(rename = "StartedAt")]
+    started_at: String,
+    #[serde(rename = "FinishedAt")]
+    finished_at: String,
+    #[serde(rename = "ProcessAfter")]
+    process_after: String,
+    #[serde(rename = "NumResets")]
+    num_resets: i32,
+    #[serde(rename = "ExternalServiceID")]
+    external_service_id: i64,
+    #[serde(rename = "NumFailures")]
+    num_failures: i32,
+    #[serde(rename = "Cancel")]
+    cancel: bool,
+    #[serde(rename = "ReposSynced")]
+    repos_synced: i32,
+    #[serde(rename = "RepoSyncErrors")]
+    repo_sync_errors: i32,
+    #[serde(rename = "ReposAdded")]
+    repos_added: i32,
+    #[serde(rename = "ReposDeleted")]
+    repos_deleted: i32,
+    #[serde(rename = "ReposModified")]
+    repos_modified: i32,
+    #[serde(rename = "ReposUnmodified")]
+    repos_unmodified: i32,
+}
+
+#[derive(serde::Serialize)]
+struct StateDump {
+    #[serde(rename = "Name")]
+    name: &'static str,
+    #[serde(rename = "UpdateQueue")]
+    update_queue: Option<Vec<QueueEntryDump>>,
+    #[serde(rename = "Schedule")]
+    schedule: Option<Vec<ScheduleEntryDump>>,
+    #[serde(rename = "SyncJobs")]
+    sync_jobs: Option<Vec<SyncJobDump>>,
+}
+
+/// Go marshals nil slices as `null`; both dumper loops start from nil.
+fn non_empty<T>(values: Vec<T>) -> Option<Vec<T>> {
+    (!values.is_empty()).then_some(values)
+}
+
 pub async fn state_json(scheduler: &UpdateScheduler, jobs: &SyncJobsStore) -> String {
-    let queue: Vec<serde_json::Value> = scheduler
+    let queue: Vec<QueueEntryDump> = scheduler
         .debug_queue()
         .into_iter()
-        .map(|update| {
-            serde_json::json!({
-                "Repo": { "ID": update.repo.id, "Name": update.repo.name },
-                "Priority": update.priority as i32,
-                "Seq": update.seq,
-                "Updating": update.updating,
-            })
+        .map(|update| QueueEntryDump {
+            repo: RepoDump {
+                id: update.repo.id,
+                name: update.repo.name,
+            },
+            priority: update.priority as i32,
+            seq: update.seq,
+            updating: update.updating,
         })
         .collect();
-    let schedule: Vec<serde_json::Value> = scheduler
+    let schedule: Vec<ScheduleEntryDump> = scheduler
         .debug_schedule()
         .into_iter()
-        .map(|entry| {
-            serde_json::json!({
-                "Repo": { "ID": entry.repo.id, "Name": entry.repo.name },
-                // `time.Duration` marshals as an integer number of
-                // nanoseconds.
-                "Interval": entry.interval.as_nanos() as i64,
-                "Due": format_rfc3339(entry.due),
-            })
+        .map(|entry| ScheduleEntryDump {
+            repo: RepoDump {
+                id: entry.repo.id,
+                name: entry.repo.name,
+            },
+            // `time.Duration` marshals as an integer number of nanoseconds.
+            interval: entry.interval.as_nanos() as i64,
+            due: format_rfc3339(entry.due),
         })
         .collect();
 
     // A failed query leaves `SyncJobs` nil in the baseline, which marshals
-    // as `null`.
+    // as `null`; so does an empty result (`basestore.NewSliceScanner`
+    // returns a nil slice).
     let sync_jobs = match jobs.list_sync_jobs().await {
-        Ok(jobs) => serde_json::Value::Array(
+        Ok(jobs) => non_empty(
             jobs.into_iter()
-                .map(|job| {
-                    serde_json::json!({
-                        "ID": job.id,
-                        "State": job.state,
-                        "FailureMessage": job.failure_message.unwrap_or_default(),
-                        "QueuedAt": format_optional_time(job.queued_at),
-                        "StartedAt": format_optional_time(job.started_at),
-                        "FinishedAt": format_optional_time(job.finished_at),
-                        "ProcessAfter": format_optional_time(job.process_after),
-                        "NumResets": job.num_resets,
-                        "ExternalServiceID": job.external_service_id,
-                        "NumFailures": job.num_failures,
-                        "Cancel": job.cancel,
-                        "ReposSynced": job.repos_synced,
-                        "RepoSyncErrors": job.repo_sync_errors,
-                        "ReposAdded": job.repos_added,
-                        "ReposDeleted": job.repos_deleted,
-                        "ReposModified": job.repos_modified,
-                        "ReposUnmodified": job.repos_unmodified,
-                    })
+                .map(|job| SyncJobDump {
+                    id: job.id as i64,
+                    state: job.state,
+                    failure_message: job.failure_message.unwrap_or_default(),
+                    queued_at: format_optional_time(job.queued_at),
+                    started_at: format_optional_time(job.started_at),
+                    finished_at: format_optional_time(job.finished_at),
+                    process_after: format_optional_time(job.process_after),
+                    num_resets: job.num_resets,
+                    external_service_id: job.external_service_id,
+                    num_failures: job.num_failures,
+                    cancel: job.cancel,
+                    repos_synced: job.repos_synced,
+                    repo_sync_errors: job.repo_sync_errors,
+                    repos_added: job.repos_added,
+                    repos_deleted: job.repos_deleted,
+                    repos_modified: job.repos_modified,
+                    repos_unmodified: job.repos_unmodified,
                 })
                 .collect(),
         ),
         Err(err) => {
             tracing::warn!(error = %err, "getting external service sync jobs for debug page");
-            serde_json::Value::Null
+            None
         }
     };
 
-    let dump = serde_json::json!([{
-        "Name": "repos",
-        "UpdateQueue": queue,
-        "Schedule": schedule,
-        "SyncJobs": sync_jobs,
-    }]);
-    let mut rendered = serde_json::to_string_pretty(&dump).expect("serialize debug dump");
-    rendered.push('\n');
-    rendered
+    let dump = StateDump {
+        name: "repos",
+        update_queue: non_empty(queue),
+        schedule: non_empty(schedule),
+        sync_jobs,
+    };
+    // `json.MarshalIndent` writes no trailing newline.
+    serde_json::to_string_pretty(&[dump]).expect("serialize debug dump")
 }
 
 /// Go's zero `time.Time` renders as `0001-01-01T00:00:00Z`.
@@ -249,15 +347,77 @@ fn format_optional_time(time: Option<sg_db::OffsetDateTime>) -> String {
     }
 }
 
+/// Query-string parameter, like `url.Values.Get`.
 fn query_param(query: &str, name: &str) -> Option<String> {
-    query.split('&').find_map(|pair| {
-        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
-        (key == name).then(|| percent_decode(value))
-    })
+    form_value(&parse_form(query), name)
 }
 
-fn percent_decode(value: &str) -> String {
-    value.replace("%20", " ").replace('+', " ")
+/// First value for `name`, matching `url.Values.Get`.
+fn form_value(params: &[(String, String)], name: &str) -> Option<String> {
+    params
+        .iter()
+        .find(|(key, _)| key == name)
+        .map(|(_, value)| value.clone())
+}
+
+/// `r.FormValue` input: `net/http` puts urlencoded POST/PUT/PATCH body values
+/// before the URL query values in `r.Form`.
+async fn form_params(req: Request<Incoming>) -> Vec<(String, String)> {
+    let mut params = Vec::new();
+    let parses_body = matches!(*req.method(), Method::POST | Method::PUT | Method::PATCH)
+        && req
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.starts_with("application/x-www-form-urlencoded"));
+    let query = req.uri().query().unwrap_or_default().to_owned();
+    if parses_body {
+        // `ParseForm` caps bodies at 10 MiB; debug requests are far smaller.
+        match req.into_body().collect().await {
+            Ok(body) => params.extend(parse_form(&String::from_utf8_lossy(&body.to_bytes()))),
+            Err(err) => tracing::warn!(error = %err, "reading manual purge form body"),
+        }
+    }
+    params.extend(parse_form(&query));
+    params
+}
+
+/// `url.ParseQuery` for the subset `FormValue` sees: `&`-separated pairs,
+/// `+` as space and `%XX` escapes.
+fn parse_form(input: &str) -> Vec<(String, String)> {
+    input
+        .split('&')
+        .filter(|pair| !pair.is_empty())
+        .map(|pair| {
+            let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+            (form_unescape(key), form_unescape(value))
+        })
+        .collect()
+}
+
+fn form_unescape(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'+' => out.push(b' '),
+            b'%' if i + 2 < bytes.len() => {
+                let high = (bytes[i + 1] as char).to_digit(16);
+                let low = (bytes[i + 2] as char).to_digit(16);
+                match (high, low) {
+                    (Some(high), Some(low)) => {
+                        out.push((high * 16 + low) as u8);
+                        i += 2;
+                    }
+                    _ => out.push(b'%'),
+                }
+            }
+            byte => out.push(byte),
+        }
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// `strconv.Atoi` error strings, so `/manual-purge`'s messages match the
@@ -402,5 +562,41 @@ mod tests {
     #[test]
     fn missing_times_use_the_go_zero_value() {
         assert_eq!(format_optional_time(None), "0001-01-01T00:00:00Z");
+    }
+
+    #[test]
+    fn form_values_unescape_like_net_url() {
+        assert_eq!(form_unescape("a+b%20c"), "a b c");
+        assert_eq!(form_unescape("%2B"), "+");
+        assert_eq!(form_unescape("100%"), "100%");
+        assert_eq!(
+            parse_form("limit=1&perSecond=0.5"),
+            vec![
+                ("limit".to_owned(), "1".to_owned()),
+                ("perSecond".to_owned(), "0.5".to_owned())
+            ]
+        );
+    }
+
+    /// The JSON shape mirrors `json.MarshalIndent`: struct field order and
+    /// `null` for nil slices, with no trailing newline.
+    #[test]
+    fn empty_state_dump_marshals_like_the_baseline() {
+        let dump = StateDump {
+            name: "repos",
+            update_queue: None,
+            schedule: None,
+            sync_jobs: None,
+        };
+        let text = serde_json::to_string_pretty(&[dump]).expect("serialize");
+        assert_eq!(
+            text,
+            "[
+  {
+    \"Name\": \"repos\",
+    \"UpdateQueue\": null,\n    \"Schedule\": null,\n    \"SyncJobs\": null
+  }
+]"
+        );
     }
 }
