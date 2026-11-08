@@ -6,3 +6,4 @@
 //! (`internal/workerutil`) follows with the queue job groups.
 
 pub mod periodic;
+pub mod recorder;

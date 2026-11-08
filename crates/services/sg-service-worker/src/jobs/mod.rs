@@ -216,7 +216,7 @@ pub async fn create_background_routines(
     while let Some(result) = set.join_next_with_id().await {
         match result {
             Ok((_, (name, Ok(routines)))) => {
-                for mut routine in routines {
+                for routine in routines {
                     routine.set_job_name(name);
                     all_routines.push(Arc::new(routine));
                 }

@@ -13,10 +13,13 @@ sg-db = { path = "../../data/sg-db" }
 sg-http = { path = "../../net/sg-http" }
 sg-keyring = { path = "../../domain/sg-keyring" }
 sg-metrics = { path = "../../base/sg-metrics" }
+sg-rcache = { path = "../../data/sg-rcache" }
+sg-redis = { path = "../../data/sg-redis" }
 async-trait = { workspace = true }
 http = { workspace = true }
 http-body-util = { workspace = true }
 hyper = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
 sqlx = { workspace = true }
 time = { workspace = true }

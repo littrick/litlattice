@@ -15,19 +15,26 @@
 //! * `Stop` cancels the handler context and waits for `Start` to return.
 //!
 //! Panic-to-error conversion is inherent in Rust (`tokio` task panics are
-//! observed on join); the recorder (`background-job-logger`) and per-operation
-//! tracing/metrics are not ported yet.
+//! observed on join); per-operation tracing/metrics are not ported yet.
+//!
+//! The `background-job-logger` recorder hooks (`LogStart` in `Start`,
+//! `LogStop` in `Stop`, `SaveKnownRoutine` + `LogRun` around every handler
+//! invocation) are ported; `Type()` is always `PERIODIC_WITH_METRICS` because
+//! `NewPeriodicGoroutine` installs a default (no-op) observation operation,
+//! which is what `typeFromOperations` keys off.
 
 use std::fmt;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use tokio::task::JoinSet;
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
+
+use super::recorder::{Recordable, Recorder, RoutineType};
 
 /// `newDefaultPeriodicRoutine`.
 pub const DEFAULT_INTERVAL: Duration = Duration::from_secs(1);
@@ -96,11 +103,15 @@ pub type GetConcurrency = Arc<dyn Fn() -> usize + Send + Sync>;
 pub struct PeriodicRoutine {
     name: String,
     description: String,
-    job_name: String,
+    /// `SetJobName` runs after construction but before `Start`, and the
+    /// recorder reads it from shared references.
+    job_name: Mutex<String>,
     get_interval: GetInterval,
     get_concurrency: GetConcurrency,
     initial_delay: Duration,
     handler: Arc<dyn Handler>,
+    /// `PeriodicGoroutine.recorder`; `None` disables the hooks.
+    recorder: Mutex<Option<Arc<Recorder>>>,
     /// `PeriodicGoroutine.reinvocations`, shared by the pool's workers.
     reinvocations: AtomicU32,
 }
@@ -110,11 +121,12 @@ impl PeriodicRoutine {
         Self {
             name: "<unnamed periodic routine>".to_owned(),
             description: "<no description provided>".to_owned(),
-            job_name: String::new(),
+            job_name: Mutex::new(String::new()),
             get_interval: Arc::new(|| DEFAULT_INTERVAL),
             get_concurrency: Arc::new(|| DEFAULT_CONCURRENCY),
             initial_delay: Duration::ZERO,
             handler,
+            recorder: Mutex::new(None),
             reinvocations: AtomicU32::new(0),
         }
     }
@@ -181,13 +193,17 @@ impl PeriodicRoutine {
         (self.get_concurrency)()
     }
 
-    pub fn job_name(&self) -> &str {
-        &self.job_name
+    pub fn job_name(&self) -> String {
+        self.job_name.lock().expect("job name lock").clone()
     }
 
-    /// `SetJobName` (recorder metadata; the recorder itself is not ported).
-    pub fn set_job_name(&mut self, job_name: impl Into<String>) {
-        self.job_name = job_name.into();
+    /// `SetJobName` (recorder metadata).
+    pub fn set_job_name(&self, job_name: impl Into<String>) {
+        *self.job_name.lock().expect("job name lock") = job_name.into();
+    }
+
+    fn recorder(&self) -> Option<Arc<Recorder>> {
+        self.recorder.lock().expect("recorder lock").clone()
     }
 
     /// `Start` on the given tracker. `shutdown` is the process/service
@@ -198,6 +214,18 @@ impl PeriodicRoutine {
     }
 
     async fn start(self: Arc<Self>, shutdown: CancellationToken) {
+        if let Some(recorder) = self.recorder() {
+            recorder.log_start(self.as_ref()).await;
+        }
+
+        Arc::clone(&self).run_pool(shutdown).await;
+
+        if let Some(recorder) = self.recorder() {
+            recorder.log_stop(self.as_ref()).await;
+        }
+    }
+
+    async fn run_pool(self: Arc<Self>, shutdown: CancellationToken) {
         let mut concurrency = (self.get_concurrency)();
         loop {
             let pool_cancel = CancellationToken::new();
@@ -282,6 +310,7 @@ impl PeriodicRoutine {
         };
 
         let handler = Arc::clone(&self.handler);
+        let started = Instant::now();
         let mut handle_fut = Box::pin(handler.handle(handler_cancel));
         let mut cancel_watch = Box::pin(cancel_watch);
         let mut cancelled = false;
@@ -299,6 +328,30 @@ impl PeriodicRoutine {
                 }
             }
         };
+
+        let duration = started.elapsed();
+
+        // `errorFilter`: shutdown errors and reinvoke-immediately requests are
+        // not recorded as errors.
+        let recorded_error = match &result {
+            Ok(()) => None,
+            Err(error) => {
+                if shutdown.is_cancelled()
+                    || pool_cancel.is_cancelled()
+                    || error.is_reinvoke_immediately()
+                {
+                    None
+                } else {
+                    Some(error.message().to_owned())
+                }
+            }
+        };
+        if let Some(recorder) = self.recorder() {
+            recorder.save_known_routine(self.as_ref()).await;
+            recorder
+                .log_run(self.as_ref(), duration, recorded_error.as_deref())
+                .await;
+        }
 
         let reinvoke = match result {
             Ok(()) => false,
@@ -330,6 +383,39 @@ impl PeriodicRoutine {
 
         self.reinvocations.store(0, Ordering::SeqCst);
         (self.get_interval)()
+    }
+}
+
+/// `PeriodicGoroutine`'s `recorder.Recordable` implementation.
+impl Recordable for PeriodicRoutine {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// `typeFromOperations`: `NewPeriodicGoroutine` always installs a default
+    /// operation, so this is `PERIODIC_WITH_METRICS`.
+    fn routine_type(&self) -> RoutineType {
+        RoutineType::PeriodicWithMetrics
+    }
+
+    fn job_name(&self) -> String {
+        PeriodicRoutine::job_name(self)
+    }
+
+    fn set_job_name(&self, job_name: &str) {
+        PeriodicRoutine::set_job_name(self, job_name);
+    }
+
+    fn description(&self) -> &str {
+        &self.description
+    }
+
+    fn interval(&self) -> Duration {
+        (self.get_interval)()
+    }
+
+    fn register_recorder(&self, recorder: Arc<Recorder>) {
+        *self.recorder.lock().expect("recorder lock") = Some(recorder);
     }
 }
 

@@ -13,7 +13,10 @@
 //! * 9.8b — `internal/goroutine.PeriodicGoroutine`, the `job.Job` /
 //!   `env.Config` contracts, `loadConfigs` / `validateConfigs` /
 //!   `createBackgroundRoutines` / `emitJobCountMetrics`, the live
-//!   configuration watcher and the first job (`webhook-log-janitor`).
+//!   configuration watcher and the first job (`webhook-log-janitor`);
+//! * 9.8c-9.8g — the database-backed janitor/statistics jobs, the
+//!   `gitserver-metrics` gauges, the `SRC_PROF_HTTP` debug server, and the
+//!   `background-job-logger` recorder on top of `sg-rcache`.
 //!
 //! Jobs that are not ported yet fail startup when enabled; the pilot narrows
 //! `WORKER_JOB_ALLOWLIST` to the ported jobs.
@@ -36,6 +39,7 @@ pub mod jobs;
 pub mod registry;
 
 use config::WorkerConfigs;
+use framework::recorder::{Recordable, Recorder};
 use jobs::{Job, JobDeps};
 
 pub const SERVICE_NAME: &str = "worker";
@@ -198,12 +202,38 @@ impl Service for WorkerService {
             .await
             .map_err(ServiceError::new)?;
         let routine_count = routines.len();
+
+        // `recorder.GetCache()` + `recorder.New(logger, env.MyName, cache)`:
+        // register every recordable routine and publish `knownJobNames`,
+        // `knownHostNames` and `knownRoutines` before the routines start.
+        let _recorder = match sg_redis::KeyValue::connect(&sg_redis::cache_endpoint()).await {
+            Ok(kv) => {
+                let recorder = Recorder::new(Recorder::cache(kv), Recorder::process_name());
+                for routine in &routines {
+                    let recordable: Arc<dyn Recordable> =
+                        Arc::clone(routine) as Arc<dyn Recordable>;
+                    routine.register_recorder(Arc::clone(&recorder));
+                    recorder.register(recordable);
+                }
+                recorder.registration_done().await;
+                Some(recorder)
+            }
+            Err(err) => {
+                // The Go pool connects lazily, so an unreachable Redis never
+                // fails startup; here the recorder is simply disabled.
+                tracing::warn!(
+                    error = %err,
+                    "background-job-logger disabled: redis unavailable"
+                );
+                None
+            }
+        };
+
         for routine in routines {
             routine.spawn(&tracker, ctx.shutdown.clone());
         }
 
-        // `ready()`: every routine is set up; the recorder
-        // (`background-job-logger`) is not ported yet.
+        // `ready()`: every routine is set up.
         ctx.ready.mark_ready();
 
         // `internal/debugserver`: exposes the process registry on
