@@ -1,23 +1,27 @@
 #![forbid(unsafe_code)]
 
-//! `internal/authz/providers/providers.go`: `ProvidersFromConfig`, reduced to
-//! the provider identities (`URN`, `ServiceType`, `ServiceID`) plus the
-//! validation problems, warnings and invalid connections the baseline returns.
+//! `internal/authz/providers/providers.go`: `ProvidersFromConfig`, producing
+//! the constructed providers plus the validation problems, warnings and
+//! invalid connections the baseline returns.
 //!
 //! Ported kind: GitHub (`internal/authz/providers/github/authz.go`). The
 //! discovery loop lists the same seven external service kinds, parses and
 //! decrypts each configuration and constructs a GitHub authz provider exactly
 //! like `github.NewAuthzProviders` (authorization gate, ACLs license, URL
 //! parsing, `groupsCacheTTL` defaults, the `allowGroupsPermissionsSync`
-//! warning). Connections of the other kinds are discovered but produce no
-//! provider yet (docs §60.4); the fixture therefore only contains GitHub and
-//! unauthorized non-GitHub services.
+//! warning and the cache it forcibly disables). Each provider is wired with a
+//! [`GithubRestClient`] for the code host and, when `authorization.groupsCacheTTL`
+//! is positive, a [`RedisGroupsCache`] over the caller's Redis pool — the same
+//! `gh_groups_perms:<serviceID>:<urn>` key space as the baseline.
 //!
-//! The GitHub provider's fetch methods are not ported yet, so this module is
-//! not wired into the permission syncer. It exists so the scheduler and the
-//! syncer can share one implementation once the GitHub client lands.
+//! Not ported yet: GitHub App authentication (`gitHubAppDetails` /
+//! `githubAppInstallationID`) is reported as a serious problem because the
+//! installation-token auther is not available; connections of the other kinds
+//! are discovered but produce no provider (docs §60.4); and the provider is not
+//! yet registered with the permission syncer.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use serde_json::Value;
 use sg_config::SiteConfiguration;
@@ -25,6 +29,12 @@ use sg_db::external_services::{ExternalService, ExternalServiceStore};
 use sg_keyring::Keyring;
 use sqlx::postgres::PgPool;
 use url::Url;
+
+use super::authz_github::{
+    GithubRepoPermsProvider, GroupsCache, MemoryGroupsCache, RedisGroupsCache,
+};
+use super::authz_github_client::GithubRestClient;
+use super::perms_syncer::AuthzProvider;
 
 /// `providers.ProvidersFromConfig`'s external service kinds, in its order.
 pub const AUTHZ_SERVICE_KINDS: &[&str] = &[
@@ -46,18 +56,11 @@ pub const TYPE_GITHUB: &str = "github";
 /// `schema.DefaultGitHubURL`.
 const DEFAULT_GITHUB_URL: &str = "https://github.com/";
 
-/// The identity of one constructed `authz.Provider`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ProviderIdentity {
-    pub urn: String,
-    pub service_type: String,
-    pub service_id: String,
-}
-
 /// `authz/types.ProviderInitResult`.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Default)]
 pub struct ProviderInitResult {
-    pub providers: Vec<ProviderIdentity>,
+    /// `authz.Provider` instances, in construction order.
+    pub providers: Vec<Arc<dyn AuthzProvider>>,
     /// The baseline calls these "serious problems": they make Sourcegraph
     /// set `authz.allowAccessByDefault` to false.
     pub serious_problems: Vec<String>,
@@ -67,7 +70,7 @@ pub struct ProviderInitResult {
 }
 
 /// Inputs `ProvidersFromConfig` reads from global state in the baseline.
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct ProvidersOptions {
     /// `licensing.Check(licensing.FeatureACLs)`: `None` when the current
     /// license activates the feature, otherwise the error text to report as a
@@ -75,6 +78,10 @@ pub struct ProvidersOptions {
     pub acls_license_error: Option<String>,
     /// `ExperimentalFeatures.EnableGithubInternalRepoVisibility`.
     pub enable_github_internal_repo_visibility: bool,
+    /// `redispool.Cache`, the Redis pool the groups cache uses. `None` falls
+    /// back to an in-memory cache for callers without a Redis pool; production
+    /// passes the shared pool so the cache lives in Redis like the baseline.
+    pub cache_kv: Option<sg_redis::KeyValue>,
 }
 
 /// One parsed GitHub external service.
@@ -83,11 +90,11 @@ struct GithubConnection {
     config: Value,
 }
 
-/// The provider state `ProviderInitResult` cannot express but the
-/// `allowGroupsPermissionsSync` warning needs.
-struct GithubProviderState {
-    identity: ProviderIdentity,
-    groups_cache: bool,
+/// One constructed GitHub provider plus the warning the
+/// `allowGroupsPermissionsSync` check emitted (if any).
+struct GithubProviderBuild {
+    provider: Arc<GithubRepoPermsProvider>,
+    warning: Option<String>,
 }
 
 /// `ProvidersFromConfig`: list every authz-capable external service, then
@@ -188,8 +195,8 @@ fn github_new_authz_providers(
     let auth_providers = github_auth_providers(site);
 
     for conn in conns {
-        let provider = match new_github_authz_provider(conn, opts) {
-            Ok(Some(provider)) => provider,
+        let build = match new_github_authz_provider(conn, opts, &auth_providers) {
+            Ok(Some(build)) => build,
             Ok(None) => continue,
             Err(err) => {
                 result.invalid_connections.push(TYPE_GITHUB.to_owned());
@@ -198,22 +205,11 @@ fn github_new_authz_providers(
             }
         };
 
-        if let Some(auth_provider) = auth_providers.get(&provider.identity.service_id) {
-            if provider.groups_cache && !auth_provider.allow_groups_permissions_sync {
-                // Groups permissions require the auth provider to request the
-                // correct scopes.
-                let service_id = &provider.identity.service_id;
-                result.warnings.push(format!(
-                    "GitHub config for {service_id} has `authorization.groupsCacheTTL` enabled, but \
-                     the authentication provider matching {service_id:?} does not have \
-                     `allowGroupsPermissionsSync` enabled. Update the [**site \
-                     configuration**](/site-admin/configuration) in the appropriate entry in \
-                     [`auth.providers`](https://sourcegraph.com/docs/admin/auth) to enable this."
-                ));
-            }
+        if let Some(warning) = build.warning {
+            result.warnings.push(warning);
         }
-
-        result.providers.push(provider.identity);
+        let provider: Arc<dyn AuthzProvider> = build.provider;
+        result.providers.push(provider);
     }
 
     result
@@ -261,12 +257,13 @@ fn github_auth_providers(site: &SiteConfiguration) -> BTreeMap<String, GithubAut
     providers
 }
 
-/// `github.newAuthzProvider`, reduced to the provider state the init result
-/// exposes.
+/// `github.newAuthzProvider`: `Ok(None)` when authorization is disabled, `Err`
+/// for the baseline's "serious problems".
 fn new_github_authz_provider(
     conn: &GithubConnection,
     opts: &ProvidersOptions,
-) -> Result<Option<GithubProviderState>, String> {
+    auth_providers: &BTreeMap<String, GithubAuthProviderRef>,
+) -> Result<Option<GithubProviderBuild>, String> {
     let Some(authorization) = conn
         .config
         .get("authorization")
@@ -287,24 +284,104 @@ fn new_github_authz_provider(
     let base_url = Url::parse(raw_url)
         .map_err(|err| format!("could not parse URL for GitHub instance {raw_url:?}: {err}"))?;
 
+    // The schema type is `float64`; the baseline casts the hours to
+    // `time.Duration` (truncating to whole nanoseconds) and then to seconds.
     // "Disable by default for now": a non-positive TTL disables the groups
     // cache; a positive TTL enables it.
-    let groups_cache_ttl = authorization
+    let groups_cache_ttl_hours = authorization
         .get("groupsCacheTTL")
-        .and_then(Value::as_i64)
-        .unwrap_or(0);
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0);
 
-    // `GroupsCacheTTL >= 0` after the baseline's `<= 0` coercion.
-    let groups_cache = groups_cache_ttl > 0;
+    let service_id = normalize_base_url(&base_url);
+    let urn = sg_extsvc::urn(&conn.service.kind, conn.service.id);
 
-    Ok(Some(GithubProviderState {
-        identity: ProviderIdentity {
-            urn: sg_extsvc::urn(&conn.service.kind, conn.service.id),
-            service_type: TYPE_GITHUB.to_owned(),
-            service_id: normalize_base_url(&base_url),
-        },
+    // `NewAuthzProviders`: the groups cache requires the matching login
+    // provider to request the right scopes; otherwise warn and forcibly
+    // disable the cache.
+    let mut groups_cache_enabled = groups_cache_ttl_hours > 0.0;
+    let warning = match auth_providers.get(&service_id) {
+        Some(auth_provider)
+            if groups_cache_enabled && !auth_provider.allow_groups_permissions_sync =>
+        {
+            groups_cache_enabled = false;
+            Some(format!(
+                "GitHub config for {service_id} has `authorization.groupsCacheTTL` enabled, but \
+                 the authentication provider matching {service_id:?} does not have \
+                 `allowGroupsPermissionsSync` enabled. Update the [**site \
+                 configuration**](/site-admin/configuration) in the appropriate entry in \
+                 [`auth.providers`](https://sourcegraph.com/docs/admin/auth) to enable this."
+            ))
+        }
+        _ => None,
+    };
+
+    // `auth.FromConnection` (GitHub App installation tokens) is not ported;
+    // report it the way the baseline reports a failure to build the auther.
+    if has_github_app_details(&conn.config) {
+        return Err(
+            "GitHub App authentication is not supported by the Rust authz provider yet".to_owned(),
+        );
+    }
+
+    let token = conn
+        .config
+        .get("token")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    let client = Arc::new(GithubRestClient::new(
+        &base_url,
+        Some(token),
+        opts.enable_github_internal_repo_visibility,
+    ));
+
+    let groups_cache: Option<Arc<dyn GroupsCache>> = if groups_cache_enabled {
+        let ttl_seconds = (groups_cache_ttl_hours * 3600.0).trunc() as i64;
+        let cache: Arc<dyn GroupsCache> = match &opts.cache_kv {
+            Some(kv) => Arc::new(RedisGroupsCache::with_ttl(
+                kv.clone(),
+                &service_id,
+                &urn,
+                ttl_seconds,
+            )),
+            None => {
+                tracing::warn!(
+                    service_id = %service_id,
+                    "no Redis pool configured for the GitHub groups cache; using an in-memory cache"
+                );
+                Arc::new(MemoryGroupsCache::default())
+            }
+        };
+        Some(cache)
+    } else {
+        None
+    };
+
+    let provider = Arc::new(GithubRepoPermsProvider::new(
+        urn,
+        service_id,
+        TYPE_GITHUB,
+        base_url.host_str().unwrap_or_default().to_owned(),
+        client,
         groups_cache,
-    }))
+        opts.enable_github_internal_repo_visibility,
+    ));
+
+    Ok(Some(GithubProviderBuild { provider, warning }))
+}
+
+/// `GitHubConnection.GitHubAppDetails != nil`: the current `gitHubAppDetails`
+/// object or the deprecated `githubAppInstallationID`.
+fn has_github_app_details(config: &Value) -> bool {
+    let has_details = config
+        .get("gitHubAppDetails")
+        .is_some_and(|value| !value.is_null());
+    let has_installation_id = config
+        .get("githubAppInstallationID")
+        .and_then(Value::as_str)
+        .is_some_and(|id| !id.is_empty());
+    has_details || has_installation_id
 }
 
 /// `extsvc.NormalizeBaseURL` + `url.URL.String()`: the host is lowercased and
@@ -322,4 +399,165 @@ fn normalize_base_url(url: &Url) -> String {
         normalized.set_path(&path);
     }
     normalized.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn github_conn(config: Value) -> GithubConnection {
+        GithubConnection {
+            service: ExternalService {
+                id: 1,
+                kind: "GITHUB".to_owned(),
+                display_name: String::new(),
+                config: String::new(),
+                encryption_key_id: String::new(),
+                last_sync_at: None,
+                next_sync_at: None,
+                unrestricted: false,
+                has_webhooks: None,
+                code_host_id: None,
+            },
+            config,
+        }
+    }
+
+    fn options() -> ProvidersOptions {
+        ProvidersOptions::default()
+    }
+
+    fn expect_err(result: Result<Option<GithubProviderBuild>, String>) -> String {
+        match result {
+            Ok(_) => panic!("expected a serious problem"),
+            Err(err) => err,
+        }
+    }
+
+    #[test]
+    fn no_authorization_builds_no_provider() {
+        let conn = github_conn(json!({"url": "https://github.example.com", "token": "t"}));
+        let build = new_github_authz_provider(&conn, &options(), &BTreeMap::new()).unwrap();
+        assert!(build.is_none());
+    }
+
+    #[test]
+    fn positive_ttl_attaches_groups_cache() {
+        let conn = github_conn(json!({
+            "url": "https://GITHUB.example.com:8443/",
+            "token": "t",
+            "authorization": {"groupsCacheTTL": 24}
+        }));
+        let build = new_github_authz_provider(&conn, &options(), &BTreeMap::new())
+            .unwrap()
+            .expect("provider");
+        assert!(build.warning.is_none());
+        assert_eq!(build.provider.urn(), "extsvc:github:1");
+        assert_eq!(build.provider.service_type(), TYPE_GITHUB);
+        assert_eq!(
+            build.provider.service_id(),
+            "https://github.example.com:8443/"
+        );
+        assert!(build.provider.groups_cache_enabled());
+    }
+
+    #[test]
+    fn non_positive_ttl_disables_groups_cache() {
+        for ttl in [json!(-1), json!(0), json!(null)] {
+            let conn = github_conn(json!({
+                "url": "https://github.example.com",
+                "token": "t",
+                "authorization": {"groupsCacheTTL": ttl}
+            }));
+            let build = new_github_authz_provider(&conn, &options(), &BTreeMap::new())
+                .unwrap()
+                .expect("provider");
+            assert!(!build.provider.groups_cache_enabled());
+        }
+    }
+
+    #[test]
+    fn login_provider_without_groups_sync_warns_and_disables_cache() {
+        let conn = github_conn(json!({
+            "url": "https://github.example.com",
+            "token": "t",
+            "authorization": {"groupsCacheTTL": 24}
+        }));
+        let mut auth_providers = BTreeMap::new();
+        auth_providers.insert(
+            "https://github.example.com/".to_owned(),
+            GithubAuthProviderRef {
+                allow_groups_permissions_sync: false,
+            },
+        );
+
+        let build = new_github_authz_provider(&conn, &options(), &auth_providers)
+            .unwrap()
+            .expect("provider");
+        let warning = build.warning.expect("warning");
+        assert!(warning.contains("does not have `allowGroupsPermissionsSync` enabled"));
+        assert!(!build.provider.groups_cache_enabled());
+    }
+
+    #[test]
+    fn login_provider_with_groups_sync_keeps_cache() {
+        let conn = github_conn(json!({
+            "url": "https://github.example.com",
+            "token": "t",
+            "authorization": {"groupsCacheTTL": 24}
+        }));
+        let mut auth_providers = BTreeMap::new();
+        auth_providers.insert(
+            "https://github.example.com/".to_owned(),
+            GithubAuthProviderRef {
+                allow_groups_permissions_sync: true,
+            },
+        );
+
+        let build = new_github_authz_provider(&conn, &options(), &auth_providers)
+            .unwrap()
+            .expect("provider");
+        assert!(build.warning.is_none());
+        assert!(build.provider.groups_cache_enabled());
+    }
+
+    #[test]
+    fn acls_license_error_is_a_serious_problem() {
+        let conn = github_conn(json!({
+            "url": "https://github.example.com",
+            "token": "t",
+            "authorization": {}
+        }));
+        let opts = ProvidersOptions {
+            acls_license_error: Some("acls unavailable".to_owned()),
+            ..ProvidersOptions::default()
+        };
+        let err = expect_err(new_github_authz_provider(&conn, &opts, &BTreeMap::new()));
+        assert_eq!(err, "acls unavailable");
+    }
+
+    #[test]
+    fn github_app_details_are_not_supported() {
+        for config in [
+            json!({
+                "url": "https://github.example.com",
+                "gitHubAppDetails": {"appID": 1, "installationID": 2},
+                "authorization": {}
+            }),
+            json!({
+                "url": "https://github.example.com",
+                "githubAppInstallationID": "2",
+                "authorization": {}
+            }),
+        ] {
+            let conn = github_conn(config);
+            let err = expect_err(new_github_authz_provider(
+                &conn,
+                &options(),
+                &BTreeMap::new(),
+            ));
+            assert!(err.contains("GitHub App authentication is not supported"));
+        }
+    }
 }

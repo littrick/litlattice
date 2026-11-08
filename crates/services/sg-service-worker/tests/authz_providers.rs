@@ -9,6 +9,7 @@
 
 use sg_config::SiteConfiguration;
 use sg_keyring::Keyring;
+use sg_redis::KeyValue;
 use sg_service_worker::jobs::authz_providers::{providers_from_config, ProvidersOptions};
 use sqlx::postgres::PgPool;
 
@@ -19,6 +20,11 @@ async fn authz_providers_matches_go_harness() {
     };
     let pool = PgPool::connect(&dsn).await.expect("connect");
     let keyring = Keyring::default();
+    let endpoint =
+        std::env::var("REDIS_CACHE_ENDPOINT").unwrap_or_else(|_| "127.0.0.1:6379".to_owned());
+    let cache_kv = KeyValue::connect(&endpoint)
+        .await
+        .expect("redis is required (set REDIS_CACHE_ENDPOINT)");
 
     let cases: [(&str, &str, Option<&str>); 5] = [
         ("plain", "{}", None),
@@ -49,6 +55,7 @@ async fn authz_providers_matches_go_harness() {
         let opts = ProvidersOptions {
             acls_license_error: license_error.map(str::to_owned),
             enable_github_internal_repo_visibility: false,
+            cache_kv: Some(cache_kv.clone()),
         };
         let result = providers_from_config(&pool, &site, &keyring, &opts).await;
 
@@ -62,7 +69,9 @@ async fn authz_providers_matches_go_harness() {
         for (i, provider) in result.providers.iter().enumerate() {
             println!(
                 "ap scenario={name} provider={i} urn={} type={} id={}",
-                provider.urn, provider.service_type, provider.service_id
+                provider.urn(),
+                provider.service_type(),
+                provider.service_id()
             );
         }
         for (i, problem) in result.serious_problems.iter().enumerate() {

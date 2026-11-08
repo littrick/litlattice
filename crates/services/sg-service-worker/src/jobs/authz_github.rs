@@ -402,6 +402,13 @@ impl GithubRepoPermsProvider {
         }
     }
 
+    /// Whether a groups cache is attached (i.e. `authorization.groupsCacheTTL`
+    /// is positive and the login provider did not force it off). Used by the
+    /// `ProvidersFromConfig` wiring tests.
+    pub fn groups_cache_enabled(&self) -> bool {
+        self.groups_cache.is_some()
+    }
+
     /// `getRepoAffiliatedGroups`: the org (admins-only when the org's default
     /// permission is not visible to all members) and, in that case, every team
     /// attached to the repository. A 404 from `GetOrganization` means the
