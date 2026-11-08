@@ -6,12 +6,18 @@
 //! the ASCII record separator (0x1E); every commit starts with that byte, so
 //! the scan is done with a small streaming parser instead of line splitting.
 //!
-//! Implemented so far: the non-diff query nodes (`author`, `committer`,
-//! `before`, `after`, `message`, booleans and operators), revision expansion,
-//! the `limit`/`limit_hit` semantics and `include_modified_files`. Diff nodes
-//! (`DiffMatches`, `DiffModifiesFile`) and `include_diff` need the persistent
-//! `git diff-tree` fetcher and the go-diff-compatible parser; until that slice
-//! lands they are reported as `UNIMPLEMENTED`.
+//! Implemented: the full query node set (`author`, `committer`, `before`,
+//! `after`, `message`, `diff`, `file`, booleans and operators), revision
+//! expansion, the `limit`/`limit_hit` semantics, `include_modified_files`
+//! (including the baseline's implicit `--name-status` when the query contains
+//! a `DiffModifiesFile` node) and `include_diff`.
+//!
+//! Diff queries run against a persistent `git diff-tree --stdin` subprocess
+//! (`search.DiffFetcher`): hashes are written one at a time, followed by the
+//! bogus `ENDOFPATCH` revision whose echoed name delimits the patch. Patches
+//! are parsed by [`crate::diff`], a port of go-diff, and the formatted output
+//! (`FormatDiff` with its 1 context line / 5 lines per hunk / 3 hunks per file
+//! / 5 files limits) mirrors the baseline byte for byte.
 //!
 //! Known divergence: the baseline compiles case-insensitive patterns by
 //! lower-casing the pattern and the haystack with an ASCII-only table
@@ -21,12 +27,17 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
 
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::process::{Child, ChildStdin, ChildStdout};
 use tokio_util::task::TaskTracker;
 
 use sg_proto::gitserver as gpb;
 
+use crate::diff::{self, FileDiff, Hunk};
 use crate::git::GitRepo;
 
 /// The baseline `commitSeparator`: ASCII record separator.
@@ -44,8 +55,15 @@ const COMMIT_FIELDS: usize = 11;
 const LOG_FORMAT: &str = "--format=format:%x1E%H%x00%D%x00%S%x00%aN%x00%aE%x00%at%x00%cN%x00\
      %cE%x00%ct%x00%B%x00%P%x00";
 
-const DIFF_UNSUPPORTED: &str = "diff search is not implemented by the Rust gitserver yet";
-const INCLUDE_DIFF_UNSUPPORTED: &str = "include_diff is not implemented by the Rust gitserver yet";
+/// Baseline `diff_format.go` constants.
+const MATCH_CONTEXT_LINES: usize = 1;
+const MAX_LINES_PER_HUNK: usize = 5;
+const MAX_HUNKS_PER_FILE: usize = 3;
+const MAX_FILES: usize = 5;
+
+/// The marker the diff fetcher appends to every request so the subprocess
+/// echoes it after the patch (`search.DiffFetcher`).
+const END_OF_PATCH: &[u8] = b"ENDOFPATCH\n";
 
 /// Errors surfaced by [`search`].
 #[derive(Debug, PartialEq, Eq)]
@@ -256,6 +274,10 @@ struct TimestampValue {
     nanos: i32,
 }
 
+type MatchFuture<'a> = Pin<
+    Box<dyn Future<Output = Result<(CommitFilterResult, MatchedCommit), SearchError>> + Send + 'a>,
+>;
+
 /// Baseline `search.MatchTree`.
 enum MatchTree {
     AuthorMatches(Regexp),
@@ -263,6 +285,8 @@ enum MatchTree {
     CommitBefore(TimestampValue),
     CommitAfter(TimestampValue),
     MessageMatches(Regexp),
+    DiffMatches(Regexp),
+    DiffModifiesFile(Regexp),
     Boolean(bool),
     Operator {
         kind: OperatorKind,
@@ -271,8 +295,7 @@ enum MatchTree {
 }
 
 impl MatchTree {
-    /// Baseline `ToMatchTree`. Diff nodes are rejected instead of fetching
-    /// diffs until the second search slice lands.
+    /// Baseline `ToMatchTree`.
     fn compile(node: &QueryNode) -> Result<Self, SearchError> {
         Ok(match node {
             QueryNode::AuthorMatches { expr, ignore_case } => {
@@ -292,8 +315,11 @@ impl MatchTree {
             QueryNode::MessageMatches { expr, ignore_case } => {
                 Self::MessageMatches(Regexp::compile(expr, *ignore_case)?)
             }
-            QueryNode::DiffMatches { .. } | QueryNode::DiffModifiesFile { .. } => {
-                return Err(SearchError::Unsupported(DIFF_UNSUPPORTED.to_owned()))
+            QueryNode::DiffMatches { expr, ignore_case } => {
+                Self::DiffMatches(Regexp::compile(expr, *ignore_case)?)
+            }
+            QueryNode::DiffModifiesFile { expr, ignore_case } => {
+                Self::DiffModifiesFile(Regexp::compile(expr, *ignore_case)?)
             }
             QueryNode::Boolean(value) => Self::Boolean(*value),
             QueryNode::Operator { kind, operands } => {
@@ -309,110 +335,242 @@ impl MatchTree {
         })
     }
 
-    fn matches(
-        &self,
-        commit: &LazyCommit,
-    ) -> Result<(CommitFilterResult, MatchedCommit), SearchError> {
-        match self {
-            Self::AuthorMatches(regexp) => {
-                let matched = regexp.is_match(&commit.raw.author_name)
-                    || regexp.is_match(&commit.raw.author_email);
-                Ok((
-                    CommitFilterResult::matched(matched),
-                    MatchedCommit::default(),
-                ))
-            }
-            Self::CommitterMatches(regexp) => {
-                let matched = regexp.is_match(&commit.raw.committer_name)
-                    || regexp.is_match(&commit.raw.committer_email);
-                Ok((
-                    CommitFilterResult::matched(matched),
-                    MatchedCommit::default(),
-                ))
-            }
-            Self::CommitBefore(time) => {
-                let date = commit.committer_date()?;
-                Ok((
-                    CommitFilterResult::matched(compare_timestamps(date, *time).is_lt()),
-                    MatchedCommit::default(),
-                ))
-            }
-            Self::CommitAfter(time) => {
-                let date = commit.committer_date()?;
-                Ok((
-                    CommitFilterResult::matched(compare_timestamps(date, *time).is_gt()),
-                    MatchedCommit::default(),
-                ))
-            }
-            Self::MessageMatches(regexp) => {
-                let found = regexp.find_all(&commit.raw.message);
-                if found.is_empty() {
-                    return Ok((CommitFilterResult::matched(false), MatchedCommit::default()));
+    /// Baseline `MatchTree.Match`. Async because diff nodes may have to fetch
+    /// and parse a patch; the recursion is boxed for that reason.
+    fn matches<'a, 'b>(&'a self, commit: &'a mut LazyCommit<'b>) -> MatchFuture<'a> {
+        Box::pin(async move {
+            match self {
+                Self::AuthorMatches(regexp) => {
+                    let matched = regexp.is_match(&commit.raw.author_name)
+                        || regexp.is_match(&commit.raw.author_email);
+                    Ok((
+                        CommitFilterResult::matched(matched),
+                        MatchedCommit::default(),
+                    ))
                 }
-                Ok((
-                    CommitFilterResult::matched(true),
-                    MatchedCommit {
-                        message: matches_to_ranges(&commit.raw.message, &found),
-                        diff: BTreeMap::new(),
-                    },
-                ))
-            }
-            Self::Boolean(value) => Ok((
-                CommitFilterResult::matched(*value),
-                MatchedCommit::default(),
-            )),
-            Self::Operator { kind, operands } => match kind {
-                OperatorKind::Not => {
-                    let Some(operand) = operands.first() else {
-                        return Err(SearchError::Message(
-                            "operator NOT has no operands".to_owned(),
-                        ));
-                    };
-                    let (mut result, _) = operand.matches(commit)?;
-                    result.invert();
-                    Ok((result, MatchedCommit::default()))
+                Self::CommitterMatches(regexp) => {
+                    let matched = regexp.is_match(&commit.raw.committer_name)
+                        || regexp.is_match(&commit.raw.committer_email);
+                    Ok((
+                        CommitFilterResult::matched(matched),
+                        MatchedCommit::default(),
+                    ))
                 }
-                OperatorKind::And => {
-                    let mut result_matches = MatchedCommit::default();
-                    // Start with everything matching, then intersect.
-                    let mut merged = CommitFilterResult {
-                        commit_matched: true,
-                        matched_file_diffs: None,
-                    };
-                    for operand in operands {
-                        let (result, matches) = operand.matches(commit)?;
-                        merged.intersect(&result);
-                        if !merged.satisfies() {
-                            return Ok((
-                                CommitFilterResult::matched(false),
-                                MatchedCommit::default(),
-                            ));
-                        }
-                        result_matches = result_matches.merge(matches);
+                Self::CommitBefore(time) => {
+                    let date = commit.committer_date()?;
+                    Ok((
+                        CommitFilterResult::matched(compare_timestamps(date, *time).is_lt()),
+                        MatchedCommit::default(),
+                    ))
+                }
+                Self::CommitAfter(time) => {
+                    let date = commit.committer_date()?;
+                    Ok((
+                        CommitFilterResult::matched(compare_timestamps(date, *time).is_gt()),
+                        MatchedCommit::default(),
+                    ))
+                }
+                Self::MessageMatches(regexp) => {
+                    let found = regexp.find_all(&commit.raw.message);
+                    if found.is_empty() {
+                        return Ok((CommitFilterResult::matched(false), MatchedCommit::default()));
                     }
-                    result_matches.constrain_to_matched(&merged.matched_file_diffs);
-                    Ok((merged, result_matches))
+                    Ok((
+                        CommitFilterResult::matched(true),
+                        MatchedCommit {
+                            message: matches_to_ranges(&commit.raw.message, &found),
+                            diff: BTreeMap::new(),
+                        },
+                    ))
                 }
-                OperatorKind::Or => {
-                    let mut result_matches = MatchedCommit::default();
-                    // Start with no matches, then union.
-                    let mut merged = CommitFilterResult {
-                        commit_matched: false,
-                        matched_file_diffs: Some(BTreeSet::new()),
-                    };
-                    for operand in operands {
-                        let (result, matches) = operand.matches(commit)?;
-                        merged.union(&result);
-                        if merged.satisfies() {
+                Self::DiffMatches(regexp) => {
+                    let diff = commit.diff().await?;
+                    let mut file_diff_highlights: BTreeMap<usize, MatchedFileDiff> =
+                        BTreeMap::new();
+                    let mut matched_file_diffs: BTreeSet<usize> = BTreeSet::new();
+                    for (file_index, file_diff) in diff.iter().enumerate() {
+                        let mut hunk_highlights: BTreeMap<usize, MatchedHunk> = BTreeMap::new();
+                        for (hunk_index, hunk) in file_diff.hunks.iter().enumerate() {
+                            let mut line_highlights: BTreeMap<usize, Vec<MatchRange>> =
+                                BTreeMap::new();
+                            for (line_index, line) in ByteLines::new(&hunk.body).enumerate() {
+                                if line.is_empty() {
+                                    continue;
+                                }
+                                if !matches!(line[0], b'+' | b'-') {
+                                    continue;
+                                }
+                                let content = &line[1..];
+                                let found = regexp.find_all(content);
+                                if !found.is_empty() {
+                                    line_highlights
+                                        .insert(line_index, matches_to_ranges(content, &found));
+                                }
+                            }
+                            if !line_highlights.is_empty() {
+                                hunk_highlights.insert(
+                                    hunk_index,
+                                    MatchedHunk {
+                                        matched_lines: line_highlights,
+                                    },
+                                );
+                            }
+                        }
+                        if !hunk_highlights.is_empty() {
+                            file_diff_highlights.insert(
+                                file_index,
+                                MatchedFileDiff {
+                                    matched_hunks: hunk_highlights,
+                                    ..MatchedFileDiff::default()
+                                },
+                            );
+                            matched_file_diffs.insert(file_index);
+                        }
+                    }
+                    Ok((
+                        CommitFilterResult {
+                            commit_matched: false,
+                            matched_file_diffs: Some(matched_file_diffs),
+                        },
+                        MatchedCommit {
+                            message: Vec::new(),
+                            diff: file_diff_highlights,
+                        },
+                    ))
+                }
+                Self::DiffModifiesFile(regexp) => {
+                    // Pre-filter with the cheaper `--name-status` output.
+                    let found_match = commit
+                        .modified_files()
+                        .iter()
+                        .any(|file| regexp.is_match(file.as_bytes()));
+                    if !found_match {
+                        return Ok((CommitFilterResult::matched(false), MatchedCommit::default()));
+                    }
+
+                    let diff = commit.diff().await?;
+                    let mut file_diff_highlights: BTreeMap<usize, MatchedFileDiff> =
+                        BTreeMap::new();
+                    let mut matched_file_diffs: BTreeSet<usize> = BTreeSet::new();
+                    for (file_index, file_diff) in diff.iter().enumerate() {
+                        let old_matches = regexp.find_all(&file_diff.orig_name);
+                        let new_matches = regexp.find_all(&file_diff.new_name);
+                        if !old_matches.is_empty() || !new_matches.is_empty() {
+                            file_diff_highlights.insert(
+                                file_index,
+                                MatchedFileDiff {
+                                    old_file: matches_to_ranges(&file_diff.orig_name, &old_matches),
+                                    new_file: matches_to_ranges(&file_diff.new_name, &new_matches),
+                                    matched_hunks: BTreeMap::new(),
+                                },
+                            );
+                            matched_file_diffs.insert(file_index);
+                        }
+                    }
+                    Ok((
+                        CommitFilterResult {
+                            commit_matched: false,
+                            matched_file_diffs: Some(matched_file_diffs),
+                        },
+                        MatchedCommit {
+                            message: Vec::new(),
+                            diff: file_diff_highlights,
+                        },
+                    ))
+                }
+                Self::Boolean(value) => Ok((
+                    CommitFilterResult::matched(*value),
+                    MatchedCommit::default(),
+                )),
+                Self::Operator { kind, operands } => match kind {
+                    OperatorKind::Not => {
+                        let Some(operand) = operands.first() else {
+                            return Err(SearchError::Message(
+                                "operator NOT has no operands".to_owned(),
+                            ));
+                        };
+                        let (mut result, _) = operand.matches(&mut *commit).await?;
+                        invert(&mut result, &mut *commit).await?;
+                        Ok((result, MatchedCommit::default()))
+                    }
+                    OperatorKind::And => {
+                        let mut result_matches = MatchedCommit::default();
+                        // Start with everything matching, then intersect.
+                        let mut merged = CommitFilterResult {
+                            commit_matched: true,
+                            matched_file_diffs: None,
+                        };
+                        for operand in operands {
+                            let (result, matches) = operand.matches(&mut *commit).await?;
+                            merged.intersect(&result);
+                            if !merged.satisfies() {
+                                return Ok((
+                                    CommitFilterResult::matched(false),
+                                    MatchedCommit::default(),
+                                ));
+                            }
                             result_matches = result_matches.merge(matches);
                         }
+                        result_matches.constrain_to_matched(&merged.matched_file_diffs);
+                        Ok((merged, result_matches))
                     }
-                    result_matches.constrain_to_matched(&merged.matched_file_diffs);
-                    Ok((merged, result_matches))
-                }
-            },
+                    OperatorKind::Or => {
+                        let mut result_matches = MatchedCommit::default();
+                        // Start with no matches, then union.
+                        let mut merged = CommitFilterResult {
+                            commit_matched: false,
+                            matched_file_diffs: Some(BTreeSet::new()),
+                        };
+                        for operand in operands {
+                            let (result, matches) = operand.matches(&mut *commit).await?;
+                            merged.union(&result);
+                            if merged.satisfies() {
+                                result_matches = result_matches.merge(matches);
+                            }
+                        }
+                        result_matches.constrain_to_matched(&merged.matched_file_diffs);
+                        Ok((merged, result_matches))
+                    }
+                },
+            }
+        })
+    }
+
+    /// Baseline `Visit` + `doSearch`'s `hasDiffModifiesFile`: any
+    /// `DiffModifiesFile` node forces `--name-status` on `git log`.
+    fn has_diff_modifies_file(&self) -> bool {
+        match self {
+            Self::DiffModifiesFile(_) => true,
+            Self::Operator { operands, .. } => {
+                operands.iter().any(MatchTree::has_diff_modifies_file)
+            }
+            _ => false,
         }
     }
+}
+
+/// Baseline `CommitFilterResult.Invert`, which needs the number of file diffs
+/// in the commit.
+async fn invert<'b>(
+    result: &mut CommitFilterResult,
+    commit: &mut LazyCommit<'b>,
+) -> Result<(), SearchError> {
+    result.commit_matched = !result.commit_matched;
+    match result.matched_file_diffs.take() {
+        None => result.matched_file_diffs = Some(BTreeSet::new()),
+        Some(diffs) if diffs.is_empty() => result.matched_file_diffs = None,
+        Some(diffs) => {
+            let diff = commit.diff().await?;
+            let mut inverted = BTreeSet::new();
+            for index in 0..diff.len() {
+                if !diffs.contains(&index) {
+                    inverted.insert(index);
+                }
+            }
+            result.matched_file_diffs = Some(inverted);
+        }
+    }
+    Ok(())
 }
 
 fn compare_timestamps(left: TimestampValue, right: TimestampValue) -> std::cmp::Ordering {
@@ -559,17 +717,6 @@ impl CommitFilterResult {
         self.matched_file_diffs
             .as_ref()
             .is_some_and(|diffs| !diffs.is_empty())
-    }
-
-    fn invert(&mut self) {
-        self.commit_matched = !self.commit_matched;
-        match &self.matched_file_diffs {
-            None => self.matched_file_diffs = Some(BTreeSet::new()),
-            Some(diffs) if diffs.is_empty() => self.matched_file_diffs = None,
-            // Inverting a non-empty set needs the parsed diff. Without diff
-            // nodes no filter can produce one (see `MatchTree::compile`).
-            Some(_) => debug_assert!(false, "diff file sets are not produced yet"),
-        }
     }
 
     fn union(&mut self, other: &Self) {
@@ -791,14 +938,46 @@ fn quote_fields(fields: &[&[u8]]) -> String {
 }
 
 /// Baseline `search.LazyCommit`: the fields that need parsing are parsed on
-/// demand; the diff-cached half arrives with the diff search slice.
-struct LazyCommit {
+/// demand and the parsed diff is cached after the first fetch.
+struct LazyCommit<'a> {
     raw: RawCommit,
+    diff: Option<Arc<Vec<FileDiff>>>,
+    /// The persistent `git diff-tree` process, started on the first diff
+    /// request and shared by every commit of this search.
+    fetcher: &'a mut Option<DiffFetcher>,
+    repo: &'a GitRepo,
 }
 
-impl LazyCommit {
-    fn new(raw: RawCommit) -> Self {
-        Self { raw }
+impl<'a> LazyCommit<'a> {
+    fn new(raw: RawCommit, fetcher: &'a mut Option<DiffFetcher>, repo: &'a GitRepo) -> Self {
+        Self {
+            raw,
+            diff: None,
+            fetcher,
+            repo,
+        }
+    }
+
+    /// Baseline `LazyCommit.Diff`: fetch the raw patch, then parse it with
+    /// go-diff semantics (ported in [`crate::diff`]).
+    async fn diff(&mut self) -> Result<Arc<Vec<FileDiff>>, SearchError> {
+        if let Some(diff) = &self.diff {
+            return Ok(Arc::clone(diff));
+        }
+        if self.fetcher.is_none() {
+            *self.fetcher = Some(DiffFetcher::start(self.repo)?);
+        }
+        let fetcher = self
+            .fetcher
+            .as_mut()
+            .expect("diff fetcher was just started");
+        let raw = fetcher.fetch(&self.raw.hash).await?;
+        let parsed = Arc::new(
+            diff::parse_multi_file_diff(&raw)
+                .map_err(|error| SearchError::Message(error.to_string()))?,
+        );
+        self.diff = Some(Arc::clone(&parsed));
+        Ok(parsed)
     }
 
     fn author_date(&self) -> Result<i64, SearchError> {
@@ -861,6 +1040,105 @@ impl LazyCommit {
         }
         result
     }
+}
+
+// ---------------------------------------------------------------------------
+// Diff fetcher (`search.DiffFetcher`)
+// ---------------------------------------------------------------------------
+
+/// A handle to a persistent `git diff-tree --stdin` subprocess. Hashes are
+/// written one at a time; the echoed `ENDOFPATCH` marker delimits each patch.
+struct DiffFetcher {
+    _child: Child,
+    stdin: ChildStdin,
+    stdout: BufReader<ChildStdout>,
+    stderr: Option<tokio::process::ChildStderr>,
+    buffer: Vec<u8>,
+}
+
+impl DiffFetcher {
+    fn start(repo: &GitRepo) -> Result<Self, SearchError> {
+        let mut command = tokio::process::Command::new("git");
+        command
+            .args([
+                "diff-tree",
+                "--stdin",
+                "--no-prefix",
+                "-p",
+                "--format=format:",
+                "--root",
+            ])
+            .current_dir(&repo.git_dir)
+            .env("GIT_DIR", &repo.git_dir)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
+        let mut child = command
+            .spawn()
+            .map_err(|err| SearchError::Message(format!("failed to run git diff-tree: {err}")))?;
+        let stdin = child.stdin.take().expect("git diff-tree stdin is piped");
+        let stdout = child.stdout.take().expect("git diff-tree stdout is piped");
+        let stderr = child.stderr.take();
+        Ok(Self {
+            _child: child,
+            stdin,
+            stdout: BufReader::new(stdout),
+            stderr,
+            buffer: Vec::new(),
+        })
+    }
+
+    /// Baseline `DiffFetcher.Fetch`: write the hash plus the marker revision,
+    /// then read until the marker comes back.
+    async fn fetch(&mut self, hash: &[u8]) -> Result<Vec<u8>, SearchError> {
+        // The baseline ignores write errors; a dead subprocess surfaces when
+        // the read below hits EOF instead.
+        let _ = self.stdin.write_all(hash).await;
+        let _ = self.stdin.write_all(b"\nENDOFPATCH\n").await;
+        let _ = self.stdin.flush().await;
+
+        loop {
+            if let Some(patch) = take_patch(&mut self.buffer) {
+                return Ok(patch);
+            }
+            let mut chunk = [0u8; 32 * 1024];
+            let read = self
+                .stdout
+                .read(&mut chunk)
+                .await
+                .map_err(|err| SearchError::Message(err.to_string()))?;
+            if read == 0 {
+                break;
+            }
+            self.buffer.extend_from_slice(&chunk[..read]);
+        }
+
+        // The scanner stopped without a token; report the subprocess stderr
+        // exactly like the baseline (`scanner.Err()` is always nil here).
+        let mut stderr = Vec::new();
+        if let Some(mut handle) = self.stderr.take() {
+            let _ = handle.read_to_end(&mut stderr).await;
+        }
+        if !stderr.is_empty() {
+            return Err(SearchError::Message(format!(
+                "git subprocess stderr: {}",
+                String::from_utf8_lossy(&stderr)
+            )));
+        }
+        Err(SearchError::Message("expected scan to succeed".to_owned()))
+    }
+}
+
+/// If the buffered output ends with the marker, return the patch before it.
+fn take_patch(buffer: &mut Vec<u8>) -> Option<Vec<u8>> {
+    if !buffer.ends_with(END_OF_PATCH) {
+        return None;
+    }
+    let patch_length = buffer.len() - END_OF_PATCH.len();
+    let patch = buffer[..patch_length].to_vec();
+    buffer.clear();
+    Some(patch)
 }
 
 fn split_refs(bytes: &[u8]) -> Vec<String> {
@@ -930,12 +1208,29 @@ fn matched_string_proto(
     }
 }
 
-fn create_commit_match(
-    commit: &LazyCommit,
+async fn create_commit_match(
+    commit: &mut LazyCommit<'_>,
     highlights: &MatchedCommit,
+    include_diff: bool,
 ) -> Result<gpb::CommitMatch, SearchError> {
     let author_date = commit.author_date()?;
     let committer_date = commit.committer_date()?;
+
+    // Baseline order: dates, then the diff (which may fetch), then the commit
+    // ID and parents.
+    let diff = if include_diff {
+        let raw_diff = commit.diff().await?;
+        // `filterRawDiff` only applies with sub-repo permissions, which the
+        // Rust gitserver does not implement.
+        let (content, ranges) = format_diff(&raw_diff, &highlights.diff);
+        matched_string_proto(content, &ranges)
+    } else {
+        gpb::commit_match::MatchedString {
+            content: String::new(),
+            ranges: Vec::new(),
+        }
+    };
+
     let oid = validated_commit_id(&commit.raw.hash)?;
     let parents = commit.parent_ids()?;
     Ok(gpb::CommitMatch {
@@ -957,14 +1252,367 @@ fn create_commit_match(
             to_valid_utf8(&commit.raw.message),
             &highlights.message,
         )),
-        // `include_diff` is rejected before a search starts, so the diff is
-        // the empty `MatchedString` the baseline always sets.
-        diff: Some(gpb::commit_match::MatchedString {
-            content: String::new(),
-            ranges: Vec::new(),
-        }),
+        diff: Some(diff),
         modified_files: commit.modified_files(),
     })
+}
+
+// ---------------------------------------------------------------------------
+// Diff formatting (`search.FormatDiff`)
+// ---------------------------------------------------------------------------
+
+/// Baseline `FormatDiff`: render up to [`MAX_FILES`] matching files, up to
+/// [`MAX_HUNKS_PER_FILE`] hunks per file, filtered by
+/// [`split_hunk_matches`], and translate the match ranges into the formatted
+/// text's coordinates.
+fn format_diff(
+    raw_diff: &[FileDiff],
+    highlights: &BTreeMap<usize, MatchedFileDiff>,
+) -> (String, Vec<MatchRange>) {
+    let mut buffer = String::new();
+    let mut location = Location::default();
+    let mut ranges = Vec::new();
+
+    let no_highlights = MatchedFileDiff::default();
+    let mut file_count = 0;
+    for (file_index, file_diff) in raw_diff.iter().enumerate() {
+        let file_highlight = match highlights.get(&file_index) {
+            Some(highlight) => highlight,
+            None if highlights.is_empty() => &no_highlights,
+            None => continue,
+        };
+        if file_count >= MAX_FILES {
+            break;
+        }
+        file_count += 1;
+
+        ranges.extend(add_ranges(&file_highlight.old_file, location));
+        let escaped = escape_utf8_and_spaces(&file_diff.orig_name);
+        buffer.push_str(&escaped);
+        buffer.push(' ');
+        location.offset = buffer.len() as u32;
+        location.column = escaped.len() as u32 + 1;
+
+        ranges.extend(add_ranges(&file_highlight.new_file, location));
+        buffer.push_str(&escape_utf8_and_spaces(&file_diff.new_name));
+        buffer.push('\n');
+        location.offset = buffer.len() as u32;
+        location.line += 1;
+        location.column = 0;
+
+        let (filtered_hunks, filtered_highlights) = split_hunk_matches(
+            &file_diff.hunks,
+            &file_highlight.matched_hunks,
+            MATCH_CONTEXT_LINES,
+            MAX_LINES_PER_HUNK,
+        );
+
+        let mut hunk_count = 0;
+        let no_hunk = MatchedHunk::default();
+        for (hunk_index, hunk) in filtered_hunks.iter().enumerate() {
+            let hunk_highlight = match filtered_highlights.get(&hunk_index) {
+                Some(highlight) => highlight,
+                None if filtered_highlights.is_empty() => &no_hunk,
+                None => continue,
+            };
+            if hunk_count >= MAX_HUNKS_PER_FILE {
+                break;
+            }
+            hunk_count += 1;
+
+            buffer.push_str(&format!(
+                "@@ -{},{} +{},{} @@ {}\n",
+                hunk.orig_start_line,
+                hunk.orig_lines,
+                hunk.new_start_line,
+                hunk.new_lines,
+                to_valid_utf8(&hunk.section),
+            ));
+            location.offset = buffer.len() as u32;
+            location.line += 1;
+            location.column = 0;
+
+            for (line_index, line) in ByteLines::new(&hunk.body).enumerate() {
+                if line.is_empty() {
+                    continue;
+                }
+                let prefix = line[0];
+                let without_prefix = &line[1..];
+                buffer.push(prefix as char);
+                location.offset = buffer.len() as u32;
+                location.column = 1;
+
+                if let Some(line_highlights) = hunk_highlight.matched_lines.get(&line_index) {
+                    ranges.extend(add_ranges(line_highlights, location));
+                }
+
+                buffer.push_str(&to_valid_utf8(without_prefix));
+                buffer.push('\n');
+                location.offset = buffer.len() as u32;
+                location.line += 1;
+                location.column = 0;
+            }
+        }
+    }
+
+    (buffer, ranges)
+}
+
+/// Baseline `escapeUTF8AndSpaces`: make the name valid UTF-8, then escape
+/// every space as `\ `.
+fn escape_utf8_and_spaces(name: &[u8]) -> String {
+    to_valid_utf8(name).replace(' ', "\\ ")
+}
+
+/// `Ranges.Add`: shift every range by `location`.
+fn add_ranges(ranges: &[MatchRange], location: Location) -> Vec<MatchRange> {
+    ranges
+        .iter()
+        .map(|range| MatchRange {
+            start: add_location(range.start, location),
+            end: add_location(range.end, location),
+        })
+        .collect()
+}
+
+fn add_location(left: Location, right: Location) -> Location {
+    Location {
+        offset: left.offset + right.offset,
+        line: left.line + right.line,
+        column: left.column + right.column,
+    }
+}
+
+/// Baseline `splitHunkMatches`: keep only matching changed lines plus
+/// `match_context_lines` of context, cap the hunk at
+/// `2 * context + max_lines_per_hunk` lines, split where gaps remain, and
+/// renumber the hunk headers. Highlights are re-keyed to the new hunk/line
+/// indices.
+fn split_hunk_matches(
+    hunks: &[Hunk],
+    hunk_highlights: &BTreeMap<usize, MatchedHunk>,
+    match_context_lines: usize,
+    max_lines_per_hunk: usize,
+) -> (Vec<Hunk>, BTreeMap<usize, MatchedHunk>) {
+    let mut results: Vec<Hunk> = Vec::new();
+    let mut new_highlights: BTreeMap<usize, MatchedHunk> = BTreeMap::new();
+
+    for (hunk_index, hunk) in hunks.iter().enumerate() {
+        let orig_highlights = hunk_highlights
+            .get(&hunk_index)
+            .map(|highlight| &highlight.matched_lines);
+        let lines: Vec<&[u8]> = split_after(&hunk.body, b'\n');
+        let line_info = compute_diff_hunk_info(&lines, orig_highlights, match_context_lines);
+
+        let mut current: Option<Hunk> = None;
+        let mut current_lines: Vec<u8> = Vec::new();
+        // `curLines` is a slice of lines in the baseline, so the cap below and
+        // the highlight keys count lines, not bytes.
+        let mut current_line_count: usize = 0;
+        let mut current_highlights: BTreeMap<usize, Vec<MatchRange>> = BTreeMap::new();
+        let mut extra_hunk_matches = 0usize;
+        let mut orig_line_offset: i32 = 0;
+        let mut new_line_offset: i32 = 0;
+
+        for (line_index, line) in lines.iter().enumerate() {
+            if line.is_empty() {
+                break;
+            }
+            let info = &line_info[line_index];
+            if info.matching || info.context {
+                if max_lines_per_hunk > 0
+                    && current_line_count == match_context_lines * 2 + max_lines_per_hunk
+                {
+                    if info.matching {
+                        extra_hunk_matches += 1;
+                    }
+                    // The baseline `continue`s here, skipping the offset
+                    // updates below as well.
+                    continue;
+                }
+
+                let current_hunk = current.get_or_insert_with(|| Hunk {
+                    orig_start_line: hunk.orig_start_line + orig_line_offset,
+                    new_start_line: hunk.new_start_line + new_line_offset,
+                    section: hunk.section.clone(),
+                    ..Hunk::default()
+                });
+                if !info.added {
+                    current_hunk.orig_lines += 1;
+                }
+                if !info.removed {
+                    current_hunk.new_lines += 1;
+                }
+                if let Some(highlights) = orig_highlights.and_then(|map| map.get(&line_index)) {
+                    if !highlights.is_empty() {
+                        current_highlights.insert(current_line_count, highlights.clone());
+                    }
+                }
+                current_lines.extend_from_slice(line);
+                current_line_count += 1;
+            } else if current.is_some() {
+                let mut done = current.take().expect("checked above");
+                add_extra_hunk_matches_section(&mut done, extra_hunk_matches);
+                done.body = std::mem::take(&mut current_lines);
+                current_line_count = 0;
+                if !current_highlights.is_empty() {
+                    new_highlights.insert(
+                        results.len(),
+                        MatchedHunk {
+                            matched_lines: std::mem::take(&mut current_highlights),
+                        },
+                    );
+                }
+                results.push(done);
+                extra_hunk_matches = 0;
+            }
+
+            if !info.added {
+                orig_line_offset += 1;
+            }
+            if !info.removed {
+                new_line_offset += 1;
+            }
+        }
+
+        if let Some(mut done) = current {
+            add_extra_hunk_matches_section(&mut done, extra_hunk_matches);
+            done.body = current_lines;
+            if !current_highlights.is_empty() {
+                new_highlights.insert(
+                    results.len(),
+                    MatchedHunk {
+                        matched_lines: current_highlights,
+                    },
+                );
+            }
+            results.push(done);
+        }
+    }
+
+    (results, new_highlights)
+}
+
+/// Baseline `addExtraHunkMatchesSection`.
+fn add_extra_hunk_matches_section(hunk: &mut Hunk, extra_hunk_matches: usize) {
+    if extra_hunk_matches > 0 {
+        if !hunk.section.is_empty() {
+            hunk.section.push(b' ');
+        }
+        hunk.section
+            .extend_from_slice(format!("... +{extra_hunk_matches}").as_bytes());
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct DiffHunkLineInfo {
+    added: bool,
+    removed: bool,
+    matching: bool,
+    context: bool,
+}
+
+impl DiffHunkLineInfo {
+    fn changed(&self) -> bool {
+        self.added || self.removed
+    }
+}
+
+/// Baseline `computeDiffHunkInfo`; `None` means the hunk has no highlights
+/// (every changed line matches).
+fn compute_diff_hunk_info(
+    lines: &[&[u8]],
+    line_highlights: Option<&BTreeMap<usize, Vec<MatchRange>>>,
+    match_context_lines: usize,
+) -> Vec<DiffHunkLineInfo> {
+    let mut info = vec![DiffHunkLineInfo::default(); lines.len()];
+    let context_lines = |line: usize| {
+        let start = line.saturating_sub(match_context_lines);
+        let end = (line + match_context_lines).min(lines.len().saturating_sub(1));
+        (start, end)
+    };
+
+    for (index, line) in lines.iter().enumerate() {
+        let (added, removed) = diff_hunk_line_status(line);
+        info[index].added = added;
+        info[index].removed = removed;
+        if info[index].changed() {
+            let matching = match line_highlights {
+                None => true,
+                Some(map) => map.contains_key(&index) || map.is_empty(),
+            };
+            info[index].matching = matching;
+            if matching {
+                let (start, end) = context_lines(index);
+                for (position, slot) in info.iter_mut().enumerate().take(end + 1).skip(start) {
+                    if position != index {
+                        slot.context = true;
+                    }
+                }
+            }
+        }
+    }
+    info
+}
+
+/// Baseline `diffHunkLineStatus`.
+fn diff_hunk_line_status(line: &[u8]) -> (bool, bool) {
+    match line.first() {
+        Some(b'+') => (true, false),
+        Some(b'-') => (false, true),
+        _ => (false, false),
+    }
+}
+
+/// `bytes.SplitAfter(data, sep)`: every line keeps its trailing separator,
+/// and a trailing separator yields a final empty element.
+fn split_after(data: &[u8], separator: u8) -> Vec<&[u8]> {
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let mut index = 0;
+    while index < data.len() {
+        if data[index] == separator {
+            parts.push(&data[start..=index]);
+            start = index + 1;
+        }
+        index += 1;
+    }
+    parts.push(&data[start..]);
+    parts
+}
+
+/// `byteutils.NewLineReader`: iterate over `\n`-terminated lines without a
+/// final empty line (and no line at all for empty input).
+struct ByteLines<'a> {
+    data: &'a [u8],
+    index: usize,
+}
+
+impl<'a> ByteLines<'a> {
+    fn new(data: &'a [u8]) -> Self {
+        Self { data, index: 0 }
+    }
+}
+
+impl<'a> Iterator for ByteLines<'a> {
+    type Item = &'a [u8];
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.index >= self.data.len() {
+            return None;
+        }
+        let start = self.index;
+        match self.data[start..].iter().position(|&byte| byte == b'\n') {
+            Some(index) => {
+                self.index = start + index + 1;
+                Some(&self.data[start..start + index])
+            }
+            None => {
+                self.index = self.data.len();
+                Some(&self.data[start..])
+            }
+        }
+    }
 }
 
 /// Baseline `matchCount`: diff ranges, then message ranges, then one.
@@ -1023,17 +1671,13 @@ where
         request.limit
     };
     let match_tree = MatchTree::compile(&request.query)?;
-    if request.include_diff {
-        return Err(SearchError::Unsupported(
-            INCLUDE_DIFF_UNSUPPORTED.to_owned(),
-        ));
-    }
+    // `doSearch`: a DiffModifiesFile node needs `--name-status` for its
+    // pre-filter, so it forces the field on even when the request did not ask.
+    let include_modified_files =
+        request.include_modified_files || match_tree.has_diff_modifies_file();
 
     let mut child = repo
-        .command(&search_log_args(
-            &request.revisions,
-            request.include_modified_files,
-        ))
+        .command(&search_log_args(&request.revisions, include_modified_files))
         .spawn()
         .map_err(|err| SearchError::Message(format!("failed to run git log: {err}")))?;
 
@@ -1055,6 +1699,9 @@ where
 
     let mut sent = 0i64;
     let mut keep_going = true;
+    // Started lazily on the first diff request, like each baseline worker's
+    // `NewDiffFetcher`.
+    let mut diff_fetcher: Option<DiffFetcher> = None;
 
     // The baseline scanner silently stops when the stream does not start with
     // the record separator, so an empty or malformed output yields no matches.
@@ -1071,10 +1718,11 @@ where
                     break;
                 }
                 let raw = RawCommit::parse(&token)?;
-                let commit = LazyCommit::new(raw);
-                let (filter, highlights) = match_tree.matches(&commit)?;
+                let mut commit = LazyCommit::new(raw, &mut diff_fetcher, repo);
+                let (filter, highlights) = match_tree.matches(&mut commit).await?;
                 if filter.satisfies() {
-                    let commit_match = create_commit_match(&commit, &highlights)?;
+                    let commit_match =
+                        create_commit_match(&mut commit, &highlights, request.include_diff).await?;
                     // Once the limit is reached the baseline still evaluates
                     // every remaining commit, but drops the matches.
                     if sent < limit {
@@ -1261,6 +1909,20 @@ mod tests {
         );
     }
 
+    /// With no diff highlights every changed line matches, so the whole hunk
+    /// (plus one line of context) is kept and renumbered.
+    #[test]
+    fn formats_diff_without_highlights() {
+        let raw = include_bytes!("../testdata/head.diff");
+        let files = crate::diff::parse_multi_file_diff(raw).expect("parses");
+        let (content, ranges) = format_diff(&files, &BTreeMap::new());
+        assert_eq!(
+            content,
+            "file.txt file.txt\n@@ -1,3 +1,3 @@ \n ALPHA\n-beta\n+ beta\n gamma\n"
+        );
+        assert!(ranges.is_empty());
+    }
+
     #[test]
     fn expands_rename_entries_in_modified_files() {
         let raw = RawCommit {
@@ -1273,7 +1935,11 @@ mod tests {
             ],
             ..RawCommit::default()
         };
-        let commit = LazyCommit::new(raw);
+        let mut fetcher = None;
+        let repo = GitRepo {
+            git_dir: std::path::PathBuf::new(),
+        };
+        let commit = LazyCommit::new(raw, &mut fetcher, &repo);
         assert_eq!(
             commit.modified_files(),
             vec![

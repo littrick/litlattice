@@ -1,0 +1,128 @@
+{
+  "expected": {
+    "limit_hit": false,
+    "matches": [
+      {
+        "author": {
+          "date": {
+            "nanos": 0,
+            "seconds": 1717372800
+          },
+          "email": "charlie@example.com",
+          "name": "Charlie Writer"
+        },
+        "committer": {
+          "date": {
+            "nanos": 0,
+            "seconds": 1717372800
+          },
+          "email": "charlie@example.com",
+          "name": "Charlie Writer"
+        },
+        "diff": {
+          "content": "file.txt file.txt\n@@ -1,3 +1,3 @@ \n ALPHA\n-beta\n+ beta\n gamma\n",
+          "ranges": [
+            {
+              "end": {
+                "column": 5,
+                "line": 3,
+                "offset": 47
+              },
+              "start": {
+                "column": 1,
+                "line": 3,
+                "offset": 43
+              }
+            },
+            {
+              "end": {
+                "column": 6,
+                "line": 4,
+                "offset": 54
+              },
+              "start": {
+                "column": 2,
+                "line": 4,
+                "offset": 50
+              }
+            }
+          ]
+        },
+        "message": {
+          "content": "whitespace only change",
+          "ranges": []
+        },
+        "modified_files": [],
+        "oid": "c13428b72681e539b30ca2358a65c223beb56d74",
+        "parents": [
+          "44ee0ae4a49f454514ace8e6ca81bfdbf4303412"
+        ],
+        "refs": [
+          "HEAD -> refs/heads/main"
+        ],
+        "source_refs": [
+          "HEAD"
+        ]
+      },
+      {
+        "author": {
+          "date": {
+            "nanos": 0,
+            "seconds": 1711929600
+          },
+          "email": "alpha@example.com",
+          "name": "Alpha Writer"
+        },
+        "committer": {
+          "date": {
+            "nanos": 0,
+            "seconds": 1711929600
+          },
+          "email": "alpha@example.com",
+          "name": "Alpha Writer"
+        },
+        "diff": {
+          "content": "/dev/null file.txt\n@@ -0,0 +1,3 @@ \n+alpha\n+beta\n+gamma\n",
+          "ranges": [
+            {
+              "end": {
+                "column": 5,
+                "line": 3,
+                "offset": 48
+              },
+              "start": {
+                "column": 1,
+                "line": 3,
+                "offset": 44
+              }
+            }
+          ]
+        },
+        "message": {
+          "content": "root commit",
+          "ranges": []
+        },
+        "modified_files": [],
+        "oid": "241c2f444340443b88aa2c476522953f9bf512d9",
+        "parents": [],
+        "refs": [
+          ""
+        ],
+        "source_refs": [
+          "HEAD"
+        ]
+      }
+    ]
+  },
+  "request": {
+    "include_diff": true,
+    "query": {
+      "diff_matches": {
+        "expr": "beta"
+      }
+    },
+    "repo": "test/blame-fixture"
+  },
+  "rpc": "search",
+  "service": "gitserver"
+}

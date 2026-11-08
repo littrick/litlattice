@@ -1,0 +1,16 @@
+{
+  "expected": {
+    "limit_hit": false,
+    "matches": []
+  },
+  "request": {
+    "query": {
+      "diff_modifies_file": {
+        "expr": "nope"
+      }
+    },
+    "repo": "test/blame-fixture"
+  },
+  "rpc": "search",
+  "service": "gitserver"
+}

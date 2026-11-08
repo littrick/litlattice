@@ -1,0 +1,24 @@
+diff --git file.txt file.txt
+new file mode 100644
+index 0000000..7a28df3
+--- /dev/null
++++ file.txt
+@@ -0,0 +1,4 @@
++alpha
++beta
++gamma
++delta
+diff --git "h\303\251llo.txt" "h\303\251llo.txt"
+new file mode 100644
+index 0000000..4de4f93
+--- /dev/null
++++ "h\303\251llo.txt"
+@@ -0,0 +1 @@
++unicode
+diff --git other.txt other.txt
+new file mode 100644
+index 0000000..e45c9c2
+--- /dev/null
++++ other.txt
+@@ -0,0 +1 @@
++other

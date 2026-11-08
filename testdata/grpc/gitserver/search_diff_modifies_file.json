@@ -1,0 +1,134 @@
+{
+  "expected": {
+    "limit_hit": false,
+    "matches": [
+      {
+        "author": {
+          "date": {
+            "nanos": 0,
+            "seconds": 1717372800
+          },
+          "email": "charlie@example.com",
+          "name": "Charlie Writer"
+        },
+        "committer": {
+          "date": {
+            "nanos": 0,
+            "seconds": 1717372800
+          },
+          "email": "charlie@example.com",
+          "name": "Charlie Writer"
+        },
+        "diff": {
+          "content": "",
+          "ranges": []
+        },
+        "message": {
+          "content": "whitespace only change",
+          "ranges": []
+        },
+        "modified_files": [
+          "file.txt"
+        ],
+        "oid": "c13428b72681e539b30ca2358a65c223beb56d74",
+        "parents": [
+          "44ee0ae4a49f454514ace8e6ca81bfdbf4303412"
+        ],
+        "refs": [
+          "HEAD -> refs/heads/main"
+        ],
+        "source_refs": [
+          "HEAD"
+        ]
+      },
+      {
+        "author": {
+          "date": {
+            "nanos": 0,
+            "seconds": 1714608000
+          },
+          "email": "bravo@example.com",
+          "name": "Bravo Writer"
+        },
+        "committer": {
+          "date": {
+            "nanos": 0,
+            "seconds": 1714608000
+          },
+          "email": "bravo@example.com",
+          "name": "Bravo Writer"
+        },
+        "diff": {
+          "content": "",
+          "ranges": []
+        },
+        "message": {
+          "content": "rewrite first and last lines",
+          "ranges": []
+        },
+        "modified_files": [
+          "file.txt"
+        ],
+        "oid": "44ee0ae4a49f454514ace8e6ca81bfdbf4303412",
+        "parents": [
+          "241c2f444340443b88aa2c476522953f9bf512d9"
+        ],
+        "refs": [
+          ""
+        ],
+        "source_refs": [
+          "HEAD"
+        ]
+      },
+      {
+        "author": {
+          "date": {
+            "nanos": 0,
+            "seconds": 1711929600
+          },
+          "email": "alpha@example.com",
+          "name": "Alpha Writer"
+        },
+        "committer": {
+          "date": {
+            "nanos": 0,
+            "seconds": 1711929600
+          },
+          "email": "alpha@example.com",
+          "name": "Alpha Writer"
+        },
+        "diff": {
+          "content": "",
+          "ranges": []
+        },
+        "message": {
+          "content": "root commit",
+          "ranges": []
+        },
+        "modified_files": [
+          "file.txt",
+          "héllo.txt",
+          "other.txt"
+        ],
+        "oid": "241c2f444340443b88aa2c476522953f9bf512d9",
+        "parents": [],
+        "refs": [
+          ""
+        ],
+        "source_refs": [
+          "HEAD"
+        ]
+      }
+    ]
+  },
+  "request": {
+    "query": {
+      "diff_modifies_file": {
+        "expr": "file\\.txt"
+      }
+    },
+    "repo": "test/blame-fixture"
+  },
+  "rpc": "search",
+  "service": "gitserver"
+}

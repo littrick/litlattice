@@ -1,0 +1,97 @@
+{
+  "expected": {
+    "limit_hit": false,
+    "matches": [
+      {
+        "author": {
+          "date": {
+            "nanos": 0,
+            "seconds": 1711929600
+          },
+          "email": "alpha@example.com",
+          "name": "Alpha Writer"
+        },
+        "committer": {
+          "date": {
+            "nanos": 0,
+            "seconds": 1711929600
+          },
+          "email": "alpha@example.com",
+          "name": "Alpha Writer"
+        },
+        "diff": {
+          "content": "/dev/null file.txt\n@@ -0,0 +1,4 @@ \n+alpha\n+beta\n+gamma\n+delta\n/dev/null héllo.txt\n@@ -0,0 +1,1 @@ \n+unicode\n/dev/null other.txt\n@@ -0,0 +1,1 @@ \n+other\n",
+          "ranges": [
+            {
+              "end": {
+                "column": 18,
+                "line": 0,
+                "offset": 18
+              },
+              "start": {
+                "column": 15,
+                "line": 0,
+                "offset": 15
+              }
+            },
+            {
+              "end": {
+                "column": 19,
+                "line": 6,
+                "offset": 83
+              },
+              "start": {
+                "column": 16,
+                "line": 6,
+                "offset": 80
+              }
+            },
+            {
+              "end": {
+                "column": 19,
+                "line": 9,
+                "offset": 129
+              },
+              "start": {
+                "column": 16,
+                "line": 9,
+                "offset": 126
+              }
+            }
+          ]
+        },
+        "message": {
+          "content": "root commit",
+          "ranges": []
+        },
+        "modified_files": [
+          "file.txt",
+          "héllo.txt",
+          "other.txt"
+        ],
+        "oid": "241c2f444340443b88aa2c476522953f9bf512d9",
+        "parents": [],
+        "refs": [
+          ""
+        ],
+        "source_refs": [
+          "HEAD~2"
+        ]
+      }
+    ]
+  },
+  "request": {
+    "include_diff": true,
+    "query": {
+      "diff_modifies_file": {
+        "expr": "txt"
+      }
+    },
+    "repo": "test/blame-fixture",
+    "revisions": [
+      "HEAD~2"
+    ]
+  },
+  "rpc": "search",
+  "service": "gitserver"
+}

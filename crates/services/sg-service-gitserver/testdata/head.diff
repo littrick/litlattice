@@ -1,0 +1,10 @@
+diff --git file.txt file.txt
+index 15d9bfc..c3494fc 100644
+--- file.txt
++++ file.txt
+@@ -1,4 +1,4 @@
+ ALPHA
+-beta
++ beta
+ gamma
+ DELTA
