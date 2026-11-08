@@ -36,6 +36,7 @@ use crate::framework::BackgroundRoutine;
 use crate::registry;
 
 pub mod batches;
+pub mod codeintel_metrics_reporter;
 pub mod codeintel_upload_backfiller;
 pub mod codeintel_upload_janitor;
 pub mod codeintel_uploadstore_expirer;
@@ -157,6 +158,9 @@ pub fn all_jobs() -> Vec<(&'static str, Arc<dyn Job>)> {
                 "executors-multiqueue-metrics-reporter" => Arc::new(
                     executors_multiqueue_metrics::ExecutorsMultiqueueMetricsReporter::new(),
                 ),
+                "codeintel-metrics-reporter" => {
+                    Arc::new(codeintel_metrics_reporter::CodeIntelMetricsReporter::new())
+                }
                 "codeintel-upload-backfiller" => {
                     Arc::new(codeintel_upload_backfiller::UploadBackfiller::new())
                 }

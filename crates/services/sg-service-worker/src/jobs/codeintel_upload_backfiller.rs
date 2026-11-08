@@ -306,6 +306,12 @@ fn format_commit_date(seconds: i64, _nanos: i32) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, PoisonError};
+
+    /// `config_rejects_malformed_values` sets process environment variables
+    /// that `config_defaults_match_the_baseline` reads; cargo runs the two
+    /// tests in parallel threads, so they must not overlap.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn job_metadata_matches_the_baseline() {
@@ -316,6 +322,7 @@ mod tests {
 
     #[test]
     fn config_defaults_match_the_baseline() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
         let config = BackfillerConfig::default();
         config.load(&mut EnvReader::new());
         assert!(config.validate().is_ok());
@@ -325,6 +332,7 @@ mod tests {
 
     #[test]
     fn config_rejects_malformed_values() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
         let config = BackfillerConfig::default();
         let mut env = EnvReader::new();
         std::env::set_var(INTERVAL_VAR, "not-a-duration");
