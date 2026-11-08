@@ -1,6 +1,7 @@
 //! Baseline `protocol.NormalizeRepo` and `gitserverfs.RepoDir`.
 
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 /// Port of Go `path.Clean` for slash-separated paths.
 fn clean_path(path: &str) -> String {
@@ -101,6 +102,30 @@ pub fn repo_dir(repos_dir: &Path, name: &str) -> Option<PathBuf> {
     dir.starts_with(repos_dir).then_some(dir)
 }
 
+/// Baseline `repoLastFetched` (`serverutil.go`): the mtime of `FETCH_HEAD`,
+/// which is the date of the last successful fetch. A repository that has been
+/// cloned but never fetched has no `FETCH_HEAD`; the mtime of `HEAD` is used.
+pub fn repo_last_fetched(git_dir: &Path) -> std::io::Result<SystemTime> {
+    match std::fs::metadata(git_dir.join("FETCH_HEAD")) {
+        Ok(metadata) => metadata.modified(),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::metadata(git_dir.join("HEAD"))?.modified()
+        }
+        Err(err) => Err(err),
+    }
+}
+
+/// Baseline `repoLastChanged` (`serverutil.go`): the mtime of `sg_refhash_v2`
+/// (written by `setLastChanged` after a fetch changed the ref set). Until that
+/// file exists it is the last-fetched time.
+pub fn repo_last_changed(git_dir: &Path) -> std::io::Result<SystemTime> {
+    match std::fs::metadata(git_dir.join("sg_refhash_v2")) {
+        Ok(metadata) => metadata.modified(),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => repo_last_fetched(git_dir),
+        Err(err) => Err(err),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -190,5 +215,42 @@ mod tests {
         }
         // Only the leading marker is removed, once.
         assert_eq!(undeleted_repo_name("DELETED-1.2-3.4-foo"), "3.4-foo");
+    }
+
+    #[test]
+    fn reports_repo_timestamps_like_the_baseline() {
+        fn touch(path: &Path, seconds: u64) -> SystemTime {
+            std::fs::write(path, b"").expect("write");
+            let time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(seconds);
+            std::fs::File::options()
+                .write(true)
+                .open(path)
+                .expect("open")
+                .set_modified(time)
+                .expect("set mtime");
+            time
+        }
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path();
+        // Neither FETCH_HEAD nor HEAD exists: the error is propagated.
+        assert!(repo_last_fetched(dir).is_err());
+        assert!(repo_last_changed(dir).is_err());
+
+        // Cloned but never fetched: last-fetched is HEAD's mtime, and
+        // last-changed falls back to it while sg_refhash_v2 is absent.
+        let head = touch(&dir.join("HEAD"), 1_600_000_000);
+        assert_eq!(repo_last_fetched(dir).expect("fetched"), head);
+        assert_eq!(repo_last_changed(dir).expect("changed"), head);
+
+        // After a fetch, FETCH_HEAD wins; sg_refhash_v2 wins once written.
+        let fetch_head = touch(&dir.join("FETCH_HEAD"), 1_700_000_000);
+        assert_eq!(repo_last_fetched(dir).expect("fetched"), fetch_head);
+        assert_eq!(repo_last_changed(dir).expect("changed"), fetch_head);
+
+        let refhash = touch(&dir.join("sg_refhash_v2"), 1_800_000_000);
+        assert_eq!(repo_last_changed(dir).expect("changed"), refhash);
+        // last-fetched still reports FETCH_HEAD, not the ref hash.
+        assert_eq!(repo_last_fetched(dir).expect("fetched"), fetch_head);
     }
 }

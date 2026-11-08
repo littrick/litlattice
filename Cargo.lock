@@ -1250,6 +1250,7 @@ dependencies = [
  "sg-http",
  "sg-metrics",
  "sg-proto",
+ "sha2",
  "tempfile",
  "tokio",
  "tokio-stream",

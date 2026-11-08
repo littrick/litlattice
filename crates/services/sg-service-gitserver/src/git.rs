@@ -9,7 +9,9 @@ use std::ops::{Deref, DerefMut};
 use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt};
 use tokio::process::{Child, Command};
 
@@ -485,7 +487,7 @@ impl GitRepo {
     async fn config_get_inner(&self, key: &str) -> Result<String, GitError> {
         // `io.ReadAll` surfaces exit code 1 when the key is unset.
         let output = self
-            .config_command(&["config".into(), "--get".into(), key.into()], &[1])
+            .command_checked(&["config".into(), "--get".into(), key.into()], &[1])
             .await?;
         if output.status.code() == Some(1) {
             return Ok(String::new());
@@ -498,7 +500,7 @@ impl GitRepo {
     pub async fn config_set(&self, key: &str, value: &str) -> Result<(), GitError> {
         let op = metrics::backend_started("config-set", "Config.Set");
         let result = self
-            .config_command(&["config".into(), key.into(), value.into()], &[])
+            .command_checked(&["config".into(), key.into(), value.into()], &[])
             .await
             .map(|_| ());
         if let Some(op) = op {
@@ -512,7 +514,7 @@ impl GitRepo {
     pub async fn config_unset(&self, key: &str) -> Result<(), GitError> {
         let op = metrics::backend_started("config-unset", "Config.Unset");
         let result = self
-            .config_command(&["config".into(), "--unset-all".into(), key.into()], &[5])
+            .command_checked(&["config".into(), "--unset-all".into(), key.into()], &[5])
             .await
             .map(|_| ());
         if let Some(op) = op {
@@ -521,10 +523,10 @@ impl GitRepo {
         result
     }
 
-    /// Run one `git config` invocation. `ok_exit_codes` lists non-zero statuses
-    /// the caller treats as success (`Get`: 1, `Unset`: 5). Failures use the
-    /// baseline `commandFailedError` text.
-    async fn config_command(
+    /// Run one git invocation and turn a failed exit status into the baseline
+    /// `commandFailedError` text. `ok_exit_codes` lists non-zero statuses the
+    /// caller treats as success (`Config.Get`: 1, `Config.Unset`: 5).
+    async fn command_checked(
         &self,
         args: &[OsString],
         ok_exit_codes: &[i32],
@@ -544,6 +546,96 @@ impl GitRepo {
             code.unwrap_or(-1),
             String::from_utf8_lossy(&output.stderr)
         )))
+    }
+
+    /// Baseline `LatestCommitTimestamp` (`gitcli/commits.go`): the committer
+    /// timestamp of the newest commit reachable from any ref.
+    ///
+    /// An empty repository, unparseable output, and a timestamp in the future
+    /// all yield the current time, exactly like the baseline.
+    pub async fn latest_commit_timestamp(&self) -> Result<SystemTime, GitError> {
+        let op = metrics::backend_started("latest-commit-timestamp", "LatestCommitTimestamp");
+        let result = self.latest_commit_timestamp_inner().await;
+        if let Some(op) = op {
+            op.finish(result.as_ref().err());
+        }
+        result
+    }
+
+    async fn latest_commit_timestamp_inner(&self) -> Result<SystemTime, GitError> {
+        let output = self
+            .command_checked(
+                &[
+                    "rev-list".into(),
+                    "--all".into(),
+                    "--timestamp".into(),
+                    "-n".into(),
+                    "1".into(),
+                ],
+                &[],
+            )
+            .await?;
+        let now = SystemTime::now();
+        let mut words = output.stdout.trim_ascii().split(|byte| *byte == b' ');
+        // The format is `<epoch> <commit>`. An empty repository prints nothing,
+        // which the baseline also tolerates (returning the current time).
+        let Some(word) = words.next().filter(|word| !word.is_empty()) else {
+            return Ok(now);
+        };
+        if words.next().is_none() {
+            return Ok(now);
+        }
+        let epoch = std::str::from_utf8(word)
+            .ok()
+            .and_then(|word| word.parse::<i64>().ok());
+        let Some(epoch) = epoch else {
+            return Ok(now);
+        };
+        let stamp = if epoch >= 0 {
+            UNIX_EPOCH.checked_add(Duration::from_secs(epoch as u64))
+        } else {
+            UNIX_EPOCH.checked_sub(Duration::from_secs(epoch.unsigned_abs()))
+        };
+        let Some(stamp) = stamp else {
+            return Ok(now);
+        };
+        Ok(if stamp > now { now } else { stamp })
+    }
+
+    /// Baseline `RefHash` (`gitcli/refs.go`): the hex-encoded SHA-256 of the
+    /// sorted `for-each-ref` listing. `setLastChanged` compares it across
+    /// fetches to decide whether the ref set changed.
+    pub async fn ref_hash(&self) -> Result<Vec<u8>, GitError> {
+        let op = metrics::backend_started("ref-hash", "RefHash");
+        let result = self.ref_hash_inner().await;
+        if let Some(op) = op {
+            op.finish(result.as_ref().err());
+        }
+        result
+    }
+
+    async fn ref_hash_inner(&self) -> Result<Vec<u8>, GitError> {
+        let output = self
+            .command_checked(
+                &[
+                    "for-each-ref".into(),
+                    "--format=%(objectname) %(refname)".into(),
+                    "--sort".into(),
+                    "refname".into(),
+                    "--sort".into(),
+                    "objectname".into(),
+                ],
+                &[],
+            )
+            .await?;
+        let digest = Sha256::digest(&output.stdout);
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut hash = Vec::with_capacity(digest.len() * 2);
+        for byte in digest {
+            hash.push(HEX[(byte >> 4) as usize]);
+            hash.push(HEX[(byte & 0x0f) as usize]);
+        }
+        Ok(hash)
     }
 
     /// Baseline `RevParseHead`, including the "HEAD does not point to
@@ -3353,5 +3445,125 @@ mod tests {
                 if message.starts_with("git command [config invalid 1] failed with status code 2 (output: ")),
             "unexpected error: {err:?}"
         );
+    }
+
+    fn git_with_env(dir: &std::path::Path, args: &[&str], envs: &[(&str, &str)]) {
+        let mut command = std::process::Command::new("git");
+        command.args(args).current_dir(dir);
+        for (key, value) in [
+            ("GIT_AUTHOR_NAME", "test"),
+            ("GIT_AUTHOR_EMAIL", "test@example.com"),
+            ("GIT_COMMITTER_NAME", "test"),
+            ("GIT_COMMITTER_EMAIL", "test@example.com"),
+        ] {
+            command.env(key, value);
+        }
+        for (key, value) in envs {
+            command.env(key, value);
+        }
+        let status = command.status().expect("run git");
+        assert!(status.success(), "git {args:?} failed");
+    }
+
+    fn assert_within_now(stamp: SystemTime) {
+        let now = SystemTime::now();
+        let diff = now
+            .duration_since(stamp)
+            .or_else(|_| stamp.duration_since(now))
+            .expect("clock");
+        assert!(diff < Duration::from_secs(60), "stamp {stamp:?} is not now");
+    }
+
+    #[tokio::test]
+    async fn hashes_refs_and_reports_latest_commit_timestamp() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("repo.git");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        git(&dir, &["init", "--bare", "-q"]);
+        let repo = GitRepo::new(&dir);
+
+        // An empty repository has no refs and no commits: the hash of an empty
+        // listing, and the current time (the baseline tolerates empty output).
+        let empty_hash = Sha256::digest([]);
+        assert_eq!(
+            repo.ref_hash().await.expect("hash"),
+            hex(&empty_hash[..]).into_bytes()
+        );
+        assert_within_now(repo.latest_commit_timestamp().await.expect("stamp"));
+
+        // Commit with a fixed committer date so the reported stamp is exact.
+        let work = tmp.path().join("work");
+        git(tmp.path(), &["init", "-q", work.to_str().expect("utf8")]);
+        std::fs::write(work.join("a.txt"), b"hello\n").expect("write");
+        git(&work, &["add", "a.txt"]);
+        git_with_env(
+            &work,
+            &["commit", "-q", "-m", "first"],
+            &[
+                ("GIT_AUTHOR_DATE", "1600000000 +0000"),
+                ("GIT_COMMITTER_DATE", "1600000000 +0000"),
+            ],
+        );
+        git(
+            &work,
+            &[
+                "push",
+                "-q",
+                dir.to_str().expect("utf8"),
+                "HEAD:refs/heads/main",
+            ],
+        );
+        assert_eq!(
+            repo.latest_commit_timestamp().await.expect("stamp"),
+            UNIX_EPOCH + Duration::from_secs(1_600_000_000)
+        );
+
+        // `ref_hash` is the hex SHA-256 of the exact `for-each-ref` stdout.
+        let listing = std::process::Command::new("git")
+            .args([
+                "for-each-ref",
+                "--format=%(objectname) %(refname)",
+                "--sort",
+                "refname",
+                "--sort",
+                "objectname",
+            ])
+            .current_dir(&dir)
+            .env("GIT_DIR", &dir)
+            .output()
+            .expect("for-each-ref");
+        assert!(listing.status.success());
+        assert_eq!(
+            repo.ref_hash().await.expect("hash"),
+            hex(&Sha256::digest(&listing.stdout)).into_bytes()
+        );
+        assert_ne!(
+            repo.ref_hash().await.expect("hash"),
+            hex(&empty_hash[..]).into_bytes()
+        );
+
+        // A commit dated in the future is clamped to the current time.
+        std::fs::write(work.join("b.txt"), b"bye\n").expect("write");
+        git(&work, &["add", "b.txt"]);
+        git_with_env(
+            &work,
+            &["commit", "-q", "-m", "future"],
+            &[
+                // Far enough in the future to be clamped; git's raw date
+                // parser rejects timestamps past 2099 (e.g. 4102444800).
+                ("GIT_AUTHOR_DATE", "2200000000 +0000"),
+                ("GIT_COMMITTER_DATE", "2200000000 +0000"),
+            ],
+        );
+        git(
+            &work,
+            &[
+                "push",
+                "-q",
+                dir.to_str().expect("utf8"),
+                "HEAD:refs/heads/main",
+            ],
+        );
+        assert_within_now(repo.latest_commit_timestamp().await.expect("stamp"));
     }
 }
