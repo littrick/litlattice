@@ -56,6 +56,7 @@ pub mod repo_embedding_janitor;
 pub mod repostatistics;
 pub mod users;
 pub mod webhooks;
+pub mod zoektrepos;
 
 /// `env.Config`: a configuration struct owned by a job.
 ///
@@ -194,6 +195,7 @@ pub fn all_jobs() -> Vec<(&'static str, Arc<dyn Job>)> {
                 "repo-statistics-compactor" => Arc::new(repostatistics::RepoStatisticsCompactor),
                 "repo-statistics-resetter" => Arc::new(repostatistics::RepoStatisticsResetter),
                 "webhook-log-janitor" => Arc::new(webhooks::WebhookLogJanitor),
+                "zoekt-repos-updater" => Arc::new(zoektrepos::ZoektReposUpdater),
                 _ => Arc::new(UnportedJob { name }),
             };
             (name, job)

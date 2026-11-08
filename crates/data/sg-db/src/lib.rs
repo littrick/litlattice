@@ -25,6 +25,7 @@ pub mod repo_statistics;
 pub mod repos;
 pub mod repoupdater_state;
 pub mod worker_queue;
+pub mod zoekt_repos;
 
 /// Connect to the frontend database. The pool is intentionally small: the
 /// gitserver only reads/writes repository metadata.

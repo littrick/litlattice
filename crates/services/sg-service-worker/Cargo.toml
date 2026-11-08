@@ -20,6 +20,7 @@ sg-metrics = { path = "../../base/sg-metrics" }
 sg-objectstorage = { path = "../../data/sg-objectstorage" }
 sg-rcache = { path = "../../data/sg-rcache" }
 sg-redis = { path = "../../data/sg-redis" }
+sg-zoekt = { path = "../../domain/sg-zoekt" }
 async-trait = { workspace = true }
 base64 = { workspace = true }
 flate2 = { workspace = true }
