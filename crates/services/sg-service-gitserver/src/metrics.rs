@@ -236,6 +236,8 @@ pub struct Metrics {
     search_running: Gauge,
     search_duration: HistogramVec,
     search_latency: Histogram,
+    // `cmd/gitserver/internal/ensurerevision.go`
+    ensure_revision: CounterVec,
     // `cmd/gitserver/internal/server.go`: clone/repo-update accounting.
     clone_queue: Gauge,
     repo_cloned_count: Counter,
@@ -332,7 +334,7 @@ impl Metrics {
         );
 
         // `cmd/gitserver/internal/ensurerevision.go`
-        let _ensure_revision = counter_vec(
+        let ensure_revision = counter_vec(
             registry,
             "src_gitserver_ensure_revision",
             "A request triggered ensureRevision in Gitserver",
@@ -515,6 +517,7 @@ impl Metrics {
             search_running,
             search_duration,
             search_latency,
+            ensure_revision,
             clone_queue,
             repo_cloned_count,
             repo_cloned_failed_count,
@@ -707,6 +710,14 @@ pub fn clone_queued(delta: f64) {
 pub fn clone_succeeded() {
     if let Some(metrics) = Metrics::global_opt() {
         metrics.repo_cloned_count.inc();
+    }
+}
+
+/// `ensureRevisionCounter` (`src_gitserver_ensure_revision{status}`): `HEAD`,
+/// `disabled`, `updated` or `update_failed`.
+pub fn ensure_revision(status: &str) {
+    if let Some(metrics) = Metrics::global_opt() {
+        metrics.ensure_revision.with_label_values(&[status]).inc();
     }
 }
 

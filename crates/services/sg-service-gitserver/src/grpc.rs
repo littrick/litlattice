@@ -34,6 +34,9 @@ pub struct Grpc {
     pub tasks: TaskTracker,
     /// `RepositoryLocker`: status text for clones/fetches in flight.
     pub locker: Arc<crate::locker::RepositoryLocker>,
+    /// `gs.svc`: `ResolveRevision` asks it to fetch on a missing revision.
+    /// `None` only in unit tests that do not exercise fetching.
+    pub fetch: Option<Arc<crate::fetchservice::FetchService>>,
 }
 
 impl Grpc {
@@ -714,13 +717,24 @@ impl gpb::gitserver_service_server::GitserverService for Grpc {
         }
         let repo = self.repo(&request.repo_name)?;
         let spec = String::from_utf8_lossy(&request.rev_spec).into_owned();
-        // `ensure_revision` would fetch missing revisions in the baseline;
-        // the Rust gitserver has no write path yet, so it behaves like a
-        // failed ensure and reports `NotFound`.
-        let commit_sha = repo
-            .resolve_revision(&spec)
-            .await
-            .map_err(|err| git_status(err, &request.repo_name))?;
+
+        // First, try to resolve the revspec.
+        let mut resolved = repo.resolve_revision(&spec).await;
+        if let Err(GitError::RevisionNotFound(_)) = resolved {
+            // `ensure_revision` asks us to fetch before retrying.
+            if request.ensure_revision.unwrap_or(false) {
+                let did_update = match &self.fetch {
+                    Some(fetch) => fetch.ensure_revision(&request.repo_name, &spec).await,
+                    // Without a fetch service the baseline's "ensure failed"
+                    // path applies: do not retry.
+                    None => false,
+                };
+                if did_update {
+                    resolved = repo.resolve_revision(&spec).await;
+                }
+            }
+        }
+        let commit_sha = resolved.map_err(|err| git_status(err, &request.repo_name))?;
         Ok(GrpcResponse::new(gpb::ResolveRevisionResponse {
             commit_sha,
         }))
@@ -1176,6 +1190,9 @@ impl gpb::gitserver_service_server::GitserverService for Grpc {
 #[cfg(test)]
 mod tests {
     use super::is_always_cloning_test;
+    use super::*;
+    use gpb::gitserver_service_server::GitserverService as _;
+    use tokio_util::sync::CancellationToken;
 
     #[test]
     fn matches_the_always_cloning_test_repo() {
@@ -1193,5 +1210,155 @@ mod tests {
         assert!(!is_always_cloning_test(
             "gitlab.com/sourcegraphtest/alwayscloningtest"
         ));
+    }
+
+    /// A backend that must never run in these tests (`ensure_revision` bails
+    /// out before fetching when auto-updates are disabled).
+    struct NeverCalledBackend;
+
+    #[async_trait::async_trait]
+    impl crate::update::UpdateBackend for NeverCalledBackend {
+        async fn repo_cloned(&self, _repo: &str) -> Result<bool, GitError> {
+            panic!("repo_cloned must not be called")
+        }
+
+        async fn clone(
+            &self,
+            _repo: &str,
+            _lock: &crate::locker::RepositoryLock,
+            _cancelled: &CancellationToken,
+        ) -> Result<(), GitError> {
+            panic!("clone must not be called")
+        }
+
+        async fn fetch(
+            &self,
+            _repo: &str,
+            _lock: &crate::locker::RepositoryLock,
+            _cancelled: &CancellationToken,
+        ) -> Result<(), GitError> {
+            panic!("fetch must not be called")
+        }
+
+        async fn set_last_error(&self, _repo: &str, _error: &str) {}
+    }
+
+    fn repo_with_a_commit(root: &std::path::Path) -> std::path::PathBuf {
+        let repos_dir = root.join("repos");
+        let work = repos_dir.join("example.com/o/r");
+        std::fs::create_dir_all(&work).expect("mkdir");
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&work)
+                .env("GIT_AUTHOR_NAME", "test")
+                .env("GIT_AUTHOR_EMAIL", "test@example.com")
+                .env("GIT_COMMITTER_NAME", "test")
+                .env("GIT_COMMITTER_EMAIL", "test@example.com")
+                .status()
+                .expect("run git");
+            assert!(status.success(), "git {args:?} failed");
+        };
+        git(&["init", "-q"]);
+        std::fs::write(work.join("a.txt"), b"hello\n").expect("write");
+        git(&["add", "a.txt"]);
+        git(&["commit", "-q", "-m", "first"]);
+        repos_dir
+    }
+
+    fn service(
+        repos_dir: &std::path::Path,
+        fetch: Option<Arc<crate::fetchservice::FetchService>>,
+    ) -> Grpc {
+        Grpc {
+            repos_dir: Arc::new(repos_dir.to_path_buf()),
+            tasks: TaskTracker::new(),
+            locker: crate::locker::RepositoryLocker::new(),
+            fetch,
+        }
+    }
+
+    fn fetch_service(
+        repos_dir: &std::path::Path,
+        disable: bool,
+    ) -> Arc<crate::fetchservice::FetchService> {
+        Arc::new(crate::fetchservice::FetchService {
+            repos_dir: Arc::new(repos_dir.to_path_buf()),
+            updater: Arc::new(crate::update::UpdateServer {
+                locker: crate::locker::RepositoryLocker::new(),
+                limiter: crate::limiter::MutableLimiter::new(5),
+                backend: Arc::new(NeverCalledBackend),
+                cancelled: CancellationToken::new(),
+            }),
+            tasks: TaskTracker::new(),
+            store: None,
+            disable_auto_git_updates: disable,
+        })
+    }
+
+    #[allow(clippy::result_large_err)] // `tonic::Status` is the RPC error type.
+    async fn resolve(
+        service: &Grpc,
+        ensure_revision: bool,
+        rev: &str,
+    ) -> Result<GrpcResponse<gpb::ResolveRevisionResponse>, Status> {
+        service
+            .resolve_revision(GrpcRequest::new(gpb::ResolveRevisionRequest {
+                repo_name: "example.com/o/r".to_owned(),
+                rev_spec: rev.as_bytes().to_vec(),
+                ensure_revision: Some(ensure_revision),
+            }))
+            .await
+    }
+
+    #[tokio::test]
+    async fn resolves_revisions_without_fetching() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repos_dir = repo_with_a_commit(tmp.path());
+        let service = service(&repos_dir, None);
+
+        assert_eq!(
+            resolve(&service, true, "HEAD")
+                .await
+                .expect("main")
+                .into_inner()
+                .commit_sha
+                .len(),
+            40
+        );
+        // No fetch service: the failed ensure must not turn into a retry.
+        let err = resolve(&service, true, "deadbeef")
+            .await
+            .expect_err("missing");
+        assert_eq!(err.code(), tonic::Code::NotFound);
+        assert_eq!(err.message(), "revision not found");
+        // `ensure_revision=false` behaves the same without a revision.
+        let err = resolve(&service, false, "deadbeef")
+            .await
+            .expect_err("missing");
+        assert_eq!(err.code(), tonic::Code::NotFound);
+
+        service.tasks.close();
+        service.tasks.wait().await;
+    }
+
+    /// With `DisableAutoGitUpdates` the ensure step reports "did not update",
+    /// so the second resolution attempt is skipped and the RPC still fails.
+    #[tokio::test]
+    async fn skips_the_retry_when_auto_updates_are_disabled() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repos_dir = repo_with_a_commit(tmp.path());
+        let fetch = fetch_service(&repos_dir, true);
+        let service = service(&repos_dir, Some(Arc::clone(&fetch)));
+
+        let err = resolve(&service, true, "deadbeef")
+            .await
+            .expect_err("missing");
+        assert_eq!(err.code(), tonic::Code::NotFound);
+
+        fetch.tasks.close();
+        fetch.tasks.wait().await;
+        service.tasks.close();
+        service.tasks.wait().await;
     }
 }

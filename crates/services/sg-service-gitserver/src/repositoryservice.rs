@@ -8,16 +8,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
-use tokio_util::sync::CancellationToken;
-use tokio_util::task::TaskTracker;
 use tonic::{Request, Response, Status};
 
 use sg_proto::gitserver as gpb;
 
 use crate::details::repo_not_found;
+use crate::fetchservice::FetchService;
 use crate::fs::{canonical_path, for_each_repo, remove_repo_directory, repo_cloned};
-use crate::repo::{repo_dir, repo_last_changed, repo_last_fetched};
-use crate::update::UpdateServer;
+use crate::repo::repo_dir;
 use sg_db::gitserver_repos::{CloneStatus, GitserverReposStore};
 
 pub struct RepositoryService {
@@ -30,10 +28,7 @@ pub struct RepositoryService {
     pub hostname: String,
     /// `s.svc`: the fetch/clone orchestration (`Server.FetchRepository`).
     /// `None` only in unit tests that do not exercise fetching.
-    pub updater: Option<Arc<UpdateServer>>,
-    /// `s.svc.ctx`-scoped task tracker for background clones; the server
-    /// closes it on shutdown.
-    pub tasks: TaskTracker,
+    pub fetch: Option<Arc<FetchService>>,
 }
 
 impl std::fmt::Debug for RepositoryService {
@@ -43,26 +38,6 @@ impl std::fmt::Debug for RepositoryService {
             .field("hostname", &self.hostname)
             .finish_non_exhaustive()
     }
-}
-
-/// `Server.FetchRepository`'s `errors.Wrap` around `repoLastFetched` /
-/// `repoLastChanged`, plus the RPC-level wrapper.
-fn last_time_error(
-    repo: &str,
-    which: &str,
-    git_dir: &std::path::Path,
-    err: std::io::Error,
-) -> Status {
-    tracing::error!(
-        repo = %repo,
-        dir = %git_dir.display(),
-        error = %err,
-        "failed to read the last {} time",
-        which
-    );
-    Status::internal(format!(
-        "failed to fetch repository: failed to get last {which} time: {err}"
-    ))
 }
 
 /// Go `timestamppb.New(time.Time)`: seconds floored at the Unix epoch and a
@@ -105,35 +80,15 @@ impl gpb::gitserver_repository_service_server::GitserverRepositoryService for Re
             return Err(Status::invalid_argument("repo_name must be specified"));
         }
 
-        let Some(updater) = &self.updater else {
+        let Some(fetch) = &self.fetch else {
             return Err(Status::internal(
                 "failed to fetch repository: the update server is not configured",
             ));
         };
-        // The baseline passes the RPC's context as the *caller* context: it
-        // only controls how long this call waits for a clone slot, while the
-        // update itself keeps running on the server context. tonic does not
-        // expose client cancellation, so wait without a caller token.
-        let caller_cancelled = CancellationToken::new();
-        if let Err(err) = updater
-            .repo_update_or_clone(&self.tasks, &repo_name, &caller_cancelled)
+        let (last_fetched, last_changed) = fetch
+            .fetch_repository(&repo_name)
             .await
-        {
-            return Err(Status::internal(format!(
-                "failed to fetch repository: {err}"
-            )));
-        }
-
-        let Some(git_dir) = repo_dir(&self.repos_dir, &repo_name) else {
-            return Err(Status::internal(format!(
-                "failed to fetch repository: failed to get last fetched time: \
-                 repository name {repo_name:?} escapes the repos dir"
-            )));
-        };
-        let last_fetched = repo_last_fetched(&git_dir)
-            .map_err(|err| last_time_error(&repo_name, "fetched", &git_dir, err))?;
-        let last_changed = repo_last_changed(&git_dir)
-            .map_err(|err| last_time_error(&repo_name, "changed", &git_dir, err))?;
+            .map_err(|err| Status::internal(format!("failed to fetch repository: {err}")))?;
 
         Ok(Response::new(gpb::FetchRepositoryResponse {
             last_fetched: Some(timestamp(last_fetched)),
@@ -238,14 +193,15 @@ impl gpb::gitserver_repository_service_server::GitserverRepositoryService for Re
 mod tests {
     use super::*;
     use gpb::gitserver_repository_service_server::GitserverRepositoryService as _;
+    use tokio_util::sync::CancellationToken;
+    use tokio_util::task::TaskTracker;
 
     fn service(repos_dir: &std::path::Path) -> RepositoryService {
         RepositoryService {
             repos_dir: Arc::new(repos_dir.to_path_buf()),
             store: None,
             hostname: "test-shard".to_owned(),
-            updater: None,
-            tasks: TaskTracker::new(),
+            fetch: None,
         }
     }
 
@@ -325,13 +281,20 @@ mod tests {
 
     fn service_with_updater(repos_dir: &std::path::Path) -> RepositoryService {
         let mut svc = service(repos_dir);
-        svc.updater = Some(Arc::new(crate::update::UpdateServer {
-            locker: crate::locker::RepositoryLocker::new(),
-            limiter: crate::limiter::MutableLimiter::new(5),
-            backend: Arc::new(CloneBackend {
-                repos_dir: repos_dir.to_path_buf(),
+        let tasks = TaskTracker::new();
+        svc.fetch = Some(Arc::new(crate::fetchservice::FetchService {
+            repos_dir: Arc::new(repos_dir.to_path_buf()),
+            updater: Arc::new(crate::update::UpdateServer {
+                locker: crate::locker::RepositoryLocker::new(),
+                limiter: crate::limiter::MutableLimiter::new(5),
+                backend: Arc::new(CloneBackend {
+                    repos_dir: repos_dir.to_path_buf(),
+                }),
+                cancelled: CancellationToken::new(),
             }),
-            cancelled: CancellationToken::new(),
+            tasks,
+            store: None,
+            disable_auto_git_updates: false,
         }));
         svc
     }
@@ -382,8 +345,10 @@ mod tests {
         let changed = response.last_changed.expect("last_changed");
         assert!(changed.seconds > last_fetched.seconds);
 
-        svc.tasks.close();
-        svc.tasks.wait().await;
+        if let Some(fetch) = &svc.fetch {
+            fetch.tasks.close();
+            fetch.tasks.wait().await;
+        }
     }
 
     #[tokio::test]
@@ -765,8 +730,7 @@ mod tests {
             repos_dir: Arc::new(repos_dir.clone()),
             store: Some(Arc::clone(&store)),
             hostname: "test-shard".to_owned(),
-            updater: None,
-            tasks: TaskTracker::new(),
+            fetch: None,
         };
         svc.delete_repository(Request::new(gpb::DeleteRepositoryRequest {
             repo_name: name.clone(),

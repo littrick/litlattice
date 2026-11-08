@@ -24,6 +24,7 @@ pub mod debug;
 mod details;
 pub mod diff;
 pub mod disk;
+pub mod fetchservice;
 pub mod frontendconfig;
 pub mod fs;
 pub mod git;
@@ -198,17 +199,26 @@ impl Service for GitserverService {
             backend,
             cancelled: ctx.shutdown.clone(),
         });
+        // `Server.svc`: shared by `Server.FetchRepository` and the read path's
+        // `ensure_revision` retry.
+        let fetch = Arc::new(fetchservice::FetchService {
+            repos_dir: Arc::new(config.repos_dir.clone()),
+            updater,
+            tasks: tasks.clone(),
+            store: Some(Arc::clone(&store)),
+            disable_auto_git_updates: unified.site.disable_auto_git_updates(),
+        });
         let grpc = Grpc {
             repos_dir: Arc::new(config.repos_dir.clone()),
             tasks: tasks.clone(),
             locker: Arc::clone(&locker),
+            fetch: Some(Arc::clone(&fetch)),
         };
         let repository_service = repositoryservice::RepositoryService {
             repos_dir: Arc::new(config.repos_dir.clone()),
             store: Some(store),
             hostname: config.external_address.clone(),
-            updater: Some(updater),
-            tasks: tasks.clone(),
+            fetch: Some(fetch),
         };
         let routes = tonic::service::Routes::new(
             gpb::gitserver_service_server::GitserverServiceServer::new(grpc),
