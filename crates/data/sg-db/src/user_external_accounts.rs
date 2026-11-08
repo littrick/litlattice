@@ -82,7 +82,13 @@ pub async fn hard_delete(pool: &PgPool, ids: &[i32], service_type: &str) -> Resu
 }
 
 /// One full `user_external_accounts` row as `Database.UserExternalAccounts().List`
-/// returns it (`extsvc.Account`, without the encrypted account data).
+/// returns it (`extsvc.Account`).
+///
+/// `auth_data`/`account_data` are returned as stored (encrypted at rest);
+/// `encryption_key_id` is the key version the caller needs to decrypt them.
+/// `None` means the column is NULL, which the baseline maps to a nil
+/// `EncryptableData` — distinct from an empty string, which is decrypted
+/// (and then fails to parse as JSON) when the key ID is set.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExternalAccount {
     pub id: i32,
@@ -91,6 +97,11 @@ pub struct ExternalAccount {
     pub service_id: String,
     pub client_id: String,
     pub account_id: String,
+    /// `auth_data` (encrypted at rest).
+    pub auth_data: Option<String>,
+    /// `account_data` (encrypted at rest).
+    pub account_data: Option<String>,
+    pub encryption_key_id: String,
     /// `expired_at IS NOT NULL` (the timestamp itself is not exposed).
     pub expired: bool,
 }
@@ -118,20 +129,26 @@ fn account_from_row(row: &sqlx::postgres::PgRow) -> Result<ExternalAccount, sqlx
         service_id: row.try_get("service_id")?,
         client_id: row.try_get("client_id")?,
         account_id: row.try_get("account_id")?,
+        auth_data: row.try_get("auth_data")?,
+        account_data: row.try_get("account_data")?,
+        encryption_key_id: row.try_get("encryption_key_id")?,
         expired: row.try_get("expired")?,
     })
 }
+
+/// The columns every `ExternalAccount` query selects, in `account_from_row`
+/// order (`listBySQL`'s column list, plus the expiry predicate).
+const ACCOUNT_COLUMNS: &str = "id, user_id, service_type, service_id, client_id, account_id, \
+     auth_data, account_data, encryption_key_id, (expired_at IS NOT NULL) AS expired";
 
 /// `userExternalAccountsStore.List`. Live accounts only, ordered by id.
 pub async fn list(
     pool: &PgPool,
     opts: &ExternalAccountsListOptions,
 ) -> Result<Vec<ExternalAccount>, sqlx::Error> {
-    let mut query = sqlx::QueryBuilder::new(
-        "SELECT id, user_id, service_type, service_id, client_id, account_id, \
-         (expired_at IS NOT NULL) AS expired \
-         FROM user_external_accounts WHERE deleted_at IS NULL",
-    );
+    let mut query = sqlx::QueryBuilder::new(format!(
+        "SELECT {ACCOUNT_COLUMNS} FROM user_external_accounts WHERE deleted_at IS NULL"
+    ));
     if let Some(user_id) = opts.user_id {
         query.push(" AND user_id = ").push_bind(user_id);
     }
@@ -163,6 +180,59 @@ pub async fn list(
 
     let rows = query.build().fetch_all(pool).await?;
     rows.iter().map(account_from_row).collect()
+}
+
+/// `userExternalAccountsStore.Get(id)`: one live account including the
+/// encrypted data columns.
+pub async fn get_by_id(pool: &PgPool, id: i32) -> Result<Option<ExternalAccount>, sqlx::Error> {
+    let row = sqlx::query(&format!(
+        "SELECT {ACCOUNT_COLUMNS} FROM user_external_accounts \
+         WHERE id = $1 AND deleted_at IS NULL LIMIT 1"
+    ))
+    .bind(id)
+    .fetch_optional(pool)
+    .await?;
+    row.as_ref().map(account_from_row).transpose()
+}
+
+/// `userExternalAccountsStore.Update`: replace the account data columns,
+/// matched by `AccountSpec` (not by id), and clear `expired_at`.
+///
+/// The caller supplies already-encrypted values (the baseline encrypts with
+/// the user-external-account keyring inside the store); `Ok(false)` mirrors
+/// the baseline's `userExternalAccountNotFoundError` when no row matches.
+pub async fn update_account_data(
+    pool: &PgPool,
+    spec: &ExternalAccountSpec,
+    auth_data: &str,
+    account_data: &str,
+    encryption_key_id: &str,
+) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query(
+        r#"
+UPDATE user_external_accounts
+SET auth_data = $5,
+    account_data = $6,
+    encryption_key_id = $7,
+    updated_at = now(),
+    expired_at = NULL
+WHERE service_type = $1
+  AND service_id = $2
+  AND client_id = $3
+  AND account_id = $4
+  AND deleted_at IS NULL
+"#,
+    )
+    .bind(&spec.service_type)
+    .bind(&spec.service_id)
+    .bind(&spec.client_id)
+    .bind(&spec.account_id)
+    .bind(auth_data)
+    .bind(account_data)
+    .bind(encryption_key_id)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() > 0)
 }
 
 /// `extsvc.AccountSpec` as carried by `authz.Provider.FetchAccount`.
@@ -266,6 +336,7 @@ WHERE service_type = $1
   AND user_id = $5
   AND deleted_at IS NULL
 RETURNING id, user_id, service_type, service_id, client_id, account_id,
+          auth_data, account_data, encryption_key_id,
           (expired_at IS NOT NULL) AS expired
 "#,
             )
@@ -285,6 +356,7 @@ INSERT INTO user_external_accounts
      auth_data, account_data, encryption_key_id)
 VALUES ($1, $2, $3, $4, $5, '', '', '')
 RETURNING id, user_id, service_type, service_id, client_id, account_id,
+          auth_data, account_data, encryption_key_id,
           (expired_at IS NOT NULL) AS expired
 "#,
             )

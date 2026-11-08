@@ -21,6 +21,8 @@
 //! Redis/ETag transport cache, OAuth token refresh, and the GraphQL API (this
 //! baseline's `GetRepository` uses the REST endpoint).
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use reqwest::header::{HeaderValue, ACCEPT, AUTHORIZATION, CACHE_CONTROL, CONTENT_TYPE, LINK};
 use reqwest::StatusCode;
@@ -28,8 +30,10 @@ use serde::de::DeserializeOwned;
 use serde::Deserialize;
 
 use super::authz_github::{
-    Collaborator, GithubClient, GithubClientError, Org, OrgDetails, Repository, Team,
+    Collaborator, GithubClient, GithubClientError, GithubUserClient, Org, OrgDetails,
+    OrgDetailsAndMembership, OrgMembership, Repository, Team,
 };
+use super::authz_github_user::OAuthBearerToken;
 use super::github_apps_installation::api_root;
 
 /// `github.V3Client`'s unconditional preview `Accept` values. The baseline
@@ -43,11 +47,22 @@ const ACCEPT_PREVIEW: [&str; 3] = [
 /// Added when `ExperimentalFeatures.EnableGithubInternalRepoVisibility` is on.
 const ACCEPT_NEBULA: &str = "application/vnd.github.nebula-preview+json";
 
+/// How the client authenticates: the external service's static token, or
+/// `OAuthBearerToken{Token, RefreshToken, Expiry, RefreshFunc, NeedsRefreshBuffer: 5}`
+/// (`WithAuthenticator`) for the user-centric path.
+#[derive(Clone)]
+pub enum Auth {
+    /// `auth.OAuthBearerToken{Token: c.Token}`; `Some("")` still sends
+    /// `Authorization: Bearer ` like the baseline.
+    Static(Option<String>),
+    OAuth(Arc<OAuthBearerToken>),
+}
+
 /// `internal/extsvc/github.V3Client`, reduced to the authz methods.
 pub struct GithubRestClient {
     http: reqwest::Client,
     api_url: reqwest::Url,
-    token: Option<String>,
+    auth: Auth,
     enable_github_internal_repo_visibility: bool,
 }
 
@@ -86,13 +101,31 @@ impl GithubRestClient {
         Self {
             http,
             api_url,
-            token,
+            auth: Auth::Static(token),
             enable_github_internal_repo_visibility,
+        }
+    }
+
+    /// `ClientAdapter.WithAuthenticator(oauthToken)`: the same client with the
+    /// user's OAuth bearer token.
+    pub fn with_oauth_token(&self, token: Arc<OAuthBearerToken>) -> Self {
+        Self {
+            http: self.http.clone(),
+            api_url: self.api_url.clone(),
+            auth: Auth::OAuth(token),
+            enable_github_internal_repo_visibility: self.enable_github_internal_repo_visibility,
         }
     }
 
     pub fn api_url(&self) -> &reqwest::Url {
         &self.api_url
+    }
+
+    /// The underlying HTTP client, shared with the OAuth token endpoint so the
+    /// refresh request uses the same proxy/TLS settings as the API calls (the
+    /// baseline's `httpcli.ExternalDoer`).
+    pub fn http_client(&self) -> reqwest::Client {
+        self.http.clone()
     }
 
     /// `path.Join(apiURL.Path, path)` resolved against the API root. The
@@ -109,15 +142,35 @@ impl GithubRestClient {
         url
     }
 
-    /// `doRequest` + `json.Decoder.Decode`: returns the decoded body and
-    /// whether the `Link` header advertises a next page.
-    async fn get_json<T: DeserializeOwned>(
-        &self,
-        path: &str,
-        query: Option<&str>,
-    ) -> Result<(T, bool), GithubClientError> {
-        let url = self.request_url(path, query);
+    /// `oauthutil.DoRequest`: a pre-emptive refresh when the token is known to
+    /// be expiring (`NeedsRefresh`), then the request; a 401 with an
+    /// `OAuthBearerToken` refreshes and retries exactly once. A failed
+    /// refresh leaves the original response in place (the 401 APIError).
+    async fn do_request(&self, url: &reqwest::Url) -> Result<reqwest::Response, GithubClientError> {
+        if let Auth::OAuth(token) = &self.auth {
+            if token.needs_refresh() {
+                if let Err(err) = token.refresh().await {
+                    tracing::warn!(error = %err, "doRequest: token refresh failed");
+                }
+            }
+        }
 
+        let response = self.send(url).await?;
+        if response.status() == StatusCode::UNAUTHORIZED {
+            if let Auth::OAuth(token) = &self.auth {
+                if token.refresh().await.is_ok() {
+                    // Re-authorize and re-do the request.
+                    return self.send(url).await;
+                }
+            }
+        }
+        Ok(response)
+    }
+
+    fn build_request(
+        &self,
+        url: &reqwest::Url,
+    ) -> Result<reqwest::RequestBuilder, GithubClientError> {
         let mut request = self
             .http
             .get(url.clone())
@@ -129,16 +182,35 @@ impl GithubRestClient {
         if self.enable_github_internal_repo_visibility {
             request = request.header(ACCEPT, ACCEPT_NEBULA);
         }
-        if let Some(token) = &self.token {
+        let token = match &self.auth {
+            Auth::Static(token) => token.clone(),
+            Auth::OAuth(token) => Some(token.token().access_token),
+        };
+        if let Some(token) = token {
             let value = HeaderValue::from_str(&format!("Bearer {token}"))
                 .map_err(|err| GithubClientError::new(format!("authenticating request: {err}")))?;
             request = request.header(AUTHORIZATION, value);
         }
+        Ok(request)
+    }
 
-        let response = request
+    async fn send(&self, url: &reqwest::Url) -> Result<reqwest::Response, GithubClientError> {
+        self.build_request(url)?
             .send()
             .await
-            .map_err(|err| GithubClientError::new(format!("request failed: {err}")))?;
+            .map_err(|err| GithubClientError::new(format!("request failed: {err}")))
+    }
+
+    /// `doRequest` + `json.Decoder.Decode`: returns the decoded body and
+    /// whether the `Link` header advertises a next page.
+    async fn get_json<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        query: Option<&str>,
+    ) -> Result<(T, bool), GithubClientError> {
+        let url = self.request_url(path, query);
+
+        let response = self.do_request(&url).await?;
 
         let has_next_page = response
             .headers()
@@ -166,12 +238,21 @@ async fn api_error(
     status: StatusCode,
     response: reqwest::Response,
 ) -> GithubClientError {
-    let message = match response.text().await {
+    let (message, documentation_url) = match response.text().await {
         Ok(body) => match serde_json::from_str::<RawError>(&body) {
-            Ok(error) => error.message.unwrap_or_default(),
-            Err(err) => format!("failed to decode error response from GitHub API: {err}: {body:?}"),
+            Ok(error) => (
+                error.message.unwrap_or_default(),
+                error.documentation_url.unwrap_or_default(),
+            ),
+            Err(err) => (
+                format!("failed to decode error response from GitHub API: {err}: {body:?}"),
+                String::new(),
+            ),
         },
-        Err(err) => format!("failed to read error response from GitHub API: {err}"),
+        Err(err) => (
+            format!("failed to read error response from GitHub API: {err}"),
+            String::new(),
+        ),
     };
     GithubClientError {
         message: format!(
@@ -179,6 +260,9 @@ async fn api_error(
             status.as_u16()
         ),
         not_found: status == StatusCode::NOT_FOUND,
+        status: status.as_u16(),
+        api_message: message,
+        documentation_url,
     }
 }
 
@@ -364,6 +448,9 @@ impl GithubClient for GithubRestClient {
             Err(err) if err.not_found => Err(GithubClientError {
                 message: "GitHub organization not found".to_owned(),
                 not_found: true,
+                status: 404,
+                api_message: "GitHub organization not found".to_owned(),
+                documentation_url: String::new(),
             }),
             Err(err) => Err(err),
         }
@@ -386,8 +473,163 @@ impl GithubClient for GithubRestClient {
             Err(err) if err.not_found => Err(GithubClientError {
                 message: "GitHub repository not found".to_owned(),
                 not_found: true,
+                status: 404,
+                api_message: "GitHub repository not found".to_owned(),
+                documentation_url: String::new(),
             }),
             Err(err) => Err(err),
         }
+    }
+}
+
+/// `convertRestRepo` reduced to the fields the authz provider reads. A
+/// `null` entry or a repository without a `node_id` is skipped, like
+/// `listRepositories`.
+fn convert_rest_repos(rest: Vec<Option<RawRepositoryListItem>>) -> Vec<Repository> {
+    // `null` entries decode to zero-valued structs in Go and are dropped for
+    // their empty `node_id`; serde needs the explicit `Option`.
+    rest.into_iter()
+        .flatten()
+        .filter(|repo| !repo.node_id.is_empty())
+        .map(|repo| Repository {
+            id: repo.node_id,
+            visibility: repo.visibility,
+        })
+        .collect()
+}
+
+#[derive(Debug, Deserialize)]
+struct RawRepositoryListItem {
+    #[serde(default)]
+    node_id: String,
+    #[serde(default)]
+    visibility: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawOrgMembership {
+    #[serde(default)]
+    state: String,
+    #[serde(default)]
+    role: String,
+}
+
+#[async_trait]
+impl GithubUserClient for GithubRestClient {
+    async fn list_affiliated_repositories(
+        &self,
+        page: i32,
+        affiliations: &[&str],
+    ) -> Result<(Vec<Repository>, bool), GithubClientError> {
+        // `ListAffiliatedRepositories`: `user/repos?sort=created&visibility=private&page=N&per_page=100[&affiliation=a,b]`.
+        let mut query = format!("sort=created&visibility=private&page={page}&per_page=100");
+        if !affiliations.is_empty() {
+            query.push_str("&affiliation=");
+            query.push_str(&affiliations.join(","));
+        }
+        let (repos, has_next): (Vec<Option<RawRepositoryListItem>>, bool) =
+            self.get_json("user/repos", Some(&query)).await?;
+        Ok((convert_rest_repos(repos), has_next))
+    }
+
+    async fn get_authenticated_user_orgs_details_and_membership(
+        &self,
+        page: i32,
+    ) -> Result<(Vec<OrgDetailsAndMembership>, bool), GithubClientError> {
+        let (orgs, has_next) = self.get_authenticated_user_orgs(page).await?;
+        let mut with_membership = Vec::with_capacity(orgs.len());
+        for org in orgs {
+            // The baseline calls `c.get` directly here (not `GetOrganization`),
+            // so a 404 keeps its raw `APIError` text.
+            let (details, _) = self
+                .get_json::<Option<RawOrgDetails>>(&format!("/orgs/{}", org.login), None)
+                .await?;
+            let (membership, _) = self
+                .get_json::<Option<RawOrgMembership>>(
+                    &format!("/user/memberships/orgs/{}", org.login),
+                    None,
+                )
+                .await?;
+            // The baseline unmarshals into the embedded pointer fields, so a
+            // JSON `null` leaves them nil.
+            with_membership.push(OrgDetailsAndMembership {
+                details: details.map(|details| OrgDetails {
+                    login: details.login,
+                    default_repository_permission: details.default_repository_permission,
+                }),
+                membership: membership.map(|membership| OrgMembership {
+                    state: membership.state,
+                    role: membership.role,
+                }),
+            });
+        }
+        Ok((with_membership, has_next))
+    }
+
+    async fn get_authenticated_user_orgs(
+        &self,
+        page: i32,
+    ) -> Result<(Vec<Org>, bool), GithubClientError> {
+        let (orgs, has_next): (Vec<RawOrg>, bool) = self
+            .get_json("/user/orgs", Some(&format!("per_page=100&page={page}")))
+            .await?;
+        Ok((
+            orgs.into_iter()
+                .map(|org| Org { login: org.login })
+                .collect(),
+            has_next,
+        ))
+    }
+
+    async fn get_authenticated_user_teams(
+        &self,
+        page: i32,
+    ) -> Result<(Vec<Team>, bool), GithubClientError> {
+        let (teams, has_next): (Vec<RawTeam>, bool) = self
+            .get_json("/user/teams", Some(&format!("per_page=100&page={page}")))
+            .await?;
+        Ok((
+            teams
+                .into_iter()
+                .map(|team| Team {
+                    slug: team.slug,
+                    repos_count: team.repos_count,
+                    organization: team.organization.map(|org| Org { login: org.login }),
+                })
+                .collect(),
+            has_next,
+        ))
+    }
+
+    async fn list_org_repositories(
+        &self,
+        org: &str,
+        page: i32,
+        repo_type: &str,
+    ) -> Result<(Vec<Repository>, bool), GithubClientError> {
+        let (repos, has_next): (Vec<Option<RawRepositoryListItem>>, bool) = self
+            .get_json(
+                &format!("/orgs/{org}/repos"),
+                Some(&format!(
+                    "sort=created&page={page}&per_page=100&type={repo_type}"
+                )),
+            )
+            .await?;
+        Ok((convert_rest_repos(repos), has_next))
+    }
+
+    async fn list_team_repositories(
+        &self,
+        org: &str,
+        team: &str,
+        page: i32,
+    ) -> Result<(Vec<Repository>, bool), GithubClientError> {
+        let (repos, has_next): (Vec<Option<RawRepositoryListItem>>, bool) = self
+            .get_json(
+                &format!("/orgs/{org}/teams/{team}/repos"),
+                Some(&format!("page={page}&per_page=100")),
+            )
+            .await?;
+        Ok((convert_rest_repos(repos), has_next))
     }
 }

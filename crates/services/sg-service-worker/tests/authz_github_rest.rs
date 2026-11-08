@@ -13,7 +13,9 @@ use std::sync::{Arc, Mutex};
 
 use http_body_util::BodyExt;
 use sg_http::HttpHandler;
-use sg_service_worker::jobs::authz_github::{Collaborator, GithubClient, GithubClientError, Team};
+use sg_service_worker::jobs::authz_github::{
+    Collaborator, GithubClient, GithubClientError, GithubUserClient, OrgDetailsAndMembership, Team,
+};
 use sg_service_worker::jobs::authz_github_client::GithubRestClient;
 use sg_service_worker::jobs::github_apps_installation::api_root;
 use tokio_util::sync::CancellationToken;
@@ -116,6 +118,53 @@ fn routes() -> BTreeMap<String, Route> {
             link: None,
             body: r#"{"message":"Not Found"}"#.to_owned(),
         },
+    );
+    routes.insert(
+        "/api/v3/user/repos?sort=created&visibility=private&page=1&per_page=100&affiliation=owner,collaborator"
+            .to_owned(),
+        Route {
+            status: 200,
+            link: Some(
+                "</api/v3/user/repos?sort=created&visibility=private&page=2&per_page=100&affiliation=owner,collaborator>; rel=\"next\""
+                    .to_owned(),
+            ),
+            body: r#"[{"node_id":"R_u1","visibility":"private"},null,{"node_id":"R_u2","visibility":"private"}]"#
+                .to_owned(),
+        },
+    );
+    routes.insert(
+        "/api/v3/user/repos?sort=created&visibility=private&page=2&per_page=100&affiliation=owner,collaborator"
+            .to_owned(),
+        route(r#"[{"node_id":"R_u3","visibility":"private"}]"#),
+    );
+    routes.insert(
+        "/api/v3/user/orgs?per_page=100&page=1".to_owned(),
+        route(r#"[{"login":"acme"},{"login":"beta"}]"#),
+    );
+    routes.insert(
+        "/api/v3/user/memberships/orgs/acme".to_owned(),
+        route(r#"{"state":"active","role":"admin"}"#),
+    );
+    routes.insert("/api/v3/orgs/beta".to_owned(), route("null"));
+    routes.insert(
+        "/api/v3/user/memberships/orgs/beta".to_owned(),
+        route("null"),
+    );
+    routes.insert(
+        "/api/v3/user/teams?per_page=100&page=1".to_owned(),
+        route(r#"[{"name":"Alpha","slug":"alpha","url":"https://ghe.example.com/api/v3/teams/1","repos_count":2,"organization":{"login":"acme"}},{"name":"NoOrg","slug":"noorg","repos_count":1,"organization":null}]"#),
+    );
+    routes.insert(
+        "/api/v3/orgs/acme/repos?sort=created&page=1&per_page=100&type=internal".to_owned(),
+        route(r#"[{"node_id":"R_o1","visibility":"internal"}]"#),
+    );
+    routes.insert(
+        "/api/v3/orgs/acme/repos?sort=created&page=1&per_page=100&type=".to_owned(),
+        route(r#"[{"node_id":"R_o2","visibility":"private"}]"#),
+    );
+    routes.insert(
+        "/api/v3/orgs/acme/teams/alpha/repos?page=1&per_page=100".to_owned(),
+        route(r#"[{"node_id":"R_t1","visibility":"private"}]"#),
     );
     routes
 }
@@ -374,5 +423,110 @@ async fn authz_github_rest_matches_go_harness() {
     }
     print_requests("repo-missing");
 
+    print_user_calls(&client, &print_requests).await;
+
     shutdown.cancel();
+}
+
+async fn print_user_calls(client: &GithubRestClient, print_requests: &impl Fn(&str)) {
+    let (status, repos, next) = match client
+        .list_affiliated_repositories(1, &["owner", "collaborator"])
+        .await
+    {
+        Ok((repos, next)) => ("ok", join_repo_ids(&repos), next),
+        Err(_) => ("err", "<empty>".to_owned(), false),
+    };
+    println!("ghrc op=user-affiliated-page1 status={status} repos={repos} next={next}");
+    print_requests("user-affiliated-page1");
+
+    let (status, repos, next) = match client
+        .list_affiliated_repositories(2, &["owner", "collaborator"])
+        .await
+    {
+        Ok((repos, next)) => ("ok", join_repo_ids(&repos), next),
+        Err(_) => ("err", "<empty>".to_owned(), false),
+    };
+    println!("ghrc op=user-affiliated-page2 status={status} repos={repos} next={next}");
+    print_requests("user-affiliated-page2");
+
+    let (status, orgs, next) = match client
+        .get_authenticated_user_orgs_details_and_membership(1)
+        .await
+    {
+        Ok((orgs, next)) => ("ok", join_org_details(&orgs), next),
+        Err(_) => ("err", "<empty>".to_owned(), false),
+    };
+    println!("ghrc op=user-orgs-details status={status} orgs={orgs} next={next}");
+    print_requests("user-orgs-details");
+
+    let (status, orgs, next) = match client.get_authenticated_user_orgs(1).await {
+        Ok((orgs, next)) => (
+            "ok",
+            orgs.iter()
+                .map(|org| org.login.clone())
+                .collect::<Vec<_>>()
+                .join(","),
+            next,
+        ),
+        Err(_) => ("err", "<empty>".to_owned(), false),
+    };
+    println!("ghrc op=user-orgs status={status} orgs={orgs} next={next}");
+    print_requests("user-orgs");
+
+    let (status, teams, next) = match client.get_authenticated_user_teams(1).await {
+        Ok((teams, next)) => ("ok", join_teams(&teams), next),
+        Err(_) => ("err", "<empty>".to_owned(), false),
+    };
+    println!("ghrc op=user-teams status={status} teams={teams} next={next}");
+    print_requests("user-teams");
+
+    for (op, repo_type) in [("org-repos-internal", "internal"), ("org-repos-all", "")] {
+        let (status, repos, next) = match client.list_org_repositories("acme", 1, repo_type).await {
+            Ok((repos, next)) => ("ok", join_repo_ids(&repos), next),
+            Err(_) => ("err", "<empty>".to_owned(), false),
+        };
+        println!("ghrc op={op} status={status} repos={repos} next={next}");
+        print_requests(op);
+    }
+
+    let (status, repos, next) = match client.list_team_repositories("acme", "alpha", 1).await {
+        Ok((repos, next)) => ("ok", join_repo_ids(&repos), next),
+        Err(_) => ("err", "<empty>".to_owned(), false),
+    };
+    println!("ghrc op=team-repos status={status} repos={repos} next={next}");
+    print_requests("team-repos");
+}
+
+fn join_repo_ids(repos: &[sg_service_worker::jobs::authz_github::Repository]) -> String {
+    if repos.is_empty() {
+        return "<empty>".to_owned();
+    }
+    repos
+        .iter()
+        .map(|repo| repo.id.clone())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn join_org_details(orgs: &[OrgDetailsAndMembership]) -> String {
+    if orgs.is_empty() {
+        return "<empty>".to_owned();
+    }
+    orgs.iter()
+        .map(|org| {
+            let details = match &org.details {
+                Some(details) => format!(
+                    "{}:{}",
+                    details.login, details.default_repository_permission
+                ),
+                None => "<nil>".to_owned(),
+            };
+            let membership = match &org.membership {
+                Some(membership) => format!("{}:{}", membership.state, membership.role),
+                None => "<nil>".to_owned(),
+            };
+            format!("{details}|{membership}")
+        })
+        .collect::<Vec<_>>()
+        .join(";")
 }

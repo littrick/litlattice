@@ -14,11 +14,16 @@
 //! is positive, a [`RedisGroupsCache`] over the caller's Redis pool — the same
 //! `gh_groups_perms:<serviceID>:<urn>` key space as the baseline.
 //!
+//! The user-centric half (`FetchUserPerms`) is constructed here too, wired to
+//! the same code host client, groups cache and `authorization` flags
+//! (`syncInternalRepoPermissions`, `groupsCacheTTL`), plus the user external
+//! account keyring and Postgres token store the OAuth refresh path needs (see
+//! [`super::authz_github_user`]).
+//!
 //! Not ported yet: GitHub App authentication (`gitHubAppDetails` /
 //! `githubAppInstallationID`) is reported as a serious problem because the
 //! installation-token auther is not available; connections of the other kinds
-//! are discovered but produce no provider (docs §60.4); and the provider is not
-//! yet registered with the permission syncer.
+//! are discovered but produce no provider (docs §60.4).
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -35,6 +40,10 @@ use super::authz_github::{
     GithubRepoPermsProvider, GroupsCache, MemoryGroupsCache, RedisGroupsCache,
 };
 use super::authz_github_client::GithubRestClient;
+use super::authz_github_user::{
+    github_oauth_providers, GithubOAuthProvider, GithubUserClientFactory, GithubUserPerms,
+    GithubUserPermsProvider, PgOAuthTokenStore,
+};
 use super::perms_syncer::{AuthzProvider, ProviderRegistry};
 
 /// `providers.ProvidersFromConfig`'s external service kinds, in its order.
@@ -157,7 +166,7 @@ pub async fn providers_from_config(
         }
     }
 
-    let github = github_new_authz_providers(&github_conns, site, opts);
+    let github = github_new_authz_providers(&github_conns, site, keyring, pool, opts);
 
     ProviderInitResult {
         providers: github.providers,
@@ -190,13 +199,25 @@ async fn parse_service_config(
 fn github_new_authz_providers(
     conns: &[GithubConnection],
     site: &SiteConfiguration,
+    keyring: &Keyring,
+    pool: &PgPool,
     opts: &ProvidersOptions,
 ) -> ProviderInitResult {
     let mut result = ProviderInitResult::default();
     let auth_providers = github_auth_providers(site);
+    // `auth.providers`, in configuration order: `GetOAuthContext` returns the
+    // first GitHub entry whose raw `url` prefixes the service ID.
+    let oauth_providers = github_oauth_providers(site);
 
     for conn in conns {
-        let build = match new_github_authz_provider(conn, opts, &auth_providers) {
+        let build = match new_github_authz_provider(
+            conn,
+            opts,
+            &auth_providers,
+            &oauth_providers,
+            keyring,
+            pool,
+        ) {
             Ok(Some(build)) => build,
             Ok(None) => continue,
             Err(err) => {
@@ -264,6 +285,9 @@ fn new_github_authz_provider(
     conn: &GithubConnection,
     opts: &ProvidersOptions,
     auth_providers: &BTreeMap<String, GithubAuthProviderRef>,
+    oauth_providers: &[GithubOAuthProvider],
+    keyring: &Keyring,
+    pool: &PgPool,
 ) -> Result<Option<GithubProviderBuild>, String> {
     let Some(authorization) = conn
         .config
@@ -359,15 +383,42 @@ fn new_github_authz_provider(
         None
     };
 
-    let provider = Arc::new(GithubRepoPermsProvider::new(
-        urn,
-        service_id,
+    // `NewProvider(..., SyncInternalRepoPermissions: c.Authorization != nil &&
+    // c.Authorization.SyncInternalRepoPermissions)`.
+    let sync_internal_repo_permissions = authorization
+        .get("syncInternalRepoPermissions")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
+    let user_external_account_key = keyring.user_external_account_key();
+    let user_client_factory: Arc<dyn GithubUserClientFactory> = client.clone();
+    let user_perms: Arc<dyn GithubUserPermsProvider> = Arc::new(GithubUserPerms::new(
+        service_id.clone(),
         TYPE_GITHUB,
-        base_url.host_str().unwrap_or_default().to_owned(),
-        client,
-        groups_cache,
-        opts.enable_github_internal_repo_visibility,
+        user_client_factory,
+        groups_cache.clone(),
+        sync_internal_repo_permissions,
+        oauth_providers.to_vec(),
+        Arc::new(PgOAuthTokenStore::new(
+            pool.clone(),
+            user_external_account_key.clone(),
+        )),
+        user_external_account_key,
+        client.http_client(),
     ));
+
+    let provider = Arc::new(
+        GithubRepoPermsProvider::new(
+            urn,
+            service_id,
+            TYPE_GITHUB,
+            base_url.host_str().unwrap_or_default().to_owned(),
+            client,
+            groups_cache,
+            opts.enable_github_internal_repo_visibility,
+        )
+        .with_user_perms(user_perms),
+    );
 
     Ok(Some(GithubProviderBuild { provider, warning }))
 }
@@ -500,21 +551,36 @@ mod tests {
         }
     }
 
-    #[test]
-    fn no_authorization_builds_no_provider() {
+    /// `new_github_authz_provider` with the production dependencies stubbed:
+    /// an unconnected pool and the empty keyring (no OAuth providers in site
+    /// config for these cases).
+    fn build_provider(
+        conn: &GithubConnection,
+        opts: &ProvidersOptions,
+        auth_providers: &BTreeMap<String, GithubAuthProviderRef>,
+    ) -> Result<Option<GithubProviderBuild>, String> {
+        let keyring = Keyring::default();
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://unused@localhost/unused")
+            .expect("lazy pool");
+        new_github_authz_provider(conn, opts, auth_providers, &[], &keyring, &pool)
+    }
+
+    #[tokio::test]
+    async fn no_authorization_builds_no_provider() {
         let conn = github_conn(json!({"url": "https://github.example.com", "token": "t"}));
-        let build = new_github_authz_provider(&conn, &options(), &BTreeMap::new()).unwrap();
+        let build = build_provider(&conn, &options(), &BTreeMap::new()).unwrap();
         assert!(build.is_none());
     }
 
-    #[test]
-    fn positive_ttl_attaches_groups_cache() {
+    #[tokio::test]
+    async fn positive_ttl_attaches_groups_cache() {
         let conn = github_conn(json!({
             "url": "https://GITHUB.example.com:8443/",
             "token": "t",
             "authorization": {"groupsCacheTTL": 24}
         }));
-        let build = new_github_authz_provider(&conn, &options(), &BTreeMap::new())
+        let build = build_provider(&conn, &options(), &BTreeMap::new())
             .unwrap()
             .expect("provider");
         assert!(build.warning.is_none());
@@ -527,23 +593,23 @@ mod tests {
         assert!(build.provider.groups_cache_enabled());
     }
 
-    #[test]
-    fn non_positive_ttl_disables_groups_cache() {
+    #[tokio::test]
+    async fn non_positive_ttl_disables_groups_cache() {
         for ttl in [json!(-1), json!(0), json!(null)] {
             let conn = github_conn(json!({
                 "url": "https://github.example.com",
                 "token": "t",
                 "authorization": {"groupsCacheTTL": ttl}
             }));
-            let build = new_github_authz_provider(&conn, &options(), &BTreeMap::new())
+            let build = build_provider(&conn, &options(), &BTreeMap::new())
                 .unwrap()
                 .expect("provider");
             assert!(!build.provider.groups_cache_enabled());
         }
     }
 
-    #[test]
-    fn login_provider_without_groups_sync_warns_and_disables_cache() {
+    #[tokio::test]
+    async fn login_provider_without_groups_sync_warns_and_disables_cache() {
         let conn = github_conn(json!({
             "url": "https://github.example.com",
             "token": "t",
@@ -557,7 +623,7 @@ mod tests {
             },
         );
 
-        let build = new_github_authz_provider(&conn, &options(), &auth_providers)
+        let build = build_provider(&conn, &options(), &auth_providers)
             .unwrap()
             .expect("provider");
         let warning = build.warning.expect("warning");
@@ -565,8 +631,8 @@ mod tests {
         assert!(!build.provider.groups_cache_enabled());
     }
 
-    #[test]
-    fn login_provider_with_groups_sync_keeps_cache() {
+    #[tokio::test]
+    async fn login_provider_with_groups_sync_keeps_cache() {
         let conn = github_conn(json!({
             "url": "https://github.example.com",
             "token": "t",
@@ -580,15 +646,15 @@ mod tests {
             },
         );
 
-        let build = new_github_authz_provider(&conn, &options(), &auth_providers)
+        let build = build_provider(&conn, &options(), &auth_providers)
             .unwrap()
             .expect("provider");
         assert!(build.warning.is_none());
         assert!(build.provider.groups_cache_enabled());
     }
 
-    #[test]
-    fn acls_license_error_is_a_serious_problem() {
+    #[tokio::test]
+    async fn acls_license_error_is_a_serious_problem() {
         let conn = github_conn(json!({
             "url": "https://github.example.com",
             "token": "t",
@@ -598,12 +664,12 @@ mod tests {
             acls_license_error: Some("acls unavailable".to_owned()),
             ..ProvidersOptions::default()
         };
-        let err = expect_err(new_github_authz_provider(&conn, &opts, &BTreeMap::new()));
+        let err = expect_err(build_provider(&conn, &opts, &BTreeMap::new()));
         assert_eq!(err, "acls unavailable");
     }
 
-    #[test]
-    fn github_app_details_are_not_supported() {
+    #[tokio::test]
+    async fn github_app_details_are_not_supported() {
         for config in [
             json!({
                 "url": "https://github.example.com",
@@ -617,11 +683,7 @@ mod tests {
             }),
         ] {
             let conn = github_conn(config);
-            let err = expect_err(new_github_authz_provider(
-                &conn,
-                &options(),
-                &BTreeMap::new(),
-            ));
+            let err = expect_err(build_provider(&conn, &options(), &BTreeMap::new()));
             assert!(err.contains("GitHub App authentication is not supported"));
         }
     }

@@ -19,8 +19,13 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use sg_db::user_external_accounts::ExternalAccount;
 
-use super::perms_syncer::{AuthzProvider, FetchError, FetchPermsOptions, FetchRepo};
+use super::authz_github_user::GithubUserPermsProvider;
+use super::perms_syncer::{
+    AuthzProvider, ExternalUserPermissions, FetchError, FetchPermsOptions, FetchRepo,
+    UserPermsError,
+};
 
 /// `extsvc.TypeGitHub`.
 pub const TYPE_GITHUB: &str = "github";
@@ -66,6 +71,15 @@ pub struct OrgMembership {
     pub role: String,
 }
 
+/// `github.OrgDetailsAndMembership`: the org details and the authenticated
+/// user's membership in it. `None` mirrors the embedded nil pointers the
+/// baseline checks for.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OrgDetailsAndMembership {
+    pub details: Option<OrgDetails>,
+    pub membership: Option<OrgMembership>,
+}
+
 /// `github.Repository` reduced to the fields permissions use.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Repository {
@@ -78,10 +92,22 @@ pub struct Repository {
 
 /// `github.APIError`-ish error: the message is already formatted like the
 /// baseline's `err.Error()`, `not_found` mirrors `github.IsNotFound(err)`.
+///
+/// `status`/`api_message`/`documentation_url` carry the raw GitHub error so
+/// callers can answer the `errcode` predicates (`Unauthorized`,
+/// `AccountSuspended`, `Temporary`) the syncer classifies on, exactly as
+/// `errors.As` would find the original `*github.APIError` through the
+/// baseline's `errors.Wrap` chain.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GithubClientError {
     pub message: String,
     pub not_found: bool,
+    /// `APIError.Code`; 0 when the error is not an HTTP API error.
+    pub status: u16,
+    /// `APIError.Message` (unwrapped).
+    pub api_message: String,
+    /// `APIError.DocumentationURL`.
+    pub documentation_url: String,
 }
 
 impl GithubClientError {
@@ -89,6 +115,9 @@ impl GithubClientError {
         Self {
             message: message.into(),
             not_found: false,
+            status: 0,
+            api_message: String::new(),
+            documentation_url: String::new(),
         }
     }
 
@@ -98,7 +127,27 @@ impl GithubClientError {
         Self {
             message: "not found".to_owned(),
             not_found: true,
+            status: 404,
+            api_message: "not found".to_owned(),
+            documentation_url: String::new(),
         }
+    }
+
+    /// `(*github.APIError).Unauthorized`.
+    pub fn unauthorized(&self) -> bool {
+        self.status == 401
+    }
+
+    /// `(*github.APIError).AccountSuspended`.
+    pub fn account_suspended(&self) -> bool {
+        self.status == 403 && self.api_message.contains("account was suspended")
+    }
+
+    /// `github.IsRateLimitExceeded` for an `APIError`.
+    pub fn rate_limit_exceeded(&self) -> bool {
+        self.status != 0
+            && (self.api_message.contains("API rate limit exceeded")
+                || self.documentation_url.contains("#rate-limiting"))
     }
 }
 
@@ -109,6 +158,54 @@ impl fmt::Display for GithubClientError {
 }
 
 impl std::error::Error for GithubClientError {}
+
+/// The subset of `github.V3Client` / `ClientAdapter`'s `client` interface the
+/// user-centric (`FetchUserPerms`) path calls. Requests are authenticated with
+/// the user's OAuth token (`WithAuthenticator`), not the external service
+/// token.
+#[async_trait]
+pub trait GithubUserClient: Send + Sync {
+    /// `ListAffiliatedRepositories(VisibilityPrivate, page, 100, affiliations...)`.
+    async fn list_affiliated_repositories(
+        &self,
+        page: i32,
+        affiliations: &[&str],
+    ) -> Result<(Vec<Repository>, bool), GithubClientError>;
+
+    /// `GetAuthenticatedUserOrgsDetailsAndMembership`.
+    async fn get_authenticated_user_orgs_details_and_membership(
+        &self,
+        page: i32,
+    ) -> Result<(Vec<OrgDetailsAndMembership>, bool), GithubClientError>;
+
+    /// `GetAuthenticatedUserOrgs`.
+    async fn get_authenticated_user_orgs(
+        &self,
+        page: i32,
+    ) -> Result<(Vec<Org>, bool), GithubClientError>;
+
+    /// `GetAuthenticatedUserTeams`.
+    async fn get_authenticated_user_teams(
+        &self,
+        page: i32,
+    ) -> Result<(Vec<Team>, bool), GithubClientError>;
+
+    /// `ListOrgRepositories(org, page, repoType)`, `type=` empty means all.
+    async fn list_org_repositories(
+        &self,
+        org: &str,
+        page: i32,
+        repo_type: &str,
+    ) -> Result<(Vec<Repository>, bool), GithubClientError>;
+
+    /// `ListTeamRepositories(org, team, page)`.
+    async fn list_team_repositories(
+        &self,
+        org: &str,
+        team: &str,
+        page: i32,
+    ) -> Result<(Vec<Repository>, bool), GithubClientError>;
+}
 
 /// The subset of `github.V3Client` / `ClientAdapter` the repository-centric
 /// provider calls. The real client is a later slice; tests inject a mock.
@@ -349,6 +446,22 @@ pub fn can_view_org_repos(org: Option<&OrgDetails>, membership: Option<&OrgMembe
     )
 }
 
+/// `internal/authz/providers/github/client.go`'s `canViewOrgRepos`, which
+/// takes the combined org details/membership value.
+pub fn can_view_org_repos_details(org: &OrgDetailsAndMembership) -> bool {
+    if let Some(membership) = &org.membership {
+        if membership.state == "active" && membership.role == "admin" {
+            return true;
+        }
+    }
+    org.details.as_ref().is_some_and(|details| {
+        matches!(
+            details.default_repository_permission.as_str(),
+            "read" | "write" | "admin"
+        )
+    })
+}
+
 /// `github.SplitRepositoryNameWithOwner`.
 fn split_repository_name_with_owner(name_with_owner: &str) -> Result<(String, String), String> {
     let parts: Vec<&str> = name_with_owner.splitn(2, '/').collect();
@@ -379,6 +492,11 @@ pub struct GithubRepoPermsProvider {
     /// `nil` when `authorization.groupsCacheTTL <= 0`.
     groups_cache: Option<Arc<dyn GroupsCache>>,
     enable_github_internal_repo_visibility: bool,
+    /// `Provider.FetchUserPerms` needs the database and OAuth configuration,
+    /// so it lives in a separately constructed component. `None` (tests that
+    /// only exercise the repository-centric path) leaves the trait default,
+    /// `Unimplemented`.
+    user_perms: Option<Arc<dyn GithubUserPermsProvider>>,
 }
 
 impl GithubRepoPermsProvider {
@@ -399,7 +517,21 @@ impl GithubRepoPermsProvider {
             client,
             groups_cache,
             enable_github_internal_repo_visibility,
+            user_perms: None,
         }
+    }
+
+    /// Attach the user-centric `FetchUserPerms` implementation (the
+    /// `ProvidersFromConfig` construction does this; unit tests for the
+    /// repository-centric path do not).
+    pub fn with_user_perms(mut self, user_perms: Arc<dyn GithubUserPermsProvider>) -> Self {
+        self.user_perms = Some(user_perms);
+        self
+    }
+
+    /// The groups cache, for the user-centric component (`fetchCachedAuthenticatedUserPerms`).
+    pub fn groups_cache(&self) -> Option<Arc<dyn GroupsCache>> {
+        self.groups_cache.clone()
     }
 
     /// Whether a groups cache is attached (i.e. `authorization.groupsCacheTTL`
@@ -501,6 +633,20 @@ impl AuthzProvider for GithubRepoPermsProvider {
 
     fn urn(&self) -> &str {
         &self.urn
+    }
+
+    /// `Provider.FetchUserPerms`: private repositories the account can read.
+    async fn fetch_user_perms(
+        &self,
+        account: &ExternalAccount,
+        opts: &FetchPermsOptions,
+    ) -> Result<Option<ExternalUserPermissions>, UserPermsError> {
+        match &self.user_perms {
+            Some(user_perms) => user_perms.fetch_user_perms(account, opts).await,
+            None => Err(UserPermsError::Unimplemented {
+                message: "FetchUserPerms is not implemented".to_owned(),
+            }),
+        }
     }
 
     /// `Provider.FetchRepoPerms`. May return a partial account list together
