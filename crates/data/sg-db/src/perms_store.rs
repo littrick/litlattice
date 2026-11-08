@@ -157,6 +157,17 @@ pub async fn set_user_external_account_perms(
     source: &str,
     now: OffsetDateTime,
 ) -> Result<SetPermissionsResult, sqlx::Error> {
+    set_user_external_account_perms_with_replace(pool, user, repo_ids, source, true, now).await
+}
+
+async fn set_user_external_account_perms_with_replace(
+    pool: &PgPool,
+    user: UserIdWithExternalAccountId,
+    repo_ids: &[i32],
+    source: &str,
+    replace_perms: bool,
+    now: OffsetDateTime,
+) -> Result<SetPermissionsResult, sqlx::Error> {
     let permissions: Vec<Permission> = repo_ids
         .iter()
         .map(|repo_id| Permission {
@@ -170,7 +181,7 @@ pub async fn set_user_external_account_perms(
         external_account_id: user.external_account_id,
         repo_id: 0,
     };
-    set_user_repo_permissions(pool, &permissions, entity, source, true, now).await
+    set_user_repo_permissions(pool, &permissions, entity, source, replace_perms, now).await
 }
 
 /// `setUserRepoPermissions`: upsert the given pairs, then (optionally) delete
@@ -527,6 +538,347 @@ pub async fn get_latest_finished_sync_job(
     let id: i32 = row.try_get("id")?;
     let finished_at: OffsetDateTime = row.try_get("finished_at")?;
     Ok(Some(FinishedSyncJob { id, finished_at }))
+}
+
+/// `authz.PermRepos`: the object type of the repository/external-account
+/// to user grant.
+pub const PERM_OBJECT_REPOS: &str = "repos";
+
+/// `authz.Read`.
+pub const PERM_READ: &str = "read";
+
+/// `authz.UserPendingPermissions`, reduced to the fields the store reads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserPendingPermissions {
+    pub id: i64,
+    pub object_ids: Vec<i32>,
+    pub updated_at: OffsetDateTime,
+}
+
+/// `PermsStore.SetRepoPendingPermissions`: record the external accounts that
+/// are pending access to a repository until their user is created. Stub rows
+/// are reused when they exist; only missing accounts are upserted (the
+/// baseline avoids growing the bigserial id sequence unnecessarily).
+#[allow(clippy::too_many_arguments)]
+pub async fn set_repo_pending_permissions(
+    pool: &PgPool,
+    repo_id: i32,
+    perm: &str,
+    service_type: &str,
+    service_id: &str,
+    account_ids: &[String],
+    now: OffsetDateTime,
+) -> Result<(), sqlx::Error> {
+    let mut tx = pool.begin().await?;
+
+    let mut existing: HashMap<String, i64> = HashMap::new();
+    if !account_ids.is_empty() {
+        let rows = sqlx::query(
+            r#"
+SELECT bind_id, id FROM user_pending_permissions
+WHERE service_type = $1
+AND service_id = $2
+AND permission = $3
+AND object_type = $4
+AND bind_id = ANY($5)
+"#,
+        )
+        .bind(service_type)
+        .bind(service_id)
+        .bind(perm)
+        .bind(PERM_OBJECT_REPOS)
+        .bind(account_ids.to_vec())
+        .fetch_all(&mut *tx)
+        .await?;
+        for row in rows {
+            existing.insert(row.try_get("bind_id")?, row.try_get("id")?);
+        }
+    }
+
+    let missing: Vec<String> = account_ids
+        .iter()
+        .filter(|bind_id| !existing.contains_key(*bind_id))
+        .cloned()
+        .collect();
+
+    let mut pending_ids: std::collections::HashSet<i64> = existing.values().copied().collect();
+    if !missing.is_empty() {
+        let rows = sqlx::query(
+            r#"
+INSERT INTO user_pending_permissions
+	(service_type, service_id, bind_id, permission, object_type, updated_at)
+SELECT $1::TEXT, $2::TEXT, UNNEST($3::TEXT[]), $4::TEXT, $5::TEXT, $6::TIMESTAMPTZ
+ON CONFLICT ON CONSTRAINT
+	user_pending_permissions_service_perm_object_unique
+DO UPDATE SET
+	updated_at = excluded.updated_at
+RETURNING id
+"#,
+        )
+        .bind(service_type)
+        .bind(service_id)
+        .bind(missing)
+        .bind(perm)
+        .bind(PERM_OBJECT_REPOS)
+        .bind(now)
+        .fetch_all(&mut *tx)
+        .await?;
+        for row in rows {
+            pending_ids.insert(row.try_get::<i64, _>("id")?);
+        }
+    }
+
+    // `FOR UPDATE` matches the baseline lock.
+    let old_ids = load_repo_pending_permission_ids(&mut tx, repo_id, perm).await?;
+    let old_ids: std::collections::HashSet<i64> = old_ids.into_iter().collect();
+
+    let added: Vec<i64> = pending_ids.difference(&old_ids).copied().collect();
+    let removed: Vec<i64> = old_ids.difference(&pending_ids).copied().collect();
+    if added.is_empty() && removed.is_empty() {
+        tx.commit().await?;
+        return Ok(());
+    }
+
+    let mut all_ids = added.clone();
+    all_ids.extend(removed.iter().copied());
+    sqlx::query(
+        r#"
+UPDATE user_pending_permissions
+SET
+	object_ids_ints = CASE
+		WHEN user_pending_permissions.id = ANY ($1) THEN
+			user_pending_permissions.object_ids_ints | $2
+		ELSE
+			user_pending_permissions.object_ids_ints - $3
+		END,
+	updated_at = $4
+WHERE
+	id = ANY ($5)
+AND permission = $6
+AND object_type = $7
+"#,
+    )
+    .bind(added)
+    .bind(vec![repo_id])
+    .bind(vec![repo_id])
+    .bind(now)
+    .bind(all_ids)
+    .bind(perm)
+    .bind(PERM_OBJECT_REPOS)
+    .execute(&mut *tx)
+    .await?;
+
+    let mut pending_ids: Vec<i64> = pending_ids.into_iter().collect();
+    pending_ids.sort_unstable();
+    sqlx::query(
+        r#"
+INSERT INTO repo_pending_permissions
+  (repo_id, permission, user_ids_ints, updated_at)
+VALUES
+  ($1, $2, $3::bigint[], $4)
+ON CONFLICT ON CONSTRAINT
+  repo_pending_permissions_perm_unique
+DO UPDATE SET
+  user_ids_ints = excluded.user_ids_ints,
+  updated_at = excluded.updated_at
+"#,
+    )
+    .bind(repo_id)
+    .bind(perm)
+    .bind(pending_ids)
+    .bind(now)
+    .execute(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+    Ok(())
+}
+
+/// `loadRepoPendingPermissions` (`FOR UPDATE`): currently stored pending user
+/// IDs of a repository; absent rows mean an empty set.
+async fn load_repo_pending_permission_ids(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    repo_id: i32,
+    perm: &str,
+) -> Result<Vec<i64>, sqlx::Error> {
+    let row = sqlx::query(
+        r#"
+SELECT user_ids_ints
+FROM repo_pending_permissions
+WHERE repo_id = $1
+AND permission = $2
+FOR UPDATE
+"#,
+    )
+    .bind(repo_id)
+    .bind(perm)
+    .fetch_optional(&mut **tx)
+    .await?;
+    match row {
+        Some(row) => row.try_get("user_ids_ints"),
+        None => Ok(Vec::new()),
+    }
+}
+
+/// `PermsStore.GrantPendingPermissions`: turn the pending repository IDs of an
+/// external account into real user permissions. Returns `false` when the
+/// account has no pending permissions (the baseline is a no-op).
+pub async fn grant_pending_permissions(
+    pool: &PgPool,
+    user: UserIdWithExternalAccountId,
+    service_type: &str,
+    service_id: &str,
+    bind_id: &str,
+    now: OffsetDateTime,
+) -> Result<bool, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+
+    let pending = sqlx::query(
+        r#"
+SELECT id, object_ids_ints, updated_at
+FROM user_pending_permissions
+WHERE service_type = $1
+AND service_id = $2
+AND permission = $3
+AND object_type = $4
+AND bind_id = $5
+FOR UPDATE
+"#,
+    )
+    .bind(service_type)
+    .bind(service_id)
+    .bind(PERM_READ)
+    .bind(PERM_OBJECT_REPOS)
+    .bind(bind_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let pending: UserPendingPermissions = match pending {
+        Some(row) => UserPendingPermissions {
+            id: row.try_get("id")?,
+            object_ids: row.try_get("object_ids_ints")?,
+            updated_at: row.try_get("updated_at")?,
+        },
+        None => {
+            tx.commit().await?;
+            return Ok(false);
+        }
+    };
+
+    let mut repo_ids = pending.object_ids.clone();
+    repo_ids.sort_unstable();
+    repo_ids.dedup();
+
+    // Non-replacing: granting adds to whatever the user already has.
+    let permissions: Vec<Permission> = repo_ids
+        .iter()
+        .map(|repo_id| Permission {
+            user_id: user.user_id,
+            external_account_id: user.external_account_id,
+            repo_id: *repo_id,
+        })
+        .collect();
+    upsert_user_repo_permissions(&mut tx, &permissions, now, SOURCE_USER_SYNC).await?;
+
+    if repo_ids.is_empty() {
+        tx.commit().await?;
+        return Ok(true);
+    }
+
+    // `upsertRepoPermissionsBatchQuery`: every repository in the page is an
+    // "added" one, so the union with excluded user IDs is equivalent.
+    sqlx::query(
+        r#"
+INSERT INTO repo_permissions
+	(repo_id, permission, user_ids_ints, updated_at)
+SELECT unnest($1::int[]), $2, $3::int[], $4
+ON CONFLICT ON CONSTRAINT
+	repo_permissions_perm_unique
+DO UPDATE SET
+	user_ids_ints = repo_permissions.user_ids_ints | excluded.user_ids_ints,
+	updated_at = excluded.updated_at
+"#,
+    )
+    .bind(repo_ids.clone())
+    .bind(PERM_READ)
+    .bind(vec![user.user_id])
+    .bind(now)
+    .execute(&mut *tx)
+    .await?;
+
+    // `upsertUserPermissionsBatchQuery` with only "added" rows.
+    sqlx::query(
+        r#"
+INSERT INTO user_permissions
+	(user_id, permission, object_type, object_ids_ints, updated_at)
+SELECT unnest($1::int[]), $2, $3, $4::int[], $5
+ON CONFLICT ON CONSTRAINT
+	user_permissions_perm_object_unique
+DO UPDATE SET
+	object_ids_ints = user_permissions.object_ids_ints | excluded.object_ids_ints,
+	updated_at = excluded.updated_at
+"#,
+    )
+    .bind(vec![user.user_id])
+    .bind(PERM_READ)
+    .bind(PERM_OBJECT_REPOS)
+    .bind(repo_ids)
+    .bind(now)
+    .execute(&mut *tx)
+    .await?;
+
+    // The pending row is deleted, which invalidates `repo_pending_permissions`
+    // entries for this user (the baseline relies on this to avoid deadlocks).
+    sqlx::query(
+        r#"
+DELETE FROM user_pending_permissions
+WHERE service_type = $1
+AND service_id = $2
+AND permission = $3
+AND object_type = $4
+AND bind_id = $5
+"#,
+    )
+    .bind(service_type)
+    .bind(service_id)
+    .bind(PERM_READ)
+    .bind(PERM_OBJECT_REPOS)
+    .bind(bind_id)
+    .execute(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+    Ok(true)
+}
+
+/// `PermsStore.ListPendingUsers`: bind IDs with non-empty pending repository
+/// IDs. Stub rows with no pending permissions are skipped.
+pub async fn list_pending_users(
+    pool: &PgPool,
+    service_type: &str,
+    service_id: &str,
+) -> Result<Vec<String>, sqlx::Error> {
+    let rows = sqlx::query(
+        r#"
+SELECT bind_id, object_ids_ints
+FROM user_pending_permissions
+WHERE service_type = $1
+AND service_id = $2
+ORDER BY bind_id
+"#,
+    )
+    .bind(service_type)
+    .bind(service_id)
+    .fetch_all(pool)
+    .await?;
+    let mut bind_ids = Vec::new();
+    for row in rows {
+        let ids: Vec<i32> = row.try_get("object_ids_ints")?;
+        if ids.is_empty() {
+            continue;
+        }
+        bind_ids.push(row.try_get("bind_id")?);
+    }
+    Ok(bind_ids)
 }
 
 #[cfg(test)]
