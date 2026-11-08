@@ -334,6 +334,26 @@ impl SiteConfiguration {
             .unwrap_or(false)
     }
 
+    /// `experimentalFeatures.insightsDataRetention`: a tri-state
+    /// `*bool`. `None` (unset/null) keeps data retention enabled; only an
+    /// explicit `false` disables the archive step.
+    pub fn insights_data_retention(&self) -> Option<bool> {
+        self.experimental_features()
+            .and_then(|features| features.get("insightsDataRetention"))
+            .and_then(serde_json::Value::as_bool)
+    }
+
+    /// `conf.Get().InsightsMaximumSampleSize`: the top-level
+    /// `insights.maximumSampleSize` site configuration field (note the dotted
+    /// JSON key). The code insights retention job interprets `<= 0` as
+    /// "unset".
+    pub fn insights_maximum_sample_size(&self) -> i64 {
+        self.raw
+            .get("insights.maximumSampleSize")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(0)
+    }
+
     /// `conf.Get().LicenseKey`: the product license key from the site
     /// configuration. Empty when the instance runs without a license.
     pub fn license_key(&self) -> String {

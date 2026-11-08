@@ -51,6 +51,7 @@ pub mod executors;
 pub mod executors_metrics;
 pub mod executors_multiqueue_metrics;
 pub mod gitserver;
+pub mod insights_data_retention;
 pub mod licensecheck;
 pub mod outbound_webhooks;
 pub mod permissions;
@@ -192,15 +193,16 @@ pub fn all_jobs() -> Vec<(&'static str, Arc<dyn Job>)> {
                 }
                 "record-encrypter" => Arc::new(encryption::RecordEncrypterJob::new()),
                 "gitserver-metrics" => Arc::new(gitserver::GitserverMetrics),
+                "insights-data-retention-job" => {
+                    Arc::new(insights_data_retention::InsightsDataRetentionJob)
+                }
                 "license-check" => Arc::new(licensecheck::LicenseCheckJob),
                 "outbound-webhook-sender" => {
                     Arc::new(outbound_webhooks::OutboundWebhookSender::new())
                 }
                 "permission-sync-job-cleaner" => Arc::new(permissions::PermissionSyncJobCleaner),
                 "rate-limit-config" => Arc::new(ratelimit::RateLimitConfigJob::new()),
-                "refresh-analytics-cache" => {
-                    Arc::new(adminanalytics::RefreshAnalyticsCacheJob)
-                }
+                "refresh-analytics-cache" => Arc::new(adminanalytics::RefreshAnalyticsCacheJob),
                 "repo-embedding-janitor" => {
                     Arc::new(repo_embedding_janitor::RepoEmbeddingJanitor::new())
                 }
