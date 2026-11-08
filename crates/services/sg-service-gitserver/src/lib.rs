@@ -26,6 +26,7 @@ pub mod disk;
 pub mod git;
 pub mod gitservice;
 pub mod grpc;
+pub mod limiter;
 pub mod locker;
 pub mod memobs;
 pub mod metrics;
@@ -34,6 +35,7 @@ pub mod postfetch;
 pub mod repo;
 pub mod search;
 pub mod trace;
+pub mod update;
 pub mod vcssyncer;
 
 use config::GitserverConfig;

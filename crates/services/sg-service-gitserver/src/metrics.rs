@@ -236,6 +236,10 @@ pub struct Metrics {
     search_running: Gauge,
     search_duration: HistogramVec,
     search_latency: Histogram,
+    // `cmd/gitserver/internal/server.go`: clone/repo-update accounting.
+    clone_queue: Gauge,
+    repo_cloned_count: Counter,
+    repo_cloned_failed_count: Counter,
 }
 
 impl Metrics {
@@ -248,17 +252,17 @@ impl Metrics {
         );
 
         // `cmd/gitserver/internal/server.go`
-        let _clone_queue = gauge(
+        let clone_queue = gauge(
             registry,
             "src_gitserver_clone_queue",
             "number of repos waiting to be cloned.",
         );
-        let _repo_cloned = counter(
+        let repo_cloned_count = counter(
             registry,
             "src_gitserver_repo_cloned",
             "number of successful git clones run",
         );
-        let _repo_cloned_failed = counter(
+        let repo_cloned_failed_count = counter(
             registry,
             "src_gitserver_repo_cloned_failed",
             "number of failed git clones",
@@ -511,6 +515,9 @@ impl Metrics {
             search_running,
             search_duration,
             search_latency,
+            clone_queue,
+            repo_cloned_count,
+            repo_cloned_failed_count,
         }
     }
 
@@ -685,6 +692,29 @@ pub fn high_memory_usage(cmd: &str) {
 /// guard is dropped. `None` when the service has not started (unit tests).
 pub fn gitservice_started(svc: &'static str) -> Option<GitserviceGuard> {
     Some(Metrics::global_opt()?.gitservice_started(svc))
+}
+
+/// `pendingClones`: the number of repositories waiting for a clone/update
+/// slot (`src_gitserver_clone_queue`). `delta` is +1 around the wait and -1
+/// afterwards.
+pub fn clone_queued(delta: f64) {
+    if let Some(metrics) = Metrics::global_opt() {
+        metrics.clone_queue.add(delta);
+    }
+}
+
+/// `repoClonedCounter`: a successful clone (`src_gitserver_repo_cloned`).
+pub fn clone_succeeded() {
+    if let Some(metrics) = Metrics::global_opt() {
+        metrics.repo_cloned_count.inc();
+    }
+}
+
+/// `repoCloneFailedCounter` (`src_gitserver_repo_cloned_failed`).
+pub fn clone_failed() {
+    if let Some(metrics) = Metrics::global_opt() {
+        metrics.repo_cloned_failed_count.inc();
+    }
 }
 
 pub struct ExecGuard {
