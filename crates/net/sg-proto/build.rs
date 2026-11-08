@@ -3,6 +3,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "proto/symbols/v1/symbols.proto",
         "proto/searcher/v1/searcher.proto",
         "proto/gitserver/v1/gitserver.proto",
+        "proto/internalapi/v1/internalapi.proto",
     ];
 
     tonic_build::configure()

@@ -14,6 +14,10 @@ pub mod gitserver {
     tonic::include_proto!("gitserver.v1");
 }
 
+pub mod internalapi {
+    tonic::include_proto!("api.internalapi.v1");
+}
+
 pub mod searcher {
     tonic::include_proto!("searcher.v1");
 }

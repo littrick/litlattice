@@ -1715,6 +1715,13 @@ dependencies = [
 [[package]]
 name = "sg-config"
 version = "0.1.0"
+dependencies = [
+ "prost-types",
+ "serde_json",
+ "sg-proto",
+ "tokio",
+ "tonic",
+]
 
 [[package]]
 name = "sg-core"
