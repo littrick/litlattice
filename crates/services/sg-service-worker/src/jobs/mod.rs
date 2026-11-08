@@ -51,6 +51,7 @@ pub mod gitserver;
 pub mod outbound_webhooks;
 pub mod permissions;
 pub mod ratelimit;
+pub mod repo_embedding_janitor;
 pub mod repostatistics;
 pub mod users;
 pub mod webhooks;
@@ -185,6 +186,9 @@ pub fn all_jobs() -> Vec<(&'static str, Arc<dyn Job>)> {
                 }
                 "permission-sync-job-cleaner" => Arc::new(permissions::PermissionSyncJobCleaner),
                 "rate-limit-config" => Arc::new(ratelimit::RateLimitConfigJob::new()),
+                "repo-embedding-janitor" => {
+                    Arc::new(repo_embedding_janitor::RepoEmbeddingJanitor::new())
+                }
                 "repo-statistics-compactor" => Arc::new(repostatistics::RepoStatisticsCompactor),
                 "repo-statistics-resetter" => Arc::new(repostatistics::RepoStatisticsResetter),
                 "webhook-log-janitor" => Arc::new(webhooks::WebhookLogJanitor),

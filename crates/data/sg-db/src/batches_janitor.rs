@@ -158,7 +158,13 @@ fn scan_ages(
 ) -> Result<Vec<(i64, Duration)>, String> {
     let mut ages = Vec::with_capacity(rows.len());
     for row in rows {
-        let id: i64 = row.try_get("id").map_err(|err| err.to_string())?;
+        // `dbworkerstore.Store.ResetStalled` decodes the id as Go `int`; the
+        // queue tables disagree on the SQL type (`changesets.id` is BIGINT,
+        // `repo_embedding_jobs.id` is INT4), so accept either.
+        let id = match row.try_get::<i64, _>("id") {
+            Ok(id) => id,
+            Err(_) => i64::from(row.try_get::<i32, _>("id").map_err(|err| err.to_string())?),
+        };
         let last_heartbeat: OffsetDateTime = row
             .try_get("last_heartbeat_at")
             .map_err(|err| err.to_string())?;
