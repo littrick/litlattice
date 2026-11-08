@@ -194,6 +194,36 @@ ORDER BY id DESC
         rows.into_iter().map(service_from_row).collect()
     }
 
+    /// One page of `ExternalServices().List(ctx, ExternalServicesListOptions{
+    /// Kinds, AfterID, LimitOffset{Limit}})`: live services of the given kinds,
+    /// newest first, excluding ids greater than or equal to `after_id` (the
+    /// baseline keeps the previous page's last id as the next `AfterID`).
+    /// `providers.ProvidersFromConfig` walks the whole list 500 rows at a time.
+    pub async fn list_by_kinds_after(
+        &self,
+        kinds: &[&str],
+        after_id: i64,
+        limit: i64,
+    ) -> Result<Vec<ExternalService>, ExternalServiceError> {
+        let kinds: Vec<String> = kinds.iter().map(|kind| (*kind).to_owned()).collect();
+        let rows = sqlx::query(
+            r#"
+SELECT id, kind, display_name, config, encryption_key_id,
+       last_sync_at, next_sync_at, unrestricted, has_webhooks, code_host_id
+FROM external_services
+WHERE deleted_at IS NULL AND kind = ANY($1) AND ($2 = 0 OR id < $2)
+ORDER BY id DESC
+LIMIT $3
+"#,
+        )
+        .bind(&kinds)
+        .bind(after_id)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(service_from_row).collect()
+    }
+
     /// `ExternalServices().Upsert` reduced to what
     /// `codeintel-package-filter-applicator` changes: `next_sync_at` (and the
     /// code host the baseline's `ensureCodeHost` step would attach).
