@@ -256,6 +256,8 @@ pub struct Metrics {
     prune_status: CounterVec,
     janitor_duration: Histogram,
     non_existing_repos_removed: Counter,
+    // `cmd/gitserver/internal/vcssyncer/instrumented_syncer.go`
+    is_cloneable_duration: HistogramVec,
 }
 
 impl Metrics {
@@ -463,7 +465,7 @@ impl Metrics {
         );
 
         // `cmd/gitserver/internal/vcssyncer/instrumented_syncer.go`
-        let _is_cloneable_duration = histogram_vec(
+        let is_cloneable_duration = histogram_vec(
             registry,
             "vcssyncer_is_cloneable_duration_seconds",
             "Time taken to check if a repository is cloneable",
@@ -547,6 +549,7 @@ impl Metrics {
             prune_status,
             janitor_duration,
             non_existing_repos_removed,
+            is_cloneable_duration,
         }
     }
 
@@ -733,6 +736,16 @@ pub fn clone_queued(delta: f64) {
 }
 
 /// `repoClonedCounter`: a successful clone (`src_gitserver_repo_cloned`).
+/// `instrumentedSyncer.IsCloneable`: `vcssyncer_is_cloneable_duration_seconds`.
+pub fn is_cloneable_observed(success: bool, seconds: f64) {
+    if let Some(metrics) = Metrics::global_opt() {
+        metrics
+            .is_cloneable_duration
+            .with_label_values(&["git", if success { "true" } else { "false" }])
+            .observe(seconds);
+    }
+}
+
 pub fn clone_succeeded() {
     if let Some(metrics) = Metrics::global_opt() {
         metrics.repo_cloned_count.inc();

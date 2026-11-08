@@ -37,6 +37,9 @@ pub struct Grpc {
     /// `gs.svc`: `ResolveRevision` asks it to fetch on a missing revision.
     /// `None` only in unit tests that do not exercise fetching.
     pub fetch: Option<Arc<crate::fetchservice::FetchService>>,
+    /// `Server.IsRepoCloneable` needs the repository store and the remote URL
+    /// source; `None` only in unit tests.
+    pub cloneable: Option<Arc<crate::cloneable::CloneableService>>,
 }
 
 impl Grpc {
@@ -405,16 +408,37 @@ impl gpb::gitserver_service_server::GitserverService for Grpc {
 
     async fn is_repo_cloneable(
         &self,
-        _request: GrpcRequest<gpb::IsRepoCloneableRequest>,
+        request: GrpcRequest<gpb::IsRepoCloneableRequest>,
     ) -> Result<GrpcResponse<gpb::IsRepoCloneableResponse>, Status> {
-        Err(unimplemented("is_repo_cloneable"))
+        let repo = request.into_inner().repo;
+        if repo.is_empty() {
+            return Err(Status::invalid_argument("no Repo given"));
+        }
+        let Some(cloneable) = self.cloneable.as_ref() else {
+            return Err(Status::unknown(
+                "GetVCSSyncer: the database is not configured",
+            ));
+        };
+        Ok(GrpcResponse::new(cloneable.is_repo_cloneable(&repo).await?))
     }
 
     async fn list_gitolite(
         &self,
-        _request: GrpcRequest<gpb::ListGitoliteRequest>,
+        request: GrpcRequest<gpb::ListGitoliteRequest>,
     ) -> Result<GrpcResponse<gpb::ListGitoliteResponse>, Status> {
-        Err(unimplemented("list_gitolite"))
+        let host = request.into_inner().gitolite_host;
+        let repos = crate::gitolite::list_repos(&host)
+            .await
+            .map_err(Status::internal)?;
+        Ok(GrpcResponse::new(gpb::ListGitoliteResponse {
+            repos: repos
+                .into_iter()
+                .map(|repo| gpb::GitoliteRepo {
+                    name: repo.name,
+                    url: repo.url,
+                })
+                .collect(),
+        }))
     }
 
     type SearchStream = Stream<gpb::SearchResponse>;
@@ -1275,6 +1299,7 @@ mod tests {
             tasks: TaskTracker::new(),
             locker: crate::locker::RepositoryLocker::new(),
             fetch,
+            cloneable: None,
         }
     }
 

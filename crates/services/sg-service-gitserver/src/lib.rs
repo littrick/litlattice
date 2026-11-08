@@ -20,6 +20,7 @@ use sg_proto::gitserver as gpb;
 
 pub mod addrs;
 pub mod cacert;
+pub mod cloneable;
 pub mod cloneurl;
 pub mod config;
 pub mod customfetch;
@@ -31,6 +32,7 @@ pub mod fetchservice;
 pub mod frontendconfig;
 pub mod fs;
 pub mod git;
+pub mod gitolite;
 pub mod gitservice;
 pub mod grpc;
 pub mod janitor;
@@ -45,6 +47,7 @@ pub mod remoteurl;
 pub mod repo;
 pub mod repositoryservice;
 pub mod search;
+pub mod security;
 pub mod statesyncer;
 pub mod tlsexternal;
 pub mod trace;
@@ -201,10 +204,18 @@ impl Service for GitserverService {
         let tasks = TaskTracker::new();
         let locker = locker::RepositoryLocker::new();
         let remote_urls = Arc::new(remoteurl::DbRemoteUrlSource {
-            repos: repo_store,
+            repos: Arc::clone(&repo_store),
             external_services,
             keyring: Arc::clone(&keyring),
         });
+        // `Server.IsRepoCloneable` needs the same remote URL lookup plus the
+        // repository store for `NewVCSSyncer`'s type dispatch.
+        let cloneable = Arc::new(cloneable::CloneableService::new(
+            config.repos_dir.clone(),
+            repo_store,
+            Arc::clone(&remote_urls) as Arc<dyn update::RemoteUrlSource>,
+            Arc::clone(&live),
+        ));
         let backend = Arc::new(update::LocalBackend::new(
             config.repos_dir.clone(),
             remote_urls,
@@ -236,6 +247,7 @@ impl Service for GitserverService {
             tasks: tasks.clone(),
             locker: Arc::clone(&locker),
             fetch: Some(Arc::clone(&fetch)),
+            cloneable: Some(cloneable),
         };
         let repository_service = repositoryservice::RepositoryService {
             repos_dir: Arc::new(config.repos_dir.clone()),

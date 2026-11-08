@@ -459,6 +459,74 @@ async fn run_bare(
         .map_err(|err| GitError::Message(format!("failed to run git: {err}")))
 }
 
+/// `gitRepoSyncer.IsCloneable`: `git ls-remote <url> HEAD` with the
+/// baseline's 30-second deadline and command configuration.
+///
+/// Failure text matches `errors.Wrap(err, "failed to check remote access: " +
+/// httpOutput)`: the combined output comes first, then the exit status. The
+/// environment is inherited (unlike `run_bare`), because `ls-remote` relies on
+/// `HOME`/`SSH_AUTH_SOCK`/credential helpers.
+pub async fn check_cloneable(remote: &VcsUrl, tls: &TlsConfig) -> Result<(), GitError> {
+    const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+    let mut args = vec![
+        "git".to_owned(),
+        "ls-remote".to_owned(),
+        remote.to_string(),
+        "HEAD".to_owned(),
+    ];
+    let mut env = Vec::new();
+    configure_remote_command(&mut args, &mut env, remote, tls);
+
+    let mut command = Command::new(&args[0]);
+    command
+        .args(&args[1..])
+        .kill_on_drop(true)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    for (key, value) in &env {
+        command.env(key, value);
+    }
+
+    let output = match tokio::time::timeout(TIMEOUT, command.output()).await {
+        Ok(Ok(output)) => output,
+        Ok(Err(err)) => return Err(GitError::Message(format!("failed to run git: {err}"))),
+        // The baseline replaces the command error with `ctx.Err()`.
+        Err(_) => return Err(GitError::Message("context deadline exceeded".to_owned())),
+    };
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let redactor = UrlRedactor::new(remote);
+    let mut combined = output.stdout;
+    combined.extend_from_slice(&output.stderr);
+    let exit = exit_status(&output.status);
+    if combined.is_empty() {
+        return Err(GitError::Message(exit));
+    }
+    Err(GitError::Message(format!(
+        "failed to check remote access: {}: {exit}",
+        redactor.redact(&String::from_utf8_lossy(&combined))
+    )))
+}
+
+/// Go `exec.ExitError.Error()`.
+fn exit_status(status: &std::process::ExitStatus) -> String {
+    if let Some(code) = status.code() {
+        return format!("exit status {code}");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(signal) = status.signal() {
+            return format!("signal: {signal}");
+        }
+    }
+    "exit status 1".to_owned()
+}
+
 /// Port of `gitRepoSyncer.Clone`: `git init --bare`, fetch all refspecs from
 /// the remote into the temporary directory, then set `HEAD`. Every syncer
 /// message and git output line is passed to `on_progress` (`tryWrite`).
