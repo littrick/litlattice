@@ -17,6 +17,7 @@ use std::sync::OnceLock;
 use regex::Regex;
 use tokio::process::Command;
 
+use crate::customfetch::CustomFetch;
 use crate::git::GitError;
 use crate::tlsexternal::TlsConfig;
 use crate::vcsurl::{UrlRedactor, VcsUrl};
@@ -188,8 +189,9 @@ pub async fn fetch_remote(
     git_dir: &Path,
     remote: &VcsUrl,
     tls: &TlsConfig,
+    custom_fetch: &CustomFetch,
 ) -> Result<i32, GitError> {
-    fetch_remote_with(git_dir, remote, tls, &mut |_| {}).await
+    fetch_remote_with(git_dir, remote, tls, custom_fetch, &mut |_| {}).await
 }
 
 /// [`fetch_remote`] while reporting the command's output line by line.
@@ -201,24 +203,35 @@ pub async fn fetch_remote(
 /// baseline interleaves the two streams through a synchronized writer; here
 /// they are drained concurrently and tokens may arrive in either order, which
 /// only affects display.
+///
+/// A `customGitFetch` mapping replaces the whole `git fetch` invocation and,
+/// like the baseline, skips `ConfigureRemoteGitCommand`: `GIT_DIR` and
+/// `GIT_LFS_SKIP_SMUDGE` still apply, the process environment is inherited.
 pub async fn fetch_remote_with(
     git_dir: &Path,
     remote: &VcsUrl,
     tls: &TlsConfig,
+    custom_fetch: &CustomFetch,
     on_progress: &mut (dyn FnMut(&[u8]) + Send),
 ) -> Result<i32, GitError> {
-    let mut args = vec![
-        "git".to_owned(),
-        "fetch".to_owned(),
-        "--progress".to_owned(),
-        "--prune".to_owned(),
-        remote.to_string(),
-    ];
-    for refspec in fetch_refspecs() {
-        args.push(refspec);
-    }
     let mut env = Vec::new();
-    configure_remote_command(&mut args, &mut env, remote, tls);
+    let args = match custom_fetch.command(remote) {
+        Some(command) => command,
+        None => {
+            let mut args = vec![
+                "git".to_owned(),
+                "fetch".to_owned(),
+                "--progress".to_owned(),
+                "--prune".to_owned(),
+                remote.to_string(),
+            ];
+            for refspec in fetch_refspecs() {
+                args.push(refspec);
+            }
+            configure_remote_command(&mut args, &mut env, remote, tls);
+            args
+        }
+    };
 
     let mut command = Command::new(&args[0]);
     command
@@ -448,9 +461,10 @@ pub async fn clone_repo(
     git_dir: &Path,
     remote: &VcsUrl,
     tls: &TlsConfig,
+    custom_fetch: &CustomFetch,
     on_progress: &mut (dyn FnMut(&[u8]) + Send),
 ) -> Result<(), GitError> {
-    clone_repo_with(git_dir, remote, tls, on_progress).await
+    clone_repo_with(git_dir, remote, tls, custom_fetch, on_progress).await
 }
 
 /// [`clone_repo`]: syncer messages and fetch output are reported the way
@@ -459,6 +473,7 @@ pub async fn clone_repo_with(
     git_dir: &Path,
     remote: &VcsUrl,
     tls: &TlsConfig,
+    custom_fetch: &CustomFetch,
     on_progress: &mut (dyn FnMut(&[u8]) + Send),
 ) -> Result<(), GitError> {
     std::fs::create_dir_all(git_dir)
@@ -472,7 +487,7 @@ pub async fn clone_repo_with(
     );
 
     emit(on_progress, "Fetching remote contents\n");
-    let exit_status = fetch_remote_with(git_dir, remote, tls, on_progress).await?;
+    let exit_status = fetch_remote_with(git_dir, remote, tls, custom_fetch, on_progress).await?;
     if exit_status != 0 {
         return Err(GitError::Message(format!(
             "failed to fetch: exit status {exit_status}"
@@ -498,10 +513,11 @@ pub async fn fetch_repo_with(
     git_dir: &Path,
     remote: &VcsUrl,
     tls: &TlsConfig,
+    custom_fetch: &CustomFetch,
     on_progress: &mut (dyn FnMut(&[u8]) + Send),
 ) -> Result<(), GitError> {
     emit(on_progress, "Fetching remote contents\n");
-    let exit_status = fetch_remote_with(git_dir, remote, tls, on_progress).await?;
+    let exit_status = fetch_remote_with(git_dir, remote, tls, custom_fetch, on_progress).await?;
     if exit_status != 0 {
         return Err(GitError::Message(format!(
             "exit code: {exit_status}, failed to fetch from remote"
@@ -668,9 +684,15 @@ mod tests {
         let mut on_progress = |line: &[u8]| progress.extend_from_slice(line);
 
         let remote = VcsUrl::parse(origin.to_str().expect("utf8")).expect("parse");
-        clone_repo(&git_dir, &remote, &TlsConfig::default(), &mut on_progress)
-            .await
-            .expect("clone");
+        clone_repo(
+            &git_dir,
+            &remote,
+            &TlsConfig::default(),
+            &CustomFetch::default(),
+            &mut on_progress,
+        )
+        .await
+        .expect("clone");
 
         let progress = String::from_utf8(progress).expect("utf8");
         for expected in [
@@ -695,6 +717,58 @@ mod tests {
             String::from_utf8_lossy(&head.stdout).trim(),
             "refs/heads/trunk"
         );
+    }
+
+    #[tokio::test]
+    async fn runs_a_custom_fetch_command() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let origin = source_repo(tmp.path());
+        let git_dir = tmp.path().join("clone-custom").join(".git");
+        let marker = tmp.path().join("custom-fetch-ran");
+        let script = tmp.path().join("custom-fetch.sh");
+        // The mapping replaces `git fetch` entirely; the baseline does not run
+        // `ConfigureRemoteGitCommand` for it, so `GIT_ASKPASS` is not set.
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nset -e\nif [ -n \"${{GIT_ASKPASS:-}}\" ]; then echo leaked >&2; exit 1; fi\n\
+                 touch {}\nexec git fetch --prune \"$1\" '+refs/heads/*:refs/heads/*' '+refs/tags/*:refs/tags/*'\n",
+                marker.display()
+            ),
+        )
+        .expect("write script");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+        let remote = VcsUrl::parse(origin.to_str().expect("utf8")).expect("parse");
+        let mappings = vec![sg_config::CustomFetchMapping {
+            domain_path: origin.to_str().expect("utf8").to_owned(),
+            fetch: vec![
+                script.to_str().expect("utf8").to_owned(),
+                remote.to_string(),
+            ],
+        }];
+        let custom = CustomFetch::build(Some(&mappings), true);
+        let mut progress = Vec::new();
+        let mut on_progress = |line: &[u8]| progress.extend_from_slice(line);
+        clone_repo(
+            &git_dir,
+            &remote,
+            &TlsConfig::default(),
+            &custom,
+            &mut on_progress,
+        )
+        .await
+        .expect("clone");
+
+        assert!(marker.exists(), "the custom command did not run");
+        let head = git_output(&git_dir, &["symbolic-ref", "HEAD"]);
+        assert!(head.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&head.stdout).trim(),
+            "refs/heads/trunk"
+        );
+        let progress = String::from_utf8_lossy(&progress);
+        assert!(progress.contains("Fetching remote contents\n"));
     }
 
     #[test]
@@ -765,9 +839,15 @@ mod tests {
         let remote = VcsUrl::parse("https://user:secret@127.0.0.1:1/org/repo.git").expect("parse");
         let mut progress = Vec::new();
         let mut on_progress = |line: &[u8]| progress.extend_from_slice(line);
-        clone_repo(&git_dir, &remote, &TlsConfig::default(), &mut on_progress)
-            .await
-            .expect_err("unreachable remote");
+        clone_repo(
+            &git_dir,
+            &remote,
+            &TlsConfig::default(),
+            &CustomFetch::default(),
+            &mut on_progress,
+        )
+        .await
+        .expect_err("unreachable remote");
         let progress = String::from_utf8_lossy(&progress).into_owned();
         // The credential never appears: it is passed through GIT_SG_PASSWORD
         // and every progress token is redacted before it is written.
@@ -786,9 +866,15 @@ mod tests {
         let mut progress = Vec::new();
         let mut on_progress = |line: &[u8]| progress.extend_from_slice(line);
         let remote = VcsUrl::parse("/does/not/exist").expect("parse");
-        let err = clone_repo(&git_dir, &remote, &TlsConfig::default(), &mut on_progress)
-            .await
-            .expect_err("missing remote");
+        let err = clone_repo(
+            &git_dir,
+            &remote,
+            &TlsConfig::default(),
+            &CustomFetch::default(),
+            &mut on_progress,
+        )
+        .await
+        .expect_err("missing remote");
         match err {
             GitError::Message(message) => {
                 assert!(

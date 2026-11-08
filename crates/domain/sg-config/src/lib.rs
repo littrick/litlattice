@@ -303,6 +303,16 @@ impl SiteConfiguration {
             .unwrap_or_default()
     }
 
+    /// Whether `experimentalFeatures.customGitFetch` is present and non-null,
+    /// i.e. Go's `CustomGitFetch != nil`. `[]` counts as configured (the
+    /// baseline warns when it is configured but `ENABLE_CUSTOM_GIT_FETCH` is
+    /// unset).
+    pub fn custom_git_fetch_configured(&self) -> bool {
+        self.experimental_features()
+            .and_then(|features| features.get("customGitFetch"))
+            .is_some_and(|value| !value.is_null())
+    }
+
     /// `conf.Get().EncryptionKeys`: the top-level `encryption.keys` object.
     /// `None` when the site config does not configure encryption.
     pub fn encryption_keys(&self) -> Option<EncryptionKeysConfig> {
@@ -654,6 +664,7 @@ mod tests {
                 fetch: vec!["git".to_owned(), "fetch".to_owned(), "--depth=1".to_owned()],
             }]
         );
+        assert!(unified.site.custom_git_fetch_configured());
         assert_eq!(
             unified.site.tls_external(),
             TlsExternal {
@@ -683,6 +694,7 @@ mod tests {
             DEFAULT_GIT_LONG_COMMAND_TIMEOUT
         );
         assert!(unified.site.custom_git_fetch().is_empty());
+        assert!(!unified.site.custom_git_fetch_configured());
         assert!(unified.site.git_server_pinned_repos().is_empty());
         assert_eq!(unified.site.tls_external(), TlsExternal::default());
         assert_eq!(

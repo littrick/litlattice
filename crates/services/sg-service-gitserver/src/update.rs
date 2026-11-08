@@ -200,6 +200,8 @@ pub struct LocalBackend {
     pub shard_id: String,
     /// `executil.tlsExternal` settings for clone/fetch commands.
     pub tls: crate::tlsexternal::TlsConfig,
+    /// `experimentalFeatures.customGitFetch` + `ENABLE_CUSTOM_GIT_FETCH`.
+    pub custom_fetch: crate::customfetch::CustomFetch,
 }
 
 impl LocalBackend {
@@ -335,8 +337,14 @@ impl UpdateBackend for LocalBackend {
         let result = match remote_url {
             Ok(remote) => {
                 let mut on_progress = progress_handler(&mut output, lock);
-                crate::vcssyncer::fetch_repo_with(&git_dir, &remote, &self.tls, &mut on_progress)
-                    .await
+                crate::vcssyncer::fetch_repo_with(
+                    &git_dir,
+                    &remote,
+                    &self.tls,
+                    &self.custom_fetch,
+                    &mut on_progress,
+                )
+                .await
             }
             // `syncer.Fetch`: `errors.Wrapf(err, "exit code: %d, failed to fetch from remote", exitCode)`.
             Err(err) => Err(GitError::Message(format!(
@@ -394,8 +402,14 @@ impl LocalBackend {
         let result = match remote_url {
             Ok(remote) => {
                 let mut on_progress = progress_handler(&mut output, lock);
-                crate::vcssyncer::clone_repo_with(&tmp_path, &remote, &self.tls, &mut on_progress)
-                    .await
+                crate::vcssyncer::clone_repo_with(
+                    &tmp_path,
+                    &remote,
+                    &self.tls,
+                    &self.custom_fetch,
+                    &mut on_progress,
+                )
+                .await
             }
             // `syncer.Clone`: `errors.Wrapf(err, "failed to fetch: exit status %d", exitCode)`.
             Err(err) => Err(GitError::Message(format!(
@@ -718,6 +732,7 @@ mod tests {
             store: None,
             shard_id: "test-shard".to_owned(),
             tls: crate::tlsexternal::TlsConfig::default(),
+            custom_fetch: crate::customfetch::CustomFetch::default(),
         }
     }
 
@@ -816,6 +831,7 @@ mod tests {
             store: None,
             shard_id: "test-shard".to_owned(),
             tls: crate::tlsexternal::TlsConfig::default(),
+            custom_fetch: crate::customfetch::CustomFetch::default(),
         };
         let repo = "github.com/sourcegraphtest/alwayscloningtest";
         let locker = RepositoryLocker::new();
@@ -837,6 +853,7 @@ mod tests {
             store: None,
             shard_id: "test-shard".to_owned(),
             tls: crate::tlsexternal::TlsConfig::default(),
+            custom_fetch: crate::customfetch::CustomFetch::default(),
         };
         let locker = RepositoryLocker::new();
         let lock = locker.try_acquire("example.com/x", "test").expect("lock");

@@ -23,6 +23,9 @@ pub struct GitserverConfig {
     pub sync_repo_state_batch_size: i64,
     /// `SRC_REPOS_SYNC_STATE_UPSERT_PER_SEC`.
     pub sync_repo_state_update_per_second: i64,
+    /// `ENABLE_CUSTOM_GIT_FETCH`: the baseline only treats the literal
+    /// `"false"` as disabled.
+    pub enable_custom_git_fetch: bool,
 }
 
 /// Port of `internal/hostname.Get`: `HOSTNAME` when set (the env registry
@@ -102,6 +105,14 @@ impl GitserverConfig {
             .parse()
             .unwrap_or(DEFAULT_SYNC_REPO_STATE_UPSERT_PER_SEC);
 
+        // `vcssyncer.enableCustomGitFetch`: `env.Get(..., "false", ...)` and
+        // any value other than the literal `"false"` enables custom fetch.
+        let enable_custom_git_fetch = env.get(
+            "ENABLE_CUSTOM_GIT_FETCH",
+            "false",
+            "Enable custom git fetch",
+        ) != "false";
+
         Ok(Self {
             repos_dir: PathBuf::from(repos_dir),
             listen_addr: override_addr.unwrap_or(listen_addr),
@@ -109,6 +120,7 @@ impl GitserverConfig {
             sync_repo_state_interval,
             sync_repo_state_batch_size,
             sync_repo_state_update_per_second,
+            enable_custom_git_fetch,
         })
     }
 

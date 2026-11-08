@@ -22,6 +22,7 @@ pub mod addrs;
 pub mod cacert;
 pub mod cloneurl;
 pub mod config;
+pub mod customfetch;
 pub mod debug;
 mod details;
 pub mod diff;
@@ -194,6 +195,14 @@ impl Service for GitserverService {
             store: Some(Arc::clone(&store)),
             shard_id: config.external_address.clone(),
             tls: tlsexternal::TlsConfig::from_site(&unified.site),
+            custom_fetch: customfetch::CustomFetch::build(
+                unified
+                    .site
+                    .custom_git_fetch_configured()
+                    .then(|| unified.site.custom_git_fetch())
+                    .as_deref(),
+                config.enable_custom_git_fetch,
+            ),
         });
         // `NewServer` builds the clone limiter from `conf.GitMaxConcurrentClones`
         // and `conf.Watch` updates it when the site config changes. The Rust

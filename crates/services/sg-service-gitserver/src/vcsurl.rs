@@ -91,6 +91,15 @@ impl VcsUrl {
         &self.path
     }
 
+    /// Go `URL.Path`: the standard-library parser decodes `%XX` escapes into
+    /// `Path`; the SCP and local parsers keep the raw text.
+    pub fn decoded_path(&self) -> String {
+        match self.format {
+            UrlFormat::Stdlib => percent_decode(&self.path),
+            UrlFormat::Rsync | UrlFormat::Local => self.path.clone(),
+        }
+    }
+
     pub fn host(&self) -> &str {
         &self.host
     }
