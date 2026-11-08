@@ -155,8 +155,8 @@ pub fn gc_mode() -> GcMode {
 
 /// `gitSetAutoGC`: unset `gc.auto` when the janitor manages gc, disable it
 /// when `sg maintenance` does, and leave it alone otherwise.
-async fn set_auto_gc(backend: &GitRepo) -> Result<(), GitError> {
-    match gc_mode() {
+pub(crate) async fn set_auto_gc(backend: &GitRepo, mode: GcMode) -> Result<(), GitError> {
+    match mode {
         GcMode::GitAutoGc | GcMode::JanitorAutoGc => backend.config_unset("gc.auto").await,
         GcMode::Maintenance => backend.config_set("gc.auto", "0").await,
     }
@@ -274,7 +274,7 @@ pub async fn post_fetch_actions(
         errors.push(format!("setting git attributes: {err}"));
     }
 
-    if let Err(err) = set_auto_gc(&backend).await {
+    if let Err(err) = set_auto_gc(&backend, gc_mode()).await {
         errors.push(format!("setting git gc mode: {}", err.message()));
     }
 

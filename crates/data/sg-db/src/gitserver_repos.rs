@@ -41,6 +41,37 @@ impl CloneStatus {
     }
 }
 
+/// `LogCorruption` failure modes.
+#[derive(Debug, thiserror::Error)]
+pub enum LogCorruptionError {
+    #[error("repo not found or already corrupt")]
+    RepoNotFoundOrAlreadyCorrupt,
+    #[error(transparent)]
+    Sqlx(#[from] sqlx::Error),
+}
+
+/// Go `time.Time` JSON encoding (`time.RFC3339Nano`, UTC `Z` suffix,
+/// fractional seconds with trailing zeros removed).
+fn json_time(now: OffsetDateTime) -> String {
+    let mut fraction = String::new();
+    let nanos = now.nanosecond();
+    if nanos > 0 {
+        fraction = format!(".{nanos:09}");
+        while fraction.ends_with('0') {
+            fraction.pop();
+        }
+    }
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}{fraction}Z",
+        now.year(),
+        u8::from(now.month()),
+        now.day(),
+        now.hour(),
+        now.minute(),
+        now.second(),
+    )
+}
+
 /// `types.GitserverRepo`. `name` is empty for lookups by ID, like the
 /// baseline's `'' as name` column.
 #[derive(Debug, Clone)]
@@ -343,6 +374,101 @@ WHERE r.name = $1::citext
             return Ok(None);
         };
         Ok(Some(scan_gitserver_repo(&row)?))
+    }
+
+    /// `LogCorruption`: prepend `{"time": <now>, "reason": <reason>}` to
+    /// `corruption_logs`, keeping at most 10 entries, and set `corrupted_at`.
+    /// The reason is truncated to 1 MiB like the baseline.
+    ///
+    /// The update only matches rows on this shard (or with an empty
+    /// `shard_id`) that are not already corrupt; zero or several matched rows
+    /// are an error, matching `repo not found or already corrupt`.
+    pub async fn log_corruption(
+        &self,
+        repo: &str,
+        reason: &str,
+        shard_id: &str,
+    ) -> Result<(), LogCorruptionError> {
+        const MAX_REASON_SIZE: usize = 1 << 20;
+        let reason = if reason.len() > MAX_REASON_SIZE {
+            String::from_utf8_lossy(&reason.as_bytes()[..MAX_REASON_SIZE]).into_owned()
+        } else {
+            reason.to_owned()
+        };
+        let log = serde_json::json!({
+            "time": json_time(OffsetDateTime::now_utc()),
+            "reason": reason,
+        });
+        let result = sqlx::query(
+            r#"
+UPDATE gitserver_repos AS gtr
+SET
+	corrupted_at = NOW(),
+	corruption_logs = (SELECT jsonb_path_query_array($1::jsonb || gtr.corruption_logs, '$[0 to 9]')),
+	updated_at = NOW()
+WHERE
+	repo_id = (SELECT id FROM repo WHERE name = $2::citext)
+AND
+	(shard_id = $3 OR shard_id = '')
+AND
+	corrupted_at IS NULL
+"#,
+        )
+        .bind(log)
+        .bind(repo)
+        .bind(shard_id)
+        .execute(&self.pool)
+        .await?;
+
+        if result.rows_affected() != 1 {
+            return Err(LogCorruptionError::RepoNotFoundOrAlreadyCorrupt);
+        }
+        Ok(())
+    }
+
+    /// `UpdateRepoSizes`: batch-update `repo_size_bytes` for at most 1000
+    /// repositories per statement, leaving rows whose size is unchanged
+    /// untouched (`IS DISTINCT FROM`). Returns the number of updated rows.
+    pub async fn update_repo_sizes(&self, repos: &[(String, i64)]) -> Result<u64, sqlx::Error> {
+        const BATCH_SIZE: usize = 1000;
+        let mut updated = 0u64;
+        for chunk in repos.chunks(BATCH_SIZE) {
+            let mut query = String::from(
+                r#"
+WITH update_data AS (
+	SELECT * FROM (VALUES
+"#,
+            );
+            for index in 0..chunk.len() {
+                if index > 0 {
+                    query.push(',');
+                }
+                let name = index * 2 + 1;
+                query.push_str(&format!("(${name}::citext, ${}::bigint)", name + 1));
+            }
+            query.push_str(
+                r#"
+	) AS tmp(repo_name, repo_size_bytes)
+)
+UPDATE gitserver_repos AS gr
+SET
+	repo_size_bytes = update_data.repo_size_bytes,
+	updated_at = NOW()
+FROM repo r
+INNER JOIN update_data on update_data.repo_name = r.name
+WHERE
+	r.id = gr.repo_id
+AND
+	update_data.repo_size_bytes IS DISTINCT FROM gr.repo_size_bytes
+"#,
+            );
+            let mut statement = sqlx::query(&query);
+            for (name, size) in chunk {
+                statement = statement.bind(name).bind(size);
+            }
+            updated += statement.execute(&self.pool).await?.rows_affected();
+        }
+        Ok(updated)
     }
 
     /// `IterateRepoGitserverStatus`: page through `gitserver_repos` joined

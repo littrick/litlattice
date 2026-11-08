@@ -135,7 +135,7 @@ fn stat_mtime(path: &Path) -> std::io::Result<SystemTime> {
 /// Go's `os.Stat` errors read `stat <path>: <reason>`; Rust's `io::Error`
 /// displays the opposite order and appends `(os error N)`, so translate the
 /// common reasons by hand.
-fn stat_error(path: &Path, err: std::io::Error) -> std::io::Error {
+pub(crate) fn stat_error(path: &Path, err: std::io::Error) -> std::io::Error {
     let reason = match err.kind() {
         std::io::ErrorKind::NotFound => "no such file or directory",
         std::io::ErrorKind::PermissionDenied => "permission denied",

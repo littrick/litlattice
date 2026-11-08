@@ -33,6 +33,7 @@ pub mod fs;
 pub mod git;
 pub mod gitservice;
 pub mod grpc;
+pub mod janitor;
 pub mod keyring;
 pub mod limiter;
 pub mod locker;
@@ -70,6 +71,9 @@ pub struct GitserverService {
     /// server).
     prof_addr: Option<String>,
     config: Option<GitserverConfig>,
+    /// The `cleanup.go` package-level environment, read at configuration
+    /// time like the baseline's init-time `env.Get` calls.
+    janitor: Option<janitor::JanitorConfig>,
 }
 
 impl GitserverService {
@@ -78,6 +82,7 @@ impl GitserverService {
             addr: None,
             prof_addr: None,
             config: None,
+            janitor: None,
         }
     }
 
@@ -87,6 +92,7 @@ impl GitserverService {
             addr: Some(addr.into()),
             prof_addr: None,
             config: None,
+            janitor: None,
         }
     }
 }
@@ -114,6 +120,13 @@ impl Service for GitserverService {
         self.prof_addr = Some(prof_addr).filter(|addr| !addr.is_empty());
         let config = GitserverConfig::load(env, self.addr.clone())?;
         self.addr = Some(config.listen_addr.clone());
+        // `cleanup.go`'s package-level `env.Get` / `env.MustGetDuration` values
+        // are read once at process start.
+        self.janitor = Some(janitor::JanitorConfig::load(
+            env,
+            config.janitor_interval,
+            config.janitor_disable_delete_repos_on_wrong_shard,
+        ));
         self.config = Some(config);
         Ok(())
     }
@@ -240,18 +253,34 @@ impl Service for GitserverService {
         // address set and pins are startup snapshots (the baseline re-reads
         // them from `conf` on every run; the Rust config client has no
         // watcher yet).
+        let addresses = addrs::GitserverAddresses {
+            addresses: unified.service_connections.git_servers.clone(),
+            pinned_servers: unified.site.git_server_pinned_repos(),
+        };
         let state_syncer = Arc::new(statesyncer::RepoStateSyncer {
             repos: Arc::clone(&store),
             locker: Arc::clone(&locker),
             repos_dir: Arc::new(config.repos_dir.clone()),
             shard_id: config.external_address.clone(),
-            addresses: addrs::GitserverAddresses {
-                addresses: unified.service_connections.git_servers.clone(),
-                pinned_servers: unified.site.git_server_pinned_repos(),
-            },
+            addresses: addresses.clone(),
             interval: config.sync_repo_state_interval,
             batch_size: config.sync_repo_state_batch_size,
             per_second: config.sync_repo_state_update_per_second,
+        });
+        // `NewJanitor`: the periodic cleanup job. Like the state syncer, the
+        // shard list, `gitLongCommandTimeout` and `disableAutoGitUpdates` are
+        // startup snapshots.
+        let janitor = Arc::new(janitor::Janitor {
+            repos_dir: Arc::new(config.repos_dir.clone()),
+            store: Some(Arc::clone(&store)),
+            shard_id: config.external_address.clone(),
+            addresses,
+            long_command_timeout: unified.site.git_long_command_timeout(),
+            disable_auto_git_updates: unified.site.disable_auto_git_updates(),
+            config: self
+                .janitor
+                .clone()
+                .ok_or_else(|| ServiceError::new("gitserver janitor was not configured"))?,
         });
         let routes = tonic::service::Routes::new(
             gpb::gitserver_service_server::GitserverServiceServer::new(grpc),
@@ -300,6 +329,10 @@ impl Service for GitserverService {
         {
             let shutdown = ctx.shutdown.clone();
             background.spawn(async move { state_syncer.run(shutdown).await });
+        }
+        {
+            let shutdown = ctx.shutdown.clone();
+            background.spawn(async move { janitor.run(shutdown).await });
         }
 
         let served = sg_http::serve(listener, routes, http, ctx.shutdown.clone()).await;

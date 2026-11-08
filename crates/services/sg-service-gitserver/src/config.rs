@@ -9,6 +9,7 @@ use sg_core::{ConfigError, EnvReader};
 pub const DEFAULT_SYNC_REPO_STATE_INTERVAL: Duration = Duration::from_secs(10 * 60);
 pub const DEFAULT_SYNC_REPO_STATE_BATCH_SIZE: i64 = 500;
 pub const DEFAULT_SYNC_REPO_STATE_UPSERT_PER_SEC: i64 = 500;
+pub const DEFAULT_JANITOR_INTERVAL: Duration = Duration::from_secs(60);
 
 #[derive(Clone)]
 pub struct GitserverConfig {
@@ -26,6 +27,10 @@ pub struct GitserverConfig {
     /// `ENABLE_CUSTOM_GIT_FETCH`: the baseline only treats the literal
     /// `"false"` as disabled.
     pub enable_custom_git_fetch: bool,
+    /// `SRC_REPOS_JANITOR_INTERVAL`: the interval between cleanup runs.
+    pub janitor_interval: Duration,
+    /// `SRC_REPOS_JANITOR_DISABLE_DELETE_REPOS_ON_WRONG_SHARD`.
+    pub janitor_disable_delete_repos_on_wrong_shard: bool,
 }
 
 /// Port of `internal/hostname.Get`: `HOSTNAME` when set (the env registry
@@ -113,6 +118,20 @@ impl GitserverConfig {
             "Enable custom git fetch",
         ) != "false";
 
+        // `shared.Config.JanitorInterval` / `JanitorDisableDeleteReposOnWrongShard`.
+        let janitor_interval = crate::memobs::parse_go_duration(&env.get(
+            "SRC_REPOS_JANITOR_INTERVAL",
+            "1m",
+            "Interval between cleanup runs",
+        ))
+        .unwrap_or(DEFAULT_JANITOR_INTERVAL);
+        let janitor_disable_delete_repos_on_wrong_shard = crate::memobs::parse_go_bool(&env.get(
+            "SRC_REPOS_JANITOR_DISABLE_DELETE_REPOS_ON_WRONG_SHARD",
+            "false",
+            "Disable deleting repos on wrong shard",
+        ))
+        .unwrap_or(false);
+
         Ok(Self {
             repos_dir: PathBuf::from(repos_dir),
             listen_addr: override_addr.unwrap_or(listen_addr),
@@ -121,6 +140,8 @@ impl GitserverConfig {
             sync_repo_state_batch_size,
             sync_repo_state_update_per_second,
             enable_custom_git_fetch,
+            janitor_interval,
+            janitor_disable_delete_repos_on_wrong_shard,
         })
     }
 

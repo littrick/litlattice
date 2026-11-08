@@ -245,6 +245,17 @@ pub struct Metrics {
     clone_queue: Gauge,
     repo_cloned_count: Counter,
     repo_cloned_failed_count: Counter,
+    // `cmd/gitserver/internal/cleanup.go`
+    repo_wrong_shard: Gauge,
+    repo_wrong_shard_deleted: Counter,
+    repos_removed: CounterVec,
+    repos_recloned: Counter,
+    janitor_running: Gauge,
+    janitor_job_duration: HistogramVec,
+    maintenance_status: CounterVec,
+    prune_status: CounterVec,
+    janitor_duration: Histogram,
+    non_existing_repos_removed: Counter,
 }
 
 impl Metrics {
@@ -279,58 +290,58 @@ impl Metrics {
         );
 
         // `cmd/gitserver/internal/cleanup.go`
-        let _repo_wrong_shard = gauge(
+        let repo_wrong_shard = gauge(
             registry,
             "src_gitserver_repo_wrong_shard",
             "The number of repos that are on disk on the wrong shard",
         );
-        let _repo_wrong_shard_deleted = counter(
+        let repo_wrong_shard_deleted = counter(
             registry,
             "src_gitserver_repo_wrong_shard_deleted",
             "The number of repos on the wrong shard that we deleted",
         );
-        let _repos_removed = counter_vec(
+        let repos_removed = counter_vec(
             registry,
             "src_gitserver_repos_removed",
             "number of repos removed during cleanup",
             &["reason"],
         );
-        let _repos_recloned = counter(
+        let repos_recloned = counter(
             registry,
             "src_gitserver_repos_recloned",
             "number of repos removed and re-cloned due to age",
         );
-        let _janitor_running = gauge(
+        let janitor_running = gauge(
             registry,
             "src_gitserver_janitor_running",
             "set to 1 when the gitserver janitor background job is running",
         );
-        let _janitor_job_duration = histogram_vec(
+        let janitor_job_duration = histogram_vec(
             registry,
             "src_gitserver_janitor_job_duration_seconds",
             "Duration of the individual jobs within the gitserver janitor background job",
             &["success", "job_name"],
             exponential_buckets_range(0.001, 240.0, 16),
         );
-        let _maintenance_status = counter_vec(
+        let maintenance_status = counter_vec(
             registry,
             "src_gitserver_maintenance_status",
             "whether the maintenance run was a success (true/false) and the reason why a cleanup was needed",
             &["success", "reason"],
         );
-        let _prune_status = counter_vec(
+        let prune_status = counter_vec(
             registry,
             "src_gitserver_prune_status",
             "whether git prune was a success (true/false) and whether it was skipped (true/false)",
             &["success", "skipped"],
         );
-        let _janitor_duration = histogram(
+        let janitor_duration = histogram(
             registry,
             "src_gitserver_janitor_duration_seconds",
             "Duration of gitserver janitor background job",
             vec![0.1, 1.0, 10.0, 60.0, 300.0, 3600.0, 7200.0],
         );
-        let _non_existing_repos_removed = counter(
+        let non_existing_repos_removed = counter(
             registry,
             "src_gitserver_non_existing_repos_removed",
             "number of non existing repos removed during cleanup",
@@ -526,6 +537,16 @@ impl Metrics {
             clone_queue,
             repo_cloned_count,
             repo_cloned_failed_count,
+            repo_wrong_shard,
+            repo_wrong_shard_deleted,
+            repos_removed,
+            repos_recloned,
+            janitor_running,
+            janitor_job_duration,
+            maintenance_status,
+            prune_status,
+            janitor_duration,
+            non_existing_repos_removed,
         }
     }
 
@@ -748,6 +769,92 @@ pub fn repo_sync_state_upsert(success: bool, count: usize) {
 pub fn clone_failed() {
     if let Some(metrics) = Metrics::global_opt() {
         metrics.repo_cloned_failed_count.inc();
+    }
+}
+
+/// `janitorRunning` (`src_gitserver_janitor_running`): 1 while a run is in
+/// progress, 0 otherwise.
+pub fn janitor_running(running: bool) {
+    if let Some(metrics) = Metrics::global_opt() {
+        metrics.janitor_running.set(if running { 1.0 } else { 0.0 });
+    }
+}
+
+/// `janitorTimer` (`src_gitserver_janitor_duration_seconds`).
+pub fn janitor_duration(seconds: f64) {
+    if let Some(metrics) = Metrics::global_opt() {
+        metrics.janitor_duration.observe(seconds);
+    }
+}
+
+/// `jobTimer` (`src_gitserver_janitor_job_duration_seconds{success,job_name}`).
+pub fn janitor_job_duration(success: bool, job_name: &str, seconds: f64) {
+    if let Some(metrics) = Metrics::global_opt() {
+        let success = if success { "true" } else { "false" };
+        metrics
+            .janitor_job_duration
+            .with_label_values(&[success, job_name])
+            .observe(seconds);
+    }
+}
+
+/// `reposRemoved` (`src_gitserver_repos_removed{reason}`).
+pub fn repos_removed(reason: &str) {
+    if let Some(metrics) = Metrics::global_opt() {
+        metrics.repos_removed.with_label_values(&[reason]).inc();
+    }
+}
+
+/// `reposRecloned` (`src_gitserver_repos_recloned`).
+pub fn repos_recloned() {
+    if let Some(metrics) = Metrics::global_opt() {
+        metrics.repos_recloned.inc();
+    }
+}
+
+/// `wrongShardReposTotal` (`src_gitserver_repo_wrong_shard`), set once at the
+/// end of a run.
+pub fn wrong_shard_repos(count: i64) {
+    if let Some(metrics) = Metrics::global_opt() {
+        metrics.repo_wrong_shard.set(count as f64);
+    }
+}
+
+/// `wrongShardReposDeletedCounter` (`src_gitserver_repo_wrong_shard_deleted`),
+/// only added when wrong-shard deletion is enabled.
+pub fn wrong_shard_repos_deleted(count: i64) {
+    if let Some(metrics) = Metrics::global_opt() {
+        metrics.repo_wrong_shard_deleted.inc_by(count as f64);
+    }
+}
+
+/// `nonExistingReposRemoved` (`src_gitserver_non_existing_repos_removed`).
+pub fn non_existing_repos_removed() {
+    if let Some(metrics) = Metrics::global_opt() {
+        metrics.non_existing_repos_removed.inc();
+    }
+}
+
+/// `maintenanceStatus` (`src_gitserver_maintenance_status{success,reason}`).
+pub fn maintenance_status(success: bool, reason: &str) {
+    if let Some(metrics) = Metrics::global_opt() {
+        let success = if success { "true" } else { "false" };
+        metrics
+            .maintenance_status
+            .with_label_values(&[success, reason])
+            .inc();
+    }
+}
+
+/// `pruneStatus` (`src_gitserver_prune_status{success,skipped}`).
+pub fn prune_status(success: bool, skipped: bool) {
+    if let Some(metrics) = Metrics::global_opt() {
+        let success = if success { "true" } else { "false" };
+        let skipped = if skipped { "true" } else { "false" };
+        metrics
+            .prune_status
+            .with_label_values(&[success, skipped])
+            .inc();
     }
 }
 
