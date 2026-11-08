@@ -100,6 +100,14 @@ TRAFFIC = {
     "src_gitserver_gitservice_running",
     "src_gitserver_gitservice_duration_seconds",
     "src_gitserver_search_duration_seconds",
+    # Emitted once the janitor has completed a run (it runs immediately at
+    # startup, but a slow first run could still miss the first scrape).
+    "src_gitserver_janitor_job_duration_seconds",
+    # Condition-gated: only appear when the janitor removes a repo or when
+    # the maintenance/prune modes are enabled.
+    "src_gitserver_repos_removed",
+    "src_gitserver_maintenance_status",
+    "src_gitserver_prune_status",
 }
 
 # Gauges whose label set is compared verbatim.
