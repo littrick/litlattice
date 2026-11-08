@@ -65,6 +65,7 @@ pub mod perforce_changelist_mapper;
 pub mod permissions;
 pub mod perms_syncer;
 pub mod perms_syncer_fetch;
+pub mod perms_syncer_job;
 pub mod policies_matcher;
 pub mod ratelimit;
 pub mod repo_embedding_janitor;
@@ -235,6 +236,7 @@ pub fn all_jobs() -> Vec<(&'static str, Arc<dyn Job>)> {
                     Arc::new(perforce_changelist_mapper::PerforceChangelistMappingJob::new())
                 }
                 "permission-sync-job-cleaner" => Arc::new(permissions::PermissionSyncJobCleaner),
+                "repo-perms-syncer" => Arc::new(perms_syncer_job::PermsSyncerJob::new()),
                 "permission-sync-job-scheduler" => {
                     Arc::new(permissions::PermissionSyncJobScheduler)
                 }

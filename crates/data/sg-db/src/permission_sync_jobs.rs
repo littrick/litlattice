@@ -18,6 +18,8 @@
 //!
 //! The SQL is copied verbatim apart from binding the formatted arguments.
 
+use std::time::Duration;
+
 use sqlx::postgres::PgPool;
 use sqlx::types::time::OffsetDateTime;
 use sqlx::Row;
@@ -375,4 +377,332 @@ async fn create_sync_job(
     }
 
     tx.commit().await
+}
+
+/// `database.PermissionSyncJob`, reduced to the fields the worker handler and
+/// the store operations read. `RecordID` is the `i64` the worker framework
+/// uses; the column is a Postgres `integer`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PermissionSyncJob {
+    pub id: i32,
+    pub state: String,
+    pub failure_message: Option<String>,
+    pub queued_at: Option<OffsetDateTime>,
+    pub started_at: Option<OffsetDateTime>,
+    pub finished_at: Option<OffsetDateTime>,
+    pub process_after: Option<OffsetDateTime>,
+    pub num_resets: i32,
+    pub num_failures: i32,
+    pub last_heartbeat_at: Option<OffsetDateTime>,
+    pub worker_hostname: String,
+    pub cancel: bool,
+    pub repository_id: Option<i32>,
+    pub user_id: Option<i32>,
+    pub priority: i32,
+    pub no_perms: bool,
+    pub invalidate_caches: bool,
+}
+
+/// Which half of the permission-sync queue a worker store serves:
+/// `syncTypeRepo` / `syncTypeUser` in `perms_syncer_worker.go`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PermissionSyncJobType {
+    Repo,
+    User,
+}
+
+impl PermissionSyncJobType {
+    /// The `PreDequeue` predicate appended to the dequeue query.
+    fn dequeue_condition(self) -> &'static str {
+        match self {
+            Self::Repo => "repository_id IS NOT NULL",
+            Self::User => "user_id IS NOT NULL",
+        }
+    }
+}
+
+/// Ids reset by [`PermissionSyncJobsWorkerStore::reset_stalled`], with the age
+/// of their last heartbeat when the reset ran.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PermissionSyncJobResetResult {
+    pub reset: Vec<(i32, Duration)>,
+    pub failed: Vec<(i32, Duration)>,
+}
+
+/// `dbworkerstore.New` configured by `makeStore` in
+/// `cmd/worker/internal/authz/perms_syncer_worker.go`: table
+/// `permission_sync_jobs`, order
+/// `priority DESC, process_after ASC NULLS FIRST, id ASC`,
+/// `MaxNumResets: 5`, `StalledMaxAge: 30s`, no retries (`MaxNumRetries: 0`,
+/// `RetryAfter: 0`).
+#[derive(Debug, Clone)]
+pub struct PermissionSyncJobsWorkerStore {
+    pool: PgPool,
+    sync_type: PermissionSyncJobType,
+}
+
+impl PermissionSyncJobsWorkerStore {
+    pub fn new(pool: PgPool, sync_type: PermissionSyncJobType) -> Self {
+        Self { pool, sync_type }
+    }
+
+    pub fn sync_type(&self) -> PermissionSyncJobType {
+        self.sync_type
+    }
+
+    /// `Store.Dequeue` with the `PreDequeue` predicate for this worker type.
+    /// Only `queued` rows are eligible: with `RetryAfter = 0` the baseline's
+    /// `errored` branch is never enabled.
+    pub async fn dequeue(
+        &self,
+        worker_hostname: &str,
+    ) -> Result<Option<PermissionSyncJob>, sqlx::Error> {
+        let now = OffsetDateTime::now_utc();
+        let condition = self.sync_type.dequeue_condition();
+        let query = format!(
+            r#"
+WITH potential_candidates AS (
+	SELECT
+		id AS candidate_id,
+		ROW_NUMBER() OVER (ORDER BY priority DESC, process_after ASC NULLS FIRST, id ASC) AS order
+	FROM permission_sync_jobs
+	WHERE
+		state = 'queued' AND
+		(process_after IS NULL OR process_after <= $1) AND
+		({condition})
+	ORDER BY priority DESC, process_after ASC NULLS FIRST, id ASC
+	LIMIT 50
+),
+candidate AS (
+	SELECT id FROM permission_sync_jobs
+	JOIN potential_candidates pc ON pc.candidate_id = permission_sync_jobs.id
+	WHERE state IN ('queued', 'errored')
+	ORDER BY pc.order
+	FOR UPDATE OF permission_sync_jobs SKIP LOCKED
+	LIMIT 1
+),
+updated_record AS (
+	UPDATE permission_sync_jobs
+	SET
+		state = 'processing',
+		started_at = $1,
+		last_heartbeat_at = $1,
+		finished_at = NULL,
+		failure_message = NULL,
+		execution_logs = NULL,
+		worker_hostname = $2
+	WHERE id IN (SELECT id FROM candidate)
+	RETURNING id, state, failure_message, queued_at, started_at, finished_at,
+	          process_after, num_resets, num_failures, last_heartbeat_at,
+	          worker_hostname, cancel, repository_id, user_id, priority,
+	          no_perms, invalidate_caches
+)
+SELECT * FROM updated_record
+"#
+        );
+        let row = sqlx::query(&query)
+            .bind(now)
+            .bind(worker_hostname)
+            .fetch_optional(&self.pool)
+            .await?;
+        row.map(scan_job).transpose()
+    }
+
+    /// `Store.Heartbeat`: refresh `last_heartbeat_at` for processing rows and
+    /// report which ids are known and which are flagged `cancel`.
+    pub async fn heartbeat(&self, ids: &[i32]) -> Result<(Vec<i32>, Vec<i32>), sqlx::Error> {
+        if ids.is_empty() {
+            return Ok((Vec::new(), Vec::new()));
+        }
+        let now = OffsetDateTime::now_utc();
+        let rows = sqlx::query(
+            r#"
+WITH alive_candidates AS (
+	SELECT id
+	FROM permission_sync_jobs
+	WHERE id = ANY($1) AND state = 'processing'
+	ORDER BY id ASC
+	FOR UPDATE
+)
+UPDATE permission_sync_jobs
+SET last_heartbeat_at = $2
+WHERE id IN (SELECT id FROM alive_candidates)
+RETURNING id, cancel
+"#,
+        )
+        .bind(ids)
+        .bind(now)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut known = Vec::with_capacity(rows.len());
+        let mut canceled = Vec::new();
+        for row in rows {
+            let id: i32 = row.try_get("id")?;
+            let cancel: bool = row.try_get("cancel")?;
+            known.push(id);
+            if cancel {
+                canceled.push(id);
+            }
+        }
+        Ok((known, canceled))
+    }
+
+    /// `Store.MarkComplete`.
+    pub async fn mark_complete(&self, id: i32) -> Result<bool, sqlx::Error> {
+        let result = sqlx::query(
+            r#"
+UPDATE permission_sync_jobs
+SET state = 'completed', finished_at = clock_timestamp()
+WHERE id = $1 AND state = 'processing'
+"#,
+        )
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// `Store.MarkErrored` with `MaxNumRetries = 0`: an errored handler always
+    /// lands in `failed` (or `canceled` when the cancel flag is set).
+    pub async fn mark_errored(&self, id: i32, failure_message: &str) -> Result<bool, sqlx::Error> {
+        let result = sqlx::query(
+            r#"
+UPDATE permission_sync_jobs
+SET state = CASE WHEN cancel THEN 'canceled' WHEN num_failures + 1 >= 0 THEN 'failed' ELSE 'errored' END,
+	finished_at = clock_timestamp(),
+	failure_message = $2,
+	num_failures = CASE WHEN cancel THEN num_failures ELSE num_failures + 1 END
+WHERE id = $1 AND state = 'processing'
+"#,
+        )
+        .bind(id)
+        .bind(failure_message)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// `Store.MarkFailed` (non-retryable handler errors).
+    pub async fn mark_failed(&self, id: i32, failure_message: &str) -> Result<bool, sqlx::Error> {
+        let result = sqlx::query(
+            r#"
+UPDATE permission_sync_jobs
+SET state = CASE WHEN cancel THEN 'canceled' ELSE 'failed' END,
+	finished_at = clock_timestamp(),
+	failure_message = $2,
+	num_failures = CASE WHEN cancel THEN num_failures ELSE num_failures + 1 END
+WHERE id = $1 AND state = 'processing'
+"#,
+        )
+        .bind(id)
+        .bind(failure_message)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// `Store.ResetStalled` (`StalledMaxAge = 30s`, `MaxNumResets = 5`).
+    pub async fn reset_stalled(&self) -> Result<PermissionSyncJobResetResult, sqlx::Error> {
+        const STALLED_MAX_AGE_SECONDS: i64 = 30;
+        const MAX_NUM_RESETS: i32 = 5;
+        const FAILURE_MESSAGE: &str =
+            "job processor died while handling this message too many times";
+
+        let now = OffsetDateTime::now_utc();
+        let reset_rows = sqlx::query(
+            r#"
+WITH stalled AS (
+	SELECT id FROM permission_sync_jobs
+	WHERE
+		state = 'processing' AND
+		$1 - last_heartbeat_at > ($2 * '1 second'::interval) AND
+		num_resets < $3
+	FOR UPDATE SKIP LOCKED
+)
+UPDATE permission_sync_jobs
+SET
+	state = 'queued',
+	queued_at = clock_timestamp(),
+	started_at = null,
+	num_resets = num_resets + 1
+WHERE id IN (SELECT id FROM stalled)
+RETURNING id, last_heartbeat_at
+"#,
+        )
+        .bind(now)
+        .bind(STALLED_MAX_AGE_SECONDS)
+        .bind(MAX_NUM_RESETS)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let failed_rows = sqlx::query(
+            r#"
+WITH stalled AS (
+	SELECT id FROM permission_sync_jobs
+	WHERE
+		state = 'processing' AND
+		$1 - last_heartbeat_at > ($2 * '1 second'::interval) AND
+		num_resets >= $3
+	FOR UPDATE SKIP LOCKED
+)
+UPDATE permission_sync_jobs
+SET
+	state = 'failed',
+	finished_at = clock_timestamp(),
+	failure_message = $4
+WHERE id IN (SELECT id FROM stalled)
+RETURNING id, last_heartbeat_at
+"#,
+        )
+        .bind(now)
+        .bind(STALLED_MAX_AGE_SECONDS)
+        .bind(MAX_NUM_RESETS)
+        .bind(FAILURE_MESSAGE)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(PermissionSyncJobResetResult {
+            reset: scan_reset_rows(now, &reset_rows)?,
+            failed: scan_reset_rows(now, &failed_rows)?,
+        })
+    }
+}
+
+fn scan_job(row: sqlx::postgres::PgRow) -> Result<PermissionSyncJob, sqlx::Error> {
+    Ok(PermissionSyncJob {
+        id: row.try_get("id")?,
+        state: row.try_get("state")?,
+        failure_message: row.try_get("failure_message")?,
+        queued_at: row.try_get("queued_at")?,
+        started_at: row.try_get("started_at")?,
+        finished_at: row.try_get("finished_at")?,
+        process_after: row.try_get("process_after")?,
+        num_resets: row.try_get("num_resets")?,
+        num_failures: row.try_get("num_failures")?,
+        last_heartbeat_at: row.try_get("last_heartbeat_at")?,
+        worker_hostname: row.try_get("worker_hostname")?,
+        cancel: row.try_get("cancel")?,
+        repository_id: row.try_get("repository_id")?,
+        user_id: row.try_get("user_id")?,
+        priority: row.try_get("priority")?,
+        no_perms: row.try_get("no_perms")?,
+        invalidate_caches: row.try_get("invalidate_caches")?,
+    })
+}
+
+fn scan_reset_rows(
+    now: OffsetDateTime,
+    rows: &[sqlx::postgres::PgRow],
+) -> Result<Vec<(i32, Duration)>, sqlx::Error> {
+    rows.iter()
+        .map(|row| {
+            let id: i32 = row.try_get("id")?;
+            let last_heartbeat: Option<OffsetDateTime> = row.try_get("last_heartbeat_at")?;
+            let age = last_heartbeat
+                .and_then(|heartbeat| Duration::try_from(now - heartbeat).ok())
+                .unwrap_or_default();
+            Ok((id, age))
+        })
+        .collect()
 }

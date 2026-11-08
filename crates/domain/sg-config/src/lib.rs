@@ -402,6 +402,16 @@ impl SiteConfiguration {
             .unwrap_or(0)
     }
 
+    /// `conf.Get().PermissionsSyncUsersMaxConcurrency`:
+    /// `permissions.syncUsersMaxConcurrency` (dotted site setting). `<= 0`
+    /// means the worker default of one handler.
+    pub fn permissions_sync_users_max_concurrency(&self) -> i64 {
+        self.raw
+            .get("permissions.syncUsersMaxConcurrency")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(0)
+    }
+
     /// `experimentalFeatures.subRepoPermissions.enabled`: the sub-repository
     /// permissions opt-in that gates `authz.DefaultSubRepoPermsChecker`
     /// (`subrepoperms.NewSubRepoPermsClient` watches this field).
