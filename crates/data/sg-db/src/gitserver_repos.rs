@@ -56,6 +56,39 @@ pub struct GitserverRepo {
     pub corruption_logs: serde_json::Value,
 }
 
+/// `SetLastFetched` failures: the baseline returns `errors.New("repo not
+/// found")` when the update touches no row and wraps execution errors with
+/// "setting last fetched".
+#[derive(Debug)]
+pub enum SetLastFetchedError {
+    RepoNotFound,
+    Database(sqlx::Error),
+}
+
+impl std::fmt::Display for SetLastFetchedError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::RepoNotFound => f.write_str("repo not found"),
+            Self::Database(err) => write!(f, "setting last fetched: {err}"),
+        }
+    }
+}
+
+impl std::error::Error for SetLastFetchedError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::RepoNotFound => None,
+            Self::Database(err) => Some(err),
+        }
+    }
+}
+
+impl From<sqlx::Error> for SetLastFetchedError {
+    fn from(err: sqlx::Error) -> Self {
+        Self::Database(err)
+    }
+}
+
 /// `ErrGitserverRepoNotFound`.
 #[derive(Debug)]
 pub struct GitserverRepoNotFound;
@@ -101,7 +134,7 @@ SET
 	shard_id = $2,
 	updated_at = NOW()
 WHERE
-	repo_id = (SELECT id FROM repo WHERE name = $3)
+	repo_id = (SELECT id FROM repo WHERE name = $3::citext)
 	AND
 	clone_status IS DISTINCT FROM $1
 "#,
@@ -130,7 +163,7 @@ SET
 	shard_id = $2,
 	updated_at = NOW()
 WHERE
-	repo_id = (SELECT id FROM repo WHERE name = $3)
+	repo_id = (SELECT id FROM repo WHERE name = $3::citext)
 	AND
 	last_error IS DISTINCT FROM $1
 "#,
@@ -148,7 +181,7 @@ WHERE
         sqlx::query(
             r#"
 INSERT INTO gitserver_repos_sync_output(repo_id, last_output)
-SELECT id, $1 FROM repo WHERE name = $2
+SELECT id, $1 FROM repo WHERE name = $2::citext
 ON CONFLICT(repo_id)
 DO UPDATE SET last_output = EXCLUDED.last_output, updated_at = NOW()
 "#,
@@ -167,7 +200,7 @@ DO UPDATE SET last_output = EXCLUDED.last_output, updated_at = NOW()
             r#"
 SELECT last_output
 FROM gitserver_repos_sync_output
-WHERE repo_id = (SELECT id FROM repo WHERE name = $1)
+WHERE repo_id = (SELECT id FROM repo WHERE name = $1::citext)
 "#,
         )
         .bind(repo)
@@ -196,7 +229,7 @@ SET
 	clone_status = $3,
 	updated_at = NOW()
 WHERE
-	repo_id = (SELECT id FROM repo WHERE name = $4)
+	repo_id = (SELECT id FROM repo WHERE name = $4::citext)
 	AND
 	repo_size_bytes IS DISTINCT FROM $1
 "#,
@@ -208,6 +241,40 @@ WHERE
         .execute(&self.pool)
         .await
         .map(|_| ())
+    }
+
+    /// `SetLastFetched`: records the fetch timestamps, clears `corrupted_at`
+    /// and marks the repository cloned. Unlike the other setters there is no
+    /// `IS DISTINCT FROM` guard, so `updated_at` always moves.
+    pub async fn set_last_fetched(
+        &self,
+        repo: &str,
+        last_fetched: OffsetDateTime,
+        last_changed: OffsetDateTime,
+    ) -> Result<(), SetLastFetchedError> {
+        let result = sqlx::query(
+            r#"
+UPDATE gitserver_repos
+SET
+	corrupted_at = NULL,
+	last_fetched = $1,
+	last_changed = $2,
+	clone_status = $3,
+	updated_at = NOW()
+WHERE repo_id = (SELECT id FROM repo WHERE name = $4::citext)
+"#,
+        )
+        .bind(last_fetched)
+        .bind(last_changed)
+        .bind(CloneStatus::Cloned.as_str())
+        .bind(repo)
+        .execute(&self.pool)
+        .await?;
+
+        if result.rows_affected() != 1 {
+            return Err(SetLastFetchedError::RepoNotFound);
+        }
+        Ok(())
     }
 
     /// `GetByName` (the baseline selects `'' as name` for this lookup).
@@ -228,7 +295,7 @@ SELECT
 	gr.corruption_logs
 FROM gitserver_repos gr
 JOIN repo r ON r.id = gr.repo_id
-WHERE r.name = $1
+WHERE r.name = $1::citext
 "#,
         )
         .bind(repo)
@@ -331,10 +398,40 @@ mod tests {
             let repo = store.get_by_name(&name).await.expect("get").expect("row");
             assert_eq!(repo.repo_size_bytes, Some(1234));
             assert_eq!(repo.clone_status, CloneStatus::Cloned);
+
+            // SetLastFetched has no IS DISTINCT FROM guard: it always clears
+            // corrupted_at and forces clone_status = cloned.
+            sqlx::query(
+                "UPDATE gitserver_repos SET corrupted_at = NOW(), clone_status = 'not_cloned' \
+                 WHERE repo_id = (SELECT id FROM repo WHERE name = $1::citext)",
+            )
+            .bind(&name)
+            .execute(&pool)
+            .await
+            .expect("mark corrupt");
+            let last_fetched = OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("time");
+            let last_changed = OffsetDateTime::from_unix_timestamp(1_700_000_500).expect("time");
+            store
+                .set_last_fetched(&name, last_fetched, last_changed)
+                .await
+                .expect("last fetched");
+            let repo = store.get_by_name(&name).await.expect("get").expect("row");
+            assert_eq!(repo.last_fetched, last_fetched);
+            assert_eq!(repo.last_changed, last_changed);
+            assert_eq!(repo.clone_status, CloneStatus::Cloned);
+            assert_eq!(repo.corrupted_at, None);
+
+            // A repository without a gitserver_repos row is "repo not found".
+            let err = store
+                .set_last_fetched("missing.example.com/repo", last_fetched, last_changed)
+                .await
+                .expect_err("missing");
+            assert!(matches!(err, SetLastFetchedError::RepoNotFound));
+            assert_eq!(err.to_string(), "repo not found");
         }
         .await;
 
-        sqlx::query("DELETE FROM repo WHERE name = $1")
+        sqlx::query("DELETE FROM repo WHERE name = $1::citext")
             .bind(&name)
             .execute(&pool)
             .await

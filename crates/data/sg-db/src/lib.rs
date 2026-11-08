@@ -7,7 +7,9 @@
 
 use sqlx::postgres::{PgPool, PgPoolOptions};
 
+pub mod external_services;
 pub mod gitserver_repos;
+pub mod repos;
 
 /// Connect to the frontend database. The pool is intentionally small: the
 /// gitserver only reads/writes repository metadata.
