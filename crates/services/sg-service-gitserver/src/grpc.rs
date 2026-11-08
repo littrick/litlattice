@@ -17,9 +17,10 @@ use tonic::{Request as GrpcRequest, Response as GrpcResponse, Status};
 
 use sg_proto::gitserver as gpb;
 
+use crate::details::{file_not_found, repo_not_found, revision_not_found};
 use crate::disk::disk_usage;
 use crate::git::{
-    pump_blame, pump_commit_log, pump_stdout, BlameHunk, BlameRange, CommitLogOptions,
+    pump_blame, pump_commit_log, pump_stdout, stat_path, BlameHunk, BlameRange, CommitLogOptions,
     CommitLogOrder, GitCommit, GitError, GitRef, GitRepo, RawDiffComparison, RefType, TreeEntry,
     CHUNK_MESSAGE_SIZE,
 };
@@ -38,13 +39,10 @@ impl Grpc {
     /// exists.
     #[allow(clippy::result_large_err)] // `tonic::Status` is the RPC error type.
     fn repo(&self, name: &str) -> Result<GitRepo, Status> {
-        let dir =
-            repo_dir(&self.repos_dir, name).ok_or_else(|| Status::not_found("repo not found"))?;
+        let dir = repo_dir(&self.repos_dir, name).ok_or_else(|| repo_not_found(name))?;
         match std::fs::metadata(dir.join("HEAD")) {
             Ok(_) => Ok(GitRepo::new(dir)),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                Err(Status::not_found("repo not found"))
-            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Err(repo_not_found(name)),
             Err(err) => Err(Status::internal(format!(
                 "failed to check if repo is cloned: {err}"
             ))),
@@ -63,12 +61,43 @@ fn unimplemented(rpc: &str) -> Status {
     ))
 }
 
-fn git_status(err: GitError) -> Status {
+/// Translate a backend error into the status the baseline would send.
+///
+/// `repo` is the raw request repo name (the baseline passes it to
+/// `RevisionNotFoundPayload`). RPCs that report file errors attach their own
+/// [`file_not_found`] payload instead of using this helper.
+fn git_status(err: GitError, repo: &str) -> Status {
     match err {
-        GitError::RevisionNotFound(_) => Status::not_found("revision not found"),
+        GitError::RevisionNotFound(spec) => revision_not_found(repo, &spec),
         GitError::FileNotFound => Status::not_found("file not found"),
         GitError::Message(message) => Status::unknown(message),
     }
+}
+
+/// Approximates Go's `%q` (`strconv.Quote`) for revision specs, which the
+/// baseline embeds in `ChangedFiles` error messages.
+fn go_quote(text: &str) -> String {
+    let mut quoted = String::with_capacity(text.len() + 2);
+    quoted.push('"');
+    for character in text.chars() {
+        match character {
+            '"' => quoted.push_str("\\\""),
+            '\\' => quoted.push_str("\\\\"),
+            '\x07' => quoted.push_str("\\a"),
+            '\x08' => quoted.push_str("\\b"),
+            '\x0c' => quoted.push_str("\\f"),
+            '\n' => quoted.push_str("\\n"),
+            '\r' => quoted.push_str("\\r"),
+            '\t' => quoted.push_str("\\t"),
+            '\x0b' => quoted.push_str("\\v"),
+            character if character.is_ascii_control() || character == '\x7f' => {
+                quoted.push_str(&format!("\\x{:02x}", character as u32));
+            }
+            character => quoted.push(character),
+        }
+    }
+    quoted.push('"');
+    quoted
 }
 
 fn file_info(entry: TreeEntry) -> gpb::FileInfo {
@@ -179,7 +208,7 @@ impl gpb::gitserver_service_server::GitserverService for Grpc {
         let child = repo
             .archive(format, &request.treeish, &request.paths)
             .await
-            .map_err(git_status)?;
+            .map_err(|err| git_status(err, &request.repo))?;
 
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<gpb::ArchiveResponse, Status>>(64);
         self.tasks.spawn(async move {
@@ -220,7 +249,14 @@ impl gpb::gitserver_service_server::GitserverService for Grpc {
             Ok(None) => {
                 return Ok(GrpcResponse::new(Box::pin(tokio_stream::empty())));
             }
-            Err(err) => return Err(git_status(err)),
+            Err(GitError::FileNotFound) => {
+                return Err(file_not_found(
+                    &request.repo_name,
+                    &request.commit,
+                    &request.path,
+                ));
+            }
+            Err(err) => return Err(git_status(err, &request.repo_name)),
         };
 
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<gpb::ReadFileResponse, Status>>(64);
@@ -259,10 +295,35 @@ impl gpb::gitserver_service_server::GitserverService for Grpc {
             ));
         }
         let repo = self.repo(&request.repo_name)?;
-        let files = repo
+        let files = match repo
             .changed_files(request.base.as_deref(), &request.head)
             .await
-            .map_err(git_status)?;
+        {
+            Ok(files) => files,
+            Err(GitError::RevisionNotFound(spec)) => {
+                // The baseline wraps the resolution error and copies
+                // `err.Error()` into `Spec`. The backend resolves the base
+                // first, so a failure with the base's spec came from there.
+                let base = request.base.as_deref().map(String::from_utf8_lossy);
+                let message = if base.as_deref() == Some(spec.as_str()) {
+                    format!(
+                        "failed to resolve base commit {}: revision not found: {}@{}",
+                        go_quote(&spec),
+                        request.repo_name,
+                        spec
+                    )
+                } else {
+                    format!(
+                        "failed to resolve head commit {}: revision not found: {}@{}",
+                        go_quote(&String::from_utf8_lossy(&request.head)),
+                        request.repo_name,
+                        spec
+                    )
+                };
+                return Err(revision_not_found(&request.repo_name, &message));
+            }
+            Err(err) => return Err(git_status(err, &request.repo_name)),
+        };
 
         // Chunk at 1 MiB like the baseline `internal/grpc/chunk`.
         let mut responses = Vec::new();
@@ -321,7 +382,7 @@ impl gpb::gitserver_service_server::GitserverService for Grpc {
         let (id, object_type) = repo
             .get_object(&request.object_name)
             .await
-            .map_err(git_status)?;
+            .map_err(|err| git_status(err, &request.repo))?;
         let r#type = match object_type.as_str() {
             "commit" => gpb::git_object::ObjectType::Commit,
             "tag" => gpb::git_object::ObjectType::Tag,
@@ -516,7 +577,10 @@ impl gpb::gitserver_service_server::GitserverService for Grpc {
         let repo = self.repo(&request.repo_name)?;
         let base = String::from_utf8_lossy(&request.base).into_owned();
         let head = String::from_utf8_lossy(&request.head).into_owned();
-        let merge_base_commit_sha = repo.merge_base(&base, &head).await.map_err(git_status)?;
+        let merge_base_commit_sha = repo
+            .merge_base(&base, &head)
+            .await
+            .map_err(|err| git_status(err, &request.repo_name))?;
         Ok(GrpcResponse::new(gpb::MergeBaseResponse {
             merge_base_commit_sha,
         }))
@@ -544,7 +608,7 @@ impl gpb::gitserver_service_server::GitserverService for Grpc {
             start_line: range.start_line,
             end_line: range.end_line,
         });
-        let child = repo
+        let child = match repo
             .blame(
                 &request.commit,
                 &request.path,
@@ -552,9 +616,20 @@ impl gpb::gitserver_service_server::GitserverService for Grpc {
                 range,
             )
             .await
-            .map_err(git_status)?;
+        {
+            Ok(child) => child,
+            Err(GitError::FileNotFound) => {
+                return Err(file_not_found(
+                    &request.repo_name,
+                    &request.commit,
+                    &request.path,
+                ));
+            }
+            Err(err) => return Err(git_status(err, &request.repo_name)),
+        };
 
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<gpb::BlameResponse, Status>>(64);
+        let repo_name = request.repo_name.clone();
         self.tasks.spawn(async move {
             let sender = tx.clone();
             let result = pump_blame(child, |hunk| {
@@ -570,7 +645,7 @@ impl gpb::gitserver_service_server::GitserverService for Grpc {
             })
             .await;
             if let Err(err) = result {
-                let _ = tx.send(Err(git_status(err))).await;
+                let _ = tx.send(Err(git_status(err, &repo_name))).await;
             }
         });
         Ok(GrpcResponse::new(Box::pin(ReceiverStream::new(rx))))
@@ -588,8 +663,11 @@ impl gpb::gitserver_service_server::GitserverService for Grpc {
         let ref_name = repo
             .symbolic_ref_head(request.short_ref)
             .await
-            .map_err(git_status)?;
-        let commit = repo.rev_parse_head().await.map_err(git_status)?;
+            .map_err(|err| git_status(err, &request.repo_name))?;
+        let commit = repo
+            .rev_parse_head()
+            .await
+            .map_err(|err| git_status(err, &request.repo_name))?;
         Ok(GrpcResponse::new(gpb::DefaultBranchResponse {
             ref_name,
             commit,
@@ -611,7 +689,7 @@ impl gpb::gitserver_service_server::GitserverService for Grpc {
         let commit = repo
             .get_commit(&request.commit, request.include_modified_files)
             .await
-            .map_err(git_status)?;
+            .map_err(|err| git_status(err, &request.repo_name))?;
         let (commit, modified_files) = git_commit_proto(commit);
         Ok(GrpcResponse::new(gpb::GetCommitResponse {
             commit: Some(commit),
@@ -632,7 +710,10 @@ impl gpb::gitserver_service_server::GitserverService for Grpc {
         // `ensure_revision` would fetch missing revisions in the baseline;
         // the Rust gitserver has no write path yet, so it behaves like a
         // failed ensure and reports `NotFound`.
-        let commit_sha = repo.resolve_revision(&spec).await.map_err(git_status)?;
+        let commit_sha = repo
+            .resolve_revision(&spec)
+            .await
+            .map_err(|err| git_status(err, &request.repo_name))?;
         Ok(GrpcResponse::new(gpb::ResolveRevisionResponse {
             commit_sha,
         }))
@@ -653,8 +734,8 @@ impl gpb::gitserver_service_server::GitserverService for Grpc {
         let before_seconds = request.time.as_ref().map_or(0, |time| time.seconds);
         let commit_sha = match repo.rev_at_time(&spec, before_seconds).await {
             Ok(commit_sha) => commit_sha,
-            Err(GitError::RevisionNotFound(_)) => {
-                return Err(Status::not_found("revision not found"))
+            Err(GitError::RevisionNotFound(spec)) => {
+                return Err(revision_not_found(&request.repo_name, &spec))
             }
             // The baseline wraps every other fault as `Internal`.
             Err(err) => return Err(Status::internal(err.message())),
@@ -707,7 +788,7 @@ impl gpb::gitserver_service_server::GitserverService for Grpc {
                 &request.paths,
             )
             .await
-            .map_err(git_status)?;
+            .map_err(|err| git_status(err, &request.repo_name))?;
 
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<gpb::RawDiffResponse, Status>>(64);
         self.tasks.spawn(async move {
@@ -775,9 +856,13 @@ impl gpb::gitserver_service_server::GitserverService for Grpc {
             path: request.path,
             follow_path_renames: request.follow_path_renames,
         };
-        let child = repo.commit_log(&options).await.map_err(git_status)?;
+        let child = repo
+            .commit_log(&options)
+            .await
+            .map_err(|err| git_status(err, &request.repo_name))?;
 
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<gpb::CommitLogResponse, Status>>(64);
+        let repo_name = request.repo_name.clone();
         self.tasks.spawn(async move {
             let sender = tx.clone();
             let result = pump_commit_log(child, spec, |commit| {
@@ -798,8 +883,8 @@ impl gpb::gitserver_service_server::GitserverService for Grpc {
             .await;
             match result {
                 Ok(()) => {}
-                Err(GitError::RevisionNotFound(_)) => {
-                    let _ = tx.send(Err(Status::not_found("revision not found"))).await;
+                Err(GitError::RevisionNotFound(spec)) => {
+                    let _ = tx.send(Err(revision_not_found(&repo_name, &spec))).await;
                 }
                 Err(err) => {
                     let _ = tx.send(Err(Status::unknown(err.message()))).await;
@@ -829,7 +914,7 @@ impl gpb::gitserver_service_server::GitserverService for Grpc {
                 request.contains_sha.as_deref(),
             )
             .await
-            .map_err(git_status)?;
+            .map_err(|err| git_status(err, &request.repo_name))?;
 
         // Chunk at 1 MiB like the baseline `internal/grpc/chunk`.
         let mut responses = Vec::new();
@@ -871,8 +956,8 @@ impl gpb::gitserver_service_server::GitserverService for Grpc {
             .await
         {
             Ok(counts) => counts,
-            Err(GitError::RevisionNotFound(_)) => {
-                return Err(Status::not_found("revision not found"))
+            Err(GitError::RevisionNotFound(spec)) => {
+                return Err(revision_not_found(&request.repo_name, &spec))
             }
             // The baseline returns every other fault unchanged (`Unknown`).
             Err(err) => return Err(Status::unknown(err.message())),
@@ -903,15 +988,15 @@ impl gpb::gitserver_service_server::GitserverService for Grpc {
         let repo = self.repo(&request.repo_name)?;
         let id = match repo.first_ever_commit().await {
             Ok(id) => id,
-            Err(GitError::RevisionNotFound(_)) => {
-                return Err(Status::not_found("revision not found"))
+            Err(GitError::RevisionNotFound(spec)) => {
+                return Err(revision_not_found(&request.repo_name, &spec))
             }
             Err(err) => return Err(Status::unknown(err.message())),
         };
         let commit = match repo.get_commit(&id, false).await {
             Ok(commit) => commit,
-            Err(GitError::RevisionNotFound(_)) => {
-                return Err(Status::not_found("revision not found"))
+            Err(GitError::RevisionNotFound(spec)) => {
+                return Err(revision_not_found(&request.repo_name, &spec))
             }
             Err(err) => return Err(Status::unknown(err.message())),
         };
@@ -932,7 +1017,18 @@ impl gpb::gitserver_service_server::GitserverService for Grpc {
         let repo = self.repo(&request.repo_name)?;
         let left = String::from_utf8_lossy(&request.left).into_owned();
         let right = String::from_utf8_lossy(&request.right).into_owned();
-        let behind_ahead = repo.behind_ahead(&left, &right).await.map_err(git_status)?;
+        let behind_ahead = match repo.behind_ahead(&left, &right).await {
+            Ok(behind_ahead) => behind_ahead,
+            Err(GitError::RevisionNotFound(spec)) => {
+                // The baseline copies `err.Error()` into `Spec` here, which
+                // is why the payload contains the full repo-qualified text.
+                return Err(revision_not_found(
+                    &request.repo_name,
+                    &format!("revision not found: {}@{spec}", request.repo_name),
+                ));
+            }
+            Err(err) => return Err(git_status(err, &request.repo_name)),
+        };
         Ok(GrpcResponse::new(gpb::BehindAheadResponse {
             behind: behind_ahead.behind,
             ahead: behind_ahead.ahead,
@@ -965,10 +1061,19 @@ impl gpb::gitserver_service_server::GitserverService for Grpc {
             return Err(Status::invalid_argument("commit_sha must be specified"));
         }
         let repo = self.repo(&request.repo_name)?;
-        let entry = repo
-            .stat(&request.commit_sha, &request.path)
-            .await
-            .map_err(git_status)?;
+        let entry = match repo.stat(&request.commit_sha, &request.path).await {
+            Ok(entry) => entry,
+            Err(GitError::FileNotFound) => {
+                // The baseline reports the cleaned path it handed to
+                // `ls-tree`, not the raw request path.
+                return Err(file_not_found(
+                    &request.repo_name,
+                    &request.commit_sha,
+                    &stat_path(&request.path),
+                ));
+            }
+            Err(err) => return Err(git_status(err, &request.repo_name)),
+        };
         Ok(GrpcResponse::new(gpb::StatResponse {
             file_info: Some(file_info(entry)),
         }))
@@ -989,14 +1094,25 @@ impl gpb::gitserver_service_server::GitserverService for Grpc {
             return Err(Status::invalid_argument("commit_sha must be specified"));
         }
         let repo = self.repo(&request.repo_name)?;
-        let entries = repo
+        let entries = match repo
             .read_dir(
                 &request.commit_sha,
                 request.path.as_deref().unwrap_or_default(),
                 request.recursive,
             )
             .await
-            .map_err(git_status)?;
+        {
+            Ok(entries) => entries,
+            Err(GitError::FileNotFound) => {
+                // `ReadDir` reports the raw request path.
+                return Err(file_not_found(
+                    &request.repo_name,
+                    &request.commit_sha,
+                    request.path.as_deref().unwrap_or_default(),
+                ));
+            }
+            Err(err) => return Err(git_status(err, &request.repo_name)),
+        };
 
         // Chunk at 1 MiB like the baseline `internal/grpc/chunk`.
         let mut responses = Vec::new();
@@ -1043,7 +1159,7 @@ impl gpb::gitserver_service_server::GitserverService for Grpc {
         let merge_base_commit_sha = repo
             .merge_base_octopus(&revspecs)
             .await
-            .map_err(git_status)?;
+            .map_err(|err| git_status(err, &request.repo_name))?;
         Ok(GrpcResponse::new(gpb::MergeBaseOctopusResponse {
             merge_base_commit_sha,
         }))

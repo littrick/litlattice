@@ -2,6 +2,18 @@
   "expected": {
     "error": {
       "code": "not_found",
+      "details": {
+        "code": 5,
+        "details": [
+          {
+            "commit": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+            "path": ".",
+            "repo": "test/symbols-fixture",
+            "type": "file_not_found"
+          }
+        ],
+        "message": "file not found"
+      },
       "message": "file not found"
     }
   },

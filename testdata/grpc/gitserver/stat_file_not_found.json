@@ -2,6 +2,18 @@
   "expected": {
     "error": {
       "code": "not_found",
+      "details": {
+        "code": 5,
+        "details": [
+          {
+            "commit": "5abdba2559d350afdf6b4dcbf32f5edaadcbdda1",
+            "path": "missing.txt",
+            "repo": "test/symbols-fixture",
+            "type": "file_not_found"
+          }
+        ],
+        "message": "file not found"
+      },
       "message": "file not found"
     }
   },

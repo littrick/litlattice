@@ -2,6 +2,18 @@
   "expected": {
     "error": {
       "code": "not_found",
+      "details": {
+        "code": 5,
+        "details": [
+          {
+            "clone_in_progress": false,
+            "clone_progress": "",
+            "repo": "test/missing-search-fixture",
+            "type": "repo_not_found"
+          }
+        ],
+        "message": "repo not found"
+      },
       "message": "repo not found"
     }
   },

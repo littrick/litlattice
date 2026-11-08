@@ -431,6 +431,13 @@ impl GitRepo {
     /// A gitlink (submodule, mode 160000) reads as an empty file, like the
     /// baseline.
     pub async fn read_file(&self, commit: &str, path: &[u8]) -> Result<Option<Child>, GitError> {
+        // Baseline `EnsureAbsoluteCommit`: `ReadFile` refuses to run git on
+        // relative revisions (the expensive resolution cannot be cached).
+        if !is_absolute_revision(commit) {
+            return Err(GitError::Message(format!(
+                "non-absolute commit ID: {commit:?}"
+            )));
+        }
         let output = self
             .output(&[
                 "ls-tree".into(),
@@ -524,7 +531,7 @@ impl GitRepo {
     /// list the root itself.
     pub async fn stat(&self, commit: &str, path: &[u8]) -> Result<TreeEntry, GitError> {
         check_spec_arg_safety(commit)?;
-        let path = clean_path_bytes(&rel_bytes(path));
+        let path = stat_path(path);
         if path == b"." {
             let sha = match self.rev_parse(&format!("{commit}^{{tree}}")).await {
                 Ok(sha) => sha,
@@ -1327,6 +1334,12 @@ fn rel_bytes(path: &[u8]) -> Vec<u8> {
         return b".".to_vec();
     }
     path.strip_prefix(b"/").unwrap_or(path).to_vec()
+}
+
+/// The path baseline `Stat` hands to `ls-tree` and reports in
+/// `FileNotFoundPayload`: `filepath.Clean(rel(path))`.
+pub(crate) fn stat_path(path: &[u8]) -> Vec<u8> {
+    clean_path_bytes(&rel_bytes(path))
 }
 
 /// One parsed `ls-tree --long -z` line before file-mode mapping.
@@ -2164,10 +2177,16 @@ mod tests {
             Err(GitError::RevisionNotFound(_))
         ));
 
-        // Unknown revision and missing file are distinguishable.
+        // `ReadFile` refuses non-absolute revisions outright (baseline
+        // `EnsureAbsoluteCommit`), unlike the other read RPCs.
         assert!(matches!(
             repo.read_file("deadbeef", b"a.txt").await,
-            Err(GitError::RevisionNotFound(_))
+            Err(GitError::Message(message)) if message == "non-absolute commit ID: \"deadbeef\""
+        ));
+        // Unknown absolute revision and missing file are distinguishable.
+        assert!(matches!(
+            repo.read_file(&"0".repeat(40), b"a.txt").await,
+            Err(GitError::RevisionNotFound(spec)) if spec == "0".repeat(40)
         ));
         assert!(matches!(
             repo.read_file(&head, b"missing.txt").await,

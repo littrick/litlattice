@@ -1,0 +1,26 @@
+{
+  "expected": {
+    "error": {
+      "code": "not_found",
+      "details": {
+        "code": 5,
+        "details": [
+          {
+            "repo": "test/symbols-fixture",
+            "spec": "nope",
+            "type": "revision_not_found"
+          }
+        ],
+        "message": "revision not found"
+      },
+      "message": "revision not found"
+    }
+  },
+  "request": {
+    "base": "nope",
+    "head": "HEAD",
+    "repo_name": "test/symbols-fixture"
+  },
+  "rpc": "merge_base",
+  "service": "gitserver"
+}

@@ -1,0 +1,15 @@
+{
+  "expected": {
+    "error": {
+      "code": "unknown",
+      "message": "non-absolute commit ID: \"nope\""
+    }
+  },
+  "request": {
+    "commit": "nope",
+    "path": "starlark/BUILD.bazel",
+    "repo_name": "test/symbols-fixture"
+  },
+  "rpc": "read_file",
+  "service": "gitserver"
+}

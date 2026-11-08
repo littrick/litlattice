@@ -2,6 +2,17 @@
   "expected": {
     "error": {
       "code": "not_found",
+      "details": {
+        "code": 5,
+        "details": [
+          {
+            "repo": "test/git-refs-fixture",
+            "spec": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef^0",
+            "type": "revision_not_found"
+          }
+        ],
+        "message": "revision not found"
+      },
       "message": "revision not found"
     }
   },

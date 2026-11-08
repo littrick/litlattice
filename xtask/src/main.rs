@@ -13,6 +13,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use prost::Message;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
@@ -1445,8 +1446,9 @@ fn normalize_raw_diff(chunks: &[gpb::RawDiffResponse]) -> Value {
 
 /// `DiskInfo` reads the live filesystem, so only the volume size is compared
 /// exactly; the free/used split moves with unrelated writes, so it is frozen
-/// as invariants plus a whole-percent value (Go and Rust both compute it from
-/// the same `statfs` fields in `float32`).
+/// as invariants (Go and Rust both compute the percentage from the same
+/// `statfs` fields in `float32`). The rounded percentage itself is not frozen:
+/// unrelated writes to the filesystem move it between record and replay.
 fn normalize_disk_info(response: &gpb::DiskInfoResponse) -> Value {
     let total = response.total_space;
     let free = response.free_space;
@@ -1459,7 +1461,6 @@ fn normalize_disk_info(response: &gpb::DiskInfoResponse) -> Value {
         "total_space": total,
         "free_space_positive": free > 0,
         "free_space_le_total": free <= total,
-        "percent_used_rounded": f64::from(response.percent_used).round() as i64,
         "percent_used_matches_formula": (f64::from(response.percent_used) - expected).abs() < 0.05,
     })
 }
@@ -1577,15 +1578,113 @@ impl From<tonic::Status> for GitserverFailure {
     }
 }
 
-/// Error responses are part of the contract: freeze the gRPC code and message
-/// (details/`Any` payloads are not compared yet).
+/// Error responses are part of the contract: freeze the gRPC code, message
+/// and the decoded `details` (`google.rpc.Status` with `gitserver.v1.*`
+/// `Any` payloads) the baseline's client consumes.
 fn normalize_status(status: &tonic::Status) -> Value {
-    json!({
-        "error": {
-            "code": code_name(status.code()),
-            "message": status.message(),
+    let mut error = json!({
+        "code": code_name(status.code()),
+        "message": status.message(),
+    });
+    if !status.details().is_empty() {
+        match decode_status_details(status.details()) {
+            Some(details) => error["details"] = details,
+            None => error["details_hex"] = json!(hex(status.details())),
         }
-    })
+    }
+    json!({"error": error})
+}
+
+/// `google.rpc.Status`, the payload of the `grpc-status-details-bin` header.
+#[derive(Clone, PartialEq, prost::Message)]
+struct RpcStatus {
+    #[prost(int32, tag = "1")]
+    code: i32,
+    #[prost(string, tag = "2")]
+    message: String,
+    #[prost(message, repeated, tag = "3")]
+    details: Vec<prost_types::Any>,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct RepoNotFoundPayload {
+    #[prost(string, tag = "1")]
+    repo: String,
+    #[prost(bool, tag = "2")]
+    clone_in_progress: bool,
+    #[prost(string, tag = "3")]
+    clone_progress: String,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct RevisionNotFoundPayload {
+    #[prost(string, tag = "1")]
+    repo: String,
+    #[prost(string, tag = "2")]
+    spec: String,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct FileNotFoundPayload {
+    #[prost(string, tag = "1")]
+    repo: String,
+    #[prost(string, tag = "2")]
+    commit: String,
+    #[prost(bytes = "vec", tag = "3")]
+    path: Vec<u8>,
+}
+
+fn decode_status_details(bytes: &[u8]) -> Option<Value> {
+    let status = RpcStatus::decode(bytes).ok()?;
+    Some(json!({
+        "code": status.code,
+        "message": status.message,
+        "details": status.details.iter().map(decode_any).collect::<Vec<_>>(),
+    }))
+}
+
+fn decode_any(any: &prost_types::Any) -> Value {
+    match any.type_url.as_str() {
+        "type.googleapis.com/gitserver.v1.RepoNotFoundPayload" => {
+            RepoNotFoundPayload::decode(any.value.as_slice())
+                .map(|payload| {
+                    json!({
+                        "type": "repo_not_found",
+                        "repo": payload.repo,
+                        "clone_in_progress": payload.clone_in_progress,
+                        "clone_progress": payload.clone_progress,
+                    })
+                })
+                .unwrap_or_else(|_| decode_any_fallback(any))
+        }
+        "type.googleapis.com/gitserver.v1.RevisionNotFoundPayload" => {
+            RevisionNotFoundPayload::decode(any.value.as_slice())
+                .map(|payload| json!({"type": "revision_not_found", "repo": payload.repo, "spec": payload.spec}))
+                .unwrap_or_else(|_| decode_any_fallback(any))
+        }
+        "type.googleapis.com/gitserver.v1.FileNotFoundPayload" => {
+            FileNotFoundPayload::decode(any.value.as_slice())
+                .map(|payload| {
+                    json!({
+                        "type": "file_not_found",
+                        "repo": payload.repo,
+                        "commit": payload.commit,
+                        // Paths are arbitrary bytes; UTF-8 keeps the fixture
+                        // readable, anything else stays lossless as hex.
+                        "path": match std::str::from_utf8(&payload.path) {
+                            Ok(path) => json!(path),
+                            Err(_) => json!({"hex": hex(&payload.path)}),
+                        },
+                    })
+                })
+                .unwrap_or_else(|_| decode_any_fallback(any))
+        }
+        _ => decode_any_fallback(any),
+    }
+}
+
+fn decode_any_fallback(any: &prost_types::Any) -> Value {
+    json!({"type_url": any.type_url, "value_hex": hex(&any.value)})
 }
 
 fn code_name(code: tonic::Code) -> &'static str {
@@ -2164,6 +2263,77 @@ mod tests {
         );
         assert_eq!(code_name(tonic::Code::Unimplemented), "unimplemented");
         assert_eq!(code_name(tonic::Code::InvalidArgument), "invalid_argument");
+    }
+
+    /// Build the status the Go server sends for `newRepoNotFoundError`.
+    fn repo_not_found_status(repo: &str) -> tonic::Status {
+        let payload = RepoNotFoundPayload {
+            repo: repo.to_owned(),
+            clone_in_progress: false,
+            clone_progress: String::new(),
+        };
+        let details = RpcStatus {
+            code: tonic::Code::NotFound as i32,
+            message: "repo not found".to_owned(),
+            details: vec![prost_types::Any {
+                type_url: "type.googleapis.com/gitserver.v1.RepoNotFoundPayload".to_owned(),
+                value: payload.encode_to_vec(),
+            }],
+        };
+        tonic::Status::with_details(
+            tonic::Code::NotFound,
+            "repo not found",
+            tonic::codegen::Bytes::from(details.encode_to_vec()),
+        )
+    }
+
+    #[test]
+    fn normalizes_error_details_payloads() {
+        assert_eq!(
+            normalize_status(&repo_not_found_status("test/repo")),
+            json!({
+                "error": {
+                    "code": "not_found",
+                    "message": "repo not found",
+                    "details": {
+                        "code": tonic::Code::NotFound as i32,
+                        "message": "repo not found",
+                        "details": [{
+                            "type": "repo_not_found",
+                            "repo": "test/repo",
+                            "clone_in_progress": false,
+                            "clone_progress": "",
+                        }],
+                    },
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn keeps_non_utf8_detail_paths_lossless() {
+        let payload = FileNotFoundPayload {
+            repo: "test/repo".to_owned(),
+            commit: "abc".to_owned(),
+            path: b"dir/\xff.txt".to_vec(),
+        };
+        let details = RpcStatus {
+            code: tonic::Code::NotFound as i32,
+            message: "file not found".to_owned(),
+            details: vec![prost_types::Any {
+                type_url: "type.googleapis.com/gitserver.v1.FileNotFoundPayload".to_owned(),
+                value: payload.encode_to_vec(),
+            }],
+        };
+        let status = tonic::Status::with_details(
+            tonic::Code::NotFound,
+            "file not found",
+            tonic::codegen::Bytes::from(details.encode_to_vec()),
+        );
+        assert_eq!(
+            normalize_status(&status)["error"]["details"]["details"][0]["path"],
+            json!({"hex": "6469722fff2e747874"})
+        );
     }
 
     #[test]

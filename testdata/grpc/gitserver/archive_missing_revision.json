@@ -1,0 +1,27 @@
+{
+  "expected": {
+    "error": {
+      "code": "not_found",
+      "details": {
+        "code": 5,
+        "details": [
+          {
+            "repo": "test/symbols-fixture",
+            "spec": "nope",
+            "type": "revision_not_found"
+          }
+        ],
+        "message": "revision not found"
+      },
+      "message": "revision not found"
+    }
+  },
+  "request": {
+    "format": "tar",
+    "paths": [],
+    "repo": "test/symbols-fixture",
+    "treeish": "nope"
+  },
+  "rpc": "archive",
+  "service": "gitserver"
+}
