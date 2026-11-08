@@ -17,6 +17,7 @@ use base64::Engine;
 use sha2::{Digest, Sha256};
 
 use sg_encryption::Key;
+use tokio_util::sync::CancellationToken;
 
 use super::store::{
     FilterEventType, Webhook, WebhookJob, WebhookLog, WebhookLogStore, WebhookStore,
@@ -155,6 +156,7 @@ pub trait WebhookClient: Send + Sync {
         url: &str,
         headers: &[(String, String)],
         body: Vec<u8>,
+        cancel: &CancellationToken,
     ) -> Result<WebhookResponse, String>;
 }
 
@@ -171,6 +173,16 @@ pub struct WebhookSender<C: WebhookClient> {
 impl<C: WebhookClient + Clone + 'static> WebhookSender<C> {
     /// `handler.Handle`.
     pub async fn handle(&self, job: &WebhookJob) -> Result<(), String> {
+        self.handle_cancellable(job, CancellationToken::new()).await
+    }
+
+    /// `handler.Handle` with the worker's cancellation token; the token is
+    /// cancelled when the queue's `cancel` flag is observed by a heartbeat.
+    pub async fn handle_cancellable(
+        &self,
+        job: &WebhookJob,
+        cancel: CancellationToken,
+    ) -> Result<(), String> {
         let filters = [FilterEventType {
             event_type: job.event_type.clone(),
             scope: job.scope.clone(),
@@ -189,7 +201,8 @@ impl<C: WebhookClient + Clone + 'static> WebhookSender<C> {
         for (index, webhook) in webhooks.into_iter().enumerate() {
             let sender = self.clone();
             let job = job.clone();
-            tasks.spawn(async move { (index, sender.send_webhook(&job, webhook).await) });
+            let cancel = cancel.clone();
+            tasks.spawn(async move { (index, sender.send_webhook(&job, webhook, cancel).await) });
         }
         let mut results = Vec::new();
         while let Some(joined) = tasks.join_next().await {
@@ -207,7 +220,12 @@ impl<C: WebhookClient + Clone + 'static> WebhookSender<C> {
 
     /// `handler.sendWebhook` (all errors are already logged by the caller's
     /// tracing spans in the baseline).
-    async fn send_webhook(&self, job: &WebhookJob, webhook: Webhook) -> Result<(), String> {
+    async fn send_webhook(
+        &self,
+        job: &WebhookJob,
+        webhook: Webhook,
+        cancel: CancellationToken,
+    ) -> Result<(), String> {
         let key = self.key.as_deref();
 
         let url = webhook
@@ -271,7 +289,11 @@ impl<C: WebhookClient + Clone + 'static> WebhookSender<C> {
             error: String::new(),
         };
 
-        let response = match self.client.post(&url, &headers, payload.into_bytes()).await {
+        let response = match self
+            .client
+            .post(&url, &headers, payload.into_bytes(), &cancel)
+            .await
+        {
             Ok(response) => response,
             Err(err) => {
                 log.error = err.clone();

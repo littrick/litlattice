@@ -14,10 +14,12 @@ use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
+pub mod dbworker;
 pub mod metrics_server;
 pub mod periodic;
 pub mod recorder;
 
+use dbworker::DbBackedRoutine;
 use periodic::PeriodicRoutine;
 use recorder::Recordable;
 
@@ -27,6 +29,7 @@ use recorder::Recordable;
 pub enum BackgroundRoutine {
     Periodic(Arc<PeriodicRoutine>),
     Server(Arc<dyn ServerRoutine>),
+    DbBacked(Arc<dyn DbBackedRoutine>),
 }
 
 /// `internal/httpserver`'s `BackgroundRoutine`: `Start` blocks while serving,
@@ -65,6 +68,7 @@ impl BackgroundRoutine {
         match self {
             Self::Periodic(routine) => routine.name(),
             Self::Server(server) => server.name(),
+            Self::DbBacked(routine) => routine.name(),
         }
     }
 
@@ -73,6 +77,7 @@ impl BackgroundRoutine {
         match self {
             Self::Periodic(routine) => routine.interval(),
             Self::Server(_) => Duration::ZERO,
+            Self::DbBacked(routine) => routine.interval(),
         }
     }
 
@@ -82,6 +87,7 @@ impl BackgroundRoutine {
         match self {
             Self::Periodic(routine) => routine.description(),
             Self::Server(_) => "",
+            Self::DbBacked(routine) => routine.description(),
         }
     }
 
@@ -90,13 +96,16 @@ impl BackgroundRoutine {
         match self {
             Self::Periodic(routine) => routine.initial_delay(),
             Self::Server(_) => Duration::ZERO,
+            Self::DbBacked(_) => Duration::ZERO,
         }
     }
 
     /// `SetJobName`: recorder metadata, only periodic routines implement it.
     pub fn set_job_name(&self, job_name: impl Into<String>) {
-        if let Self::Periodic(routine) = self {
-            routine.set_job_name(job_name);
+        match self {
+            Self::Periodic(routine) => routine.set_job_name(job_name),
+            Self::DbBacked(routine) => routine.set_job_name(&job_name.into()),
+            Self::Server(_) => {}
         }
     }
 
@@ -106,6 +115,7 @@ impl BackgroundRoutine {
         match self.as_ref() {
             Self::Periodic(routine) => Some(Arc::clone(routine) as Arc<dyn Recordable>),
             Self::Server(_) => None,
+            Self::DbBacked(routine) => Arc::clone(routine).recordable(),
         }
     }
 
@@ -114,6 +124,12 @@ impl BackgroundRoutine {
     pub fn spawn(self: &Arc<Self>, tracker: &TaskTracker, shutdown: CancellationToken) {
         match self.as_ref() {
             Self::Periodic(routine) => Arc::clone(routine).spawn(tracker, shutdown),
+            Self::DbBacked(routine) => {
+                let routine = Arc::clone(routine);
+                tracker.spawn(async move {
+                    routine.start_arc(shutdown).await;
+                });
+            }
             Self::Server(server) => {
                 let server = Arc::clone(server);
                 tracker.spawn(async move {
