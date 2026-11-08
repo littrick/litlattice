@@ -13,6 +13,7 @@ use sg_config::LiveConfig;
 use sg_db::external_service_repos::ExternalServiceReposStore;
 use sg_db::external_service_sync_jobs::SyncJobsStore;
 use sg_db::external_services::ExternalServiceStore;
+use sg_service_repo_updater::metrics::Metrics;
 use sg_service_repo_updater::scheduler::SystemClock;
 use sg_service_repo_updater::sync_worker::SyncWorker;
 use sg_service_repo_updater::syncer::{ExtsvcSourceFactory, Syncer};
@@ -67,6 +68,7 @@ async fn worker_runs_a_queued_job_to_completion() {
         Arc::new(ExtsvcSourceFactory::new(None)),
         None,
         Arc::new(SystemClock),
+        Arc::new(Metrics::new()),
     ));
     let worker = Arc::new(
         SyncWorker::new(jobs.clone(), syncer, Arc::clone(&live), "test-host")

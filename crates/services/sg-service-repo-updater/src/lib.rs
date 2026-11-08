@@ -166,7 +166,7 @@ impl Service for RepoUpdaterService {
             Arc::new(DbSchedulerStore::new(gitserver_repos)),
             gitserver_client.clone(),
             Arc::clone(&live),
-            metrics,
+            Arc::clone(&metrics),
         ));
 
         // `repos.NewSyncer` + `repos.NewSourcer`. `OTHER` fetches src-expose
@@ -183,6 +183,7 @@ impl Service for RepoUpdaterService {
             source_factory,
             Some(diff_tx.clone()),
             Arc::new(SystemClock),
+            Arc::clone(&metrics),
         ));
         let sync_worker = Arc::new(
             SyncWorker::new(
@@ -201,6 +202,7 @@ impl Service for RepoUpdaterService {
             purge_gitserver_repos,
             gitserver_client.clone() as Arc<dyn RepoUpdateClient>,
             Arc::clone(&live),
+            Arc::clone(&metrics),
         ));
         // `newUnclonedReposManager`: priority boost for repos gitserver has
         // not cloned yet.
@@ -320,6 +322,7 @@ impl Service for RepoUpdaterService {
                 scheduler: Arc::clone(&scheduler),
                 sync_jobs: Arc::new(sync_jobs),
                 purge: Arc::clone(&purge_worker),
+                metrics: Arc::clone(&metrics),
                 tasks: tasks.clone(),
             });
             let shutdown = ctx.shutdown.clone();

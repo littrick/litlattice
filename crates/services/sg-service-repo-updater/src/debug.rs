@@ -19,6 +19,7 @@ use tokio_util::task::TaskTracker;
 
 use sg_db::external_service_sync_jobs::SyncJobsStore;
 
+use crate::metrics::Metrics;
 use crate::purge::PurgeWorker;
 use crate::scheduler::UpdateScheduler;
 
@@ -35,6 +36,8 @@ pub struct DebugContext {
     pub scheduler: Arc<UpdateScheduler>,
     pub sync_jobs: Arc<SyncJobsStore>,
     pub purge: Arc<PurgeWorker>,
+    /// Metric handles, including the scrape-time state gauges.
+    pub metrics: Arc<Metrics>,
     /// Structured-concurrency tracker for manual purges.
     pub tasks: TaskTracker,
 }
@@ -64,11 +67,19 @@ pub fn handler(context: Arc<DebugContext>) -> sg_http::HttpHandler {
 
 async fn route(context: &DebugContext, req: &Request<Incoming>) -> Response<tonic::body::BoxBody> {
     match req.uri().path() {
-        "/metrics" => text(
-            StatusCode::OK,
-            sg_metrics::CONTENT_TYPE,
-            sg_metrics::render_default(),
-        ),
+        "/metrics" => {
+            // The baseline registers the state families as `GaugeFunc`s, so
+            // each scrape recomputes them from the database.
+            context
+                .metrics
+                .refresh_state(context.sync_jobs.pool())
+                .await;
+            text(
+                StatusCode::OK,
+                sg_metrics::CONTENT_TYPE,
+                sg_metrics::render_default(),
+            )
+        }
         "/repo-updater-state" => {
             // `repoUpdaterStatsHandler`: JSON is the only non-HTML rendering
             // implemented here; `format=json` is what the baseline's UI and

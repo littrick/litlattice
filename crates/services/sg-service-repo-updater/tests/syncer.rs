@@ -13,6 +13,7 @@ use std::time::Duration;
 
 use sg_db::external_service_repos::ExternalServiceReposStore;
 use sg_db::external_services::ExternalServiceStore;
+use sg_service_repo_updater::metrics::Metrics;
 use sg_service_repo_updater::scheduler::SystemClock;
 use sg_service_repo_updater::syncer::{
     ExtsvcSourceFactory, NoopProgressRecorder, SyncProgress, Syncer,
@@ -80,6 +81,7 @@ fn syncer(
         Arc::new(ExtsvcSourceFactory::new(None)),
         Some(tx),
         Arc::new(SystemClock),
+        Arc::new(Metrics::new()),
     );
     (syncer, rx)
 }
@@ -306,6 +308,89 @@ async fn revives_soft_deleted_repos_and_reports_progress() {
         .filter(|(_, deleted)| !deleted)
         .count();
     assert_eq!(live, 1);
+
+    cleanup(&pool, service_id, &suffix).await;
+}
+
+/// `Syncer.observeSync` / `ObservedSource.ListRepos` / `observeDiff` must
+/// publish the same families the baseline does.
+#[tokio::test]
+async fn emits_syncer_and_source_metrics() {
+    let Some(pool) = test_pool().await else {
+        return;
+    };
+    let suffix = unique_suffix();
+    let base = format!("https://{suffix}.example.com");
+    let service_id =
+        insert_service(&pool, &format!(r#"{{"url":"{base}","repos":["/r1.git"]}}"#)).await;
+
+    let metrics = Arc::new(Metrics::new());
+    let syncer = Syncer::new(
+        ExternalServiceStore::new(pool.clone()),
+        ExternalServiceReposStore::new(pool.clone()),
+        Arc::new(ExtsvcSourceFactory::new(None)),
+        None,
+        Arc::new(SystemClock),
+        Arc::clone(&metrics),
+    );
+    syncer
+        .sync_external_service(
+            service_id,
+            Duration::from_secs(60),
+            &NoopProgressRecorder,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("sync");
+
+    let family = sg_service_repo_updater::metrics::SYNC_FAMILY;
+    assert_eq!(
+        metrics
+            .syncer_start_sync
+            .with_label_values(&[family, "site"])
+            .get(),
+        1.0
+    );
+    assert!(
+        metrics
+            .syncer_sync_last_time
+            .with_label_values(&[family])
+            .get()
+            > 0.0
+    );
+    assert_eq!(
+        metrics
+            .syncer_sync_duration_seconds
+            .with_label_values(&["true", family])
+            .get_sample_count(),
+        1
+    );
+    assert_eq!(
+        metrics
+            .syncer_sync_errors_total
+            .with_label_values(&[family, "site", "unknown"])
+            .get(),
+        0.0
+    );
+    assert_eq!(
+        metrics
+            .syncer_synced_repos_total
+            .with_label_values(&["added"])
+            .get(),
+        1.0
+    );
+    assert_eq!(metrics.source_repos_total.with_label_values(&[]).get(), 1.0);
+    assert_eq!(
+        metrics
+            .source_duration_seconds
+            .with_label_values(&[])
+            .get_sample_count(),
+        1
+    );
+    assert_eq!(
+        metrics.source_errors_total.with_label_values(&[]).get(),
+        0.0
+    );
 
     cleanup(&pool, service_id, &suffix).await;
 }

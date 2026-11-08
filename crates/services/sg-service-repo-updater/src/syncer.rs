@@ -24,7 +24,7 @@
 //!   relay task subscribes is dropped (the relay is started before any sync).
 
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use tokio::sync::broadcast;
@@ -36,6 +36,7 @@ use sg_db::external_service_repos::{
 use sg_db::external_services::{ExternalService, ExternalServiceStore};
 use sg_extsvc::{HttpGetter, ModifiedRepo, Repo, RepoSyncDiff, Source, SourceInfo, SourceService};
 
+use crate::metrics::{sync_error_reason, Metrics, OWNER_SITE, OWNER_UNDEFINED};
 use crate::scheduler::Clock;
 
 /// `calcSyncInterval`'s `maxSyncInterval`.
@@ -120,6 +121,7 @@ pub struct Syncer {
     /// `Syncer.Synced`; `None` disables publishing (as in the baseline).
     synced: Option<broadcast::Sender<RepoSyncDiff>>,
     clock: Arc<dyn Clock>,
+    metrics: Arc<Metrics>,
 }
 
 impl Syncer {
@@ -129,6 +131,7 @@ impl Syncer {
         sourcer: Arc<dyn SourceFactory>,
         synced: Option<broadcast::Sender<RepoSyncDiff>>,
         clock: Arc<dyn Clock>,
+        metrics: Arc<Metrics>,
     ) -> Self {
         Self {
             external_services,
@@ -136,6 +139,7 @@ impl Syncer {
             sourcer,
             synced,
             clock,
+            metrics,
         }
     }
 
@@ -148,13 +152,21 @@ impl Syncer {
         progress: &dyn ProgressRecorder,
         cancel: &CancellationToken,
     ) -> Result<(), String> {
+        let began = self.clock.now();
         tracing::info!(external_service_id, "syncing external service");
 
-        let svc = self
-            .external_services
-            .get_by_id(external_service_id)
-            .await
-            .map_err(|err| format!("fetching external services: {err}"))?;
+        let svc = match self.external_services.get_by_id(external_service_id).await {
+            Ok(svc) => svc,
+            Err(err) => {
+                let message = format!("fetching external services: {err}");
+                self.observe_sync_finished(
+                    began,
+                    &Result::<(), String>::Err(message.clone()),
+                    None,
+                );
+                return Err(message);
+            }
+        };
 
         let mut modified = false;
         let outcome = self
@@ -190,7 +202,40 @@ impl Syncer {
         }
         tracing::debug!(backoff = ?interval, "synced external service");
 
+        self.observe_sync_finished(began, &outcome, Some(&svc));
+
         outcome
+    }
+
+    /// `Syncer.observeSync`'s deferred closure: increments the started counter,
+    /// records the finish time, duration and (on failure) the error reason.
+    fn observe_sync_finished(
+        &self,
+        began: SystemTime,
+        outcome: &Result<(), String>,
+        svc: Option<&ExternalService>,
+    ) {
+        let ended = self.clock.now();
+        let seconds = ended
+            .duration_since(began)
+            .unwrap_or_default()
+            .as_secs_f64();
+        // `float64(now.Unix())`: whole seconds, matching the baseline.
+        let now_unix = ended
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as f64;
+        let owner = if svc.is_some() {
+            OWNER_SITE
+        } else {
+            OWNER_UNDEFINED
+        };
+        let reason = match outcome {
+            Ok(()) => "",
+            Err(err) => sync_error_reason(err),
+        };
+        self.metrics
+            .observe_sync_finished(outcome.is_ok(), seconds, now_unix, owner, reason);
     }
 
     async fn sync_service(
@@ -209,7 +254,18 @@ impl Syncer {
             );
         }
 
+        // `ObservedSource.ListRepos` -> `REDMetrics.Observe`: on success the
+        // duration and the result count (including error results) are
+        // recorded; on any error only the error counter increments and the
+        // duration sample is skipped, like the baseline.
+        let source_began = std::time::Instant::now();
         let results = src.list_repos().await;
+        let had_error = results.iter().any(|res| res.err.is_some());
+        self.metrics.observe_source(
+            source_began.elapsed().as_secs_f64(),
+            results.len(),
+            had_error,
+        );
 
         // `seen` holds the ids of every repo this sync touched, so the delete
         // phase can tell what the external service no longer sources.
@@ -323,6 +379,10 @@ impl Syncer {
             .map_err(|err| format!("syncer: opening transaction: {err}"))?;
 
         let diff = self.sync_one_tx(&mut tx, svc, sourced).await?;
+
+        // The baseline observes the diff in a deferred block, so it is
+        // recorded even if the commit fails.
+        self.metrics.observe_diff(&diff);
 
         // Commit before publishing: gitserver must be able to find the repo in
         // the database when it reacts to the diff.
@@ -466,9 +526,6 @@ impl Syncer {
 
     /// `Syncer.notifyDeleted`: the deleted repos are published by id only.
     fn notify_deleted(&self, deleted: &[i32]) {
-        let Some(sender) = &self.synced else {
-            return;
-        };
         let mut diff = RepoSyncDiff::default();
         for id in deleted {
             diff.deleted.push(Repo {
@@ -476,6 +533,11 @@ impl Syncer {
                 ..Repo::default()
             });
         }
+        // `observeDiff` runs before the `Synced != nil` check in the baseline.
+        self.metrics.observe_diff(&diff);
+        let Some(sender) = &self.synced else {
+            return;
+        };
         if !diff.is_empty() {
             let _ = sender.send(diff);
         }

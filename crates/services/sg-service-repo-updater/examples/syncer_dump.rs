@@ -13,6 +13,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use sg_db::external_service_repos::ExternalServiceReposStore;
 use sg_db::external_services::ExternalServiceStore;
+use sg_service_repo_updater::metrics::Metrics;
 use sg_service_repo_updater::scheduler::SystemClock;
 use sg_service_repo_updater::syncer::{
     ExtsvcSourceFactory, ProgressRecorder, SyncProgress, Syncer,
@@ -148,6 +149,7 @@ async fn main() {
         Arc::new(ExtsvcSourceFactory::new(None)),
         None,
         Arc::new(SystemClock),
+        Arc::new(Metrics::new()),
     );
     let token = CancellationToken::new();
 

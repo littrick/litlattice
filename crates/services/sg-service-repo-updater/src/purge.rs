@@ -10,8 +10,7 @@
 //! `limit` and a per-second rate.
 //!
 //! The baseline's Prometheus counters (`src_repoupdater_purge_success` /
-//! `_failed`) are replaced by log lines; the statistics are only consumed by
-//! dashboards, not by any protocol.
+//! `_failed`) are incremented per repository, like the Go worker.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -22,6 +21,7 @@ use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
+use crate::metrics::Metrics;
 use crate::scheduler::RepoUpdateClient;
 
 /// `rate.NewLimiter(10, 1)` for the periodic worker.
@@ -73,6 +73,7 @@ pub struct PurgeWorker {
     gitserver: Arc<dyn RepoUpdateClient>,
     live: Arc<LiveConfig>,
     limiter: Limiter,
+    metrics: Arc<Metrics>,
 }
 
 impl PurgeWorker {
@@ -80,12 +81,14 @@ impl PurgeWorker {
         gitserver_repos: GitserverReposStore,
         gitserver: Arc<dyn RepoUpdateClient>,
         live: Arc<LiveConfig>,
+        metrics: Arc<Metrics>,
     ) -> Self {
         Self {
             gitserver_repos,
             gitserver,
             live,
             limiter: Limiter::new(PURGE_RATE_PER_SECOND),
+            metrics,
         }
     }
 
@@ -185,10 +188,12 @@ impl PurgeWorker {
             total += 1;
             if let Err(err) = self.gitserver.delete_repository(&repo).await {
                 tracing::error!(repo = %repo, error = %err, "failed to remove repository");
+                self.metrics.purge_failed.inc();
                 failed += 1;
                 continue;
             }
             success += 1;
+            self.metrics.purge_success.inc();
         }
 
         if failed > 0 {
@@ -278,5 +283,111 @@ mod tests {
             "{:?}",
             start.elapsed()
         );
+    }
+
+    struct FakeGitserver;
+
+    #[async_trait::async_trait]
+    impl RepoUpdateClient for FakeGitserver {
+        async fn fetch_repository(
+            &self,
+            _repo: &str,
+        ) -> Result<(SystemTime, SystemTime), tonic::Status> {
+            Err(tonic::Status::unavailable("unused"))
+        }
+
+        async fn delete_repository(&self, repo: &str) -> Result<(), tonic::Status> {
+            if repo.contains("/fail") {
+                return Err(tonic::Status::internal("boom"));
+            }
+            Ok(())
+        }
+    }
+
+    fn live_config(site: &str) -> Arc<LiveConfig> {
+        let unified = sg_config::Unified::parse(&sg_config::RawUnified {
+            site: site.to_owned(),
+            ..Default::default()
+        })
+        .expect("site config");
+        Arc::new(LiveConfig::new(unified))
+    }
+
+    /// `purgeSuccess`/`purgeFailed` are incremented per repository.
+    #[tokio::test]
+    async fn purge_counts_successes_and_failures() {
+        let Ok(dsn) = std::env::var("SG_TEST_DATABASE_DSN") else {
+            eprintln!("SG_TEST_DATABASE_DSN unset; skipping");
+            return;
+        };
+        let pool = sg_db::connect(&dsn, 5).await.expect("connect");
+        let suffix = format!(
+            "purge-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        );
+        let mut ids = Vec::new();
+        for leaf in ["ok", "fail"] {
+            let id: i32 = sqlx::query_scalar("INSERT INTO repo(name) VALUES ($1) RETURNING id")
+                .bind(format!("{suffix}.example.com/{leaf}"))
+                .fetch_one(&pool)
+                .await
+                .expect("insert repo");
+            sqlx::query(
+                "UPDATE repo SET deleted_at = clock_timestamp() - interval '3 hours' WHERE id = $1",
+            )
+            .bind(id)
+            .execute(&pool)
+            .await
+            .expect("soft delete");
+            sqlx::query("UPDATE gitserver_repos SET clone_status = 'cloned' WHERE repo_id = $1")
+                .bind(id)
+                .execute(&pool)
+                .await
+                .expect("clone status");
+            ids.push(id);
+        }
+
+        let cutoff = sg_db::OffsetDateTime::now_utc() - time::Duration::hours(1);
+        let store = GitserverReposStore::new(pool.clone());
+        let candidates = store
+            .list_purgeable_repos(&ListPurgableReposOptions {
+                deleted_before: Some(cutoff),
+                limit: None,
+            })
+            .await
+            .expect("candidates");
+        if candidates.iter().any(|name| !name.contains(&suffix)) {
+            // Leftover deleted repos from another run would skew the counts.
+            eprintln!("foreign purgeable repos present; skipping: {candidates:?}");
+            sqlx::query("DELETE FROM repo WHERE id = ANY($1)")
+                .bind(&ids)
+                .execute(&pool)
+                .await
+                .expect("cleanup");
+            return;
+        }
+
+        let metrics = Arc::new(Metrics::new());
+        let worker = PurgeWorker::new(
+            store,
+            Arc::new(FakeGitserver),
+            live_config("{}"),
+            Arc::clone(&metrics),
+        );
+        worker
+            .purge(Some(cutoff), 10, &Limiter::new(1000.0))
+            .await
+            .expect("purge");
+        assert_eq!(metrics.purge_success.get(), 1.0);
+        assert_eq!(metrics.purge_failed.get(), 1.0);
+
+        sqlx::query("DELETE FROM repo WHERE id = ANY($1)")
+            .bind(&ids)
+            .execute(&pool)
+            .await
+            .expect("cleanup");
     }
 }

@@ -12,6 +12,7 @@ pub mod external_service_sync_jobs;
 pub mod external_services;
 pub mod gitserver_repos;
 pub mod repos;
+pub mod repoupdater_state;
 
 /// Connect to the frontend database. The pool is intentionally small: the
 /// gitserver only reads/writes repository metadata.
