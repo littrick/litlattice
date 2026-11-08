@@ -1,6 +1,8 @@
-//! Read-only view of `external_services`, as needed by gitserver's remote URL
-//! lookup (`internal/database/external_services.go`: `GetByID` → `List` with
-//! `IncludeDeleted=false`).
+//! View of `external_services`, as needed by gitserver's remote URL lookup
+//! (`internal/database/external_services.go`: `GetByID` → `List` with
+//! `IncludeDeleted=false`), the syncer scheduler, the rate-limit job, and the
+//! `codeintel-package-filter-applicator` job (which bumps `next_sync_at` and
+//! attaches the package code host; see [`ExternalServiceStore::mark_next_sync_at`]).
 //!
 //! `config` stays encrypted exactly as stored; callers decrypt it with the
 //! keyring identified by `encryption_key_id` (`extsvc.NewEncryptedConfig`).
@@ -23,6 +25,11 @@ pub struct ExternalService {
     pub last_sync_at: Option<sqlx::types::time::OffsetDateTime>,
     pub next_sync_at: Option<sqlx::types::time::OffsetDateTime>,
     pub unrestricted: bool,
+    /// `external_services.has_webhooks`; `NULL` until an upsert computes it.
+    pub has_webhooks: Option<bool>,
+    /// `external_services.code_host_id`; `None` until an upsert attaches the
+    /// service to a code host.
+    pub code_host_id: Option<i32>,
 }
 
 /// Lookup failures. The baseline's `GetByID` returns
@@ -30,7 +37,14 @@ pub struct ExternalService {
 /// the raw database error otherwise.
 #[derive(Debug)]
 pub enum ExternalServiceError {
-    NotFound { id: i64 },
+    NotFound {
+        id: i64,
+    },
+    /// `mark_next_sync_at` only handles the package repository kinds.
+    InvalidKind {
+        id: i64,
+        kind: String,
+    },
     Database(sqlx::Error),
 }
 
@@ -38,6 +52,9 @@ impl std::fmt::Display for ExternalServiceError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::NotFound { id } => write!(f, "external service not found: id {id}"),
+            Self::InvalidKind { id, kind } => {
+                write!(f, "external service {id} has non-package kind {kind:?}")
+            }
             Self::Database(err) => write!(f, "external service: {err}"),
         }
     }
@@ -47,6 +64,7 @@ impl std::error::Error for ExternalServiceError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::NotFound { .. } => None,
+            Self::InvalidKind { .. } => None,
             Self::Database(err) => Some(err),
         }
     }
@@ -77,7 +95,7 @@ impl ExternalServiceStore {
         let row = sqlx::query(
             r#"
 SELECT id, kind, display_name, config, encryption_key_id,
-       last_sync_at, next_sync_at, unrestricted
+       last_sync_at, next_sync_at, unrestricted, has_webhooks, code_host_id
 FROM external_services
 WHERE id = $1 AND deleted_at IS NULL
 "#,
@@ -124,7 +142,7 @@ WHERE id = $1 AND deleted_at IS NULL
         let rows = sqlx::query(
             r#"
 SELECT id, kind, display_name, config, encryption_key_id,
-       last_sync_at, next_sync_at, unrestricted
+       last_sync_at, next_sync_at, unrestricted, has_webhooks, code_host_id
 FROM external_services
 WHERE deleted_at IS NULL
 ORDER BY id DESC
@@ -141,7 +159,7 @@ ORDER BY id DESC
         let rows = sqlx::query(
             r#"
 SELECT id, kind, display_name, config, encryption_key_id,
-       last_sync_at, next_sync_at, unrestricted
+       last_sync_at, next_sync_at, unrestricted, has_webhooks, code_host_id
 FROM external_services
 WHERE deleted_at IS NULL
 ORDER BY id
@@ -150,6 +168,144 @@ ORDER BY id
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter().map(service_from_row).collect()
+    }
+
+    /// `ExternalServices().List(ctx, ExternalServicesListOptions{Kinds: ...})`:
+    /// live services of the given kinds, newest first (the default
+    /// `OrderByDirection`). Used by `codeintel-package-filter-applicator` to
+    /// mark every package repository external service for an immediate sync.
+    pub async fn list_by_kinds(
+        &self,
+        kinds: &[&str],
+    ) -> Result<Vec<ExternalService>, ExternalServiceError> {
+        let kinds: Vec<String> = kinds.iter().map(|kind| (*kind).to_owned()).collect();
+        let rows = sqlx::query(
+            r#"
+SELECT id, kind, display_name, config, encryption_key_id,
+       last_sync_at, next_sync_at, unrestricted, has_webhooks, code_host_id
+FROM external_services
+WHERE deleted_at IS NULL AND kind = ANY($1)
+ORDER BY id DESC
+"#,
+        )
+        .bind(&kinds)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(service_from_row).collect()
+    }
+
+    /// `ExternalServices().Upsert` reduced to what
+    /// `codeintel-package-filter-applicator` changes: `next_sync_at` (and the
+    /// code host the baseline's `ensureCodeHost` step would attach).
+    ///
+    /// The baseline calls `Upsert` with the services it just listed, i.e.
+    /// every other column is written back unchanged. Rust therefore updates
+    /// only the columns the job actually changes: `next_sync_at`,
+    /// `code_host_id`, and the two values `recalculateFields` recomputes
+    /// (`unrestricted`, `has_webhooks`). See `docs/modules/06_worker.md`
+    /// §32.4 for the documented deviations (no config re-validation or
+    /// re-encryption, `updated_at` is left untouched exactly like the
+    /// baseline's `excluded.updated_at`).
+    ///
+    /// `unrestricted`/`has_webhooks` are recomputed from the stored config
+    /// only when it is plaintext (`encryption_key_id` empty, so
+    /// [`recalculate_unrestricted`] can read it); for encrypted configs the
+    /// baseline would decrypt it, but the values were already computed when
+    /// the service was created, so the existing values are kept.
+    ///
+    /// Only the six package repository kinds are supported: their
+    /// `UniqueCodeHostIdentifier` is the kind string itself.
+    pub async fn mark_next_sync_at(
+        &self,
+        services: &[ExternalService],
+        next_sync_at: OffsetDateTime,
+    ) -> Result<(), ExternalServiceError> {
+        if services.is_empty() {
+            return Ok(());
+        }
+
+        let mut tx = self.pool.begin().await?;
+        for service in services {
+            let Some(url) = package_code_host_url(&service.kind) else {
+                return Err(ExternalServiceError::InvalidKind {
+                    id: service.id,
+                    kind: service.kind.clone(),
+                });
+            };
+
+            // `ensureCodeHost` → `CodeHostStore.Create`: insert-or-get by url.
+            sqlx::query(
+                r#"
+INSERT INTO code_hosts (kind, url) VALUES ($1, $2)
+ON CONFLICT (url) DO NOTHING
+"#,
+            )
+            .bind(&service.kind)
+            .bind(url)
+            .execute(&mut *tx)
+            .await?;
+            let code_host_id: i32 = sqlx::query_scalar("SELECT id FROM code_hosts WHERE url = $1")
+                .bind(url)
+                .fetch_one(&mut *tx)
+                .await?;
+
+            // `recalculateFields` for a plaintext config; `None` keeps the
+            // stored value (encrypted config, decrypted by the baseline).
+            let plaintext = service.encryption_key_id.is_empty();
+            let unrestricted = plaintext.then(|| recalculate_unrestricted(&service.config));
+            // `configurationHasWebhooks` is `false` for every package kind.
+            let has_webhooks = plaintext.then_some(false);
+
+            // `upsertExternalServicesQuery`: next_sync_at/code_host_id change,
+            // everything else is written back with the loaded value.
+            sqlx::query(
+                r#"
+UPDATE external_services
+SET next_sync_at = $2,
+    code_host_id = $3,
+    unrestricted = COALESCE($4, unrestricted),
+    has_webhooks = COALESCE($5, has_webhooks)
+WHERE id = $1 AND deleted_at IS NULL
+"#,
+            )
+            .bind(service.id)
+            .bind(next_sync_at)
+            .bind(code_host_id)
+            .bind(unrestricted)
+            .bind(has_webhooks)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+}
+
+/// `calcUnrestricted` with `permissionsUserMapping` disabled (the worker's
+/// default site configuration): `false` when the config sets
+/// `enforcePermissions`, otherwise `true` unless the config has an
+/// `authorization` block.
+fn recalculate_unrestricted(config: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(config) else {
+        return true;
+    };
+    if let Some(enforce_permissions) = value.get("enforcePermissions") {
+        return !enforce_permissions.as_bool().unwrap_or(false);
+    }
+    value.get("authorization").is_none()
+}
+
+/// `uniqueCodeHostIdentifier` for the package repository kinds: the kind
+/// string (`GOMODULES`, `JVMPACKAGES`, ...), mirroring `Variant.AsKind()`.
+pub fn package_code_host_url(kind: &str) -> Option<&'static str> {
+    match kind {
+        "GOMODULES" => Some("GOMODULES"),
+        "JVMPACKAGES" => Some("JVMPACKAGES"),
+        "NPMPACKAGES" => Some("NPMPACKAGES"),
+        "PYTHONPACKAGES" => Some("PYTHONPACKAGES"),
+        "RUBYPACKAGES" => Some("RUBYPACKAGES"),
+        "RUSTPACKAGES" => Some("RUSTPACKAGES"),
+        _ => None,
     }
 }
 
@@ -163,6 +319,8 @@ fn service_from_row(row: sqlx::postgres::PgRow) -> Result<ExternalService, Exter
         last_sync_at: row.try_get("last_sync_at")?,
         next_sync_at: row.try_get("next_sync_at")?,
         unrestricted: row.try_get("unrestricted")?,
+        has_webhooks: row.try_get("has_webhooks")?,
+        code_host_id: row.try_get("code_host_id")?,
     })
 }
 
@@ -199,6 +357,8 @@ mod tests {
                 last_sync_at: None,
                 next_sync_at: None,
                 unrestricted: false,
+                has_webhooks: None,
+                code_host_id: None,
             }
         );
 

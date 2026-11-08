@@ -8,5 +8,6 @@
 //! variables, so the loader lives here instead of in either service.
 
 pub mod lsifuploadstore;
+pub mod packagefilters;
 
 pub use lsifuploadstore::Config as UploadStoreConfig;

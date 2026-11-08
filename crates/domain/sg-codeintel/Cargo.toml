@@ -9,4 +9,5 @@ publish.workspace = true
 [dependencies]
 sg-core = { path = "../../base/sg-core" }
 sg-objectstorage = { path = "../../data/sg-objectstorage" }
+regex = { workspace = true }
 tokio = { workspace = true }

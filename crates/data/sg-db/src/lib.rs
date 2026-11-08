@@ -10,6 +10,7 @@ use sqlx::postgres::{PgPool, PgPoolOptions};
 pub mod batches;
 pub mod batches_janitor;
 pub mod codeintel_codegraph;
+pub mod codeintel_dependencies;
 pub mod codeintel_uploads;
 pub mod executor_heartbeats;
 pub mod external_service_repos;

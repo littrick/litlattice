@@ -3829,6 +3829,7 @@ dependencies = [
 name = "sg-codeintel"
 version = "0.1.0"
 dependencies = [
+ "regex",
  "sg-core",
  "sg-objectstorage",
  "tokio",

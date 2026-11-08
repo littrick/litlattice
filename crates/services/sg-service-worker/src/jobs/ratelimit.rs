@@ -486,6 +486,8 @@ mod tests {
                 last_sync_at: None,
                 next_sync_at: None,
                 unrestricted: false,
+                has_webhooks: None,
+                code_host_id: None,
             };
             let err = extract_encryptable_rate_limit(&keyring, &unknown)
                 .await
