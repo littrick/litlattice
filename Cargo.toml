@@ -5,7 +5,18 @@ members = [
     "bins/*",
     "xtask",
 ]
-exclude = ["vendor/*"]
+# `exclude` does not accept glob patterns, so every vendored grammar is listed:
+# they are build dependencies (`[workspace.dependencies]`), not workspace members.
+exclude = [
+    "vendor/tree-sitter-c-sharp",
+    "vendor/tree-sitter-cpp",
+    "vendor/tree-sitter-go",
+    "vendor/tree-sitter-java",
+    "vendor/tree-sitter-javascript",
+    "vendor/tree-sitter-python",
+    "vendor/tree-sitter-ruby",
+    "vendor/tree-sitter-typescript",
+]
 
 [workspace.package]
 version = "0.1.0"

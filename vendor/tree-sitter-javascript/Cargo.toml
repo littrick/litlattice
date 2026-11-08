@@ -46,4 +46,8 @@ path = "bindings/rust/lib.rs"
 version = "~0.20.10"
 
 [build-dependencies.cc]
-version = "~1.0.83"
+# Loosened from upstream's `~1.0.83` so this vendored grammar can coexist with
+# rusqlite/sqlx, whose native crates require cc >= 1.1.6. The build script only
+# uses the long-stable `cc::Build` API. The other vendored grammars already
+# declare `1.0` here.
+version = "1.0"
