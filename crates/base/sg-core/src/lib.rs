@@ -25,4 +25,4 @@ pub use run::{run, run_with_options, RunOptions};
 pub use sanity::sanity_check;
 pub use service::{Service, ServiceContext};
 
-pub use sg_env::EnvReader;
+pub use sg_env::{parse_go_duration, EnvReader};

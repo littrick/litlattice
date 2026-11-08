@@ -8,6 +8,7 @@
 use sqlx::postgres::{PgPool, PgPoolOptions};
 
 pub mod batches;
+pub mod executor_heartbeats;
 pub mod external_service_repos;
 pub mod external_service_sync_jobs;
 pub mod external_services;

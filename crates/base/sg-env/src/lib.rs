@@ -159,6 +159,88 @@ fn parse_bool(raw: &str) -> bool {
     )
 }
 
+/// `time.ParseDuration` (Go). Supports the same unit set and concatenation
+/// rules as the baseline config values (`1s`, `25m`, `168h`, fractions,
+/// negative durations); the error strings mirror Go's for the common
+/// malformed inputs.
+///
+/// `std::time::Duration` cannot be negative; every baseline use of these
+/// values feeds a ticker or deadline, where Go would panic on a negative
+/// duration, so negative results clamp to zero (and are otherwise preserved
+/// in magnitude only when the caller only cares about positivity).
+pub fn parse_go_duration(value: &str) -> Result<std::time::Duration, String> {
+    use std::time::Duration;
+
+    let invalid = || format!("time: invalid duration {value:?}");
+    if value.is_empty() {
+        return Err(invalid());
+    }
+    let (negative, rest) = match value.as_bytes()[0] {
+        b'-' => (true, &value[1..]),
+        b'+' => (false, &value[1..]),
+        _ => (false, value),
+    };
+    // `time.ParseDuration` special-cases a lone zero ("0", "+0", "-0").
+    if rest == "0" {
+        return Ok(Duration::ZERO);
+    }
+    if rest.is_empty() {
+        return Err(invalid());
+    }
+
+    let mut remaining = rest;
+    let mut total_nanos: u128 = 0;
+    while !remaining.is_empty() {
+        let number_len = remaining
+            .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+            .unwrap_or(remaining.len());
+        if number_len == 0 {
+            return Err(invalid());
+        }
+        let number: f64 = match remaining[..number_len].parse::<f64>() {
+            Ok(number) if number.is_finite() && number >= 0.0 => number,
+            _ => return Err(invalid()),
+        };
+        remaining = &remaining[number_len..];
+        let (unit_nanos, after) = if let Some(r) = remaining.strip_prefix("ns") {
+            (1.0, r)
+        } else if let Some(r) = remaining.strip_prefix("us") {
+            (1_000.0, r)
+        } else if let Some(r) = remaining.strip_prefix("µs") {
+            (1_000.0, r)
+        } else if let Some(r) = remaining.strip_prefix("μs") {
+            (1_000.0, r)
+        } else if let Some(r) = remaining.strip_prefix("ms") {
+            (1_000_000.0, r)
+        } else if let Some(r) = remaining.strip_prefix('s') {
+            (1_000_000_000.0, r)
+        } else if let Some(r) = remaining.strip_prefix('m') {
+            (60_000_000_000.0, r)
+        } else if let Some(r) = remaining.strip_prefix('h') {
+            (3_600_000_000_000.0, r)
+        } else if remaining.is_empty() {
+            return Err(format!("time: missing unit in duration {value:?}"));
+        } else {
+            return Err(format!("time: invalid duration {value:?}"));
+        };
+        total_nanos += (number * unit_nanos).round() as u128;
+        remaining = after;
+    }
+
+    let total_nanos = if negative {
+        if total_nanos > i64::MAX as u128 {
+            return Err(invalid());
+        }
+        -(total_nanos as i128)
+    } else {
+        if total_nanos > i64::MAX as u128 {
+            return Err(invalid());
+        }
+        total_nanos as i128
+    };
+    Ok(Duration::from_nanos(total_nanos.max(0) as u64))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -174,6 +256,25 @@ mod tests {
         let b = help.find("B_VAR").expect("B_VAR");
         assert!(a < b);
         assert!(help.contains("(value: \"1\")"));
+    }
+
+    #[test]
+    fn go_durations_parse_like_time_parse_duration() {
+        use std::time::Duration;
+        assert_eq!(parse_go_duration("1s"), Ok(Duration::from_secs(1)));
+        assert_eq!(parse_go_duration("168h"), Ok(Duration::from_secs(604_800)));
+        assert_eq!(parse_go_duration("25m"), Ok(Duration::from_secs(1500)));
+        assert_eq!(parse_go_duration("1.5s"), Ok(Duration::from_millis(1500)));
+        assert_eq!(parse_go_duration("1h30m"), Ok(Duration::from_secs(5400)));
+        assert_eq!(parse_go_duration("0"), Ok(Duration::ZERO));
+        assert_eq!(
+            parse_go_duration("1x"),
+            Err("time: invalid duration \"1x\"".to_owned())
+        );
+        assert_eq!(
+            parse_go_duration("5"),
+            Err("time: missing unit in duration \"5\"".to_owned())
+        );
     }
 
     #[test]

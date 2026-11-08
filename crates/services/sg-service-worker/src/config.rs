@@ -197,7 +197,7 @@ fn get_required(
 }
 
 /// Format errors like `cockroachdb/errors.Append`.
-fn combine_errors(errors: &[String]) -> Option<String> {
+pub(crate) fn combine_errors(errors: &[String]) -> Option<String> {
     match errors {
         [] => None,
         [single] => Some(single.clone()),

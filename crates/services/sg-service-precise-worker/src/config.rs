@@ -5,7 +5,7 @@
 
 use std::time::Duration;
 
-use sg_core::{ConfigError, EnvReader};
+use sg_core::{parse_go_duration, ConfigError, EnvReader};
 
 /// `cmd/precise-code-intel-worker/shared`: `const addr = ":3188"`.
 pub const DEFAULT_PORT: &str = "3188";
@@ -368,83 +368,6 @@ fn parse_strconv_bool(value: &str) -> Option<bool> {
         "0" | "f" | "F" | "FALSE" | "false" | "False" => Some(false),
         _ => None,
     }
-}
-
-/// `time.ParseDuration`. Supports the same unit set and concatenation rules as
-/// the baseline config values (`1s`, `25m`, `168h`, fractions, negative
-/// durations); the error strings mirror Go's for the common malformed inputs.
-fn parse_go_duration(value: &str) -> Result<Duration, String> {
-    let invalid = || format!("time: invalid duration {value:?}");
-    if value.is_empty() {
-        return Err(invalid());
-    }
-    let (negative, rest) = match value.as_bytes()[0] {
-        b'-' => (true, &value[1..]),
-        b'+' => (false, &value[1..]),
-        _ => (false, value),
-    };
-    // `time.ParseDuration` special-cases a lone zero ("0", "+0", "-0").
-    if rest == "0" {
-        return Ok(Duration::ZERO);
-    }
-    if rest.is_empty() {
-        return Err(invalid());
-    }
-
-    let mut remaining = rest;
-    let mut total_nanos: u128 = 0;
-    while !remaining.is_empty() {
-        let number_len = remaining
-            .find(|c: char| !(c.is_ascii_digit() || c == '.'))
-            .unwrap_or(remaining.len());
-        if number_len == 0 {
-            return Err(invalid());
-        }
-        let number: f64 = match remaining[..number_len].parse::<f64>() {
-            Ok(number) if number.is_finite() && number >= 0.0 => number,
-            _ => return Err(invalid()),
-        };
-        remaining = &remaining[number_len..];
-        let (unit_nanos, after) = if let Some(r) = remaining.strip_prefix("ns") {
-            (1.0, r)
-        } else if let Some(r) = remaining.strip_prefix("us") {
-            (1_000.0, r)
-        } else if let Some(r) = remaining.strip_prefix("µs") {
-            (1_000.0, r)
-        } else if let Some(r) = remaining.strip_prefix("μs") {
-            (1_000.0, r)
-        } else if let Some(r) = remaining.strip_prefix("ms") {
-            (1_000_000.0, r)
-        } else if let Some(r) = remaining.strip_prefix('s') {
-            (1_000_000_000.0, r)
-        } else if let Some(r) = remaining.strip_prefix('m') {
-            (60_000_000_000.0, r)
-        } else if let Some(r) = remaining.strip_prefix('h') {
-            (3_600_000_000_000.0, r)
-        } else if remaining.is_empty() {
-            return Err(format!("time: missing unit in duration {value:?}"));
-        } else {
-            return Err(format!("time: invalid duration {value:?}"));
-        };
-        total_nanos += (number * unit_nanos).round() as u128;
-        remaining = after;
-    }
-
-    let total_nanos = if negative {
-        if total_nanos > i64::MAX as u128 {
-            return Err(invalid());
-        }
-        -(total_nanos as i128)
-    } else {
-        if total_nanos > i64::MAX as u128 {
-            return Err(invalid());
-        }
-        total_nanos as i128
-    };
-    // `std::time::Duration` cannot be negative. Every baseline use of these
-    // values feeds a ticker or deadline, where Go would panic on a negative
-    // duration, so clamping to zero is the closest well-defined behavior.
-    Ok(Duration::from_nanos(total_nanos.max(0) as u64))
 }
 
 #[cfg(test)]
