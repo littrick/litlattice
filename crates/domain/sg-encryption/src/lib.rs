@@ -10,9 +10,16 @@
 //! - The `encrypt` mechanism is `nonce || AES-256-GCM(secret, plaintext)`.
 //! - The `envelope` mechanism wraps a random 32-byte key with the key secret
 //!   and uses that random key for the payload (see `envelope`).
+//!
+//! Key backends mirror `internal/encryption`: [`MountedKey`] (AES key from an
+//! environment variable or file), [`AwsKmsKey`]/[`CloudKmsKey`] (envelope or
+//! legacy payloads wrapped by a cloud KMS), and [`NoopKey`] (plaintext).
 
 mod aeshelper;
+pub mod awskms;
+pub mod cloudkms;
 mod envelope;
+pub mod kms;
 pub mod mounted;
 mod wrapper;
 
@@ -21,6 +28,7 @@ use std::fmt;
 use async_trait::async_trait;
 use serde::Serialize;
 
+pub use kms::{AwsKmsKey, CloudKmsKey, KmsTransport};
 pub use mounted::{MountedKey, MountedKeyConfig};
 pub use wrapper::StorableEncryptedKey;
 

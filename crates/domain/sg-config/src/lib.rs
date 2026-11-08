@@ -183,11 +183,26 @@ pub struct MountedEncryptionKeyConfig {
     pub version: String,
 }
 
+/// `schema.AWSKMSEncryptionKey`: a key managed by AWS KMS.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AwsKmsEncryptionKeyConfig {
+    pub key_id: String,
+    pub region: String,
+    pub credentials_file: String,
+}
+
+/// `schema.CloudKMSEncryptionKey`: a key managed by Google Cloud KMS.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CloudKmsEncryptionKeyConfig {
+    pub keyname: String,
+    pub credentials_file: String,
+}
+
 /// `schema.EncryptionKey`, a tagged union discriminated by `type`.
 #[derive(Debug, Clone, PartialEq)]
 pub enum EncryptionKeyConfig {
-    Cloudkms(serde_json::Value),
-    Awskms(serde_json::Value),
+    Cloudkms(CloudKmsEncryptionKeyConfig),
+    Awskms(AwsKmsEncryptionKeyConfig),
     Mounted(MountedEncryptionKeyConfig),
     Noop,
     /// An entry whose `type` is not one of the four known types. Go fails to
@@ -398,8 +413,15 @@ fn parse_encryption_key(value: &serde_json::Value) -> Option<EncryptionKeyConfig
             .to_owned()
     };
     Some(match key_type {
-        "awskms" => EncryptionKeyConfig::Awskms(value.clone()),
-        "cloudkms" => EncryptionKeyConfig::Cloudkms(value.clone()),
+        "awskms" => EncryptionKeyConfig::Awskms(AwsKmsEncryptionKeyConfig {
+            key_id: string("keyId"),
+            region: string("region"),
+            credentials_file: string("credentialsFile"),
+        }),
+        "cloudkms" => EncryptionKeyConfig::Cloudkms(CloudKmsEncryptionKeyConfig {
+            keyname: string("keyname"),
+            credentials_file: string("credentialsFile"),
+        }),
         "mounted" => EncryptionKeyConfig::Mounted(MountedEncryptionKeyConfig {
             env_var_name: string("envVarName"),
             filepath: string("filepath"),
@@ -901,7 +923,12 @@ mod tests {
                         "envVarName": "SG_KEY",
                     },
                     "webhookKey": {"type": "noop"},
-                    "gitHubAppKey": {"type": "awskms", "key": "arn"},
+                    "gitHubAppKey": {"type": "awskms", "keyId": "arn"},
+                    "executorSecretKey": {
+                        "type": "cloudkms",
+                        "keyname": "projects/p/locations/l/keyRings/r/cryptoKeys/k",
+                        "credentialsFile": "/tmp/creds.json",
+                    },
                     "webhookLogKey": {"type": "mystery"},
                 },
             }"#,
@@ -920,10 +947,21 @@ mod tests {
             }))
         );
         assert_eq!(keys.webhook_key, Some(EncryptionKeyConfig::Noop));
-        assert!(matches!(
+        assert_eq!(
             keys.github_app_key,
-            Some(EncryptionKeyConfig::Awskms(_))
-        ));
+            Some(EncryptionKeyConfig::Awskms(AwsKmsEncryptionKeyConfig {
+                key_id: "arn".to_owned(),
+                region: String::new(),
+                credentials_file: String::new(),
+            }))
+        );
+        assert_eq!(
+            keys.executor_secret_key,
+            Some(EncryptionKeyConfig::Cloudkms(CloudKmsEncryptionKeyConfig {
+                keyname: "projects/p/locations/l/keyRings/r/cryptoKeys/k".to_owned(),
+                credentials_file: "/tmp/creds.json".to_owned(),
+            }))
+        );
         assert!(matches!(
             keys.webhook_log_key,
             Some(EncryptionKeyConfig::Unknown(_))

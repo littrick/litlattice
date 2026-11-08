@@ -1,0 +1,8 @@
+{
+  "aws_key_id": "4b739277-5a93-4551-b71c-99608c9c805d",
+  "aws_legacy_ciphertext": "eyJLZXkiOiJkM0poY0hCbFpEb3dNVEl6TkRVMk56ZzVZV0pqWkdWbU1ERXlNelExTmpjNE9XRmlZMlJsWmc9PSIsIk5vbmNlIjoiL1hFTlpTY093SEpaQnVLUiIsIkNpcGhlcnRleHQiOiJaZE82U3djODZiU1VLZ0N1LzJlU3R5WmJjZm9vVHhlMGEyV2VOOC9Fb2ptdStOanUvT0oxWlpWaEpBV09oS0hXODBJPSJ9",
+  "aws_legacy_empty_ciphertext": "eyJLZXkiOiJkM0poY0hCbFpEb3dNVEl6TkRVMk56ZzVZV0pqWkdWbU1ERXlNelExTmpjNE9XRmlZMlJsWmc9PSIsIk5vbmNlIjoiaDZMekQzcVp1cUgyK1dEayIsIkNpcGhlcnRleHQiOiJ5NHlFNjJ3anlXMWNSRjdOQmdSVGFRPT0ifQ==",
+  "cloud_key_name": "projects/erik-test-kms/locations/us/keyRings/erik-test/cryptoKeys/test-kms",
+  "cloud_legacy_ciphertext": "eyJNZWNoYW5pc20iOiIiLCJLZXlOYW1lIjoicHJvamVjdHMvZXJpay10ZXN0LWttcy9sb2NhdGlvbnMvdXMva2V5UmluZ3MvZXJpay10ZXN0L2NyeXB0b0tleXMvdGVzdC1rbXMiLCJXcmFwcGVkS2V5IjpudWxsLCJDaXBoZXJ0ZXh0IjoiZDNKaGNIQmxaRHAyWlhKNWMyVmpjbVYwZEdWemRIWmhiSFZsIiwiTm9uY2UiOm51bGx9",
+  "plaintext": "legacy secret from the Go baseline"
+}

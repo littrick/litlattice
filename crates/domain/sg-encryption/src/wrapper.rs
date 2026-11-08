@@ -74,7 +74,7 @@ impl StorableEncryptedKey {
 
 /// Go's `encoding/base64.CorruptInputError` text, which the baseline surfaces
 /// verbatim when a stored value is malformed.
-fn go_base64_error(err: &base64::DecodeError, input_len: usize) -> String {
+pub(crate) fn go_base64_error(err: &base64::DecodeError, input_len: usize) -> String {
     match err {
         base64::DecodeError::InvalidByte(offset, _)
         | base64::DecodeError::InvalidLength(offset)
@@ -96,7 +96,9 @@ fn serialize_bytes<S: Serializer>(bytes: &[u8], serializer: S) -> Result<S::Ok, 
     serializer.serialize_str(&STANDARD.encode(bytes))
 }
 
-fn deserialize_bytes<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<u8>, D::Error> {
+pub(crate) fn deserialize_bytes<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<u8>, D::Error> {
     // Go marshals a nil slice as `null`; accept that (and a missing field,
     // handled by `default`) as empty bytes.
     let encoded = Option::<String>::deserialize(deserializer)?;

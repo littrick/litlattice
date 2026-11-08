@@ -9,21 +9,21 @@
 
 use std::sync::Arc;
 
+use crate::cloneurl;
+use crate::git::GitError;
+use crate::keyring::Keyring;
+use crate::update::RemoteUrlSource;
 use async_trait::async_trait;
 use sg_db::external_services::ExternalServiceStore;
 use sg_db::repos::RepoStore;
-use sg_encryption::Key;
-
-use crate::cloneurl;
-use crate::git::GitError;
-use crate::update::RemoteUrlSource;
 
 /// `db.Repos()` / `db.ExternalServices()` backed [`RemoteUrlSource`].
 pub struct DbRemoteUrlSource {
     pub repos: Arc<RepoStore>,
     pub external_services: Arc<ExternalServiceStore>,
-    /// `keyring.Default().ExternalServiceKey`.
-    pub key: Option<Arc<dyn Key>>,
+    /// `keyring.Default()`: `getEncryptionKey` reads the current ring for
+    /// every lookup, so a rebuilt keyring applies to subsequent reads.
+    pub keyring: Arc<Keyring>,
 }
 
 impl DbRemoteUrlSource {
@@ -59,11 +59,12 @@ impl DbRemoteUrlSource {
             .await
             .map_err(|err| err.to_string())?;
 
+        let key = self.keyring.external_service_key();
         cloneurl::for_encryptable_config(
             &service.kind,
             &service.config,
             &service.encryption_key_id,
-            self.key.as_deref(),
+            key.as_deref(),
             &stored,
         )
         .await
@@ -93,7 +94,7 @@ mod tests {
         let source = DbRemoteUrlSource {
             repos: Arc::new(RepoStore::new(pool.clone())),
             external_services: Arc::new(ExternalServiceStore::new(pool)),
-            key: None,
+            keyring: Arc::new(Keyring::default()),
         };
         let err = source
             .remote_url("missing.example.com/repo")
@@ -122,7 +123,7 @@ mod tests {
         let source = DbRemoteUrlSource {
             repos: repos.clone(),
             external_services,
-            key: None,
+            keyring: Arc::new(Keyring::default()),
         };
 
         let name = format!(
@@ -213,7 +214,7 @@ mod tests {
         let source = DbRemoteUrlSource {
             repos: Arc::new(RepoStore::new(pool.clone())),
             external_services: Arc::new(ExternalServiceStore::new(pool.clone())),
-            key: None,
+            keyring: Arc::new(Keyring::default()),
         };
         let name = format!(
             "remote-url-nosources-{}.example.com/repo",

@@ -181,8 +181,9 @@ impl Service for GitserverService {
         let external_services = Arc::new(sg_db::external_services::ExternalServiceStore::new(pool));
 
         // `shared.Main` → `keyring.Init`: a configured key that cannot be
-        // constructed fails startup.
-        let external_service_key = keyring::external_service_key(&unified.site).map_err(|err| {
+        // constructed fails startup. The ring is replaced in place by the
+        // `conf.Watch` equivalent below.
+        let keyring = keyring::init(&unified.site).await.map_err(|err| {
             ServiceError::with_source("initializing keyring", std::io::Error::other(err))
         })?;
 
@@ -203,7 +204,7 @@ impl Service for GitserverService {
         let remote_urls = Arc::new(remoteurl::DbRemoteUrlSource {
             repos: repo_store,
             external_services,
-            key: external_service_key,
+            keyring: Arc::clone(&keyring),
         });
         let backend = Arc::new(update::LocalBackend::new(
             config.repos_dir.clone(),
@@ -327,6 +328,22 @@ impl Service for GitserverService {
                 sg_config::ConfigWatcher::new(Arc::clone(&config_client), Arc::clone(&live));
             let shutdown = ctx.shutdown.clone();
             background.spawn(async move { watcher.run(shutdown).await });
+        }
+        {
+            // `keyring.Init`'s `conf.Watch` callback: rebuild the ring in place
+            // on every configuration replacement.
+            let built_generation = live.generation();
+            let keyring = Arc::clone(&keyring);
+            let live = Arc::clone(&live);
+            let shutdown = ctx.shutdown.clone();
+            background.spawn(async move {
+                if let Err(err) = keyring::watch(keyring, live, built_generation, shutdown).await {
+                    // The baseline panics inside the watch callback, which
+                    // terminates the process with exit status 2.
+                    tracing::error!(error = %err, "creating encryption keyring");
+                    std::process::exit(2);
+                }
+            });
         }
         {
             let shutdown = ctx.shutdown.clone();
