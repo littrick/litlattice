@@ -261,6 +261,28 @@ pub fn check_acls(license_key: &str) -> bool {
     acls_for(&info)
 }
 
+/// `licensing.Check(licensing.FeatureACLs)`'s error text, as
+/// `authz/providers` reports it in `ProviderInitResult.Problems`: `None` when
+/// the feature is activated, otherwise the baseline's message.
+///
+/// `licensing.Check` wraps a license parse failure as
+/// `checking feature "acls" activation: <err>`; a valid license whose plan
+/// lacks the feature yields `featureNotActivatedError`'s upgrade message.
+pub fn check_acls_error(license_key: &str) -> Option<String> {
+    let info = match configured_license_info(license_key) {
+        Ok(info) => info,
+        Err(err) => return Some(format!("checking feature \"acls\" activation: {err}")),
+    };
+    if acls_for(&info) {
+        return None;
+    }
+    Some(
+        "The feature \"acls\" is not activated in your Sourcegraph license. Upgrade your \
+         Sourcegraph subscription to use this feature."
+            .to_owned(),
+    )
+}
+
 /// `BasicFeature("acls").Check`: an explicit `acls` tag grants the feature,
 /// otherwise `internal/licensing/data.go` enables it for every plan except
 /// the free plans (`free-0`, `free-1`).
@@ -549,6 +571,31 @@ mod tests {
         // No plan tag at all: `PlanFromTags` falls back to the old enterprise
         // plan, which includes ACLs.
         assert!(acls_for(&Info::default()));
+    }
+
+    #[test]
+    fn acls_error_matches_the_baseline_messages() {
+        // Free plan: valid license, feature not included.
+        assert_eq!(
+            check_acls_error("").as_deref(),
+            Some(
+                "The feature \"acls\" is not activated in your Sourcegraph license. Upgrade your \
+                 Sourcegraph subscription to use this feature."
+            )
+        );
+        // Unparseable key: `Check` wraps the parse error (the port's parser
+        // already reports a different detail text than Go's).
+        let error = check_acls_error("not a key").expect("not activated");
+        assert!(
+            error.starts_with("checking feature \"acls\" activation: "),
+            "{error}"
+        );
+        // Enterprise plan includes ACLs.
+        let info = Info {
+            tags: vec!["plan:enterprise-0".to_owned()],
+            ..Info::default()
+        };
+        assert!(acls_for(&info));
     }
 
     #[test]

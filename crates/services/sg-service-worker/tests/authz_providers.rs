@@ -7,10 +7,15 @@
 //! `test_ws/p9-go/run_authz_providers_diff.sh` applies
 //! `authz_providers_fixtures.sql` immediately before each side.
 
+use std::sync::Arc;
+
 use sg_config::SiteConfiguration;
 use sg_keyring::Keyring;
 use sg_redis::KeyValue;
-use sg_service_worker::jobs::authz_providers::{providers_from_config, ProvidersOptions};
+use sg_service_worker::jobs::authz_providers::{
+    providers_from_config, ConfigAuthzProviders, ProvidersOptions,
+};
+use sg_service_worker::jobs::perms_syncer::ProviderRegistry;
 use sqlx::postgres::PgPool;
 
 #[tokio::test(flavor = "multi_thread")]
@@ -84,4 +89,50 @@ async fn authz_providers_matches_go_harness() {
             println!("ap scenario={name} invalid={i} type={conn}");
         }
     }
+
+    // M9.8ba: the registry the worker's perms syncer consults on every sync.
+    // The default license check would reject the free-plan site, so inject the
+    // baseline's `licensing.MockCheckFeature` equivalent.
+    let site = SiteConfiguration::parse("{}").expect("site config");
+    let live_config = Arc::new(sg_config::LiveConfig::new(sg_config::Unified {
+        site,
+        service_connections: Default::default(),
+    }));
+    let registry = ConfigAuthzProviders::new(
+        pool.clone(),
+        live_config,
+        Arc::new(Keyring::default()),
+        Some(cache_kv.clone()),
+    )
+    .with_acls_error_check(Arc::new(|_| None));
+    let providers = registry.providers().await;
+    let mut urns: Vec<&str> = providers.iter().map(|provider| provider.urn()).collect();
+    urns.sort_unstable();
+    println!(
+        "apr registry=acl-ok providers={} urns={}",
+        providers.len(),
+        urns.join(",")
+    );
+    assert_eq!(
+        urns,
+        [
+            "extsvc:github:12001",
+            "extsvc:github:12003",
+            "extsvc:github:12004"
+        ]
+    );
+
+    let unlicensed = ConfigAuthzProviders::new(
+        pool.clone(),
+        Arc::new(sg_config::LiveConfig::new(sg_config::Unified {
+            site: SiteConfiguration::parse("{}").expect("site config"),
+            service_connections: Default::default(),
+        })),
+        Arc::new(Keyring::default()),
+        Some(cache_kv),
+    )
+    .with_acls_error_check(Arc::new(|_| Some("acls unavailable".to_owned())));
+    let providers = unlicensed.providers().await;
+    println!("apr registry=acl-error providers={}", providers.len());
+    assert!(providers.is_empty());
 }

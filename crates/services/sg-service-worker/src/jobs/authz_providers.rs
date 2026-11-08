@@ -23,8 +23,9 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use serde_json::Value;
-use sg_config::SiteConfiguration;
+use sg_config::{LiveConfig, SiteConfiguration};
 use sg_db::external_services::{ExternalService, ExternalServiceStore};
 use sg_keyring::Keyring;
 use sqlx::postgres::PgPool;
@@ -34,7 +35,7 @@ use super::authz_github::{
     GithubRepoPermsProvider, GroupsCache, MemoryGroupsCache, RedisGroupsCache,
 };
 use super::authz_github_client::GithubRestClient;
-use super::perms_syncer::AuthzProvider;
+use super::perms_syncer::{AuthzProvider, ProviderRegistry};
 
 /// `providers.ProvidersFromConfig`'s external service kinds, in its order.
 pub const AUTHZ_SERVICE_KINDS: &[&str] = &[
@@ -399,6 +400,70 @@ fn normalize_base_url(url: &Url) -> String {
         normalized.set_path(&path);
     }
     normalized.to_string()
+}
+
+/// `permsSyncerImpl.providerFactory`: reconstruct the providers from the live
+/// configuration on every sync, discarding problems and warnings exactly like
+/// the baseline (`ps, _, _, _ := providers.ProvidersFromConfig(...)`).
+pub struct ConfigAuthzProviders {
+    pool: PgPool,
+    live_config: Arc<LiveConfig>,
+    keyring: Arc<Keyring>,
+    cache_kv: Option<sg_redis::KeyValue>,
+    acls_error: AclsErrorCheck,
+}
+
+/// `licensing.Check(licensing.FeatureACLs)` as an injectable predicate
+/// returning the error text; the default reads the site license key.
+pub type AclsErrorCheck = Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
+
+impl ConfigAuthzProviders {
+    pub fn new(
+        pool: PgPool,
+        live_config: Arc<LiveConfig>,
+        keyring: Arc<Keyring>,
+        cache_kv: Option<sg_redis::KeyValue>,
+    ) -> Self {
+        Self {
+            pool,
+            live_config,
+            keyring,
+            cache_kv,
+            acls_error: Arc::new(sg_licensing::check_acls_error),
+        }
+    }
+
+    /// Test seam replacing the license check (`licensing.MockCheckFeature`).
+    pub fn with_acls_error_check(mut self, check: AclsErrorCheck) -> Self {
+        self.acls_error = check;
+        self
+    }
+}
+
+#[async_trait]
+impl ProviderRegistry for ConfigAuthzProviders {
+    async fn providers(&self) -> Vec<Arc<dyn AuthzProvider>> {
+        let unified = self.live_config.current();
+        let site = &unified.site;
+        let opts = ProvidersOptions {
+            acls_license_error: (self.acls_error)(&site.license_key()),
+            enable_github_internal_repo_visibility: enable_github_internal_repo_visibility(site),
+            cache_kv: self.cache_kv.clone(),
+        };
+        providers_from_config(&self.pool, site, &self.keyring, &opts)
+            .await
+            .providers
+    }
+}
+
+/// `ExperimentalFeatures.EnableGithubInternalRepoVisibility` from the raw site
+/// configuration (the zero config has no `experimentalFeatures` block).
+pub fn enable_github_internal_repo_visibility(site: &SiteConfiguration) -> bool {
+    site.raw()
+        .get("experimentalFeatures")
+        .and_then(|features| features.get("enableGithubInternalRepoVisibility"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
 }
 
 #[cfg(test)]

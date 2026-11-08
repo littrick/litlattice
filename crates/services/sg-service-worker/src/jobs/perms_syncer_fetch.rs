@@ -77,9 +77,10 @@ impl ExternalAccountPermsFetcher {
         self
     }
 
-    fn providers_by_service_id(&self) -> HashMap<String, Arc<dyn AuthzProvider>> {
+    async fn providers_by_service_id(&self) -> HashMap<String, Arc<dyn AuthzProvider>> {
         self.registry
             .providers()
+            .await
             .into_iter()
             .map(|provider| (provider.service_id().to_owned(), provider))
             .collect()
@@ -165,7 +166,7 @@ impl UserPermsFetcher for ExternalAccountPermsFetcher {
             );
         }
 
-        let by_service_id = self.providers_by_service_id();
+        let by_service_id = self.providers_by_service_id().await;
 
         // Ask every provider without an account for this user whether it can
         // determine one.

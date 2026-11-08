@@ -174,9 +174,11 @@ pub trait AuthzProvider: Send + Sync {
 }
 
 /// `providers.ProvidersFromConfig` as seen by the syncer. The registry is
-/// consulted on every sync, matching the baseline's `providerFactory`.
+/// consulted on every sync, matching the baseline's `providerFactory`; it is
+/// async because the construction lists external services from the database.
+#[async_trait]
 pub trait ProviderRegistry: Send + Sync {
-    fn providers(&self) -> Vec<Arc<dyn AuthzProvider>>;
+    async fn providers(&self) -> Vec<Arc<dyn AuthzProvider>>;
 }
 
 /// Result of one `syncRepoPerms` call. `result` is `None` when the baseline
@@ -272,6 +274,7 @@ impl PermsSyncer {
             let by_urn: HashMap<String, Arc<dyn AuthzProvider>> = self
                 .registry
                 .providers()
+                .await
                 .into_iter()
                 .map(|provider| (provider.urn().to_owned(), provider))
                 .collect();

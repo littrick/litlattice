@@ -21,8 +21,9 @@ use sqlx::Row;
 
 struct NoProviders;
 
+#[async_trait]
 impl ProviderRegistry for NoProviders {
-    fn providers(&self) -> Vec<Arc<dyn AuthzProvider>> {
+    async fn providers(&self) -> Vec<Arc<dyn AuthzProvider>> {
         Vec::new()
     }
 }

@@ -28,8 +28,9 @@ struct SrRegistry {
     providers: Vec<Arc<dyn AuthzProvider>>,
 }
 
+#[async_trait]
 impl ProviderRegistry for SrRegistry {
-    fn providers(&self) -> Vec<Arc<dyn AuthzProvider>> {
+    async fn providers(&self) -> Vec<Arc<dyn AuthzProvider>> {
         self.providers.clone()
     }
 }

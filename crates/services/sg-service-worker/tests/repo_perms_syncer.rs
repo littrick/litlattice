@@ -58,8 +58,9 @@ impl AuthzProvider for FakeProvider {
 
 struct FakeRegistry;
 
+#[async_trait]
 impl ProviderRegistry for FakeRegistry {
-    fn providers(&self) -> Vec<Arc<dyn AuthzProvider>> {
+    async fn providers(&self) -> Vec<Arc<dyn AuthzProvider>> {
         vec![Arc::new(FakeProvider)]
     }
 }

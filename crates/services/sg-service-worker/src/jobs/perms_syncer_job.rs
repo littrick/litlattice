@@ -17,12 +17,12 @@
 //! The handler calls `syncUserPerms` / `syncRepoPerms`, turns "all providers
 //! failed" into an error, and stores the result with `SaveSyncResult`.
 //!
-//! Porting notes (docs/modules/06_worker.md §58):
+//! Porting notes (docs/modules/06_worker.md §58, §65):
 //!
-//! * `providers.ProvidersFromConfig` is not ported yet, so the registry is
-//!   empty: the queue, handler and storage paths run end to end, but no code
-//!   host is queried and every sync is a successful no-op. This is the next
-//!   slice's main gap.
+//! * The provider registry is [`ConfigAuthzProviders`]: every sync calls
+//!   `providers.ProvidersFromConfig` against the live site configuration and
+//!   the frontend database, like the baseline's `providerFactory`. The groups
+//!   cache uses the shared Redis cache endpoint when it is reachable.
 //! * Prometheus metrics (`workerutil.NewMetrics`,
 //!   `dbworker.NewResetterMetrics`) and the debug/error log lines are not
 //!   ported, consistent with the other worker slices.
@@ -40,6 +40,7 @@ use sg_db::perms_store::{count_statuses, save_sync_result, CodeHostState, SetPer
 use sqlx::postgres::PgPool;
 use tokio_util::sync::CancellationToken;
 
+use super::authz_providers::ConfigAuthzProviders;
 use super::perms_syncer::{AuthzProvider, FetchPermsOptions, PermsSyncer, ProviderRegistry};
 use super::perms_syncer_fetch::ExternalAccountPermsFetcher;
 use super::{Job, JobDeps};
@@ -82,7 +83,22 @@ impl Job for PermsSyncerJob {
         _setup_ctx: CancellationToken,
     ) -> Result<Vec<BackgroundRoutine>, String> {
         let pool = deps.frontend.clone();
-        let registry: Arc<dyn ProviderRegistry> = Arc::new(NoAuthzProviders);
+        let cache_kv = match sg_redis::KeyValue::connect(&sg_redis::cache_endpoint()).await {
+            Ok(kv) => Some(kv),
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "GitHub groups cache unavailable: redis connection failed"
+                );
+                None
+            }
+        };
+        let registry: Arc<dyn ProviderRegistry> = Arc::new(ConfigAuthzProviders::new(
+            pool.clone(),
+            Arc::clone(&deps.live_config),
+            Arc::clone(&deps.keyring),
+            cache_kv,
+        ));
         let fetcher = Arc::new(ExternalAccountPermsFetcher::new(
             pool.clone(),
             Arc::clone(&registry),
@@ -152,12 +168,13 @@ pub fn sync_users_max_concurrency(site: &sg_config::SiteConfiguration) -> usize 
     }
 }
 
-/// `providers.ProvidersFromConfig` is not ported yet; the handler and queue
-/// machinery are exercised with no configured provider.
+/// Empty registry used by the differential harness, which drives the queue
+/// and handler machinery without a configured code host.
 pub struct NoAuthzProviders;
 
+#[async_trait]
 impl ProviderRegistry for NoAuthzProviders {
-    fn providers(&self) -> Vec<Arc<dyn AuthzProvider>> {
+    async fn providers(&self) -> Vec<Arc<dyn AuthzProvider>> {
         Vec::new()
     }
 }
