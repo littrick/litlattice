@@ -63,6 +63,10 @@ done
 is_lazy() {
     case "$1" in
         *_duration_seconds|*_errors_total|*_client_total|*_store_total|*_syncer_total) return 0 ;;
+        # `NewStoreMetrics` families (`src_repoupdater_store_*`,
+        # `src_repocreater_store_*`) are empty-label vectors that only render
+        # after the operation has been observed once.
+        *_store_*) return 0 ;;
         *) return 1 ;;
     esac
 }
@@ -160,11 +164,43 @@ do
 done
 echo "  info Go ops observed: ${go_ops:-<none>}"
 
+# `internal/repos/observability.go` `NewStoreMetrics`: the syncer observes
+# `Transact`, `Done` and the four repo-write operations. The create families
+# use the baseline's `src_repocreater_` prefix and the delete-not-in families
+# keep its `exernal` typo; both must match exactly.
+echo "repos store family metadata"
+for family in \
+    src_repoupdater_store_transact_duration_seconds \
+    src_repoupdater_store_transact_total \
+    src_repoupdater_store_transact_errors_total \
+    src_repoupdater_store_done_duration_seconds \
+    src_repoupdater_store_done_total \
+    src_repoupdater_store_done_errors_total \
+    src_repocreater_store_create_external_service_repo_duration_seconds \
+    src_repocreater_store_create_external_service_repo_total \
+    src_repocreater_store_create_external_service_repo_errors_total \
+    src_repoupdater_store_update_external_service_repo_duration_seconds \
+    src_repoupdater_store_update_external_service_repo_total \
+    src_repoupdater_store_update_external_service_repo_errors_total \
+    src_repoupdater_store_delete_external_service_repo_duration_seconds \
+    src_repoupdater_store_delete_external_service_repo_total \
+    src_repoupdater_store_delete_external_service_repo_errors_total \
+    src_repoupdater_store_delete_exernal_service_repos_not_in_duration_seconds \
+    src_repoupdater_store_delete_exernal_service_repos_not_in_total \
+    src_repoupdater_store_delete_exernal_service_repos_not_in_errors_total
+do
+    check_family "$family"
+done
+
 for family in \
     src_external_service_queue_resets_total \
     src_external_service_queue_max_resets_total \
     src_external_service_queue_reset_errors_total \
-    src_repo_updater_external_service_syncer_handlers
+    src_repo_updater_external_service_syncer_handlers \
+    src_repoupdater_store_transact_total \
+    src_repoupdater_store_done_total \
+    src_repocreater_store_create_external_service_repo_total \
+    src_repoupdater_store_delete_exernal_service_repos_not_in_total
 do
     echo "  info $family go=$(value "$TMP/go.txt" "$family") rust=$(value "$TMP/rust.txt" "$family") (process-local)"
 done

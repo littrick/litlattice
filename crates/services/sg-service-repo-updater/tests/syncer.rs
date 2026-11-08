@@ -394,3 +394,124 @@ async fn emits_syncer_and_source_metrics() {
 
     cleanup(&pool, service_id, &suffix).await;
 }
+
+/// `NewStoreMetrics`: the sync transaction (`Transact`/`Done`), the
+/// create/update/delete writes, and the nested `Transact`/`Done` pair the
+/// baseline opens per repo inside `DeleteExternalServiceRepo`.
+#[tokio::test]
+async fn emits_store_metrics_for_create_update_and_delete() {
+    let Some(pool) = test_pool().await else {
+        return;
+    };
+    let suffix = unique_suffix();
+    let base = format!("https://{suffix}.example.com");
+    let service_id =
+        insert_service(&pool, &format!(r#"{{"url":"{base}","repos":["/r1.git"]}}"#)).await;
+
+    let metrics = Arc::new(Metrics::new());
+    let syncer = Syncer::new(
+        ExternalServiceStore::new(pool.clone()),
+        ExternalServiceReposStore::new(pool.clone()).with_observer(
+            Arc::clone(&metrics) as Arc<dyn sg_db::external_service_repos::StoreObserver>
+        ),
+        Arc::new(ExtsvcSourceFactory::new(None)),
+        None,
+        Arc::new(SystemClock),
+        Arc::clone(&metrics),
+    );
+    let token = CancellationToken::new();
+    let min = Duration::from_secs(60);
+
+    // Sync 1: create r1 → one transaction + one create.
+    syncer
+        .sync_external_service(service_id, min, &NoopProgressRecorder, &token)
+        .await
+        .expect("create sync");
+
+    // Sync 2: make the stored row differ so the update path runs.
+    sqlx::query("UPDATE repo SET description = 'stale' WHERE name LIKE $1")
+        .bind(format!("%{suffix}.example.com/%"))
+        .execute(&pool)
+        .await
+        .expect("stale description");
+    syncer
+        .sync_external_service(service_id, min, &NoopProgressRecorder, &token)
+        .await
+        .expect("update sync");
+
+    // Sync 3: create r2 and delete r1.
+    sqlx::query("UPDATE external_services SET config = $2 WHERE id = $1")
+        .bind(service_id)
+        .bind(format!(r#"{{"url":"{base}","repos":["/r2.git"]}}"#))
+        .execute(&pool)
+        .await
+        .expect("update config");
+    syncer
+        .sync_external_service(service_id, min, &NoopProgressRecorder, &token)
+        .await
+        .expect("delete sync");
+
+    assert_eq!(
+        metrics.store_transact_total.with_label_values(&[]).get(),
+        4.0,
+        "three sync transactions plus the per-delete one"
+    );
+    assert_eq!(metrics.store_done_total.with_label_values(&[]).get(), 4.0);
+    assert_eq!(
+        metrics
+            .store_transact_errors_total
+            .with_label_values(&[])
+            .get(),
+        0.0
+    );
+    assert_eq!(
+        metrics.store_done_errors_total.with_label_values(&[]).get(),
+        0.0
+    );
+    assert_eq!(
+        metrics
+            .store_transact_duration_seconds
+            .with_label_values(&[])
+            .get_sample_count(),
+        4
+    );
+    assert_eq!(
+        metrics
+            .store_create_external_service_repo_total
+            .with_label_values(&[])
+            .get(),
+        2.0
+    );
+    assert_eq!(
+        metrics
+            .store_update_external_service_repo_total
+            .with_label_values(&[])
+            .get(),
+        1.0
+    );
+    assert_eq!(
+        metrics
+            .store_delete_external_service_repo_total
+            .with_label_values(&[])
+            .get(),
+        1.0
+    );
+    assert_eq!(
+        metrics
+            .store_delete_external_service_repos_not_in_total
+            .with_label_values(&[])
+            .get(),
+        3.0,
+        "the delete phase runs on every successful sync"
+    );
+    for family in [
+        &metrics.store_create_external_service_repo_errors_total,
+        &metrics.store_update_external_service_repo_errors_total,
+        &metrics.store_delete_external_service_repo_errors_total,
+        &metrics.store_delete_external_service_repos_not_in_errors_total,
+    ] {
+        assert_eq!(family.with_label_values(&[]).get(), 0.0);
+    }
+
+    cleanup(&pool, service_id, &suffix).await;
+}

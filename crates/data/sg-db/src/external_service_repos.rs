@@ -6,10 +6,34 @@
 //! The repo (`repo`) and association (`external_service_repos`) writes are
 //! issued in one transaction, like `Syncer.sync`'s `Store.Transact`.
 
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgPool;
 use sqlx::types::time::OffsetDateTime;
 use sqlx::Row;
+
+/// `internal/repos/observability.go`'s `StoreMetrics` operations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoreOp {
+    Transact,
+    Done,
+    CreateExternalServiceRepo,
+    UpdateExternalServiceRepo,
+    DeleteExternalServiceRepo,
+    DeleteExternalServiceReposNotIn,
+}
+
+/// Observation hook for the store's RED metrics. The repo-updater service
+/// implements it on top of `sg_metrics` (see `internal/repos/observability.go`
+/// `NewStoreMetrics`); `sg-db` itself stays free of Prometheus so the store
+/// can be used by other processes that never observe these families.
+pub trait StoreObserver: Send + Sync {
+    /// `metrics.REDMetrics.Observe(secs, count, err)`: `had_error` records
+    /// whether the operation returned an error.
+    fn observe(&self, op: StoreOp, seconds: Duration, had_error: bool);
+}
 
 /// `api.ExternalRepoSpec` as stored in the `repo` columns.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -92,26 +116,51 @@ pub enum SyncRepoOutcome {
 #[derive(Clone)]
 pub struct ExternalServiceReposStore {
     pool: PgPool,
+    observer: Option<Arc<dyn StoreObserver>>,
 }
 
 /// A transaction for `Syncer.sync`'s read-decide-write sequence
 /// (`Store.Transact` in the baseline).
 pub struct RepoTransaction<'a> {
-    tx: sqlx::Transaction<'a, sqlx::Postgres>,
+    tx: Option<sqlx::Transaction<'a, sqlx::Postgres>>,
+    observer: Option<Arc<dyn StoreObserver>>,
+    /// Set by [`RepoTransaction::commit`] so the rollback path in
+    /// [`Drop`] does not observe a second `Done`.
+    finished: bool,
 }
 
 impl ExternalServiceReposStore {
     pub fn new(pool: PgPool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            observer: None,
+        }
+    }
+
+    /// Attach the RED metrics observer (`SetMetrics` in the baseline).
+    pub fn with_observer(mut self, observer: Arc<dyn StoreObserver>) -> Self {
+        self.observer = Some(observer);
+        self
     }
 
     pub fn pool(&self) -> &PgPool {
         &self.pool
     }
 
+    fn observe_store(&self, op: StoreOp, started: Instant, had_error: bool) {
+        if let Some(observer) = &self.observer {
+            observer.observe(op, started.elapsed(), had_error);
+        }
+    }
+
     pub async fn begin(&self) -> Result<RepoTransaction<'_>, sqlx::Error> {
+        let started = Instant::now();
+        let tx = self.pool.begin().await;
+        self.observe_store(StoreOp::Transact, started, tx.is_err());
         Ok(RepoTransaction {
-            tx: self.pool.begin().await?,
+            tx: Some(tx?),
+            observer: self.observer.clone(),
+            finished: false,
         })
     }
 
@@ -170,6 +219,24 @@ impl ExternalServiceReposStore {
         service_id: i64,
         seen: &[i64],
     ) -> Result<(Vec<i32>, Option<sqlx::Error>), sqlx::Error> {
+        let started = Instant::now();
+        let result = self.delete_not_in_inner(service_id, seen).await;
+        // The baseline observes the named `err` return after the explicit
+        // `return deleted, errs`, i.e. the aggregated per-repo error (or the
+        // list query error) decides whether the call counts as failed.
+        let had_error = match &result {
+            Ok((_, first_error)) => first_error.is_some(),
+            Err(_) => true,
+        };
+        self.observe_store(StoreOp::DeleteExternalServiceReposNotIn, started, had_error);
+        result
+    }
+
+    async fn delete_not_in_inner(
+        &self,
+        service_id: i64,
+        seen: &[i64],
+    ) -> Result<(Vec<i32>, Option<sqlx::Error>), sqlx::Error> {
         let row = sqlx::query(
             r#"
 SELECT array_agg(repo_id) AS ids
@@ -201,16 +268,31 @@ WHERE external_service_id = $1 AND repo_id != ALL($2)
         Ok((deleted, first_error))
     }
 
-    /// `DeleteExternalServiceRepo`.
+    /// `DeleteExternalServiceRepo`. Outside a transaction the baseline opens
+    /// a nested `s.transact`/`s.Done` pair, so this observes `Transact` and
+    /// `Done` around the delete as well.
     pub async fn delete_one(&self, service_id: i64, repo_id: i32) -> Result<(), sqlx::Error> {
-        let mut tx = self.pool.begin().await?;
-        delete_one(&mut tx, service_id, repo_id).await?;
-        tx.commit().await?;
-        Ok(())
+        let started = Instant::now();
+        let result = self.delete_one_inner(service_id, repo_id).await;
+        self.observe_store(StoreOp::DeleteExternalServiceRepo, started, result.is_err());
+        result
+    }
+
+    async fn delete_one_inner(&self, service_id: i64, repo_id: i32) -> Result<(), sqlx::Error> {
+        let mut tx = self.begin().await?;
+        delete_association(tx.tx(), service_id, repo_id).await?;
+        tx.commit().await
     }
 }
 
-impl RepoTransaction<'_> {
+impl<'a> RepoTransaction<'a> {
+    /// The live `sqlx` transaction; present until [`RepoTransaction::commit`].
+    fn tx(&mut self) -> &mut sqlx::Transaction<'a, sqlx::Postgres> {
+        self.tx
+            .as_mut()
+            .expect("transaction is present until commit")
+    }
+
     /// `Repos.List` with `Names` + `ExternalRepos`, `IncludeBlocked` and
     /// `IncludeDeleted` set, `UseOr: true` (`Syncer.sync`'s lookup).
     pub async fn list_for_sync(
@@ -253,7 +335,7 @@ WHERE
         .bind(&external_repo.id)
         .bind(&external_repo.service_type)
         .bind(&external_repo.service_id)
-        .fetch_all(&mut *self.tx)
+        .fetch_all(&mut **self.tx())
         .await?;
 
         rows.into_iter().map(row_to_stored_repo).collect()
@@ -261,6 +343,18 @@ WHERE
 
     /// `CreateExternalServiceRepo` (and the caller-reported `Added` diff).
     pub async fn create(
+        &mut self,
+        service_id: i64,
+        repo: &RepoWrite,
+        clone_url: &str,
+    ) -> Result<SyncRepoOutcome, sqlx::Error> {
+        let started = Instant::now();
+        let result = self.create_inner(service_id, repo, clone_url).await;
+        self.observe(StoreOp::CreateExternalServiceRepo, started, result.is_err());
+        result
+    }
+
+    async fn create_inner(
         &mut self,
         service_id: i64,
         repo: &RepoWrite,
@@ -287,18 +381,31 @@ RETURNING id, created_at
         .bind(repo.stars)
         .bind(repo.private)
         .bind(&repo.metadata)
-        .fetch_one(&mut *self.tx)
+        .fetch_one(&mut **self.tx())
         .await?;
 
         let id: i32 = row.try_get("id")?;
         let created_at: OffsetDateTime = row.try_get("created_at")?;
-        upsert_association(&mut self.tx, service_id, id, clone_url).await?;
+        upsert_association(self.tx(), service_id, id, clone_url).await?;
         Ok(SyncRepoOutcome::Created { id, created_at })
     }
 
     /// `UpdateExternalServiceRepo`: updates the repo row (clearing
     /// `deleted_at`) and the association's clone URL.
     pub async fn update(
+        &mut self,
+        service_id: i64,
+        id: i32,
+        repo: &RepoWrite,
+        clone_url: &str,
+    ) -> Result<SyncRepoOutcome, sqlx::Error> {
+        let started = Instant::now();
+        let result = self.update_inner(service_id, id, repo, clone_url).await;
+        self.observe(StoreOp::UpdateExternalServiceRepo, started, result.is_err());
+        result
+    }
+
+    async fn update_inner(
         &mut self,
         service_id: i64,
         id: i32,
@@ -338,25 +445,54 @@ RETURNING updated_at
         .bind(repo.private)
         .bind(&repo.metadata)
         .bind(id)
-        .fetch_one(&mut *self.tx)
+        .fetch_one(&mut **self.tx())
         .await?;
         let updated_at: OffsetDateTime = row.try_get("updated_at")?;
-        upsert_association(&mut self.tx, service_id, id, clone_url).await?;
+        upsert_association(self.tx(), service_id, id, clone_url).await?;
         Ok(SyncRepoOutcome::Updated { id, updated_at })
     }
 
     /// `Syncer.sync`'s naming-conflict branch: soft-delete the repo that owns
     /// the sourced name but has a different external repo spec.
     pub async fn delete_conflicting(&mut self, id: i32) -> Result<(), sqlx::Error> {
-        soft_delete_repo(&mut self.tx, id).await
+        soft_delete_repo(self.tx(), id).await
     }
 
-    pub async fn commit(self) -> Result<(), sqlx::Error> {
-        self.tx.commit().await
+    fn observe(&self, op: StoreOp, started: Instant, had_error: bool) {
+        if let Some(observer) = &self.observer {
+            observer.observe(op, started.elapsed(), had_error);
+        }
+    }
+
+    /// `Store.Done`: commits and observes the close (success or commit
+    /// error). The rollback path is observed by [`Drop`].
+    pub async fn commit(mut self) -> Result<(), sqlx::Error> {
+        let started = Instant::now();
+        let result = match self.tx.take() {
+            Some(tx) => tx.commit().await,
+            None => Ok(()),
+        };
+        self.finished = true;
+        self.observe(StoreOp::Done, started, result.is_err());
+        result
     }
 }
 
-async fn delete_one(
+impl Drop for RepoTransaction<'_> {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        // Dropping the `sqlx` transaction rolls back. The baseline observes
+        // `Store.Done(err)` with the caller's error before rolling back; the
+        // rollback itself is too fast to measure, so the sample is zero.
+        if let Some(observer) = &self.observer {
+            observer.observe(StoreOp::Done, Duration::ZERO, true);
+        }
+    }
+}
+
+async fn delete_association(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     service_id: i64,
     repo_id: i32,

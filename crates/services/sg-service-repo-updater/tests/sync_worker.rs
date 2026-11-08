@@ -65,7 +65,9 @@ async fn worker_runs_a_queued_job_to_completion() {
     let metrics = Arc::new(Metrics::new());
     let syncer = Arc::new(Syncer::new(
         ExternalServiceStore::new(pool.clone()),
-        ExternalServiceReposStore::new(pool.clone()),
+        ExternalServiceReposStore::new(pool.clone()).with_observer(
+            Arc::clone(&metrics) as Arc<dyn sg_db::external_service_repos::StoreObserver>
+        ),
         Arc::new(ExtsvcSourceFactory::new(None)),
         None,
         Arc::new(SystemClock),
@@ -147,6 +149,28 @@ async fn worker_runs_a_queued_job_to_completion() {
             .with_label_values(&["Handle"])
             .get(),
         0.0
+    );
+
+    // `StoreMetrics`: one transaction for the repo, one create, and the
+    // (empty) `DeleteExternalServiceReposNotIn` pass.
+    assert_eq!(
+        metrics.store_transact_total.with_label_values(&[]).get(),
+        1.0
+    );
+    assert_eq!(metrics.store_done_total.with_label_values(&[]).get(), 1.0);
+    assert_eq!(
+        metrics
+            .store_create_external_service_repo_total
+            .with_label_values(&[])
+            .get(),
+        1.0
+    );
+    assert_eq!(
+        metrics
+            .store_delete_external_service_repos_not_in_total
+            .with_label_values(&[])
+            .get(),
+        1.0
     );
 
     let last_sync_at: Option<sg_db::OffsetDateTime> =

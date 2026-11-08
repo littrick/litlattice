@@ -16,6 +16,11 @@
 //! - `internal/workerutil/dbworker/store` (`internal/repos/sync_worker.go`
 //!   creates the store as `repo_sync_worker_store`), which registers
 //!   `src_workerutil_dbworker_store_repo_sync_worker_store_*`
+//! - `internal/repos/observability.go` `NewStoreMetrics` (`StoreMetrics`):
+//!   `src_repoupdater_store_*` families, plus the baseline's
+//!   `src_repocreater_store_create_external_service_repo_*` prefix (sic) and
+//!   the `delete_exernal_service_repos_not_in` spelling (sic), which are
+//!   preserved so scrapes match the Go process byte for byte
 //! - `cmd/repo-updater/shared/main.go` `mustRegisterMetrics` (the
 //!   scrape-time `GaugeFunc`s refreshed by [`Metrics::refresh_state`])
 //!
@@ -25,7 +30,9 @@
 //! registration order.
 
 use std::sync::atomic::{AtomicI64, Ordering};
+use std::time::Duration;
 
+use sg_db::external_service_repos::{StoreObserver, StoreOp};
 use sg_metrics::prometheus::{
     Counter, CounterVec, Gauge, GaugeVec, HistogramOpts, HistogramVec, Opts,
 };
@@ -94,6 +101,33 @@ pub struct Metrics {
     pub sync_worker_store_duration_seconds: HistogramVec,
     pub sync_worker_store_total: CounterVec,
     pub sync_worker_store_errors_total: CounterVec,
+    // `NewStoreMetrics` (`internal/repos/observability.go`). Only the
+    // operations the syncer uses are ever observed; the remaining families
+    // of `StoreMetrics` are registered by the baseline but never touched
+    // (`REDMetrics.Observe` is nil-safe), and `UpdateRepo`/`EnqueueSyncJobs`
+    // are nil in the baseline's constructor, so none of them ever render.
+    //
+    // The create families keep the baseline's `src_repocreater_` prefix and
+    // the not-in families keep its `exernal` typo: the scrape must stay
+    // identical.
+    pub store_transact_duration_seconds: HistogramVec,
+    pub store_transact_total: CounterVec,
+    pub store_transact_errors_total: CounterVec,
+    pub store_done_duration_seconds: HistogramVec,
+    pub store_done_total: CounterVec,
+    pub store_done_errors_total: CounterVec,
+    pub store_create_external_service_repo_duration_seconds: HistogramVec,
+    pub store_create_external_service_repo_total: CounterVec,
+    pub store_create_external_service_repo_errors_total: CounterVec,
+    pub store_update_external_service_repo_duration_seconds: HistogramVec,
+    pub store_update_external_service_repo_total: CounterVec,
+    pub store_update_external_service_repo_errors_total: CounterVec,
+    pub store_delete_external_service_repo_duration_seconds: HistogramVec,
+    pub store_delete_external_service_repo_total: CounterVec,
+    pub store_delete_external_service_repo_errors_total: CounterVec,
+    pub store_delete_external_service_repos_not_in_duration_seconds: HistogramVec,
+    pub store_delete_external_service_repos_not_in_total: CounterVec,
+    pub store_delete_external_service_repos_not_in_errors_total: CounterVec,
     // `mustRegisterMetrics` scrape-time gauges.
     pub external_services_total: Gauge,
     pub queued_sync_jobs_total: Gauge,
@@ -320,6 +354,65 @@ impl Metrics {
         )
         .expect("valid metric");
 
+        // `NewStoreMetrics`' RED families (empty label sets, like Go).
+        let (store_transact_duration_seconds, store_transact_total, store_transact_errors_total) =
+            store_red_families(
+                "src_repoupdater_store_transact",
+                "Time spent opening a transaction",
+                "Total number of opened transactions",
+                "Total number of errors when opening a transaction",
+            );
+        let (store_done_duration_seconds, store_done_total, store_done_errors_total) =
+            store_red_families(
+                "src_repoupdater_store_done",
+                "Time spent closing a transaction",
+                "Total number of closed transactions",
+                "Total number of errors when closing a transaction",
+            );
+        let (
+            store_create_external_service_repo_duration_seconds,
+            store_create_external_service_repo_total,
+            store_create_external_service_repo_errors_total,
+        ) = store_red_families(
+            // The baseline's prefix for this family is `src_repocreater_`,
+            // not `src_repoupdater_` (sic).
+            "src_repocreater_store_create_external_service_repo",
+            "Time spent creating external service repos",
+            "Total number of created external service repos",
+            "Total number of errors when creating external service repos",
+        );
+        let (
+            store_update_external_service_repo_duration_seconds,
+            store_update_external_service_repo_total,
+            store_update_external_service_repo_errors_total,
+        ) = store_red_families(
+            "src_repoupdater_store_update_external_service_repo",
+            "Time spent updating external service repos",
+            "Total number of updated external service repos",
+            "Total number of errors when updating external service repos",
+        );
+        let (
+            store_delete_external_service_repo_duration_seconds,
+            store_delete_external_service_repo_total,
+            store_delete_external_service_repo_errors_total,
+        ) = store_red_families(
+            "src_repoupdater_store_delete_external_service_repo",
+            "Time spent deleting external service repos",
+            "Total number of external service repo deletions",
+            "Total number of errors when deleting external service repos",
+        );
+        let (
+            store_delete_external_service_repos_not_in_duration_seconds,
+            store_delete_external_service_repos_not_in_total,
+            store_delete_external_service_repos_not_in_errors_total,
+        ) = store_red_families(
+            // `delete_exernal_service_repos_not_in` (sic).
+            "src_repoupdater_store_delete_exernal_service_repos_not_in",
+            "Time spent calling DeleteExternalServiceReposNotIn",
+            "Total number of calls to DeleteExternalServiceReposNotIn",
+            "Total number of errors when calling DeleteExternalServiceReposNotIn",
+        );
+
         let external_services_total = Gauge::new(
             "src_repoupdater_external_services_total",
             "The total number of external services added",
@@ -384,6 +477,24 @@ impl Metrics {
             Box::new(sync_worker_store_duration_seconds.clone()),
             Box::new(sync_worker_store_total.clone()),
             Box::new(sync_worker_store_errors_total.clone()),
+            Box::new(store_transact_duration_seconds.clone()),
+            Box::new(store_transact_total.clone()),
+            Box::new(store_transact_errors_total.clone()),
+            Box::new(store_done_duration_seconds.clone()),
+            Box::new(store_done_total.clone()),
+            Box::new(store_done_errors_total.clone()),
+            Box::new(store_create_external_service_repo_duration_seconds.clone()),
+            Box::new(store_create_external_service_repo_total.clone()),
+            Box::new(store_create_external_service_repo_errors_total.clone()),
+            Box::new(store_update_external_service_repo_duration_seconds.clone()),
+            Box::new(store_update_external_service_repo_total.clone()),
+            Box::new(store_update_external_service_repo_errors_total.clone()),
+            Box::new(store_delete_external_service_repo_duration_seconds.clone()),
+            Box::new(store_delete_external_service_repo_total.clone()),
+            Box::new(store_delete_external_service_repo_errors_total.clone()),
+            Box::new(store_delete_external_service_repos_not_in_duration_seconds.clone()),
+            Box::new(store_delete_external_service_repos_not_in_total.clone()),
+            Box::new(store_delete_external_service_repos_not_in_errors_total.clone()),
             Box::new(external_services_total.clone()),
             Box::new(queued_sync_jobs_total.clone()),
             Box::new(completed_sync_jobs_total.clone()),
@@ -428,6 +539,24 @@ impl Metrics {
             sync_worker_store_duration_seconds,
             sync_worker_store_total,
             sync_worker_store_errors_total,
+            store_transact_duration_seconds,
+            store_transact_total,
+            store_transact_errors_total,
+            store_done_duration_seconds,
+            store_done_total,
+            store_done_errors_total,
+            store_create_external_service_repo_duration_seconds,
+            store_create_external_service_repo_total,
+            store_create_external_service_repo_errors_total,
+            store_update_external_service_repo_duration_seconds,
+            store_update_external_service_repo_total,
+            store_update_external_service_repo_errors_total,
+            store_delete_external_service_repo_duration_seconds,
+            store_delete_external_service_repo_total,
+            store_delete_external_service_repo_errors_total,
+            store_delete_external_service_repos_not_in_duration_seconds,
+            store_delete_external_service_repos_not_in_total,
+            store_delete_external_service_repos_not_in_errors_total,
             external_services_total,
             queued_sync_jobs_total,
             completed_sync_jobs_total,
@@ -613,6 +742,76 @@ impl Default for Metrics {
     }
 }
 
+/// `metrics.NewREDMetrics` with an empty label set, as `NewStoreMetrics`
+/// builds its families.
+fn store_red_families(
+    prefix: &str,
+    duration_help: &str,
+    count_help: &str,
+    errors_help: &str,
+) -> (HistogramVec, CounterVec, CounterVec) {
+    let duration = HistogramVec::new(
+        HistogramOpts::new(prefix.to_owned() + "_duration_seconds", duration_help),
+        &[],
+    )
+    .expect("valid metric");
+    let count = CounterVec::new(Opts::new(prefix.to_owned() + "_total", count_help), &[])
+        .expect("valid metric");
+    let errors = CounterVec::new(
+        Opts::new(prefix.to_owned() + "_errors_total", errors_help),
+        &[],
+    )
+    .expect("valid metric");
+    (duration, count, errors)
+}
+
+/// `SetMetrics` wiring: the syncer's store reports every `Transact`/`Done`
+/// and repo-write operation through [`StoreObserver`].
+impl StoreObserver for Metrics {
+    fn observe(&self, op: StoreOp, seconds: Duration, had_error: bool) {
+        let (duration, total, errors) = match op {
+            StoreOp::Transact => (
+                &self.store_transact_duration_seconds,
+                &self.store_transact_total,
+                &self.store_transact_errors_total,
+            ),
+            StoreOp::Done => (
+                &self.store_done_duration_seconds,
+                &self.store_done_total,
+                &self.store_done_errors_total,
+            ),
+            StoreOp::CreateExternalServiceRepo => (
+                &self.store_create_external_service_repo_duration_seconds,
+                &self.store_create_external_service_repo_total,
+                &self.store_create_external_service_repo_errors_total,
+            ),
+            StoreOp::UpdateExternalServiceRepo => (
+                &self.store_update_external_service_repo_duration_seconds,
+                &self.store_update_external_service_repo_total,
+                &self.store_update_external_service_repo_errors_total,
+            ),
+            StoreOp::DeleteExternalServiceRepo => (
+                &self.store_delete_external_service_repo_duration_seconds,
+                &self.store_delete_external_service_repo_total,
+                &self.store_delete_external_service_repo_errors_total,
+            ),
+            StoreOp::DeleteExternalServiceReposNotIn => (
+                &self.store_delete_external_service_repos_not_in_duration_seconds,
+                &self.store_delete_external_service_repos_not_in_total,
+                &self.store_delete_external_service_repos_not_in_errors_total,
+            ),
+        };
+        observe_red(
+            duration,
+            total,
+            errors,
+            &[],
+            seconds.as_secs_f64(),
+            had_error,
+        );
+    }
+}
+
 /// `metrics.REDMetrics.Observe`: on error only the error counter increments
 /// (and the count series is created with `Add(0)`), and **no duration sample
 /// is recorded**; on success the duration is observed and the count is added.
@@ -746,6 +945,17 @@ mod tests {
         metrics.observe_sync_worker_handle(0.1, true);
         metrics.observe_sync_worker_store("Dequeue", 0.1, false);
         metrics.observe_sync_worker_store("MarkErrored", 0.1, true);
+        for op in [
+            StoreOp::Transact,
+            StoreOp::Done,
+            StoreOp::CreateExternalServiceRepo,
+            StoreOp::UpdateExternalServiceRepo,
+            StoreOp::DeleteExternalServiceRepo,
+            StoreOp::DeleteExternalServiceReposNotIn,
+        ] {
+            metrics.observe(op, Duration::from_millis(1), false);
+            metrics.observe(op, Duration::from_millis(1), true);
+        }
         metrics.external_service_queue_resets_total.inc_by(2.0);
         metrics.external_service_queue_max_resets_total.inc();
         metrics.external_service_queue_reset_errors_total.inc();
@@ -795,6 +1005,60 @@ mod tests {
             Box::new(metrics.sync_worker_store_duration_seconds.clone()),
             Box::new(metrics.sync_worker_store_total.clone()),
             Box::new(metrics.sync_worker_store_errors_total.clone()),
+            Box::new(metrics.store_transact_duration_seconds.clone()),
+            Box::new(metrics.store_transact_total.clone()),
+            Box::new(metrics.store_transact_errors_total.clone()),
+            Box::new(metrics.store_done_duration_seconds.clone()),
+            Box::new(metrics.store_done_total.clone()),
+            Box::new(metrics.store_done_errors_total.clone()),
+            Box::new(
+                metrics
+                    .store_create_external_service_repo_duration_seconds
+                    .clone(),
+            ),
+            Box::new(metrics.store_create_external_service_repo_total.clone()),
+            Box::new(
+                metrics
+                    .store_create_external_service_repo_errors_total
+                    .clone(),
+            ),
+            Box::new(
+                metrics
+                    .store_update_external_service_repo_duration_seconds
+                    .clone(),
+            ),
+            Box::new(metrics.store_update_external_service_repo_total.clone()),
+            Box::new(
+                metrics
+                    .store_update_external_service_repo_errors_total
+                    .clone(),
+            ),
+            Box::new(
+                metrics
+                    .store_delete_external_service_repo_duration_seconds
+                    .clone(),
+            ),
+            Box::new(metrics.store_delete_external_service_repo_total.clone()),
+            Box::new(
+                metrics
+                    .store_delete_external_service_repo_errors_total
+                    .clone(),
+            ),
+            Box::new(
+                metrics
+                    .store_delete_external_service_repos_not_in_duration_seconds
+                    .clone(),
+            ),
+            Box::new(
+                metrics
+                    .store_delete_external_service_repos_not_in_total
+                    .clone(),
+            ),
+            Box::new(
+                metrics
+                    .store_delete_external_service_repos_not_in_errors_total
+                    .clone(),
+            ),
             Box::new(metrics.external_services_total.clone()),
             Box::new(metrics.queued_sync_jobs_total.clone()),
             Box::new(metrics.completed_sync_jobs_total.clone()),
@@ -837,6 +1101,24 @@ mod tests {
             "src_workerutil_dbworker_store_repo_sync_worker_store_duration_seconds",
             "src_workerutil_dbworker_store_repo_sync_worker_store_total",
             "src_workerutil_dbworker_store_repo_sync_worker_store_errors_total",
+            "src_repoupdater_store_transact_duration_seconds",
+            "src_repoupdater_store_transact_total",
+            "src_repoupdater_store_transact_errors_total",
+            "src_repoupdater_store_done_duration_seconds",
+            "src_repoupdater_store_done_total",
+            "src_repoupdater_store_done_errors_total",
+            "src_repocreater_store_create_external_service_repo_duration_seconds",
+            "src_repocreater_store_create_external_service_repo_total",
+            "src_repocreater_store_create_external_service_repo_errors_total",
+            "src_repoupdater_store_update_external_service_repo_duration_seconds",
+            "src_repoupdater_store_update_external_service_repo_total",
+            "src_repoupdater_store_update_external_service_repo_errors_total",
+            "src_repoupdater_store_delete_external_service_repo_duration_seconds",
+            "src_repoupdater_store_delete_external_service_repo_total",
+            "src_repoupdater_store_delete_external_service_repo_errors_total",
+            "src_repoupdater_store_delete_exernal_service_repos_not_in_duration_seconds",
+            "src_repoupdater_store_delete_exernal_service_repos_not_in_total",
+            "src_repoupdater_store_delete_exernal_service_repos_not_in_errors_total",
             "src_repoupdater_external_services_total",
             "src_repoupdater_queued_sync_jobs_total",
             "src_repoupdater_completed_sync_jobs_total",
@@ -946,6 +1228,89 @@ mod tests {
                 .with_label_values(&["Dequeue"])
                 .get_sample_count(),
             0
+        );
+    }
+
+    /// The store observer maps each `StoreOp` to its own family and keeps
+    /// `REDMetrics.Observe` semantics (no duration sample on error).
+    #[test]
+    fn store_metrics_follow_the_red_observation() {
+        let metrics = Metrics::new();
+        metrics.observe(
+            StoreOp::CreateExternalServiceRepo,
+            Duration::from_millis(2),
+            false,
+        );
+        assert_eq!(
+            metrics
+                .store_create_external_service_repo_total
+                .with_label_values(&[])
+                .get(),
+            1.0
+        );
+        assert_eq!(
+            metrics
+                .store_create_external_service_repo_duration_seconds
+                .with_label_values(&[])
+                .get_sample_count(),
+            1
+        );
+        assert_eq!(
+            metrics
+                .store_create_external_service_repo_errors_total
+                .with_label_values(&[])
+                .get(),
+            0.0
+        );
+
+        metrics.observe(
+            StoreOp::CreateExternalServiceRepo,
+            Duration::from_millis(2),
+            true,
+        );
+        assert_eq!(
+            metrics
+                .store_create_external_service_repo_total
+                .with_label_values(&[])
+                .get(),
+            1.0,
+            "errors only `Add(0)` the count series"
+        );
+        assert_eq!(
+            metrics
+                .store_create_external_service_repo_errors_total
+                .with_label_values(&[])
+                .get(),
+            1.0
+        );
+        assert_eq!(
+            metrics
+                .store_create_external_service_repo_duration_seconds
+                .with_label_values(&[])
+                .get_sample_count(),
+            1,
+            "errors are not observed in the duration histogram"
+        );
+
+        // Each operation has a distinct family.
+        metrics.observe(
+            StoreOp::DeleteExternalServiceReposNotIn,
+            Duration::ZERO,
+            false,
+        );
+        assert_eq!(
+            metrics
+                .store_delete_external_service_repos_not_in_total
+                .with_label_values(&[])
+                .get(),
+            1.0
+        );
+        assert_eq!(
+            metrics
+                .store_update_external_service_repo_total
+                .with_label_values(&[])
+                .get(),
+            0.0
         );
     }
 }

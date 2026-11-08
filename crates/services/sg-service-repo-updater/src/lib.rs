@@ -146,17 +146,22 @@ impl Service for RepoUpdaterService {
             .await
             .map_err(|err| ServiceError::with_source("connecting to the frontend database", err))?;
 
+        let metrics = Arc::new(Metrics::new());
         let repo_store = Arc::new(sg_db::repos::RepoStore::new(pool.clone()));
         let gitserver_repos = sg_db::gitserver_repos::GitserverReposStore::new(pool.clone());
         let purge_gitserver_repos = sg_db::gitserver_repos::GitserverReposStore::new(pool.clone());
         let external_services = sg_db::external_services::ExternalServiceStore::new(pool.clone());
         let external_service_repos =
-            sg_db::external_service_repos::ExternalServiceReposStore::new(pool.clone());
+            sg_db::external_service_repos::ExternalServiceReposStore::new(pool.clone())
+                // `store.SetMetrics(m)`: the syncer's `Transact`/`Done` and
+                // repo-write operations feed `src_repoupdater_store_*`.
+                .with_observer(
+                    Arc::clone(&metrics) as Arc<dyn sg_db::external_service_repos::StoreObserver>
+                );
         let sync_jobs = sg_db::external_service_sync_jobs::SyncJobsStore::new(pool);
 
         let git_servers = unified.service_connections.git_servers.clone();
 
-        let metrics = Arc::new(Metrics::new());
         // Addresses and pins are re-read from `live` on every call, matching
         // `conf.Watch` in `internal/gitserver/connection`.
         let gitserver_client = Arc::new(GitserverRepoClient::new(
