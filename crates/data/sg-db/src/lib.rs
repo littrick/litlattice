@@ -23,6 +23,7 @@ pub mod github_apps;
 pub mod gitserver_repos;
 pub mod global_state;
 pub mod permission_sync_jobs;
+pub mod perms_store;
 pub mod repo_embeddings;
 pub mod repo_statistics;
 pub mod repos;
