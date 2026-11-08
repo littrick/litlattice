@@ -66,7 +66,27 @@ impl HttpClient {
         headers: &[(String, String)],
         body: Vec<u8>,
     ) -> Result<HttpResponse, String> {
-        let mut builder = http::Request::builder().method(Method::POST).uri(url);
+        self.request(Method::POST, url, headers, body).await
+    }
+
+    /// `httpCli.Do(req)` for a `GET` with the given headers, returning the
+    /// status, headers and full body (the Cody Gateway usage worker's shape).
+    pub async fn get_with_headers(
+        &self,
+        url: &str,
+        headers: &[(String, String)],
+    ) -> Result<HttpResponse, String> {
+        self.request(Method::GET, url, headers, Vec::new()).await
+    }
+
+    async fn request(
+        &self,
+        method: Method,
+        url: &str,
+        headers: &[(String, String)],
+        body: Vec<u8>,
+    ) -> Result<HttpResponse, String> {
+        let mut builder = http::Request::builder().method(method).uri(url);
         for (name, value) in headers {
             let name = HeaderName::from_bytes(name.as_bytes())
                 .map_err(|err| format!("invalid header name {name:?}: {err}"))?;
