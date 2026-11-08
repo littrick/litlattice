@@ -30,6 +30,7 @@ use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
+use crate::metrics::Metrics;
 use crate::syncer::{ProgressRecorder, SyncProgress, Syncer};
 
 /// `SyncWorkerOptions.NumHandlers` default.
@@ -121,6 +122,7 @@ pub struct SyncWorker {
     jobs: SyncJobsStore,
     syncer: Arc<Syncer>,
     live: Arc<LiveConfig>,
+    metrics: Arc<Metrics>,
     hostname: String,
     num_handlers: usize,
     worker_interval: Duration,
@@ -134,12 +136,14 @@ impl SyncWorker {
         jobs: SyncJobsStore,
         syncer: Arc<Syncer>,
         live: Arc<LiveConfig>,
+        metrics: Arc<Metrics>,
         hostname: impl Into<String>,
     ) -> Self {
         Self {
             jobs,
             syncer,
             live,
+            metrics,
             hostname: hostname.into(),
             num_handlers: DEFAULT_NUM_HANDLERS,
             worker_interval: DEFAULT_WORKER_INTERVAL,
@@ -187,6 +191,47 @@ impl SyncWorker {
             let token = shutdown.clone();
             tasks.spawn(async move { worker.janitor_loop(token).await });
         }
+
+        // `newLenientConcurrencyGauge`: the baseline starts this ticker when
+        // the worker metrics are built, so it lives as long as the service.
+        let worker = Arc::clone(&self);
+        let token = shutdown.clone();
+        tasks.spawn(async move { worker.handlers_gauge_loop(token).await });
+    }
+
+    /// `dbworkerstore` operation metrics: one duration sample on success,
+    /// one error on failure (no duration sample), matching
+    /// `metrics.REDMetrics.Observe`.
+    async fn timed_store<T>(
+        &self,
+        op: &'static str,
+        future: impl std::future::Future<Output = Result<T, sqlx::Error>>,
+    ) -> Result<T, sqlx::Error> {
+        let started = Instant::now();
+        let result = future.await;
+        self.metrics.observe_sync_worker_store(
+            op,
+            started.elapsed().as_secs_f64(),
+            result.is_err(),
+        );
+        result
+    }
+
+    /// `runLenientConcurrencyGauge`: every second, publish the largest
+    /// handler concurrency seen since the previous tick.
+    async fn handlers_gauge_loop(&self, shutdown: CancellationToken) {
+        let mut ticker = tokio::time::interval_at(
+            tokio::time::Instant::now() + Duration::from_secs(1),
+            Duration::from_secs(1),
+        );
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                _ = shutdown.cancelled() => return,
+                _ = ticker.tick() => {}
+            }
+            self.metrics.flush_handlers();
+        }
     }
 
     /// `Syncer.Routines`' enqueue goroutine: immediately, then every
@@ -222,7 +267,10 @@ impl SyncWorker {
                 }
             };
 
-            match self.jobs.dequeue(&self.hostname).await {
+            match self
+                .timed_store("Dequeue", self.jobs.dequeue(&self.hostname))
+                .await
+            {
                 Ok(Some(job)) => {
                     let worker = Arc::clone(&self);
                     let token = shutdown.clone();
@@ -253,6 +301,10 @@ impl SyncWorker {
     /// `syncHandler.Handle` + `workerutil.Worker.handle`'s terminal-state
     /// update.
     async fn handle(&self, job: SyncJob, shutdown: &CancellationToken) {
+        self.metrics.handlers_inc();
+        let _handler_guard = HandlerGuard {
+            metrics: self.metrics.as_ref(),
+        };
         let job_token = CancellationToken::new();
         self.running
             .lock()
@@ -268,6 +320,7 @@ impl SyncWorker {
             "Dequeued record for processing"
         );
 
+        let handle_started = Instant::now();
         let outcome = tokio::select! {
             _ = shutdown.cancelled() => {
                 job_token.cancel();
@@ -281,6 +334,10 @@ impl SyncWorker {
                 &job_token,
             ) => result,
         };
+        // `workerutil`'s `Handle` operation: the handler error (including
+        // cancellation) is what the RED metrics see.
+        self.metrics
+            .observe_sync_worker_handle(handle_started.elapsed().as_secs_f64(), outcome.is_err());
 
         self.running
             .lock()
@@ -288,7 +345,10 @@ impl SyncWorker {
             .remove(&job.id);
 
         match outcome {
-            Ok(()) => match self.jobs.mark_complete(job.id).await {
+            Ok(()) => match self
+                .timed_store("MarkComplete", self.jobs.mark_complete(job.id))
+                .await
+            {
                 Ok(true) => tracing::debug!(job_id = job.id, "Marked record as complete"),
                 Ok(false) => tracing::warn!(job_id = job.id, "record was not processing"),
                 Err(err) => tracing::error!(job_id = job.id, error = %err, "store.MarkComplete"),
@@ -298,9 +358,11 @@ impl SyncWorker {
                 // (`isJobCanceled`); with `MaxNumRetries = 0` both paths end
                 // in `failed`, or `canceled` when the cancel flag is set.
                 let result = if job_token.is_cancelled() {
-                    self.jobs.mark_failed(job.id, &err).await
+                    self.timed_store("MarkFailed", self.jobs.mark_failed(job.id, &err))
+                        .await
                 } else {
-                    self.jobs.mark_errored(job.id, &err).await
+                    self.timed_store("MarkErrored", self.jobs.mark_errored(job.id, &err))
+                        .await
                 };
                 match result {
                     Ok(true) => {
@@ -313,6 +375,8 @@ impl SyncWorker {
                 }
             }
         }
+        // `_handler_guard` decrements the gauge here; the baseline does the
+        // same in the handler goroutine's `defer` after the state update.
     }
 
     /// `workerutil.Worker.Start`'s heartbeat goroutine.
@@ -335,7 +399,10 @@ impl SyncWorker {
                 .keys()
                 .copied()
                 .collect();
-            let (known, canceled) = match self.jobs.heartbeat(&ids).await {
+            let (known, canceled) = match self
+                .timed_store("Heartbeat", self.jobs.heartbeat(&ids))
+                .await
+            {
                 Ok(result) => result,
                 Err(err) => {
                     tracing::error!(ids = ?ids, error = %err, "Failed to refresh heartbeats");
@@ -363,16 +430,32 @@ impl SyncWorker {
     /// `dbworker.Resetter`: requeue stalled jobs every 5 minutes.
     async fn resetter_loop(&self, shutdown: CancellationToken) {
         loop {
-            match self.jobs.reset_stalled().await {
-                Ok(result) if !result.reset.is_empty() || !result.failed.is_empty() => {
-                    tracing::info!(
-                        reset = ?result.reset,
-                        failed = ?result.failed,
-                        "Requeued stalled sync jobs"
-                    );
+            match self
+                .timed_store("ResetStalled", self.jobs.reset_stalled())
+                .await
+            {
+                Ok(result) => {
+                    // `Resetter.Start`: RecordResets/RecordResetFailures are
+                    // added on every iteration, errors increment their own
+                    // counter and the loop keeps going.
+                    self.metrics
+                        .external_service_queue_resets_total
+                        .inc_by(result.reset.len() as f64);
+                    self.metrics
+                        .external_service_queue_max_resets_total
+                        .inc_by(result.failed.len() as f64);
+                    if !result.reset.is_empty() || !result.failed.is_empty() {
+                        tracing::info!(
+                            reset = ?result.reset,
+                            failed = ?result.failed,
+                            "Requeued stalled sync jobs"
+                        );
+                    }
                 }
-                Ok(_) => {}
-                Err(err) => tracing::error!(error = %err, "resetting stalled sync jobs"),
+                Err(err) => {
+                    self.metrics.external_service_queue_reset_errors_total.inc();
+                    tracing::error!(error = %err, "resetting stalled sync jobs");
+                }
             }
             if !sleep_or_shutdown(RESETTER_INTERVAL, &shutdown).await {
                 return;
@@ -398,6 +481,18 @@ impl SyncWorker {
                 return;
             }
         }
+    }
+}
+
+/// Decrements the worker-concurrency gauge on every exit path, mirroring the
+/// baseline's `defer w.options.Metrics.numJobs.Dec()`.
+struct HandlerGuard<'a> {
+    metrics: &'a Metrics,
+}
+
+impl Drop for HandlerGuard<'_> {
+    fn drop(&mut self) {
+        self.metrics.handlers_dec();
     }
 }
 

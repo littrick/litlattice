@@ -62,19 +62,26 @@ async fn worker_runs_a_queued_job_to_completion() {
         .await
         .expect("enqueue");
 
+    let metrics = Arc::new(Metrics::new());
     let syncer = Arc::new(Syncer::new(
         ExternalServiceStore::new(pool.clone()),
         ExternalServiceReposStore::new(pool.clone()),
         Arc::new(ExtsvcSourceFactory::new(None)),
         None,
         Arc::new(SystemClock),
-        Arc::new(Metrics::new()),
+        Arc::clone(&metrics),
     ));
     let worker = Arc::new(
-        SyncWorker::new(jobs.clone(), syncer, Arc::clone(&live), "test-host")
-            .with_num_handlers(1)
-            .with_worker_interval(Duration::from_millis(20))
-            .with_cleanup_old_jobs(false),
+        SyncWorker::new(
+            jobs.clone(),
+            syncer,
+            Arc::clone(&live),
+            Arc::clone(&metrics),
+            "test-host",
+        )
+        .with_num_handlers(1)
+        .with_worker_interval(Duration::from_millis(20))
+        .with_cleanup_old_jobs(false),
     );
 
     let shutdown = CancellationToken::new();
@@ -102,6 +109,45 @@ async fn worker_runs_a_queued_job_to_completion() {
     .await
     .expect("counters");
     assert_eq!(counters, (1, 1, 0, 0));
+
+    // `workerutil`/`dbworkerstore` metrics: the Dequeue poll ran, the job
+    // was handled once and marked complete. (`Heartbeat` fires every 15s, so
+    // it is normally absent for a short test.)
+    assert!(
+        metrics
+            .sync_worker_store_total
+            .with_label_values(&["Dequeue"])
+            .get()
+            > 0.0
+    );
+    assert_eq!(
+        metrics
+            .sync_worker_store_total
+            .with_label_values(&["MarkComplete"])
+            .get(),
+        1.0
+    );
+    assert_eq!(
+        metrics
+            .sync_worker_store_duration_seconds
+            .with_label_values(&["MarkComplete"])
+            .get_sample_count(),
+        1
+    );
+    assert_eq!(
+        metrics
+            .sync_worker_total
+            .with_label_values(&["Handle"])
+            .get(),
+        1.0
+    );
+    assert_eq!(
+        metrics
+            .sync_worker_errors_total
+            .with_label_values(&["Handle"])
+            .get(),
+        0.0
+    );
 
     let last_sync_at: Option<sg_db::OffsetDateTime> =
         sqlx::query_scalar("SELECT last_sync_at FROM external_services WHERE id = $1")

@@ -10,6 +10,12 @@
 //!   `GetRepo` families have no code path because no implemented source kind
 //!   is a `RepoGetter`)
 //! - `cmd/repo-updater/internal/purge/purge.go` (`src_repoupdater_purge_*`)
+//! - `internal/repos/sync_worker.go` `newWorkerMetrics` /
+//!   `newResetterMetrics` (`src_repo_updater_external_service_syncer_*`,
+//!   `src_external_service_queue_*`)
+//! - `internal/workerutil/dbworker/store` (`internal/repos/sync_worker.go`
+//!   creates the store as `repo_sync_worker_store`), which registers
+//!   `src_workerutil_dbworker_store_repo_sync_worker_store_*`
 //! - `cmd/repo-updater/shared/main.go` `mustRegisterMetrics` (the
 //!   scrape-time `GaugeFunc`s refreshed by [`Metrics::refresh_state`])
 //!
@@ -17,6 +23,8 @@
 //! process and only the first registration owns the family in the default
 //! registry. Tests read the handles directly, so they do not depend on
 //! registration order.
+
+use std::sync::atomic::{AtomicI64, Ordering};
 
 use sg_metrics::prometheus::{
     Counter, CounterVec, Gauge, GaugeVec, HistogramOpts, HistogramVec, Opts,
@@ -64,6 +72,28 @@ pub struct Metrics {
     pub gitserver_client_duration_seconds: HistogramVec,
     pub gitserver_client_total: CounterVec,
     pub gitserver_client_errors_total: CounterVec,
+    // `workerutil.NewMetrics(observationCtx, "repo_updater_external_service_syncer")`.
+    // The repos handler implements no `WithHooks`, so only the `Handle` op
+    // is ever observed; the other operations are registered (and therefore
+    // possible label values) but stay empty, exactly like the baseline.
+    pub sync_worker_handlers: Gauge,
+    pub sync_worker_duration_seconds: HistogramVec,
+    pub sync_worker_total: CounterVec,
+    pub sync_worker_errors_total: CounterVec,
+    /// `newLenientConcurrencyGauge`'s running total (updated by
+    /// [`Metrics::handlers_inc`]/[`Metrics::handlers_dec`]).
+    handlers_current: AtomicI64,
+    /// The maximum concurrency seen since the last [`Metrics::flush_handlers`].
+    handlers_max: AtomicI64,
+    // `newResetterMetrics` (`src_external_service_queue_*`).
+    pub external_service_queue_resets_total: Counter,
+    pub external_service_queue_max_resets_total: Counter,
+    pub external_service_queue_reset_errors_total: Counter,
+    // `workerutil/dbworker/store.newOperations` for the
+    // `repo_sync_worker_store` store.
+    pub sync_worker_store_duration_seconds: HistogramVec,
+    pub sync_worker_store_total: CounterVec,
+    pub sync_worker_store_errors_total: CounterVec,
     // `mustRegisterMetrics` scrape-time gauges.
     pub external_services_total: Gauge,
     pub queued_sync_jobs_total: Gauge,
@@ -219,6 +249,77 @@ impl Metrics {
         )
         .expect("valid metric");
 
+        let sync_worker_handlers = Gauge::new(
+            "src_repo_updater_external_service_syncer_handlers",
+            "The number of active handlers.",
+        )
+        .expect("valid metric");
+        let sync_worker_duration_seconds = HistogramVec::new(
+            HistogramOpts::new(
+                "src_repo_updater_external_service_syncer_duration_seconds",
+                "Time in seconds spent performing successful repo_updater_external_service_syncer operations",
+            ),
+            &["op"],
+        )
+        .expect("valid metric");
+        let sync_worker_total = CounterVec::new(
+            Opts::new(
+                "src_repo_updater_external_service_syncer_total",
+                "Total number of method invocations.",
+            ),
+            &["op"],
+        )
+        .expect("valid metric");
+        let sync_worker_errors_total = CounterVec::new(
+            Opts::new(
+                "src_repo_updater_external_service_syncer_errors_total",
+                "Total number of repo_updater_external_service_syncer operations resulting in an unexpected error",
+            ),
+            &["op"],
+        )
+        .expect("valid metric");
+
+        let external_service_queue_resets_total = Counter::new(
+            "src_external_service_queue_resets_total",
+            "Total number of external services put back into queued state",
+        )
+        .expect("valid metric");
+        let external_service_queue_max_resets_total = Counter::new(
+            "src_external_service_queue_max_resets_total",
+            "Total number of external services that exceed the max number of resets",
+        )
+        .expect("valid metric");
+        let external_service_queue_reset_errors_total = Counter::new(
+            "src_external_service_queue_reset_errors_total",
+            "Total number of errors when running the external service resetter",
+        )
+        .expect("valid metric");
+
+        let sync_worker_store_duration_seconds = HistogramVec::new(
+            HistogramOpts::new(
+                "src_workerutil_dbworker_store_repo_sync_worker_store_duration_seconds",
+                "Time in seconds spent performing successful workerutil_dbworker_store_repo_sync_worker_store operations",
+            ),
+            &["op"],
+        )
+        .expect("valid metric");
+        let sync_worker_store_total = CounterVec::new(
+            Opts::new(
+                "src_workerutil_dbworker_store_repo_sync_worker_store_total",
+                "Total number of method invocations.",
+            ),
+            &["op"],
+        )
+        .expect("valid metric");
+        let sync_worker_store_errors_total = CounterVec::new(
+            Opts::new(
+                "src_workerutil_dbworker_store_repo_sync_worker_store_errors_total",
+                "Total number of workerutil_dbworker_store_repo_sync_worker_store operations resulting in an unexpected error",
+            ),
+            &["op"],
+        )
+        .expect("valid metric");
+
         let external_services_total = Gauge::new(
             "src_repoupdater_external_services_total",
             "The total number of external services added",
@@ -273,6 +374,16 @@ impl Metrics {
             Box::new(gitserver_client_duration_seconds.clone()),
             Box::new(gitserver_client_total.clone()),
             Box::new(gitserver_client_errors_total.clone()),
+            Box::new(sync_worker_handlers.clone()),
+            Box::new(sync_worker_duration_seconds.clone()),
+            Box::new(sync_worker_total.clone()),
+            Box::new(sync_worker_errors_total.clone()),
+            Box::new(external_service_queue_resets_total.clone()),
+            Box::new(external_service_queue_max_resets_total.clone()),
+            Box::new(external_service_queue_reset_errors_total.clone()),
+            Box::new(sync_worker_store_duration_seconds.clone()),
+            Box::new(sync_worker_store_total.clone()),
+            Box::new(sync_worker_store_errors_total.clone()),
             Box::new(external_services_total.clone()),
             Box::new(queued_sync_jobs_total.clone()),
             Box::new(completed_sync_jobs_total.clone()),
@@ -305,6 +416,18 @@ impl Metrics {
             gitserver_client_duration_seconds,
             gitserver_client_total,
             gitserver_client_errors_total,
+            sync_worker_handlers,
+            sync_worker_duration_seconds,
+            sync_worker_total,
+            sync_worker_errors_total,
+            handlers_current: AtomicI64::new(0),
+            handlers_max: AtomicI64::new(0),
+            external_service_queue_resets_total,
+            external_service_queue_max_resets_total,
+            external_service_queue_reset_errors_total,
+            sync_worker_store_duration_seconds,
+            sync_worker_store_total,
+            sync_worker_store_errors_total,
             external_services_total,
             queued_sync_jobs_total,
             completed_sync_jobs_total,
@@ -355,21 +478,59 @@ impl Metrics {
     /// error → `errors_total++`, `total += 0` (creating the series), no
     /// duration sample; success → one duration sample and `total++`.
     pub fn observe_gitserver_client(&self, op: &str, scope: &str, seconds: f64, had_error: bool) {
-        if had_error {
-            self.gitserver_client_errors_total
-                .with_label_values(&[op, scope])
-                .inc();
-            self.gitserver_client_total
-                .with_label_values(&[op, scope])
-                .inc_by(0.0);
-        } else {
-            self.gitserver_client_duration_seconds
-                .with_label_values(&[op, scope])
-                .observe(seconds);
-            self.gitserver_client_total
-                .with_label_values(&[op, scope])
-                .inc();
-        }
+        observe_red(
+            &self.gitserver_client_duration_seconds,
+            &self.gitserver_client_total,
+            &self.gitserver_client_errors_total,
+            &[op, scope],
+            seconds,
+            had_error,
+        );
+    }
+
+    /// `newLenientConcurrencyGauge`: one handler is now active.
+    pub fn handlers_inc(&self) {
+        let current = self.handlers_current.fetch_add(1, Ordering::SeqCst) + 1;
+        self.handlers_max.fetch_max(current, Ordering::SeqCst);
+    }
+
+    /// `newLenientConcurrencyGauge`: one handler finished.
+    pub fn handlers_dec(&self) {
+        self.handlers_current.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    /// The baseline's one-second ticker: publish the largest concurrency
+    /// observed since the previous tick.
+    pub fn flush_handlers(&self) {
+        self.sync_worker_handlers
+            .set(self.handlers_max.swap(0, Ordering::SeqCst) as f64);
+    }
+
+    /// `workerutil`'s `Handle` operation: `endObservation(1, ...)` with the
+    /// handler error (`PreHandle`/`PostHandle` are never observed because the
+    /// repos handler has no hooks).
+    pub fn observe_sync_worker_handle(&self, seconds: f64, had_error: bool) {
+        observe_red(
+            &self.sync_worker_duration_seconds,
+            &self.sync_worker_total,
+            &self.sync_worker_errors_total,
+            &["Handle"],
+            seconds,
+            had_error,
+        );
+    }
+
+    /// `dbworkerstore`'s operations (`Dequeue`, `Heartbeat`, `ResetStalled`,
+    /// `MarkComplete`, `MarkErrored`, `MarkFailed`) with `count = 1`.
+    pub fn observe_sync_worker_store(&self, op: &str, seconds: f64, had_error: bool) {
+        observe_red(
+            &self.sync_worker_store_duration_seconds,
+            &self.sync_worker_store_total,
+            &self.sync_worker_store_errors_total,
+            &[op],
+            seconds,
+            had_error,
+        );
     }
 
     /// `observeSync`'s deferred half: after a `SyncExternalService` call.
@@ -449,6 +610,26 @@ impl Metrics {
 impl Default for Metrics {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// `metrics.REDMetrics.Observe`: on error only the error counter increments
+/// (and the count series is created with `Add(0)`), and **no duration sample
+/// is recorded**; on success the duration is observed and the count is added.
+fn observe_red(
+    duration: &HistogramVec,
+    total: &CounterVec,
+    errors: &CounterVec,
+    labels: &[&str],
+    seconds: f64,
+    had_error: bool,
+) {
+    if had_error {
+        errors.with_label_values(labels).inc();
+        total.with_label_values(labels).inc_by(0.0);
+    } else {
+        duration.with_label_values(labels).observe(seconds);
+        total.with_label_values(labels).inc();
     }
 }
 
@@ -559,6 +740,15 @@ mod tests {
         metrics.gitserver_client_concurrent_requests.set(0.0);
         metrics.observe_gitserver_client("FetchRepository", "repoupdater.scheduler", 0.1, false);
         metrics.observe_gitserver_client("DeleteRepository", "repoupdater.purgeworker", 0.1, true);
+        metrics.handlers_inc();
+        metrics.flush_handlers();
+        metrics.observe_sync_worker_handle(0.1, false);
+        metrics.observe_sync_worker_handle(0.1, true);
+        metrics.observe_sync_worker_store("Dequeue", 0.1, false);
+        metrics.observe_sync_worker_store("MarkErrored", 0.1, true);
+        metrics.external_service_queue_resets_total.inc_by(2.0);
+        metrics.external_service_queue_max_resets_total.inc();
+        metrics.external_service_queue_reset_errors_total.inc();
         metrics.purge_success.inc();
         metrics.purge_failed.inc();
         metrics.external_services_total.set(1.0);
@@ -595,6 +785,16 @@ mod tests {
             Box::new(metrics.gitserver_client_duration_seconds.clone()),
             Box::new(metrics.gitserver_client_total.clone()),
             Box::new(metrics.gitserver_client_errors_total.clone()),
+            Box::new(metrics.sync_worker_handlers.clone()),
+            Box::new(metrics.sync_worker_duration_seconds.clone()),
+            Box::new(metrics.sync_worker_total.clone()),
+            Box::new(metrics.sync_worker_errors_total.clone()),
+            Box::new(metrics.external_service_queue_resets_total.clone()),
+            Box::new(metrics.external_service_queue_max_resets_total.clone()),
+            Box::new(metrics.external_service_queue_reset_errors_total.clone()),
+            Box::new(metrics.sync_worker_store_duration_seconds.clone()),
+            Box::new(metrics.sync_worker_store_total.clone()),
+            Box::new(metrics.sync_worker_store_errors_total.clone()),
             Box::new(metrics.external_services_total.clone()),
             Box::new(metrics.queued_sync_jobs_total.clone()),
             Box::new(metrics.completed_sync_jobs_total.clone()),
@@ -627,6 +827,16 @@ mod tests {
             "src_gitserver_repositoryservice_client_duration_seconds",
             "src_gitserver_repositoryservice_client_total",
             "src_gitserver_repositoryservice_client_errors_total",
+            "src_repo_updater_external_service_syncer_handlers",
+            "src_repo_updater_external_service_syncer_duration_seconds",
+            "src_repo_updater_external_service_syncer_total",
+            "src_repo_updater_external_service_syncer_errors_total",
+            "src_external_service_queue_resets_total",
+            "src_external_service_queue_max_resets_total",
+            "src_external_service_queue_reset_errors_total",
+            "src_workerutil_dbworker_store_repo_sync_worker_store_duration_seconds",
+            "src_workerutil_dbworker_store_repo_sync_worker_store_total",
+            "src_workerutil_dbworker_store_repo_sync_worker_store_errors_total",
             "src_repoupdater_external_services_total",
             "src_repoupdater_queued_sync_jobs_total",
             "src_repoupdater_completed_sync_jobs_total",
@@ -677,6 +887,65 @@ mod tests {
                 .with_label_values(&labels)
                 .get(),
             1.0
+        );
+    }
+
+    /// `newLenientConcurrencyGauge` publishes the maximum concurrency seen
+    /// since the previous tick, not the instantaneous value.
+    #[test]
+    fn handlers_gauge_is_lenient() {
+        let metrics = Metrics::new();
+        metrics.handlers_inc();
+        metrics.handlers_inc();
+        metrics.handlers_dec();
+        metrics.flush_handlers();
+        assert_eq!(metrics.sync_worker_handlers.get(), 2.0);
+
+        metrics.handlers_dec();
+        metrics.flush_handlers();
+        assert_eq!(metrics.sync_worker_handlers.get(), 0.0);
+    }
+
+    #[test]
+    fn sync_worker_red_metrics_match_the_observation_helper() {
+        let metrics = Metrics::new();
+        metrics.observe_sync_worker_handle(0.5, false);
+        assert_eq!(
+            metrics
+                .sync_worker_total
+                .with_label_values(&["Handle"])
+                .get(),
+            1.0
+        );
+        assert_eq!(
+            metrics
+                .sync_worker_duration_seconds
+                .with_label_values(&["Handle"])
+                .get_sample_count(),
+            1
+        );
+
+        metrics.observe_sync_worker_store("Dequeue", 0.5, true);
+        assert_eq!(
+            metrics
+                .sync_worker_store_total
+                .with_label_values(&["Dequeue"])
+                .get(),
+            0.0
+        );
+        assert_eq!(
+            metrics
+                .sync_worker_store_errors_total
+                .with_label_values(&["Dequeue"])
+                .get(),
+            1.0
+        );
+        assert_eq!(
+            metrics
+                .sync_worker_store_duration_seconds
+                .with_label_values(&["Dequeue"])
+                .get_sample_count(),
+            0
         );
     }
 }

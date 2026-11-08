@@ -206,6 +206,7 @@ impl Service for RepoUpdaterService {
                 sync_jobs.clone(),
                 Arc::clone(&syncer),
                 Arc::clone(&live),
+                Arc::clone(&metrics),
                 sync_worker::hostname(),
             )
             .with_num_handlers(
