@@ -33,6 +33,7 @@ pub mod postfetch;
 pub mod repo;
 pub mod search;
 pub mod trace;
+pub mod vcssyncer;
 
 use config::GitserverConfig;
 use gitservice::GitService;
