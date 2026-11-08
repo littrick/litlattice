@@ -1,0 +1,309 @@
+#![forbid(unsafe_code)]
+
+//! Repository-centric half of `cmd/worker/internal/authz/perms_syncer.go`
+//! (`permsSyncerImpl.syncRepoPerms`).
+//!
+//! The provider itself is injected through [`AuthzProvider`]: the code-host
+//! implementations (GitHub, GitLab, ...) and the `providers.ProvidersFromConfig`
+//! construction are later slices. This module owns the parts that are
+//! provider-independent:
+//!
+//! * select the provider whose URN matches one of the repository's sources
+//!   (only for private repositories);
+//! * call `FetchRepoPerms`, mapping the baseline's 404 / unimplemented
+//!   special cases to a successful provider status;
+//! * map external account IDs to internal user IDs and write
+//!   `user_repo_permissions` + `repo_permissions` (`SetRepoPerms`);
+//! * record the accounts without an internal user as pending permissions;
+//! * serialise all permission-table writes with `permsUpdateLock` and keep the
+//!   two writes in one transaction.
+//!
+//! Metrics, tracing and the delay log fields are not ported (consistent with
+//! the other worker slices). The user-centric path (`syncUserPerms`) and the
+//! worker job registration are later slices.
+
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use sg_db::perms_store::{
+    get_latest_finished_sync_job, get_user_ids_by_external_accounts,
+    set_repo_pending_permissions_tx, set_repo_perms_tx, CodeHostState, SetPermissionsResult,
+    UserIdWithExternalAccountId, PERM_READ, SOURCE_REPO_SYNC,
+};
+use sg_db::repos::RepoStore;
+use sqlx::postgres::PgPool;
+use sqlx::types::time::OffsetDateTime;
+use tokio::sync::Mutex;
+
+/// `authz.FetchPermsOptions`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FetchPermsOptions {
+    pub invalidate_caches: bool,
+}
+
+/// The repository identity passed to `FetchRepoPerms`
+/// (`extsvc.Repository` + `api.ExternalRepoSpec`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FetchRepo {
+    pub uri: String,
+    pub external_repo_id: String,
+    pub service_type: String,
+    pub service_id: String,
+}
+
+/// The three `FetchRepoPerms` outcomes the syncer treats specially.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FetchError {
+    /// `github.APIError{Code: 404}`: a token with only read access cannot
+    /// fetch permissions. Treated as success so the scheduler does not retry.
+    NotFound,
+    /// `authz.ErrUnimplemented`: skipped, treated as success.
+    Unimplemented,
+    /// Any other error. Like the baseline, the provider may return the
+    /// partial account list it managed to fetch alongside the error; those
+    /// partial results are used when `noPerms` is true.
+    Failed {
+        message: String,
+        partial_account_ids: Vec<String>,
+    },
+}
+
+/// `authz.Provider` subset used by the repository-centric sync.
+#[async_trait]
+pub trait AuthzProvider: Send + Sync {
+    /// `ServiceType`, e.g. `github`.
+    fn service_type(&self) -> &str;
+    /// `ServiceID`, e.g. `https://github.com/`.
+    fn service_id(&self) -> &str;
+    /// `URN`, e.g. `extsvc:github:1`.
+    fn urn(&self) -> &str;
+    /// `FetchRepoPerms`: external account IDs with read access.
+    async fn fetch_repo_perms(
+        &self,
+        repo: &FetchRepo,
+        opts: &FetchPermsOptions,
+    ) -> Result<Vec<String>, FetchError>;
+}
+
+/// `providers.ProvidersFromConfig` as seen by the syncer. The registry is
+/// consulted on every sync, matching the baseline's `providerFactory`.
+pub trait ProviderRegistry: Send + Sync {
+    fn providers(&self) -> Vec<Arc<dyn AuthzProvider>>;
+}
+
+/// Result of one `syncRepoPerms` call. `result` is `None` when the baseline
+/// would return a nil `*database.SetPermissionsResult`.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RepoSyncOutcome {
+    pub result: Option<SetPermissionsResult>,
+    pub statuses: Vec<CodeHostState>,
+    pub error: Option<String>,
+}
+
+/// `permsSyncerImpl` for repository-centric sync.
+pub struct PermsSyncer {
+    pool: PgPool,
+    repo_store: RepoStore,
+    registry: Arc<dyn ProviderRegistry>,
+    /// `permsUpdateLock`: only one permission-table write at a time.
+    perms_update_lock: Mutex<()>,
+}
+
+impl PermsSyncer {
+    pub fn new(pool: PgPool, registry: Arc<dyn ProviderRegistry>) -> Self {
+        Self {
+            repo_store: RepoStore::new(pool.clone()),
+            pool,
+            registry,
+            perms_update_lock: Mutex::new(()),
+        }
+    }
+
+    /// `permsSyncerImpl.syncRepoPerms`. When `no_perms` is true, partial
+    /// `FetchRepoPerms` results are written even if the provider failed.
+    pub async fn sync_repo_perms(
+        &self,
+        repo_id: i32,
+        no_perms: bool,
+        fetch_opts: FetchPermsOptions,
+    ) -> RepoSyncOutcome {
+        let mut outcome = RepoSyncOutcome::default();
+
+        let repo = match self.repo_store.get_by_id(repo_id).await {
+            Ok(Some(repo)) => repo,
+            Ok(None) => return outcome,
+            Err(err) => {
+                outcome.error = Some(format!("get repository: {err}"));
+                return outcome;
+            }
+        };
+
+        let provider = if repo.private {
+            let by_urn: HashMap<String, Arc<dyn AuthzProvider>> = self
+                .registry
+                .providers()
+                .into_iter()
+                .map(|provider| (provider.urn().to_owned(), provider))
+                .collect();
+            repo.sources.iter().find_map(|source| {
+                let urn = format!("extsvc:{}:{}", source.kind, source.external_service_id);
+                by_urn.get(&urn).cloned()
+            })
+        } else {
+            None
+        };
+
+        let Some(provider) = provider else {
+            // No authz provider is configured for this repository: the
+            // baseline skips the fetch and leaves permissions untouched.
+            return outcome;
+        };
+
+        let fetch_repo = FetchRepo {
+            uri: repo.uri.clone().unwrap_or_default(),
+            external_repo_id: repo.external_id.clone().unwrap_or_default(),
+            service_type: repo.external_service_type.clone().unwrap_or_default(),
+            service_id: repo.external_service_id.clone().unwrap_or_default(),
+        };
+
+        let ext_account_ids = match provider.fetch_repo_perms(&fetch_repo, &fetch_opts).await {
+            Ok(ids) => {
+                // The baseline appends a status for every provider call,
+                // including successful ones.
+                outcome.statuses.push(CodeHostState::new_provider_status(
+                    provider.service_id(),
+                    provider.service_type(),
+                    None,
+                    "FetchRepoPerms",
+                ));
+                ids
+            }
+            Err(FetchError::NotFound) => {
+                outcome.statuses.push(CodeHostState::new_provider_status(
+                    provider.service_id(),
+                    provider.service_type(),
+                    None,
+                    "FetchRepoPerms",
+                ));
+                return outcome;
+            }
+            Err(FetchError::Unimplemented) => {
+                outcome.statuses.push(CodeHostState::new_provider_status(
+                    provider.service_id(),
+                    provider.service_type(),
+                    None,
+                    "FetchRepoPerms",
+                ));
+                return outcome;
+            }
+            Err(FetchError::Failed {
+                message,
+                partial_account_ids,
+            }) => {
+                outcome.statuses.push(CodeHostState::new_provider_status(
+                    provider.service_id(),
+                    provider.service_type(),
+                    Some(&message),
+                    "FetchRepoPerms",
+                ));
+                if !no_perms {
+                    outcome.error = Some(format!(
+                        "fetch repository permissions for repository {:?} (id: {}): {message}",
+                        repo.name, repo.id
+                    ));
+                    return outcome;
+                }
+                partial_account_ids
+            }
+        };
+
+        let mut accounts_to_users: HashMap<String, UserIdWithExternalAccountId> = HashMap::new();
+        if !ext_account_ids.is_empty() {
+            match get_user_ids_by_external_accounts(
+                &self.pool,
+                provider.service_type(),
+                provider.service_id(),
+                &ext_account_ids,
+            )
+            .await
+            {
+                Ok(users) => accounts_to_users = users,
+                Err(err) => {
+                    outcome.error = Some(format!(
+                        "get user IDs by external accounts for repository {:?} (id: {}): {err}",
+                        repo.name, repo.id
+                    ));
+                    return outcome;
+                }
+            }
+        }
+
+        // The baseline ignores errors from this lookup.
+        let _last_sync_job = get_latest_finished_sync_job(&self.pool, None, Some(repo_id), true)
+            .await
+            .unwrap_or(None);
+
+        let mut pending_account_ids: Vec<String> = ext_account_ids
+            .iter()
+            .filter(|account_id| !accounts_to_users.contains_key(*account_id))
+            .cloned()
+            .collect();
+        pending_account_ids.sort();
+        pending_account_ids.dedup();
+
+        let mut users: Vec<UserIdWithExternalAccountId> =
+            accounts_to_users.values().copied().collect();
+        users.sort_by_key(|user| (user.user_id, user.external_account_id));
+
+        let now = OffsetDateTime::now_utc();
+        let _guard = self.perms_update_lock.lock().await;
+        let mut tx = match self.pool.begin().await {
+            Ok(tx) => tx,
+            Err(err) => {
+                outcome.error = Some(format!(
+                    "start transaction for repository {:?} (id: {}): {err}",
+                    repo.name, repo.id
+                ));
+                return outcome;
+            }
+        };
+
+        match set_repo_perms_tx(&mut tx, repo_id, &users, SOURCE_REPO_SYNC, now).await {
+            Ok(result) => outcome.result = Some(result),
+            Err(err) => {
+                outcome.error = Some(format!(
+                    "set user repo permissions for repository {:?} (id: {}): {err}",
+                    repo.name, repo.id
+                ));
+                return outcome;
+            }
+        }
+
+        if let Err(err) = set_repo_pending_permissions_tx(
+            &mut tx,
+            repo_id,
+            PERM_READ,
+            provider.service_type(),
+            provider.service_id(),
+            &pending_account_ids,
+            now,
+        )
+        .await
+        {
+            outcome.error = Some(format!(
+                "set repository pending permissions for repository {:?} (id: {}): {err}",
+                repo.name, repo.id
+            ));
+            return outcome;
+        }
+
+        if let Err(err) = tx.commit().await {
+            outcome.error = Some(format!(
+                "commit transaction for repository {:?} (id: {}): {err}",
+                repo.name, repo.id
+            ));
+        }
+        outcome
+    }
+}

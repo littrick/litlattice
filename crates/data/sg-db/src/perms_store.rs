@@ -131,6 +131,21 @@ pub async fn set_repo_perms(
     source: &str,
     now: OffsetDateTime,
 ) -> Result<SetPermissionsResult, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    let result = set_repo_perms_tx(&mut tx, repo_id, users, source, now).await?;
+    tx.commit().await?;
+    Ok(result)
+}
+
+/// `SetRepoPerms` inside the caller's transaction (`permsSyncer.syncRepoPerms`
+/// writes permissions and pending permissions atomically).
+pub async fn set_repo_perms_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    repo_id: i32,
+    users: &[UserIdWithExternalAccountId],
+    source: &str,
+    now: OffsetDateTime,
+) -> Result<SetPermissionsResult, sqlx::Error> {
     let permissions: Vec<Permission> = users
         .iter()
         .map(|user| Permission {
@@ -144,7 +159,7 @@ pub async fn set_repo_perms(
         external_account_id: 0,
         repo_id,
     };
-    set_user_repo_permissions(pool, &permissions, entity, source, true, now).await
+    set_user_repo_permissions_tx(tx, &permissions, entity, source, true, now).await
 }
 
 /// `PermsStore.SetUserExternalAccountPerms` (the replacing variant; the
@@ -195,20 +210,33 @@ async fn set_user_repo_permissions(
     now: OffsetDateTime,
 ) -> Result<SetPermissionsResult, sqlx::Error> {
     let mut tx = pool.begin().await?;
+    let result =
+        set_user_repo_permissions_tx(&mut tx, permissions, entity, source, replace_perms, now)
+            .await?;
+    tx.commit().await?;
+    Ok(result)
+}
 
+async fn set_user_repo_permissions_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    permissions: &[Permission],
+    entity: PermissionEntity,
+    source: &str,
+    replace_perms: bool,
+    now: OffsetDateTime,
+) -> Result<SetPermissionsResult, sqlx::Error> {
     let updates = if permissions.is_empty() {
         Vec::new()
     } else {
-        upsert_user_repo_permissions(&mut tx, permissions, now, source).await?
+        upsert_user_repo_permissions(tx, permissions, now, source).await?
     };
 
     let deleted = if replace_perms {
-        delete_old_user_repo_permissions(&mut tx, entity, now, source).await?
+        delete_old_user_repo_permissions(tx, entity, now, source).await?
     } else {
         Vec::new()
     };
 
-    tx.commit().await?;
     Ok(SetPermissionsResult {
         added: updates.iter().filter(|is_new| **is_new).count(),
         removed: deleted.len(),
@@ -570,7 +598,31 @@ pub async fn set_repo_pending_permissions(
     now: OffsetDateTime,
 ) -> Result<(), sqlx::Error> {
     let mut tx = pool.begin().await?;
+    set_repo_pending_permissions_tx(
+        &mut tx,
+        repo_id,
+        perm,
+        service_type,
+        service_id,
+        account_ids,
+        now,
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(())
+}
 
+/// `SetRepoPendingPermissions` inside the caller's transaction.
+#[allow(clippy::too_many_arguments)]
+pub async fn set_repo_pending_permissions_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    repo_id: i32,
+    perm: &str,
+    service_type: &str,
+    service_id: &str,
+    account_ids: &[String],
+    now: OffsetDateTime,
+) -> Result<(), sqlx::Error> {
     let mut existing: HashMap<String, i64> = HashMap::new();
     if !account_ids.is_empty() {
         let rows = sqlx::query(
@@ -588,7 +640,7 @@ AND bind_id = ANY($5)
         .bind(perm)
         .bind(PERM_OBJECT_REPOS)
         .bind(account_ids.to_vec())
-        .fetch_all(&mut *tx)
+        .fetch_all(&mut **tx)
         .await?;
         for row in rows {
             existing.insert(row.try_get("bind_id")?, row.try_get("id")?);
@@ -621,7 +673,7 @@ RETURNING id
         .bind(perm)
         .bind(PERM_OBJECT_REPOS)
         .bind(now)
-        .fetch_all(&mut *tx)
+        .fetch_all(&mut **tx)
         .await?;
         for row in rows {
             pending_ids.insert(row.try_get::<i64, _>("id")?);
@@ -629,13 +681,12 @@ RETURNING id
     }
 
     // `FOR UPDATE` matches the baseline lock.
-    let old_ids = load_repo_pending_permission_ids(&mut tx, repo_id, perm).await?;
+    let old_ids = load_repo_pending_permission_ids(tx, repo_id, perm).await?;
     let old_ids: std::collections::HashSet<i64> = old_ids.into_iter().collect();
 
     let added: Vec<i64> = pending_ids.difference(&old_ids).copied().collect();
     let removed: Vec<i64> = old_ids.difference(&pending_ids).copied().collect();
     if added.is_empty() && removed.is_empty() {
-        tx.commit().await?;
         return Ok(());
     }
 
@@ -665,7 +716,7 @@ AND object_type = $7
     .bind(all_ids)
     .bind(perm)
     .bind(PERM_OBJECT_REPOS)
-    .execute(&mut *tx)
+    .execute(&mut **tx)
     .await?;
 
     let mut pending_ids: Vec<i64> = pending_ids.into_iter().collect();
@@ -687,10 +738,9 @@ DO UPDATE SET
     .bind(perm)
     .bind(pending_ids)
     .bind(now)
-    .execute(&mut *tx)
+    .execute(&mut **tx)
     .await?;
 
-    tx.commit().await?;
     Ok(())
 }
 

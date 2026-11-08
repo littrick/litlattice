@@ -8,6 +8,7 @@
 
 use serde::Deserialize;
 use sqlx::postgres::PgPool;
+use sqlx::types::time::OffsetDateTime;
 use sqlx::Row;
 
 /// One entry of `types.Repo.Sources` (`types.SourceInfo` after `scanRepo`).
@@ -35,6 +36,12 @@ pub struct Repo {
     pub uri: Option<String>,
     /// `repo.blocked`: `{"reason": "..."}` when the repository is blocked.
     pub blocked: Option<serde_json::Value>,
+    /// `repo.private`; permission syncing only fetches private repositories.
+    pub private: bool,
+    /// `repo.external_id`; `types.Repo.ExternalRepo.ID`.
+    pub external_id: Option<String>,
+    /// `repo.created_at`; used for the first-sync delay metric.
+    pub created_at: OffsetDateTime,
     /// `repo.sources`; empty when no live external service references the repo.
     pub sources: Vec<SourceInfo>,
 }
@@ -72,6 +79,9 @@ SELECT
 	r.metadata,
 	r.uri,
 	r.blocked,
+	r.private,
+	r.external_id,
+	r.created_at,
 	(
 		SELECT json_agg(
 			json_build_object(
@@ -113,6 +123,9 @@ LIMIT 1
             metadata: row.try_get("metadata")?,
             uri: row.try_get("uri")?,
             blocked: row.try_get("blocked")?,
+            private: row.try_get("private")?,
+            external_id: row.try_get("external_id")?,
+            created_at: row.try_get("created_at")?,
             sources,
         }))
     }
@@ -135,6 +148,9 @@ SELECT
 	r.metadata,
 	r.uri,
 	r.blocked,
+	r.private,
+	r.external_id,
+	r.created_at,
 	(
 		SELECT json_agg(
 			json_build_object(
@@ -175,6 +191,9 @@ LIMIT 1
             metadata: row.try_get("metadata")?,
             uri: row.try_get("uri")?,
             blocked: row.try_get("blocked")?,
+            private: row.try_get("private")?,
+            external_id: row.try_get("external_id")?,
+            created_at: row.try_get("created_at")?,
             sources,
         }))
     }

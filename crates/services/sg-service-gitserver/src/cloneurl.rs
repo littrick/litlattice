@@ -620,6 +620,9 @@ mod tests {
             metadata,
             uri: None,
             blocked: None,
+            private: false,
+            external_id: None,
+            created_at: sqlx::types::time::OffsetDateTime::now_utc(),
             sources: Vec::new(),
         }
     }
