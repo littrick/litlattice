@@ -230,6 +230,7 @@ pub struct Metrics {
     backend_errors: CounterVec,
     exec_running: GaugeVec,
     exec_duration: HistogramVec,
+    exec_high_memory: CounterVec,
     gitservice_running: GaugeVec,
     gitservice_duration: HistogramVec,
     search_running: Gauge,
@@ -410,7 +411,7 @@ impl Metrics {
             &["cmd"],
             exponential_buckets_range(0.01, 60.0, 12),
         );
-        let _exec_high_memory = counter_vec(
+        let exec_high_memory = counter_vec(
             registry,
             "src_gitserver_exec_high_memory_usage_count",
             "gitcli.GitCommand high memory usage by subcommand",
@@ -504,6 +505,7 @@ impl Metrics {
             backend_errors,
             exec_running,
             exec_duration,
+            exec_high_memory,
             gitservice_running,
             gitservice_duration,
             search_running,
@@ -535,6 +537,10 @@ impl Metrics {
             started: Instant::now(),
             armed: true,
         }
+    }
+
+    fn high_memory_usage(&self, cmd: &str) {
+        self.exec_high_memory.with_label_values(&[cmd]).inc();
     }
 
     fn search_started(&self) {
@@ -661,6 +667,16 @@ pub fn backend_started(op: &'static str, concurrent: &'static str) -> Option<Bac
 pub fn exec_started(args: &[std::ffi::OsString]) -> Option<ExecGuard> {
     let cmd = args.first()?.to_string_lossy();
     Some(Metrics::global_opt()?.exec_started(&cmd))
+}
+
+/// Baseline `cmdReader.trace`: a finished `git` child whose observed peak
+/// memory usage exceeded `highMemoryUsageThreshold` increments the counter
+/// labelled with the subcommand. Only children observed through `memcmd`
+/// (`GITSERVER_MEMORY_OBSERVATION_ENABLED`) can reach this.
+pub fn high_memory_usage(cmd: &str) {
+    if let Some(metrics) = Metrics::global_opt() {
+        metrics.high_memory_usage(cmd);
+    }
 }
 
 /// Records one `git` upload-pack service request for the baseline

@@ -26,6 +26,7 @@ pub mod disk;
 pub mod git;
 pub mod gitservice;
 pub mod grpc;
+pub mod memobs;
 pub mod metrics;
 mod mux;
 pub mod repo;

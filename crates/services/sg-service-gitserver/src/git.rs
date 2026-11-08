@@ -47,14 +47,33 @@ pub struct GitChild {
     child: Child,
     _exec: Option<metrics::ExecGuard>,
     _backend: Option<metrics::BackendGuard>,
+    /// `GITSERVER_MEMORY_OBSERVATION_ENABLED` sampler; `None` unless enabled.
+    /// Dropped after the child is waited on, like `cmdReader.waitCmd` calling
+    /// `memoryObserver.Stop()`.
+    _memory: Option<crate::memobs::MemoryObserver>,
 }
 
 impl GitChild {
     fn new(child: Child, args: &[OsString]) -> Self {
+        Self::with_exec(child, args, metrics::exec_started(args))
+    }
+
+    /// Adopt an already-spawned child whose `exec_*` guard was created before
+    /// `spawn` (the baseline increments the gauge only after a successful
+    /// `Start`).
+    fn with_exec(child: Child, args: &[OsString], exec: Option<metrics::ExecGuard>) -> Self {
+        let cmd = args
+            .first()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let memory = child
+            .id()
+            .and_then(|pid| crate::memobs::MemoryObserver::start(pid, cmd));
         Self {
             child,
-            _exec: metrics::exec_started(args),
+            _exec: exec,
             _backend: None,
+            _memory: memory,
         }
     }
 
@@ -71,8 +90,10 @@ impl GitChild {
             child,
             _exec,
             _backend,
+            _memory,
         } = self;
         let output = child.wait_with_output().await;
+        drop(_memory);
         drop(_exec);
         drop(_backend);
         output
@@ -312,15 +333,21 @@ impl GitRepo {
 
     async fn output(&self, args: &[OsString]) -> Result<std::process::Output, GitError> {
         let exec = metrics::exec_started(args);
-        match self.command(args).output().await {
-            Ok(output) => Ok(output),
+        let child = match self.command(args).spawn() {
+            Ok(child) => child,
             Err(err) => {
                 if let Some(exec) = exec {
                     exec.failed_to_start();
                 }
-                Err(GitError::Message(format!("failed to run git: {err}")))
+                return Err(GitError::Message(format!("failed to run git: {err}")));
             }
-        }
+        };
+        // `wait_with_output` drains both pipes like `Command::output`, and
+        // drops the execution/memory measurements after the child exited.
+        GitChild::with_exec(child, args, exec)
+            .wait_with_output()
+            .await
+            .map_err(|err| GitError::Message(format!("failed to run git: {err}")))
     }
 
     /// `git cat-file -t -- <spec>`; exit 128 with the baseline's stderr

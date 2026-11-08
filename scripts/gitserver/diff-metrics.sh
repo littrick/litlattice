@@ -96,6 +96,7 @@ TRAFFIC = {
     "src_gitserver_backend_errors_total",
     "src_gitserver_exec_running",
     "src_gitserver_exec_duration_seconds",
+    "src_gitserver_exec_high_memory_usage_count",
     "src_gitserver_gitservice_running",
     "src_gitserver_gitservice_duration_seconds",
     "src_gitserver_search_duration_seconds",
@@ -131,7 +132,11 @@ def parse(path):
                 base = name
                 for suffix in ("_bucket", "_sum", "_count"):
                     if base.endswith(suffix):
-                        base = base[: -len(suffix)]
+                        candidate = base[: -len(suffix)]
+                        # Only histogram components belong to a family; a
+                        # counter whose own name ends in `_count` does not.
+                        if families.get(candidate, {}).get("type") == "histogram":
+                            base = candidate
                         break
                 if base in families:
                     families[base]["samples"][line] = True
