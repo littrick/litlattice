@@ -23,8 +23,10 @@ use sg_config::ConfigClient;
 use sg_core::{ConfigError, EnvReader, Service, ServiceContext, ServiceError};
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 
 pub mod config;
+pub mod queue;
 
 use config::PreciseWorkerConfig;
 
@@ -37,6 +39,9 @@ pub fn service_name() -> &'static str {
 /// How long to wait between failed frontend-configuration fetches
 /// (`conf.Get` retries in the baseline).
 const CONFIG_RETRY_INTERVAL: Duration = Duration::from_secs(1);
+
+/// `processor.NewUploadResetter`'s `Interval`.
+const RESETTER_INTERVAL: Duration = Duration::from_secs(30);
 
 pub struct PreciseWorkerService {
     /// Rust-only rollout knob (not part of the baseline registry) so the pilot
@@ -123,7 +128,7 @@ impl Service for PreciseWorkerService {
                 "postgres_dsn is not configured by the frontend",
             ));
         }
-        let _frontend_pool = sg_db::connect(&dsn, 10)
+        let frontend_pool = sg_db::connect(&dsn, 10)
             .await
             .map_err(|err| ServiceError::with_source("connecting to the frontend database", err))?;
 
@@ -155,9 +160,62 @@ impl Service for PreciseWorkerService {
             budget = config.worker_budget,
             "serving precise-code-intel-worker health endpoint"
         );
-        serve_health(&config.listen_addr, ctx.shutdown.clone())
-            .await
-            .map_err(|err| ServiceError::with_source("serving HTTP", err))
+        // `processor.NewUploadResetter` + `workerutil.Worker`: the resetter
+        // loop is part of this slice; the dequeue/handler loop arrives with
+        // the SCIP processor (9.7c) so the Rust process cannot consume uploads
+        // before it can process them.
+        let queue_store = Arc::new(queue::UploadQueueStore::new(frontend_pool));
+        let tasks = TaskTracker::new();
+        {
+            let store = Arc::clone(&queue_store);
+            let shutdown = ctx.shutdown.clone();
+            tasks.spawn(async move { resetter_loop(store, shutdown).await });
+        }
+
+        let served = serve_health(&config.listen_addr, ctx.shutdown.clone()).await;
+        ctx.shutdown.cancel();
+        tasks.close();
+        tasks.wait().await;
+        served.map_err(|err| ServiceError::with_source("serving HTTP", err))
+    }
+}
+
+/// `dbworker.Resetter.Start`: reset stalled records immediately, then every
+/// `Interval` (30s) until shutdown.
+async fn resetter_loop(store: Arc<queue::UploadQueueStore>, shutdown: CancellationToken) {
+    loop {
+        match store.reset_stalled().await {
+            Ok(result) => {
+                for (id, age) in &result.reset {
+                    tracing::warn!(
+                        name = "precise_code_intel_upload_worker_resetter",
+                        id,
+                        time_since_last_heartbeat = ?age,
+                        "Reset stalled record back to 'queued' state"
+                    );
+                }
+                for (id, age) in &result.failed {
+                    tracing::warn!(
+                        name = "precise_code_intel_upload_worker_resetter",
+                        id,
+                        time_since_last_heartbeat = ?age,
+                        "Reset stalled record to 'failed' state"
+                    );
+                }
+            }
+            Err(err) => {
+                tracing::error!(
+                    name = "precise_code_intel_upload_worker_resetter",
+                    error = %err,
+                    "Failed to reset stalled records"
+                );
+            }
+        }
+
+        tokio::select! {
+            _ = shutdown.cancelled() => return,
+            _ = sleep(RESETTER_INTERVAL) => {}
+        }
     }
 }
 
