@@ -1,0 +1,10 @@
+{
+  "envelope_ciphertext": "eyJNZWNoYW5pc20iOiJlbnZlbG9wZSIsIktleU5hbWUiOiJ0ZXN0LWtleSIsIldyYXBwZWRLZXkiOiJOL0JwazlIZm9xTTFQWlkrTG9UWDRHRDhoWHhmK2YrcHVodTNxa29kQk05VVE5azJ2aHFPbWhFZ1dLY3Njd3BaVGRTUFNNdG16WklPQjBnTyIsIkNpcGhlcnRleHQiOiJoZ3VoZTJjM1ExaEhySFRiMlN4VWdPaG5hYWxhYUN4VVNldE9iaE1DSWV6b3FoelpjVjNiWUxyRFhUaDZDaE00bjFYYUJ0UU00cXB6U2pPRlREcz0iLCJOb25jZSI6Ijh1MHB4N3RkWm01blV5ZjIifQ==",
+  "key_version_json": "{\"Type\":\"mounted\",\"Name\":\"test-key\",\"Version\":\"v1\"}",
+  "keyname": "test-key",
+  "legacy_ciphertext": "eyJNZWNoYW5pc20iOiJlbmNyeXB0IiwiS2V5TmFtZSI6InRlc3Qta2V5IiwiV3JhcHBlZEtleSI6bnVsbCwiQ2lwaGVydGV4dCI6Ik9QbWwxcERicnNnYjVXQ3FxdVhXYlFTVWd1K2FpVnEvWXY1ZjViQ1lJZWtxK2Q0UkIyNW9OY1pOblpnYkpvNm9jVi96dEd0U1hOMzFoRDNGd0xYRGxnNm9vVXVUK3VyZ3krQT0iLCJOb25jZSI6bnVsbH0=",
+  "legacy_empty_ciphertext": "eyJNZWNoYW5pc20iOiIiLCJLZXlOYW1lIjoidGVzdC1rZXkiLCJXcmFwcGVkS2V5IjpudWxsLCJDaXBoZXJ0ZXh0IjoiT1BtbDFwRGJyc2diNVdDcXF1WFdiUVNVZ3UrYWlWcS9ZdjVmNWJDWUlla3ErZDRSQjI1b05jWk5uWmdiSm82b2NWL3p0R3RTWE4zMWhEM0Z3TFhEbGc2b29VdVQrdXJneStBPSIsIk5vbmNlIjpudWxsfQ==",
+  "plaintext": "{\"url\":\"https://example.com\",\"token\":\"s3cret\"}",
+  "secret": "0123456789abcdef0123456789abcdef",
+  "version": "v1"
+}
