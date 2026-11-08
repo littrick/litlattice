@@ -156,12 +156,15 @@ impl Service for GitserverService {
         // `shared.Main` blocks in `conf.Get()` (via `getDB`) until the frontend
         // has provided the initial configuration, and fails when the database
         // DSN is missing. Mirror that before binding the port.
-        let config_client = sg_config::ConfigClient::from_env();
+        let config_client = Arc::new(sg_config::ConfigClient::from_env());
         let unified = frontendconfig::wait_for_initial_config(&config_client, &ctx.shutdown)
             .await
             .ok_or_else(|| {
                 ServiceError::new("gitserver stopped while waiting for the frontend configuration")
             })?;
+        // `conf.Get()` starts as the configuration the frontend served at
+        // startup; the background watcher below replaces it in place.
+        let live = Arc::new(sg_config::LiveConfig::new((*unified).clone()));
         let dsn = unified.service_connections.postgres_dsn.clone();
         if dsn.is_empty() {
             return Err(ServiceError::new(
@@ -202,29 +205,20 @@ impl Service for GitserverService {
             external_services,
             key: external_service_key,
         });
-        let backend = Arc::new(update::LocalBackend {
-            repos_dir: config.repos_dir.clone(),
+        let backend = Arc::new(update::LocalBackend::new(
+            config.repos_dir.clone(),
             remote_urls,
-            store: Some(Arc::clone(&store)),
-            shard_id: config.external_address.clone(),
-            tls: tlsexternal::TlsConfig::from_site(&unified.site),
-            custom_fetch: customfetch::CustomFetch::build(
-                unified
-                    .site
-                    .custom_git_fetch_configured()
-                    .then(|| unified.site.custom_git_fetch())
-                    .as_deref(),
-                config.enable_custom_git_fetch,
-            ),
-            clone_progress_log: unified.site.clone_progress_log(),
-            long_command_timeout: unified.site.git_long_command_timeout(),
-        });
+            Some(Arc::clone(&store)),
+            config.external_address.clone(),
+            Arc::clone(&live),
+            config.enable_custom_git_fetch,
+        ));
         // `NewServer` builds the clone limiter from `conf.GitMaxConcurrentClones`
-        // and `conf.Watch` updates it when the site config changes. The Rust
-        // config client has no watcher yet, so the limit is fixed at startup.
+        // and `conf.Watch` updates it when the site config changes.
+        let clone_limiter = limiter::MutableLimiter::new(unified.site.git_max_concurrent_clones());
         let updater = Arc::new(update::UpdateServer {
             locker: Arc::clone(&locker),
-            limiter: limiter::MutableLimiter::new(unified.site.git_max_concurrent_clones()),
+            limiter: Arc::clone(&clone_limiter),
             backend,
             cancelled: ctx.shutdown.clone(),
         });
@@ -235,7 +229,7 @@ impl Service for GitserverService {
             updater,
             tasks: tasks.clone(),
             store: Some(Arc::clone(&store)),
-            disable_auto_git_updates: unified.site.disable_auto_git_updates(),
+            live: Arc::clone(&live),
         });
         let grpc = Grpc {
             repos_dir: Arc::new(config.repos_dir.clone()),
@@ -250,33 +244,25 @@ impl Service for GitserverService {
             fetch: Some(fetch),
         };
         // `NewRepoStateSyncer`: reconcile clone state with the database. The
-        // address set and pins are startup snapshots (the baseline re-reads
-        // them from `conf` on every run; the Rust config client has no
-        // watcher yet).
-        let addresses = addrs::GitserverAddresses {
-            addresses: unified.service_connections.git_servers.clone(),
-            pinned_servers: unified.site.git_server_pinned_repos(),
-        };
+        // address set and pins are recomputed from `conf.Get()` on every run.
         let state_syncer = Arc::new(statesyncer::RepoStateSyncer {
             repos: Arc::clone(&store),
             locker: Arc::clone(&locker),
             repos_dir: Arc::new(config.repos_dir.clone()),
             shard_id: config.external_address.clone(),
-            addresses: addresses.clone(),
+            live: Arc::clone(&live),
             interval: config.sync_repo_state_interval,
             batch_size: config.sync_repo_state_batch_size,
             per_second: config.sync_repo_state_update_per_second,
         });
         // `NewJanitor`: the periodic cleanup job. Like the state syncer, the
         // shard list, `gitLongCommandTimeout` and `disableAutoGitUpdates` are
-        // startup snapshots.
+        // read from `conf.Get()` on every run.
         let janitor = Arc::new(janitor::Janitor {
             repos_dir: Arc::new(config.repos_dir.clone()),
             store: Some(Arc::clone(&store)),
             shard_id: config.external_address.clone(),
-            addresses,
-            long_command_timeout: unified.site.git_long_command_timeout(),
-            disable_auto_git_updates: unified.site.disable_auto_git_updates(),
+            live: Arc::clone(&live),
             config: self
                 .janitor
                 .clone()
@@ -334,6 +320,18 @@ impl Service for GitserverService {
             let shutdown = ctx.shutdown.clone();
             background.spawn(async move { janitor.run(shutdown).await });
         }
+        {
+            // `conf.client.continuouslyUpdate`: poll the frontend and swap the
+            // live configuration when it changes.
+            let watcher =
+                sg_config::ConfigWatcher::new(Arc::clone(&config_client), Arc::clone(&live));
+            let shutdown = ctx.shutdown.clone();
+            background.spawn(async move { watcher.run(shutdown).await });
+        }
+        {
+            let shutdown = ctx.shutdown.clone();
+            background.spawn(async move { watch_clone_limit(clone_limiter, live, shutdown).await });
+        }
 
         let served = sg_http::serve(listener, routes, http, ctx.shutdown.clone()).await;
         // The background tasks may outlive an early main-server failure.
@@ -344,6 +342,29 @@ impl Service for GitserverService {
             .await
             .ok();
         served.map_err(|err| ServiceError::with_source("gitserver http server failed", err))
+    }
+}
+
+/// `conf.Watch(func() { cloneLimiter.SetLimit(conf.GitMaxConcurrentClones()) })`
+/// from `NewServer`: apply the current limit immediately, then after every
+/// configuration change.
+async fn watch_clone_limit(
+    limiter: Arc<limiter::MutableLimiter>,
+    live: Arc<sg_config::LiveConfig>,
+    shutdown: tokio_util::sync::CancellationToken,
+) {
+    limiter.set_limit(live.current().site.git_max_concurrent_clones());
+    let mut changes = live.subscribe();
+    loop {
+        tokio::select! {
+            _ = shutdown.cancelled() => return,
+            changed = changes.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+            }
+        }
+        limiter.set_limit(live.current().site.git_max_concurrent_clones());
     }
 }
 
@@ -402,4 +423,59 @@ fn not_found() -> Response<tonic::body::BoxBody> {
         header::HeaderValue::from_static("nosniff"),
     );
     response
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn live(site: &str) -> Arc<sg_config::LiveConfig> {
+        let raw = sg_config::RawUnified {
+            site: site.to_owned(),
+            ..Default::default()
+        };
+        Arc::new(sg_config::LiveConfig::new(
+            sg_config::Unified::parse(&raw).expect("site config"),
+        ))
+    }
+
+    #[tokio::test]
+    async fn clone_limit_follows_the_live_config() {
+        let live = live(r#"{"gitMaxConcurrentClones": 7}"#);
+        let limiter = limiter::MutableLimiter::new(1);
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let task = tokio::spawn({
+            let limiter = Arc::clone(&limiter);
+            let live = Arc::clone(&live);
+            let shutdown = shutdown.clone();
+            async move { watch_clone_limit(limiter, live, shutdown).await }
+        });
+
+        // `conf.Watch(f)` runs `f` immediately when the watcher registers.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while limiter.get_limit().0 != 7 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("initial limit applied");
+
+        live.set(
+            sg_config::Unified::parse(&sg_config::RawUnified {
+                site: r#"{"gitMaxConcurrentClones": 3}"#.to_owned(),
+                ..Default::default()
+            })
+            .expect("site config"),
+        );
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while limiter.get_limit().0 != 3 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("updated limit applied");
+
+        shutdown.cancel();
+        task.await.expect("watcher exits");
+    }
 }

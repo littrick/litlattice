@@ -11,10 +11,11 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
+use sg_config::{LiveConfig, SiteConfiguration};
 use sg_db::gitserver_repos::{CloneStatus, GitserverReposStore};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
@@ -200,19 +201,80 @@ pub struct LocalBackend {
     pub store: Option<Arc<GitserverReposStore>>,
     /// `s.hostname`, stored as `gitserver_repos.shard_id`.
     pub shard_id: String,
-    /// `executil.tlsExternal` settings for clone/fetch commands.
-    pub tls: crate::tlsexternal::TlsConfig,
-    /// `experimentalFeatures.customGitFetch` + `ENABLE_CUSTOM_GIT_FETCH`.
-    pub custom_fetch: crate::customfetch::CustomFetch,
-    /// `siteConfig.cloneProgressLog`: also write fetch/clone output to a
-    /// temporary log file.
-    pub clone_progress_log: bool,
-    /// `conf.GitLongCommandTimeout()`: the deadline for a clone or fetch
-    /// operation (default 2h).
-    pub long_command_timeout: std::time::Duration,
+    /// The process-wide live configuration (`conf.Get()`). The command
+    /// settings below are read per clone/fetch, like the baseline, so a site
+    /// config change takes effect without a restart.
+    pub live: Arc<LiveConfig>,
+    /// The `ENABLE_CUSTOM_GIT_FETCH` env var (`enableCustomGitFetch`), fixed
+    /// for the process lifetime; combined with the live
+    /// `experimentalFeatures.customGitFetch` per command.
+    pub enable_custom_git_fetch: bool,
+    /// `conf.Cached` for `executil.tlsExternal`: the CA bundle is written once
+    /// per configuration revision rather than once per git command.
+    tls_cache: Mutex<Option<(u64, crate::tlsexternal::TlsConfig)>>,
+}
+
+/// The site-config-derived settings of one clone/fetch command
+/// (`executil.tlsExternal()`, `customGitFetch()`, `conf.Get().CloneProgressLog`,
+/// `conf.GitLongCommandTimeout()`, read at the point of use in the baseline).
+struct CommandConfig {
+    tls: crate::tlsexternal::TlsConfig,
+    custom_fetch: crate::customfetch::CustomFetch,
+    clone_progress_log: bool,
+    long_command_timeout: std::time::Duration,
 }
 
 impl LocalBackend {
+    pub fn new(
+        repos_dir: PathBuf,
+        remote_urls: Arc<dyn RemoteUrlSource>,
+        store: Option<Arc<GitserverReposStore>>,
+        shard_id: String,
+        live: Arc<LiveConfig>,
+        enable_custom_git_fetch: bool,
+    ) -> Self {
+        Self {
+            repos_dir,
+            remote_urls,
+            store,
+            shard_id,
+            live,
+            enable_custom_git_fetch,
+            tls_cache: Mutex::new(None),
+        }
+    }
+
+    /// The live command settings. TLS settings go through `conf.Cached`-style
+    /// memoization keyed on the config generation, because computing them
+    /// writes a certificate bundle to disk.
+    fn command_config(&self) -> CommandConfig {
+        let unified = self.live.current();
+        let site: &SiteConfiguration = &unified.site;
+        let tls = {
+            let generation = self.live.generation();
+            let mut cache = self.tls_cache.lock().unwrap_or_else(|err| err.into_inner());
+            match cache.as_ref() {
+                Some((cached_generation, tls)) if *cached_generation == generation => tls.clone(),
+                _ => {
+                    let tls = crate::tlsexternal::TlsConfig::from_site(site);
+                    *cache = Some((generation, tls.clone()));
+                    tls
+                }
+            }
+        };
+        CommandConfig {
+            tls,
+            custom_fetch: crate::customfetch::CustomFetch::build(
+                site.custom_git_fetch_configured()
+                    .then(|| site.custom_git_fetch())
+                    .as_deref(),
+                self.enable_custom_git_fetch,
+            ),
+            clone_progress_log: site.clone_progress_log(),
+            long_command_timeout: site.git_long_command_timeout(),
+        }
+    }
+
     fn git_dir(&self, repo: &str) -> Result<PathBuf, GitError> {
         crate::repo::repo_dir(&self.repos_dir, repo).ok_or_else(|| {
             GitError::Message(format!("repository name {:?} escapes the repos dir", repo))
@@ -399,19 +461,20 @@ impl UpdateBackend for LocalBackend {
         // `syncer.Fetch`, but the error is still wrapped with the (empty)
         // output. `SetLastOutput` runs even when the lookup fails.
         let remote_url = self.remote_url_for_fetch(repo).await;
+        let command = self.command_config();
         let mut output = LinebasedWriter::new();
-        let mut log = create_progress_log(self.clone_progress_log, repo);
+        let mut log = create_progress_log(command.clone_progress_log, repo);
         let mut timed_out = false;
         let result = match remote_url {
             Ok(remote) => {
                 let mut on_progress = progress_handler(&mut output, lock, &mut log);
                 match tokio::time::timeout(
-                    self.long_command_timeout,
+                    command.long_command_timeout,
                     crate::vcssyncer::fetch_repo_with(
                         &git_dir,
                         &remote,
-                        &self.tls,
-                        &self.custom_fetch,
+                        &command.tls,
+                        &command.custom_fetch,
                         &mut on_progress,
                     ),
                 )
@@ -436,7 +499,7 @@ impl UpdateBackend for LocalBackend {
         if timed_out {
             return Err(GitError::Message(format!(
                 "failed to update repo within deadline of {}",
-                crate::memobs::format_go_duration(self.long_command_timeout)
+                crate::memobs::format_go_duration(command.long_command_timeout)
             )));
         }
         result.map_err(|err| {
@@ -483,19 +546,20 @@ impl LocalBackend {
         // The remote lookup is part of `syncer.Clone` in the baseline, so its
         // failure is wrapped with the (possibly empty) clone output too.
         let remote_url = self.remote_url_for_fetch(repo).await;
+        let command = self.command_config();
         let mut output = LinebasedWriter::new();
-        let mut log = create_progress_log(self.clone_progress_log, repo);
+        let mut log = create_progress_log(command.clone_progress_log, repo);
         let mut timed_out = false;
         let result = match remote_url {
             Ok(remote) => {
                 let mut on_progress = progress_handler(&mut output, lock, &mut log);
                 match tokio::time::timeout(
-                    self.long_command_timeout,
+                    command.long_command_timeout,
                     crate::vcssyncer::clone_repo_with(
                         &tmp_path,
                         &remote,
-                        &self.tls,
-                        &self.custom_fetch,
+                        &command.tls,
+                        &command.custom_fetch,
                         &mut on_progress,
                     ),
                 )
@@ -520,7 +584,7 @@ impl LocalBackend {
         if timed_out {
             return Err(GitError::Message(format!(
                 "failed to clone repo within deadline of {}",
-                crate::memobs::format_go_duration(self.long_command_timeout)
+                crate::memobs::format_go_duration(command.long_command_timeout)
             )));
         }
         if let Err(err) = result {
@@ -825,47 +889,57 @@ mod tests {
         (origin, work)
     }
 
+    /// An empty site configuration, i.e. `conf.Get()` after a frontend with
+    /// no site config.
+    fn live(site: &str) -> Arc<sg_config::LiveConfig> {
+        let raw = sg_config::RawUnified {
+            site: site.to_owned(),
+            ..Default::default()
+        };
+        Arc::new(sg_config::LiveConfig::new(
+            sg_config::Unified::parse(&raw).expect("site config"),
+        ))
+    }
+
     fn local_backend(repos_dir: &Path, repo: &str, origin: &Path) -> LocalBackend {
-        LocalBackend {
-            repos_dir: repos_dir.to_path_buf(),
-            remote_urls: Arc::new(StaticUrls(HashMap::from([(
+        LocalBackend::new(
+            repos_dir.to_path_buf(),
+            Arc::new(StaticUrls(HashMap::from([(
                 repo.to_owned(),
                 origin.to_str().expect("utf8").to_owned(),
             )]))),
-            store: None,
-            shard_id: "test-shard".to_owned(),
-            tls: crate::tlsexternal::TlsConfig::default(),
-            custom_fetch: crate::customfetch::CustomFetch::default(),
-            clone_progress_log: false,
-            long_command_timeout: std::time::Duration::from_secs(7200),
-        }
+            None,
+            "test-shard".to_owned(),
+            live("{}"),
+            false,
+        )
     }
 
-    /// A backend whose custom fetch command is `sleep 60`, so a deadline can
-    /// interrupt it without any network or repository setup.
-    fn slow_backend(
-        repos_dir: &Path,
-        repo: &str,
-        remote: &Path,
-        timeout: std::time::Duration,
-    ) -> LocalBackend {
-        let mappings = vec![sg_config::CustomFetchMapping {
-            domain_path: remote.to_str().expect("utf8").to_owned(),
-            fetch: vec!["sleep".to_owned(), "60".to_owned()],
-        }];
-        LocalBackend {
-            repos_dir: repos_dir.to_path_buf(),
-            remote_urls: Arc::new(StaticUrls(HashMap::from([(
+    /// A backend whose custom fetch command is `sleep 60`, so the clone
+    /// deadline (`gitLongCommandTimeout`, in seconds) can interrupt it
+    /// without any network or repository setup.
+    fn slow_backend(repos_dir: &Path, repo: &str, remote: &Path) -> LocalBackend {
+        let site = serde_json::json!({
+            "gitLongCommandTimeout": 1,
+            "experimentalFeatures": {
+                "customGitFetch": [{
+                    "domainPath": remote.to_str().expect("utf8"),
+                    "fetch": "sleep 60",
+                }],
+            },
+        })
+        .to_string();
+        LocalBackend::new(
+            repos_dir.to_path_buf(),
+            Arc::new(StaticUrls(HashMap::from([(
                 repo.to_owned(),
                 remote.to_str().expect("utf8").to_owned(),
             )]))),
-            store: None,
-            shard_id: "test-shard".to_owned(),
-            tls: crate::tlsexternal::TlsConfig::default(),
-            custom_fetch: crate::customfetch::CustomFetch::build(Some(&mappings), true),
-            clone_progress_log: false,
-            long_command_timeout: timeout,
-        }
+            None,
+            "test-shard".to_owned(),
+            live(&site),
+            true,
+        )
     }
 
     #[tokio::test]
@@ -957,16 +1031,14 @@ mod tests {
         let repos_dir = tmp.path().join("repos");
         std::fs::create_dir_all(&repos_dir).expect("mkdir");
         // No remote URL is registered: the special case must not look it up.
-        let backend = LocalBackend {
-            repos_dir: repos_dir.clone(),
-            remote_urls: Arc::new(StaticUrls(HashMap::new())),
-            store: None,
-            shard_id: "test-shard".to_owned(),
-            tls: crate::tlsexternal::TlsConfig::default(),
-            custom_fetch: crate::customfetch::CustomFetch::default(),
-            clone_progress_log: false,
-            long_command_timeout: std::time::Duration::from_secs(7200),
-        };
+        let backend = LocalBackend::new(
+            repos_dir.clone(),
+            Arc::new(StaticUrls(HashMap::new())),
+            None,
+            "test-shard".to_owned(),
+            live("{}"),
+            false,
+        );
         let repo = "github.com/sourcegraphtest/alwayscloningtest";
         let locker = RepositoryLocker::new();
         let lock = locker.try_acquire(repo, "test").expect("lock");
@@ -981,16 +1053,14 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let repos_dir = tmp.path().join("repos");
         std::fs::create_dir_all(&repos_dir).expect("mkdir");
-        let backend = LocalBackend {
+        let backend = LocalBackend::new(
             repos_dir,
-            remote_urls: Arc::new(StaticUrls(HashMap::new())),
-            store: None,
-            shard_id: "test-shard".to_owned(),
-            tls: crate::tlsexternal::TlsConfig::default(),
-            custom_fetch: crate::customfetch::CustomFetch::default(),
-            clone_progress_log: false,
-            long_command_timeout: std::time::Duration::from_secs(7200),
-        };
+            Arc::new(StaticUrls(HashMap::new())),
+            None,
+            "test-shard".to_owned(),
+            live("{}"),
+            false,
+        );
         let locker = RepositoryLocker::new();
         let lock = locker.try_acquire("example.com/x", "test").expect("lock");
         let err = backend
@@ -1047,12 +1117,7 @@ mod tests {
         let origin = tmp.path().join("origin.git");
         std::fs::create_dir_all(&origin).expect("mkdir");
         let repo = "example.com/owner/slow";
-        let backend = slow_backend(
-            &repos_dir,
-            repo,
-            &origin,
-            std::time::Duration::from_millis(50),
-        );
+        let backend = slow_backend(&repos_dir, repo, &origin);
         let locker = RepositoryLocker::new();
         let lock = locker.try_acquire(repo, "test").expect("lock");
 
@@ -1061,10 +1126,7 @@ mod tests {
             .await
             .expect_err("clone deadline");
         // `cloneRepo`: `failed to clone repo within deadline of %s`.
-        assert_eq!(
-            err.message(),
-            "failed to clone repo within deadline of 50ms"
-        );
+        assert_eq!(err.message(), "failed to clone repo within deadline of 1s");
         assert!(!backend.repo_cloned(repo).await.expect("repo cloned"));
     }
 
@@ -1078,12 +1140,7 @@ mod tests {
         let repo = "example.com/owner/slow";
         let git_dir = crate::repo::repo_dir(&repos_dir, repo).expect("git dir");
         std::fs::create_dir_all(&git_dir).expect("mkdir");
-        let backend = slow_backend(
-            &repos_dir,
-            repo,
-            &origin,
-            std::time::Duration::from_millis(50),
-        );
+        let backend = slow_backend(&repos_dir, repo, &origin);
         let locker = RepositoryLocker::new();
         let lock = locker.try_acquire(repo, "test").expect("lock");
 
@@ -1092,10 +1149,7 @@ mod tests {
             .await
             .expect_err("fetch deadline");
         // `doRepoUpdate`: `failed to update repo within deadline of %s`.
-        assert_eq!(
-            err.message(),
-            "failed to update repo within deadline of 50ms"
-        );
+        assert_eq!(err.message(), "failed to update repo within deadline of 1s");
     }
 
     /// Exercises the `gitserver_repos` writes of `cloneRepo`/`doRepoUpdate`

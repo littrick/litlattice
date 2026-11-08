@@ -13,6 +13,7 @@ use sqlx::types::time::OffsetDateTime;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
+use sg_config::LiveConfig;
 use sg_db::gitserver_repos::GitserverReposStore;
 
 use crate::repo::{repo_dir, repo_last_changed, repo_last_fetched};
@@ -25,8 +26,9 @@ pub struct FetchService {
     pub tasks: TaskTracker,
     /// `s.db.GitserverRepos()`; `None` only in unit tests.
     pub store: Option<Arc<GitserverReposStore>>,
-    /// `conf.Get().DisableAutoGitUpdates`: `EnsureRevision` must not fetch.
-    pub disable_auto_git_updates: bool,
+    /// The live configuration; `EnsureRevision` reads
+    /// `conf.Get().DisableAutoGitUpdates` on every call, like the baseline.
+    pub live: Arc<LiveConfig>,
 }
 
 impl FetchService {
@@ -68,7 +70,7 @@ impl FetchService {
             return false;
         }
 
-        if self.disable_auto_git_updates {
+        if self.live.current().site.disable_auto_git_updates() {
             crate::metrics::ensure_revision("disabled");
             // A fetch here is exactly what `DisableAutoGitUpdates` forbids.
             return false;
@@ -187,8 +189,18 @@ mod tests {
             }),
             tasks: TaskTracker::new(),
             store: None,
-            disable_auto_git_updates: disable,
+            live: live_config(disable),
         }
+    }
+
+    fn live_config(disable: bool) -> Arc<LiveConfig> {
+        let raw = sg_config::RawUnified {
+            site: serde_json::json!({ "disableAutoGitUpdates": disable }).to_string(),
+            ..Default::default()
+        };
+        Arc::new(LiveConfig::new(
+            sg_config::Unified::parse(&raw).expect("site config"),
+        ))
     }
 
     async fn shutdown(service: &FetchService) {

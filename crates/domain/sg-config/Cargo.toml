@@ -10,5 +10,7 @@ publish.workspace = true
 sg-proto = { path = "../../net/sg-proto" }
 tonic = { workspace = true }
 tokio = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
 serde_json = { workspace = true }
 prost-types = { workspace = true }

@@ -1292,8 +1292,18 @@ mod tests {
             }),
             tasks: TaskTracker::new(),
             store: None,
-            disable_auto_git_updates: disable,
+            live: live_config(disable),
         })
+    }
+
+    fn live_config(disable: bool) -> Arc<sg_config::LiveConfig> {
+        let raw = sg_config::RawUnified {
+            site: serde_json::json!({ "disableAutoGitUpdates": disable }).to_string(),
+            ..Default::default()
+        };
+        Arc::new(sg_config::LiveConfig::new(
+            sg_config::Unified::parse(&raw).expect("site config"),
+        ))
     }
 
     #[allow(clippy::result_large_err)] // `tonic::Status` is the RPC error type.

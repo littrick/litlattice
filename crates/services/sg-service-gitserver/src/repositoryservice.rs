@@ -294,7 +294,9 @@ mod tests {
             }),
             tasks,
             store: None,
-            disable_auto_git_updates: false,
+            live: Arc::new(sg_config::LiveConfig::new(
+                sg_config::Unified::parse(&sg_config::RawUnified::default()).expect("site config"),
+            )),
         }));
         svc
     }

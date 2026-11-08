@@ -16,13 +16,16 @@
 //! - [`ServiceConnections`] carries the deployment wiring the frontend owns
 //!   (notably `postgresDSN` and the gitserver addresses).
 //!
-//! The client does not yet implement the baseline's watcher goroutine
-//! (`conf.Watch`); callers refresh explicitly and read the cached value.
+//! [`ConfigWatcher`] is the baseline's `continuouslyUpdate` goroutine: it
+//! polls `GetConfig` every 0–5 seconds and, when the raw configuration
+//! changes, replaces the [`LiveConfig`] snapshot and wakes every
+//! `conf.Watch`-style consumer.
 
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use sg_proto::internalapi as proto;
+use tokio_util::sync::CancellationToken;
 use tonic::transport::{Channel, Endpoint};
 
 /// `SRC_FRONTEND_INTERNAL` default (`internalapi.frontendInternal`).
@@ -56,6 +59,19 @@ impl std::fmt::Display for ConfigError {
 }
 
 impl std::error::Error for ConfigError {}
+
+impl ConfigError {
+    /// `isFrontendUnreachableError`: gRPC `Unavailable`, or a failed
+    /// connection. The watcher suppresses these during the frontend's
+    /// startup window.
+    pub fn is_unreachable(&self) -> bool {
+        match self {
+            ConfigError::Client(status) => status.code() == tonic::Code::Unavailable,
+            ConfigError::Transport(_) => true,
+            ConfigError::Parse(_) => false,
+        }
+    }
+}
 
 impl From<tonic::Status> for ConfigError {
     fn from(status: tonic::Status) -> Self {
@@ -417,6 +433,9 @@ pub struct ConfigClient {
     addr: String,
     channel: tokio::sync::OnceCell<Channel>,
     current: RwLock<Option<Arc<Unified>>>,
+    /// The raw configuration `current` was parsed from. `conf`'s store keeps
+    /// it to compare fresh fetches without reparsing (`RawUnified.Equal`).
+    raw: RwLock<Option<RawUnified>>,
 }
 
 impl ConfigClient {
@@ -435,6 +454,7 @@ impl ConfigClient {
             addr: normalize_address(&addr.into()),
             channel: tokio::sync::OnceCell::new(),
             current: RwLock::new(None),
+            raw: RwLock::new(None),
         }
     }
 
@@ -466,6 +486,7 @@ impl ConfigClient {
     pub async fn refresh(&self) -> Result<Arc<Unified>, ConfigError> {
         let raw = self.fetch_raw().await?;
         let unified = Arc::new(Unified::parse(&raw)?);
+        *self.raw.write().expect("config lock poisoned") = Some(raw);
         *self.current.write().expect("config lock poisoned") = Some(unified.clone());
         Ok(unified)
     }
@@ -475,10 +496,160 @@ impl ConfigClient {
         self.current.read().expect("config lock poisoned").clone()
     }
 
+    /// The raw configuration behind [`Self::get`].
+    pub fn raw(&self) -> Option<RawUnified> {
+        self.raw.read().expect("config lock poisoned").clone()
+    }
+
     /// Seed the cache for tests (`conf.Mock`).
     pub fn set(&self, unified: Unified) {
         *self.current.write().expect("config lock poisoned") = Some(Arc::new(unified));
     }
+}
+
+/// `conf.Watch`'s shared state: the most recently parsed configuration plus a
+/// generation counter that advances whenever it is replaced.
+///
+/// Consumers either read [`Self::current`] at the point of use (the baseline's
+/// `conf.Get()`) or subscribe to [`Self::subscribe`] (the baseline's
+/// `conf.Watch(f)`, which also invokes `f` immediately).
+pub struct LiveConfig {
+    current: RwLock<Arc<Unified>>,
+    generation: tokio::sync::watch::Sender<u64>,
+}
+
+impl LiveConfig {
+    /// Start from the configuration the service booted with (`conf.Get`
+    /// returns the initial config before the first background update).
+    pub fn new(initial: Unified) -> Self {
+        Self {
+            current: RwLock::new(Arc::new(initial)),
+            generation: tokio::sync::watch::channel(0).0,
+        }
+    }
+
+    /// `conf.Get`.
+    pub fn current(&self) -> Arc<Unified> {
+        self.current.read().expect("config lock poisoned").clone()
+    }
+
+    /// A counter that changes exactly when the configuration is replaced.
+    /// Caches keyed on it (`conf.Cached`) recompute only after a change.
+    pub fn generation(&self) -> u64 {
+        *self.generation.borrow()
+    }
+
+    /// `conf.Watch`: the receiver's `changed()` resolves on every replacement.
+    pub fn subscribe(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.generation.subscribe()
+    }
+
+    /// Replace the snapshot and notify watchers. Also the test/mock hook
+    /// (`conf.Mock`).
+    pub fn set(&self, unified: Unified) {
+        *self.current.write().expect("config lock poisoned") = Arc::new(unified);
+        self.generation.send_modify(|generation| {
+            *generation = generation.wrapping_add(1);
+        });
+    }
+}
+
+/// `conf.client.continuouslyUpdate`: the background goroutine that keeps a
+/// [`LiveConfig`] in sync with the frontend.
+pub struct ConfigWatcher {
+    client: Arc<ConfigClient>,
+    live: Arc<LiveConfig>,
+    /// `opts.sleepBetweenUpdates`: only tests shrink this.
+    max_poll_jitter: Duration,
+}
+
+/// `delayBeforeUnreachableLog`: how long the frontend may be unreachable
+/// before the watcher logs it (services often start before the frontend).
+const DELAY_BEFORE_UNREACHABLE_LOG: Duration = Duration::from_secs(15);
+
+/// `rand.Int63n(5 * time.Second)`.
+const MAX_POLL_JITTER: Duration = Duration::from_secs(5);
+
+impl ConfigWatcher {
+    pub fn new(client: Arc<ConfigClient>, live: Arc<LiveConfig>) -> Self {
+        Self {
+            client,
+            live,
+            max_poll_jitter: MAX_POLL_JITTER,
+        }
+    }
+
+    /// Test hook for `continuousUpdateOptions.sleepBetweenUpdates`.
+    pub fn with_poll_jitter(mut self, max_poll_jitter: Duration) -> Self {
+        self.max_poll_jitter = max_poll_jitter;
+        self
+    }
+
+    /// Poll `GetConfig` until shutdown, replacing `live` when the raw
+    /// configuration changes (`RawUnified.Equal`, so `id` alone does not
+    /// count).
+    ///
+    /// Erratum: the baseline's loop starts with an unconditional
+    /// `fetchAndUpdate` before its first sleep. Here the caller has already
+    /// fetched the initial configuration (`wait_for_initial_config`), so the
+    /// first comparison is seeded from [`ConfigClient::raw`] and the loop
+    /// starts with the sleep, avoiding a duplicate update at startup.
+    pub async fn run(&self, shutdown: CancellationToken) {
+        let mut previous = self.client.raw();
+        let mut last_update = Instant::now();
+
+        loop {
+            tokio::select! {
+                _ = shutdown.cancelled() => return,
+                _ = tokio::time::sleep(poll_jitter(self.max_poll_jitter)) => {}
+            }
+
+            match self.client.fetch_raw().await {
+                Ok(raw) => {
+                    last_update = Instant::now();
+                    let changed = previous
+                        .as_ref()
+                        .map(|previous| !previous.equal(&raw))
+                        .unwrap_or(true);
+                    previous = Some(raw.clone());
+                    if !changed {
+                        continue;
+                    }
+                    match Unified::parse(&raw) {
+                        Ok(unified) => {
+                            tracing::info!("config changed, notifying watchers");
+                            self.live.set(unified);
+                        }
+                        // `store.MaybeUpdate` keeps the previous config when
+                        // the new one does not parse.
+                        Err(err) => tracing::error!(
+                            error = %err,
+                            "received error during background config update"
+                        ),
+                    }
+                }
+                Err(err) => {
+                    if last_update.elapsed() > DELAY_BEFORE_UNREACHABLE_LOG || !err.is_unreachable()
+                    {
+                        tracing::error!(
+                            error = %err,
+                            "received error during background config update"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// A cheap stand-in for Go's `rand.Int63n(5s)`: the low bits of the wall
+/// clock, modulo the jitter window.
+fn poll_jitter(max: Duration) -> Duration {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos() as u64)
+        .unwrap_or(0);
+    Duration::from_nanos(nanos % max.as_nanos().max(1) as u64)
 }
 
 /// `mustParseSourcegraphInternalURL`: bare addresses default to `http` and
@@ -827,6 +998,77 @@ mod tests {
         handle.abort();
     }
 
+    #[tokio::test]
+    async fn config_watcher_follows_the_frontend() {
+        use proto::config_service_server::{ConfigService, ConfigServiceServer};
+        use std::sync::Mutex;
+
+        struct FakeConfig(Arc<Mutex<proto::RawUnified>>);
+
+        #[tonic::async_trait]
+        impl ConfigService for FakeConfig {
+            async fn get_config(
+                &self,
+                _request: tonic::Request<proto::GetConfigRequest>,
+            ) -> Result<tonic::Response<proto::GetConfigResponse>, tonic::Status> {
+                let raw = self.0.lock().expect("lock").clone();
+                Ok(tonic::Response::new(proto::GetConfigResponse {
+                    raw_unified: Some(raw),
+                }))
+            }
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let incoming = tonic::transport::server::TcpIncoming::from_listener(
+            listener,
+            true,
+            Some(Duration::from_secs(5)),
+        )
+        .expect("incoming");
+        let raw = Arc::new(Mutex::new(proto::RawUnified {
+            id: 1,
+            site: r#"{"cloneProgressLog": true}"#.to_owned(),
+            ..Default::default()
+        }));
+        let server = tonic::transport::Server::builder()
+            .add_service(ConfigServiceServer::new(FakeConfig(Arc::clone(&raw))));
+        let handle = tokio::spawn(async move { server.serve_with_incoming(incoming).await });
+
+        let client = Arc::new(ConfigClient::new(format!("127.0.0.1:{}", addr.port())));
+        let initial = client.refresh().await.expect("initial config");
+        assert!(initial.site.clone_progress_log());
+        let live = Arc::new(LiveConfig::new((*initial).clone()));
+        let mut updates = live.subscribe();
+
+        let watcher = ConfigWatcher::new(Arc::clone(&client), Arc::clone(&live))
+            .with_poll_jitter(Duration::from_millis(10));
+        let shutdown = CancellationToken::new();
+        let task = tokio::spawn({
+            let shutdown = shutdown.clone();
+            async move { watcher.run(shutdown).await }
+        });
+
+        // The same raw config is not a change.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(live.generation(), 0);
+
+        // A site config change reaches the watchers within the poll window.
+        raw.lock().expect("lock").site = r#"{"cloneProgressLog": false}"#.to_owned();
+        tokio::time::timeout(Duration::from_secs(5), updates.changed())
+            .await
+            .expect("config change")
+            .expect("watcher alive");
+        assert_eq!(live.generation(), 1);
+        assert!(!live.current().site.clone_progress_log());
+
+        shutdown.cancel();
+        task.await.expect("watcher exits");
+        handle.abort();
+    }
+
     /// Manual parity check against a running Go frontend:
     /// `SG_TEST_FRONTEND_ADDR=127.0.0.1:3090 cargo test -p sg-config`.
     #[tokio::test]
@@ -842,6 +1084,36 @@ mod tests {
             !unified.service_connections.postgres_dsn.is_empty(),
             "postgres DSN is empty"
         );
+    }
+
+    #[tokio::test]
+    async fn live_config_notifies_watchers_on_change() {
+        let live = LiveConfig::new(Unified::parse(&RawUnified::default()).expect("parse"));
+        assert!(!live.current().site.clone_progress_log());
+
+        // `conf.Watch(f)` runs f immediately; here that is the initial read.
+        let mut updates = live.subscribe();
+        assert_eq!(live.generation(), 0);
+
+        live.set(
+            Unified::parse(&RawUnified {
+                site: r#"{"cloneProgressLog": true}"#.to_owned(),
+                ..Default::default()
+            })
+            .expect("parse"),
+        );
+        updates.changed().await.expect("change");
+        assert_eq!(live.generation(), 1);
+        assert!(live.current().site.clone_progress_log());
+
+        // The poll jitter is always below the 5s window (`rand.Int63n`).
+        assert!(poll_jitter(MAX_POLL_JITTER) < MAX_POLL_JITTER);
+    }
+
+    #[test]
+    fn unreachable_errors_are_flagged() {
+        assert!(ConfigError::Client(tonic::Status::unavailable("down")).is_unreachable());
+        assert!(!ConfigError::Client(tonic::Status::internal("boom")).is_unreachable());
     }
 
     #[test]

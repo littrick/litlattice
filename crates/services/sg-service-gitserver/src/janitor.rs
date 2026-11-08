@@ -18,6 +18,7 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use sg_config::LiveConfig;
 use sg_core::EnvReader;
 use sg_db::gitserver_repos::{CloneStatus, GitserverReposStore};
 use tokio_util::sync::CancellationToken;
@@ -133,9 +134,10 @@ pub struct Janitor {
     pub repos_dir: Arc<PathBuf>,
     pub store: Option<Arc<GitserverReposStore>>,
     pub shard_id: String,
-    pub addresses: GitserverAddresses,
-    pub long_command_timeout: Duration,
-    pub disable_auto_git_updates: bool,
+    /// `conf.Get()`: the shard list is recomputed on every run
+    /// (`connection.NewGitserverAddresses(conf.Get())`), and
+    /// `DisableAutoGitUpdates` / `GitLongCommandTimeout` are read live.
+    pub live: Arc<LiveConfig>,
     pub config: JanitorConfig,
 }
 
@@ -185,9 +187,12 @@ impl Janitor {
         metrics::janitor_running(true);
         let _guard = RunGuard { start };
 
+        // `gitserverAddrs := connection.NewGitserverAddresses(conf.Get())`
+        // happens once per run.
+        let unified = self.live.current();
+        let addresses = GitserverAddresses::from_unified(&unified);
         let mut state = RunState {
-            known_shard: self
-                .addresses
+            known_shard: addresses
                 .addresses
                 .iter()
                 .any(|addr| crate::addrs::hostname_match(&self.shard_id, addr)),
@@ -196,12 +201,12 @@ impl Janitor {
         if !state.known_shard {
             tracing::warn!(
                 current_hostname = %self.shard_id,
-                all_shards = ?self.addresses.addresses,
+                all_shards = ?addresses.addresses,
                 "current shard is not included in the list of known gitserver shards, will not delete repos"
             );
         }
 
-        let jobs = self.jobs();
+        let jobs = self.jobs(unified.site.disable_auto_git_updates());
         let mut repos = Vec::new();
         fs::for_each_repo(&self.repos_dir, |name, git_dir| {
             repos.push((name.to_owned(), git_dir.to_path_buf()));
@@ -217,7 +222,9 @@ impl Janitor {
                     break 'repos;
                 }
                 let job_start = Instant::now();
-                let (done, err) = self.run_job(job, &mut state, repo, git_dir).await;
+                let (done, err) = self
+                    .run_job(job, &addresses, &mut state, repo, git_dir)
+                    .await;
                 metrics::janitor_job_duration(
                     err.is_none(),
                     job,
@@ -269,7 +276,7 @@ impl Janitor {
     }
 
     /// The ordered cleanup list from `cleanupRepos`.
-    fn jobs(&self) -> Vec<&'static str> {
+    fn jobs(&self, disable_auto_git_updates: bool) -> Vec<&'static str> {
         let mut jobs = vec![
             "delete wrong shard repos",
             "maybe remove corrupt",
@@ -286,7 +293,7 @@ impl Janitor {
             }
             GcMode::GitAutoGc => {}
         }
-        if !self.disable_auto_git_updates {
+        if !disable_auto_git_updates {
             jobs.push("maybe re-clone");
         }
         // Compute the size last so it reflects the previous jobs' cleanups.
@@ -297,17 +304,23 @@ impl Janitor {
     async fn run_job(
         &self,
         name: &str,
+        addresses: &GitserverAddresses,
         state: &mut RunState,
         repo: &str,
         git_dir: &Path,
     ) -> Outcome {
         match name {
-            "delete wrong shard repos" => self.maybe_delete_wrong_shard(state, repo, git_dir),
+            "delete wrong shard repos" => {
+                self.maybe_delete_wrong_shard(addresses, state, repo, git_dir)
+            }
             "maybe remove corrupt" => self.maybe_remove_corrupt(state, repo, git_dir).await,
             "maybe remove non existing" => {
                 self.maybe_remove_non_existing(state, repo, git_dir).await
             }
-            "remove stale locks" => remove_stale_locks(git_dir, self.long_command_timeout),
+            // `2*conf.GitLongCommandTimeout()`: read at the point of use.
+            "remove stale locks" => {
+                remove_stale_locks(git_dir, self.live.current().site.git_long_command_timeout())
+            }
             "ensure git attributes" => (
                 false,
                 postfetch::set_git_attributes(git_dir)
@@ -340,15 +353,12 @@ impl Janitor {
     /// `maybeDeleteWrongShardRepos`.
     fn maybe_delete_wrong_shard(
         &self,
+        addresses: &GitserverAddresses,
         state: &mut RunState,
         repo: &str,
         git_dir: &Path,
     ) -> Outcome {
-        let addr = self
-            .addresses
-            .addr_for_repo(repo)
-            .unwrap_or_default()
-            .to_owned();
+        let addr = addresses.addr_for_repo(repo).unwrap_or_default().to_owned();
         if crate::addrs::hostname_match(&self.shard_id, &addr) {
             return (false, None);
         }
@@ -1509,9 +1519,22 @@ mod tests {
             repos_dir: Arc::new(repos_dir.to_path_buf()),
             store: None,
             shard_id: "gitserver-0".to_owned(),
-            addresses,
-            long_command_timeout: Duration::from_secs(7200),
-            disable_auto_git_updates: false,
+            live: Arc::new(LiveConfig::new(
+                sg_config::Unified::parse(&sg_config::RawUnified {
+                    service_connections: sg_config::ServiceConnections {
+                        git_servers: addresses.addresses.clone(),
+                        ..Default::default()
+                    },
+                    site: serde_json::json!({
+                        "experimentalFeatures": {
+                            "gitServerPinnedRepos": addresses.pinned_servers,
+                        },
+                    })
+                    .to_string(),
+                    ..Default::default()
+                })
+                .expect("config"),
+            )),
             config: JanitorConfig {
                 git_gc_mode: GcMode::GitAutoGc,
                 ..config
@@ -1568,21 +1591,18 @@ mod tests {
         std::fs::create_dir_all(&repos).expect("mkdir");
         let (repo, git_dir) = bare_repo(&repos, "example.com/owner/repo");
 
-        let janitor = janitor(
-            &repos,
-            GitserverAddresses {
-                addresses: vec!["gitserver-0:3178".to_owned(), "gitserver-1:3178".to_owned()],
-                pinned_servers: [(repo.clone(), "gitserver-1:3178".to_owned())]
-                    .into_iter()
-                    .collect(),
-            },
-        )
-        .await;
+        let addresses = GitserverAddresses {
+            addresses: vec!["gitserver-0:3178".to_owned(), "gitserver-1:3178".to_owned()],
+            pinned_servers: [(repo.clone(), "gitserver-1:3178".to_owned())]
+                .into_iter()
+                .collect(),
+        };
+        let janitor = janitor(&repos, addresses.clone()).await;
         let mut state = RunState {
             known_shard: true,
             ..RunState::default()
         };
-        let (done, err) = janitor.maybe_delete_wrong_shard(&mut state, &repo, &git_dir);
+        let (done, err) = janitor.maybe_delete_wrong_shard(&addresses, &mut state, &repo, &git_dir);
         assert!(done);
         assert!(err.is_none());
         assert_eq!(state.wrong_shard_count, 1);
@@ -1596,16 +1616,13 @@ mod tests {
         let repos = tmp.path().join("repos");
         std::fs::create_dir_all(&repos).expect("mkdir");
         let (repo, git_dir) = bare_repo(&repos, "example.com/owner/repo");
-        let janitor = janitor(
-            &repos,
-            GitserverAddresses {
-                addresses: vec!["other:3178".to_owned()],
-                pinned_servers: Default::default(),
-            },
-        )
-        .await;
+        let addresses = GitserverAddresses {
+            addresses: vec!["other:3178".to_owned()],
+            pinned_servers: Default::default(),
+        };
+        let janitor = janitor(&repos, addresses.clone()).await;
         let mut state = RunState::default();
-        let (done, err) = janitor.maybe_delete_wrong_shard(&mut state, &repo, &git_dir);
+        let (done, err) = janitor.maybe_delete_wrong_shard(&addresses, &mut state, &repo, &git_dir);
         assert!(!done);
         assert!(err.is_none());
         assert_eq!(state.wrong_shard_count, 1);

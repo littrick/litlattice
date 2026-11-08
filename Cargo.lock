@@ -1818,7 +1818,9 @@ dependencies = [
  "serde_json",
  "sg-proto",
  "tokio",
+ "tokio-util",
  "tonic",
+ "tracing",
 ]
 
 [[package]]

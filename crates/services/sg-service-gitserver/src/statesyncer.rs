@@ -3,14 +3,15 @@
 //!
 //! The baseline runs a full scan when the configured gitserver set (or the
 //! pinned-repo map) changes, and after any failed sync; otherwise only rows
-//! without a shard are visited. Rust's config client has no watcher yet, so
-//! the address set is a startup snapshot and the first successful sync is
-//! effectively the only full one.
+//! without a shard are visited. The address set is read from the live
+//! configuration on every tick (`NewGitserverAddresses(conf.Get())`), so a
+//! configuration change triggers the full scan without a restart.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use sg_config::LiveConfig;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
@@ -78,7 +79,8 @@ pub struct RepoStateSyncer {
     pub locker: Arc<RepositoryLocker>,
     pub repos_dir: Arc<std::path::PathBuf>,
     pub shard_id: String,
-    pub addresses: GitserverAddresses,
+    /// `conf.Get()`: the shard list and pins are recomputed on every run.
+    pub live: Arc<LiveConfig>,
     pub interval: Duration,
     pub batch_size: i64,
     pub per_second: i64,
@@ -100,15 +102,18 @@ impl RepoStateSyncer {
                 _ = ticker.tick() => {}
             }
 
-            let current_addrs = self.addresses.addresses.join(",");
+            // `connection.NewGitserverAddresses(conf.Get())` per run.
+            let addresses = GitserverAddresses::from_unified(&self.live.current());
+
+            let current_addrs = addresses.addresses.join(",");
             full_sync = full_sync || current_addrs != previous_addrs;
             previous_addrs = current_addrs;
 
-            let current_pinned = pinned_key(&self.addresses.pinned_servers);
+            let current_pinned = pinned_key(&addresses.pinned_servers);
             full_sync = full_sync || current_pinned != previous_pinned;
             previous_pinned = current_pinned;
 
-            match self.sync_repo_state(full_sync, &shutdown).await {
+            match self.sync_repo_state(full_sync, &addresses, &shutdown).await {
                 Ok(()) => full_sync = false,
                 Err(err) => {
                     // The baseline retries a full sync next time.
@@ -122,10 +127,11 @@ impl RepoStateSyncer {
     pub async fn sync_repo_state(
         &self,
         full_sync: bool,
+        addresses: &GitserverAddresses,
         shutdown: &CancellationToken,
     ) -> Result<(), String> {
         tracing::debug!(full_sync, "starting syncRepoState");
-        let addrs = &self.addresses.addresses;
+        let addrs = &addresses.addresses;
 
         if !addrs
             .iter()
@@ -190,10 +196,7 @@ impl RepoStateSyncer {
                 crate::metrics::repo_sync_state("check");
 
                 // Only reconcile repositories this shard owns.
-                let addr = self
-                    .addresses
-                    .addr_for_repo(&status.name)
-                    .unwrap_or_default();
+                let addr = addresses.addr_for_repo(&status.name).unwrap_or_default();
                 if !hostname_match(&self.shard_id, addr) {
                     crate::metrics::repo_sync_state("other_shard");
                     continue;
@@ -299,16 +302,26 @@ mod tests {
             locker: RepositoryLocker::new(),
             repos_dir: Arc::new(repos_dir.path().to_path_buf()),
             shard_id: "gitserver-9".to_owned(),
-            addresses: GitserverAddresses {
-                addresses: vec!["gitserver-0:3178".to_owned()],
-                pinned_servers: BTreeMap::new(),
-            },
+            live: Arc::new(LiveConfig::new(
+                sg_config::Unified::parse(&sg_config::RawUnified {
+                    service_connections: sg_config::ServiceConnections {
+                        git_servers: vec!["gitserver-0:3178".to_owned()],
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                })
+                .expect("config"),
+            )),
             interval: Duration::from_secs(60),
             batch_size: 500,
             per_second: 500,
         };
+        let addresses = GitserverAddresses {
+            addresses: vec!["gitserver-0:3178".to_owned()],
+            pinned_servers: BTreeMap::new(),
+        };
         let err = syncer
-            .sync_repo_state(true, &CancellationToken::new())
+            .sync_repo_state(true, &addresses, &CancellationToken::new())
             .await
             .expect_err("unknown shard");
         assert_eq!(

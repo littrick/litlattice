@@ -6,6 +6,8 @@
 
 use std::collections::BTreeMap;
 
+use sg_config::Unified;
+
 /// `connection.GitserverAddresses`.
 #[derive(Debug, Clone, Default)]
 pub struct GitserverAddresses {
@@ -16,6 +18,16 @@ pub struct GitserverAddresses {
 }
 
 impl GitserverAddresses {
+    /// `connection.NewGitserverAddresses(conf.Get())`: the shard list from
+    /// the service connections and the pins from the site config. Called on
+    /// every janitor run and state sync so both follow a live configuration.
+    pub fn from_unified(unified: &Unified) -> Self {
+        Self {
+            addresses: unified.service_connections.git_servers.clone(),
+            pinned_servers: unified.site.git_server_pinned_repos(),
+        }
+    }
+
     /// `AddrForRepo`: pinned repos win; otherwise the normalized name is
     /// hashed (MD5, big-endian first 8 bytes) modulo the shard count.
     ///
