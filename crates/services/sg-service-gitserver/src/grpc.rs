@@ -32,6 +32,8 @@ type Stream<T> = Pin<Box<dyn tokio_stream::Stream<Item = Result<T, Status>> + Se
 pub struct Grpc {
     pub repos_dir: Arc<std::path::PathBuf>,
     pub tasks: TaskTracker,
+    /// `RepositoryLocker`: status text for clones/fetches in flight.
+    pub locker: Arc<crate::locker::RepositoryLocker>,
 }
 
 impl Grpc {
@@ -490,9 +492,6 @@ impl gpb::gitserver_service_server::GitserverService for Grpc {
             None => false,
         };
 
-        // `RepositoryLocker.Status` only has entries while a clone is in
-        // flight; the Rust server has no write path yet (M9.3), so the locker
-        // is empty and the `!cloned && locked` branch cannot trigger.
         let mut response = gpb::RepoCloneProgressResponse {
             cloned,
             clone_in_progress: always_cloning,
@@ -500,6 +499,14 @@ impl gpb::gitserver_service_server::GitserverService for Grpc {
         };
         if always_cloning {
             response.clone_progress = "This will never finish cloning".to_owned();
+        }
+        // `repoCloneProgress`: the locker status only overrides the response
+        // while the repository is not cloned (`!cloned && locked`).
+        if let Some(clone_progress) = self.locker.status(&request.repo_name) {
+            if !cloned {
+                response.clone_in_progress = true;
+                response.clone_progress = clone_progress;
+            }
         }
         Ok(GrpcResponse::new(response))
     }

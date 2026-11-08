@@ -26,6 +26,7 @@ pub mod disk;
 pub mod git;
 pub mod gitservice;
 pub mod grpc;
+pub mod locker;
 pub mod memobs;
 pub mod metrics;
 mod mux;
@@ -133,6 +134,7 @@ impl Service for GitserverService {
         let grpc = Grpc {
             repos_dir: Arc::new(config.repos_dir.clone()),
             tasks: tasks.clone(),
+            locker: locker::RepositoryLocker::new(),
         };
         let routes = tonic::service::Routes::new(
             gpb::gitserver_service_server::GitserverServiceServer::new(grpc),
