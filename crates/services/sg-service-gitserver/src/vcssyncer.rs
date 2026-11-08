@@ -112,7 +112,7 @@ pub fn fetch_refspecs() -> Vec<String> {
 /// SSH, the URL argument loses its userinfo and an extra credential helper
 /// reads `GIT_SG_USERNAME`/`GIT_SG_PASSWORD` instead, so the secret does not
 /// appear in `ps` output.
-fn configure_remote_command(
+pub(crate) fn configure_remote_command(
     args: &mut Vec<String>,
     env: &mut Vec<(String, String)>,
     remote: &VcsUrl,
@@ -513,7 +513,7 @@ pub async fn check_cloneable(remote: &VcsUrl, tls: &TlsConfig) -> Result<(), Git
 }
 
 /// Go `exec.ExitError.Error()`.
-fn exit_status(status: &std::process::ExitStatus) -> String {
+pub(crate) fn exit_status(status: &std::process::ExitStatus) -> String {
     if let Some(code) = status.code() {
         return format!("exit status {code}");
     }

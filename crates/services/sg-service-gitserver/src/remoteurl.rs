@@ -73,6 +73,12 @@ impl DbRemoteUrlSource {
 
 #[async_trait]
 impl RemoteUrlSource for DbRemoteUrlSource {
+    /// `GetRemoteURLFunc`: the raw lookup. `Server.getRemoteURL` adds the
+    /// `GetRemoteURLFunc` wrapper itself.
+    async fn remote_url_func(&self, repo: &str) -> Result<String, GitError> {
+        self.lookup(repo).await.map_err(GitError::Message)
+    }
+
     async fn remote_url(&self, repo: &str) -> Result<String, GitError> {
         self.lookup(repo)
             .await

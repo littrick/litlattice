@@ -41,6 +41,7 @@ pub mod locker;
 pub mod memobs;
 pub mod metrics;
 mod mux;
+pub mod patch;
 pub mod postfetch;
 pub mod progress;
 pub mod remoteurl;
@@ -216,6 +217,12 @@ impl Service for GitserverService {
             Arc::clone(&remote_urls) as Arc<dyn update::RemoteUrlSource>,
             Arc::clone(&live),
         ));
+        // `Server.CreateCommitFromPatch`: the batch-changes write path.
+        let patch = Arc::new(patch::PatchService::new(
+            config.repos_dir.clone(),
+            Arc::clone(&remote_urls) as Arc<dyn update::RemoteUrlSource>,
+            Arc::clone(&live),
+        ));
         let backend = Arc::new(update::LocalBackend::new(
             config.repos_dir.clone(),
             remote_urls,
@@ -248,6 +255,7 @@ impl Service for GitserverService {
             locker: Arc::clone(&locker),
             fetch: Some(Arc::clone(&fetch)),
             cloneable: Some(cloneable),
+            patch: Some(patch),
         };
         let repository_service = repositoryservice::RepositoryService {
             repos_dir: Arc::new(config.repos_dir.clone()),

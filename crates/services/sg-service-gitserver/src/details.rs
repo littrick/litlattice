@@ -57,6 +57,19 @@ struct FileNotFoundPayload {
     path: Vec<u8>,
 }
 
+/// `gitserver.v1.CreateCommitFromPatchError`.
+#[derive(Clone, PartialEq, Message)]
+struct CreateCommitFromPatchErrorPayload {
+    #[prost(string, tag = "1")]
+    repository_name: String,
+    #[prost(string, tag = "2")]
+    internal_error: String,
+    #[prost(string, tag = "3")]
+    command: String,
+    #[prost(string, tag = "4")]
+    combined_output: String,
+}
+
 fn payload<P: Message>(name: &str, payload: &P) -> prost_types::Any {
     prost_types::Any {
         type_url: format!("type.googleapis.com/gitserver.v1.{name}"),
@@ -86,6 +99,48 @@ pub(crate) fn repo_not_found(repo: &str) -> Status {
                 repo: repo.to_owned(),
                 clone_in_progress: false,
                 clone_progress: String::new(),
+            },
+        ),
+    )
+}
+
+/// Baseline `newRepoNotFoundError` with the repository locker's state
+/// (`checkRepoExists`). `clone_in_progress` is true when the repository is
+/// locked, which can only be a clone in progress for an uncloned repository.
+pub(crate) fn repo_not_found_with_progress(
+    repo: &str,
+    clone_in_progress: bool,
+    clone_progress: &str,
+) -> Status {
+    with_payload(
+        tonic::Code::NotFound,
+        "repo not found",
+        payload(
+            "RepoNotFoundPayload",
+            &RepoNotFoundPayload {
+                repo: repo.to_owned(),
+                clone_in_progress,
+                clone_progress: clone_progress.to_owned(),
+            },
+        ),
+    )
+}
+
+/// `CreateCommitFromPatchError.ToStatus()`: `codes.Internal` whose message is
+/// the internal error, with the error as a details payload.
+pub(crate) fn create_commit_from_patch_error(
+    error: &crate::patch::CreateCommitFromPatchError,
+) -> Status {
+    with_payload(
+        tonic::Code::Internal,
+        &error.internal_error,
+        payload(
+            "CreateCommitFromPatchError",
+            &CreateCommitFromPatchErrorPayload {
+                repository_name: error.repository_name.clone(),
+                internal_error: error.internal_error.clone(),
+                command: error.command.clone(),
+                combined_output: error.combined_output.clone(),
             },
         ),
     )

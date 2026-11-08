@@ -17,7 +17,10 @@ use tonic::{Request as GrpcRequest, Response as GrpcResponse, Status};
 
 use sg_proto::gitserver as gpb;
 
-use crate::details::{file_not_found, repo_not_found, revision_not_found};
+use crate::details::{
+    create_commit_from_patch_error, file_not_found, repo_not_found, repo_not_found_with_progress,
+    revision_not_found,
+};
 use crate::disk::disk_usage;
 use crate::git::{
     pump_blame, pump_commit_log, pump_stdout, stat_path, BlameHunk, BlameRange, CommitLogOptions,
@@ -40,6 +43,9 @@ pub struct Grpc {
     /// `Server.IsRepoCloneable` needs the repository store and the remote URL
     /// source; `None` only in unit tests.
     pub cloneable: Option<Arc<crate::cloneable::CloneableService>>,
+    /// `Server.CreateCommitFromPatch` (the write path); `None` only in unit
+    /// tests.
+    pub patch: Option<Arc<crate::patch::PatchService>>,
 }
 
 impl Grpc {
@@ -51,6 +57,28 @@ impl Grpc {
         match std::fs::metadata(dir.join("HEAD")) {
             Ok(_) => Ok(GitRepo::new(dir)),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Err(repo_not_found(name)),
+            Err(err) => Err(Status::internal(format!(
+                "failed to check if repo is cloned: {err}"
+            ))),
+        }
+    }
+
+    /// Baseline `checkRepoExists`: report `NotFound` with the locker's state
+    /// when the repository is not cloned.
+    #[allow(clippy::result_large_err)] // `tonic::Status` is the RPC error type.
+    fn check_repo_exists(&self, name: &str) -> Result<(), Status> {
+        match crate::fs::repo_cloned(&self.repos_dir, name) {
+            Ok(true) => Ok(()),
+            Ok(false) => {
+                // An uncloned repository can only be locked while it is being
+                // cloned.
+                let status = self.locker.status(name);
+                Err(repo_not_found_with_progress(
+                    name,
+                    status.is_some(),
+                    status.as_deref().unwrap_or_default(),
+                ))
+            }
             Err(err) => Err(Status::internal(format!(
                 "failed to check if repo is cloned: {err}"
             ))),
@@ -368,11 +396,81 @@ impl gpb::gitserver_service_server::GitserverService for Grpc {
     // Stubs
     // ------------------------------------------------------------------
 
+    /// Client-streaming: one `Metadata` message, then `Patch` messages. The
+    /// baseline pipes the patch chunks into `git apply`'s stdin as they
+    /// arrive; here they are buffered first (documented deviation) while
+    /// preserving the baseline's error precedence: a reader error wins over
+    /// the child's exit status because `os/exec.Cmd.Wait` returns it first.
     async fn create_commit_from_patch_binary(
         &self,
-        _request: GrpcRequest<tonic::Streaming<gpb::CreateCommitFromPatchBinaryRequest>>,
+        request: GrpcRequest<tonic::Streaming<gpb::CreateCommitFromPatchBinaryRequest>>,
     ) -> Result<GrpcResponse<gpb::CreateCommitFromPatchBinaryResponse>, Status> {
-        Err(unimplemented("create_commit_from_patch_binary"))
+        let mut stream = request.into_inner();
+
+        // `s.Recv()`: an error (including `io.EOF` when the client sent
+        // nothing) is returned unchanged; gRPC maps `io.EOF` to Unknown.
+        let Some(first) = stream.message().await? else {
+            return Err(Status::unknown("EOF"));
+        };
+        let metadata = match first.payload {
+            Some(gpb::create_commit_from_patch_binary_request::Payload::Metadata(metadata)) => {
+                metadata
+            }
+            _ => return Err(Status::invalid_argument("must send metadata event first")),
+        };
+        if metadata.repo.is_empty() {
+            return Err(Status::invalid_argument("repo must be specified"));
+        }
+        self.check_repo_exists(&metadata.repo)?;
+
+        let mut patch = Vec::new();
+        let mut patch_stream_error = None;
+        loop {
+            match stream.message().await {
+                Ok(Some(message)) => match message.payload {
+                    Some(gpb::create_commit_from_patch_binary_request::Payload::Patch(chunk)) => {
+                        patch.extend_from_slice(&chunk.data);
+                    }
+                    _ => {
+                        // `streamio`'s reader returns the status error to
+                        // `exec`, which surfaces it as the command failure.
+                        patch_stream_error = Some(
+                            "rpc error: code = InvalidArgument desc = must only send patch events after metadata"
+                                .to_owned(),
+                        );
+                        break;
+                    }
+                },
+                Ok(None) => break,
+                Err(status) => {
+                    patch_stream_error = Some(format!(
+                        "rpc error: code = {:?} desc = {}",
+                        status.code(),
+                        status.message()
+                    ));
+                    break;
+                }
+            }
+        }
+
+        let Some(patch_service) = &self.patch else {
+            return Err(unimplemented("create_commit_from_patch_binary"));
+        };
+        let request = crate::patch::CreateCommitFromPatchRequest::from_metadata(metadata);
+        let response = patch_service
+            .create_commit_from_patch(&request, &patch, patch_stream_error)
+            .await;
+        if let Some(error) = &response.error {
+            // `resp.ToProto()` reports the error and the handler returns its
+            // status; the partially filled response is not sent.
+            return Err(create_commit_from_patch_error(error));
+        }
+        Ok(GrpcResponse::new(
+            gpb::CreateCommitFromPatchBinaryResponse {
+                rev: response.rev,
+                changelist_id: response.changelist_id,
+            },
+        ))
     }
 
     async fn get_object(
@@ -1300,6 +1398,7 @@ mod tests {
             locker: crate::locker::RepositoryLocker::new(),
             fetch,
             cloneable: None,
+            patch: None,
         }
     }
 

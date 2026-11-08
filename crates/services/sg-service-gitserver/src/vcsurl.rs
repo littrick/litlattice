@@ -132,6 +132,11 @@ impl std::fmt::Display for VcsUrl {
             // ParseURL keeps the input text; reserializing a well-formed URL
             // yields the same string.
             UrlFormat::Stdlib | UrlFormat::Rsync => f.write_str(&self.raw),
+            // Go's stdlib `URL.String()` only writes `//` when the host, path
+            // or userinfo is non-empty, so an empty local path serializes as
+            // `file:` (which git then parses as an SCP-style URL with host
+            // `file`), not `file://`.
+            UrlFormat::Local if self.raw.is_empty() => f.write_str("file:"),
             UrlFormat::Local => write!(f, "file://{}", self.raw),
         }
     }
@@ -560,5 +565,20 @@ mod tests {
             "fatal: <redacted>"
         );
         assert_eq!(redactor.redact("nothing here"), "nothing here");
+    }
+
+    #[test]
+    fn empty_local_urls_serialize_like_go() {
+        // `vcs.ParseURL("")` → `parseLocal` → stdlib `URL.String()`, which
+        // omits `//` for an empty host/path: `file:`. `CreateCommitFromPatch`
+        // then hands that to `git push`, which parses it as an SCP-style URL
+        // whose host is `file` (the differential run depends on this).
+        let url = parsed("");
+        assert_eq!(url.format, UrlFormat::Local);
+        assert_eq!(url.to_string(), "file:");
+        assert_eq!(
+            UrlRedactor::new(&url).redact("ssh: hostname file: unknown"),
+            "ssh: hostname <redacted> unknown"
+        );
     }
 }

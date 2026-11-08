@@ -178,6 +178,18 @@ impl UpdateServer {
 /// looks the repository up in Postgres and ports `cloneurl`.
 #[async_trait]
 pub trait RemoteUrlSource: Send + Sync {
+    /// `GetRemoteURLFunc` (`shared.getRemoteURLFunc`): the raw clone URL
+    /// lookup, with lookup errors returned unchanged. `Server.getRemoteURL`
+    /// (used by `CreateCommitFromPatch`) wraps failures with
+    /// `GetRemoteURLFunc`; the `vcssyncer.RemoteURLSource` closure used by
+    /// `IsRepoCloneable`/fetches [wraps][Self::remote_url] with
+    /// `getting remote URL for %q`.
+    async fn remote_url_func(&self, repo: &str) -> Result<String, GitError> {
+        self.remote_url(repo).await
+    }
+
+    /// The `vcssyncer.RemoteURLSource` closure from `shared.makeServer`:
+    /// wraps lookup failures with `getting remote URL for %q`.
     async fn remote_url(&self, repo: &str) -> Result<String, GitError>;
 }
 
