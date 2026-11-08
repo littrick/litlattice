@@ -4,10 +4,10 @@
 //! `Provider.FetchRepoPerms` and `getRepoAffiliatedGroups`, plus
 //! `cache.go`'s `cachedGroup`/`cachedGroups`.
 //!
-//! The GitHub REST/GraphQL client and the Redis-backed group cache are
-//! injected through [`GithubClient`] and [`GroupsCache`]. The V3Client port
-//! and the `rcache`-backed implementation land in later slices; this module
-//! fixes the permission computation, deduplication and cache semantics.
+//! The GitHub REST client and the Redis-backed group cache are injected
+//! through [`GithubClient`] and [`GroupsCache`]; [`RedisGroupsCache`] mirrors
+//! the baseline's `rcache.NewWithTTL` key space. This module owns the
+//! permission computation, deduplication and cache semantics.
 //!
 //! The user-centric `FetchUserPerms` path additionally needs external-account
 //! decryption and OAuth token refresh, so it is not ported yet; the
@@ -187,14 +187,17 @@ impl CachedGroup {
     }
 }
 
-/// `cache.go`'s `httpcache.Cache` as used by `cachedGroups`. The baseline
-/// backs it with `rcache`; tests use [`MemoryGroupsCache`].
+/// `cache.go`'s `httpcache.Cache` as used by `cachedGroups`. Production uses
+/// [`RedisGroupsCache`]; tests use [`MemoryGroupsCache`]. The trait is async
+/// because the `rcache` port is async; the baseline's `httpcache.Cache`
+/// methods are synchronous but return no errors (they log and continue).
+#[async_trait]
 pub trait GroupsCache: Send + Sync {
     /// Always returns a group with `org`/`team` populated, even on a miss.
-    fn get(&self, org: &str, team: &str) -> (CachedGroup, bool);
-    fn set(&self, group: &CachedGroup) -> Result<(), String>;
+    async fn get(&self, org: &str, team: &str) -> (CachedGroup, bool);
+    async fn set(&self, group: &CachedGroup) -> Result<(), String>;
     /// Deletes the key and clears the cached values.
-    fn invalidate(&self, group: &mut CachedGroup);
+    async fn invalidate(&self, group: &mut CachedGroup);
 }
 
 /// In-memory `httpcache.Cache` stand-in that stores the same JSON bytes the
@@ -230,8 +233,9 @@ impl MemoryGroupsCache {
     }
 }
 
+#[async_trait]
 impl GroupsCache for MemoryGroupsCache {
-    fn get(&self, org: &str, team: &str) -> (CachedGroup, bool) {
+    async fn get(&self, org: &str, team: &str) -> (CachedGroup, bool) {
         let raw = CachedGroup::new(org, team);
         let Some(bytes) = self.entries.lock().unwrap().get(&raw.key()).cloned() else {
             return (raw, false);
@@ -242,14 +246,87 @@ impl GroupsCache for MemoryGroupsCache {
         }
     }
 
-    fn set(&self, group: &CachedGroup) -> Result<(), String> {
+    async fn set(&self, group: &CachedGroup) -> Result<(), String> {
         let bytes = serde_json::to_vec(group).map_err(|err| err.to_string())?;
         self.entries.lock().unwrap().insert(group.key(), bytes);
         Ok(())
     }
 
-    fn invalidate(&self, group: &mut CachedGroup) {
+    async fn invalidate(&self, group: &mut CachedGroup) {
         self.entries.lock().unwrap().remove(&group.key());
+        group.repositories = None;
+        group.users = None;
+    }
+}
+
+/// `NewProvider`'s cache namespace:
+/// `fmt.Sprintf("gh_groups_perms:%s:%s", codeHost.ServiceID, urn)`.
+pub fn groups_cache_key_prefix(service_id: &str, urn: &str) -> String {
+    format!("gh_groups_perms:{service_id}:{urn}")
+}
+
+/// The `rcache`-backed `cachedGroups`. Every value lives under
+/// `v2:<prefix>:<v1/<org>[/<team>]>`, the baseline's exact key space
+/// (`rcache.dataVersion` + `Cache.rkeyPrefix` + `cachedGroup.key`). With a
+/// positive TTL `Set` issues `SETEX`; TTL 0 issues a plain `SET`, matching
+/// `rcache.NewWithTTL`.
+pub struct RedisGroupsCache {
+    cache: sg_rcache::Cache,
+}
+
+impl RedisGroupsCache {
+    pub fn new(cache: sg_rcache::Cache) -> Self {
+        Self { cache }
+    }
+
+    /// `NewProvider`: `rcache.NewWithTTL(redispool.Cache, key_prefix, TTL seconds)`.
+    pub fn with_ttl(kv: sg_redis::KeyValue, service_id: &str, urn: &str, ttl_seconds: i64) -> Self {
+        Self::new(sg_rcache::Cache::new_with_ttl(
+            kv,
+            &groups_cache_key_prefix(service_id, urn),
+            ttl_seconds,
+        ))
+    }
+
+    pub fn cache(&self) -> &sg_rcache::Cache {
+        &self.cache
+    }
+}
+
+#[async_trait]
+impl GroupsCache for RedisGroupsCache {
+    async fn get(&self, org: &str, team: &str) -> (CachedGroup, bool) {
+        let raw = CachedGroup::new(org, team);
+        // `rcache.Cache.Get` logs Redis failures and reports a miss; callers
+        // cannot distinguish an error from an absent key.
+        let bytes = match self.cache.get(&raw.key()).await {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                tracing::warn!(key = %raw.key(), error = %err, "failed to execute redis command");
+                None
+            }
+        };
+        match bytes {
+            Some(bytes) => match serde_json::from_slice::<CachedGroup>(&bytes) {
+                Ok(group) => (group, true),
+                Err(_) => (raw, false),
+            },
+            None => (raw, false),
+        }
+    }
+
+    async fn set(&self, group: &CachedGroup) -> Result<(), String> {
+        let bytes = serde_json::to_vec(group).map_err(|err| err.to_string())?;
+        self.cache
+            .set(&group.key(), &bytes)
+            .await
+            .map_err(|err| err.to_string())
+    }
+
+    async fn invalidate(&self, group: &mut CachedGroup) {
+        if let Err(err) = self.cache.delete(&group.key()).await {
+            tracing::warn!(key = %group.key(), error = %err, "failed to execute redis command");
+        }
         group.repositories = None;
         group.users = None;
     }
@@ -347,13 +424,19 @@ impl GithubRepoPermsProvider {
 
         let mut groups = Vec::new();
         // `syncGroup` in the baseline.
-        let mut sync_group = |owner: &str, team: &str, admins_only: bool| {
-            let (mut group, exists) = cache.get(owner, team);
-            if exists && opts.invalidate_caches {
-                cache.invalidate(&mut group);
+        async fn sync_group(
+            cache: &dyn GroupsCache,
+            owner: &str,
+            team: &str,
+            admins_only: bool,
+            invalidate_caches: bool,
+        ) -> RepoAffiliatedGroup {
+            let (mut group, exists) = cache.get(owner, team).await;
+            if exists && invalidate_caches {
+                cache.invalidate(&mut group).await;
             }
-            groups.push(RepoAffiliatedGroup { group, admins_only });
-        };
+            RepoAffiliatedGroup { group, admins_only }
+        }
 
         // If this repo is an internal repo, allow everyone in the org to read
         // it (behind the temporary feature flag).
@@ -372,9 +455,9 @@ impl GithubRepoPermsProvider {
         let all_org_members_can_read =
             is_repo_internally_visible || can_view_org_repos(Some(&org), None);
         if all_org_members_can_read {
-            sync_group(owner, "", false);
+            groups.push(sync_group(cache, owner, "", false, opts.invalidate_caches).await);
         } else {
-            sync_group(owner, "", true);
+            groups.push(sync_group(cache, owner, "", true, opts.invalidate_caches).await);
 
             let mut page = 1;
             loop {
@@ -384,7 +467,9 @@ impl GithubRepoPermsProvider {
                     .await
                     .map_err(|err| err.message)?;
                 for team in teams {
-                    sync_group(owner, &team.slug, false);
+                    groups.push(
+                        sync_group(cache, owner, &team.slug, false, opts.invalidate_caches).await,
+                    );
                 }
                 if !has_next {
                     break;
@@ -494,7 +579,7 @@ impl AuthzProvider for GithubRepoPermsProvider {
                 if !repositories.is_empty() && !repositories.contains(&repo_id) {
                     repositories.push(repo_id.clone());
                     // The baseline ignores the cache write error here.
-                    let _ = cache.set(&group.group);
+                    let _ = cache.set(&group.group).await;
                 }
             }
 
@@ -563,7 +648,7 @@ impl AuthzProvider for GithubRepoPermsProvider {
             }
 
             // Persist the group; the baseline ignores this error.
-            let _ = cache.set(&group.group);
+            let _ = cache.set(&group.group).await;
         }
 
         Ok(user_ids)
