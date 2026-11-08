@@ -10,7 +10,9 @@
 
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use sg_db::gitserver_repos::{CloneStatus, GitserverReposStore};
@@ -202,6 +204,12 @@ pub struct LocalBackend {
     pub tls: crate::tlsexternal::TlsConfig,
     /// `experimentalFeatures.customGitFetch` + `ENABLE_CUSTOM_GIT_FETCH`.
     pub custom_fetch: crate::customfetch::CustomFetch,
+    /// `siteConfig.cloneProgressLog`: also write fetch/clone output to a
+    /// temporary log file.
+    pub clone_progress_log: bool,
+    /// `conf.GitLongCommandTimeout()`: the deadline for a clone or fetch
+    /// operation (default 2h).
+    pub long_command_timeout: std::time::Duration,
 }
 
 impl LocalBackend {
@@ -256,6 +264,7 @@ impl LocalBackend {
 fn progress_handler<'a>(
     output: &'a mut LinebasedWriter,
     lock: &'a RepositoryLock,
+    log: &'a mut Option<std::fs::File>,
 ) -> impl FnMut(&[u8]) + Send + 'a {
     move |token: &[u8]| {
         output.write(token);
@@ -263,8 +272,65 @@ fn progress_handler<'a>(
         let line = line.trim();
         if !line.is_empty() {
             lock.set_status(line);
+            if let Some(file) = log.as_mut() {
+                // `readFetchProgress`: failing to write is non-fatal.
+                use std::io::Write as _;
+                let _ = file.write_all(line.as_bytes());
+                let _ = file.write_all(b"\n");
+            }
         }
     }
+}
+
+/// `readFetchProgress` opening its log file when `siteConfig.cloneProgressLog`
+/// is on: `os.CreateTemp("", "")`, kept for the operation's lifetime.
+fn create_progress_log(enabled: bool, repo: &str) -> Option<std::fs::File> {
+    if !enabled {
+        return None;
+    }
+    match create_temp_log_file() {
+        Ok((path, file)) => {
+            tracing::info!(file = %path.display(), repo, "logging fetch output");
+            Some(file)
+        }
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                repo,
+                "failed to create temporary fetch log file"
+            );
+            None
+        }
+    }
+}
+
+fn create_temp_log_file() -> std::io::Result<(PathBuf, std::fs::File)> {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let dir = std::env::temp_dir();
+    for _ in 0..100 {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = dir.join(format!(
+            "gitserver-fetch-{}-{nanos}-{counter}.log",
+            std::process::id()
+        ));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(file) => return Ok((path, file)),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(err),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "failed to create the fetch log file",
+    ))
 }
 
 fn io_error(context: &str, err: std::io::Error) -> GitError {
@@ -334,17 +400,30 @@ impl UpdateBackend for LocalBackend {
         // output. `SetLastOutput` runs even when the lookup fails.
         let remote_url = self.remote_url_for_fetch(repo).await;
         let mut output = LinebasedWriter::new();
+        let mut log = create_progress_log(self.clone_progress_log, repo);
+        let mut timed_out = false;
         let result = match remote_url {
             Ok(remote) => {
-                let mut on_progress = progress_handler(&mut output, lock);
-                crate::vcssyncer::fetch_repo_with(
-                    &git_dir,
-                    &remote,
-                    &self.tls,
-                    &self.custom_fetch,
-                    &mut on_progress,
+                let mut on_progress = progress_handler(&mut output, lock, &mut log);
+                match tokio::time::timeout(
+                    self.long_command_timeout,
+                    crate::vcssyncer::fetch_repo_with(
+                        &git_dir,
+                        &remote,
+                        &self.tls,
+                        &self.custom_fetch,
+                        &mut on_progress,
+                    ),
                 )
                 .await
+                {
+                    Ok(result) => result,
+                    // `fetchCtx.Err()`: the caller reports the deadline.
+                    Err(_) => {
+                        timed_out = true;
+                        Err(GitError::Message("deadline exceeded".to_owned()))
+                    }
+                }
             }
             // `syncer.Fetch`: `errors.Wrapf(err, "exit code: %d, failed to fetch from remote", exitCode)`.
             Err(err) => Err(GitError::Message(format!(
@@ -354,6 +433,12 @@ impl UpdateBackend for LocalBackend {
         };
 
         self.set_last_output(repo, &output.to_string_lossy()).await;
+        if timed_out {
+            return Err(GitError::Message(format!(
+                "failed to update repo within deadline of {}",
+                crate::memobs::format_go_duration(self.long_command_timeout)
+            )));
+        }
         result.map_err(|err| {
             GitError::Message(format!(
                 "failed to fetch repo {:?} with output {:?}: {}",
@@ -399,17 +484,29 @@ impl LocalBackend {
         // failure is wrapped with the (possibly empty) clone output too.
         let remote_url = self.remote_url_for_fetch(repo).await;
         let mut output = LinebasedWriter::new();
+        let mut log = create_progress_log(self.clone_progress_log, repo);
+        let mut timed_out = false;
         let result = match remote_url {
             Ok(remote) => {
-                let mut on_progress = progress_handler(&mut output, lock);
-                crate::vcssyncer::clone_repo_with(
-                    &tmp_path,
-                    &remote,
-                    &self.tls,
-                    &self.custom_fetch,
-                    &mut on_progress,
+                let mut on_progress = progress_handler(&mut output, lock, &mut log);
+                match tokio::time::timeout(
+                    self.long_command_timeout,
+                    crate::vcssyncer::clone_repo_with(
+                        &tmp_path,
+                        &remote,
+                        &self.tls,
+                        &self.custom_fetch,
+                        &mut on_progress,
+                    ),
                 )
                 .await
+                {
+                    Ok(result) => result,
+                    Err(_) => {
+                        timed_out = true;
+                        Err(GitError::Message("deadline exceeded".to_owned()))
+                    }
+                }
             }
             // `syncer.Clone`: `errors.Wrapf(err, "failed to fetch: exit status %d", exitCode)`.
             Err(err) => Err(GitError::Message(format!(
@@ -420,6 +517,12 @@ impl LocalBackend {
 
         // Best-effort update the output of the clone, even on failure.
         self.set_last_output(repo, &output.to_string_lossy()).await;
+        if timed_out {
+            return Err(GitError::Message(format!(
+                "failed to clone repo within deadline of {}",
+                crate::memobs::format_go_duration(self.long_command_timeout)
+            )));
+        }
         if let Err(err) = result {
             // Baseline: `errors.Wrapf(cloneErr, "clone failed. Output: %s", output)`.
             return Err(GitError::Message(format!(
@@ -733,6 +836,35 @@ mod tests {
             shard_id: "test-shard".to_owned(),
             tls: crate::tlsexternal::TlsConfig::default(),
             custom_fetch: crate::customfetch::CustomFetch::default(),
+            clone_progress_log: false,
+            long_command_timeout: std::time::Duration::from_secs(7200),
+        }
+    }
+
+    /// A backend whose custom fetch command is `sleep 60`, so a deadline can
+    /// interrupt it without any network or repository setup.
+    fn slow_backend(
+        repos_dir: &Path,
+        repo: &str,
+        remote: &Path,
+        timeout: std::time::Duration,
+    ) -> LocalBackend {
+        let mappings = vec![sg_config::CustomFetchMapping {
+            domain_path: remote.to_str().expect("utf8").to_owned(),
+            fetch: vec!["sleep".to_owned(), "60".to_owned()],
+        }];
+        LocalBackend {
+            repos_dir: repos_dir.to_path_buf(),
+            remote_urls: Arc::new(StaticUrls(HashMap::from([(
+                repo.to_owned(),
+                remote.to_str().expect("utf8").to_owned(),
+            )]))),
+            store: None,
+            shard_id: "test-shard".to_owned(),
+            tls: crate::tlsexternal::TlsConfig::default(),
+            custom_fetch: crate::customfetch::CustomFetch::build(Some(&mappings), true),
+            clone_progress_log: false,
+            long_command_timeout: timeout,
         }
     }
 
@@ -832,6 +964,8 @@ mod tests {
             shard_id: "test-shard".to_owned(),
             tls: crate::tlsexternal::TlsConfig::default(),
             custom_fetch: crate::customfetch::CustomFetch::default(),
+            clone_progress_log: false,
+            long_command_timeout: std::time::Duration::from_secs(7200),
         };
         let repo = "github.com/sourcegraphtest/alwayscloningtest";
         let locker = RepositoryLocker::new();
@@ -854,6 +988,8 @@ mod tests {
             shard_id: "test-shard".to_owned(),
             tls: crate::tlsexternal::TlsConfig::default(),
             custom_fetch: crate::customfetch::CustomFetch::default(),
+            clone_progress_log: false,
+            long_command_timeout: std::time::Duration::from_secs(7200),
         };
         let locker = RepositoryLocker::new();
         let lock = locker.try_acquire("example.com/x", "test").expect("lock");
@@ -872,6 +1008,93 @@ mod tests {
         assert!(
             message.starts_with("clone failed. Output: "),
             "unexpected error: {message}"
+        );
+    }
+
+    #[test]
+    fn progress_handler_tees_non_empty_lines_to_the_log() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("fetch.log");
+        let mut log = Some(std::fs::File::create(&path).expect("create log"));
+        let locker = RepositoryLocker::new();
+        let lock = locker.try_acquire("example.com/x", "test").expect("lock");
+        let mut output = LinebasedWriter::new();
+        {
+            let mut handler = progress_handler(&mut output, &lock, &mut log);
+            handler(b"  Receiving objects: 50%\r");
+            handler(b"\n");
+            handler(b"   \n");
+            handler(b"Resolving deltas: 100%\n");
+        }
+        assert_eq!(
+            locker.status("example.com/x").as_deref(),
+            Some("Resolving deltas: 100%")
+        );
+        // `readFetchProgress` writes the trimmed line and a newline; blank
+        // tokens are skipped like empty lock statuses.
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read log"),
+            "Receiving objects: 50%\nResolving deltas: 100%\n"
+        );
+        assert!(create_progress_log(false, "example.com/x").is_none());
+    }
+
+    #[tokio::test]
+    async fn local_backend_reports_the_clone_deadline() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repos_dir = tmp.path().join("repos");
+        std::fs::create_dir_all(&repos_dir).expect("mkdir");
+        let origin = tmp.path().join("origin.git");
+        std::fs::create_dir_all(&origin).expect("mkdir");
+        let repo = "example.com/owner/slow";
+        let backend = slow_backend(
+            &repos_dir,
+            repo,
+            &origin,
+            std::time::Duration::from_millis(50),
+        );
+        let locker = RepositoryLocker::new();
+        let lock = locker.try_acquire(repo, "test").expect("lock");
+
+        let err = backend
+            .clone(repo, &lock, &CancellationToken::new())
+            .await
+            .expect_err("clone deadline");
+        // `cloneRepo`: `failed to clone repo within deadline of %s`.
+        assert_eq!(
+            err.message(),
+            "failed to clone repo within deadline of 50ms"
+        );
+        assert!(!backend.repo_cloned(repo).await.expect("repo cloned"));
+    }
+
+    #[tokio::test]
+    async fn local_backend_reports_the_fetch_deadline() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repos_dir = tmp.path().join("repos");
+        std::fs::create_dir_all(&repos_dir).expect("mkdir");
+        let origin = tmp.path().join("origin.git");
+        std::fs::create_dir_all(&origin).expect("mkdir");
+        let repo = "example.com/owner/slow";
+        let git_dir = crate::repo::repo_dir(&repos_dir, repo).expect("git dir");
+        std::fs::create_dir_all(&git_dir).expect("mkdir");
+        let backend = slow_backend(
+            &repos_dir,
+            repo,
+            &origin,
+            std::time::Duration::from_millis(50),
+        );
+        let locker = RepositoryLocker::new();
+        let lock = locker.try_acquire(repo, "test").expect("lock");
+
+        let err = backend
+            .fetch(repo, &lock, &CancellationToken::new())
+            .await
+            .expect_err("fetch deadline");
+        // `doRepoUpdate`: `failed to update repo within deadline of %s`.
+        assert_eq!(
+            err.message(),
+            "failed to update repo within deadline of 50ms"
         );
     }
 

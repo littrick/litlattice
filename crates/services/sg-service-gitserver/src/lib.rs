@@ -203,6 +203,8 @@ impl Service for GitserverService {
                     .as_deref(),
                 config.enable_custom_git_fetch,
             ),
+            clone_progress_log: unified.site.clone_progress_log(),
+            long_command_timeout: unified.site.git_long_command_timeout(),
         });
         // `NewServer` builds the clone limiter from `conf.GitMaxConcurrentClones`
         // and `conf.Watch` updates it when the site config changes. The Rust

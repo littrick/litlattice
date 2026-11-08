@@ -228,6 +228,57 @@ fn parse_positive_go_duration(value: &str) -> Option<Duration> {
     Some(Duration::from_nanos(total_nanos.round() as u64))
 }
 
+/// Go `time.Duration.String()` for non-negative durations, used in the
+/// deadline error messages (`failed to clone repo within deadline of 2h0m0s`).
+pub fn format_go_duration(duration: Duration) -> String {
+    let mut u = duration.as_nanos();
+    if u == 0 {
+        return "0s".to_owned();
+    }
+    if u < 1_000_000_000 {
+        let (unit, prec) = if u < 1_000 {
+            ("ns", 0)
+        } else if u < 1_000_000 {
+            ("µs", 3)
+        } else {
+            ("ms", 6)
+        };
+        let frac = fmt_frac(&mut u, prec);
+        return format!("{}{}{}", u, frac, unit);
+    }
+    let frac = fmt_frac(&mut u, 9);
+    let mut out = format!("{}{}s", u % 60, frac);
+    u /= 60;
+    if u > 0 {
+        out = format!("{}m{}", u % 60, out);
+        u /= 60;
+        if u > 0 {
+            out = format!("{u}h{out}");
+        }
+    }
+    out
+}
+
+/// `fmtFrac`: strip `prec` decimal digits off `v`, printing the fraction only
+/// when it is non-zero (trailing zeros trimmed).
+fn fmt_frac(v: &mut u128, prec: u32) -> String {
+    let mut digits = String::new();
+    let mut print = false;
+    for _ in 0..prec {
+        let digit = *v % 10;
+        print = print || digit != 0;
+        if print {
+            digits.insert(0, char::from(b'0' + digit as u8));
+        }
+        *v /= 10;
+    }
+    if print {
+        format!(".{digits}")
+    } else {
+        String::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -258,6 +309,23 @@ mod tests {
             Some(Duration::from_millis(250))
         );
         assert_eq!(parse_go_duration("0s"), Some(Duration::ZERO));
+    }
+
+    #[test]
+    fn formats_go_durations() {
+        // Golden values from Go's `time.Duration.String()`.
+        assert_eq!(format_go_duration(Duration::ZERO), "0s");
+        assert_eq!(format_go_duration(Duration::from_nanos(1)), "1ns");
+        assert_eq!(format_go_duration(Duration::from_micros(1500)), "1.5ms");
+        assert_eq!(format_go_duration(Duration::from_millis(50)), "50ms");
+        assert_eq!(format_go_duration(Duration::from_millis(1500)), "1.5s");
+        assert_eq!(format_go_duration(Duration::from_secs(90)), "1m30s");
+        assert_eq!(format_go_duration(Duration::from_secs(7200)), "2h0m0s");
+        assert_eq!(format_go_duration(Duration::from_secs(5415)), "1h30m15s");
+        assert_eq!(
+            format_go_duration(Duration::from_millis(5415) + Duration::from_micros(500)),
+            "5.4155s"
+        );
     }
 
     #[test]

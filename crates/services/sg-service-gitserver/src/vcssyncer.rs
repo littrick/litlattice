@@ -67,6 +67,9 @@ pub async fn make_bare_repo(git_dir: &Path) -> Result<(), GitError> {
     let output = Command::new("git")
         .args(["init", "--bare", "."])
         .current_dir(git_dir)
+        // The operation-level deadline drops this future; the baseline kills
+        // the whole process group (see the module notes in the docs).
+        .kill_on_drop(true)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -237,6 +240,7 @@ pub async fn fetch_remote_with(
     command
         .args(&args[1..])
         .current_dir(git_dir)
+        .kill_on_drop(true)
         .env("GIT_DIR", git_dir)
         .env("GIT_LFS_SKIP_SMUDGE", "1");
     for (key, value) in &env {
@@ -440,6 +444,7 @@ async fn run_bare(
     command
         .args(&configured_args[1..])
         .current_dir(git_dir)
+        .kill_on_drop(true)
         .env_clear()
         .env("GIT_DIR", git_dir)
         .stdin(Stdio::null())
