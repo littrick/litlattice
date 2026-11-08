@@ -37,6 +37,7 @@ use crate::registry;
 
 pub mod adminanalytics;
 pub mod auth_sourcegraph_operator_cleaner;
+pub mod authz_github;
 pub mod authz_providers;
 pub mod batches;
 pub mod batches_scheduler;
