@@ -19,6 +19,7 @@ use sg_config::SiteConfiguration;
 
 use crate::config::FrontendConfig;
 use crate::ipallowlist::{self, AllowlistEnv};
+use crate::mux::SecurityConfig;
 use crate::version::Version;
 use crate::{debug, middleware};
 
@@ -151,11 +152,12 @@ impl Service for FrontendService {
         ready.store(true, Ordering::SeqCst);
 
         let allowlist = ipallowlist::compile(&self.site_config, &self.allowlist_env).map(Arc::new);
+        let security = SecurityConfig::from_site_config(&self.site_config);
 
         tracing::info!(addr = %external_addr, "frontend listening");
         let served = sg_http::serve_http(
             external,
-            middleware::external_handler(self.version.bytes(), allowlist),
+            middleware::external_handler(self.version.bytes(), allowlist, security),
             ctx.shutdown.clone(),
         )
         .await;

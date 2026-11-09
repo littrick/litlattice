@@ -21,6 +21,7 @@ use tonic::body::BoxBody;
 
 use crate::health;
 use crate::ipallowlist::{self, IpAllowlistConfig};
+use crate::mux::{self, SecurityConfig};
 
 /// `middleware.isBlackhole`.
 pub fn is_blackhole<B>(req: &Request<B>) -> bool {
@@ -119,12 +120,16 @@ pub fn internal_response<B>(_req: &Request<B>) -> Response<BoxBody> {
 pub fn external_handler(
     version: Bytes,
     allowlist: Option<Arc<IpAllowlistConfig>>,
+    security: SecurityConfig,
 ) -> sg_http::HttpHandler {
     Arc::new(move |req: Request<Incoming>| {
         let version = version.clone();
         let allowlist = allowlist.clone();
+        let security = security.clone();
         Box::pin(async move {
-            external_response_with_ipallowlist(&req, &version, allowlist.as_deref(), go_not_found)
+            external_response_with_ipallowlist(&req, &version, allowlist.as_deref(), || {
+                mux::route(&req, &security, mux::not_found_dispatch)
+            })
         })
     })
 }
