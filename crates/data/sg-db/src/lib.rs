@@ -16,6 +16,7 @@ pub mod codeintel_policies;
 pub mod codeintel_uploads;
 pub mod event_logs;
 pub mod executor_heartbeats;
+pub mod exhaustive_search;
 pub mod external_service_repos;
 pub mod external_service_sync_jobs;
 pub mod external_services;
