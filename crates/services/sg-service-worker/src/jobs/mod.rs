@@ -75,6 +75,7 @@ pub mod gitserver;
 pub mod insights_backfill_handler;
 pub mod insights_backfill_inprogress;
 pub mod insights_backfill_store;
+pub mod insights_data_prune;
 pub mod insights_data_retention;
 pub mod insights_enqueuer;
 pub mod insights_pings;
