@@ -14,19 +14,25 @@
 //! the JSON printers (`ToJSON`/`PrettyJSON`). Predicate syntax is still scanned and labeled
 //! `IsPredicate` so parse trees match the baseline.
 
+pub mod basic;
 pub mod fields;
 pub mod labels;
+pub mod mapper;
 pub mod node;
 pub mod parser;
+pub mod pipeline;
 pub mod predicate;
 pub mod printer;
 pub mod range;
 pub mod transformer;
+pub mod validate;
 
+pub use basic::{plan_to_q, to_nodes, Basic, Parameters, Plan};
 pub use labels::Labels;
 pub use node::{
     to_string as query_to_string, Annotation, Node, Operator, OperatorKind, Parameter, Pattern,
 };
 pub use parser::{parse, ParseError, SearchType};
+pub use pipeline::{pipeline, pipeline_query};
 pub use printer::string_human;
 pub use range::{Position, Range};

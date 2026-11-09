@@ -97,6 +97,53 @@ pub fn go_quote(s: &str) -> String {
     out
 }
 
+impl Pattern {
+    /// `Pattern.IsRegExp`: neither `Literal` nor `Structural` is set.
+    pub fn is_regexp(&self) -> bool {
+        !self
+            .annotation
+            .labels
+            .is_set(Labels::LITERAL | Labels::STRUCTURAL)
+    }
+
+    /// `Pattern.RegExpPattern`: the value as a regexp (literals are quoted).
+    pub fn regexp_pattern(&self) -> String {
+        if self.is_regexp() {
+            self.value.clone()
+        } else {
+            regexp_quote_meta(&self.value)
+        }
+    }
+}
+
+/// `regexp.QuoteMeta` (`\.+*?()|[]{}^$`).
+pub fn regexp_quote_meta(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if matches!(
+            b,
+            b'\\'
+                | b'.'
+                | b'+'
+                | b'*'
+                | b'?'
+                | b'('
+                | b')'
+                | b'|'
+                | b'['
+                | b']'
+                | b'{'
+                | b'}'
+                | b'^'
+                | b'$'
+        ) {
+            out.push('\\');
+        }
+        out.push(b as char);
+    }
+    out
+}
+
 impl std::fmt::Display for Pattern {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if self.negated {
