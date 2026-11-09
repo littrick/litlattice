@@ -47,7 +47,7 @@ use std::time::Duration;
 
 use sqlx::postgres::{PgPool, PgRow};
 use sqlx::types::time::OffsetDateTime;
-use sqlx::Row;
+use sqlx::{Postgres, Row, Transaction};
 use thiserror::Error;
 
 /// `types.JobState` (a Go string type with no validation on scan): the raw
@@ -817,13 +817,7 @@ pub async fn get_job_logs(
     Ok(jobs)
 }
 
-/// `Store.CreateExhaustiveSearchRepoJob`.
-pub async fn create_exhaustive_search_repo_job(
-    pool: &PgPool,
-    repo_id: i32,
-    search_job_id: i64,
-    ref_spec: &str,
-) -> Result<i64, Error> {
+fn validate_repo_job(repo_id: i32, search_job_id: i64, ref_spec: &str) -> Result<(), Error> {
     if search_job_id <= 0 {
         return Err(Error::MissingSearchJobId);
     }
@@ -833,11 +827,50 @@ pub async fn create_exhaustive_search_repo_job(
     if ref_spec.is_empty() {
         return Err(Error::MissingRefSpec);
     }
+    Ok(())
+}
+
+fn validate_revision_job(search_repo_job_id: i64, revision: &str) -> Result<(), Error> {
+    if search_repo_job_id <= 0 {
+        return Err(Error::MissingSearchRepoJobId);
+    }
+    if revision.is_empty() {
+        return Err(Error::MissingRevision);
+    }
+    Ok(())
+}
+
+/// `Store.CreateExhaustiveSearchRepoJob`.
+pub async fn create_exhaustive_search_repo_job(
+    pool: &PgPool,
+    repo_id: i32,
+    search_job_id: i64,
+    ref_spec: &str,
+) -> Result<i64, Error> {
+    validate_repo_job(repo_id, search_job_id, ref_spec)?;
     let id = sqlx::query_scalar::<_, i32>(CREATE_REPO_SEARCH_JOB_SQL)
         .bind(repo_id)
         .bind(search_job_id)
         .bind(ref_spec)
         .fetch_one(pool)
+        .await?;
+    Ok(i64::from(id))
+}
+
+/// `Store.CreateExhaustiveSearchRepoJob` inside a caller-owned transaction
+/// (`Store.Transact` in the worker handler).
+pub async fn create_exhaustive_search_repo_job_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    repo_id: i32,
+    search_job_id: i64,
+    ref_spec: &str,
+) -> Result<i64, Error> {
+    validate_repo_job(repo_id, search_job_id, ref_spec)?;
+    let id = sqlx::query_scalar::<_, i32>(CREATE_REPO_SEARCH_JOB_SQL)
+        .bind(repo_id)
+        .bind(search_job_id)
+        .bind(ref_spec)
+        .fetch_one(&mut **tx)
         .await?;
     Ok(i64::from(id))
 }
@@ -848,16 +881,27 @@ pub async fn create_exhaustive_search_repo_revision_job(
     search_repo_job_id: i64,
     revision: &str,
 ) -> Result<i64, Error> {
-    if search_repo_job_id <= 0 {
-        return Err(Error::MissingSearchRepoJobId);
-    }
-    if revision.is_empty() {
-        return Err(Error::MissingRevision);
-    }
+    validate_revision_job(search_repo_job_id, revision)?;
     let id = sqlx::query_scalar::<_, i32>(CREATE_REV_SEARCH_JOB_SQL)
         .bind(revision)
         .bind(search_repo_job_id)
         .fetch_one(pool)
+        .await?;
+    Ok(i64::from(id))
+}
+
+/// `Store.CreateExhaustiveSearchRepoRevisionJob` inside a caller-owned
+/// transaction.
+pub async fn create_exhaustive_search_repo_revision_job_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    search_repo_job_id: i64,
+    revision: &str,
+) -> Result<i64, Error> {
+    validate_revision_job(search_repo_job_id, revision)?;
+    let id = sqlx::query_scalar::<_, i32>(CREATE_REV_SEARCH_JOB_SQL)
+        .bind(revision)
+        .bind(search_repo_job_id)
+        .fetch_one(&mut **tx)
         .await?;
     Ok(i64::from(id))
 }
