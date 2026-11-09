@@ -262,13 +262,147 @@ pub async fn get_action_job_metadata(
         .await?;
     // The baseline scans by position; the `monitorID` alias and the CASE
     // expression have no stable lowercase names.
+    // The baseline scans `search_results` into `[]byte`, which accepts NULL;
+    // `json.Unmarshal(nil, …)` then reports "unexpected end of JSON input".
     Ok(ActionJobMetadata {
         description: row.try_get(0)?,
         query: row.try_get(1)?,
         monitor_id: row.try_get(2)?,
-        results: row.try_get(3)?,
+        results: row
+            .try_get::<Option<serde_json::Value>, _>(3)?
+            .unwrap_or(serde_json::Value::Null),
         owner_name: row.try_get(4)?,
     })
+}
+
+/// `database.EmailAction` subset used by the action runner.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EmailAction {
+    pub id: i64,
+    pub monitor: i64,
+    pub priority: String,
+    pub include_results: bool,
+}
+
+/// `emailsColumns` subset: `codeMonitorStore.GetEmailAction`. `priority` is
+/// the `cm_email_priority` enum; it is cast to text so the scan yields the
+/// same string the baseline's `database/sql` scan produces.
+pub const GET_EMAIL_ACTION_SQL: &str = "SELECT cm_emails.id, cm_emails.monitor, \
+     cm_emails.priority::text AS priority, cm_emails.include_results FROM cm_emails \
+     WHERE cm_emails.id = $1";
+
+/// `codeMonitorStore.GetEmailAction`.
+pub async fn get_email_action(pool: &PgPool, email_id: i64) -> Result<EmailAction, sqlx::Error> {
+    let row = sqlx::query(GET_EMAIL_ACTION_SQL)
+        .bind(email_id)
+        .fetch_one(pool)
+        .await?;
+    Ok(EmailAction {
+        id: row.try_get("id")?,
+        monitor: row.try_get("monitor")?,
+        priority: row.try_get("priority")?,
+        include_results: row.try_get("include_results")?,
+    })
+}
+
+/// `database.WebhookAction` subset used by the action runner.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WebhookAction {
+    pub id: i64,
+    pub monitor: i64,
+    pub url: String,
+    pub include_results: bool,
+}
+
+/// `getWebhookActionQuery` with `webhookActionColumns` narrowed to the fields
+/// `handleWebhook` reads.
+pub const GET_WEBHOOK_ACTION_SQL: &str = "SELECT cm_webhooks.id, cm_webhooks.monitor, \
+     cm_webhooks.url, cm_webhooks.include_results FROM cm_webhooks WHERE cm_webhooks.id = $1";
+
+/// `codeMonitorStore.GetWebhookAction`.
+pub async fn get_webhook_action(
+    pool: &PgPool,
+    webhook_id: i64,
+) -> Result<WebhookAction, sqlx::Error> {
+    let row = sqlx::query(GET_WEBHOOK_ACTION_SQL)
+        .bind(webhook_id)
+        .fetch_one(pool)
+        .await?;
+    Ok(WebhookAction {
+        id: row.try_get("id")?,
+        monitor: row.try_get("monitor")?,
+        url: row.try_get("url")?,
+        include_results: row.try_get("include_results")?,
+    })
+}
+
+/// `database.SlackWebhookAction` subset used by the action runner.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SlackWebhookAction {
+    pub id: i64,
+    pub monitor: i64,
+    pub url: String,
+    pub include_results: bool,
+}
+
+/// `getSlackWebhookActionQuery` narrowed to the fields `handleSlackWebhook`
+/// reads.
+pub const GET_SLACK_WEBHOOK_ACTION_SQL: &str = "SELECT cm_slack_webhooks.id, \
+     cm_slack_webhooks.monitor, cm_slack_webhooks.url, \
+     cm_slack_webhooks.include_results FROM cm_slack_webhooks \
+     WHERE cm_slack_webhooks.id = $1";
+
+/// `codeMonitorStore.GetSlackWebhookAction`.
+pub async fn get_slack_webhook_action(
+    pool: &PgPool,
+    slack_webhook_id: i64,
+) -> Result<SlackWebhookAction, sqlx::Error> {
+    let row = sqlx::query(GET_SLACK_WEBHOOK_ACTION_SQL)
+        .bind(slack_webhook_id)
+        .fetch_one(pool)
+        .await?;
+    Ok(SlackWebhookAction {
+        id: row.try_get("id")?,
+        monitor: row.try_get("monitor")?,
+        url: row.try_get("url")?,
+        include_results: row.try_get("include_results")?,
+    })
+}
+
+/// `database.Recipient`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Recipient {
+    pub id: i64,
+    pub email: i64,
+    pub namespace_user_id: Option<i32>,
+    pub namespace_org_id: Option<i32>,
+}
+
+/// `recipientColumns`.
+pub const RECIPIENT_COLUMNS: &str = "cm_recipients.id, cm_recipients.email, \
+     cm_recipients.namespace_user_id, cm_recipients.namespace_org_id";
+
+/// `readRecipientQueryFmtStr` with `ListRecipientsOpts{EmailID}`.
+pub const LIST_RECIPIENTS_SQL: &str = "SELECT cm_recipients.id, cm_recipients.email, \
+     cm_recipients.namespace_user_id, cm_recipients.namespace_org_id FROM cm_recipients \
+     WHERE email = $1 ORDER BY id ASC LIMIT ALL";
+
+/// `codeMonitorStore.ListRecipients` for one e-mail action (no pagination).
+pub async fn list_recipients(pool: &PgPool, email_id: i64) -> Result<Vec<Recipient>, sqlx::Error> {
+    let rows = sqlx::query(LIST_RECIPIENTS_SQL)
+        .bind(email_id)
+        .fetch_all(pool)
+        .await?;
+    rows.into_iter()
+        .map(|row| {
+            Ok(Recipient {
+                id: row.try_get("id")?,
+                email: row.try_get("email")?,
+                namespace_user_id: row.try_get("namespace_user_id")?,
+                namespace_org_id: row.try_get("namespace_org_id")?,
+            })
+        })
+        .collect()
 }
 
 #[cfg(test)]
