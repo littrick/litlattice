@@ -19,3 +19,7 @@ pub use service::{
     default_go_modules, default_lua_modules, lua_modules_from_files, CreateOptions,
     CreateSandboxError, GoModule, Service,
 };
+
+/// Re-exported so downstream crates can name `mlua` types without adding a
+/// second (feature-mismatched) dependency on the same version.
+pub use mlua;

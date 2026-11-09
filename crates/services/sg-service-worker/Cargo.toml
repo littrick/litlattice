@@ -19,6 +19,7 @@ sg-insights = { path = "../../domain/sg-insights" }
 sg-insights-query = { path = "../../domain/sg-insights-query" }
 sg-keyring = { path = "../../domain/sg-keyring" }
 sg-licensing = { path = "../../domain/sg-licensing" }
+sg-luasandbox = { path = "../../domain/sg-luasandbox" }
 sg-metrics = { path = "../../base/sg-metrics" }
 sg-objectstorage = { path = "../../data/sg-objectstorage" }
 sg-proto = { path = "../../net/sg-proto" }
@@ -41,6 +42,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true, features = ["oid"] }
 sqlx = { workspace = true }
+tar = "0.4"
 time = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true, features = ["net"] }

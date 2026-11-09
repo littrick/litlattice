@@ -64,6 +64,7 @@ pub mod codeintel_autoindexing_dependency_indexing_scheduler;
 pub mod codeintel_autoindexing_dependency_scheduler;
 pub mod codeintel_autoindexing_dependency_sync_scheduler;
 pub mod codeintel_autoindexing_enqueuer;
+pub mod codeintel_autoindexing_inference;
 pub mod codeintel_autoindexing_jobselector;
 pub mod codeintel_autoindexing_package_inference;
 pub mod codeintel_autoindexing_path_patterns;

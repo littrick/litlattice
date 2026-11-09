@@ -1,0 +1,337 @@
+[
+  {
+    "name": "empty",
+    "files": {},
+    "override": "",
+    "max_files": 0,
+    "max_size": 0
+  },
+  {
+    "name": "go modules",
+    "files": {
+      "foo/bar/go.mod": "",
+      "foo/baz/go.mod": ""
+    },
+    "override": "",
+    "max_files": 0,
+    "max_size": 0
+  },
+  {
+    "name": "go files in root",
+    "files": {
+      "internal/a.go": "",
+      "internal/b.go": "",
+      "main.go": ""
+    },
+    "override": "",
+    "max_files": 0,
+    "max_size": 0
+  },
+  {
+    "name": "go files in non-root (no match)",
+    "files": {
+      "cmd/src/main.go": ""
+    },
+    "override": "",
+    "max_files": 0,
+    "max_size": 0
+  },
+  {
+    "name": "dotnet sln files exist",
+    "files": {
+      "foo/baz/two.sln": "",
+      "foo/baz/two.vbproj": "",
+      "one.csproj": "",
+      "one.sln": ""
+    },
+    "override": "",
+    "max_files": 0,
+    "max_size": 0
+  },
+  {
+    "name": "dotnet sln files do not exist",
+    "files": {
+      "foo/baz/two.vbproj": "",
+      "one.csproj": ""
+    },
+    "override": "",
+    "max_files": 0,
+    "max_size": 0
+  },
+  {
+    "name": "JVM project with Gradle",
+    "files": {
+      "build.gradle": "",
+      "src/java/com/sourcegraph/codeintel/dumb.java": "",
+      "src/java/com/sourcegraph/codeintel/fun.scala": ""
+    },
+    "override": "",
+    "max_files": 0,
+    "max_size": 0
+  },
+  {
+    "name": "JVM project with Maven",
+    "files": {
+      "pom.xml": "",
+      "src/java/com/sourcegraph/codeintel/dumb.java": "",
+      "src/java/com/sourcegraph/codeintel/fun.scala": ""
+    },
+    "override": "",
+    "max_files": 0,
+    "max_size": 0
+  },
+  {
+    "name": "JVM project with SBT",
+    "files": {
+      "build.sbt": "",
+      "src/java/com/sourcegraph/codeintel/dumb.java": "",
+      "src/java/com/sourcegraph/codeintel/fun.scala": ""
+    },
+    "override": "",
+    "max_files": 0,
+    "max_size": 0
+  },
+  {
+    "name": "JVM project with lsif-java.json",
+    "files": {
+      "lsif-java.json": "",
+      "src/java/com/sourcegraph/codeintel/dumb.java": "",
+      "src/java/com/sourcegraph/codeintel/fun.scala": ""
+    },
+    "override": "",
+    "max_files": 0,
+    "max_size": 0
+  },
+  {
+    "name": "JVM project without build file",
+    "files": {
+      "src/java/com/sourcegraph/codeintel/dumb.java": "",
+      "src/java/com/sourcegraph/codeintel/fun.scala": ""
+    },
+    "override": "",
+    "max_files": 0,
+    "max_size": 0
+  },
+  {
+    "name": "Nested JVM project WITHOUT top-level build file",
+    "files": {
+      "my-module/pom.xml": "",
+      "my-module/src/java/com/sourcegraph/codeintel/dumb.java": "",
+      "our-module/pom.xml": "",
+      "our-module/src/java/com/sourcegraph/codeintel/dumb.java": ""
+    },
+    "override": "",
+    "max_files": 0,
+    "max_size": 0
+  },
+  {
+    "name": "python package 1",
+    "files": {
+      "PKG-INFO": "\nMetadata-Version: 2.1\nName: numpy\nVersion: 1.22.3\nSummary:  NumPy is the fundamental package for array computing with Python.\n"
+    },
+    "override": "",
+    "max_files": 0,
+    "max_size": 0
+  },
+  {
+    "name": "python package 3",
+    "files": {
+      "PKG-INFO": "\nMetadata-Version: 2.1\nName: numpy\nVersion: 1.22.3\nSummary:  NumPy is the fundamental package for array computing with Python.\n",
+      "nested/lib/proj-2.egg-info/PKG-INFO": "\nMetadata-Version: 2.1\nName: numpy-proj-2\nVersion: 2.0.0\nSummary:  NumPy is the fundamental package for array computing with Python.\n",
+      "src/numpy.egg-info/PKG-INFO": "\nMetadata-Version: 2.1\nName: numpy\nVersion: 1.22.3\nSummary:  NumPy is the fundamental package for array computing with Python.\n"
+    },
+    "override": "",
+    "max_files": 0,
+    "max_size": 0
+  },
+  {
+    "name": "python pyproject",
+    "files": {
+      "pyproject.toml": ""
+    },
+    "override": "",
+    "max_files": 0,
+    "max_size": 0
+  },
+  {
+    "name": "python multiple roots",
+    "files": {
+      "first_root/pyproject.toml": "",
+      "second_root/pyproject.toml": ""
+    },
+    "override": "",
+    "max_files": 0,
+    "max_size": 0
+  },
+  {
+    "name": "scip-ruby",
+    "files": {
+      "a/Gemfile": "",
+      "a/Gemfile.lock": "",
+      "a/a.gemspec": "",
+      "a/rubygems-metadata.yml": "",
+      "b/Gemfile": "",
+      "c/Gemfile.lock": "",
+      "d/d.gemspec": "",
+      "e/rubygems-metadata.yml": ""
+    },
+    "override": "",
+    "max_files": 0,
+    "max_size": 0
+  },
+  {
+    "name": "rust-analyzer",
+    "files": {
+      "foo/bar/Cargo.toml": "",
+      "foo/baz/Cargo.toml": ""
+    },
+    "override": "",
+    "max_files": 0,
+    "max_size": 0
+  },
+  {
+    "name": "tsconfig in subdirectories",
+    "files": {
+      "a/tsconfig.json": "",
+      "b/tsconfig.json": "",
+      "c/tsconfig.json": ""
+    },
+    "override": "",
+    "max_files": 0,
+    "max_size": 0
+  },
+  {
+    "name": "typescript installation steps",
+    "files": {
+      "foo/bar/baz/tsconfig.json": "",
+      "foo/bar/bonk/package.json": "",
+      "foo/bar/bonk/tsconfig.json": "",
+      "foo/bar/package.json": "",
+      "foo/bar/yarn.lock": "",
+      "foo/baz/tsconfig.json": "",
+      "package.json": "",
+      "tsconfig.json": ""
+    },
+    "override": "",
+    "max_files": 0,
+    "max_size": 0
+  },
+  {
+    "name": "typescript with lerna configuration",
+    "files": {
+      "lerna.json": "{\"npmClient\": \"yarn\"}",
+      "package.json": "",
+      "tsconfig.json": ""
+    },
+    "override": "",
+    "max_files": 0,
+    "max_size": 0
+  },
+  {
+    "name": "typescript with node version",
+    "files": {
+      ".nvmrc": "",
+      "package.json": "{\"engines\": {\"node\": \"42\"}}",
+      "tsconfig.json": ""
+    },
+    "override": "",
+    "max_files": 0,
+    "max_size": 0
+  },
+  {
+    "name": "override custom recognizer",
+    "files": {
+      "bar/sg-test": "",
+      "baz/sg-test": "",
+      "foo/sg-test": "",
+      "sg-test": ""
+    },
+    "override": "\nlocal path = require(\"path\")\nlocal pattern = require(\"sg.autoindex.patterns\")\nlocal recognizer = require(\"sg.autoindex.recognizer\")\n\nlocal custom_recognizer = recognizer.new_path_recognizer {\n\tpatterns = { pattern.new_path_basename(\"sg-test\") },\n\n\tgenerate = function(_, paths)\n\t\tlocal jobs = {}\n\t\tfor i = 1, #paths do\n\t\t\ttable.insert(jobs, {\n\t\t\t\tsteps = {},\n\t\t\t\troot = path.dirname(paths[i]),\n\t\t\t\tindexer = \"test-override\",\n\t\t\t\tindexer_args = {},\n\t\t\t\toutfile = \"\",\n\t\t\t})\n\t\tend\n\n\t\treturn jobs\n\tend,\n}\n\nreturn require(\"sg.autoindex.config\").new({\n\t[\"custom.test\"] = custom_recognizer,\n})\n",
+    "max_files": 0,
+    "max_size": 0
+  },
+  {
+    "name": "disable default",
+    "files": {
+      "acme-custom.yaml": "",
+      "bar/acme-custom.yaml": "",
+      "baz/acme-custom.yaml": "",
+      "foo/acme-custom.yaml": ""
+    },
+    "override": "\nlocal path = require(\"path\")\nlocal pattern = require(\"sg.autoindex.patterns\")\nlocal recognizer = require(\"sg.autoindex.recognizer\")\n\nlocal custom_recognizer = recognizer.new_path_recognizer {\n\tpatterns = { pattern.new_path_basename(\"acme-custom.yaml\") },\n\n\tgenerate = function(_, paths)\n\t\tlocal jobs = {}\n\t\tfor i = 1, #paths do\n\t\t\ttable.insert(jobs, {\n\t\t\t\tsteps = {},\n\t\t\t\troot = path.dirname(paths[i]),\n\t\t\t\tindexer = \"acme/custom-indexer\",\n\t\t\t\tindexer_args = {},\n\t\t\t\toutfile = \"\",\n\t\t\t})\n\t\tend\n\n\t\treturn jobs\n\tend,\n}\n\nreturn require(\"sg.autoindex.config\").new({\n\t[\"sg.test\"] = false,\n\t[\"acme.custom\"] = custom_recognizer,\n})\n",
+    "max_files": 0,
+    "max_size": 0
+  },
+  {
+    "name": "print override",
+    "files": {
+      "nothing.txt": ""
+    },
+    "override": "print(\"hello from override\")\nreturn require(\"sg.autoindex.config\").new({})",
+    "max_files": 0,
+    "max_size": 0
+  },
+  {
+    "name": "error missing indexer",
+    "files": {
+      "custom.txt": ""
+    },
+    "override": "\nlocal pattern = require(\"sg.autoindex.patterns\")\nlocal recognizer = require(\"sg.autoindex.recognizer\")\nreturn require(\"sg.autoindex.config\").new({\n\t[\"custom.bad\"] = recognizer.new_path_recognizer {\n\t\tpatterns = { pattern.new_path_basename(\"custom.txt\") },\n\t\tgenerate = function() return { { root = \"x\" } } end,\n\t},\n})",
+    "max_files": 0,
+    "max_size": 0
+  },
+  {
+    "name": "error unknown field",
+    "files": {
+      "custom.txt": ""
+    },
+    "override": "\nlocal pattern = require(\"sg.autoindex.patterns\")\nlocal recognizer = require(\"sg.autoindex.recognizer\")\nreturn require(\"sg.autoindex.config\").new({\n\t[\"custom.bad\"] = recognizer.new_path_recognizer {\n\t\tpatterns = { pattern.new_path_basename(\"custom.txt\") },\n\t\tgenerate = function() return { { indexer = \"x\", bogus = 1 } } end,\n\t},\n})",
+    "max_files": 0,
+    "max_size": 0
+  },
+  {
+    "name": "error pattern type",
+    "files": {
+      "x.txt": ""
+    },
+    "override": "\nlocal recognizer = require(\"sg.autoindex.recognizer\")\nreturn require(\"sg.autoindex.config\").new({\n\t[\"custom.bad\"] = recognizer.new_path_recognizer {\n\t\tpatterns = { 42 },\n\t\tgenerate = function() end,\n\t},\n})",
+    "max_files": 0,
+    "max_size": 0
+  },
+  {
+    "name": "error module not found",
+    "files": {},
+    "override": "return require(\"no.such.module\")",
+    "max_files": 0,
+    "max_size": 0
+  },
+  {
+    "name": "error syntax",
+    "files": {},
+    "override": "return {",
+    "max_files": 0,
+    "max_size": 0
+  },
+  {
+    "name": "error file size limit",
+    "files": {
+      "package.json": "aaaaaaaaaaa",
+      "tsconfig.json": ""
+    },
+    "override": "",
+    "max_files": 0,
+    "max_size": 10
+  },
+  {
+    "name": "error file count limit",
+    "files": {
+      "a/package.json": "",
+      "b/package.json": "",
+      "c/package.json": "",
+      "tsconfig.json": ""
+    },
+    "override": "",
+    "max_files": 2,
+    "max_size": 0
+  }
+]
