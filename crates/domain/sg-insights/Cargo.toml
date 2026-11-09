@@ -7,8 +7,12 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+async-trait = { workspace = true }
 sg-insights-query = { path = "../sg-insights-query" }
 sg-search-query = { path = "../sg-search-query" }
 # `parsing`/`macros` are used by the differential harness and unit tests; the
 # library only needs `OffsetDateTime` arithmetic.
 time = { workspace = true, features = ["parsing", "macros"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }
