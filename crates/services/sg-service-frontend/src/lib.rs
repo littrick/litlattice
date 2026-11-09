@@ -1,9 +1,20 @@
 #![forbid(unsafe_code)]
 
-//! `sg-service-frontend`: skeleton service crate for `frontend`.
+//! `sg-service-frontend`: the Rust `frontend` process.
+//!
+//! Wave 1 (process skeleton) so far: the external/internal/debug listeners,
+//! `INSECURE_DEV`-dependent address defaults, `/healthz` and `/__version`, the
+//! `BlackHole` middleware, and the debug `/healthz` + `/ready` endpoints.
+//! GraphQL, sessions, UI, the configuration service and enterprise setup are
+//! not ported yet; `docs/overviews/m9_8dx_frontend_skeleton_overview.md`
+//! records what each missing layer is supposed to do.
 
-pub const SERVICE_NAME: &str = "frontend";
+pub mod config;
+pub mod debug;
+pub mod health;
+pub mod middleware;
+pub mod service;
+pub mod version;
 
-pub fn service_name() -> &'static str {
-    SERVICE_NAME
-}
+pub use service::{service_name, FrontendService, SERVICE_NAME};
+pub use version::Version;
