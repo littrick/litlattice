@@ -193,10 +193,7 @@ pub async fn mark_as_exported(pool: &PgPool, event_ids: &[String]) -> Result<(),
 
 /// `telemetryEventsExportQueueStore.DeletedExported`: delete events exported
 /// before `before`, returning the number of affected rows.
-pub async fn deleted_exported(
-    pool: &PgPool,
-    before: OffsetDateTime,
-) -> Result<i64, sqlx::Error> {
+pub async fn deleted_exported(pool: &PgPool, before: OffsetDateTime) -> Result<i64, sqlx::Error> {
     let result = sqlx::query(
         "DELETE FROM telemetry_events_export_queue \
          WHERE exported_at IS NOT NULL \
@@ -211,9 +208,7 @@ pub async fn deleted_exported(
 /// `telemetryEventsExportQueueStore.CountUnexported`: the number of events not
 /// yet exported and the timestamp of the oldest such event (`None` when the
 /// queue is empty, matching Go's `sql.NullTime` zero value).
-pub async fn count_unexported(
-    pool: &PgPool,
-) -> Result<(i64, Option<OffsetDateTime>), sqlx::Error> {
+pub async fn count_unexported(pool: &PgPool) -> Result<(i64, Option<OffsetDateTime>), sqlx::Error> {
     let row: (i64, Option<OffsetDateTime>) = sqlx::query_as(
         "SELECT COUNT(*), MIN(timestamp) \
          FROM telemetry_events_export_queue \

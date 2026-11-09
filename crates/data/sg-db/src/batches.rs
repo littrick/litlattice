@@ -303,9 +303,7 @@ LIMIT 1
     /// matching row in a single statement; this is the same statement with
     /// `RETURNING changesets.id` (the baseline scans the full row and treats
     /// `ID == 0` as no results).
-    pub async fn enqueue_next_scheduled_changeset(
-        &self,
-    ) -> Result<Option<i64>, sqlx::Error> {
+    pub async fn enqueue_next_scheduled_changeset(&self) -> Result<Option<i64>, sqlx::Error> {
         sqlx::query_scalar(
             r#"
 WITH c AS (

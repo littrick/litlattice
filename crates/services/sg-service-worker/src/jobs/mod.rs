@@ -75,6 +75,7 @@ pub mod insights_data_retention;
 pub mod insights_query_runner;
 pub mod licensecheck;
 pub mod outbound_webhooks;
+pub mod own_repo_indexing;
 pub mod perforce_changelist_mapper;
 pub mod permissions;
 pub mod perms_syncer;
@@ -249,6 +250,9 @@ pub fn all_jobs() -> Vec<(&'static str, Arc<dyn Job>)> {
                 "license-check" => Arc::new(licensecheck::LicenseCheckJob),
                 "outbound-webhook-sender" => {
                     Arc::new(outbound_webhooks::OutboundWebhookSender::new())
+                }
+                "own-repo-indexing-queue" => {
+                    Arc::new(own_repo_indexing::OwnRepoIndexingQueue::new())
                 }
                 "perforce-changelist-mapper" => {
                     Arc::new(perforce_changelist_mapper::PerforceChangelistMappingJob::new())

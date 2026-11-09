@@ -30,7 +30,8 @@ pub const RAW_SITE_CONFIG_ENV: &str = "SRC_CLOUD_SITE_CONFIG";
 
 /// `sourcegraphCloudSiteConfigSignerPublicKey`, verbatim from
 /// `internal/cloud/site_config.go`.
-pub const SOURCEGRAPH_CLOUD_SITE_CONFIG_SIGNER_PUBLIC_KEY: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFnVjzARMu+jaSrTgvJCpWEDP503Y3k3DMbs5ghHOkML";
+pub const SOURCEGRAPH_CLOUD_SITE_CONFIG_SIGNER_PUBLIC_KEY: &str =
+    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFnVjzARMu+jaSrTgvJCpWEDP503Y3k3DMbs5ghHOkML";
 
 /// `cloud.SchemaSiteConfig`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
@@ -152,8 +153,8 @@ fn parse_site_config_with_public_key(
         .decode(raw)
         .map_err(|err| format!("decode raw site config: {err}"))?;
 
-    let signed: SignedSiteConfig =
-        serde_json::from_slice(&signed_data).map_err(|err| format!("unmarshal signed data: {err}"))?;
+    let signed: SignedSiteConfig = serde_json::from_slice(&signed_data)
+        .map_err(|err| format!("unmarshal signed data: {err}"))?;
 
     let signature = signed
         .signature

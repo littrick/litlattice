@@ -124,6 +124,12 @@ pub struct Commit {
     pub oid: String,
     /// `commit.Parents`, in the order gitserver reported them.
     pub parents: Vec<String>,
+    /// `commit.Author.Name` (`gitdomain.Commit.Author`).
+    pub author_name: String,
+    /// `commit.Author.Email`.
+    pub author_email: String,
+    /// `commit.Author.Date`; absent when the signature has no date.
+    pub author_date: Option<prost_types::Timestamp>,
     /// `commit.Committer.Date`; absent when the signature has no date.
     pub committer_date: Option<prost_types::Timestamp>,
     /// `commit.Message`. gitserver sends it as bytes; Go converts it to a
@@ -501,9 +507,7 @@ impl GitserverClient {
             ));
         }
         if options.ranges.is_empty() && !options.all_refs {
-            return Err(Error::Message(
-                "must specify a range or AllRefs".to_owned(),
-            ));
+            return Err(Error::Message("must specify a range or AllRefs".to_owned()));
         }
         let order = match options.order.unwrap_or(CommitsOrder::Default) {
             CommitsOrder::Default => pb::commit_log_request::CommitLogOrder::Unspecified,
@@ -516,7 +520,11 @@ impl GitserverClient {
         let mut stream = client
             .commit_log(pb::CommitLogRequest {
                 repo_name: repo.to_owned(),
-                ranges: options.ranges.iter().map(|r| r.as_bytes().to_vec()).collect(),
+                ranges: options
+                    .ranges
+                    .iter()
+                    .map(|r| r.as_bytes().to_vec())
+                    .collect(),
                 all_refs: options.all_refs,
                 after: options.after,
                 before: options.before,
@@ -552,9 +560,13 @@ impl GitserverClient {
 
 /// `gitdomain.CommitFromProto`, reduced to the fields gitserver clients read.
 fn commit_from_proto(commit: pb::GitCommit) -> Commit {
+    let author = commit.author.unwrap_or_default();
     Commit {
         oid: commit.oid,
         parents: commit.parents,
+        author_name: String::from_utf8_lossy(&author.name).into_owned(),
+        author_email: String::from_utf8_lossy(&author.email).into_owned(),
+        author_date: author.date,
         committer_date: commit.committer.and_then(|committer| committer.date),
         message: String::from_utf8_lossy(&commit.message).into_owned(),
     }
