@@ -81,6 +81,7 @@ pub mod insights_enqueuer;
 pub mod insights_job;
 pub mod insights_license_check;
 pub mod insights_pings;
+pub mod insights_pipeline;
 pub mod insights_query_runner;
 pub mod licensecheck;
 pub mod out_of_band_migrations;

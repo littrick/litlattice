@@ -43,6 +43,11 @@ pub enum CommitError {
         repo: String,
         spec: String,
     },
+    /// `gitdomain.RepoNotExistError`.
+    RepoNotFound {
+        repo: String,
+        clone_in_progress: bool,
+    },
     Wrapped {
         message: String,
         source: Box<CommitError>,
@@ -64,7 +69,17 @@ impl CommitError {
         match self {
             Self::RevisionNotFound { .. } => true,
             Self::Wrapped { source, .. } => source.is_revision_not_found(),
-            Self::Other(_) => false,
+            Self::RepoNotFound { .. } | Self::Other(_) => false,
+        }
+    }
+
+    /// `gitdomain.IsRepoNotExist` (`errors.HasType` → `errors.As`) after
+    /// unwrapping.
+    pub fn is_repo_not_found(&self) -> bool {
+        match self {
+            Self::RepoNotFound { .. } => true,
+            Self::Wrapped { source, .. } => source.is_repo_not_found(),
+            Self::RevisionNotFound { .. } | Self::Other(_) => false,
         }
     }
 }
@@ -74,6 +89,16 @@ impl fmt::Display for CommitError {
         match self {
             Self::RevisionNotFound { repo, spec } => {
                 write!(f, "revision not found: {repo}@{spec}")
+            }
+            Self::RepoNotFound {
+                repo,
+                clone_in_progress,
+            } => {
+                if *clone_in_progress {
+                    write!(f, "repository does not exist (clone in progress): {repo}")
+                } else {
+                    write!(f, "repository does not exist: {repo}")
+                }
             }
             Self::Wrapped { message, source } => write!(f, "{message}: {source}"),
             Self::Other(message) => f.write_str(message),
@@ -87,6 +112,13 @@ impl From<sg_git::Error> for CommitError {
     fn from(err: sg_git::Error) -> Self {
         match err {
             sg_git::Error::RevisionNotFound { repo, spec } => Self::RevisionNotFound { repo, spec },
+            sg_git::Error::RepoNotFound {
+                repo,
+                clone_in_progress,
+            } => Self::RepoNotFound {
+                repo,
+                clone_in_progress,
+            },
             other => Self::Other(other.to_string()),
         }
     }
@@ -356,5 +388,26 @@ mod tests {
         assert!(is_empty_repo_error(&CommitError::wrapped(
             "nice!", not_found
         )));
+    }
+
+    #[test]
+    fn repo_not_found_follows_the_wrapper_chain() {
+        let not_found = CommitError::RepoNotFound {
+            repo: "foo".to_owned(),
+            clone_in_progress: false,
+        };
+        assert!(!not_found.is_revision_not_found());
+        assert!(not_found.is_repo_not_found());
+        assert!(CommitError::wrapped("FindNearestCommit", not_found.clone()).is_repo_not_found());
+        assert!(!CommitError::Other("boom".to_owned()).is_repo_not_found());
+        assert_eq!(not_found.to_string(), "repository does not exist: foo");
+        assert_eq!(
+            CommitError::RepoNotFound {
+                repo: "foo".to_owned(),
+                clone_in_progress: true,
+            }
+            .to_string(),
+            "repository does not exist (clone in progress): foo"
+        );
     }
 }
