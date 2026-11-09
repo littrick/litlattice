@@ -19,12 +19,16 @@
 //! - [`discovery`] (`internal/insights/discovery`): the repository iterators
 //!   used by the backfill workers (all repositories with a page cache, query
 //!   scope, configured list, and the per-series dispatch).
+//! - [`compression`] (`internal/insights/compression`): backfill plan
+//!   compression over sample times, with the gitserver commit index injected
+//!   through [`compression::CommitFetcher`].
 //!
-//! Not ported here: `aggregation`/`compression` (they need search results and
-//! gitserver commit indexes), the storage-bound scheduler/iterator methods
-//! (`BackfillStore`, `PersistentRepoIterator` persistence) and anything else
-//! that touches insight storage; see `docs/modules/06_worker.md`.
+//! Not ported here: `aggregation` (it needs search results), the storage-bound
+//! scheduler/iterator methods (`BackfillStore`, `PersistentRepoIterator`
+//! persistence) and anything else that touches insight storage; see
+//! `docs/modules/06_worker.md`.
 
+pub mod compression;
 pub mod discovery;
 pub mod iterator;
 pub mod priority;
