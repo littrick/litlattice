@@ -68,6 +68,45 @@ impl Parameters {
         );
         result
     }
+
+    /// `Parameters.yesNoOnlyValue`: the last value of a yes/no/only field wins
+    /// (`Yes`/`No`/`Only`), an unparsable value panics like the baseline
+    /// (validation should already have rejected it).
+    pub fn yes_no_only_value(&self, field: &str) -> Option<crate::validate::YesNoOnly> {
+        let mut result = None;
+        visit_field(
+            &self.to_nodes(),
+            field,
+            &mut |value, _negated, _annotation| {
+                let yno = crate::validate::parse_yes_no_only(value);
+                if yno == crate::validate::YesNoOnly::Invalid {
+                    panic!(
+                        "Invalid value {} for field {}",
+                        crate::node::go_quote(value),
+                        crate::node::go_quote(field)
+                    );
+                }
+                result = Some(yno);
+            },
+        );
+        result
+    }
+
+    /// `Parameters.Index`: `index:` value, defaulting to `Yes`.
+    pub fn index(&self) -> crate::validate::YesNoOnly {
+        self.yes_no_only_value(crate::fields::FIELD_INDEX)
+            .unwrap_or(crate::validate::YesNoOnly::Yes)
+    }
+
+    /// `Parameters.Fork`.
+    pub fn fork(&self) -> Option<crate::validate::YesNoOnly> {
+        self.yes_no_only_value(crate::fields::FIELD_FORK)
+    }
+
+    /// `Parameters.Archived`.
+    pub fn archived(&self) -> Option<crate::validate::YesNoOnly> {
+        self.yes_no_only_value(crate::fields::FIELD_ARCHIVED)
+    }
 }
 
 /// `toNodes`.
@@ -177,6 +216,11 @@ impl Basic {
     /// `Basic.IsRegexp`.
     pub fn is_regexp(&self) -> bool {
         has_pattern_label(self, crate::labels::Labels::REGEXP)
+    }
+
+    /// `Basic.IsStructural`.
+    pub fn is_structural(&self) -> bool {
+        has_pattern_label(self, crate::labels::Labels::STRUCTURAL)
     }
 
     /// `Basic.IsEmptyPattern`.
