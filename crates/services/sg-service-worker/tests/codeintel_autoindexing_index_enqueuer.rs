@@ -18,13 +18,13 @@ use async_trait::async_trait;
 use sg_db::codeintel_autoindexing_enqueuer::AutoIndexJob;
 use sg_service_worker::jobs::autoindex_config::{AutoIndexJobSpec, DockerStep as ConfigDockerStep};
 use sg_service_worker::jobs::codeintel_autoindexing_enqueuer::{
-    IndexEnqueuer, PackageRepoInference, ResolveRevisionError, RevisionResolver,
-    VersionedPackageRepo,
+    IndexEnqueuer, ResolveRevisionError, RevisionResolver, VersionedPackageRepo,
 };
 use sg_service_worker::jobs::codeintel_autoindexing_jobselector::{
     FileReadError, InferenceResult, InferenceService, JobSelector, JobSelectorSettings,
     SourcegraphYamlReader,
 };
+use sg_service_worker::jobs::codeintel_autoindexing_package_inference::DefaultPackageRepoInference;
 use sqlx::postgres::PgPool;
 use sqlx::Row;
 
@@ -133,19 +133,6 @@ impl RevisionResolver for FakeResolver {
     }
 }
 
-struct FakePackageInference {
-    mapping: Option<(String, String)>,
-}
-
-impl PackageRepoInference for FakePackageInference {
-    fn infer_repository_and_revision(
-        &self,
-        _package: &VersionedPackageRepo,
-    ) -> Option<(String, String)> {
-        self.mapping.clone()
-    }
-}
-
 struct Case {
     name: &'static str,
     repo: i32,
@@ -156,7 +143,6 @@ struct Case {
     max: i64,
     setup: &'static str,
     package: Option<VersionedPackageRepo>,
-    mapping: Option<(String, String)>,
 }
 
 fn package(scheme: &str, name: &str, version: &str) -> VersionedPackageRepo {
@@ -179,7 +165,6 @@ fn cases() -> Vec<Case> {
             max: 50,
             setup: "",
             package: None,
-            mapping: None,
         },
         Case {
             name: "queue-forced-bypasses-is-queued",
@@ -191,7 +176,6 @@ fn cases() -> Vec<Case> {
             max: 50,
             setup: "upload",
             package: None,
-            mapping: None,
         },
         Case {
             name: "queue-not-forced-noop-when-queued",
@@ -203,7 +187,6 @@ fn cases() -> Vec<Case> {
             max: 50,
             setup: "upload",
             package: None,
-            mapping: None,
         },
         Case {
             name: "queue-root-indexer-filters",
@@ -215,7 +198,6 @@ fn cases() -> Vec<Case> {
             max: 50,
             setup: "index-root",
             package: None,
-            mapping: None,
         },
         Case {
             name: "queue-root-indexer-reindex-allows",
@@ -227,7 +209,6 @@ fn cases() -> Vec<Case> {
             max: 50,
             setup: "index-root-reindex",
             package: None,
-            mapping: None,
         },
         Case {
             name: "queue-empty-selection",
@@ -239,7 +220,6 @@ fn cases() -> Vec<Case> {
             max: 50,
             setup: "",
             package: None,
-            mapping: None,
         },
         Case {
             name: "queue-revision-not-found",
@@ -251,7 +231,6 @@ fn cases() -> Vec<Case> {
             max: 50,
             setup: "",
             package: None,
-            mapping: None,
         },
         Case {
             name: "queue-revision-error",
@@ -263,7 +242,6 @@ fn cases() -> Vec<Case> {
             max: 50,
             setup: "",
             package: None,
-            mapping: None,
         },
         Case {
             name: "queue-repo-not-found",
@@ -275,7 +253,6 @@ fn cases() -> Vec<Case> {
             max: 50,
             setup: "",
             package: None,
-            mapping: None,
         },
         Case {
             name: "queue-blocked-repo",
@@ -287,7 +264,6 @@ fn cases() -> Vec<Case> {
             max: 50,
             setup: "",
             package: None,
-            mapping: None,
         },
         Case {
             name: "queue-limit-suppresses",
@@ -299,7 +275,6 @@ fn cases() -> Vec<Case> {
             max: 2,
             setup: "",
             package: None,
-            mapping: None,
         },
         Case {
             name: "queue-limit-bypass",
@@ -311,7 +286,6 @@ fn cases() -> Vec<Case> {
             max: 2,
             setup: "",
             package: None,
-            mapping: None,
         },
         Case {
             name: "queue-package-ok",
@@ -327,10 +301,6 @@ fn cases() -> Vec<Case> {
                 "https://github.com/example/enq-pkg-a",
                 "v1.2.3-abcdef123456",
             )),
-            mapping: Some((
-                "github.com/example/enq-pkg-a".to_owned(),
-                "abcdef123456".to_owned(),
-            )),
         },
         Case {
             name: "queue-package-infer-none",
@@ -342,7 +312,6 @@ fn cases() -> Vec<Case> {
             max: 50,
             setup: "",
             package: Some(package("nonsense", "x", "1")),
-            mapping: None,
         },
         Case {
             name: "queue-package-repo-missing",
@@ -357,10 +326,6 @@ fn cases() -> Vec<Case> {
                 "gomod",
                 "https://github.com/example/enq-pkg-missing",
                 "v1.2.3-abcdef123456",
-            )),
-            mapping: Some((
-                "github.com/example/enq-pkg-missing".to_owned(),
-                "abcdef123456".to_owned(),
             )),
         },
         Case {
@@ -377,10 +342,6 @@ fn cases() -> Vec<Case> {
                 "https://github.com/example/enq-blocked",
                 "v1.2.3-abcdef123456",
             )),
-            mapping: Some((
-                "github.com/example/enq-blocked".to_owned(),
-                "abcdef123456".to_owned(),
-            )),
         },
         Case {
             name: "queue-package-revision-not-found",
@@ -395,10 +356,6 @@ fn cases() -> Vec<Case> {
                 "gomod",
                 "https://github.com/example/enq-pkg-b",
                 "v9.9.9-deadbeef",
-            )),
-            mapping: Some((
-                "github.com/example/enq-pkg-b".to_owned(),
-                "deadbeef".to_owned(),
             )),
         },
         Case {
@@ -415,10 +372,6 @@ fn cases() -> Vec<Case> {
                 "https://github.com/example/enq-pkg-b",
                 "v9.9.8-cafebabe",
             )),
-            mapping: Some((
-                "github.com/example/enq-pkg-b".to_owned(),
-                "cafebabe".to_owned(),
-            )),
         },
         Case {
             name: "queue-package-queued-noop",
@@ -433,10 +386,6 @@ fn cases() -> Vec<Case> {
                 "gomod",
                 "https://github.com/example/enq-pkg-a",
                 "v1.2.3-abcdef123456",
-            )),
-            mapping: Some((
-                "github.com/example/enq-pkg-a".to_owned(),
-                "abcdef123456".to_owned(),
             )),
         },
     ]
@@ -593,9 +542,7 @@ async fn autoindexing_index_enqueuer_matches_go_harness() {
         let resolver = Arc::new(FakeResolver {
             calls: Mutex::new(Vec::new()),
         });
-        let package_inference = Arc::new(FakePackageInference {
-            mapping: case.mapping.clone(),
-        });
+        let package_inference = Arc::new(DefaultPackageRepoInference);
         let selector = JobSelector::new(
             pool.clone(),
             inference.clone(),
