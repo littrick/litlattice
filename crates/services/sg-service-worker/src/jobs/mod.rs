@@ -37,6 +37,8 @@ use crate::registry;
 
 pub mod adminanalytics;
 pub mod auth_sourcegraph_operator_cleaner;
+pub mod authz_bitbucketcloud;
+pub mod authz_bitbucketcloud_client;
 pub mod authz_github;
 pub mod authz_github_client;
 pub mod authz_github_user;

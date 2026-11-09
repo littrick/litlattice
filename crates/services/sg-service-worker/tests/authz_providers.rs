@@ -116,6 +116,7 @@ async fn authz_providers_matches_go_harness() {
     assert_eq!(
         urns,
         [
+            "extsvc:bitbucketcloud:12012",
             "extsvc:github:12001",
             "extsvc:github:12003",
             "extsvc:github:12004"

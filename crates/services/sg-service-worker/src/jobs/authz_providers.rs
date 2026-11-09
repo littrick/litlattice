@@ -50,6 +50,11 @@ use sg_keyring::Keyring;
 use sqlx::postgres::PgPool;
 use url::Url;
 
+use super::authz_bitbucketcloud::{
+    bitbucketcloud_oauth_providers, BitbucketCloudOAuthProvider, BitbucketCloudProvider,
+    TYPE_BITBUCKETCLOUD,
+};
+use super::authz_bitbucketcloud_client::{BitbucketCloudAuth, BitbucketCloudRestClient};
 use super::authz_github::{
     GithubRepoPermsProvider, GroupsCache, MemoryGroupsCache, RedisGroupsCache,
 };
@@ -125,6 +130,12 @@ struct GitlabConnection {
     config: Value,
 }
 
+/// One parsed Bitbucket Cloud external service.
+struct BitbucketCloudConnection {
+    service: ExternalService,
+    config: Value,
+}
+
 /// `featureflag.FromContext(ctx)` as attached by the perms syncer's
 /// `WithFlags(ctx, db.FeatureFlags())`: the global (non-rollout) value of
 /// `gitLabProjectVisibilityExperimental`. Any storage error or a rollout flag
@@ -169,6 +180,7 @@ pub async fn providers_from_config(
 
     let mut github_conns = Vec::new();
     let mut gitlab_conns = Vec::new();
+    let mut bitbucketcloud_conns = Vec::new();
     let mut serious_problems = Vec::new();
     let mut after_id = 0_i64;
 
@@ -208,6 +220,8 @@ pub async fn providers_from_config(
                 github_conns.push(GithubConnection { service, config });
             } else if service.kind == "GITLAB" {
                 gitlab_conns.push(GitlabConnection { service, config });
+            } else if service.kind == "BITBUCKETCLOUD" {
+                bitbucketcloud_conns.push(BitbucketCloudConnection { service, config });
             }
             // Other kinds are not ported yet; see the module docs.
         }
@@ -220,21 +234,33 @@ pub async fn providers_from_config(
     // `authz.go`: GitHub providers first, then GitLab. The OAuth branch needs
     // `auth.providers`, which `newAuthzProvider` receives as its `ps` argument.
     let gitlab_authn = gitlab_oauth_providers(site);
+    let bitbucketcloud_authn = bitbucketcloud_oauth_providers(site);
     let github = github_new_authz_providers(&github_conns, site, keyring, pool, opts);
     let gitlab = gitlab_new_authz_providers(&gitlab_conns, &gitlab_authn, keyring, pool, opts);
+    let bitbucketcloud = bitbucketcloud_new_authz_providers(
+        &bitbucketcloud_conns,
+        &bitbucketcloud_authn,
+        keyring,
+        pool,
+        opts,
+    );
 
     let mut providers = github.providers;
     providers.extend(gitlab.providers);
+    providers.extend(bitbucketcloud.providers);
     let mut warnings = github.warnings;
     warnings.extend(gitlab.warnings);
+    warnings.extend(bitbucketcloud.warnings);
     let mut invalid_connections = github.invalid_connections;
     invalid_connections.extend(gitlab.invalid_connections);
+    invalid_connections.extend(bitbucketcloud.invalid_connections);
 
     ProviderInitResult {
         providers,
         serious_problems: {
             serious_problems.extend(github.serious_problems);
             serious_problems.extend(gitlab.serious_problems);
+            serious_problems.extend(bitbucketcloud.serious_problems);
             serious_problems
         },
         warnings,
@@ -449,6 +475,120 @@ fn new_gitlab_authz_provider(
         // members nil in the baseline.
         _ => Err("No identityProvider was specified".to_owned()),
     }
+}
+
+/// `bitbucketcloud.NewAuthzProviders`: one provider per connection with
+/// authorization enabled; construction failures are serious problems for
+/// `extsvc.TypeBitbucketCloud`.
+fn bitbucketcloud_new_authz_providers(
+    conns: &[BitbucketCloudConnection],
+    authn_providers: &[BitbucketCloudOAuthProvider],
+    keyring: &Keyring,
+    pool: &PgPool,
+    opts: &ProvidersOptions,
+) -> ProviderInitResult {
+    let mut result = ProviderInitResult::default();
+    for conn in conns {
+        match new_bitbucketcloud_authz_provider(conn, authn_providers, keyring, pool, opts) {
+            Ok(Some(provider)) => result.providers.push(provider),
+            Ok(None) => {}
+            Err(err) => {
+                result
+                    .invalid_connections
+                    .push(TYPE_BITBUCKETCLOUD.to_owned());
+                result.serious_problems.push(err);
+            }
+        }
+    }
+    result
+}
+
+/// `bitbucketcloud.newAuthzProvider`. `Ok(None)` covers both "authorization
+/// not configured" and the baseline's `NewProvider` returning nil when
+/// `conn.url` fails to parse.
+fn new_bitbucketcloud_authz_provider(
+    conn: &BitbucketCloudConnection,
+    authn_providers: &[BitbucketCloudOAuthProvider],
+    keyring: &Keyring,
+    pool: &PgPool,
+    opts: &ProvidersOptions,
+) -> Result<Option<Arc<dyn AuthzProvider>>, String> {
+    let Some(_authorization) = conn
+        .config
+        .get("authorization")
+        .filter(|value| !value.is_null())
+    else {
+        return Ok(None);
+    };
+
+    if let Some(message) = &opts.acls_license_error {
+        return Err(message.clone());
+    }
+
+    // `bitbucketcloud.NewClient`: `UrlFromConfig` parses `apiURL` (default
+    // `https://api.bitbucket.org`) and a parse failure is a construction error.
+    let api_url = conn
+        .config
+        .get("apiURL")
+        .and_then(Value::as_str)
+        .filter(|url| !url.is_empty());
+    let access_token = conn
+        .config
+        .get("accessToken")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let auth = if access_token.is_empty() {
+        BitbucketCloudAuth::Basic {
+            username: conn
+                .config
+                .get("username")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned(),
+            password: conn
+                .config
+                .get("appPassword")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned(),
+        }
+    } else {
+        BitbucketCloudAuth::Bearer(Arc::new(super::authz_github_user::OAuthBearerToken::new(
+            super::authz_github_user::OAuthToken {
+                access_token: access_token.to_owned(),
+                ..Default::default()
+            },
+            None,
+        )))
+    };
+    let http = reqwest::Client::new();
+    let client = BitbucketCloudRestClient::with_http_client(http.clone(), api_url, auth)?;
+
+    // `NewProvider` parses `conn.Url`; an unparsable URL makes it return nil.
+    let raw_url = conn
+        .config
+        .get("url")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let Ok(base_url) = Url::parse(raw_url) else {
+        return Ok(None);
+    };
+    let service_id = normalize_base_url(&base_url);
+    let urn = sg_extsvc::urn(&conn.service.kind, conn.service.id);
+
+    let provider = BitbucketCloudProvider::new(
+        urn,
+        service_id,
+        Arc::new(client),
+        Arc::new(PgOAuthTokenStore::new(
+            pool.clone(),
+            keyring.user_external_account_key(),
+        )),
+        http,
+        authn_providers.to_vec(),
+    )
+    .with_user_external_account_key(keyring.user_external_account_key());
+    Ok(Some(Arc::new(provider)))
 }
 
 /// One `schema.GitHubAuthProvider` entry the warning path reads.
