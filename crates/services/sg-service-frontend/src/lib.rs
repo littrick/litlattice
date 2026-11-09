@@ -19,6 +19,7 @@ pub mod ipallowlist;
 pub mod middleware;
 pub mod mux;
 pub mod service;
+pub mod service_connections;
 pub mod site_config_file;
 pub mod tenant;
 pub mod trace_headers;
