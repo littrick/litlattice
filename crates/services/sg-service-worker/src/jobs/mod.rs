@@ -54,6 +54,7 @@ pub mod batches_scheduler;
 pub mod bitbucket_project_permissions;
 pub mod bitbucket_server_client;
 pub mod code_monitor_actions;
+pub mod code_monitor_workers;
 pub mod code_monitors;
 pub mod codehost_version_syncing;
 pub mod codeintel_metrics_reporter;
