@@ -162,6 +162,12 @@ pub fn pipeline_query(input: &str, search_type: SearchType) -> Result<Plan, Stri
     pipeline(vec![init(input.to_owned(), search_type)])
 }
 
+/// `ParseRegexp`: `Run(Init(in, SearchTypeRegex))`, i.e. parsing without
+/// pipeline validation.
+pub fn parse_regexp(input: &str) -> Result<Vec<Node>, String> {
+    run(init_regexp(input.to_owned()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

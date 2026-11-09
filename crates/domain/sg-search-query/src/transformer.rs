@@ -634,3 +634,36 @@ pub fn to_basic_query(nodes: &[Node]) -> Result<Basic, String> {
     let (parameters, pattern) = partition_search_pattern(nodes)?;
     Ok(Basic::new(Parameters::new(parameters), pattern))
 }
+
+/// `AddRegexpField`: add or extend a non-negated regexp-valued field. If an
+/// existing parameter of `field` holds a value contained in `pattern`, it is
+/// replaced in place; otherwise the parameter is appended and `And` nodes are
+/// reduced at the top level (`NewOperator`).
+pub fn add_regexp_field(q: &[Node], field: &str, pattern: &str) -> String {
+    let mut modified = false;
+    let mut mapped = map_parameter(q, &mut |got_field, value, negated, annotation| {
+        let value = if field == got_field && pattern.contains(value) {
+            modified = true;
+            pattern.to_owned()
+        } else {
+            value.to_owned()
+        };
+        Some(Node::Parameter(Parameter {
+            field: got_field.to_owned(),
+            value,
+            negated,
+            annotation: annotation.clone(),
+        }))
+    });
+
+    if !modified {
+        mapped.push(Node::Parameter(Parameter {
+            field: field.to_owned(),
+            value: pattern.to_owned(),
+            negated: false,
+            annotation: crate::node::Annotation::default(),
+        }));
+        mapped = new_operator(mapped, OperatorKind::And);
+    }
+    crate::printer::string_human(&mapped)
+}

@@ -7,11 +7,14 @@ use time::{OffsetDateTime, UtcOffset};
 
 use sg_search_query::basic::{map_plan, Plan};
 use sg_search_query::fields::{
-    FIELD_AFTER, FIELD_ARCHIVED, FIELD_AUTHOR, FIELD_BEFORE, FIELD_CASE, FIELD_COUNT, FIELD_FILE,
-    FIELD_FORK, FIELD_PATTERN_TYPE, FIELD_REPO, FIELD_REV, FIELD_TIMEOUT, FIELD_TYPE,
+    FIELD_AFTER, FIELD_ARCHIVED, FIELD_AUTHOR, FIELD_BEFORE, FIELD_CASE, FIELD_CONTENT,
+    FIELD_COUNT, FIELD_FILE, FIELD_FORK, FIELD_PATTERN_TYPE, FIELD_REPO, FIELD_REV, FIELD_TIMEOUT,
+    FIELD_TYPE,
 };
 use sg_search_query::node::{regexp_quote_meta, Parameter};
-use sg_search_query::{pipeline_query, plan_to_q, string_human, Parameters, SearchType};
+use sg_search_query::{
+    add_regexp_field, pipeline_query, plan_to_q, string_human, Parameters, SearchType,
+};
 
 use crate::parser::parse_query;
 use crate::repo::{exactly_one_repo, parameter, repositories};
@@ -26,6 +29,49 @@ pub const NO_REPO_METADATA_TEXT: &str = "No metadata";
 
 /// `QueryNotSupported`.
 pub const QUERY_NOT_SUPPORTED: &str = "query not supported";
+
+/// `MapType`: the compute grouping key for a command insight series.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MapType {
+    Lang,
+    Repo,
+    Path,
+    Author,
+    Date,
+}
+
+impl MapType {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MapType::Lang => "lang",
+            MapType::Repo => "repo",
+            MapType::Path => "path",
+            MapType::Author => "author",
+            MapType::Date => "date",
+        }
+    }
+}
+
+/// The compute command that corresponds to the execution for Code Insights.
+const INSIGHTS_COMPUTE_COMMAND: &str = "output.extra";
+
+/// `ComputeInsightCommandQuery`: convert a search query into a compute
+/// `output.extra(...)` query that groups matches by `map_type`.
+pub fn compute_insight_command_query(
+    query: &str,
+    map_type: MapType,
+) -> Result<ComputeInsightQuery, String> {
+    let parsed = crate::compute::parse(query).map_err(|err| format!("compute.Parse: {err}"))?;
+    let pattern = parsed.command.to_search_pattern();
+    Ok(add_regexp_field(
+        &parsed.parameters,
+        FIELD_CONTENT,
+        &format!(
+            "{INSIGHTS_COMPUTE_COMMAND}({pattern} -> ${})",
+            map_type.as_str()
+        ),
+    ))
+}
 
 /// `withDefaults`: insert default parameters that the query does not specify,
 /// preserving user-supplied values. `count:all` becomes `count:99999999` via

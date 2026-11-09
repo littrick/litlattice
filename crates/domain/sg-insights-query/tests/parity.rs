@@ -7,10 +7,22 @@ use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
 use sg_insights_query::builder::*;
+use sg_insights_query::compute;
 use sg_insights_query::parser::*;
 use sg_insights_query::regexp::*;
 use sg_insights_query::PointDiffQueryOpts;
 use sg_search_query::{plan_to_q, string_human, Parameters, SearchType};
+
+fn harness_map_type(name: &str) -> MapType {
+    match name {
+        "lang" => MapType::Lang,
+        "repo" => MapType::Repo,
+        "path" => MapType::Path,
+        "author" => MapType::Author,
+        "date" => MapType::Date,
+        other => panic!("unknown map type {other}"),
+    }
+}
 
 fn harness_parameters(spec: &str) -> Parameters {
     if spec.is_empty() || spec == "-" {
@@ -273,6 +285,21 @@ fn insights_query_builder_parity() {
                 parts[2],
                 for_repos(parts[1], &harness_strings(parts[2]))
             ),
+            "compute" => match compute::parse(parts[1]) {
+                Ok(q) => println!(
+                    "cp\t{}\t{}\t{}\t{}\t{}",
+                    parts[1],
+                    q.parameters.len(),
+                    q.command.string(),
+                    q.string(),
+                    q.to_search_query()
+                ),
+                Err(err) => println!("cp\t{}\terror: {err}", parts[1]),
+            },
+            "ciq" => match compute_insight_command_query(parts[1], harness_map_type(parts[2])) {
+                Ok(got) => println!("cq\t{}\t{}\t{}", parts[1], parts[2], got),
+                Err(err) => println!("cq\t{}\t{}\terror: {err}", parts[1], parts[2]),
+            },
             other => panic!("unknown op {other:?}"),
         }
     }

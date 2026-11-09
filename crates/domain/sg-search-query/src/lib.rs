@@ -33,6 +33,7 @@ pub use node::{
     to_string as query_to_string, Annotation, Node, Operator, OperatorKind, Parameter, Pattern,
 };
 pub use parser::{parse, ParseError, SearchType};
-pub use pipeline::{pipeline, pipeline_query};
+pub use pipeline::{parse_regexp, pipeline, pipeline_query};
 pub use printer::string_human;
 pub use range::{Position, Range};
+pub use transformer::add_regexp_field;

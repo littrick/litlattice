@@ -53,6 +53,21 @@ impl Parameters {
     pub fn to_nodes(&self) -> Vec<Node> {
         self.0.iter().cloned().map(Node::Parameter).collect()
     }
+
+    /// `Parameters.boolValue` / `Parameters.IsCaseSensitive`: the last visited
+    /// `case:` value decides; a parse error yields `false` (the baseline
+    /// discards the error, which validation should already have caught).
+    pub fn is_case_sensitive(&self) -> bool {
+        let mut result = false;
+        visit_field(
+            &self.to_nodes(),
+            crate::fields::FIELD_CASE,
+            &mut |value, _negated, _annotation| {
+                result = crate::validate::parse_bool(value).unwrap_or(false);
+            },
+        );
+        result
+    }
 }
 
 /// `toNodes`.
