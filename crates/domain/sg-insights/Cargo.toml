@@ -9,6 +9,6 @@ publish.workspace = true
 [dependencies]
 sg-insights-query = { path = "../sg-insights-query" }
 sg-search-query = { path = "../sg-search-query" }
-# `parsing` is used by the differential harness / unit tests; the library only
-# needs `OffsetDateTime` arithmetic.
-time = { workspace = true, features = ["parsing"] }
+# `parsing`/`macros` are used by the differential harness and unit tests; the
+# library only needs `OffsetDateTime` arithmetic.
+time = { workspace = true, features = ["parsing", "macros"] }
