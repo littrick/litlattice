@@ -157,12 +157,32 @@ pub async fn is_queued(
     repository_id: i32,
     commit: &str,
 ) -> Result<bool, sqlx::Error> {
+    fetch_is_queued(pool, repository_id, commit).await
+}
+
+/// [`is_queued`] inside the caller's transaction (`QueueRepoRev`).
+pub async fn is_queued_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    repository_id: i32,
+    commit: &str,
+) -> Result<bool, sqlx::Error> {
+    fetch_is_queued(&mut **tx, repository_id, commit).await
+}
+
+async fn fetch_is_queued<'e, E>(
+    executor: E,
+    repository_id: i32,
+    commit: &str,
+) -> Result<bool, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
     let row = sqlx::query(IS_QUEUED_SQL)
         .bind(repository_id)
         .bind(commit)
         .bind(repository_id)
         .bind(commit)
-        .fetch_one(pool)
+        .fetch_one(executor)
         .await?;
     row.try_get(0)
 }
