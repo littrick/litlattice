@@ -8,7 +8,7 @@
 //! The server URL is normalised to `SERVER` in error messages because the two
 //! harnesses bind different ports.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use http_body_util::BodyExt;
@@ -25,6 +25,45 @@ struct Route {
     status: u16,
     link: Option<String>,
     body: String,
+}
+
+/// Scripted response for `GetAuthenticatedOAuthScopes`, which always requests
+/// the API root. Each call consumes the next entry.
+#[derive(Clone)]
+struct ScopeRoute {
+    status: u16,
+    body: String,
+    scope: Option<String>,
+}
+
+fn scope_routes() -> Vec<ScopeRoute> {
+    vec![
+        ScopeRoute {
+            status: 200,
+            body: "{}".to_owned(),
+            scope: Some("read:org, user".to_owned()),
+        },
+        ScopeRoute {
+            status: 200,
+            body: "{}".to_owned(),
+            scope: Some(String::new()),
+        },
+        ScopeRoute {
+            status: 200,
+            body: "null".to_owned(),
+            scope: Some("read:org".to_owned()),
+        },
+        ScopeRoute {
+            status: 200,
+            body: "{}".to_owned(),
+            scope: Some("repo,read:org".to_owned()),
+        },
+        ScopeRoute {
+            status: 500,
+            body: r#"{"message":"boom"}"#.to_owned(),
+            scope: None,
+        },
+    ]
 }
 
 fn route(body: &str) -> Route {
@@ -171,14 +210,17 @@ fn routes() -> BTreeMap<String, Route> {
 
 async fn start_server(
     routes: BTreeMap<String, Route>,
+    scope_routes: Vec<ScopeRoute>,
     records: Arc<Mutex<Vec<String>>>,
 ) -> (String, CancellationToken) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind scripted server");
     let addr = listener.local_addr().expect("server addr");
+    let scope_routes = Arc::new(Mutex::new(VecDeque::from(scope_routes)));
     let http: HttpHandler = Arc::new(move |req: http::Request<hyper::body::Incoming>| {
         let routes = routes.clone();
+        let scope_routes = Arc::clone(&scope_routes);
         let records = Arc::clone(&records);
         Box::pin(async move {
             let target = req
@@ -209,6 +251,24 @@ async fn start_server(
                 header(http::header::CACHE_CONTROL),
             ));
             let _ = req.into_body().collect().await;
+
+            if target == "/api/v3" {
+                let route = scope_routes
+                    .lock()
+                    .expect("lock")
+                    .pop_front()
+                    .expect("scripted scope response");
+                let mut response = http::Response::builder().status(route.status);
+                if let Some(scope) = route.scope {
+                    response = response.header("x-oauth-scopes", scope);
+                }
+                return response
+                    .header("Content-Type", "application/json")
+                    .body(tonic::body::boxed(http_body_util::Full::new(
+                        hyper::body::Bytes::from(route.body),
+                    )))
+                    .expect("response");
+            }
 
             let fallback = Route {
                 status: 404,
@@ -282,7 +342,7 @@ macro_rules! users_line {
 #[tokio::test(flavor = "multi_thread")]
 async fn authz_github_rest_matches_go_harness() {
     let records = Arc::new(Mutex::new(Vec::<String>::new()));
-    let (server, shutdown) = start_server(routes(), Arc::clone(&records)).await;
+    let (server, shutdown) = start_server(routes(), scope_routes(), Arc::clone(&records)).await;
 
     for raw in [
         "https://github.com/",
@@ -425,7 +485,35 @@ async fn authz_github_rest_matches_go_harness() {
 
     print_user_calls(&client, &print_requests).await;
 
+    for op in [
+        "oauth-scopes-read-org",
+        "oauth-scopes-empty",
+        "oauth-scopes-null-body",
+        "oauth-scopes-no-space",
+        "oauth-scopes-error",
+    ] {
+        match client.get_authenticated_oauth_scopes().await {
+            Ok(scopes) => println!(
+                "ghrc op={op} status=ok scopes={} err=none",
+                join_scopes(&scopes)
+            ),
+            Err(err) => println!(
+                "ghrc op={op} status=err scopes=<empty> err={}",
+                normalize(&server, &err)
+            ),
+        }
+        print_requests(op);
+    }
+
     shutdown.cancel();
+}
+
+fn join_scopes(scopes: &[String]) -> String {
+    if scopes.is_empty() {
+        "<empty>".to_owned()
+    } else {
+        scopes.join(",")
+    }
 }
 
 async fn print_user_calls(client: &GithubRestClient, print_requests: &impl Fn(&str)) {

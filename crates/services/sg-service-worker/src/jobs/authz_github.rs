@@ -10,8 +10,12 @@
 //! permission computation, deduplication and cache semantics.
 //!
 //! The user-centric `FetchUserPerms` path additionally needs external-account
-//! decryption and OAuth token refresh, so it is not ported yet; the
-//! [`AuthzProvider`] default keeps returning `Unimplemented` for it.
+//! decryption and OAuth token refresh, so it is injected as
+//! [`GithubUserPermsProvider`] (see [`GithubRepoPermsProvider::with_user_perms`]).
+//!
+//! Also ported here: `Provider.FetchAccount` (always nil for GitHub, whose API
+//! cannot map a user by external SSO account) and `Provider.ValidateConnection`
+//! (`requiredAuthScopes` + `GetAuthenticatedOAuthScopes`).
 
 use std::collections::{BTreeMap, HashSet};
 use std::fmt;
@@ -19,7 +23,8 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use sg_db::user_external_accounts::ExternalAccount;
+use sg_db::user_external_accounts::{ExternalAccount, ExternalAccountSpec};
+use sg_db::users::UserRecord;
 
 use super::authz_github_user::GithubUserPermsProvider;
 use super::perms_syncer::{
@@ -247,7 +252,14 @@ pub trait GithubClient: Send + Sync {
         owner: &str,
         name: &str,
     ) -> Result<Repository, GithubClientError>;
+
+    /// `GetAuthenticatedOAuthScopes`: `GET /` and the `x-oauth-scopes`
+    /// response header, split on `", "`.
+    async fn get_authenticated_oauth_scopes(&self) -> Result<Vec<String>, GithubClientError>;
 }
+
+/// `Provider.requiredAuthScopes`'s message when the token lacks an org scope.
+pub const REQUIRED_ORGANIZATION_SCOPES_MESSAGE: &str = "Scope `read:org`, `write:org`, or `admin:org` is required to enable `authorization.groupsCacheTTL` - please provide a `token` with the required scopes, or try updating the [**site configuration**](/site-admin/configuration)'s corresponding entry in [`auth.providers`](https://sourcegraph.com/docs/admin/auth) to enable `allowGroupsPermissionsSync`.";
 
 /// `cache.go`'s `cachedGroup`. The JSON field names and `null` vs `[]` for
 /// the two slices match the baseline's `json.Marshal` output byte for byte.
@@ -541,6 +553,14 @@ impl GithubRepoPermsProvider {
         self.groups_cache.is_some()
     }
 
+    /// `Provider.requiredAuthScopes`: pulling group permissions needs one of
+    /// the org scopes, but only when the groups cache is enabled. `None` means
+    /// `ValidateConnection` has nothing to check.
+    fn required_auth_scopes(&self) -> Option<[&'static str; 3]> {
+        self.groups_cache.as_ref()?;
+        Some(["read:org", "write:org", "admin:org"])
+    }
+
     /// `getRepoAffiliatedGroups`: the org (admins-only when the org's default
     /// permission is not visible to all members) and, in that case, every team
     /// attached to the repository. A 404 from `GetOrganization` means the
@@ -633,6 +653,15 @@ impl AuthzProvider for GithubRepoPermsProvider {
 
     fn urn(&self) -> &str {
         &self.urn
+    }
+
+    /// `Provider.FetchAccount`: the GitHub API has no way to look up a user by
+    /// external SSO account, so the baseline always returns nil.
+    async fn fetch_account(
+        &self,
+        _user: &UserRecord,
+    ) -> Result<Option<ExternalAccountSpec>, String> {
+        Ok(None)
     }
 
     /// `Provider.FetchUserPerms`: private repositories the account can read.
@@ -805,6 +834,32 @@ impl AuthzProvider for GithubRepoPermsProvider {
         }
 
         Ok(user_ids)
+    }
+
+    /// `Provider.ValidateConnection`. The baseline's `p.client()` cannot fail
+    /// here (the client is built by the constructor), so the `"unable to get
+    /// client"` branch has no Rust counterpart.
+    async fn validate_connection(&self) -> Result<(), String> {
+        let Some(required) = self.required_auth_scopes() else {
+            return Ok(());
+        };
+
+        let scopes = self
+            .client
+            .get_authenticated_oauth_scopes()
+            .await
+            .map_err(|err| {
+                format!(
+                    "additional OAuth scopes are required, but failed to get available scopes: {err}"
+                )
+            })?;
+
+        let got: HashSet<&str> = scopes.iter().map(String::as_str).collect();
+        if required.iter().any(|scope| got.contains(scope)) {
+            Ok(())
+        } else {
+            Err(REQUIRED_ORGANIZATION_SCOPES_MESSAGE.to_owned())
+        }
     }
 }
 

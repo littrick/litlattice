@@ -480,6 +480,54 @@ impl GithubClient for GithubRestClient {
             Err(err) => Err(err),
         }
     }
+
+    async fn get_authenticated_oauth_scopes(&self) -> Result<Vec<String>, GithubClientError> {
+        // `c.get(ctx, "/", &struct{}{})`: `path.Join(apiURL.Path, "/")`, i.e.
+        // the API root without a trailing slash.
+        let mut url = self.api_url.clone();
+        url.set_path(&join_root_path(self.api_url.path()));
+        url.set_query(None);
+
+        let response = self.do_request(&url).await?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(api_error(&url, status, response).await);
+        }
+        let headers = response.headers().clone();
+
+        // `doRequest` decodes the body into `&struct{}{}` before
+        // `GetAuthenticatedOAuthScopes` reads the headers: an object or
+        // `null` is accepted, anything else is a decode error. The decode
+        // error text itself comes from serde and differs from Go's.
+        if status != StatusCode::NO_CONTENT && status != StatusCode::NOT_MODIFIED {
+            let body = response.text().await.map_err(|err| {
+                GithubClientError::new(format!("failed to read response body: {err}"))
+            })?;
+            serde_json::from_str::<Option<serde_json::Map<String, serde_json::Value>>>(&body)
+                .map_err(|err| GithubClientError::new(err.to_string()))?;
+        }
+
+        let scope = headers
+            .get("x-oauth-scopes")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("");
+        if scope.is_empty() {
+            return Ok(Vec::new());
+        }
+        // `strings.Split(scope, ", ")`: a comma without a following space
+        // does not split, exactly like the baseline.
+        Ok(scope.split(", ").map(str::to_owned).collect())
+    }
+}
+
+/// `path.Join(base, "/")` for the API-root request.
+fn join_root_path(base: &str) -> String {
+    let base = base.trim_end_matches('/');
+    if base.is_empty() {
+        "/".to_owned()
+    } else {
+        base.to_owned()
+    }
 }
 
 /// `convertRestRepo` reduced to the fields the authz provider reads. A

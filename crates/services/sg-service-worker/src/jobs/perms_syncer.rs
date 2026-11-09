@@ -171,6 +171,11 @@ pub trait AuthzProvider: Send + Sync {
             message: "FetchUserPerms is not implemented".to_owned(),
         })
     }
+    /// `ValidateConnection`: configuration-time connectivity and auth-scope
+    /// check. The syncer never calls it; site config validation does.
+    async fn validate_connection(&self) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 /// `providers.ProvidersFromConfig` as seen by the syncer. The registry is

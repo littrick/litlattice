@@ -186,6 +186,11 @@ impl GithubClient for MockClient {
             .clone()
             .ok_or_else(|| GithubClientError::new("no repository"))
     }
+
+    async fn get_authenticated_oauth_scopes(&self) -> Result<Vec<String>, GithubClientError> {
+        self.record("get-authenticated-oauth-scopes".to_owned());
+        Ok(Vec::new())
+    }
 }
 
 fn join_ids(ids: &[String]) -> String {
