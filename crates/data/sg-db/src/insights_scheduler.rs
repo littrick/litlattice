@@ -893,6 +893,11 @@ impl PersistentRepoIterator {
         end: OffsetDateTime,
         on_terminal: &mut dyn TerminalHandler,
     ) -> Result<(), String> {
+        // Go advances the retry cursor in the finish closure, before
+        // `doFinishN`, so a failed finish still consumes the retry slot.
+        if handle.is_retry {
+            self.retry_cursor += 1;
+        }
         let errors_count = handle
             .repos
             .iter()

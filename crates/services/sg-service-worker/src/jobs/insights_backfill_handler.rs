@@ -263,14 +263,14 @@ impl NewBackfillHandler {
 
 /// Go's `time.Time.Truncate(time.Minute)`: floor the absolute instant to a
 /// whole minute (the value is a UTC wall clock here).
-fn truncate_to_minute(time: OffsetDateTime) -> OffsetDateTime {
+pub(crate) fn truncate_to_minute(time: OffsetDateTime) -> OffsetDateTime {
     let seconds = time.unix_timestamp();
     let floored = seconds - seconds.rem_euclid(60);
     OffsetDateTime::from_unix_timestamp(floored).unwrap_or(time)
 }
 
 /// Render driver errors the way the Go baseline logs them.
-fn sql_error(err: &sqlx::Error) -> String {
+pub(crate) fn sql_error(err: &sqlx::Error) -> String {
     match err {
         sqlx::Error::RowNotFound => "sql: no rows in result set".to_owned(),
         other => other.to_string(),

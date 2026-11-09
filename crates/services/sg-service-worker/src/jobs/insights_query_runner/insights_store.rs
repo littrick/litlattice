@@ -248,6 +248,7 @@ pub async fn record_points_and_times(
 /// `IncompleteReason`.
 pub const REASON_TIMEOUT: &str = "timeout";
 pub const REASON_GENERIC: &str = "generic";
+pub const REASON_EXCEEDS_ERROR_LIMIT: &str = "exceeds-error-limit";
 
 /// `AddIncompleteDatapoint`: the `time` column is `timestamp without time
 /// zone`, so bind the UTC wall clock (lib/pq sends a zoned time that PG casts
@@ -258,17 +259,49 @@ pub async fn add_incomplete_datapoint(
     reason: &str,
     time: OffsetDateTime,
 ) -> Result<(), String> {
+    let mut conn = pool.acquire().await.map_err(|err| err.to_string())?;
+    add_incomplete_datapoint_in(&mut conn, series_id, None, reason, time).await
+}
+
+/// `AddIncompleteDatapoint` on an existing connection or transaction
+/// (`h.insightsStore.WithOther(tx)` in the in-progress handler).
+pub async fn add_incomplete_datapoint_in(
+    conn: &mut sqlx::PgConnection,
+    series_id: i32,
+    repo_id: Option<i32>,
+    reason: &str,
+    time: OffsetDateTime,
+) -> Result<(), String> {
     let time: PrimitiveDateTime = PrimitiveDateTime::new(time.date(), time.time());
     sqlx::query(
         "insert into insight_series_incomplete_points (series_id, repo_id, reason, time) values ($1, $2, $3, $4) on conflict do nothing",
     )
     .bind(series_id)
-    .bind(None::<i32>)
+    .bind(repo_id)
     .bind(reason)
     .bind(time)
-    .execute(pool)
+    .execute(conn)
     .await
     .map_err(|err| err.to_string())?;
+    Ok(())
+}
+
+/// `SetSeriesBackfillComplete`: `UPDATE insight_series SET
+/// backfill_completed_at = $1 WHERE series_id = $2`.
+///
+/// The Go handler calls this on the plain insight store (not on its
+/// transaction), so it keeps its own autocommit connection here too.
+pub async fn set_series_backfill_complete(
+    pool: &PgPool,
+    series_id: &str,
+    timestamp: PrimitiveDateTime,
+) -> Result<(), String> {
+    sqlx::query("UPDATE insight_series SET backfill_completed_at = $1 WHERE series_id = $2")
+        .bind(timestamp)
+        .bind(series_id)
+        .execute(pool)
+        .await
+        .map_err(|err| err.to_string())?;
     Ok(())
 }
 
