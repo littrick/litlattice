@@ -78,6 +78,7 @@ pub mod insights_backfill_store;
 pub mod insights_data_prune;
 pub mod insights_data_retention;
 pub mod insights_enqueuer;
+pub mod insights_license_check;
 pub mod insights_pings;
 pub mod insights_query_runner;
 pub mod licensecheck;
