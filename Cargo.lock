@@ -2693,6 +2693,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "num_threads"
+version = "0.1.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cabcc654086861f9e1bc5115258de62ef92c79b20f4615a1b0cc57c4e82027d4"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "once_cell"
 version = "1.21.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4030,6 +4039,28 @@ name = "sg-httpcli"
 version = "0.1.0"
 
 [[package]]
+name = "sg-insights"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "prost-types 0.13.5",
+ "sg-git",
+ "sg-insights-query",
+ "sg-search-query",
+ "time",
+ "tokio",
+]
+
+[[package]]
+name = "sg-insights-query"
+version = "0.1.0"
+dependencies = [
+ "regex-syntax",
+ "sg-search-query",
+ "time",
+]
+
+[[package]]
 name = "sg-keyring"
 version = "0.1.0"
 dependencies = [
@@ -4329,6 +4360,8 @@ dependencies = [
  "sg-extsvc",
  "sg-git",
  "sg-http",
+ "sg-insights",
+ "sg-insights-query",
  "sg-keyring",
  "sg-licensing",
  "sg-luasandbox",
@@ -4337,6 +4370,7 @@ dependencies = [
  "sg-proto",
  "sg-rcache",
  "sg-redis",
+ "sg-txemail",
  "sg-zoekt",
  "sha2 0.10.9",
  "sqlx",
@@ -4354,6 +4388,20 @@ dependencies = [
 [[package]]
 name = "sg-trace"
 version = "0.1.0"
+
+[[package]]
+name = "sg-txemail"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "md5",
+ "regex",
+ "rustls 0.23.46",
+ "rustls-native-certs",
+ "serde_json",
+ "thiserror 1.0.69",
+ "time",
+]
 
 [[package]]
 name = "sg-ui"
@@ -4908,7 +4956,9 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cdb87b95ec50ddfa440816d227a17b2ccbdda963a316a727fda0fc4334f7d134"
 dependencies = [
  "deranged",
+ "libc",
  "num-conv",
+ "num_threads",
  "powerfmt",
  "serde_core",
  "time-core",

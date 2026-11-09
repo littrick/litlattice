@@ -117,6 +117,30 @@ pub struct FileInfo {
     pub name: String,
 }
 
+/// One entry of a `ReadDir` listing with the directory flag preserved.
+///
+/// The proto carries no explicit `is_directory` field: the baseline's
+/// `fs.FileInfo.IsDir` reads `os.ModeDir` out of `FileInfo.mode`, where
+/// gitserver encodes `uint32(fi.Mode())` (`gitdomain.FSFileInfoToProto`).
+/// The Rust gitserver port encodes the same flag (`MODE_DIR`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirEntry {
+    pub name: String,
+    pub is_dir: bool,
+}
+
+/// `os.ModeDir`: the bit gitserver sets in `FileInfo.mode` for tree entries.
+const MODE_DIR: u32 = 1 << 31;
+
+/// `gitdomain.ProtoFileInfoToFS`'s directory flag (`fs.FileInfo.IsDir` is
+/// `Mode().IsDir()`, i.e. `mode & os.ModeDir != 0`).
+fn dir_entry(file_info: &pb::FileInfo) -> DirEntry {
+    DirEntry {
+        name: String::from_utf8_lossy(&file_info.name).into_owned(),
+        is_dir: file_info.mode & MODE_DIR != 0,
+    }
+}
+
 /// The subset of `gitdomain.Commit` the upload processor, the code-intel
 /// commit graph updater and the Perforce changelist mapper read.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -448,6 +472,24 @@ impl GitserverClient {
         commit: &str,
         path: &str,
     ) -> Result<Vec<FileInfo>, Error> {
+        Ok(self
+            .read_dir_entries(repo, commit, path, false)
+            .await?
+            .into_iter()
+            .map(|entry| FileInfo { name: entry.name })
+            .collect())
+    }
+
+    /// `gitserver.Client.ReadDir` with `recursive` and the directory flag
+    /// preserved (`inference.gitService.ReadDir` drains the whole iterator,
+    /// including the tree entries `-t` adds).
+    pub async fn read_dir_entries(
+        &self,
+        repo: &str,
+        commit: &str,
+        path: &str,
+        recursive: bool,
+    ) -> Result<Vec<DirEntry>, Error> {
         let mut client = self.client_for(repo).await?;
         let context = format!("read dir {repo}@{commit}:{path}");
         let mut stream = client
@@ -455,7 +497,7 @@ impl GitserverClient {
                 repo_name: repo.to_owned(),
                 commit_sha: commit.to_owned(),
                 path: Some(path.as_bytes().to_vec()),
-                recursive: false,
+                recursive,
             })
             .await
             .map_err(|status| translate_status(status, &context))?
@@ -468,9 +510,7 @@ impl GitserverClient {
             .map_err(|status| translate_status(status, &context))?
         {
             for file_info in chunk.file_info {
-                files.push(FileInfo {
-                    name: String::from_utf8_lossy(&file_info.name).into_owned(),
-                });
+                files.push(dir_entry(&file_info));
             }
         }
         Ok(files)
@@ -659,5 +699,28 @@ mod payloads {
         pub repo: String,
         #[prost(string, tag = "2")]
         pub spec: String,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dir_entry_reads_the_mode_dir_bit() {
+        let directory = pb::FileInfo {
+            name: b"vendor".to_vec(),
+            mode: 0o40000 | MODE_DIR,
+            ..Default::default()
+        };
+        assert!(dir_entry(&directory).is_dir);
+        assert_eq!(dir_entry(&directory).name, "vendor");
+
+        let file = pb::FileInfo {
+            name: b"main.go".to_vec(),
+            mode: 0o100644,
+            ..Default::default()
+        };
+        assert!(!dir_entry(&file).is_dir);
     }
 }

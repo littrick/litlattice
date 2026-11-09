@@ -20,17 +20,14 @@
 //! implementations of the handler seams from M9.8dg/M9.8dh on top of
 //! `sg-db` and assembles the job.
 //!
-//! Scope note: this slice assembles the sync scheduler and both resetters.
 //! The indexing scheduler's `IndexEnqueuer` is
-//! `autoindexing.Service.QueueAutoIndexJobsForPackage`, whose production
-//! implementation reads repository files through gitserver and runs the
-//! embedded Lua inference sandbox (`inference.NewService(db)` →
-//! `internal/luasandbox`); that pipeline is still unported. Assembling the
-//! indexing worker with an enqueuer that cannot infer would mark real queue
-//! records failed, so the worker is deferred until the inference slice lands
-//! (documented in `docs/modules/06_worker.md` §130). Its adapters are
-//! implemented here so the differential harness can drive the handler against
-//! the real stores.
+//! `autoindexing.Service.QueueAutoIndexJobsForPackage`; its production chain
+//! (`autoindexing.NewService` → `newService` → `jobselector.NewJobSelector` →
+//! `enqueuer.NewIndexEnqueuer`) is assembled here from the production
+//! adapters in [`super::codeintel_autoindexing_inference_production`] (which
+//! bind gitserver, the site-config indexer map and the inference env limits
+//! to the M9.8dm inference service) and the M9.8dc/M9.8de job-selector and
+//! enqueuer ports.
 //!
 //! Not ported: worker/resetter metrics, observation spans and the
 //! `actor.WithInternalActor` context (the SQL has no authz condition).
@@ -54,10 +51,16 @@ use tokio_util::sync::CancellationToken;
 use super::codeintel_autoindexing_dependency_indexing_scheduler as indexing;
 use super::codeintel_autoindexing_dependency_sync_scheduler as sync;
 use super::codeintel_autoindexing_enqueuer::{IndexEnqueuer, VersionedPackageRepo};
+use super::codeintel_autoindexing_inference::{InferenceService, SandboxService};
+use super::codeintel_autoindexing_inference_production::{
+    inference_environment, GitserverGitService, GitserverRevisionResolver, GitserverYamlReader,
+    InferenceAdapter, TokenBucketLimiter,
+};
+use super::codeintel_autoindexing_package_inference::DefaultPackageRepoInference;
 use super::codeintel_autoindexing_scheduler::auto_indexing_enabled;
 use super::codeintel_dependency_jobs::{
     DependencyIndexingJobRecord, DependencyIndexingJobStore, DependencySyncingJobRecord,
-    DependencySyncingJobStore, IndexResetter,
+    DependencySyncingJobStore, IndexResetter, INDEXING_WORKER_DESCRIPTION, INDEXING_WORKER_NAME,
 };
 use super::{get_interval, Job, JobConfig, JobDeps};
 use crate::config::combine_errors;
@@ -66,6 +69,8 @@ use crate::framework::dbworker::{
     DbRecord, DbWorkerHandler, ResetterOptions, ResetterRoutine, WorkerOptions, WorkerRoutine,
 };
 use crate::framework::BackgroundRoutine;
+use sg_git::GitserverClient;
+use sg_luasandbox::Service as LuaSandboxService;
 
 /// `autoindexingDependencyScheduler.Description()`.
 pub const JOB_DESCRIPTION: &str = "";
@@ -632,6 +637,67 @@ impl Job for AutoindexingDependencyScheduler {
             },
         );
 
+        // `autoindexing.NewService`'s production chain: the gitserver client
+        // feeds the inference service (M9.8dm), the job selector and the
+        // enqueuer (M9.8dc/M9.8de). The env limits are read here because the
+        // baseline reads them in package init (`env.MustGetInt`).
+        let unified = deps.live_config.current();
+        let git = Arc::new(GitserverClient::new(
+            unified.service_connections.git_servers.clone(),
+        ));
+
+        let mut env = EnvReader::new();
+        let environment = inference_environment(&unified.site, &mut env)?;
+        let sandbox: Arc<dyn SandboxService> = Arc::new(LuaSandboxService::new());
+        let inference_service = Arc::new(InferenceService::new(
+            sandbox,
+            Arc::new(GitserverGitService::new(git.clone())),
+            Arc::new(TokenBucketLimiter::new(
+                environment.gitserver_request_rate_limit,
+            )),
+            environment.settings,
+        ));
+        let enqueuer = Arc::new(IndexEnqueuer::from_env(
+            pool.clone(),
+            Arc::new(GitserverRevisionResolver::new(git.clone())),
+            Arc::new(DefaultPackageRepoInference),
+            Arc::new(InferenceAdapter::new(inference_service)),
+            Arc::new(GitserverYamlReader::new(git)),
+            &mut env,
+        )?);
+
+        let indexing_store = Arc::new(DependencyIndexingJobStore::new(pool.clone()));
+        let indexing_worker = WorkerRoutine::new(
+            indexing_store.clone(),
+            Arc::new(IndexingSchedulerWorker {
+                handler: indexing::DependencyIndexingSchedulerHandler {
+                    uploads: Arc::new(UploadsAdapter::new(pool.clone())),
+                    repos: Arc::new(ReposAdapter::new(RepoStore::new(pool.clone()))),
+                    external_services: Arc::new(IndexingExternalServicesAdapter::new(
+                        ExternalServiceStore::new(pool.clone()),
+                    )),
+                    gitserver_repos: Arc::new(GitserverRepoStoreAdapter::new(
+                        GitserverReposStore::new(pool.clone()),
+                    )),
+                    index_enqueuer: Arc::new(IndexEnqueuerAdapter::new(enqueuer)),
+                    worker_store: indexing_store.clone(),
+                    settings: indexing::HandlerSettings {
+                        auto_indexing_enabled,
+                        disabled: index_scheduler_disabled(),
+                    },
+                },
+            }),
+            WorkerOptions {
+                name: INDEXING_WORKER_NAME.to_owned(),
+                description: INDEXING_WORKER_DESCRIPTION.to_owned(),
+                interval: self.config.indexer_scheduler_poll_interval(),
+                heartbeat_interval: WORKER_HEARTBEAT_INTERVAL,
+                num_handlers: usize::try_from(self.config.indexer_scheduler_concurrency())
+                    .unwrap_or_default(),
+                worker_hostname: crate::framework::dbworker::default_hostname(),
+            },
+        );
+
         let index_resetter = ResetterRoutine::new(
             Arc::new(IndexResetter::new(pool.clone())),
             ResetterOptions {
@@ -648,10 +714,9 @@ impl Job for AutoindexingDependencyScheduler {
             },
         );
 
-        // TODO(M9.8dl+): append the dependency indexing scheduler worker once
-        // the Lua inference pipeline is ported; see the module docs.
         Ok(vec![
             BackgroundRoutine::DbBacked(Arc::new(sync_worker)),
+            BackgroundRoutine::DbBacked(Arc::new(indexing_worker)),
             BackgroundRoutine::DbBacked(Arc::new(index_resetter)),
             BackgroundRoutine::DbBacked(Arc::new(dependency_index_resetter)),
         ])
@@ -709,7 +774,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn routines_include_the_sync_worker_and_both_resetters() {
+    async fn routines_match_the_baseline_order() {
         let job = AutoindexingDependencyScheduler::new();
         let deps = JobDeps {
             frontend: lazy_pool(),
@@ -725,6 +790,7 @@ mod tests {
             names,
             vec![
                 "precise_code_intel_dependency_sync_scheduler_worker",
+                "precise_code_intel_dependency_indexing_scheduler_worker",
                 "precise_code_intel_index_worker_resetter",
                 "precise_code_intel_dependency_index_worker_resetter",
             ]
