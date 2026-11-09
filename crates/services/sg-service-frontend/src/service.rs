@@ -169,11 +169,17 @@ impl Service for FrontendService {
 
         if let Some((addr, listener)) = internal {
             let shutdown = ctx.shutdown.clone();
+            let store = Arc::clone(wiring.store());
             background.spawn(async move {
-                // `internalgrpc.MultiplexHandlers`; no gRPC services are
-                // registered yet, so gRPC traffic has no route, like a mux
-                // without handlers.
-                let routes = tonic::service::Routes::default();
+                // `httpapi.go:397` registers the configuration service on the
+                // internal gRPC server; `serve_cmd.go:397` multiplexes gRPC
+                // and the internal HTTP handler on the same listener
+                // (`internalgrpc.MultiplexHandlers`).
+                let routes = tonic::service::Routes::new(
+                    sg_proto::internalapi::config_service_server::ConfigServiceServer::new(
+                        crate::configuration_api::ConfigApi::new(store),
+                    ),
+                );
                 let handler = middleware::internal_handler();
                 if let Err(err) = sg_http::serve(listener, routes, handler, shutdown).await {
                     tracing::error!(addr, error = %err, "frontend internal server failed");
