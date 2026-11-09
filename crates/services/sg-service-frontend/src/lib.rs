@@ -21,6 +21,7 @@ pub mod mux;
 pub mod service;
 pub mod site_config_file;
 pub mod tenant;
+pub mod trace_headers;
 pub mod version;
 
 pub use service::{service_name, FrontendService, SERVICE_NAME};

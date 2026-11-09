@@ -168,12 +168,19 @@ impl Service for FrontendService {
 
         let allowlist = ipallowlist::compile(&self.site_config, &self.allowlist_env).map(Arc::new);
         let forbid_all = crate::auth::forbidden(&self.site_config);
+        let trace_url_template = crate::trace_headers::url_template(&self.site_config);
         let security = SecurityConfig::from_site_config(&self.site_config);
 
         tracing::info!(addr = %external_addr, "frontend listening");
         let served = sg_http::serve_http(
             external,
-            middleware::external_handler(self.version.bytes(), allowlist, forbid_all, security),
+            middleware::external_handler(
+                self.version.bytes(),
+                allowlist,
+                forbid_all,
+                trace_url_template,
+                security,
+            ),
             ctx.shutdown.clone(),
         )
         .await;

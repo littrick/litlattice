@@ -3,14 +3,15 @@
 //! The outer half of `newExternalHTTPHandler`'s middleware chain:
 //!
 //! ```text
-//! ipAllowlist → tenant → ForbidAll → GoGet → BlackHole → healthCheck → ServeMux
+//! ipAllowlist → tenant → instrumentation/trace → ForbidAll → GoGet →
+//! BlackHole → healthCheck → ServeMux
 //! ```
 //!
 //! The baseline wraps the mux with `ipAllowlist → tenant → instrumentation →
-//! tracepkg → ForbidAll → GoGet → BlackHole → healthCheck → gcontext → Trace`;
-//! the instrumentation/trace layers are observational, so they land in later
-//! slices (docs/overviews/m9_8ea §1.4). `ForbidAll` reads the site
-//! configuration snapshot and is ported here (m9_8ec).
+//! tracepkg → ForbidAll → GoGet → BlackHole → healthCheck → gcontext → Trace`.
+//! `ForbidAll` reads the site configuration snapshot (m9_8ec); the
+//! instrumentation/trace layers only contribute response headers here
+//! (m9_8ed). Span export, metrics and slow-request logging are not ported.
 
 use std::sync::Arc;
 
@@ -26,6 +27,7 @@ use crate::health;
 use crate::ipallowlist::{self, IpAllowlistConfig};
 use crate::mux::{self, SecurityConfig};
 use crate::tenant;
+use crate::trace_headers;
 
 /// `middleware.isBlackhole`.
 pub fn is_blackhole<B>(req: &Request<B>) -> bool {
@@ -93,16 +95,23 @@ pub fn external_response_with_next<B>(
 }
 
 /// The chain with the baseline's outer layers: `ipAllowlist` runs before the
-/// tenant lookup, which runs before `ForbidAll`; all of it precedes GoGet,
-/// BlackHole and healthCheck, so a denied `/healthz` is a 403 and an unknown
-/// tenant beats a go-get response. `None` means the allowlist is disabled
-/// (`configResolver()` returned nil); `forbid_all` is
-/// [`auth::forbidden`]'s result for the current site configuration.
+/// tenant lookup, which runs before the instrumentation/trace layers;
+/// `ForbidAll` follows them and precedes GoGet, BlackHole and healthCheck, so
+/// a denied `/healthz` is a 403 and an unknown tenant beats a go-get response.
+/// `None` means the allowlist is disabled (`configResolver()` returned nil);
+/// `forbid_all` is [`auth::forbidden`]'s result for the current site
+/// configuration.
+///
+/// The trace layers never reject: they mint IDs after the tenant middleware
+/// succeeds and stamp `X-Trace`/`X-Trace-Span`/`X-Trace-URL` on whatever the
+/// inner chain returns (including ForbidAll's 403). ipAllowlist and tenant
+/// rejections happen outside them and carry no trace headers.
 pub fn external_response_with_ipallowlist<B>(
     req: &mut Request<B>,
     version: &Bytes,
     allowlist: Option<&IpAllowlistConfig>,
     forbid_all: bool,
+    trace_url_template: Option<&str>,
     external_url: &str,
     next: impl FnOnce(&mut Request<B>) -> Response<BoxBody>,
 ) -> Response<BoxBody> {
@@ -114,19 +123,24 @@ pub fn external_response_with_ipallowlist<B>(
     if let Err(response) = tenant::external_tenant_from_hostname(req, tenant::fixed_tenant_one) {
         return response;
     }
-    if forbid_all {
-        return auth::forbidden_response();
-    }
-    if let Some(response) = goimportpath::response(req, external_url) {
-        return response;
-    }
-    if is_blackhole(req) {
-        return blackhole_response();
-    }
-    if let Some(response) = health::health_check(req.uri().path(), version) {
-        return response;
-    }
-    next(req)
+    let trace = trace_headers::TraceIds::generate();
+    let mut response = (|| {
+        if forbid_all {
+            return auth::forbidden_response();
+        }
+        if let Some(response) = goimportpath::response(req, external_url) {
+            return response;
+        }
+        if is_blackhole(req) {
+            return blackhole_response();
+        }
+        if let Some(response) = health::health_check(req.uri().path(), version) {
+            return response;
+        }
+        next(req)
+    })();
+    trace_headers::apply(&mut response, &trace, trace_url_template, external_url);
+    response
 }
 
 /// `newExternalHTTPHandler` without its config-dependent layers.
@@ -135,7 +149,9 @@ pub fn external_response<B>(
     version: &Bytes,
     external_url: &str,
 ) -> Response<BoxBody> {
-    external_response_with_ipallowlist(req, version, None, false, external_url, |_| go_not_found())
+    external_response_with_ipallowlist(req, version, None, false, None, external_url, |_| {
+        go_not_found()
+    })
 }
 
 /// `newInternalHTTPHandler`'s mux once every `/.internal/` route is registered;
@@ -149,11 +165,13 @@ pub fn external_handler(
     version: Bytes,
     allowlist: Option<Arc<IpAllowlistConfig>>,
     forbid_all: bool,
+    trace_url_template: Option<String>,
     security: SecurityConfig,
 ) -> sg_http::HttpHandler {
     Arc::new(move |mut req: Request<Incoming>| {
         let version = version.clone();
         let allowlist = allowlist.clone();
+        let trace_url_template = trace_url_template.clone();
         let security = security.clone();
         Box::pin(async move {
             external_response_with_ipallowlist(
@@ -161,6 +179,7 @@ pub fn external_handler(
                 &version,
                 allowlist.as_deref(),
                 forbid_all,
+                trace_url_template.as_deref(),
                 &security.external_url,
                 |req| mux::route(req, &security, mux::not_found_dispatch),
             )
@@ -261,6 +280,7 @@ mod tests {
                 &Bytes::from_static(b"v"),
                 None,
                 true,
+                None,
                 "https://sourcegraph.com",
                 |_| go_not_found(),
             );
@@ -296,6 +316,7 @@ mod tests {
             &Bytes::from_static(b"v"),
             Some(&allowlist),
             true,
+            None,
             "",
             |_| go_not_found(),
         );
@@ -305,6 +326,120 @@ mod tests {
             response.headers().get(header::CONTENT_TYPE).unwrap(),
             "text/html; charset=utf-8"
         );
+    }
+
+    fn assert_hex(value: &str, len: usize) {
+        assert_eq!(value.len(), len, "{value}");
+        assert!(
+            value
+                .chars()
+                .all(|ch| ch.is_ascii_hexdigit() && !ch.is_ascii_uppercase()),
+            "{value}"
+        );
+    }
+
+    #[test]
+    fn trace_headers_stamp_every_response_after_the_tenant() {
+        let template = "https://traces.example/{{ .TraceID }}";
+        for (path, forbid_all) in [
+            ("/healthz", false),
+            ("/sourcegraph/sourcegraph?go-get=1", false),
+            ("/api/ext/github/webhook", false),
+            ("/.api/graphql", false),
+            ("/.api/graphql", true),
+        ] {
+            let mut req = request(path);
+            let response = external_response_with_ipallowlist(
+                &mut req,
+                &Bytes::from_static(b"v"),
+                None,
+                forbid_all,
+                Some(template),
+                "https://ext",
+                |_| go_not_found(),
+            );
+            let trace = response
+                .headers()
+                .get(trace_headers::TRACE_HEADER)
+                .unwrap_or_else(|| panic!("{path} has no X-Trace"))
+                .to_str()
+                .unwrap();
+            assert_hex(trace, 32);
+            assert_hex(
+                response
+                    .headers()
+                    .get(trace_headers::TRACE_SPAN_HEADER)
+                    .unwrap()
+                    .to_str()
+                    .unwrap(),
+                16,
+            );
+            assert_eq!(
+                response
+                    .headers()
+                    .get(trace_headers::TRACE_URL_HEADER)
+                    .unwrap()
+                    .to_str()
+                    .unwrap(),
+                format!("https://traces.example/{trace}"),
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn trace_url_is_written_empty_without_a_template() {
+        let mut req = request("/.api/graphql");
+        let response = external_response_with_ipallowlist(
+            &mut req,
+            &Bytes::from_static(b"v"),
+            None,
+            false,
+            None,
+            "",
+            |_| go_not_found(),
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(trace_headers::TRACE_URL_HEADER)
+                .unwrap(),
+            ""
+        );
+    }
+
+    #[test]
+    fn allowlist_rejections_carry_no_trace_headers() {
+        let allowlist = IpAllowlistConfig {
+            authorized_client_ips: vec!["10.0.0.1".parse().unwrap()],
+            ..IpAllowlistConfig::default()
+        };
+        let mut denied = request("/");
+        denied
+            .extensions_mut()
+            .insert(sg_http::RemoteAddr("192.0.2.10:1234".to_owned()));
+        let response = external_response_with_ipallowlist(
+            &mut denied,
+            &Bytes::from_static(b"v"),
+            Some(&allowlist),
+            false,
+            Some("https://traces.example/{{ .TraceID }}"),
+            "",
+            |_| go_not_found(),
+        );
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(response
+            .headers()
+            .get(trace_headers::TRACE_HEADER)
+            .is_none());
+        assert!(response
+            .headers()
+            .get(trace_headers::TRACE_SPAN_HEADER)
+            .is_none());
+        assert!(response
+            .headers()
+            .get(trace_headers::TRACE_URL_HEADER)
+            .is_none());
     }
 
     #[test]
@@ -322,6 +457,7 @@ mod tests {
             &Bytes::from_static(b"v"),
             Some(&allowlist),
             false,
+            None,
             "",
             |_| go_not_found(),
         );
@@ -342,6 +478,7 @@ mod tests {
             &Bytes::from_static(b"v"),
             Some(&IpAllowlistConfig::default()),
             false,
+            None,
             "",
             |_| go_not_found(),
         );
