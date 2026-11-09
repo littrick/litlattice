@@ -11,6 +11,8 @@ use sg_config::server::ConfigurationSource;
 use sg_config::RawUnified;
 use sg_service_frontend::configuration_server::FrontendConfigurationServer;
 use sg_service_frontend::configuration_source::DbConfigurationSource;
+use sg_service_frontend::configuration_startup::override_site_config;
+use sg_service_frontend::site_config_file::split_paths;
 use sqlx::{PgPool, Row};
 use tokio_util::sync::CancellationToken;
 
@@ -54,6 +56,21 @@ async fn latest(pool: &PgPool) -> (i32, i32, String) {
 /// The schema requires `auth.providers` (the custom check rejects an empty
 /// list), so the write scenarios use the smallest valid document.
 const NEW_SITE: &str = r#"{"auth.providers":[{"type":"builtin","allowSignup":true}]}"#;
+
+/// `overrideSiteConfig`: the error (or `nil`), the row count and the latest
+/// row after the call.
+async fn print_override(pool: &PgPool, tag: &str, result: &Result<bool, String>) {
+    let error = match result {
+        Ok(_) => "nil".to_owned(),
+        Err(err) => flat(err),
+    };
+    let (id, author, contents) = latest(pool).await;
+    println!(
+        "cw override {tag} err={error} rows={} latest id={id} author={author} contents={}",
+        rows(pool).await,
+        flat(&contents)
+    );
+}
 
 fn print_write(scenario: &str, result: Result<(), String>, rows: i64, latest: (i32, i32, String)) {
     match result {
@@ -215,6 +232,17 @@ async fn configuration_source_harness() {
                 restart
             );
             wiring.shutdown().await;
+        }
+        "override-apply" | "override-same" | "override-error" => {
+            reset(&pool).await;
+            let value = std::env::var("SITE_CONFIG_FILE").unwrap_or_default();
+            let paths = split_paths(&value);
+            let first = override_site_config(&source, &paths).await;
+            print_override(&pool, &format!("{scenario}-first"), &first).await;
+            if scenario == "override-same" {
+                let second = override_site_config(&source, &paths).await;
+                print_override(&pool, &format!("{scenario}-second"), &second).await;
+            }
         }
         other => panic!("unknown scenario {other}"),
     }

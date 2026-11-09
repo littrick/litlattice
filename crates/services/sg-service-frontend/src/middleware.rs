@@ -21,10 +21,12 @@ use http_body_util::Full;
 use hyper::body::Incoming;
 use tonic::body::BoxBody;
 
+use sg_config::LiveConfig;
+
 use crate::auth;
 use crate::goimportpath;
 use crate::health;
-use crate::ipallowlist::{self, IpAllowlistConfig};
+use crate::ipallowlist::{self, AllowlistEnv, IpAllowlistConfig};
 use crate::mux::{self, SecurityConfig};
 use crate::tenant;
 use crate::trace_headers;
@@ -182,6 +184,95 @@ pub fn external_handler(
                 trace_url_template.as_deref(),
                 &security.external_url,
                 |req| mux::route(req, &security, mux::not_found_dispatch),
+            )
+        })
+    })
+}
+
+/// The middleware state derived from one configuration snapshot: what the
+/// baseline computes lazily from `conf.Get()`(`conf.Cached`).
+struct DerivedConfig {
+    allowlist: Option<Arc<IpAllowlistConfig>>,
+    forbid_all: bool,
+    trace_url_template: Option<String>,
+    security: SecurityConfig,
+}
+
+impl DerivedConfig {
+    fn from_site(site: &sg_config::SiteConfiguration, env: &AllowlistEnv) -> Self {
+        Self {
+            allowlist: ipallowlist::compile(site, env).map(Arc::new),
+            forbid_all: auth::forbidden(site),
+            trace_url_template: trace_headers::url_template(site),
+            security: SecurityConfig::from_site_config(site),
+        }
+    }
+}
+
+/// `conf.Cached` for the config-dependent middleware layers: derived values
+/// are cached by [`LiveConfig::generation`], so a configuration update is
+/// picked up by the next request without a restart (except for the options in
+/// `needRestartToApply`, which stay in the restart marker).
+pub struct LiveMiddleware {
+    live: Arc<LiveConfig>,
+    allowlist_env: AllowlistEnv,
+    cache: std::sync::Mutex<Option<(u64, Arc<DerivedConfig>)>>,
+}
+
+impl LiveMiddleware {
+    pub fn new(live: Arc<LiveConfig>, allowlist_env: AllowlistEnv) -> Self {
+        Self {
+            live,
+            allowlist_env,
+            cache: std::sync::Mutex::new(None),
+        }
+    }
+
+    fn current(&self) -> Arc<DerivedConfig> {
+        // Read the generation before the snapshot: a racing `set` then leaves
+        // a cache entry tagged with the older generation, which the next
+        // request recomputes (the reverse order could pin stale values).
+        let generation = self.live.generation();
+        if let Ok(cache) = self.cache.lock() {
+            if let Some((cached, derived)) = cache.as_ref() {
+                if *cached == generation {
+                    return Arc::clone(derived);
+                }
+            }
+        }
+        let derived = Arc::new(DerivedConfig::from_site(
+            &self.live.current().site,
+            &self.allowlist_env,
+        ));
+        if let Ok(mut cache) = self.cache.lock() {
+            *cache = Some((generation, Arc::clone(&derived)));
+        }
+        derived
+    }
+}
+
+/// The hyper entry point for the external listener, reading the middleware
+/// configuration from the live configuration snapshot (`conf.Get()` per
+/// request, cached by generation).
+pub fn external_handler_with_live(
+    live: Arc<LiveConfig>,
+    allowlist_env: AllowlistEnv,
+    version: Bytes,
+) -> sg_http::HttpHandler {
+    let middleware = Arc::new(LiveMiddleware::new(live, allowlist_env));
+    Arc::new(move |mut req: Request<Incoming>| {
+        let middleware = Arc::clone(&middleware);
+        let version = version.clone();
+        Box::pin(async move {
+            let derived = middleware.current();
+            external_response_with_ipallowlist(
+                &mut req,
+                &version,
+                derived.allowlist.as_deref(),
+                derived.forbid_all,
+                derived.trace_url_template.as_deref(),
+                &derived.security.external_url,
+                |req| mux::route(req, &derived.security, mux::not_found_dispatch),
             )
         })
     })
@@ -487,5 +578,43 @@ mod tests {
             allowed.extensions().get::<crate::tenant::TenantId>(),
             Some(&crate::tenant::TenantId(1))
         );
+    }
+
+    fn live_config(site: &str) -> Arc<LiveConfig> {
+        let raw = sg_config::RawUnified {
+            site: site.to_owned(),
+            ..sg_config::RawUnified::default()
+        };
+        Arc::new(LiveConfig::new(
+            sg_config::Unified::parse(&raw).expect("site configuration"),
+        ))
+    }
+
+    #[test]
+    fn live_middleware_recomputes_after_configuration_changes() {
+        let live = live_config(
+            r#"{"auth.providers":[{"type":"builtin","allowSignup":true}],
+                "auth.allowedIpAddress":{"enabled":true,"userIpAddress":[]}}"#,
+        );
+        let middleware = LiveMiddleware::new(Arc::clone(&live), AllowlistEnv::default());
+
+        let derived = middleware.current();
+        assert!(!derived.forbid_all);
+        assert!(derived.allowlist.is_some());
+
+        // Same generation: the derived values are reused.
+        let again = middleware.current();
+        assert!(Arc::ptr_eq(&derived, &again));
+
+        // A configuration update (empty providers, no allowlist) is visible to
+        // the next call without rebuilding the middleware.
+        let updated = sg_config::RawUnified {
+            site: r#"{"auth.providers":[]}"#.to_owned(),
+            ..sg_config::RawUnified::default()
+        };
+        live.set(sg_config::Unified::parse(&updated).expect("updated configuration"));
+        let derived = middleware.current();
+        assert!(derived.forbid_all);
+        assert!(derived.allowlist.is_none());
     }
 }

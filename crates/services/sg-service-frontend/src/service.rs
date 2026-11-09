@@ -3,10 +3,12 @@
 //! `cmd/frontend/internal/cli/serve_cmd.go` process skeleton: the external and
 //! internal listeners plus the debug server.
 //!
-//! The full baseline startup sequence (database, Redis, migrations, out-of-band
-//! migration validation, configuration watcher, GraphQL schema, enterprise
-//! hooks) is not ported yet. This slice binds the listeners, answers the
-//! health/version surface, marks ready and shuts down all servers together.
+//! The configuration path is ported (M9.8el): `overrideSiteConfig`, the DB
+//! configuration service and a live, generation-cached middleware config. The
+//! rest of the baseline startup sequence (Redis wait, migrations, out-of-band
+//! migration validation, GraphQL schema, enterprise hooks) is not ported yet.
+//! This slice binds the listeners, answers the health/version surface, marks
+//! ready and shuts down all servers and the configuration tasks together.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -18,8 +20,8 @@ use tokio::task::JoinSet;
 use sg_config::SiteConfiguration;
 
 use crate::config::FrontendConfig;
-use crate::ipallowlist::{self, AllowlistEnv};
-use crate::mux::SecurityConfig;
+use crate::configuration_server;
+use crate::ipallowlist::AllowlistEnv;
 use crate::version::Version;
 use crate::{debug, middleware};
 
@@ -123,6 +125,29 @@ impl Service for FrontendService {
             .clone()
             .ok_or_else(|| ServiceError::new("frontend configuration was not loaded"))?;
 
+        // Baseline `serve_cmd.go:134-139`: apply the `SITE_CONFIG_FILE`
+        // override first, then start the configuration service. Like the
+        // baseline (whose `InitDB` fails before this point), the process needs
+        // a database.
+        let pool = configuration_server::FrontendConfigurationServer::connect_frontend_pool()
+            .await
+            .map_err(ServiceError::new)?;
+        let source = crate::configuration_source::DbConfigurationSource::new(pool)
+            .map_err(ServiceError::new)?;
+        crate::configuration_startup::override_from_env(&source)
+            .await
+            .map_err(|err| {
+                ServiceError::new(format!("failed to apply site config overrides: {err}"))
+            })?;
+        let wiring = configuration_server::FrontendConfigurationServer::start_with_source(
+            source,
+            ctx.shutdown.clone(),
+        )
+        .await
+        .map_err(|err| {
+            ServiceError::new(format!("failed to initialize configuration service: {err}"))
+        })?;
+
         let external_addr = config.external_bind_address().to_owned();
         let external = sg_http::listen(&external_addr).await.map_err(|err| {
             ServiceError::with_source(format!("failed to listen on {external_addr}"), err)
@@ -166,20 +191,13 @@ impl Service for FrontendService {
         ctx.ready.mark_ready();
         ready.store(true, Ordering::SeqCst);
 
-        let allowlist = ipallowlist::compile(&self.site_config, &self.allowlist_env).map(Arc::new);
-        let forbid_all = crate::auth::forbidden(&self.site_config);
-        let trace_url_template = crate::trace_headers::url_template(&self.site_config);
-        let security = SecurityConfig::from_site_config(&self.site_config);
-
         tracing::info!(addr = %external_addr, "frontend listening");
         let served = sg_http::serve_http(
             external,
-            middleware::external_handler(
+            middleware::external_handler_with_live(
+                Arc::clone(wiring.live()),
+                self.allowlist_env.clone(),
                 self.version.bytes(),
-                allowlist,
-                forbid_all,
-                trace_url_template,
-                security,
             ),
             ctx.shutdown.clone(),
         )
@@ -188,6 +206,7 @@ impl Service for FrontendService {
         // A failure of the external listener must stop the sibling servers.
         ctx.shutdown.cancel();
         drain(&mut background).await;
+        wiring.shutdown().await;
         served.map_err(|err| ServiceError::with_source("frontend http server failed", err))
     }
 }
