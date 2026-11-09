@@ -49,6 +49,7 @@ pub mod authz_github_user;
 pub mod authz_gitlab;
 pub mod authz_gitlab_client;
 pub mod authz_providers;
+pub mod autoindex_config;
 pub mod batches;
 pub mod batches_scheduler;
 pub mod bitbucket_project_permissions;
