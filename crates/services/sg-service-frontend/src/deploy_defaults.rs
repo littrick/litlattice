@@ -173,6 +173,15 @@ pub fn default_site_config_redacted_json(deploy_type: &str) -> Result<&'static s
     }
 }
 
+/// The default document and its redaction snapshot in one lookup; the DB
+/// configuration source seeds with this pair (`SiteGetLatest`).
+pub fn default_site_config_pair(deploy_type: &str) -> Result<(&'static str, &'static str), String> {
+    Ok((
+        default_site_config_json(deploy_type)?,
+        default_site_config_redacted_json(deploy_type)?,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -242,6 +251,14 @@ mod tests {
         );
         let err = default_site_config_redacted_json("bogus").expect_err("invalid");
         assert!(err.ends_with("Got: \"bogus\""), "{err}");
+    }
+
+    #[test]
+    fn default_pair_returns_the_document_and_its_snapshot() {
+        let (raw, redacted) = default_site_config_pair("kubernetes").expect("pair");
+        assert!(raw.contains("auth.providers"));
+        assert!(redacted.contains("auth.providers"));
+        assert!(default_site_config_pair("bogus").is_err());
     }
 
     #[test]

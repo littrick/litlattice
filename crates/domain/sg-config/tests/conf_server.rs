@@ -42,17 +42,22 @@ impl FakeSource {
 }
 
 impl ConfigurationSource for FakeSource {
-    fn read(&self) -> Result<RawUnified, String> {
+    async fn read(&self) -> Result<RawUnified, String> {
         self.counters.reads.fetch_add(1, Ordering::SeqCst);
         Ok(self.raw.lock().expect("fake lock poisoned").clone())
     }
 
-    fn write(&self, data: &RawUnified, _last_id: i32, _author_user_id: i32) -> Result<(), String> {
+    async fn write(
+        &self,
+        data: RawUnified,
+        _last_id: i32,
+        _author_user_id: i32,
+    ) -> Result<(), String> {
         if let Some(error) = &self.write_error {
             return Err(error.clone());
         }
         self.counters.writes.fetch_add(1, Ordering::SeqCst);
-        *self.raw.lock().expect("fake lock poisoned") = data.clone();
+        *self.raw.lock().expect("fake lock poisoned") = data;
         Ok(())
     }
 }
@@ -210,14 +215,14 @@ async fn write_harness() {
     );
 }
 
-fn cached_source_harness() {
+async fn cached_source_harness() {
     let counters = Counters::default();
     let cached = CachedConfigurationSource::new(
         FakeSource::with_site("{}", counters.clone()),
         Duration::from_secs(3600),
     );
-    cached.read().expect("read");
-    let raw = cached.read().expect("read");
+    cached.read().await.expect("read");
+    let raw = cached.read().await.expect("read");
     println!(
         "cg ttl-hit reads={} site={:?}",
         counters.reads.load(Ordering::SeqCst),
@@ -229,9 +234,9 @@ fn cached_source_harness() {
         FakeSource::with_site("{}", counters.clone()),
         Duration::ZERO,
     );
-    cached.read().expect("read");
+    cached.read().await.expect("read");
     std::thread::sleep(Duration::from_millis(1));
-    cached.read().expect("read");
+    cached.read().await.expect("read");
     println!(
         "cg ttl-zero reads={} site={:?}",
         counters.reads.load(Ordering::SeqCst),
@@ -243,18 +248,19 @@ fn cached_source_harness() {
         FakeSource::with_site("{}", counters.clone()),
         Duration::from_secs(3600),
     );
-    cached.read().expect("read");
+    cached.read().await.expect("read");
     cached
         .write(
-            &RawUnified {
+            RawUnified {
                 site: r#"{"externalURL":"https://example.com"}"#.to_owned(),
                 ..RawUnified::default()
             },
             1,
             7,
         )
+        .await
         .expect("write");
-    let raw = cached.read().expect("read");
+    let raw = cached.read().await.expect("read");
     println!(
         "cg write-updates reads={} site={:?}",
         counters.reads.load(Ordering::SeqCst),
@@ -275,7 +281,7 @@ fn cached_source_harness() {
     )
     .expect("write fixture");
     let file = FileConfigurationSource::new(path.clone());
-    let raw = file.read().expect("read");
+    let raw = file.read().await.expect("read");
     println!(
         "cg file-read id={} site={:?} git={} pg={}",
         raw.id,
@@ -285,13 +291,14 @@ fn cached_source_harness() {
     );
     assert!(file
         .write(
-            &RawUnified {
+            RawUnified {
                 site: "{}".to_owned(),
                 ..RawUnified::default()
             },
             1,
             7,
         )
+        .await
         .is_err());
     println!("cg file-write err=source");
     let _ = std::fs::remove_file(path);
@@ -302,5 +309,5 @@ async fn conf_server_harness() {
     // Fixed order mirrors the Go harness file order.
     restart_harness();
     write_harness().await;
-    cached_source_harness();
+    cached_source_harness().await;
 }

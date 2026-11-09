@@ -13,7 +13,9 @@
 //! Not ported here (see docs/overviews/m9_8ef_frontend_conf_server):
 //! the DB-backed `configurationSource` and fsnotify `watchUpdate`, the
 //! generic `Diff` API (it needs the full Go type information), and the
-//! startup wiring (`InitConfigurationServerFrontendOnly`).
+//! startup wiring (`InitConfigurationServerFrontendOnly`). The trait's
+//! methods are `async` with native `async fn` futures so the DB source
+//! (`sg-service-frontend::configuration_source`, M9.8ei) can await sqlx.
 
 use std::path::PathBuf;
 use std::sync::{Mutex, RwLock};
@@ -26,12 +28,17 @@ use crate::{ConfigError, LiveConfig, RawUnified, SiteConfiguration, Unified};
 
 /// `conf.ConfigurationSource`: direct access to the raw configuration.
 ///
-/// The baseline takes a `context.Context`; this synchronous trait is the
-/// frontend-only surface. DB support will be added as an async adapter in a
-/// later slice.
+/// The baseline takes a `context.Context`; the port returns a `Send` future
+/// for the same reason. The methods take owned data so the returned futures
+/// do not borrow their arguments.
 pub trait ConfigurationSource: Send + Sync {
-    fn read(&self) -> Result<RawUnified, String>;
-    fn write(&self, data: &RawUnified, last_id: i32, author_user_id: i32) -> Result<(), String>;
+    fn read(&self) -> impl std::future::Future<Output = Result<RawUnified, String>> + Send;
+    fn write(
+        &self,
+        data: RawUnified,
+        last_id: i32,
+        author_user_id: i32,
+    ) -> impl std::future::Future<Output = Result<(), String>> + Send;
 }
 
 /// The errors `Server::Write` can return.
@@ -88,7 +95,8 @@ impl<S: ConfigurationSource> Server<S> {
         Unified::parse(&input).map_err(ServerError::Parse)?;
 
         self.source
-            .write(&input, last_id, author_user_id)
+            .write(input, last_id, author_user_id)
+            .await
             .map_err(ServerError::Source)?;
 
         let (done_sender, done_receiver) = oneshot::channel();
@@ -197,7 +205,8 @@ pub fn need_restart_to_apply(before: &Unified, after: &Unified) -> bool {
 pub struct CachedConfigurationSource<S: ConfigurationSource> {
     source: S,
     ttl: Duration,
-    entry: Mutex<Option<(RawUnified, Instant)>>,
+    /// Async because `read`/`write` hold it across awaits.
+    entry: tokio::sync::Mutex<Option<(RawUnified, Instant)>>,
 }
 
 impl<S: ConfigurationSource> CachedConfigurationSource<S> {
@@ -208,7 +217,7 @@ impl<S: ConfigurationSource> CachedConfigurationSource<S> {
         Self {
             source,
             ttl,
-            entry: Mutex::new(None),
+            entry: tokio::sync::Mutex::new(None),
         }
     }
 
@@ -218,22 +227,30 @@ impl<S: ConfigurationSource> CachedConfigurationSource<S> {
 }
 
 impl<S: ConfigurationSource> ConfigurationSource for CachedConfigurationSource<S> {
-    fn read(&self) -> Result<RawUnified, String> {
-        let mut entry = self.entry.lock().expect("config cache lock poisoned");
-        if let Some((cached, cached_at)) = entry.as_ref() {
-            if cached_at.elapsed() <= self.ttl {
-                return Ok(cached.clone());
+    async fn read(&self) -> Result<RawUnified, String> {
+        {
+            let entry = self.entry.lock().await;
+            if let Some((cached, cached_at)) = entry.as_ref() {
+                if cached_at.elapsed() <= self.ttl {
+                    return Ok(cached.clone());
+                }
             }
         }
-        let updated = self.source.read()?;
-        *entry = Some((updated.clone(), Instant::now()));
+        let updated = self.source.read().await?;
+        *self.entry.lock().await = Some((updated.clone(), Instant::now()));
         Ok(updated)
     }
 
-    fn write(&self, data: &RawUnified, last_id: i32, author_user_id: i32) -> Result<(), String> {
-        let mut entry = self.entry.lock().expect("config cache lock poisoned");
-        self.source.write(data, last_id, author_user_id)?;
-        *entry = Some((data.clone(), Instant::now()));
+    async fn write(
+        &self,
+        data: RawUnified,
+        last_id: i32,
+        author_user_id: i32,
+    ) -> Result<(), String> {
+        self.source
+            .write(data.clone(), last_id, author_user_id)
+            .await?;
+        *self.entry.lock().await = Some((data, Instant::now()));
         Ok(())
     }
 }
@@ -253,7 +270,7 @@ impl FileConfigurationSource {
 }
 
 impl ConfigurationSource for FileConfigurationSource {
-    fn read(&self) -> Result<RawUnified, String> {
+    async fn read(&self) -> Result<RawUnified, String> {
         let content = std::fs::read_to_string(&self.filename).map_err(|err| err.to_string())?;
         let value: serde_json::Value =
             serde_json::from_str(&content).map_err(|err| err.to_string())?;
@@ -274,7 +291,12 @@ impl ConfigurationSource for FileConfigurationSource {
         })
     }
 
-    fn write(&self, _data: &RawUnified, _last_id: i32, _author_user_id: i32) -> Result<(), String> {
+    async fn write(
+        &self,
+        _data: RawUnified,
+        _last_id: i32,
+        _author_user_id: i32,
+    ) -> Result<(), String> {
         Err("tried to write to file based configuration source".to_owned())
     }
 }
@@ -358,14 +380,14 @@ mod tests {
     }
 
     impl ConfigurationSource for FakeSource {
-        fn read(&self) -> Result<RawUnified, String> {
+        async fn read(&self) -> Result<RawUnified, String> {
             self.reads.fetch_add(1, Ordering::SeqCst);
             Ok(self.raw.lock().expect("fake lock poisoned").clone())
         }
 
-        fn write(
+        async fn write(
             &self,
-            data: &RawUnified,
+            data: RawUnified,
             _last_id: i32,
             _author_user_id: i32,
         ) -> Result<(), String> {
@@ -373,7 +395,7 @@ mod tests {
                 return Err(error.clone());
             }
             self.writes.fetch_add(1, Ordering::SeqCst);
-            *self.raw.lock().expect("fake lock poisoned") = data.clone();
+            *self.raw.lock().expect("fake lock poisoned") = data;
             Ok(())
         }
     }
@@ -403,7 +425,7 @@ mod tests {
         let done = updates.recv().await.expect("handshake");
         assert_eq!(server.source().writes.load(Ordering::SeqCst), 1);
         assert_eq!(
-            server.source().read().expect("read").site,
+            server.source().read().await.expect("read").site,
             r#"{"externalURL":"https://example.com"}"#
         );
         done.send(()).expect("close handshake");
@@ -503,40 +525,41 @@ mod tests {
         runner.await.expect("join");
     }
 
-    #[test]
-    fn cached_source_reuses_the_entry_within_the_ttl() {
+    #[tokio::test]
+    async fn cached_source_reuses_the_entry_within_the_ttl() {
         let cached =
             CachedConfigurationSource::new(FakeSource::with_site("{}"), Duration::from_secs(60));
-        assert_eq!(cached.read().expect("read").site, "{}");
-        assert_eq!(cached.read().expect("read").site, "{}");
+        assert_eq!(cached.read().await.expect("read").site, "{}");
+        assert_eq!(cached.read().await.expect("read").site, "{}");
         assert_eq!(cached.source.reads.load(Ordering::SeqCst), 1);
     }
 
-    #[test]
-    fn cached_source_rereads_after_the_ttl() {
+    #[tokio::test]
+    async fn cached_source_rereads_after_the_ttl() {
         let cached = CachedConfigurationSource::new(FakeSource::with_site("{}"), Duration::ZERO);
-        cached.read().expect("read");
-        cached.read().expect("read");
+        cached.read().await.expect("read");
+        cached.read().await.expect("read");
         assert_eq!(cached.source.reads.load(Ordering::SeqCst), 2);
     }
 
-    #[test]
-    fn cached_source_updates_the_entry_after_a_write() {
+    #[tokio::test]
+    async fn cached_source_updates_the_entry_after_a_write() {
         let cached =
             CachedConfigurationSource::new(FakeSource::with_site("{}"), Duration::from_secs(60));
-        cached.read().expect("read");
+        cached.read().await.expect("read");
         cached
-            .write(&raw(r#"{"externalURL":"https://example.com"}"#), 1, 7)
+            .write(raw(r#"{"externalURL":"https://example.com"}"#), 1, 7)
+            .await
             .expect("write");
         assert_eq!(
-            cached.read().expect("read").site,
+            cached.read().await.expect("read").site,
             r#"{"externalURL":"https://example.com"}"#
         );
         assert_eq!(cached.source.reads.load(Ordering::SeqCst), 1);
     }
 
-    #[test]
-    fn file_source_reads_the_raw_unified_shape_and_rejects_writes() {
+    #[tokio::test]
+    async fn file_source_reads_the_raw_unified_shape_and_rejects_writes() {
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|elapsed| elapsed.as_nanos())
@@ -551,13 +574,13 @@ mod tests {
         )
         .expect("write fixture");
         let source = FileConfigurationSource::new(path.clone());
-        let raw = source.read().expect("read");
+        let raw = source.read().await.expect("read");
         assert_eq!(raw.id, 5);
         assert_eq!(raw.site, "{}");
         assert_eq!(raw.service_connections.git_servers, ["g9"]);
         assert_eq!(raw.service_connections.postgres_dsn, "pg");
         assert_eq!(
-            source.write(&raw, 1, 7).expect_err("write"),
+            source.write(raw.clone(), 1, 7).await.expect_err("write"),
             "tried to write to file based configuration source"
         );
         let _ = std::fs::remove_file(path);

@@ -11,6 +11,7 @@
 
 pub mod auth;
 pub mod config;
+pub mod configuration_source;
 pub mod debug;
 pub mod deploy_defaults;
 pub mod goimportpath;

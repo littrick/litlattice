@@ -9,6 +9,7 @@ publish.workspace = true
 [dependencies]
 sg-config = { path = "../../domain/sg-config" }
 sg-core = { path = "../../base/sg-core" }
+sg-db = { path = "../../data/sg-db" }
 sg-http = { path = "../../net/sg-http" }
 sg-metrics = { path = "../../base/sg-metrics" }
 async-trait = { workspace = true }
@@ -17,6 +18,7 @@ http = { workspace = true }
 http-body-util = { workspace = true }
 hyper = { workspace = true }
 serde_json = { workspace = true }
+sqlx = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 tonic = { workspace = true }
