@@ -18,6 +18,7 @@ pub mod codeintel_codegraph;
 pub mod codeintel_dependencies;
 pub mod codeintel_dependency_jobs;
 pub mod codeintel_policies;
+pub mod codeintel_ranking;
 pub mod codeintel_uploads;
 pub mod event_logs;
 pub mod executor_heartbeats;
