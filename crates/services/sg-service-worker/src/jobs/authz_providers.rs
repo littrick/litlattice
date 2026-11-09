@@ -20,6 +20,15 @@
 //! account keyring and Postgres token store the OAuth refresh path needs (see
 //! [`super::authz_github_user`]).
 //!
+//! Ported kind: GitLab (`internal/authz/providers/gitlab/authz.go`), for the
+//! `username` identity provider only. It decrypts the config, applies the
+//! authorization gate, the ACLs license check and the URL parse error, then
+//! constructs a [`SudoProvider`] wired to a [`GitlabRestClientProvider`]
+//! (`!markInternalReposAsPublic` becomes `syncInternalRepoPermissions`, like
+//! the baseline). The `oauth` identity provider, whose full implementation
+//! needs external-account token refresh, is reported as a serious problem
+//! instead (docs §68.3).
+//!
 //! Not ported yet: GitHub App authentication (`gitHubAppDetails` /
 //! `githubAppInstallationID`) is reported as a serious problem because the
 //! installation-token auther is not available; connections of the other kinds
@@ -44,6 +53,8 @@ use super::authz_github_user::{
     github_oauth_providers, GithubOAuthProvider, GithubUserClientFactory, GithubUserPerms,
     GithubUserPermsProvider, PgOAuthTokenStore,
 };
+use super::authz_gitlab::{SudoProvider, TYPE_GITLAB};
+use super::authz_gitlab_client::GitlabRestClientProvider;
 use super::perms_syncer::{AuthzProvider, ProviderRegistry};
 
 /// `providers.ProvidersFromConfig`'s external service kinds, in its order.
@@ -100,6 +111,12 @@ struct GithubConnection {
     config: Value,
 }
 
+/// One parsed GitLab external service.
+struct GitlabConnection {
+    service: ExternalService,
+    config: Value,
+}
+
 /// One constructed GitHub provider plus the warning the
 /// `allowGroupsPermissionsSync` check emitted (if any).
 struct GithubProviderBuild {
@@ -120,6 +137,7 @@ pub async fn providers_from_config(
     let store = ExternalServiceStore::new(pool.clone());
 
     let mut github_conns = Vec::new();
+    let mut gitlab_conns = Vec::new();
     let mut serious_problems = Vec::new();
     let mut after_id = 0_i64;
 
@@ -157,6 +175,8 @@ pub async fn providers_from_config(
 
             if service.kind == "GITHUB" {
                 github_conns.push(GithubConnection { service, config });
+            } else if service.kind == "GITLAB" {
+                gitlab_conns.push(GitlabConnection { service, config });
             }
             // Other kinds are not ported yet; see the module docs.
         }
@@ -166,16 +186,26 @@ pub async fn providers_from_config(
         }
     }
 
+    // `authz.go`: GitHub providers first, then GitLab.
     let github = github_new_authz_providers(&github_conns, site, keyring, pool, opts);
+    let gitlab = gitlab_new_authz_providers(&gitlab_conns, opts);
+
+    let mut providers = github.providers;
+    providers.extend(gitlab.providers);
+    let mut warnings = github.warnings;
+    warnings.extend(gitlab.warnings);
+    let mut invalid_connections = github.invalid_connections;
+    invalid_connections.extend(gitlab.invalid_connections);
 
     ProviderInitResult {
-        providers: github.providers,
+        providers,
         serious_problems: {
             serious_problems.extend(github.serious_problems);
+            serious_problems.extend(gitlab.serious_problems);
             serious_problems
         },
-        warnings: github.warnings,
-        invalid_connections: github.invalid_connections,
+        warnings,
+        invalid_connections,
     }
 }
 
@@ -235,6 +265,94 @@ fn github_new_authz_providers(
     }
 
     result
+}
+
+/// `gitlab.NewAuthzProviders`: build one provider per connection, reporting
+/// construction failures as serious problems for `extsvc.TypeGitLab`.
+fn gitlab_new_authz_providers(
+    conns: &[GitlabConnection],
+    opts: &ProvidersOptions,
+) -> ProviderInitResult {
+    let mut result = ProviderInitResult::default();
+    for conn in conns {
+        match new_gitlab_authz_provider(conn, opts) {
+            Ok(Some(provider)) => result.providers.push(provider),
+            Ok(None) => {}
+            Err(err) => {
+                result.invalid_connections.push(TYPE_GITLAB.to_owned());
+                result.serious_problems.push(err);
+            }
+        }
+    }
+    result
+}
+
+/// `gitlab.newAuthzProvider`: `Ok(None)` when authorization is disabled, `Err`
+/// for the baseline's "serious problems". Only the `username` (sudo) identity
+/// provider is ported; `oauth` is reported as unsupported.
+fn new_gitlab_authz_provider(
+    conn: &GitlabConnection,
+    opts: &ProvidersOptions,
+) -> Result<Option<Arc<dyn AuthzProvider>>, String> {
+    let Some(authorization) = conn
+        .config
+        .get("authorization")
+        .filter(|value| !value.is_null())
+    else {
+        return Ok(None);
+    };
+
+    if let Some(message) = &opts.acls_license_error {
+        return Err(message.clone());
+    }
+
+    let raw_url = conn
+        .config
+        .get("url")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let base_url = Url::parse(raw_url)
+        .map_err(|err| format!("Could not parse URL for GitLab instance {raw_url:?}: {err}"))?;
+
+    let identity_provider = authorization
+        .get("identityProvider")
+        .and_then(|idp| idp.get("type"))
+        .and_then(Value::as_str);
+    match identity_provider {
+        Some("username") => {
+            // `SyncInternalRepoPermissions: !c.MarkInternalReposAsPublic`.
+            let mark_internal_repos_as_public = conn
+                .config
+                .get("markInternalReposAsPublic")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let token = conn
+                .config
+                .get("token")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned();
+            let service_id = normalize_base_url(&base_url);
+            let urn = sg_extsvc::urn(&conn.service.kind, conn.service.id);
+            let client_provider = Arc::new(GitlabRestClientProvider::new(&base_url, Some(token)));
+            let provider: Arc<dyn AuthzProvider> = Arc::new(SudoProvider::new(
+                urn,
+                service_id,
+                client_provider,
+                !mark_internal_repos_as_public,
+            ));
+            Ok(Some(provider))
+        }
+        // The baseline builds a full OAuth provider; the Rust port needs the
+        // external-account token refresh path, so it is a later slice.
+        Some("oauth") => Err(
+            "GitLab OAuth identity provider is not supported by the Rust authz provider yet"
+                .to_owned(),
+        ),
+        // `authorization` without an `identityProvider` leaves both union
+        // members nil in the baseline.
+        _ => Err("No identityProvider was specified".to_owned()),
+    }
 }
 
 /// One `schema.GitHubAuthProvider` entry the warning path reads.
@@ -544,7 +662,7 @@ mod tests {
         ProvidersOptions::default()
     }
 
-    fn expect_err(result: Result<Option<GithubProviderBuild>, String>) -> String {
+    fn expect_err<T>(result: Result<T, String>) -> String {
         match result {
             Ok(_) => panic!("expected a serious problem"),
             Err(err) => err,
@@ -686,5 +804,99 @@ mod tests {
             let err = expect_err(build_provider(&conn, &options(), &BTreeMap::new()));
             assert!(err.contains("GitHub App authentication is not supported"));
         }
+    }
+
+    fn gitlab_conn(config: Value) -> GitlabConnection {
+        GitlabConnection {
+            service: ExternalService {
+                id: 2,
+                kind: "GITLAB".to_owned(),
+                display_name: String::new(),
+                config: String::new(),
+                encryption_key_id: String::new(),
+                last_sync_at: None,
+                next_sync_at: None,
+                unrestricted: false,
+                has_webhooks: None,
+                code_host_id: None,
+            },
+            config,
+        }
+    }
+
+    fn expect_gitlab_provider(result: Option<Arc<dyn AuthzProvider>>) -> Arc<dyn AuthzProvider> {
+        result.expect("expected a provider")
+    }
+
+    #[test]
+    fn gitlab_without_authorization_builds_no_provider() {
+        let conn = gitlab_conn(json!({"url": "https://gitlab.example.com", "token": "t"}));
+        assert!(new_gitlab_authz_provider(&conn, &options())
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn gitlab_username_provider_identity() {
+        let conn = gitlab_conn(json!({
+            "url": "https://GITLAB.example.com:8443",
+            "token": "t",
+            "authorization": {"identityProvider": {"type": "username"}}
+        }));
+        let provider =
+            expect_gitlab_provider(new_gitlab_authz_provider(&conn, &options()).unwrap());
+        assert_eq!(provider.urn(), "extsvc:gitlab:2");
+        assert_eq!(provider.service_type(), TYPE_GITLAB);
+        assert_eq!(provider.service_id(), "https://gitlab.example.com:8443/");
+    }
+
+    #[test]
+    fn gitlab_missing_identity_provider_is_a_serious_problem() {
+        let conn = gitlab_conn(json!({
+            "url": "https://gitlab.example.com",
+            "token": "t",
+            "authorization": {}
+        }));
+        let err = expect_err(new_gitlab_authz_provider(&conn, &options()));
+        assert_eq!(err, "No identityProvider was specified");
+    }
+
+    #[test]
+    fn gitlab_oauth_identity_provider_is_not_supported() {
+        let conn = gitlab_conn(json!({
+            "url": "https://gitlab.example.com",
+            "token": "t",
+            "authorization": {"identityProvider": {"type": "oauth"}}
+        }));
+        let err = expect_err(new_gitlab_authz_provider(&conn, &options()));
+        assert!(err.contains("GitLab OAuth identity provider is not supported"));
+    }
+
+    #[test]
+    fn gitlab_acls_license_error_is_a_serious_problem() {
+        let conn = gitlab_conn(json!({
+            "url": "https://gitlab.example.com",
+            "token": "t",
+            "authorization": {"identityProvider": {"type": "username"}}
+        }));
+        let opts = ProvidersOptions {
+            acls_license_error: Some("acls unavailable".to_owned()),
+            ..ProvidersOptions::default()
+        };
+        let err = expect_err(new_gitlab_authz_provider(&conn, &opts));
+        assert_eq!(err, "acls unavailable");
+    }
+
+    #[test]
+    fn gitlab_invalid_url_is_a_serious_problem() {
+        let conn = gitlab_conn(json!({
+            "url": "https://exa mple.com",
+            "token": "t",
+            "authorization": {"identityProvider": {"type": "username"}}
+        }));
+        let err = expect_err(new_gitlab_authz_provider(&conn, &options()));
+        assert!(
+            err.starts_with("Could not parse URL for GitLab instance \"https://exa mple.com\": ")
+        );
     }
 }
