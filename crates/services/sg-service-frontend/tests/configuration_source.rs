@@ -5,10 +5,14 @@
 //! scratch database cloned from the `sourcegraph` schema, and the scenario in
 //! `SG_CONFIG_SOURCE_SCENARIO`. Each scenario resets the table itself.
 
+use std::time::Duration;
+
 use sg_config::server::ConfigurationSource;
 use sg_config::RawUnified;
+use sg_service_frontend::configuration_server::FrontendConfigurationServer;
 use sg_service_frontend::configuration_source::DbConfigurationSource;
 use sqlx::{PgPool, Row};
+use tokio_util::sync::CancellationToken;
 
 fn flat(input: &str) -> String {
     input
@@ -162,6 +166,55 @@ async fn configuration_source_harness() {
             reset(&pool).await;
             let raw = source.read().await.expect("seed read");
             write_case(&pool, &source, "write-zero-author", raw.id, 0).await;
+        }
+        "wiring" => {
+            reset(&pool).await;
+            let shutdown = CancellationToken::new();
+            let wiring = FrontendConfigurationServer::start_with_pool(pool.clone(), shutdown)
+                .await
+                .expect("start configuration server");
+            let initial = wiring.store().raw();
+            println!(
+                "cw wiring init id={} site={} rows={}",
+                initial.id,
+                flat(&initial.site),
+                rows(&pool).await
+            );
+
+            let result = wiring
+                .server()
+                .write(
+                    RawUnified {
+                        site: NEW_SITE.to_owned(),
+                        ..RawUnified::default()
+                    },
+                    initial.id,
+                    3,
+                )
+                .await
+                .map_err(|err| err.to_string());
+            let after = wiring.store().raw();
+            let mut restart = 0;
+            for _ in 0..50 {
+                if wiring.server().need_server_restart() {
+                    restart = 1;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            let error = match result {
+                Ok(()) => "nil".to_owned(),
+                Err(err) => flat(&err),
+            };
+            println!(
+                "cw wiring write-err={} rows={} after-id={} after-site={} restart={}",
+                error,
+                rows(&pool).await,
+                after.id,
+                flat(&after.site),
+                restart
+            );
+            wiring.shutdown().await;
         }
         other => panic!("unknown scenario {other}"),
     }
