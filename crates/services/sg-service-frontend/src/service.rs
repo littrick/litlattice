@@ -92,12 +92,20 @@ impl Service for FrontendService {
         self.config = Some(FrontendConfig::load(env)?);
         self.allowlist_env = AllowlistEnv::from_env();
         // Baseline `serve_cmd.go:135`: `overrideSiteConfig` fails startup when
-        // the file cannot be read or merged.
-        if let Some(site_config) = crate::site_config_file::load_from_env().map_err(|err| {
+        // the file cannot be read or merged. Without the variable the baseline
+        // database seeds `confdefaults.Default`, so the port falls back to the
+        // deployment default document (which includes the `builtin` auth
+        // provider); `SITE_CONFIG_FILE` replaces it wholesale
+        // (`WriteWithOverride`).
+        self.site_config = match crate::site_config_file::load_from_env().map_err(|err| {
             ConfigError::new(format!("failed to apply site config overrides: {err}"))
         })? {
-            self.site_config = site_config;
-        }
+            Some(site_config) => site_config,
+            None => crate::deploy_defaults::default_site_config(
+                &std::env::var(crate::deploy_defaults::DEPLOY_TYPE_VAR).unwrap_or_default(),
+            )
+            .map_err(ConfigError::new)?,
+        };
         Ok(())
     }
 
@@ -159,12 +167,13 @@ impl Service for FrontendService {
         ready.store(true, Ordering::SeqCst);
 
         let allowlist = ipallowlist::compile(&self.site_config, &self.allowlist_env).map(Arc::new);
+        let forbid_all = crate::auth::forbidden(&self.site_config);
         let security = SecurityConfig::from_site_config(&self.site_config);
 
         tracing::info!(addr = %external_addr, "frontend listening");
         let served = sg_http::serve_http(
             external,
-            middleware::external_handler(self.version.bytes(), allowlist, security),
+            middleware::external_handler(self.version.bytes(), allowlist, forbid_all, security),
             ctx.shutdown.clone(),
         )
         .await;
@@ -205,6 +214,20 @@ mod tests {
         service.configure(&mut env).expect("configure");
         assert!(service.config().is_some());
         assert!(service.validate().is_ok());
+    }
+
+    #[test]
+    fn configure_loads_the_deployment_default_site_config() {
+        if std::env::var(crate::site_config_file::SITE_CONFIG_FILE_VAR).is_ok() {
+            // The ambient environment supplies its own configuration.
+            return;
+        }
+        let mut service = FrontendService::new();
+        let mut env = EnvReader::new();
+        service.configure(&mut env).expect("configure");
+        // The deployment default carries a builtin provider, so ForbidAll must
+        // not reject the instance like an empty configuration would.
+        assert!(!crate::auth::forbidden(&service.site_config));
     }
 
     #[test]

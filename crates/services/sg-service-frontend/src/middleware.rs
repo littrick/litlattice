@@ -3,14 +3,14 @@
 //! The outer half of `newExternalHTTPHandler`'s middleware chain:
 //!
 //! ```text
-//! ipAllowlist → tenant → GoGet → BlackHole → healthCheck → ServeMux
+//! ipAllowlist → tenant → ForbidAll → GoGet → BlackHole → healthCheck → ServeMux
 //! ```
 //!
 //! The baseline wraps the mux with `ipAllowlist → tenant → instrumentation →
 //! tracepkg → ForbidAll → GoGet → BlackHole → healthCheck → gcontext → Trace`;
-//! the instrumentation/trace layers are observational and `ForbidAll` needs
-//! the configuration service, so they land in later slices
-//! (docs/overviews/m9_8ea §1.4).
+//! the instrumentation/trace layers are observational, so they land in later
+//! slices (docs/overviews/m9_8ea §1.4). `ForbidAll` reads the site
+//! configuration snapshot and is ported here (m9_8ec).
 
 use std::sync::Arc;
 
@@ -20,6 +20,7 @@ use http_body_util::Full;
 use hyper::body::Incoming;
 use tonic::body::BoxBody;
 
+use crate::auth;
 use crate::goimportpath;
 use crate::health;
 use crate::ipallowlist::{self, IpAllowlistConfig};
@@ -92,14 +93,16 @@ pub fn external_response_with_next<B>(
 }
 
 /// The chain with the baseline's outer layers: `ipAllowlist` runs before the
-/// tenant lookup, which runs before GoGet; all of it precedes BlackHole and
-/// healthCheck, so a denied `/healthz` is a 403 and an unknown tenant beats a
-/// go-get response. `None` means the allowlist is disabled
-/// (`configResolver()` returned nil).
+/// tenant lookup, which runs before `ForbidAll`; all of it precedes GoGet,
+/// BlackHole and healthCheck, so a denied `/healthz` is a 403 and an unknown
+/// tenant beats a go-get response. `None` means the allowlist is disabled
+/// (`configResolver()` returned nil); `forbid_all` is
+/// [`auth::forbidden`]'s result for the current site configuration.
 pub fn external_response_with_ipallowlist<B>(
     req: &mut Request<B>,
     version: &Bytes,
     allowlist: Option<&IpAllowlistConfig>,
+    forbid_all: bool,
     external_url: &str,
     next: impl FnOnce(&mut Request<B>) -> Response<BoxBody>,
 ) -> Response<BoxBody> {
@@ -110,6 +113,9 @@ pub fn external_response_with_ipallowlist<B>(
     }
     if let Err(response) = tenant::external_tenant_from_hostname(req, tenant::fixed_tenant_one) {
         return response;
+    }
+    if forbid_all {
+        return auth::forbidden_response();
     }
     if let Some(response) = goimportpath::response(req, external_url) {
         return response;
@@ -129,7 +135,7 @@ pub fn external_response<B>(
     version: &Bytes,
     external_url: &str,
 ) -> Response<BoxBody> {
-    external_response_with_ipallowlist(req, version, None, external_url, |_| go_not_found())
+    external_response_with_ipallowlist(req, version, None, false, external_url, |_| go_not_found())
 }
 
 /// `newInternalHTTPHandler`'s mux once every `/.internal/` route is registered;
@@ -142,6 +148,7 @@ pub fn internal_response<B>(_req: &Request<B>) -> Response<BoxBody> {
 pub fn external_handler(
     version: Bytes,
     allowlist: Option<Arc<IpAllowlistConfig>>,
+    forbid_all: bool,
     security: SecurityConfig,
 ) -> sg_http::HttpHandler {
     Arc::new(move |mut req: Request<Incoming>| {
@@ -153,6 +160,7 @@ pub fn external_handler(
                 &mut req,
                 &version,
                 allowlist.as_deref(),
+                forbid_all,
                 &security.external_url,
                 |req| mux::route(req, &security, mux::not_found_dispatch),
             )
@@ -240,6 +248,66 @@ mod tests {
     }
 
     #[test]
+    fn forbid_all_precedes_go_get_health_and_the_mux() {
+        for path in [
+            "/sourcegraph/sourcegraph?go-get=1",
+            "/healthz",
+            "/__version",
+            "/.api/graphql",
+        ] {
+            let mut req = request(path);
+            let response = external_response_with_ipallowlist(
+                &mut req,
+                &Bytes::from_static(b"v"),
+                None,
+                true,
+                "https://sourcegraph.com",
+                |_| go_not_found(),
+            );
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{path}");
+            assert_eq!(
+                response.headers().get(header::CONTENT_TYPE).unwrap(),
+                "text/plain; charset=utf-8",
+                "{path}"
+            );
+            assert_eq!(
+                response
+                    .headers()
+                    .get(header::X_CONTENT_TYPE_OPTIONS)
+                    .unwrap(),
+                "nosniff",
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn forbid_all_runs_after_the_allowlist() {
+        let allowlist = IpAllowlistConfig {
+            authorized_client_ips: vec!["10.0.0.1".parse().unwrap()],
+            ..IpAllowlistConfig::default()
+        };
+        let mut denied = request("/");
+        denied
+            .extensions_mut()
+            .insert(sg_http::RemoteAddr("192.0.2.10:1234".to_owned()));
+        let response = external_response_with_ipallowlist(
+            &mut denied,
+            &Bytes::from_static(b"v"),
+            Some(&allowlist),
+            true,
+            "",
+            |_| go_not_found(),
+        );
+        // The allowlist's HTML rejection wins over ForbidAll's plain text.
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "text/html; charset=utf-8"
+        );
+    }
+
+    #[test]
     fn allowlist_denial_precedes_the_tenant_middleware() {
         let allowlist = IpAllowlistConfig {
             authorized_client_ips: vec!["10.0.0.1".parse().unwrap()],
@@ -253,6 +321,7 @@ mod tests {
             &mut denied,
             &Bytes::from_static(b"v"),
             Some(&allowlist),
+            false,
             "",
             |_| go_not_found(),
         );
@@ -272,6 +341,7 @@ mod tests {
             &mut allowed,
             &Bytes::from_static(b"v"),
             Some(&IpAllowlistConfig::default()),
+            false,
             "",
             |_| go_not_found(),
         );

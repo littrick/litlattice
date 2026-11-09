@@ -9,8 +9,10 @@
 //! not ported yet; `docs/overviews/m9_8dx_frontend_skeleton_overview.md`
 //! records what each missing layer is supposed to do.
 
+pub mod auth;
 pub mod config;
 pub mod debug;
+pub mod deploy_defaults;
 pub mod goimportpath;
 pub mod health;
 pub mod ipallowlist;
