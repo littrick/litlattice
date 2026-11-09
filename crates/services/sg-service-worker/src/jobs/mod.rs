@@ -74,6 +74,7 @@ pub mod gitserver;
 pub mod insights_data_retention;
 pub mod insights_query_runner;
 pub mod licensecheck;
+pub mod out_of_band_migrations;
 pub mod outbound_webhooks;
 pub mod own_repo_indexing;
 pub mod perforce_changelist_mapper;
@@ -249,6 +250,9 @@ pub fn all_jobs() -> Vec<(&'static str, Arc<dyn Job>)> {
                     Arc::new(insights_query_runner::InsightsQueryRunnerJob)
                 }
                 "license-check" => Arc::new(licensecheck::LicenseCheckJob),
+                "out-of-band-migrations" => {
+                    Arc::new(out_of_band_migrations::OutOfBandMigrationsJob::new())
+                }
                 "outbound-webhook-sender" => {
                     Arc::new(outbound_webhooks::OutboundWebhookSender::new())
                 }

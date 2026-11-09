@@ -30,6 +30,18 @@ pub enum BackgroundRoutine {
     Periodic(Arc<PeriodicRoutine>),
     Server(Arc<dyn ServerRoutine>),
     DbBacked(Arc<dyn DbBackedRoutine>),
+    /// A routine that is neither periodic nor a DB-queue worker and has no
+    /// error channel, e.g. `oobmigration.Runner`: `Start` blocks until the
+    /// process context is cancelled.
+    Custom(Arc<dyn BlockingRoutine>),
+}
+
+/// A plain `goroutine.BackgroundRoutine`: a named task that returns when its
+/// token is cancelled.
+#[async_trait]
+pub trait BlockingRoutine: Send + Sync {
+    fn name(&self) -> &'static str;
+    async fn start(&self, shutdown: CancellationToken);
 }
 
 /// `internal/httpserver`'s `BackgroundRoutine`: `Start` blocks while serving,
@@ -69,6 +81,7 @@ impl BackgroundRoutine {
             Self::Periodic(routine) => routine.name(),
             Self::Server(server) => server.name(),
             Self::DbBacked(routine) => routine.name(),
+            Self::Custom(routine) => routine.name(),
         }
     }
 
@@ -78,6 +91,7 @@ impl BackgroundRoutine {
             Self::Periodic(routine) => routine.interval(),
             Self::Server(_) => Duration::ZERO,
             Self::DbBacked(routine) => routine.interval(),
+            Self::Custom(_) => Duration::ZERO,
         }
     }
 
@@ -88,6 +102,7 @@ impl BackgroundRoutine {
             Self::Periodic(routine) => routine.description(),
             Self::Server(_) => "",
             Self::DbBacked(routine) => routine.description(),
+            Self::Custom(_) => "",
         }
     }
 
@@ -97,6 +112,7 @@ impl BackgroundRoutine {
             Self::Periodic(routine) => routine.initial_delay(),
             Self::Server(_) => Duration::ZERO,
             Self::DbBacked(_) => Duration::ZERO,
+            Self::Custom(_) => Duration::ZERO,
         }
     }
 
@@ -105,7 +121,7 @@ impl BackgroundRoutine {
         match self {
             Self::Periodic(routine) => routine.set_job_name(job_name),
             Self::DbBacked(routine) => routine.set_job_name(&job_name.into()),
-            Self::Server(_) => {}
+            Self::Server(_) | Self::Custom(_) => {}
         }
     }
 
@@ -114,7 +130,7 @@ impl BackgroundRoutine {
     pub fn recordable(self: &Arc<Self>) -> Option<Arc<dyn Recordable>> {
         match self.as_ref() {
             Self::Periodic(routine) => Some(Arc::clone(routine) as Arc<dyn Recordable>),
-            Self::Server(_) => None,
+            Self::Server(_) | Self::Custom(_) => None,
             Self::DbBacked(routine) => Arc::clone(routine).recordable(),
         }
     }
@@ -141,6 +157,12 @@ impl BackgroundRoutine {
                         );
                         std::process::exit(1);
                     }
+                });
+            }
+            Self::Custom(routine) => {
+                let routine = Arc::clone(routine);
+                tracker.spawn(async move {
+                    routine.start(shutdown).await;
                 });
             }
         }
