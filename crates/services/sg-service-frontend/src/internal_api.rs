@@ -113,9 +113,7 @@ pub fn internal_response<B>(req: &Request<B>, live: &LiveConfig) -> Response<Box
 }
 
 /// `routeRegexpGroup.setMatch`'s strict-slash branch: `http.Redirect` to the
-/// path without its trailing slash. The route handler is replaced, so the
-/// `JsonMiddleware` content type is absent. Go's `http.Redirect` sets the
-/// `text/html` type for GET and HEAD but only writes the HTML body for GET.
+/// path without its trailing slash.
 pub(crate) fn strict_slash_redirect(
     method: &Method,
     path: &str,
@@ -126,27 +124,41 @@ pub(crate) fn strict_slash_redirect(
         location.push('?');
         location.push_str(query);
     }
+    http_redirect(method, StatusCode::MOVED_PERMANENTLY, location)
+}
+
+/// Go `http.Redirect`: sets `text/html` for GET/HEAD, writes the HTML body
+/// only for GET, and leaves other methods with just `Location`. The route
+/// handler is replaced, so no `JsonMiddleware` content type is involved.
+pub(crate) fn http_redirect(
+    method: &Method,
+    status: StatusCode,
+    location: String,
+) -> Response<BoxBody> {
     let location = hex_escape_non_ascii(&location);
+    let status_text = match status {
+        StatusCode::MOVED_PERMANENTLY => "Moved Permanently",
+        StatusCode::FOUND => "Found",
+        StatusCode::SEE_OTHER => "See Other",
+        StatusCode::TEMPORARY_REDIRECT => "Temporary Redirect",
+        StatusCode::PERMANENT_REDIRECT => "Permanent Redirect",
+        _ => "",
+    };
     match *method {
         Method::GET => {
             let body = format!(
-                "<a href=\"{}\">Moved Permanently</a>.\n\n",
+                "<a href=\"{}\">{status_text}</a>.\n\n",
                 html_escape(&location)
             );
-            located_with_body(
-                StatusCode::MOVED_PERMANENTLY,
-                location,
-                Some("text/html; charset=utf-8"),
-                body,
-            )
+            located_with_body(status, location, Some("text/html; charset=utf-8"), body)
         }
         Method::HEAD => located_with_body(
-            StatusCode::MOVED_PERMANENTLY,
+            status,
             location,
             Some("text/html; charset=utf-8"),
             Bytes::new(),
         ),
-        _ => located(StatusCode::MOVED_PERMANENTLY, location, None),
+        _ => located(status, location, None),
     }
 }
 

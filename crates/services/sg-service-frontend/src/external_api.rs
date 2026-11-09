@@ -18,12 +18,18 @@
 //! - `/.api/insights/export/{id}` (GET), `/.api/search/export/{id}.jsonl`
 //!   and `{id}.log` (GET), `/.api/completions/{stream,code}` (POST) ->
 //!   their enterprise default 404;
+//! - `/.api/src-cli/versions/{rest:.*}` (GET/POST) -> the release cache is
+//!   disabled with the default config, so `http.NotFound`;
+//! - `/.api/src-cli/{rest:.*}` (GET) -> `version` JSON, the six GitHub
+//!   download filenames (302), else `http.NotFound`;
+//! - `/.api/client-config` and `/.api/modelconfig/supported-models.json`
+//!   (GET) -> `401 Unauthorized` without the auth/session middleware;
 //! - anything else -> gorilla's default `http.NotFoundHandler`
 //!   (`404 page not found\n`, `nosniff`).
 //!
 //! gorilla enables `StrictSlash(true)` on the subrouter, but its PathPrefix
-//! routes (`/scim/v2`) are unaffected; the exact routes redirect a trailing
-//! slash away exactly like `http.Redirect`.
+//! routes (`/scim/v2`, `/registry`) are unaffected; matched template routes
+//! redirect a trailing slash away exactly like `http.Redirect`.
 
 use http::{Method, Request, Response, StatusCode};
 use tonic::body::BoxBody;
@@ -31,8 +37,8 @@ use tonic::body::BoxBody;
 use sg_config::LiveConfig;
 
 use crate::internal_api::{
-    decode_path, empty_response, enterprise_not_found, escape_path, hex_escape_non_ascii, located,
-    strict_slash_redirect, text_response,
+    decode_path, empty_response, enterprise_not_found, escape_path, hex_escape_non_ascii,
+    http_redirect, located, strict_slash_redirect, text_response,
 };
 use crate::mux;
 
@@ -46,6 +52,26 @@ const INSIGHTS_EXPORT_PREFIX: &str = "/.api/insights/export/";
 const SEARCH_EXPORT_PREFIX: &str = "/.api/search/export/";
 const CHAT_COMPLETIONS_PATH: &str = "/.api/completions/stream";
 const CODE_COMPLETIONS_PATH: &str = "/.api/completions/code";
+const SRC_CLI_VERSIONS_PREFIX: &str = "/.api/src-cli/versions/";
+const SRC_CLI_PREFIX: &str = "/.api/src-cli/";
+const CLIENT_CONFIG_PATH: &str = "/.api/client-config";
+const MODEL_CONFIG_PATH: &str = "/.api/modelconfig/supported-models.json";
+
+/// `srccli.MinimumVersion` (`internal/src-cli/consts.go:9`). The remote
+/// version cache is not ported, so `src_cli_version_handler.Version()`
+/// always takes the air-gapped fallback path.
+const SRC_CLI_MINIMUM_VERSION: &str = "5.5.0";
+/// `srcCliDownloadsURL` (`src_cli.go:27`).
+const SRC_CLI_DOWNLOADS_URL: &str = "https://github.com/sourcegraph/src-cli/releases/download";
+/// `allowedFilenames` (`src_cli.go:32-39`).
+const SRC_CLI_FILENAMES: [&str; 6] = [
+    "src_darwin_amd64",
+    "src_darwin_arm64",
+    "src_linux_amd64",
+    "src_linux_arm64",
+    "src_windows_amd64.exe",
+    "src_windows_arm64.exe",
+];
 
 /// `lsifDeprecationHandler` (`httpapi.go:459-462`).
 const LSIF_DEPRECATION_MESSAGE: &str = "Sourcegraph v4.5+ no longer accepts LSIF uploads. The Sourcegraph CLI v4.4.2+ will translate LSIF to SCIP prior to uploading. Please check the version of the CLI utility used to upload this artifact.";
@@ -65,6 +91,10 @@ enum Route {
     SearchExportLog { id: String },
     ChatCompletionsStream,
     CodeCompletions,
+    SrcCliVersions,
+    SrcCli { rest: String },
+    ClientConfig,
+    ModelConfig,
 }
 
 impl Route {
@@ -84,7 +114,17 @@ impl Route {
             Route::ScipUpload => method == Method::POST || method == Method::HEAD,
             Route::ComputeStream => method == Method::GET || method == Method::POST,
             Route::ChatCompletionsStream | Route::CodeCompletions => method == Method::POST,
+            Route::SrcCliVersions => method == Method::GET || method == Method::POST,
+            Route::SrcCli { .. } | Route::ClientConfig | Route::ModelConfig => {
+                method == Method::GET
+            }
         }
+    }
+
+    /// `PathPrefix` routes ignore `StrictSlash`; every other registered
+    /// template takes the trailing-slash redirect.
+    fn is_prefix(&self) -> bool {
+        matches!(self, Route::Registry | Route::Scim)
     }
 }
 
@@ -107,20 +147,25 @@ pub fn api_response<B>(req: &Request<B>, _live: &LiveConfig) -> Response<BoxBody
         );
     }
 
-    let (route, matched_path) = match match_route(&decoded) {
-        Some(route) => (route, decoded.as_str()),
+    let route = match match_route(&decoded) {
+        Some(route) => route,
         None => match decoded.strip_suffix('/').map(match_route) {
-            Some(Some(route)) => (route, &decoded[..decoded.len() - 1]),
+            Some(Some(route)) => route,
             _ => return page_not_found(),
         },
     };
     if !route.allows(req.method()) {
         return empty_response(StatusCode::METHOD_NOT_ALLOWED);
     }
-    // Prefix routes never take the strict-slash branch (their match consumes
-    // the whole path); only the exact routes can be shorter than `decoded`.
-    if matched_path.len() != decoded.len() {
-        return strict_slash_redirect(req.method(), matched_path, req.uri().query());
+    // gorilla appends `[/]?` to every non-prefix path regexp and redirects
+    // when the request's trailing slash differs from the template's. All the
+    // registered templates end without a slash.
+    if decoded.ends_with('/') && !route.is_prefix() {
+        return strict_slash_redirect(
+            req.method(),
+            &decoded[..decoded.len() - 1],
+            req.uri().query(),
+        );
     }
 
     match route {
@@ -145,6 +190,9 @@ pub fn api_response<B>(req: &Request<B>, _live: &LiveConfig) -> Response<BoxBody
         Route::SearchExportLog { .. } => enterprise_not_found("search jobs logs handler"),
         Route::ChatCompletionsStream => enterprise_not_found("chat completions streaming endpoint"),
         Route::CodeCompletions => enterprise_not_found("code completions streaming endpoint"),
+        Route::SrcCliVersions => page_not_found(),
+        Route::SrcCli { rest } => src_cli_response(req.method(), &rest),
+        Route::ClientConfig | Route::ModelConfig => unauthorized_response(),
     }
 }
 
@@ -177,6 +225,14 @@ fn match_route(path: &str) -> Option<Route> {
     if path == COMPUTE_STREAM_PATH {
         return Some(Route::ComputeStream);
     }
+    if path.strip_prefix(SRC_CLI_VERSIONS_PREFIX).is_some() {
+        return Some(Route::SrcCliVersions);
+    }
+    if let Some(rest) = path.strip_prefix(SRC_CLI_PREFIX) {
+        return Some(Route::SrcCli {
+            rest: rest.to_owned(),
+        });
+    }
     if let Some(rest) = path.strip_prefix(INSIGHTS_EXPORT_PREFIX) {
         if let Some(id) = single_segment(rest) {
             return Some(Route::InsightsExport { id: id.to_owned() });
@@ -195,6 +251,12 @@ fn match_route(path: &str) -> Option<Route> {
     }
     if path == CODE_COMPLETIONS_PATH {
         return Some(Route::CodeCompletions);
+    }
+    if path == CLIENT_CONFIG_PATH {
+        return Some(Route::ClientConfig);
+    }
+    if path == MODEL_CONFIG_PATH {
+        return Some(Route::ModelConfig);
     }
     None
 }
@@ -232,6 +294,39 @@ fn registry_response() -> Response<BoxBody> {
         StatusCode::NOT_FOUND,
         "text/plain; charset=utf-8",
         "no local extension registry exists\n",
+        true,
+    )
+}
+
+/// `srcCliVersionHandler.ServeHTTP` (`src_cli.go:68-82`). The remote
+/// `sourcegraph.com` version cache is not ported: `Version()` always falls
+/// back to `srccli.MinimumVersion`, the same answer as an air-gapped
+/// baseline.
+fn src_cli_response(method: &Method, rest: &str) -> Response<BoxBody> {
+    if rest == "version" {
+        let body = format!("{{\"version\":\"{SRC_CLI_MINIMUM_VERSION}\"}}\n");
+        return text_response(
+            StatusCode::OK,
+            "application/json; charset=utf-8",
+            &body,
+            false,
+        );
+    }
+    if SRC_CLI_FILENAMES.contains(&rest) {
+        let location = format!("{SRC_CLI_DOWNLOADS_URL}/{SRC_CLI_MINIMUM_VERSION}/{rest}");
+        return http_redirect(method, StatusCode::FOUND, location);
+    }
+    page_not_found()
+}
+
+/// `clientconfig.GetClientConfigHandler` / `modelconfig.GetSupportedModelsHandler`
+/// without the auth/session middleware: `actor.FromContext` returns an
+/// unauthenticated actor, so both answer `http.Error(..., 401)`.
+fn unauthorized_response() -> Response<BoxBody> {
+    text_response(
+        StatusCode::UNAUTHORIZED,
+        "text/plain; charset=utf-8",
+        "Unauthorized\n",
         true,
     )
 }
@@ -322,5 +417,56 @@ mod tests {
         assert_eq!(page.status(), StatusCode::NOT_FOUND);
         let body = page.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(&body[..], b"404 page not found\n");
+    }
+
+    #[tokio::test]
+    async fn src_cli_and_config_routes() {
+        let live = live();
+        let version = api_response(&request(Method::GET, "/.api/src-cli/version"), &live);
+        assert_eq!(version.status(), StatusCode::OK);
+        assert_eq!(
+            version.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/json; charset=utf-8"
+        );
+        let body = version.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body[..], b"{\"version\":\"5.5.0\"}\n");
+
+        let download = api_response(
+            &request(Method::GET, "/.api/src-cli/src_linux_amd64"),
+            &live,
+        );
+        assert_eq!(download.status(), StatusCode::FOUND);
+        assert_eq!(
+            download.headers().get(header::LOCATION).unwrap(),
+            "https://github.com/sourcegraph/src-cli/releases/download/5.5.0/src_linux_amd64"
+        );
+
+        // Template routes redirect a trailing slash even when `rest` is empty;
+        // the PathPrefix routes never do.
+        assert_eq!(
+            api_response(&request(Method::GET, "/.api/src-cli/"), &live).status(),
+            StatusCode::MOVED_PERMANENTLY
+        );
+        assert_eq!(
+            api_response(&request(Method::GET, "/.api/registry/"), &live).status(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            api_response(&request(Method::GET, "/.api/src-cli/versions/"), &live)
+                .headers()
+                .get(header::LOCATION)
+                .unwrap(),
+            "/.api/src-cli/versions"
+        );
+
+        let unauthorized = api_response(&request(Method::GET, "/.api/client-config"), &live);
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            unauthorized
+                .headers()
+                .get(header::X_CONTENT_TYPE_OPTIONS)
+                .unwrap(),
+            "nosniff"
+        );
     }
 }
