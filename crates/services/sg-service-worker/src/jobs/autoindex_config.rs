@@ -725,11 +725,10 @@ impl YamlParser {
                 items.push(nested);
                 continue;
             }
-            if (rest.starts_with('[')
+            if !(rest.starts_with('[')
                 || rest.starts_with('{')
                 || rest.starts_with('\'')
                 || rest.starts_with('"'))
-                == false
                 && self.looks_like_mapping(&rest)
             {
                 let item_indent = indent + 2;

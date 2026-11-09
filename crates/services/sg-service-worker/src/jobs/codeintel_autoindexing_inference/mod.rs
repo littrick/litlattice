@@ -83,11 +83,11 @@ pub fn inference_modules(
 
     modules.insert(
         "internal_patterns".to_string(),
-        Arc::new(|lua| libs::patterns_module(lua)),
+        Arc::new(libs::patterns_module),
     );
     modules.insert(
         "internal_recognizers".to_string(),
-        Arc::new(|lua| libs::recognizers_module(lua)),
+        Arc::new(libs::recognizers_module),
     );
 
     let options = libs::IndexerOptions {

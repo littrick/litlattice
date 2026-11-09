@@ -805,8 +805,7 @@ pub async fn export_ranking_graph(
     let mut lsif_tx = codeintel_pool.begin().await?;
 
     let uploads =
-        codeintel_ranking::get_uploads_for_ranking_on(&mut *tx, &graph_key, read_batch_size)
-            .await?;
+        codeintel_ranking::get_uploads_for_ranking_on(&mut tx, &graph_key, read_batch_size).await?;
     let num_uploads = uploads.len() as i64;
     let mut num_definitions = 0i64;
     let mut num_references = 0i64;
@@ -827,7 +826,7 @@ pub async fn export_ranking_graph(
             let document = Document::decode(decompress(&compressed)?.as_slice())?;
 
             let (definitions, references) = set_definitions_and_references_for_upload(
-                &mut *tx,
+                &mut tx,
                 &graph_key,
                 write_batch_size,
                 upload,
@@ -842,7 +841,7 @@ pub async fn export_ranking_graph(
         }
 
         codeintel_ranking::insert_initial_path_ranks_on(
-            &mut *tx,
+            &mut tx,
             upload.exported_upload_id,
             &document_paths,
             write_batch_size,

@@ -97,7 +97,7 @@ pub fn patterns_module(lua: &Lua) -> mlua::Result<Table> {
     module.set(
         "backdoor",
         lua.create_function(|lua, (glob, pathspec_table): (String, Table)| {
-            let pathspecs = map_slice(&pathspec_table, |value| assert_lua_string(value))?;
+            let pathspecs = map_slice(&pathspec_table, assert_lua_string)?;
             lua.create_userdata(PathPattern::new(glob, pathspecs))
         })?,
     )?;

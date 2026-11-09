@@ -86,7 +86,7 @@ pub fn set_strings<'a>(target: &'a mut Vec<String>) -> Decoder<'a> {
             Value::Table(table) => table,
             other => return Err(new_type_error("table", other)),
         };
-        let strings = map_slice(table, |value| assert_lua_string(value))?;
+        let strings = map_slice(table, assert_lua_string)?;
         target.extend(strings);
         Ok(())
     })

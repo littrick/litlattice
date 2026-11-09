@@ -334,7 +334,7 @@ fn set_strings_option<'a>(target: &'a mut Option<Vec<String>>) -> Decoder<'a> {
             Value::Table(table) => table,
             other => return Err(new_type_error("table", other)),
         };
-        let strings = map_slice(table, |value| assert_lua_string(value))?;
+        let strings = map_slice(table, assert_lua_string)?;
         if !strings.is_empty() {
             target.get_or_insert_with(Vec::new).extend(strings);
         }

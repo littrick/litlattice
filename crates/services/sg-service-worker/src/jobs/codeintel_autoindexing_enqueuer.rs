@@ -78,6 +78,30 @@ impl std::fmt::Display for ResolveRevisionError {
     }
 }
 
+/// `QueueAutoIndexJobs` failures the periodic scheduler distinguishes
+/// (`gitdomain.RevisionNotFoundError` is skipped, every other error aborts).
+///
+/// [`ResolveRevisionError::NotFound`] is promoted to
+/// `RevisionNotFound`; all other failures keep the baseline error text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QueueAutoIndexJobsError {
+    /// `*gitdomain.RevisionNotFoundError`.
+    RevisionNotFound,
+    /// Any other failure, already formatted like the baseline's wrapped error.
+    Other(String),
+}
+
+impl std::fmt::Display for QueueAutoIndexJobsError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            QueueAutoIndexJobsError::RevisionNotFound => f.write_str("revision not found"),
+            QueueAutoIndexJobsError::Other(error) => f.write_str(error),
+        }
+    }
+}
+
+impl std::error::Error for QueueAutoIndexJobsError {}
+
 /// `gitserver.Client.ResolveRevision(…, ResolveRevisionOptions{EnsureRevision:
 /// true})`.
 #[async_trait]
@@ -149,14 +173,27 @@ impl IndexEnqueuer {
         configuration: &str,
         force: bool,
         bypass_limit: bool,
-    ) -> Result<Vec<AutoIndexJob>, String> {
-        let repo = self.repo_for_id(repository_id).await?;
+    ) -> Result<Vec<AutoIndexJob>, QueueAutoIndexJobsError> {
+        let repo = self
+            .repo_for_id(repository_id)
+            .await
+            .map_err(QueueAutoIndexJobsError::Other)?;
 
-        let commit = self
+        let commit = match self
             .revision_resolver
             .resolve_revision(&repo.name, rev)
             .await
-            .map_err(|err| format!("gitserver.ResolveRevision: {err}"))?;
+        {
+            Ok(commit) => commit,
+            Err(ResolveRevisionError::NotFound) => {
+                return Err(QueueAutoIndexJobsError::RevisionNotFound)
+            }
+            Err(ResolveRevisionError::Other(err)) => {
+                return Err(QueueAutoIndexJobsError::Other(format!(
+                    "gitserver.ResolveRevision: {err}"
+                )))
+            }
+        };
 
         self.queue_jobs_for_repo_and_commit(
             repository_id,
@@ -166,6 +203,7 @@ impl IndexEnqueuer {
             bypass_limit,
         )
         .await
+        .map_err(QueueAutoIndexJobsError::Other)
     }
 
     /// `QueueAutoIndexJobsForPackage`.

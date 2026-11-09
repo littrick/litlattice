@@ -255,16 +255,7 @@ impl DbResetter for DependencyIndexResetter {
         )
         .await
         .map_err(|err| err.to_string())?;
-        Ok((
-            reset
-                .into_iter()
-                .map(|(id, age)| (i64::from(id), age))
-                .collect(),
-            failed
-                .into_iter()
-                .map(|(id, age)| (i64::from(id), age))
-                .collect(),
-        ))
+        Ok((reset.into_iter().collect(), failed.into_iter().collect()))
     }
 }
 
@@ -294,16 +285,7 @@ impl DbResetter for IndexResetter {
         )
         .await
         .map_err(|err| err.to_string())?;
-        Ok((
-            reset
-                .into_iter()
-                .map(|(id, age)| (i64::from(id), age))
-                .collect(),
-            failed
-                .into_iter()
-                .map(|(id, age)| (i64::from(id), age))
-                .collect(),
-        ))
+        Ok((reset.into_iter().collect(), failed.into_iter().collect()))
     }
 }
 

@@ -257,6 +257,9 @@ pub fn all_jobs() -> Vec<(&'static str, Arc<dyn Job>)> {
                 "codeintel-autoindexing-dependency-scheduler" => Arc::new(
                     codeintel_autoindexing_dependency_scheduler::AutoindexingDependencyScheduler::new(),
                 ),
+                "codeintel-autoindexing-scheduler" => {
+                    Arc::new(codeintel_autoindexing_scheduler::AutoindexingScheduler::new())
+                }
                 "codeintel-ranking-file-reference-counter" => Arc::new(
                     codeintel_ranking_file_reference_counter::RankingFileReferenceCounter::new(),
                 ),

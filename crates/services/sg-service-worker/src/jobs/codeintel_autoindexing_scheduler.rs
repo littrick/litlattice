@@ -40,10 +40,11 @@
 //! aborts (and rolls back) the batch; unlike the periodic scheduler it does
 //! not special-case `RevisionNotFound`.
 //!
-//! Not ported: the `IndexEnqueuer` production implementation
-//! (`internal/codeintel/autoindexing/internal/enqueuer` and its inference
-//! pipeline). Because of that the `codeintel-autoindexing-scheduler` job is
-//! still not registered.
+//! [`AutoindexingScheduler`] is the job wrapper from
+//! `cmd/worker/internal/codeintel/autoindexing_scheduler.go`: it exposes the
+//! [`SchedulerConfig`] singleton and assembles both routines from the
+//! production enqueuer chain ([`EnqueuerAdapter`] over
+//! `enqueuer::IndexEnqueuer`). Registration lives in [`super::all_jobs`].
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -61,11 +62,22 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
-use super::policies_matcher::{Extractor, MatcherGit, PolicyMatcher};
-use super::{get_interval, JobConfig};
+use super::codeintel_autoindexing_enqueuer::{
+    IndexEnqueuer as ProductionIndexEnqueuer, QueueAutoIndexJobsError as EnqueuerError,
+};
+use super::codeintel_autoindexing_inference::{InferenceService, SandboxService};
+use super::codeintel_autoindexing_inference_production::{
+    inference_environment, GitserverGitService, GitserverRevisionResolver, GitserverYamlReader,
+    InferenceAdapter, TokenBucketLimiter,
+};
+use super::codeintel_autoindexing_package_inference::DefaultPackageRepoInference;
+use super::policies_matcher::{Extractor, GitserverGit, MatcherGit, PolicyMatcher};
+use super::{get_interval, Job, JobConfig, JobDeps};
 use crate::config::combine_errors;
 use crate::framework::periodic::{Handler, HandlerError, PeriodicRoutine};
 use crate::framework::BackgroundRoutine;
+use sg_git::GitserverClient;
+use sg_luasandbox::Service as LuaSandboxService;
 
 /// `goroutine.WithName("codeintel.autoindexing-background-scheduler")`.
 pub const ROUTINE_NAME: &str = "codeintel.autoindexing-background-scheduler";
@@ -727,6 +739,121 @@ pub fn new_scheduler_routine(
     .into()
 }
 
+/// The scheduler trait over the production [`ProductionIndexEnqueuer`].
+///
+/// `QueueAutoIndexJobs` returns `*gitdomain.RevisionNotFoundError`, which the
+/// periodic scheduler skips; the production port promotes that class to
+/// [`QueueAutoIndexJobsError::RevisionNotFound`] and keeps every other error
+/// verbatim.
+pub struct EnqueuerAdapter {
+    enqueuer: Arc<ProductionIndexEnqueuer>,
+}
+
+impl EnqueuerAdapter {
+    pub fn new(enqueuer: Arc<ProductionIndexEnqueuer>) -> Self {
+        Self { enqueuer }
+    }
+}
+
+#[async_trait]
+impl IndexEnqueuer for EnqueuerAdapter {
+    async fn queue_auto_index_jobs(
+        &self,
+        repository_id: i32,
+        rev: &str,
+        configuration: &str,
+        force: bool,
+        bypass_limit: bool,
+    ) -> Result<(), QueueAutoIndexJobsError> {
+        self.enqueuer
+            .queue_auto_index_jobs(repository_id, rev, configuration, force, bypass_limit)
+            .await
+            .map(|_| ())
+            .map_err(|err| match err {
+                EnqueuerError::RevisionNotFound => QueueAutoIndexJobsError::RevisionNotFound,
+                EnqueuerError::Other(message) => QueueAutoIndexJobsError::Other(message),
+            })
+    }
+}
+
+/// `cmd/worker/internal/codeintel.NewAutoindexingSchedulerJob`.
+#[derive(Debug, Default)]
+pub struct AutoindexingScheduler {
+    config: Arc<SchedulerConfig>,
+}
+
+impl AutoindexingScheduler {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn config(&self) -> &SchedulerConfig {
+        &self.config
+    }
+}
+
+#[async_trait]
+impl Job for AutoindexingScheduler {
+    fn configs(&self) -> Vec<Arc<dyn JobConfig>> {
+        vec![self.config.clone()]
+    }
+
+    async fn routines(
+        &self,
+        deps: &JobDeps,
+        _setup_ctx: CancellationToken,
+    ) -> Result<Vec<BackgroundRoutine>, String> {
+        let pool = deps.frontend.clone();
+
+        // `autoindexing.NewService`'s production chain (M9.8dc/M9.8dm/M9.8dd),
+        // assembled like the dependency scheduler job.
+        let unified = deps.live_config.current();
+        let git = Arc::new(GitserverClient::new(
+            unified.service_connections.git_servers.clone(),
+        ));
+
+        let mut env = EnvReader::new();
+        let environment = inference_environment(&unified.site, &mut env)?;
+        let sandbox: Arc<dyn SandboxService> = Arc::new(LuaSandboxService::new());
+        let inference_service = Arc::new(InferenceService::new(
+            sandbox,
+            Arc::new(GitserverGitService::new(git.clone())),
+            Arc::new(TokenBucketLimiter::new(
+                environment.gitserver_request_rate_limit,
+            )),
+            environment.settings,
+        ));
+        let enqueuer = Arc::new(ProductionIndexEnqueuer::from_env(
+            pool.clone(),
+            Arc::new(GitserverRevisionResolver::new(git.clone())),
+            Arc::new(DefaultPackageRepoInference),
+            Arc::new(InferenceAdapter::new(inference_service)),
+            Arc::new(GitserverYamlReader::new(git.clone())),
+            &mut env,
+        )?);
+        let enqueuer: Arc<dyn IndexEnqueuer> = Arc::new(EnqueuerAdapter::new(enqueuer));
+        let matcher_git: Arc<dyn MatcherGit> = Arc::new(GitserverGit::new(git));
+
+        Ok(vec![
+            new_scheduler_routine(
+                pool.clone(),
+                Arc::clone(&deps.live_config),
+                matcher_git,
+                Arc::clone(&enqueuer),
+                self.config.settings(),
+                self.config.scheduler_interval(),
+            ),
+            new_on_demand_scheduler_routine(
+                pool,
+                Arc::clone(&deps.live_config),
+                enqueuer,
+                self.config.on_demand_batch_size(),
+                self.config.on_demand_scheduler_interval(),
+            ),
+        ])
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -871,5 +998,34 @@ mod tests {
             ON_DEMAND_ROUTINE_DESCRIPTION,
             "schedule autoindexing jobs for explicitly requested repo+revhash combinations"
         );
+    }
+
+    #[test]
+    fn scheduler_job_exposes_the_scheduler_config() {
+        let job = AutoindexingScheduler::new();
+        let configs = job.configs();
+        assert_eq!(configs.len(), 1);
+        assert!(configs[0].validate().is_ok());
+        assert_eq!(job.description(), "");
+    }
+
+    /// `autoindexing.NewIndexSchedulers` returns the periodic routine first
+    /// and the on-demand routine second.
+    #[tokio::test]
+    async fn scheduler_job_builds_the_two_routines_in_baseline_order() {
+        let job = AutoindexingScheduler::new();
+        let deps = JobDeps {
+            frontend: sqlx::postgres::PgPoolOptions::new()
+                .connect_lazy("postgres://unused@localhost/unused")
+                .expect("lazy pool"),
+            live_config: Arc::new(LiveConfig::new(Default::default())),
+            keyring: Arc::new(sg_keyring::Keyring::default()),
+        };
+        let routines = job
+            .routines(&deps, CancellationToken::new())
+            .await
+            .expect("routines");
+        let names: Vec<&str> = routines.iter().map(|routine| routine.name()).collect();
+        assert_eq!(names, vec![ROUTINE_NAME, ON_DEMAND_ROUTINE_NAME]);
     }
 }

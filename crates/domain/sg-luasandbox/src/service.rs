@@ -296,9 +296,7 @@ pub fn go_clean(path: &str) -> String {
     }
 
     while r < n {
-        if bytes[r] == b'/' {
-            r += 1;
-        } else if bytes[r] == b'.' && (r + 1 == n || bytes[r + 1] == b'/') {
+        if bytes[r] == b'/' || (bytes[r] == b'.' && (r + 1 == n || bytes[r + 1] == b'/')) {
             r += 1;
         } else if bytes[r] == b'.'
             && r + 1 < n
