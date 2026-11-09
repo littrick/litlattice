@@ -11,6 +11,7 @@ pub mod batches;
 pub mod batches_janitor;
 pub mod code_monitors;
 pub mod codeintel_autoindex_queue;
+pub mod codeintel_autoindexing_enqueuer;
 pub mod codeintel_codegraph;
 pub mod codeintel_dependencies;
 pub mod codeintel_policies;
