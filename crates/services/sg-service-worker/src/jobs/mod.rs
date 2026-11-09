@@ -76,6 +76,7 @@ pub mod insights_backfill_handler;
 pub mod insights_backfill_inprogress;
 pub mod insights_backfill_store;
 pub mod insights_data_retention;
+pub mod insights_enqueuer;
 pub mod insights_query_runner;
 pub mod licensecheck;
 pub mod out_of_band_migrations;

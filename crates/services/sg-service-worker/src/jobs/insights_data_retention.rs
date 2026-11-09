@@ -658,6 +658,28 @@ pub async fn clean_jobs(pool: &PgPool, before: OffsetDateTime) -> Result<u64, St
     Ok(result.rows_affected())
 }
 
+/// `retention.EnqueueJob`: queue one series for the retention worker.
+///
+/// `insights_data_retention_jobs.series_id` is the `insight_series.id` and
+/// `series_id_string` is the string `series_id` (the column names are
+/// inverted in the baseline schema).
+pub async fn enqueue_job(
+    pool: &PgPool,
+    insight_series_id: i32,
+    series_id: &str,
+) -> Result<i32, String> {
+    let row = sqlx::query(
+        "INSERT INTO insights_data_retention_jobs (series_id, series_id_string) VALUES ($1, $2) RETURNING id",
+    )
+    .bind(insight_series_id)
+    .bind(series_id)
+    .fetch_one(pool)
+    .await
+    .map_err(|err| err.to_string())?;
+    row.try_get("id")
+        .map_err(|err: sqlx::Error| err.to_string())
+}
+
 /// `retention.NewCleaner`'s handler.
 pub struct CleanerHandler {
     pool: PgPool,

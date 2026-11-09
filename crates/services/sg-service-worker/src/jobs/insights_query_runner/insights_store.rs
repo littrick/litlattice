@@ -13,52 +13,215 @@ use sqlx::postgres::PgPool;
 use sqlx::types::time::{OffsetDateTime, PrimitiveDateTime};
 use sqlx::Row;
 
-/// `types.InsightSeries` subset used by the query runner.
+/// `types.InsightSeries` subset used by the query runner and the enqueuer.
+///
+/// `repositories` is `NULL` in the table and `[]string` (nil) in Go; both are
+/// flattened to an empty vector, which is what the query builder branches on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Series {
     pub id: i32,
     pub series_id: String,
+    pub query: String,
     pub repositories: Vec<String>,
+    pub sample_interval_unit: String,
+    pub sample_interval_value: i32,
+    pub group_by: Option<String>,
+    pub repository_criteria: Option<String>,
     pub just_in_time: bool,
     pub generation_method: String,
 }
 
-/// `InsightStore.GetDataSeries` with `SeriesID` + `deleted_at IS NULL`.
-pub async fn get_data_series(pool: &PgPool, series_id: &str) -> Result<Option<Series>, String> {
-    let row = sqlx::query(
-        r#"
-SELECT id, series_id, repositories, just_in_time, generation_method
-FROM insight_series
-WHERE deleted_at IS NULL
-  AND series_id = $1
-"#,
-    )
-    .bind(series_id)
-    .fetch_optional(pool)
-    .await
-    .map_err(|err| err.to_string())?;
+/// The columns [`Series`] reads. `sample_interval_unit` is the `time_unit`
+/// enum; casting to text matches how lib/pq decodes it in the baseline.
+const SERIES_COLUMNS: &str = "id, series_id, query, sample_interval_unit::text AS sample_interval_unit, \
+     sample_interval_value, group_by, repository_criteria, just_in_time, generation_method, repositories";
 
-    let Some(row) = row else {
-        return Ok(None);
-    };
-    Ok(Some(Series {
+fn map_series(row: &sqlx::postgres::PgRow) -> Result<Series, String> {
+    Ok(Series {
         id: row
             .try_get("id")
             .map_err(|err: sqlx::Error| err.to_string())?,
         series_id: row
             .try_get("series_id")
             .map_err(|err: sqlx::Error| err.to_string())?,
+        query: row
+            .try_get("query")
+            .map_err(|err: sqlx::Error| err.to_string())?,
         repositories: row
             .try_get::<Option<Vec<String>>, _>("repositories")
             .map_err(|err: sqlx::Error| err.to_string())?
             .unwrap_or_default(),
+        sample_interval_unit: row
+            .try_get("sample_interval_unit")
+            .map_err(|err: sqlx::Error| err.to_string())?,
+        sample_interval_value: row
+            .try_get("sample_interval_value")
+            .map_err(|err: sqlx::Error| err.to_string())?,
+        group_by: row
+            .try_get("group_by")
+            .map_err(|err: sqlx::Error| err.to_string())?,
+        repository_criteria: row
+            .try_get("repository_criteria")
+            .map_err(|err: sqlx::Error| err.to_string())?,
         just_in_time: row
             .try_get("just_in_time")
             .map_err(|err: sqlx::Error| err.to_string())?,
         generation_method: row
             .try_get("generation_method")
             .map_err(|err: sqlx::Error| err.to_string())?,
-    }))
+    })
+}
+
+/// `GetDataSeriesArgs`. Zero values mean "no predicate" like the baseline
+/// (`time.Time.IsZero`, `ID != 0`, string length, booleans).
+#[derive(Debug, Clone, Default)]
+pub struct GetDataSeriesArgs {
+    pub next_recording_before: Option<OffsetDateTime>,
+    pub next_snapshot_before: Option<OffsetDateTime>,
+    pub include_deleted: bool,
+    pub backfill_not_queued: bool,
+    pub backfill_not_complete: bool,
+    pub series_id: Option<String>,
+    pub id: Option<i32>,
+    pub global_only: bool,
+    pub exclude_just_in_time: bool,
+}
+
+/// `InsightStore.GetDataSeries`: predicates joined in the baseline's order.
+pub async fn get_data_series_with_args(
+    pool: &PgPool,
+    args: &GetDataSeriesArgs,
+) -> Result<Vec<Series>, String> {
+    let mut preds: Vec<String> = Vec::new();
+    let mut binds: Vec<PrimitiveDateTime> = Vec::new();
+    let mut text_binds: Vec<String> = Vec::new();
+    let mut id_bind: Option<i32> = None;
+
+    if let Some(before) = args.next_recording_before {
+        preds.push(format!("next_recording_after < ${}", binds.len() + 1));
+        binds.push(PrimitiveDateTime::new(before.date(), before.time()));
+    }
+    if let Some(before) = args.next_snapshot_before {
+        preds.push(format!("next_snapshot_after < ${}", binds.len() + 1));
+        binds.push(PrimitiveDateTime::new(before.date(), before.time()));
+    }
+    if !args.include_deleted {
+        preds.push("deleted_at IS NULL".to_owned());
+    }
+    if preds.is_empty() {
+        preds.push("TRUE".to_owned());
+    }
+    if args.backfill_not_queued {
+        preds.push("backfill_queued_at IS NULL".to_owned());
+    }
+    if args.backfill_not_complete {
+        preds.push("backfill_completed_at IS NULL".to_owned());
+    }
+    if let Some(series_id) = &args.series_id {
+        preds.push(format!(
+            "series_id = ${}",
+            binds.len() + text_binds.len() + 1
+        ));
+        text_binds.push(series_id.clone());
+    }
+    if let Some(id) = args.id {
+        preds.push(format!("id = ${}", binds.len() + text_binds.len() + 1));
+        id_bind = Some(id);
+    }
+    if args.global_only {
+        preds.push(
+            "((repositories IS NULL OR CARDINALITY(repositories) = 0) AND repository_criteria IS NULL)"
+                .to_owned(),
+        );
+    }
+    if args.exclude_just_in_time {
+        preds.push("just_in_time = false".to_owned());
+    }
+
+    let sql = format!(
+        "SELECT {SERIES_COLUMNS} FROM insight_series WHERE {}",
+        preds.join("\n AND ")
+    );
+    let mut query = sqlx::query(&sql);
+    for bind in &binds {
+        query = query.bind(*bind);
+    }
+    for bind in &text_binds {
+        query = query.bind(bind.as_str());
+    }
+    if let Some(id) = id_bind {
+        query = query.bind(id);
+    }
+    let rows = query.fetch_all(pool).await.map_err(|err| err.to_string())?;
+    rows.iter().map(map_series).collect()
+}
+
+/// `InsightStore.GetDataSeries` restricted to `SeriesID` + `deleted_at IS
+/// NULL`, used by the query runner handler.
+pub async fn get_data_series(pool: &PgPool, series_id: &str) -> Result<Option<Series>, String> {
+    let rows = get_data_series_with_args(
+        pool,
+        &GetDataSeriesArgs {
+            series_id: Some(series_id.to_owned()),
+            ..GetDataSeriesArgs::default()
+        },
+    )
+    .await?;
+    Ok(rows.into_iter().next())
+}
+
+/// `NextSnapshot`: the next UTC midnight strictly after `current`.
+pub fn next_snapshot(current: OffsetDateTime) -> OffsetDateTime {
+    let current = current.to_offset(time::UtcOffset::UTC);
+    let next = current.date().next_day().expect("next snapshot date");
+    PrimitiveDateTime::new(next, time::Time::MIDNIGHT).assume_utc()
+}
+
+fn interval_for(series: &Series) -> sg_insights::timeseries::TimeInterval {
+    sg_insights::timeseries::TimeInterval {
+        unit: sg_insights::types::IntervalUnit::from_str_value(&series.sample_interval_unit),
+        value: i64::from(series.sample_interval_value),
+    }
+}
+
+/// `InsightStore.StampRecording`: `last_recorded_at = now`, `next_recording_after
+/// = now.StepForwards(interval)`.
+pub async fn stamp_recording(
+    pool: &PgPool,
+    now: OffsetDateTime,
+    series: &Series,
+) -> Result<(), String> {
+    let next = interval_for(series).step_forwards(now);
+    sqlx::query(
+        "UPDATE insight_series SET last_recorded_at = $1, next_recording_after = $2 WHERE id = $3",
+    )
+    .bind(PrimitiveDateTime::new(now.date(), now.time()))
+    .bind(PrimitiveDateTime::new(next.date(), next.time()))
+    .bind(series.id)
+    .execute(pool)
+    .await
+    .map_err(|err| err.to_string())?;
+    Ok(())
+}
+
+/// `InsightStore.StampSnapshot`: `last_snapshot_at = now`,
+/// `next_snapshot_after = NextSnapshot(now)`.
+pub async fn stamp_snapshot(
+    pool: &PgPool,
+    now: OffsetDateTime,
+    series: &Series,
+) -> Result<(), String> {
+    let next = next_snapshot(now);
+    sqlx::query(
+        "UPDATE insight_series SET last_snapshot_at = $1, next_snapshot_after = $2 WHERE id = $3",
+    )
+    .bind(PrimitiveDateTime::new(now.date(), now.time()))
+    .bind(PrimitiveDateTime::new(next.date(), next.time()))
+    .bind(series.id)
+    .execute(pool)
+    .await
+    .map_err(|err| err.to_string())?;
+    Ok(())
 }
 
 /// `store.PersistMode`.
@@ -74,6 +237,14 @@ impl PersistMode {
             "record" => Some(Self::Record),
             "snapshot" => Some(Self::Snapshot),
             _ => None,
+        }
+    }
+
+    /// `string(store.PersistMode)` as written into the queue row.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Record => "record",
+            Self::Snapshot => "snapshot",
         }
     }
 

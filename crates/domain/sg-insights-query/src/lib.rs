@@ -24,11 +24,12 @@ pub mod repo;
 pub use builder::{
     add_author_filter, add_file_filter, add_filter, add_repo_filter, add_repo_metadata_filter,
     aggregation_query, build_filter_text, code_insights_query_defaults,
-    compute_insight_command_query, for_repo_revision, for_repos, global_query,
-    is_single_repo_query, make_query_with_repo_filters, multi_repo_query, point_diff_query,
-    point_in_time_query, repository_scope_query, set_case_sensitivity, single_repo_query,
-    single_repo_query_indexed, with_count, with_count_all, with_defaults, BasicQuery,
-    ComputeInsightQuery, MapType, PointDiffQueryOpts, NO_REPO_METADATA_TEXT, QUERY_NOT_SUPPORTED,
+    compute_insight_command_query, compute_insight_command_query_with_map_type, for_repo_revision,
+    for_repos, global_query, is_single_repo_query, make_query_with_repo_filters, multi_repo_query,
+    point_diff_query, point_in_time_query, repository_scope_query, set_case_sensitivity,
+    single_repo_query, single_repo_query_indexed, with_count, with_count_all, with_defaults,
+    BasicQuery, ComputeInsightQuery, MapType, PointDiffQueryOpts, NO_REPO_METADATA_TEXT,
+    QUERY_NOT_SUPPORTED,
 };
 pub use parser::{
     contains_field, detect_search_type, is_valid_scope_query, parameters_from_query_plan,

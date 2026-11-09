@@ -79,6 +79,85 @@ impl DbRecord for Job {
 pub const RECORD_MODE: &str = "record";
 pub const SNAPSHOT_MODE: &str = "snapshot";
 
+/// The `queryrunner.Job` fields `EnqueueJob` writes; the remaining dbworker
+/// columns are left at their table defaults.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NewJob {
+    pub series_id: String,
+    pub search_query: String,
+    pub record_time: Option<OffsetDateTime>,
+    pub persist_mode: String,
+    pub dependent_frames: Vec<PrimitiveDateTime>,
+    pub state: String,
+    pub process_after: Option<OffsetDateTime>,
+    pub cost: i32,
+    pub priority: i32,
+}
+
+/// `queryrunner.EnqueueJob`: insert the job row, then its dependent frames,
+/// in one transaction, returning the new id.
+pub async fn enqueue_job(pool: &PgPool, job: &NewJob) -> Result<i32, String> {
+    let mut tx = pool.begin().await.map_err(|err| err.to_string())?;
+    let record_time = job
+        .record_time
+        .map(|value| PrimitiveDateTime::new(value.date(), value.time()));
+    let process_after = job
+        .process_after
+        .map(|value| PrimitiveDateTime::new(value.date(), value.time()));
+    let row = sqlx::query(
+        r#"
+INSERT INTO insights_query_runner_jobs (
+	series_id,
+	search_query,
+	record_time,
+	state,
+	process_after,
+	cost,
+	priority,
+	persist_mode
+) VALUES ($1, $2, $3, $4, $5, $6, $7, $8::persistmode)
+RETURNING id
+"#,
+    )
+    .bind(&job.series_id)
+    .bind(&job.search_query)
+    .bind(record_time)
+    .bind(&job.state)
+    .bind(process_after)
+    .bind(job.cost)
+    .bind(job.priority)
+    .bind(&job.persist_mode)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(|err| err.to_string())?;
+    let id: i32 = row
+        .try_get("id")
+        .map_err(|err: sqlx::Error| err.to_string())?;
+    if !job.dependent_frames.is_empty() {
+        let mut values: Vec<String> = Vec::with_capacity(job.dependent_frames.len());
+        for index in 0..job.dependent_frames.len() {
+            values.push(format!("($1, ${})", index + 2));
+        }
+        let sql = format!(
+            "INSERT INTO insights_query_runner_jobs_dependencies (job_id, recording_time) VALUES {}",
+            values.join(",")
+        );
+        let mut query = sqlx::query(&sql).bind(id);
+        for frame in &job.dependent_frames {
+            query = query.bind(*frame);
+        }
+        if query.execute(&mut *tx).await.is_err() {
+            // Baseline quirk: `EnqueueJob` returns `(0, nil)` when the
+            // dependency insert fails, so the already-inserted job row is
+            // committed and the caller sees success with id 0.
+            tx.commit().await.map_err(|err| err.to_string())?;
+            return Ok(0);
+        }
+    }
+    tx.commit().await.map_err(|err| err.to_string())?;
+    Ok(id)
+}
+
 /// `workerStoreExtra.WillRetry`: `int(NumFailures)+1 < MaxNumRetries`.
 pub fn will_retry(num_failures: i32) -> bool {
     num_failures + 1 < MAX_NUM_RETRIES

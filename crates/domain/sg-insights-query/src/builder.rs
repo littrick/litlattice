@@ -61,15 +61,22 @@ pub fn compute_insight_command_query(
     query: &str,
     map_type: MapType,
 ) -> Result<ComputeInsightQuery, String> {
+    compute_insight_command_query_with_map_type(query, map_type.as_str())
+}
+
+/// `ComputeInsightCommandQuery` with the `MapType` still encoded as the raw
+/// string stored in `insight_series.group_by` (the baseline casts any string
+/// to `querybuilder.MapType`, so unknown values are passed through verbatim).
+pub fn compute_insight_command_query_with_map_type(
+    query: &str,
+    map_type: &str,
+) -> Result<ComputeInsightQuery, String> {
     let parsed = crate::compute::parse(query).map_err(|err| format!("compute.Parse: {err}"))?;
     let pattern = parsed.command.to_search_pattern();
     Ok(add_regexp_field(
         &parsed.parameters,
         FIELD_CONTENT,
-        &format!(
-            "{INSIGHTS_COMPUTE_COMMAND}({pattern} -> ${})",
-            map_type.as_str()
-        ),
+        &format!("{INSIGHTS_COMPUTE_COMMAND}({pattern} -> ${map_type})"),
     ))
 }
 
