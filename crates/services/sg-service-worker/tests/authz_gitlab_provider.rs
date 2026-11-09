@@ -16,6 +16,7 @@ use async_trait::async_trait;
 use http_body_util::BodyExt;
 use sg_db::users::UserRecord;
 use sg_http::HttpHandler;
+use sg_service_worker::jobs::authz_github_user::OAuthBearerToken;
 use sg_service_worker::jobs::authz_gitlab::{
     AuthUser, GitlabClient, GitlabClientError, GitlabClientProvider, Member, Project, SudoProvider,
 };
@@ -170,6 +171,10 @@ impl GitlabClient for DeadlineClient {
 
 impl GitlabClientProvider for DeadlineProvider {
     fn pat_client(&self, _sudo: &str) -> Arc<dyn GitlabClient> {
+        Arc::new(DeadlineClient)
+    }
+
+    fn oauth_client(&self, _token: Arc<OAuthBearerToken>) -> Arc<dyn GitlabClient> {
         Arc::new(DeadlineClient)
     }
 }

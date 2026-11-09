@@ -22,17 +22,29 @@
 //! The GitLab REST client and the per-sudo client construction are injected
 //! through [`GitlabClientProvider`] / [`GitlabClient`], mirroring
 //! `ClientProvider.GetPATClient(sudoToken, sudo)`; [`super::authz_gitlab_client`]
-//! is the production implementation. The OAuth identity provider is a later
-//! slice.
+//! is the production implementation.
+//!
+//! [`OAuthProvider`] (`oauth.go`) is the user-centric half: `FetchUserPerms`
+//! reads the user's stored OAuth token, refreshes it through
+//! `oauthutil`/`externalAccountTokenRefresher` when needed, and lists projects
+//! with that token. `FetchRepoPerms` is intentionally unimplemented. The
+//! `auth.providers` lookup that builds it (`newAuthzProvider`'s `oauth` branch)
+//! lives in [`super::authz_providers`]; [`gitlab_oauth_providers`] and
+//! [`get_oauth_context`] mirror `gitlab.GetOAuthContext`.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use sg_config::SiteConfiguration;
 use sg_db::user_external_accounts::{ExternalAccount, ExternalAccountSpec};
 use sg_db::users::UserRecord;
 use sg_encryption::Key;
 
+use super::authz_github_user::{
+    decrypt_stored_token, AccountTokenRefresher, OAuthBearerToken, OAuthContext, OAuthTokenStore,
+    TokenRefresher,
+};
 use super::perms_syncer::{
     AuthzProvider, ExternalUserPermissions, FetchError, FetchPermsOptions, FetchRepo,
     UserPermsError,
@@ -165,6 +177,75 @@ pub trait GitlabClient: Send + Sync {
 /// ignores `sudo` (the baseline returns `getClient(nil)`).
 pub trait GitlabClientProvider: Send + Sync {
     fn pat_client(&self, sudo: &str) -> Arc<dyn GitlabClient>;
+
+    /// `ClientProvider.NewClient(oauthToken)`: a client that authenticates
+    /// with the user's OAuth bearer token (refreshing it when needed).
+    fn oauth_client(&self, token: Arc<OAuthBearerToken>) -> Arc<dyn GitlabClient>;
+}
+
+/// One `auth.providers` entry of type `gitlab`. `url` is the raw configured
+/// value (empty when unset), which `GetOAuthContext` uses for its prefix
+/// match.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitlabOAuthProvider {
+    pub url: String,
+    pub client_id: String,
+    pub client_secret: String,
+    /// `authnProvider.Gitlab.SyncInternalRepoPermissions`; `None` means the
+    /// baseline's default (`true`).
+    pub sync_internal_repo_permissions: Option<bool>,
+}
+
+/// `conf.SiteConfig().AuthProviders`, filtered to GitLab entries.
+pub fn gitlab_oauth_providers(site: &SiteConfiguration) -> Vec<GitlabOAuthProvider> {
+    let Some(entries) = site.raw().get("auth.providers").and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+    entries
+        .iter()
+        .filter(|entry| entry.get("type").and_then(|v| v.as_str()) == Some("gitlab"))
+        .map(|entry| GitlabOAuthProvider {
+            url: entry
+                .get("url")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_owned(),
+            client_id: entry
+                .get("clientID")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_owned(),
+            client_secret: entry
+                .get("clientSecret")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_owned(),
+            sync_internal_repo_permissions: entry
+                .get("syncInternalRepoPermissions")
+                .and_then(|v| v.as_bool()),
+        })
+        .collect()
+}
+
+/// `gitlab.GetOAuthContext(baseURL)`: the first GitLab authn provider whose
+/// URL (one trailing slash trimmed) prefixes `base_url`. An empty configured
+/// URL matches everything, exactly like the baseline's `strings.HasPrefix`.
+pub fn get_oauth_context(
+    providers: &[GitlabOAuthProvider],
+    base_url: &str,
+) -> Option<OAuthContext> {
+    for provider in providers {
+        let gl_url = provider.url.strip_suffix('/').unwrap_or(&provider.url);
+        if !base_url.starts_with(gl_url) {
+            continue;
+        }
+        return Some(OAuthContext {
+            client_id: provider.client_id.clone(),
+            client_secret: provider.client_secret.clone(),
+            token_url: format!("{gl_url}/oauth/token"),
+        });
+    }
+    None
 }
 
 /// `gitLabProjectVisibilityExperimental`, read by `listProjects` through
@@ -577,6 +658,178 @@ impl AuthzProvider for SudoProvider {
     }
 }
 
+/// `OAuthProvider` (`oauth.go`): GitLab permissions computed with the user's
+/// own OAuth token. Repository-centric syncing is not implemented; the perms
+/// syncer relies on the user-centric `FetchUserPerms` instead.
+pub struct OAuthProvider {
+    urn: String,
+    service_id: String,
+    client_provider: Arc<dyn GitlabClientProvider>,
+    /// `!connection.MarkInternalReposAsPublic` (from the matching
+    /// `auth.providers` entry): `listProjects`'s `listInternalRepos`.
+    sync_internal_repo_permissions: bool,
+    feature_flags: Arc<dyn GitlabFeatureFlags>,
+    /// The user-external-account key `GetExternalAccountData` decrypts the
+    /// account's `account_data`/`auth_data` with.
+    user_external_account_key: Option<Arc<dyn Key>>,
+    /// The store `externalAccountTokenRefresher` re-reads and updates.
+    token_store: Arc<dyn OAuthTokenStore>,
+    /// The HTTP client the token refresher posts with.
+    http: reqwest::Client,
+    /// `conf.SiteConfig().AuthProviders` entries of type `gitlab`, used for the
+    /// runtime `gitlab.GetOAuthContext` lookup.
+    oauth_providers: Vec<GitlabOAuthProvider>,
+}
+
+impl OAuthProvider {
+    pub fn new(
+        urn: impl Into<String>,
+        service_id: impl Into<String>,
+        client_provider: Arc<dyn GitlabClientProvider>,
+        sync_internal_repo_permissions: bool,
+        token_store: Arc<dyn OAuthTokenStore>,
+        http: reqwest::Client,
+        oauth_providers: Vec<GitlabOAuthProvider>,
+    ) -> Self {
+        Self {
+            urn: urn.into(),
+            service_id: service_id.into(),
+            client_provider,
+            sync_internal_repo_permissions,
+            feature_flags: Arc::new(StaticGitlabFeatureFlags::new(false)),
+            user_external_account_key: None,
+            token_store,
+            http,
+            oauth_providers,
+        }
+    }
+
+    /// Wire the user-external-account key used to decrypt
+    /// `account_data`/`auth_data`.
+    pub fn with_user_external_account_key(mut self, key: Option<Arc<dyn Key>>) -> Self {
+        self.user_external_account_key = key;
+        self
+    }
+
+    /// Wire the `gitLabProjectVisibilityExperimental` lookup.
+    pub fn with_feature_flags(mut self, feature_flags: Arc<dyn GitlabFeatureFlags>) -> Self {
+        self.feature_flags = feature_flags;
+        self
+    }
+
+    pub fn sync_internal_repo_permissions(&self) -> bool {
+        self.sync_internal_repo_permissions
+    }
+}
+
+#[async_trait]
+impl AuthzProvider for OAuthProvider {
+    fn service_type(&self) -> &str {
+        TYPE_GITLAB
+    }
+
+    fn service_id(&self) -> &str {
+        &self.service_id
+    }
+
+    fn urn(&self) -> &str {
+        &self.urn
+    }
+
+    /// `FetchRepoPerms`: `authz.ErrUnimplemented{}`; OAuth connections rely on
+    /// user-centric syncs.
+    async fn fetch_repo_perms(
+        &self,
+        _repo: &FetchRepo,
+        _opts: &FetchPermsOptions,
+    ) -> Result<Vec<String>, FetchError> {
+        Err(FetchError::Unimplemented)
+    }
+
+    /// `FetchUserPerms`: the projects the user's stored OAuth token can read.
+    /// The client refreshes the token (`oauthutil.DoRequest`) when it is
+    /// expiring or the API answers 401.
+    async fn fetch_user_perms(
+        &self,
+        account: &ExternalAccount,
+        _opts: &FetchPermsOptions,
+    ) -> Result<Option<ExternalUserPermissions>, UserPermsError> {
+        let failed = |message: String| UserPermsError::Failed {
+            message,
+            partial: None,
+        };
+
+        if account.service_id != self.service_id || account.service_type != TYPE_GITLAB {
+            return Err(failed(format!(
+                "not a code host of the account: want {:?} but have {:?}",
+                account.service_id, self.service_id
+            )));
+        }
+
+        // `gitlab.GetExternalAccountData` decrypts the account data (as an
+        // `AuthUser`) before reading the token; its value is discarded but a
+        // decryption/decoding error still fails the fetch.
+        if let Err(err) =
+            get_external_account_user(self.user_external_account_key.as_deref(), account).await
+        {
+            return Err(failed(format!("get external account data: {err}")));
+        }
+        let token =
+            match decrypt_stored_token(self.user_external_account_key.as_deref(), account).await {
+                Ok(token) => token,
+                Err(err) => return Err(failed(format!("get external account data: {err}"))),
+            };
+        let Some(token) = token else {
+            return Err(failed(
+                "no token found in the external account data".to_owned(),
+            ));
+        };
+
+        // `GetAccountRefreshAndStoreOAuthTokenFunc(…, gitlab.GetOAuthContext(
+        // strings.TrimSuffix(p.ServiceID(), "/")))`. Without a matching
+        // `auth.providers` entry the baseline's nil context panics inside the
+        // refresh closure; we instead build the token without a refresher, so
+        // a refresh attempt reports "refresh not implemented" (docs §70.3).
+        let base_url = self
+            .service_id
+            .strip_suffix('/')
+            .unwrap_or(&self.service_id);
+        let refresher: Option<Arc<dyn TokenRefresher>> =
+            get_oauth_context(&self.oauth_providers, base_url).map(|oauth| {
+                Arc::new(AccountTokenRefresher::new(
+                    self.token_store.clone(),
+                    self.user_external_account_key.clone(),
+                    account.id,
+                    oauth,
+                    self.http.clone(),
+                )) as Arc<dyn TokenRefresher>
+            });
+        let bearer = Arc::new(OAuthBearerToken::new(token, refresher));
+        let client = self.client_provider.oauth_client(bearer);
+        let experimental_visibility = self.feature_flags.project_visibility_experimental().await;
+
+        match list_projects(
+            client.as_ref(),
+            self.sync_internal_repo_permissions,
+            experimental_visibility,
+        )
+        .await
+        {
+            Ok(exacts) => Ok(Some(ExternalUserPermissions {
+                exacts,
+                ..ExternalUserPermissions::default()
+            })),
+            Err(err) => Err(UserPermsError::Failed {
+                message: err.message,
+                partial: Some(ExternalUserPermissions {
+                    exacts: err.partial_repo_ids,
+                    ..ExternalUserPermissions::default()
+                }),
+            }),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -588,6 +841,53 @@ mod tests {
         assert_eq!(query_escape("a/b@c"), "a%2Fb%40c");
         assert_eq!(query_escape("-_.~"), "-_.~");
         assert_eq!(query_escape("ü"), "%C3%BC");
+    }
+
+    #[test]
+    fn oauth_providers_filter_gitlab_entries() {
+        let site = SiteConfiguration::parse(
+            r#"{"auth.providers":[
+                {"type":"github","url":"https://github.com"},
+                {"type":"gitlab","url":"https://gitlab.example.com/","clientID":"id","clientSecret":"secret","syncInternalRepoPermissions":false}
+            ]}"#,
+        )
+        .expect("site config");
+        assert_eq!(
+            gitlab_oauth_providers(&site),
+            vec![GitlabOAuthProvider {
+                url: "https://gitlab.example.com/".to_owned(),
+                client_id: "id".to_owned(),
+                client_secret: "secret".to_owned(),
+                sync_internal_repo_permissions: Some(false),
+            }]
+        );
+    }
+
+    #[test]
+    fn oauth_context_uses_a_prefix_match() {
+        let providers = vec![
+            GitlabOAuthProvider {
+                url: "https://gitlab.example.com/".to_owned(),
+                client_id: "one".to_owned(),
+                client_secret: "s1".to_owned(),
+                sync_internal_repo_permissions: None,
+            },
+            GitlabOAuthProvider {
+                url: String::new(),
+                client_id: "any".to_owned(),
+                client_secret: "s2".to_owned(),
+                sync_internal_repo_permissions: None,
+            },
+        ];
+        let context = get_oauth_context(&providers, "https://gitlab.example.com").expect("context");
+        assert_eq!(context.client_id, "one");
+        assert_eq!(context.token_url, "https://gitlab.example.com/oauth/token");
+        // An empty configured URL prefixes everything (the later entry matches
+        // once the earlier ones do not).
+        let context = get_oauth_context(&providers, "https://other.example.com").expect("context");
+        assert_eq!(context.client_id, "any");
+        assert_eq!(context.token_url, "/oauth/token");
+        assert!(get_oauth_context(&[], "https://gitlab.example.com").is_none());
     }
 
     #[test]

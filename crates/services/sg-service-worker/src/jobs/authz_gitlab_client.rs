@@ -8,6 +8,10 @@
 //!   "api/v4") + "/"`),
 //! * `GetPATClient(token, sudo)` (`Private-Token`, plus `Sudo` when set; an
 //!   empty token means an unauthenticated client),
+//! * `NewClient(auth.OAuthBearerToken)` (`Authorization: Bearer`, the
+//!   user-centric OAuth path) and `oauthutil.DoRequest`'s refresh contract: a
+//!   pre-emptive `NeedsRefresh` refresh, and one refresh-and-retry on a 401
+//!   (a failed refresh leaves the original 401 response in place),
 //! * `ListProjects`, `ListMembers`, `ListUsers` with the `Link: rel="next"`
 //!   pagination header,
 //! * `doWithBaseURL`'s headers (`Content-Type: application/json;
@@ -16,15 +20,16 @@
 //!   GitLab API (<url>): HTTP error status <code>`).
 //!
 //! Not ported: the rate-limit monitors and 429 retries, the Redis-backed
-//! project metadata cache, the request counter, and OAuth token refresh.
+//! project metadata cache and the request counter.
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use reqwest::header::{HeaderName, HeaderValue, CACHE_CONTROL, CONTENT_TYPE, LINK};
+use reqwest::header::{HeaderName, HeaderValue, AUTHORIZATION, CACHE_CONTROL, CONTENT_TYPE, LINK};
 use reqwest::StatusCode;
 use serde::de::DeserializeOwned;
 
+use super::authz_github_user::OAuthBearerToken;
 use super::authz_gitlab::{
     AuthUser, GitlabClient, GitlabClientError, GitlabClientProvider, Member, Project,
 };
@@ -60,6 +65,12 @@ impl GitlabRestClientProvider {
             token: token.unwrap_or_default(),
         }
     }
+
+    /// The underlying HTTP client. The OAuth token refresher uses it, like
+    /// `oauthutil.DoRequest` passes the client's own doer to `Refresh`.
+    pub fn http_client(&self) -> reqwest::Client {
+        self.http.clone()
+    }
 }
 
 impl GitlabClientProvider for GitlabRestClientProvider {
@@ -71,15 +82,36 @@ impl GitlabClientProvider for GitlabRestClientProvider {
             sudo,
         ))
     }
+
+    /// `ClientProvider.NewClient(oauthToken)`.
+    fn oauth_client(&self, token: Arc<OAuthBearerToken>) -> Arc<dyn GitlabClient> {
+        Arc::new(GitlabRestClient::with_oauth_token(
+            self.http.clone(),
+            &self.base_url,
+            token,
+        ))
+    }
+}
+
+/// How the client authenticates: `SudoableToken` (PAT) or
+/// `auth.OAuthBearerToken` (the user's token, refreshed on demand).
+#[derive(Clone)]
+enum Auth {
+    /// `GetPATClient(token, sudo)`: an empty token means an unauthenticated
+    /// client, which ignores `sudo`.
+    Pat {
+        token: String,
+        sudo: String,
+    },
+    OAuth(Arc<OAuthBearerToken>),
 }
 
 /// `gitlab.Client`, reduced to the authz methods. Each instance is bound to one
-/// (token, sudo) pair; URLs are resolved against the instance's API root.
+/// authenticator; URLs are resolved against the instance's API root.
 pub struct GitlabRestClient {
     http: reqwest::Client,
     api_base: reqwest::Url,
-    token: String,
-    sudo: String,
+    auth: Auth,
 }
 
 impl GitlabRestClient {
@@ -94,17 +126,104 @@ impl GitlabRestClient {
         token: &str,
         sudo: &str,
     ) -> Self {
+        Self::with_auth(
+            http,
+            base_url,
+            Auth::Pat {
+                token: token.to_owned(),
+                sudo: sudo.to_owned(),
+            },
+        )
+    }
+
+    /// `ClientProvider.NewClient(oauthToken)`.
+    pub fn with_oauth_token(
+        http: reqwest::Client,
+        base_url: &reqwest::Url,
+        token: Arc<OAuthBearerToken>,
+    ) -> Self {
+        Self::with_auth(http, base_url, Auth::OAuth(token))
+    }
+
+    fn with_auth(http: reqwest::Client, base_url: &reqwest::Url, auth: Auth) -> Self {
         Self {
             http,
             api_base: api_base_url(base_url),
-            token: token.to_owned(),
-            sudo: sudo.to_owned(),
+            auth,
         }
     }
 
     /// The `/api/v4/` root requests are resolved against.
     pub fn api_base(&self) -> &reqwest::Url {
         &self.api_base
+    }
+
+    /// `oauthutil.DoRequest`: a pre-emptive refresh when the token is known to
+    /// be expiring (`NeedsRefresh`), then the request; a 401 with an
+    /// `OAuthBearerToken` refreshes and retries exactly once. A failed
+    /// refresh leaves the original response in place.
+    async fn do_request(&self, url: &reqwest::Url) -> Result<reqwest::Response, GitlabClientError> {
+        if let Auth::OAuth(token) = &self.auth {
+            if token.needs_refresh() {
+                if let Err(err) = token.refresh().await {
+                    tracing::warn!(error = %err, "doRequest: token refresh failed");
+                }
+            }
+        }
+
+        let response = self.send(url).await?;
+        if response.status() == StatusCode::UNAUTHORIZED {
+            if let Auth::OAuth(token) = &self.auth {
+                if token.refresh().await.is_ok() {
+                    // Re-authorize and re-do the request.
+                    return self.send(url).await;
+                }
+            }
+        }
+        Ok(response)
+    }
+
+    fn build_request(
+        &self,
+        url: &reqwest::Url,
+    ) -> Result<reqwest::RequestBuilder, GitlabClientError> {
+        let mut request = self
+            .http
+            .get(url.clone())
+            .header(CONTENT_TYPE, "application/json; charset=utf-8")
+            .header(CACHE_CONTROL, "max-age=0");
+        match &self.auth {
+            Auth::Pat { token, sudo } => {
+                if !token.is_empty() {
+                    let value = HeaderValue::from_str(token).map_err(|err| {
+                        GitlabClientError::new(format!("authenticating request: {err}"))
+                    })?;
+                    request = request.header(PRIVATE_TOKEN, value);
+                    if !sudo.is_empty() {
+                        let value = HeaderValue::from_str(sudo).map_err(|err| {
+                            GitlabClientError::new(format!("authenticating request: {err}"))
+                        })?;
+                        request = request.header(SUDO, value);
+                    }
+                }
+            }
+            Auth::OAuth(token) => {
+                let value =
+                    HeaderValue::from_str(&format!("Bearer {}", token.token().access_token))
+                        .map_err(|err| {
+                            GitlabClientError::new(format!("authenticating request: {err}"))
+                        })?;
+                request = request.header(AUTHORIZATION, value);
+            }
+        }
+        Ok(request)
+    }
+
+    async fn send(&self, url: &reqwest::Url) -> Result<reqwest::Response, GitlabClientError> {
+        self.build_request(url)?
+            .send()
+            .await
+            .map_err(|err| GitlabClientError::new(format!("request failed: {err}")))
     }
 
     async fn get_json<T: DeserializeOwned + Default>(
@@ -119,27 +238,7 @@ impl GitlabRestClient {
             .join(url_str)
             .map_err(|err| GitlabClientError::new(format!("parse URL: {err}")))?;
 
-        let mut request = self
-            .http
-            .get(url.clone())
-            .header(CONTENT_TYPE, "application/json; charset=utf-8")
-            .header(CACHE_CONTROL, "max-age=0");
-        if !self.token.is_empty() {
-            let value = HeaderValue::from_str(&self.token)
-                .map_err(|err| GitlabClientError::new(format!("authenticating request: {err}")))?;
-            request = request.header(PRIVATE_TOKEN, value);
-            if !self.sudo.is_empty() {
-                let value = HeaderValue::from_str(&self.sudo).map_err(|err| {
-                    GitlabClientError::new(format!("authenticating request: {err}"))
-                })?;
-                request = request.header(SUDO, value);
-            }
-        }
-
-        let response = request
-            .send()
-            .await
-            .map_err(|err| GitlabClientError::new(format!("request failed: {err}")))?;
+        let response = self.do_request(&url).await?;
 
         let next = next_page_url(response.headers().get(LINK).and_then(|v| v.to_str().ok()));
         let status = response.status();

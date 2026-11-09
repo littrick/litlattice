@@ -114,7 +114,7 @@ pub async fn external_account_token(
 
 /// `encryption.DecryptJSON[oauth2.Token](acct.AuthData)`: `None` when the
 /// column is NULL (or the empty cipher with an empty key ID).
-async fn decrypt_stored_token(
+pub(crate) async fn decrypt_stored_token(
     key: Option<&dyn Key>,
     account: &ExternalAccount,
 ) -> Result<Option<OAuthToken>, String> {
