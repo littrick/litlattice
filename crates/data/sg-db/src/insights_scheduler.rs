@@ -591,3 +591,407 @@ mod tests {
         assert_eq!(iterator.errors[0].failure_count, 1);
     }
 }
+
+// -------------------------------------------------------------------------
+// Backfill queue (management UI): `GetBackfillQueueInfo` / `GetBackfillQueueTotalCount`
+// -------------------------------------------------------------------------
+
+/// One `ORDER BY` field of the queue pagination, mirroring
+/// `database.OrderByOption`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueueOrderBy {
+    pub field: String,
+    pub nulls: Option<QueueNulls>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueueNulls {
+    First,
+    Last,
+}
+
+/// Subset of `database.PaginationArgs` used by the backfill queue.
+///
+/// Like the baseline, `order_by` falls back to `id` when empty; the queue
+/// query joins several tables, so callers normally pass `isb.id` (the
+/// default `BackfillID` column). `after`/`before` only use the first value.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct QueuePagination {
+    pub first: Option<i32>,
+    pub last: Option<i32>,
+    pub after: Vec<i32>,
+    pub before: Vec<i32>,
+    pub order_by: Vec<QueueOrderBy>,
+    pub ascending: bool,
+}
+
+/// `scheduler.BackfillQueueArgs`.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct BackfillQueueArgs {
+    pub pagination: Option<QueuePagination>,
+    pub states: Option<Vec<String>>,
+    pub text_search: Option<String>,
+    pub id: Option<i32>,
+}
+
+/// `scheduler.BackfillQueueItem`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BackfillQueueItem {
+    pub id: i32,
+    pub insight_title: String,
+    pub series_id: i32,
+    pub insight_unique_id: String,
+    pub series_label: String,
+    pub series_search_query: String,
+    pub backfill_state: String,
+    pub percent_complete: Option<i64>,
+    pub backfill_cost: Option<i64>,
+    pub runtime_duration: Option<i64>,
+    pub backfill_created_at: Option<PrimitiveDateTime>,
+    pub backfill_started_at: Option<PrimitiveDateTime>,
+    pub backfill_completed_at: Option<PrimitiveDateTime>,
+    pub queue_position: Option<i64>,
+    pub errors: Option<Vec<String>>,
+    pub creator_id: Option<i32>,
+}
+
+enum QueueBind {
+    Text(String),
+    Int(i32),
+}
+
+/// `backfillWhere`: the queue filters (and, for the info query, the cursor
+/// bounds). Cursor bounds are appended in `GetBackfillQueueInfo` only; the
+/// total count ignores pagination entirely, as in the baseline.
+fn queue_where(args: &BackfillQueueArgs, include_cursor: bool) -> (String, Vec<QueueBind>) {
+    let mut clauses: Vec<String> = vec!["s.deleted_at IS NULL".to_owned()];
+    let mut binds: Vec<QueueBind> = Vec::new();
+
+    if let Some(text_search) = &args.text_search {
+        if !text_search.is_empty() {
+            let pattern = format!("%{text_search}%");
+            let first = binds.len() + 1;
+            binds.push(QueueBind::Text(pattern.clone()));
+            let second = binds.len() + 1;
+            binds.push(QueueBind::Text(pattern));
+            clauses.push(format!("(title ILIKE ${first} OR label ILIKE ${second})"));
+        }
+    }
+
+    if let Some(states) = &args.states {
+        if !states.is_empty() {
+            let mut placeholders = Vec::with_capacity(states.len());
+            for state in states {
+                binds.push(QueueBind::Text(state.to_lowercase()));
+                placeholders.push(format!("${}", binds.len()));
+            }
+            clauses.push(format!(
+                "state.backfill_state in ({})",
+                placeholders.join(",")
+            ));
+        }
+    }
+
+    if let Some(id) = args.id {
+        binds.push(QueueBind::Int(id));
+        clauses.push(format!("isb.id = ${}", binds.len()));
+    }
+
+    if include_cursor {
+        if let Some(pagination) = &args.pagination {
+            if let Some(after) = pagination.after.first() {
+                binds.push(QueueBind::Int(*after));
+                clauses.push(format!("isb.id > ${}", binds.len()));
+            }
+            if let Some(before) = pagination.before.first() {
+                binds.push(QueueBind::Int(*before));
+                clauses.push(format!("isb.id < ${}", binds.len()));
+            }
+        }
+    }
+
+    (clauses.join(" AND "), binds)
+}
+
+/// `database.PaginationArgs.SQL` + `AppendOrderToQuery`/`AppendLimitToQuery`
+/// as applied by `GetBackfillQueueInfo`. Returns the ORDER BY body and the
+/// optional LIMIT.
+fn queue_order_and_limit(args: &BackfillQueueArgs) -> (String, Option<i32>) {
+    let (order_by, ascending, limit) = match &args.pagination {
+        None => (
+            vec![QueueOrderBy {
+                field: "isb.id".to_owned(),
+                nulls: None,
+            }],
+            false,
+            None,
+        ),
+        Some(pagination) => {
+            let order_by = if pagination.order_by.is_empty() {
+                vec![QueueOrderBy {
+                    field: "id".to_owned(),
+                    nulls: None,
+                }]
+            } else {
+                pagination.order_by.clone()
+            };
+            let ascending = if pagination.first.is_some() {
+                pagination.ascending
+            } else if pagination.last.is_some() {
+                !pagination.ascending
+            } else {
+                pagination.ascending
+            };
+            (order_by, ascending, pagination.first.or(pagination.last))
+        }
+    };
+    let direction = if ascending { "ASC" } else { "DESC" };
+    let fields = order_by
+        .iter()
+        .map(|order| match order.nulls {
+            None => format!("{} {}", order.field, direction),
+            Some(QueueNulls::First) => format!("{} {} NULLS FIRST", order.field, direction),
+            Some(QueueNulls::Last) => format!("{} {} NULLS LAST", order.field, direction),
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    (fields, limit)
+}
+
+const BACKFILL_COUNT_SQL: &str = r#"
+WITH state as (
+select isb.id, CASE
+  WHEN ijbip.state IS NULL THEN isb.state
+  ELSE ijbip.state
+END backfill_state
+    from insight_series_backfill isb
+    left join insights_jobs_backfill_in_progress ijbip on isb.id = ijbip.backfill_id and ijbip.state = 'queued'
+    )
+select count(*)
+from insight_series_backfill isb
+    left join repo_iterator ri on isb.repo_iterator_id = ri.id
+    join insight_view_series ivs on ivs.insight_series_id = isb.series_id
+    join insight_series s on isb.series_id = s.id
+    join insight_view iv on ivs.insight_view_id = iv.id
+    join state  on isb.id = state.id
+{where_clause}
+"#;
+
+const BACKFILL_QUEUE_SQL: &str = r#"
+WITH job_queue as (
+    select backfill_id, state, row_number() over (ORDER BY estimated_cost, backfill_id)  queue_position
+    from insights_jobs_backfill_in_progress where state = 'queued'
+),
+errors as (
+    select repo_iterator_id, array_agg(err_msg) error_messages
+    from repo_iterator_errors, unnest(error_message[:25]) err_msg
+    group by  repo_iterator_id
+),
+state as (
+select isb.id, CASE
+  WHEN ijbip.state IS NULL THEN isb.state
+  ELSE ijbip.state
+END backfill_state
+    from insight_series_backfill isb
+    left join insights_jobs_backfill_in_progress ijbip on isb.id = ijbip.backfill_id and ijbip.state = 'queued'
+    )
+select isb.id,
+       title,
+       s.id,
+	   iv.unique_id insight_id,
+       label,
+       query,
+       state.backfill_state,
+       round(ri.percent_complete *100) percent_complete,
+       round(isb.estimated_cost),
+       ri.runtime_duration runtime_duration,
+       ri.created_at backfill_created_at,
+       ri.started_at backfill_started_at,
+       ri.completed_at backfill_completed_at,
+       jq.queue_position,
+       e.error_messages,
+	   (SELECT user_id FROM insight_view_grants WHERE insight_view_id = iv.id ORDER BY id LIMIT 1) creator_id
+from insight_series_backfill isb
+    left join repo_iterator ri on isb.repo_iterator_id = ri.id
+    left join errors e on isb.repo_iterator_id = e.repo_iterator_id
+    left join job_queue jq on jq.backfill_id = isb.id
+    join insight_view_series ivs on ivs.insight_series_id = isb.series_id
+    join insight_series s on isb.series_id = s.id
+    join insight_view iv on ivs.insight_view_id = iv.id
+    join state  on isb.id = state.id
+{where_clause}
+"#;
+
+fn bind_queue<'q>(
+    mut query: sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments>,
+    binds: &[QueueBind],
+) -> sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments> {
+    for bind in binds {
+        query = match bind {
+            QueueBind::Text(value) => query.bind(value.clone()),
+            QueueBind::Int(value) => query.bind(*value),
+        };
+    }
+    query
+}
+
+/// `BackfillStore.GetBackfillQueueTotalCount`.
+pub async fn get_backfill_queue_total_count(
+    pool: &PgPool,
+    args: &BackfillQueueArgs,
+) -> Result<i64, sqlx::Error> {
+    let (where_clause, binds) = queue_where(args, false);
+    let sql = BACKFILL_COUNT_SQL.replace("{where_clause}", &format!("WHERE {where_clause}"));
+    bind_queue(sqlx::query(&sql), &binds)
+        .fetch_one(pool)
+        .await?
+        .try_get(0)
+}
+
+/// `BackfillStore.GetBackfillQueueInfo`.
+pub async fn get_backfill_queue_info(
+    pool: &PgPool,
+    args: &BackfillQueueArgs,
+) -> Result<Vec<BackfillQueueItem>, sqlx::Error> {
+    let (where_clause, binds) = queue_where(args, true);
+    let (order, limit) = queue_order_and_limit(args);
+    let mut sql = BACKFILL_QUEUE_SQL.replace("{where_clause}", &format!("WHERE {where_clause}"));
+    sql.push_str(" ORDER BY ");
+    sql.push_str(&order);
+    if let Some(limit) = limit {
+        sql.push_str(&format!(" LIMIT {limit}"));
+    }
+    let rows = bind_queue(sqlx::query(&sql), &binds)
+        .fetch_all(pool)
+        .await?;
+    rows.iter()
+        .map(|row| {
+            Ok(BackfillQueueItem {
+                id: row.try_get(0)?,
+                insight_title: row.try_get(1)?,
+                series_id: row.try_get(2)?,
+                insight_unique_id: row.try_get(3)?,
+                series_label: row.try_get(4)?,
+                series_search_query: row.try_get(5)?,
+                backfill_state: row.try_get(6)?,
+                percent_complete: row.try_get::<Option<f64>, _>(7)?.map(|v| v as i64),
+                backfill_cost: row.try_get::<Option<f64>, _>(8)?.map(|v| v as i64),
+                runtime_duration: row.try_get(9)?,
+                backfill_created_at: row.try_get(10)?,
+                backfill_started_at: row.try_get(11)?,
+                backfill_completed_at: row.try_get(12)?,
+                queue_position: row.try_get(13)?,
+                errors: row.try_get(14)?,
+                creator_id: row.try_get(15)?,
+            })
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod queue_tests {
+    use super::*;
+
+    fn field(field: &str) -> QueueOrderBy {
+        QueueOrderBy {
+            field: field.to_owned(),
+            nulls: None,
+        }
+    }
+
+    #[test]
+    fn default_pagination_orders_by_backfill_id_desc_without_limit() {
+        let args = BackfillQueueArgs::default();
+        assert_eq!(
+            queue_order_and_limit(&args),
+            ("isb.id DESC".to_owned(), None)
+        );
+    }
+
+    #[test]
+    fn first_uses_ascending_flag_and_limit() {
+        let args = BackfillQueueArgs {
+            pagination: Some(QueuePagination {
+                first: Some(3),
+                order_by: vec![field("isb.id")],
+                ascending: true,
+                ..QueuePagination::default()
+            }),
+            ..BackfillQueueArgs::default()
+        };
+        assert_eq!(
+            queue_order_and_limit(&args),
+            ("isb.id ASC".to_owned(), Some(3))
+        );
+    }
+
+    #[test]
+    fn last_inverts_direction_and_uses_limit() {
+        let args = BackfillQueueArgs {
+            pagination: Some(QueuePagination {
+                last: Some(2),
+                order_by: vec![field("isb.id")],
+                ascending: false,
+                ..QueuePagination::default()
+            }),
+            ..BackfillQueueArgs::default()
+        };
+        assert_eq!(
+            queue_order_and_limit(&args),
+            ("isb.id ASC".to_owned(), Some(2))
+        );
+    }
+
+    #[test]
+    fn empty_order_by_falls_back_to_id_like_the_pagination_helper() {
+        let args = BackfillQueueArgs {
+            pagination: Some(QueuePagination {
+                first: Some(1),
+                ascending: false,
+                ..QueuePagination::default()
+            }),
+            ..BackfillQueueArgs::default()
+        };
+        assert_eq!(
+            queue_order_and_limit(&args),
+            ("id DESC".to_owned(), Some(1))
+        );
+    }
+
+    #[test]
+    fn where_binds_text_states_id_and_cursors_in_order() {
+        let args = BackfillQueueArgs {
+            pagination: Some(QueuePagination {
+                first: Some(5),
+                after: vec![52],
+                before: vec![60],
+                ..QueuePagination::default()
+            }),
+            states: Some(vec!["NEW".to_owned(), "Queued".to_owned()]),
+            text_search: Some("chart".to_owned()),
+            id: Some(50),
+        };
+        let (clause, binds) = queue_where(&args, true);
+        assert_eq!(
+            clause,
+            "s.deleted_at IS NULL AND (title ILIKE $1 OR label ILIKE $2) \
+             AND state.backfill_state in ($3,$4) AND isb.id = $5 AND isb.id > $6 AND isb.id < $7"
+        );
+        assert!(matches!(&binds[0], QueueBind::Text(value) if value == "%chart%"));
+        assert!(matches!(&binds[2], QueueBind::Text(value) if value == "new"));
+        assert!(matches!(&binds[6], QueueBind::Int(value) if *value == 60));
+    }
+
+    #[test]
+    fn total_count_ignores_cursor_bounds() {
+        let args = BackfillQueueArgs {
+            pagination: Some(QueuePagination {
+                after: vec![52],
+                ..QueuePagination::default()
+            }),
+            ..BackfillQueueArgs::default()
+        };
+        let (clause, _) = queue_where(&args, false);
+        assert_eq!(clause, "s.deleted_at IS NULL");
+    }
+}

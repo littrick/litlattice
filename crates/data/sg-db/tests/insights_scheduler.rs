@@ -321,6 +321,139 @@ async fn run_iterator_corpus(pool: &PgPool, corpus_path: &str) {
     }
 }
 
+fn fmt_opt_int(value: Option<i64>) -> String {
+    value.map_or_else(|| "-".to_owned(), |value| value.to_string())
+}
+
+fn fmt_opt_i32(value: Option<i32>) -> String {
+    value.map_or_else(|| "-".to_owned(), |value| value.to_string())
+}
+
+fn fmt_opt_strings(value: Option<Vec<String>>) -> String {
+    value.map_or_else(|| "-".to_owned(), |messages| messages.join("|"))
+}
+
+async fn run_queue_corpus(pool: &PgPool, corpus_path: &str) {
+    let corpus = std::fs::read_to_string(corpus_path).expect("read queue corpus");
+    for line in corpus.lines() {
+        if line.is_empty() {
+            continue;
+        }
+        let parts: Vec<&str> = line.split('\t').collect();
+        match parts[0] {
+            "queueinfo" => {
+                let mode = parts[1];
+                let (a1, a2) = (parts[2], parts[3]);
+                let mut args = is::BackfillQueueArgs::default();
+                if parts[4] != "-" {
+                    args.states = Some(parts[4].split(',').map(str::to_owned).collect());
+                }
+                if parts[5] != "-" {
+                    args.text_search = Some(parts[5].to_owned());
+                }
+                if parts[6] != "-" {
+                    args.id = Some(atoi(parts[6]));
+                }
+                match mode {
+                    "default" => {}
+                    "first" | "last" => {
+                        let limit = atoi(a1);
+                        let mut pagination = is::QueuePagination {
+                            order_by: vec![is::QueueOrderBy {
+                                field: "isb.id".to_owned(),
+                                nulls: None,
+                            }],
+                            ..is::QueuePagination::default()
+                        };
+                        if mode == "first" {
+                            pagination.first = Some(limit);
+                        } else {
+                            pagination.last = Some(limit);
+                        }
+                        if a2 != "-" {
+                            let (key, value) = a2.split_once('=').expect("cursor");
+                            let cursor = atoi(value);
+                            if key == "after" {
+                                pagination.after = vec![cursor];
+                            } else {
+                                pagination.before = vec![cursor];
+                            }
+                        }
+                        args.pagination = Some(pagination);
+                    }
+                    "order" => {
+                        args.pagination = Some(is::QueuePagination {
+                            order_by: vec![is::QueueOrderBy {
+                                field: a1.to_owned(),
+                                nulls: None,
+                            }],
+                            ascending: a2 == "true",
+                            ..is::QueuePagination::default()
+                        });
+                    }
+                    other => panic!("unknown queueinfo mode {other:?}"),
+                }
+                let items = is::get_backfill_queue_info(pool, &args)
+                    .await
+                    .expect("GetBackfillQueueInfo");
+                println!(
+                    "qinfo mode={} a1={} a2={} states={} search={} id={} count={}",
+                    mode,
+                    a1,
+                    a2,
+                    parts[4],
+                    parts[5],
+                    parts[6],
+                    items.len()
+                );
+                for (index, item) in items.iter().enumerate() {
+                    println!(
+                        "qitem {} id={} title={} sid={} uid={} label={} query={} state={} pct={} cost={} runtime={} created={} started={} completed={} pos={} creator={} errors={}",
+                        index,
+                        item.id,
+                        item.insight_title,
+                        item.series_id,
+                        item.insight_unique_id,
+                        item.series_label,
+                        item.series_search_query,
+                        item.backfill_state,
+                        fmt_opt_int(item.percent_complete),
+                        fmt_opt_int(item.backfill_cost),
+                        fmt_opt_int(item.runtime_duration),
+                        fmt_time(item.backfill_created_at),
+                        fmt_time(item.backfill_started_at),
+                        fmt_time(item.backfill_completed_at),
+                        fmt_opt_int(item.queue_position),
+                        fmt_opt_i32(item.creator_id),
+                        fmt_opt_strings(item.errors.clone())
+                    );
+                }
+            }
+            "queuetotal" => {
+                let mut args = is::BackfillQueueArgs::default();
+                if parts[1] != "-" {
+                    args.states = Some(parts[1].split(',').map(str::to_owned).collect());
+                }
+                if parts[2] != "-" {
+                    args.text_search = Some(parts[2].to_owned());
+                }
+                if parts[3] != "-" {
+                    args.id = Some(atoi(parts[3]));
+                }
+                let count = is::get_backfill_queue_total_count(pool, &args)
+                    .await
+                    .expect("GetBackfillQueueTotalCount");
+                println!(
+                    "qtotal states={} search={} id={} count={}",
+                    parts[1], parts[2], parts[3], count
+                );
+            }
+            other => panic!("unknown op {other:?}"),
+        }
+        std::io::stdout().flush().expect("flush");
+    }
+}
+
 #[tokio::test]
 async fn insights_scheduler_db_parity() {
     let Ok(dsn) = std::env::var("SG_QTEST_INSIGHTS_DSN") else {
@@ -329,13 +462,15 @@ async fn insights_scheduler_db_parity() {
     if dsn.is_empty() {
         return;
     }
-    let (Ok(backfill_corpus), Ok(iterator_corpus)) = (
+    let (Ok(backfill_corpus), Ok(iterator_corpus), Ok(queue_corpus)) = (
         std::env::var("SG_INSIGHTS_SCHEDULER_DB_BACKFILL_CORPUS"),
         std::env::var("SG_INSIGHTS_SCHEDULER_DB_ITERATOR_CORPUS"),
+        std::env::var("SG_INSIGHTS_SCHEDULER_DB_QUEUE_CORPUS"),
     ) else {
         return;
     };
     let pool = PgPool::connect(&dsn).await.expect("connect database");
     run_backfill_corpus(&pool, &backfill_corpus).await;
     run_iterator_corpus(&pool, &iterator_corpus).await;
+    run_queue_corpus(&pool, &queue_corpus).await;
 }
