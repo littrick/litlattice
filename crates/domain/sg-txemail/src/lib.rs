@@ -22,17 +22,24 @@
 //! subset is rejected with [`TemplateError::Unsupported`] instead of silently
 //! rendering differently; see `docs/modules/06_worker.md` §108 for the list.
 //!
+//! [`Email`] plus [`Email::bytes`] port `jordan-wright/email`'s `Bytes()` for
+//! the no-attachment case that `txemail` uses (see [`mime`]).
+//!
 //! Not ported in this slice: the `html2text` fallback for templates without a
-//! `Text` body, `jordan-wright/email` MIME assembly (`Bytes`) and the SMTP
-//! transport (`Send`). [`parse_template`] returns
-//! [`TxEmailError::Html2TextNotPorted`] instead of emitting a divergent body.
+//! `Text` body, MIME attachments, and the SMTP transport (`txemail.Send`).
+//! [`parse_template`] returns [`TxEmailError::Html2TextNotPorted`] instead of
+//! emitting a divergent body.
 
 mod address;
 mod escape;
+mod mail;
+mod mime;
 mod template;
 
 use std::collections::BTreeMap;
 
+pub use address::mail_address;
+pub use mime::{Email, MimeError, MimeRuntime};
 pub use template::{TemplateError, TemplateMode};
 
 /// `txtypes.Templates`: subject plus HTML and plain-text bodies.
@@ -73,6 +80,24 @@ pub struct RenderedMessage {
     pub subject: String,
     pub text: String,
     pub html: String,
+}
+
+impl RenderedMessage {
+    /// Converts the rendered fields into the `jordan-wright/email` message that
+    /// `txemail.Send` serializes with `Bytes()`.
+    pub fn into_email(self) -> Email {
+        Email {
+            reply_to: self.reply_to.unwrap_or_default(),
+            from: self.from,
+            to: self.to,
+            cc: Vec::new(),
+            bcc: Vec::new(),
+            subject: self.subject,
+            text: self.text.into_bytes(),
+            html: self.html.into_bytes(),
+            headers: self.headers,
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]

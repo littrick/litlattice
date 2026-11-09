@@ -215,6 +215,12 @@ fn b_encode(charset: &str, input: &str) -> String {
     out
 }
 
+/// `mime.QEncoding.Encode(charset, input)`, used when serializing a header
+/// value (Go's `headerToBytes` passes `UTF-8`).
+pub(crate) fn q_encoding_encode(charset: &str, input: &str) -> String {
+    q_encode(charset, input)
+}
+
 fn utf8_len(first_byte: u8) -> usize {
     match first_byte {
         0x00..=0x7f => 1,
