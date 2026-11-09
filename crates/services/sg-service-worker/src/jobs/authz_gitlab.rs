@@ -13,21 +13,30 @@
 //!   user matching the Sourcegraph username (`users?per_page=2&username=…`).
 //! * `SudoProvider.ValidateConnection` — a `projects` request under a 5s
 //!   deadline; only the unwrapped context error counts as a timeout.
+//! * `SudoProvider.FetchUserPerms` / `listProjects` — the private (and,
+//!   depending on `syncInternalRepoPermissions`, internal) projects the
+//!   impersonated user can read, with GitLab's `min_access_level=20` filter or
+//!   the `gitLabProjectVisibilityExperimental` feature flag's
+//!   `ContentsVisible` filter.
 //!
 //! The GitLab REST client and the per-sudo client construction are injected
 //! through [`GitlabClientProvider`] / [`GitlabClient`], mirroring
 //! `ClientProvider.GetPATClient(sudoToken, sudo)`; [`super::authz_gitlab_client`]
-//! is the production implementation. `Provider.FetchUserPerms` (`listProjects`)
-//! and the OAuth identity provider are later slices.
+//! is the production implementation. The OAuth identity provider is a later
+//! slice.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use sg_db::user_external_accounts::ExternalAccountSpec;
+use sg_db::user_external_accounts::{ExternalAccount, ExternalAccountSpec};
 use sg_db::users::UserRecord;
+use sg_encryption::Key;
 
-use super::perms_syncer::{AuthzProvider, FetchError, FetchPermsOptions, FetchRepo};
+use super::perms_syncer::{
+    AuthzProvider, ExternalUserPermissions, FetchError, FetchPermsOptions, FetchRepo,
+    UserPermsError,
+};
 
 /// `extsvc.TypeGitLab`.
 pub const TYPE_GITLAB: &str = "gitlab";
@@ -41,6 +50,7 @@ pub const VALIDATE_CONNECTION_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// `gitlab.Project`, reduced to the fields permissions use.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(default)]
 pub struct Project {
     /// `ProjectCommon.ID` (a Go `int`).
     pub id: i64,
@@ -59,6 +69,7 @@ impl Project {
 
 /// `gitlab.Member`, reduced to the fields permissions use.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(default)]
 pub struct Member {
     /// `Member.ID` (a Go `int32`).
     pub id: i64,
@@ -68,6 +79,7 @@ pub struct Member {
 
 /// `gitlab.AuthUser`, reduced to the fields the provider reads.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(default)]
 pub struct AuthUser {
     /// `AuthUser.ID` (a Go `int32`).
     pub id: i64,
@@ -155,6 +167,39 @@ pub trait GitlabClientProvider: Send + Sync {
     fn pat_client(&self, sudo: &str) -> Arc<dyn GitlabClient>;
 }
 
+/// `gitLabProjectVisibilityExperimental`, read by `listProjects` through
+/// `featureflag.FromContext(ctx).GetBoolOr(…, false)`. The perms syncer
+/// attaches the database-backed global store; callers without one see the
+/// default (`false`).
+pub const GITLAB_PROJECT_VISIBILITY_EXPERIMENTAL: &str = "gitLabProjectVisibilityExperimental";
+
+/// The feature flag lookup `listProjects` needs.
+#[async_trait]
+pub trait GitlabFeatureFlags: Send + Sync {
+    /// `GetBoolOr("gitLabProjectVisibilityExperimental", false)`.
+    async fn project_visibility_experimental(&self) -> bool;
+}
+
+/// A fixed flag set for tests and callers without a database.
+pub struct StaticGitlabFeatureFlags {
+    pub project_visibility_experimental: bool,
+}
+
+impl StaticGitlabFeatureFlags {
+    pub fn new(project_visibility_experimental: bool) -> Self {
+        Self {
+            project_visibility_experimental,
+        }
+    }
+}
+
+#[async_trait]
+impl GitlabFeatureFlags for StaticGitlabFeatureFlags {
+    async fn project_visibility_experimental(&self) -> bool {
+        self.project_visibility_experimental
+    }
+}
+
 /// `listMembers`'s error: the baseline returns the partial account list it
 /// managed to fetch alongside the error.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -202,6 +247,97 @@ pub async fn list_members(
     Ok(user_ids)
 }
 
+/// `listProjects`'s error: like `listMembers`, the baseline returns the partial
+/// project list it managed to fetch alongside the error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListProjectsError {
+    pub message: String,
+    pub partial_repo_ids: Vec<String>,
+}
+
+/// `listProjects`: the private projects (and, when `list_internal_repos`,
+/// internal ones) the authenticated or impersonated user has Reporter access
+/// to. `experimental_visibility` replaces GitLab's `min_access_level=20` filter
+/// with the visibility rules plus the `ContentsVisible` check.
+pub async fn list_projects(
+    client: &dyn GitlabClient,
+    list_internal_repos: bool,
+    experimental_visibility: bool,
+) -> Result<Vec<String>, ListProjectsError> {
+    // `url.Values.Encode` sorts keys; `visibility` is set per iteration.
+    let base_query = if experimental_visibility {
+        "per_page=100&simple=true"
+    } else {
+        "min_access_level=20&per_page=100&simple=true"
+    };
+
+    let mut visibilities = vec!["private"];
+    if list_internal_repos {
+        visibilities.push("internal");
+    }
+
+    // 100 matches the maximum page size, thus a good default (the baseline's
+    // initial slice capacity).
+    let mut project_ids: Vec<String> = Vec::with_capacity(100);
+    for visibility in visibilities {
+        let mut next_url = format!("projects?{base_query}&visibility={visibility}");
+        loop {
+            let (projects, next) = match client.list_projects(&next_url).await {
+                Ok(result) => result,
+                Err(err) => {
+                    return Err(ListProjectsError {
+                        message: err.message,
+                        partial_repo_ids: project_ids,
+                    })
+                }
+            };
+
+            for project in projects {
+                // With the experimental flag, GitLab returns projects the user
+                // can see but whose contents they cannot read; skip those.
+                if experimental_visibility && !project.contents_visible() {
+                    continue;
+                }
+                project_ids.push(project.id.to_string());
+            }
+
+            match next {
+                Some(next) => next_url = next,
+                None => break,
+            }
+        }
+    }
+
+    Ok(project_ids)
+}
+
+/// `GetExternalAccountData`'s `Data != nil` check, including the empty cipher
+/// with an empty key ID (which `extsvc.NewEncryptedData` maps to nil).
+fn encryptable_account_data(account: &ExternalAccount) -> Option<&str> {
+    let data = account.account_data.as_deref()?;
+    if data.is_empty() && account.encryption_key_id.is_empty() {
+        return None;
+    }
+    Some(data)
+}
+
+/// `gitlab.GetExternalAccountData`'s user half. `Ok(None)` means the account
+/// has no `Data`; any decryption or JSON error is returned as the baseline
+/// propagates it.
+async fn get_external_account_user(
+    key: Option<&dyn Key>,
+    account: &ExternalAccount,
+) -> Result<Option<AuthUser>, String> {
+    let Some(data) = encryptable_account_data(account) else {
+        return Ok(None);
+    };
+    let plain = sg_encryption::maybe_decrypt(key, data, &account.encryption_key_id)
+        .await
+        .map_err(|err| err.to_string())?;
+    // `json.Unmarshal` into a struct pointer accepts a JSON `null`.
+    serde_json::from_str::<Option<AuthUser>>(&plain).map_err(|err| err.to_string())
+}
+
 /// `SudoProvider.ValidateConnection`'s generic failure text.
 fn insufficient_privileges_message() -> String {
     "access token did not have sufficient privileges, requires scopes \"sudo\" and \"api\""
@@ -232,9 +368,13 @@ pub struct SudoProvider {
     urn: String,
     service_id: String,
     client_provider: Arc<dyn GitlabClientProvider>,
-    /// `!connection.MarkInternalReposAsPublic`. `listProjects` uses this as
-    /// `listInternalRepos`; the repository-centric half does not read it yet.
+    /// `!connection.MarkInternalReposAsPublic`: `listProjects`'s
+    /// `listInternalRepos`.
     sync_internal_repo_permissions: bool,
+    /// The user-external-account key `FetchUserPerms` decrypts `account_data`
+    /// with (`GetExternalAccountData`).
+    user_external_account_key: Option<Arc<dyn Key>>,
+    feature_flags: Arc<dyn GitlabFeatureFlags>,
 }
 
 impl SudoProvider {
@@ -249,11 +389,25 @@ impl SudoProvider {
             service_id: service_id.into(),
             client_provider,
             sync_internal_repo_permissions,
+            user_external_account_key: None,
+            feature_flags: Arc::new(StaticGitlabFeatureFlags::new(false)),
         }
     }
 
+    /// Wire the user-external-account key used to decrypt `account_data`.
+    pub fn with_user_external_account_key(mut self, key: Option<Arc<dyn Key>>) -> Self {
+        self.user_external_account_key = key;
+        self
+    }
+
+    /// Wire the `gitLabProjectVisibilityExperimental` lookup.
+    pub fn with_feature_flags(mut self, feature_flags: Arc<dyn GitlabFeatureFlags>) -> Self {
+        self.feature_flags = feature_flags;
+        self
+    }
+
     /// `SudoProvider.syncInternalRepoPermissions`, read by `FetchUserPerms`
-    /// (`listProjects`) in a later slice.
+    /// (`listProjects`).
     pub fn sync_internal_repo_permissions(&self) -> bool {
         self.sync_internal_repo_permissions
     }
@@ -330,6 +484,64 @@ impl AuthzProvider for SudoProvider {
             client_id: String::new(),
             account_id: gitlab_user.id.to_string(),
         }))
+    }
+
+    /// `FetchUserPerms`: the projects the account's GitLab user can read,
+    /// fetched with a sudo client impersonating the user ID stored encrypted
+    /// in `account_data`.
+    async fn fetch_user_perms(
+        &self,
+        account: &ExternalAccount,
+        _opts: &FetchPermsOptions,
+    ) -> Result<Option<ExternalUserPermissions>, UserPermsError> {
+        let failed = |message: String| UserPermsError::Failed {
+            message,
+            partial: None,
+        };
+
+        if account.service_id != self.service_id || account.service_type != TYPE_GITLAB {
+            return Err(failed(format!(
+                "not a code host of the account: want {:?} but have {:?}",
+                account.service_id, self.service_id
+            )));
+        }
+
+        let user =
+            match get_external_account_user(self.user_external_account_key.as_deref(), account)
+                .await
+            {
+                Ok(Some(user)) => user,
+                // The baseline dereferences the nil user here; report it instead of
+                // panicking (docs §69.3).
+                Ok(None) => {
+                    return Err(failed(
+                        "get external account data: no account data".to_owned(),
+                    ))
+                }
+                Err(err) => return Err(failed(format!("get external account data: {err}"))),
+            };
+
+        let experimental_visibility = self.feature_flags.project_visibility_experimental().await;
+        let client = self.client_provider.pat_client(&user.id.to_string());
+        match list_projects(
+            client.as_ref(),
+            self.sync_internal_repo_permissions,
+            experimental_visibility,
+        )
+        .await
+        {
+            Ok(exacts) => Ok(Some(ExternalUserPermissions {
+                exacts,
+                ..ExternalUserPermissions::default()
+            })),
+            Err(err) => Err(UserPermsError::Failed {
+                message: err.message,
+                partial: Some(ExternalUserPermissions {
+                    exacts: err.partial_repo_ids,
+                    ..ExternalUserPermissions::default()
+                }),
+            }),
+        }
     }
 
     /// `ValidateConnection`: a `projects` request proves the token has the
