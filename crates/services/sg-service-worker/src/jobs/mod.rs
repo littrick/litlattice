@@ -60,6 +60,7 @@ pub mod code_monitor_email;
 pub mod code_monitor_workers;
 pub mod code_monitors;
 pub mod codehost_version_syncing;
+pub mod codeintel_autoindexing_jobselector;
 pub mod codeintel_autoindexing_scheduler;
 pub mod codeintel_metrics_reporter;
 pub mod codeintel_package_filter_applicator;
