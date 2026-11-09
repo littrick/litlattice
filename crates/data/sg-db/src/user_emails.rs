@@ -1,11 +1,12 @@
-//! `internal/database/user_emails.go` (`GetInitialSiteAdminInfo`) and the
-//! `global_state` pre-check it performs (`SiteInitialized`).
+//! `internal/database/user_emails.go`: `GetInitialSiteAdminInfo` (plus the
+//! `global_state` pre-check it performs, `SiteInitialized`) and
+//! `GetPrimaryEmail`, which the code monitor e-mail action reads.
 //!
-//! Only the path the usage telemetry exporter reads is ported: the email and
-//! terms-of-service flag of the active site admin with the lowest user ID,
-//! which is the baseline's best guess for the initial installer. A site that
-//! has not been initialized yields an empty email; a lookup failure is
-//! replaced with the baseline's fixed message.
+//! `get_initial_site_admin_info` ports the path the usage telemetry exporter
+//! reads: the email and terms-of-service flag of the active site admin with
+//! the lowest user ID, which is the baseline's best guess for the initial
+//! installer. A site that has not been initialized yields an empty email; a
+//! lookup failure is replaced with the baseline's fixed message.
 
 use sqlx::postgres::PgPool;
 use sqlx::Row;
@@ -45,4 +46,31 @@ pub async fn get_initial_site_admin_info(pool: &PgPool) -> Result<(String, bool)
         )),
         None => Err("initial site admin email not found".to_owned()),
     }
+}
+
+/// `userEmailsStore.GetPrimaryEmail`: the user's `is_primary` address and
+/// whether it has been verified (`verified_at IS NOT NULL`).
+///
+/// `None` is the baseline's `userEmailNotFoundError`, which
+/// `errcode.IsNotFound` reports as not-found (the code monitor e-mail action
+/// turns it into `unable to send email to user ID %d with unknown email
+/// address`). Other failures keep the driver error text.
+pub async fn get_primary_email(
+    pool: &PgPool,
+    user_id: i32,
+) -> Result<Option<(String, bool)>, sqlx::Error> {
+    let row = sqlx::query(
+        "SELECT email, verified_at IS NOT NULL AS verified FROM user_emails \
+         WHERE user_id=$1 AND is_primary",
+    )
+    .bind(user_id)
+    .fetch_optional(pool)
+    .await?;
+    row.map(|row| {
+        Ok((
+            row.try_get::<String, _>("email")?,
+            row.try_get::<bool, _>("verified")?,
+        ))
+    })
+    .transpose()
 }
