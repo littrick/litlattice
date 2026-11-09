@@ -1,12 +1,21 @@
 #![forbid(unsafe_code)]
 
-//! Differential harness for the `insights-job` assembly (M9.8cg).
+//! Differential harness for the `insights-job` assembly (M9.8cg, extended in
+//! M9.8ck with the historical monitor).
 //!
 //! Mirror of the Go harness
 //! `cmd/worker/internal/insights/parity_job_harness_test.go`: the same corpus
 //! scripts `DISABLE_CODE_INSIGHTS` and `DISABLE_CODE_INSIGHTS_HISTORICAL`;
 //! both sides print the canonical `ij ` lines (job description, routine
 //! count, and each routine's name/description/interval) from the real job.
+//!
+//! `enabled-historical` runs the job with the scheduler monitor wired in, so
+//! the comparison also covers the four monitor routines. Go's
+//! `dbworker.Resetter` exposes neither `Description()` nor `Interval()`; both
+//! harnesses therefore print `description="" interval=-1` for the
+//! `_resetter` routines (the baseline resetters are the only routines without
+//! metadata), and the Go harness normalises `dbworker.Resetter[<name>]` to
+//! `<name>` (the Rust resetter records the plain options name).
 //!
 //! Gated by `SG_INSIGHTS_JOB_CORPUS`; the codeinsights connection comes from
 //! `SG_QTEST_INSIGHTS_DSN`. The frontend pool is lazy: the harness never runs
@@ -60,9 +69,14 @@ async fn insights_job_differential() {
         match op {
             "disabled" => std::env::set_var("DISABLE_CODE_INSIGHTS", "true"),
             "enabled" => std::env::remove_var("DISABLE_CODE_INSIGHTS"),
+            "enabled-historical" => std::env::remove_var("DISABLE_CODE_INSIGHTS"),
             other => panic!("unknown op {other:?}"),
         }
-        std::env::set_var(HISTORICAL_ENV, "true");
+        if op == "enabled-historical" {
+            std::env::remove_var(HISTORICAL_ENV);
+        } else {
+            std::env::set_var(HISTORICAL_ENV, "true");
+        }
 
         let routines = match job
             .routines(&deps(&insights_dsn), CancellationToken::new())
@@ -76,6 +90,15 @@ async fn insights_job_differential() {
         };
         println!("ij {label} result=ok routines={}", routines.len());
         for routine in &routines {
+            // Go resetters expose no metadata; both harnesses render them the
+            // same way.
+            if routine.name().ends_with("_resetter") {
+                println!(
+                    "ij {label} routine name={:?} description=\"\" interval=-1",
+                    routine.name()
+                );
+                continue;
+            }
             println!(
                 "ij {label} routine name={:?} description={:?} interval={}",
                 routine.name(),

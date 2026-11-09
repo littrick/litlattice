@@ -62,6 +62,9 @@ pub struct InsightSeriesRecord {
     pub generated_from_capture_groups: bool,
     pub repositories: Vec<String>,
     pub repository_criteria: Option<String>,
+    /// `insight_series.generation_method`: the backfill pipeline's handler
+    /// selector (`search`, `search-compute`, `mapping-compute`).
+    pub generation_method: String,
 }
 
 /// `InsightStore.GetDataSeriesByID` (`deleted_at IS NULL AND id = $1`).
@@ -78,7 +81,7 @@ pub async fn get_data_series_by_id(pool: &PgPool, id: i32) -> Result<InsightSeri
 SELECT id, series_id, query, created_at,
        sample_interval_unit::text AS sample_interval_unit,
        sample_interval_value, generated_from_capture_groups, repositories,
-       repository_criteria
+       repository_criteria, generation_method
 FROM insight_series
 WHERE deleted_at IS NULL
 "#,
@@ -92,7 +95,7 @@ WHERE deleted_at IS NULL
 SELECT id, series_id, query, created_at,
        sample_interval_unit::text AS sample_interval_unit,
        sample_interval_value, generated_from_capture_groups, repositories,
-       repository_criteria
+       repository_criteria, generation_method
 FROM insight_series
 WHERE deleted_at IS NULL
   AND id = $1
@@ -140,6 +143,9 @@ fn row_to_series(row: &sqlx::postgres::PgRow) -> Result<InsightSeriesRecord, Str
         repositories: repositories.unwrap_or_default(),
         repository_criteria: row
             .try_get("repository_criteria")
+            .map_err(|err: sqlx::Error| err.to_string())?,
+        generation_method: row
+            .try_get("generation_method")
             .map_err(|err: sqlx::Error| err.to_string())?,
     })
 }

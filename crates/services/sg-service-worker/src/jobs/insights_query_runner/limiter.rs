@@ -18,6 +18,10 @@ use tokio_util::sync::CancellationToken;
 pub const DEFAULT_RATE_LIMIT: f64 = 20.0;
 /// `defaultBurst := 20`.
 pub const DEFAULT_BURST: i64 = 20;
+/// `defaultRateLimit := rate.Limit(20.0)` in `limiter/historical.go`.
+pub const HISTORICAL_DEFAULT_RATE_LIMIT: f64 = 20.0;
+/// `defaultBurst := 20` in `limiter/historical.go`.
+pub const HISTORICAL_DEFAULT_BURST: i64 = 20;
 
 struct Bucket {
     tokens: f64,
@@ -55,6 +59,17 @@ impl SearchQueryLimiter {
             .insights_query_worker_rate_limit()
             .unwrap_or(DEFAULT_RATE_LIMIT);
         Self::new(rate, site.insights_query_worker_rate_limit_burst())
+    }
+
+    /// `limiter.HistoricalWorkRate`'s `getHistoricalWorkerRateLimit`: the
+    /// configured rate or 20 frames/s; a non-positive burst falls back to 20
+    /// (the same default value as the search-query limiter; the baseline
+    /// keeps the two limiters independent but with equal defaults).
+    pub fn historical_from_site(site: &sg_config::SiteConfiguration) -> Self {
+        let rate = site
+            .insights_historical_worker_rate_limit()
+            .unwrap_or(HISTORICAL_DEFAULT_RATE_LIMIT);
+        Self::new(rate, site.insights_historical_worker_rate_limit_burst())
     }
 
     /// `Limiter.Wait`: block until one token is available. Cancellation

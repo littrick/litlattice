@@ -151,6 +151,14 @@ impl TabulationResult {
     }
 }
 
+/// `streaming.RepoResult`: the repository search tabulator behind
+/// `query.StreamingRepoQueryExecutor`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RepoResult {
+    pub events: StreamDecoderEvents,
+    pub repos: Vec<sg_insights::discovery::MinimalRepo>,
+}
+
 /// `streaming.ComputeMatch`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ComputeMatch {
@@ -355,6 +363,50 @@ pub fn decode_search(body: &str) -> Result<TabulationResult, String> {
     Ok(result)
 }
 
+/// `RepoDecoder` over a streamed search response body: collects the
+/// `EventRepoMatch` entries (the repo-scope search returns one match per
+/// repository). Alerts and errors are surfaced through the shared
+/// `StreamDecoderEvents`; `No repositories found` stays silent.
+pub fn decode_repo(body: &str) -> Result<RepoResult, String> {
+    let mut result = RepoResult::default();
+    for (event, data) in parse_events(body)? {
+        match event.as_str() {
+            "progress" => {
+                let progress = decode_progress(&data)?;
+                result.events.on_progress(&progress);
+            }
+            "matches" => {
+                for value in decode_matches(&data)? {
+                    let match_type = value
+                        .get("type")
+                        .and_then(Value::as_str)
+                        .unwrap_or(CONTENT_MATCH_TYPE);
+                    if match_type != REPO_MATCH_TYPE {
+                        continue;
+                    }
+                    result.repos.push(sg_insights::discovery::MinimalRepo {
+                        id: i64::from(json_i32(&value, "repositoryID")),
+                        name: json_str(&value, "repository").to_owned(),
+                    });
+                }
+            }
+            "alert" => {
+                let alert: EventAlert =
+                    serde_json::from_str(&data).map_err(|err| json_err("alert", err))?;
+                result.events.on_alert(&alert.title, &alert.description);
+            }
+            "error" => {
+                let error: EventError =
+                    serde_json::from_str(&data).map_err(|err| json_err("error", err))?;
+                result.events.errors.push(error.message);
+            }
+            "done" => break,
+            _ => {}
+        }
+    }
+    Ok(result)
+}
+
 /// `MatchContextComputeDecoder` over a streamed compute response body.
 pub fn decode_compute_match_context(body: &str) -> Result<ComputeTabulationResult, String> {
     let mut result = ComputeTabulationResult::default();
@@ -485,6 +537,33 @@ mod tests {
         assert_eq!(result.events.errors, vec!["bad thing"]);
         // The event after `done` is not decoded.
         assert!(!result.repo_counts.contains_key("ignored"));
+    }
+
+    #[test]
+    fn repo_decoder_collects_repo_matches() {
+        let result = decode_repo(SEARCH_BODY).expect("decode");
+        assert_eq!(
+            result.repos,
+            vec![sg_insights::discovery::MinimalRepo {
+                id: 2,
+                name: "github.com/c/d".to_owned(),
+            }]
+        );
+        // RepoDecoder's OnAlert uses the same `No repositories found`
+        // suppression as the tabulators.
+        assert_eq!(
+            result.events.alerts,
+            vec![
+                "shard-timeout: 1 timed out",
+                "backend-missing: zoekt-a",
+                "Alert: boom"
+            ]
+        );
+        assert_eq!(result.events.skipped_reasons, vec!["display: limit"]);
+        assert!(result.events.did_timeout);
+        assert_eq!(result.events.errors, vec!["bad thing"]);
+        // The event after `done` is not decoded.
+        assert!(result.repos.iter().all(|repo| repo.id != 9));
     }
 
     #[test]

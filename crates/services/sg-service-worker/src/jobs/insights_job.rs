@@ -15,11 +15,15 @@
 //!   `insights.license_check`.
 //!
 //! `GetBackgroundJobs` then appends the four historical-backfill monitor
-//! routines unless `DISABLE_CODE_INSIGHTS_HISTORICAL` parses true. The
-//! pipeline backfiller behind that monitor is not ported yet, so the job
-//! returns an explicit error instead of silently running without historical
-//! backfill; set `DISABLE_CODE_INSIGHTS_HISTORICAL=true` (as the Kubernetes
-//! deployment does when the feature is off) until the monitor is ported.
+//! routines unless `DISABLE_CODE_INSIGHTS_HISTORICAL` parses true:
+//! `backfill_in_progress_worker`, its resetter, `backfill_new_backfill_worker`
+//! and its resetter (see [`crate::jobs::insights_scheduler`]). The monitor is
+//! assembled exactly like the baseline: an insights gitserver client feeding
+//! both the commit client and the compression filter, the streaming search
+//! provider and its sub-repo checker behind the three search handlers, the
+//! codeinsights results store, the default pipeline backfiller, the
+//! all-repositories iterator over the frontend database and the streaming repo
+//! query executor.
 //!
 //! The license monitor runs the real `licensing.Check(FeatureCodeInsights)`
 //! (`sg_licensing::check_code_insights`) against the configured license key
@@ -37,6 +41,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::framework::periodic::{Handler, HandlerError, PeriodicRoutine};
 use crate::framework::BackgroundRoutine;
+use crate::jobs::insights_backfill_inprogress::{HandlerConfig, SystemClock};
 use crate::jobs::insights_data_prune::{
     DataPruner, DATA_PRUNER_DESCRIPTION, DATA_PRUNER_INTERVAL, DATA_PRUNER_NAME,
 };
@@ -52,22 +57,27 @@ use crate::jobs::insights_license_check::{
 use crate::jobs::insights_pings::{
     InsightsPingEmitter, PINGS_EMITTER_DESCRIPTION, PINGS_EMITTER_INTERVAL, PINGS_EMITTER_NAME,
 };
+use crate::jobs::insights_pipeline::{new_default_backfiller, BackfillerConfig};
+use crate::jobs::insights_query_runner::limiter;
+use crate::jobs::insights_query_runner::search;
+use crate::jobs::insights_scheduler::{
+    new_background_job_monitor, MonitorConfig, PgDiscoveryRepoStore, PgInsightRepoStore,
+    PgResultsStore, PipelineBackfiller,
+};
 use crate::jobs::licensecheck::{is_license_valid, SharedStore};
 use crate::jobs::{Job, JobDeps};
+
+use sg_insights::compression::{DataFrameFilter, GitserverFilter};
+use sg_insights::discovery::{
+    AllReposIterator, Clock, RepoStore as DiscoveryRepoStore, SeriesRepoIterator,
+};
+use sg_insights::gitserver::GitCommitClient;
 
 /// `insightsJob.Description` (empty in the baseline).
 pub const JOB_DESCRIPTION: &str = "";
 
 /// `DISABLE_CODE_INSIGHTS_HISTORICAL`.
 pub const HISTORICAL_ENV: &str = "DISABLE_CODE_INSIGHTS_HISTORICAL";
-
-/// Returned when the historical backfill monitor would be enabled. The
-/// baseline's `pipeline.NewDefaultBackfiller` / `scheduler.NewBackgroundJobMonitor`
-/// pair is not ported yet, so setup fails loudly rather than skipping the
-/// monitor silently (see the module docs).
-pub const HISTORICAL_NOT_PORTED: &str =
-    "historical insight backfill is not implemented by the Rust worker yet; \
-     set DISABLE_CODE_INSIGHTS_HISTORICAL=true to run without it";
 
 /// `strconv.ParseBool(os.Getenv("DISABLE_CODE_INSIGHTS_HISTORICAL"))`: only a
 /// parseable true disables the monitor; an unset or unparseable value keeps
@@ -221,12 +231,72 @@ impl Job for InsightsJob {
             .await
             .map_err(|err| format!("failed to connect to codeinsights database: {err}"))?;
 
+        let mut routines = build_base_routines(deps, insights.clone());
         if !historical_backfill_disabled(std::env::var(HISTORICAL_ENV).ok().as_deref()) {
-            return Err(HISTORICAL_NOT_PORTED.to_owned());
+            routines.extend(build_historical_monitor(deps, insights).routines());
         }
-
-        Ok(build_base_routines(deps, insights))
+        Ok(routines)
     }
+}
+
+/// `GetBackgroundJobs`'s historical branch: `scheduler.NewBackgroundJobMonitor`
+/// with its production dependency graph.
+fn build_historical_monitor(
+    deps: &JobDeps,
+    insights: PgPool,
+) -> crate::jobs::insights_scheduler::BackgroundJobMonitor {
+    let unified = deps.live_config.current();
+
+    // `internalGitserver.NewClient("insights")`: one client behind both the
+    // commit client and the compression filter.
+    let git = Arc::new(sg_git::GitserverClient::new(
+        unified.service_connections.git_servers.clone(),
+    ));
+    let commit_client = Arc::new(GitCommitClient::new(git));
+    let compression_plan: Arc<dyn DataFrameFilter> =
+        Arc::new(GitserverFilter::new(commit_client.clone()));
+
+    let provider = Arc::new(search::HttpStreamingSearch::from_env());
+    let sub_repo = Arc::new(search::PgSubRepoChecker::new(
+        deps.frontend.clone(),
+        Arc::clone(&deps.live_config),
+    ));
+    let search_handlers = search::get_search_handlers(provider.clone(), sub_repo);
+    let results_store = Arc::new(PgResultsStore::new(insights.clone()));
+
+    let site = unified.site.clone();
+    let backfiller = new_default_backfiller(BackfillerConfig {
+        commit_client,
+        compression_plan,
+        search_handlers,
+        insight_store: results_store,
+        search_plan_worker_limit: 1,
+        search_runner_worker_limit: 1,
+        search_rate_limiter: Arc::new(limiter::SearchQueryLimiter::from_site(&site)),
+        historic_rate_limiter: Arc::new(limiter::SearchQueryLimiter::historical_from_site(&site)),
+    });
+
+    let discovery_store: Arc<dyn DiscoveryRepoStore> =
+        Arc::new(PgDiscoveryRepoStore::new(deps.frontend.clone()));
+    let clock: Arc<dyn Clock> = Arc::new(OffsetDateTime::now_utc);
+    let all_repos = Arc::new(AllReposIterator::new(
+        Arc::clone(&discovery_store),
+        clock,
+        crate::jobs::insights_scheduler::ALL_REPOS_CACHE_TIME,
+    ));
+    let repo_query_executor = Arc::new(search::StreamingRepoQueryExecutor::new(provider));
+    let series_repo_iterator: Arc<dyn sg_insights::discovery::SeriesRepoSelector> = Arc::new(
+        SeriesRepoIterator::new(all_repos, discovery_store, repo_query_executor),
+    );
+
+    new_background_job_monitor(MonitorConfig {
+        insights_pool: insights,
+        series_repo_iterator,
+        insight_repo_store: Arc::new(PgInsightRepoStore::new(deps.frontend.clone())),
+        backfiller: Arc::new(PipelineBackfiller::new(backfiller)),
+        clock: Arc::new(SystemClock),
+        handler_config: HandlerConfig::default(),
+    })
 }
 
 /// `GetBackgroundJobs`'s five always-on routines, in baseline order.

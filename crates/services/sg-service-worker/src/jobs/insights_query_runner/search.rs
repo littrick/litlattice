@@ -8,20 +8,24 @@
 //! handler can be exercised without a frontend; [`HttpStreamingSearch`] is the
 //! production implementation against the frontend internal API.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use sqlx::postgres::PgPool;
-use sqlx::types::time::OffsetDateTime;
+use sqlx::types::time::{OffsetDateTime, PrimitiveDateTime};
 use sqlx::Row;
 use tokio_util::sync::CancellationToken;
 
 use sg_config::LiveConfig;
 use sg_db::repos::RepoStore;
+use sg_insights::discovery::{MinimalRepo, RepoQueryExecutor};
 
 use super::insights_store::{self, RecordSeriesPoint, RecordingTime, Series};
 use super::store::SNAPSHOT_MODE;
-use super::streaming::{self, ComputeTabulationResult, StreamDecoderEvents, TabulationResult};
+use super::streaming::{
+    self, ComputeTabulationResult, RepoResult, StreamDecoderEvents, TabulationResult,
+};
 
 /// `types.GenerationMethod`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -114,6 +118,17 @@ pub trait StreamingSearch: Send + Sync + 'static {
         query: &str,
         ctx: &CancellationToken,
     ) -> Result<ComputeTabulationResult, String>;
+
+    /// `streaming.Search` with the `RepoDecoder` tabulator, used by the
+    /// historical backfill's repository-scope query executor.
+    async fn repo_search(
+        &self,
+        query: &str,
+        ctx: &CancellationToken,
+    ) -> Result<RepoResult, String> {
+        let _ = (query, ctx);
+        Err("repo search is not supported by this provider".to_owned())
+    }
 }
 
 async fn search_provider(
@@ -250,6 +265,160 @@ impl StreamingSearch for HttpStreamingSearch {
         let url = self.compute_url(query);
         let body = self.get_body(url, ctx).await?;
         streaming::decode_compute_text(&body)
+    }
+
+    async fn repo_search(
+        &self,
+        query: &str,
+        ctx: &CancellationToken,
+    ) -> Result<RepoResult, String> {
+        let url = self.search_url(query);
+        let body = self.get_body(url, ctx).await?;
+        streaming::decode_repo(&body)
+    }
+}
+
+/// `query.StreamingRepoQueryExecutor`: resolves a `repo:` criteria query to
+/// the repositories it matches by running it through the streaming search API
+/// with the repository tabulator.
+pub struct StreamingRepoQueryExecutor {
+    provider: Arc<dyn StreamingSearch>,
+}
+
+impl StreamingRepoQueryExecutor {
+    pub fn new(provider: Arc<dyn StreamingSearch>) -> Self {
+        Self { provider }
+    }
+}
+
+#[async_trait]
+impl RepoQueryExecutor for StreamingRepoQueryExecutor {
+    /// `StreamingRepoQueryExecutor.ExecuteRepoList`.
+    async fn execute_repo_list(&self, query: &str) -> Result<Vec<MinimalRepo>, String> {
+        let result = self
+            .provider
+            .repo_search(query, &CancellationToken::new())
+            .await
+            .map_err(|err| format!("RepoDecoder: {err}"))?;
+
+        if !result.events.skipped_reasons.is_empty() {
+            tracing::error!(
+                reasons = %go_slice(&result.events.skipped_reasons),
+                query = %query,
+                "repo search encountered skipped events"
+            );
+        }
+        if !result.events.alerts.is_empty() {
+            tracing::error!(
+                alerts = %go_slice(&result.events.alerts),
+                query = %query,
+                "repo search encountered alert events"
+            );
+        }
+        if !result.events.errors.is_empty() {
+            return Err(format!(
+                "streaming repo search: errors: {}",
+                go_slice(&result.events.errors)
+            ));
+        }
+        Ok(result.repos)
+    }
+}
+
+/// `queryrunner.GetSearchHandlers`: the pipeline handler map keyed by
+/// generation method, backed by the streaming providers.
+pub fn get_search_handlers(
+    provider: Arc<dyn StreamingSearch>,
+    sub_repo: Arc<dyn SubRepoChecker>,
+) -> HashMap<String, Arc<dyn crate::jobs::insights_pipeline::InsightsHandler>> {
+    let mut handlers: HashMap<String, Arc<dyn crate::jobs::insights_pipeline::InsightsHandler>> =
+        HashMap::new();
+    for (raw, method) in [
+        ("search", GenerationMethod::Search),
+        ("search-compute", GenerationMethod::SearchCompute),
+        ("mapping-compute", GenerationMethod::MappingCompute),
+    ] {
+        handlers.insert(
+            raw.to_owned(),
+            Arc::new(StreamingHandler {
+                provider: Arc::clone(&provider),
+                sub_repo: Arc::clone(&sub_repo),
+                method,
+            }),
+        );
+    }
+    handlers
+}
+
+/// One `GetSearchHandlers` closure: builds the query-runner job view of a
+/// pipeline search job and runs the matching recordings generator.
+struct StreamingHandler {
+    provider: Arc<dyn StreamingSearch>,
+    sub_repo: Arc<dyn SubRepoChecker>,
+    method: GenerationMethod,
+}
+
+#[async_trait]
+impl crate::jobs::insights_pipeline::InsightsHandler for StreamingHandler {
+    async fn handle(
+        &self,
+        job: &crate::jobs::insights_pipeline::SearchJob,
+        _series: &Series,
+        record_time: OffsetDateTime,
+    ) -> Result<Vec<RecordSeriesPoint>, String> {
+        let store_job = super::store::Job {
+            series_id: job.series_id.clone(),
+            search_query: job.search_query.clone(),
+            record_time: job.record_time,
+            persist_mode: job.persist_mode.clone(),
+            dependent_frames: job
+                .dependent_frames
+                .iter()
+                .map(|frame| PrimitiveDateTime::new(frame.date(), frame.time()))
+                .collect(),
+            cost: 0,
+            priority: 0,
+            id: 0,
+            state: String::new(),
+            failure_message: None,
+            started_at: None,
+            finished_at: None,
+            process_after: None,
+            num_resets: 0,
+            num_failures: 0,
+        };
+        let ctx = CancellationToken::new();
+        match self.method {
+            GenerationMethod::Search => generate_search_recordings(
+                &store_job,
+                record_time,
+                self.provider.as_ref(),
+                self.sub_repo.as_ref(),
+                &ctx,
+            )
+            .await
+            .map_err(|err| format!("searchHandler: {err}")),
+            GenerationMethod::SearchCompute => generate_compute_recordings(
+                &store_job,
+                record_time,
+                self.provider.as_ref(),
+                self.sub_repo.as_ref(),
+                &ctx,
+                false,
+            )
+            .await
+            .map_err(|err| format!("computeHandler: {err}")),
+            GenerationMethod::MappingCompute => generate_compute_recordings(
+                &store_job,
+                record_time,
+                self.provider.as_ref(),
+                self.sub_repo.as_ref(),
+                &ctx,
+                true,
+            )
+            .await
+            .map_err(|err| format!("mappingComputeHandler: {err}")),
+        }
     }
 }
 

@@ -83,6 +83,7 @@ pub mod insights_license_check;
 pub mod insights_pings;
 pub mod insights_pipeline;
 pub mod insights_query_runner;
+pub mod insights_scheduler;
 pub mod licensecheck;
 pub mod out_of_band_migrations;
 pub mod outbound_webhooks;

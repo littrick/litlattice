@@ -402,6 +402,26 @@ impl SiteConfiguration {
             .unwrap_or(0)
     }
 
+    /// `conf.Get().InsightsHistoricalWorkerRateLimit`: the top-level
+    /// `insights.historical.worker.rateLimit` site configuration field.
+    /// `None` (unset/null) means the historical limiter's default of 20
+    /// frames/s.
+    pub fn insights_historical_worker_rate_limit(&self) -> Option<f64> {
+        self.raw
+            .get("insights.historical.worker.rateLimit")
+            .and_then(serde_json::Value::as_f64)
+    }
+
+    /// `conf.Get().InsightsHistoricalWorkerRateLimitBurst`: the top-level
+    /// `insights.historical.worker.rateLimitBurst` site configuration field.
+    /// `<= 0` means the historical limiter's default burst of 20.
+    pub fn insights_historical_worker_rate_limit_burst(&self) -> i64 {
+        self.raw
+            .get("insights.historical.worker.rateLimitBurst")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(0)
+    }
+
     /// `conf.Get().PermissionsSyncUsersMaxConcurrency`:
     /// `permissions.syncUsersMaxConcurrency` (dotted site setting). `<= 0`
     /// means the worker default of one handler.
