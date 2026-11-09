@@ -30,7 +30,7 @@
 //! serious problem at construction, see `authz_providers`), and the
 //! `WithEncryptionKey` cache wrapper (it only affects latency).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -197,6 +197,12 @@ pub struct OAuthContext {
     pub client_id: String,
     pub client_secret: String,
     pub token_url: String,
+    /// `CustomQueryParams`: provider-specific values `newTokenRequest` adds to
+    /// the refresh POST body after the standard parameters. Values are inserted
+    /// verbatim (Azure DevOps passes pre-escaped values, exactly like the
+    /// baseline), and the body is encoded with sorted keys like
+    /// `url.Values.Encode`.
+    pub custom_query_params: BTreeMap<String, String>,
 }
 
 /// One `auth.providers` entry of type `github`. `url` is the raw configured
@@ -252,6 +258,7 @@ pub fn get_oauth_context(
             client_id: provider.client_id.clone(),
             client_secret: provider.client_secret.clone(),
             token_url: format!("{gh_url}/login/oauth/access_token"),
+            custom_query_params: BTreeMap::new(),
         });
     }
     None
@@ -411,12 +418,16 @@ impl TokenRefresher for AccountTokenRefresher {
 impl AccountTokenRefresher {
     /// `oauthutil.RetrieveToken(doer, oauthCtx, refreshToken, AuthStyleInParams)`.
     async fn retrieve_token(&self, refresh_token: &str) -> Result<OAuthToken, String> {
-        let form = [
-            ("client_id", self.oauth.client_id.as_str()),
-            ("client_secret", self.oauth.client_secret.as_str()),
-            ("grant_type", "refresh_token"),
-            ("refresh_token", refresh_token),
-        ];
+        // `url.Values.Encode` sorts keys; `CustomQueryParams` are `Set` after
+        // the standard parameters, so they may override them.
+        let mut form: BTreeMap<&str, &str> = BTreeMap::new();
+        form.insert("client_id", self.oauth.client_id.as_str());
+        form.insert("client_secret", self.oauth.client_secret.as_str());
+        form.insert("grant_type", "refresh_token");
+        form.insert("refresh_token", refresh_token);
+        for (key, value) in &self.oauth.custom_query_params {
+            form.insert(key.as_str(), value.as_str());
+        }
         // Build the body before awaiting: the encoder types are not `Send`.
         let body = url::form_urlencoded::Serializer::new(String::new())
             .extend_pairs(form)

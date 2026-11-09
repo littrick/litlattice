@@ -388,6 +388,7 @@ async fn authz_github_user_refresh_matches_go_harness() {
                 client_id: "client".to_owned(),
                 client_secret: "secret".to_owned(),
                 token_url: format!("{base_url}/login/oauth/access_token"),
+                custom_query_params: std::collections::BTreeMap::new(),
             },
             reqwest::Client::new(),
         );

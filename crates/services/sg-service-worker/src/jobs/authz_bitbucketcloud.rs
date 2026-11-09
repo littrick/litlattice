@@ -94,6 +94,7 @@ pub fn get_oauth_context(
             client_id: provider.client_key.clone(),
             client_secret: provider.client_secret.clone(),
             token_url: format!("{raw_url}/site/oauth2/access_token"),
+            custom_query_params: std::collections::BTreeMap::new(),
         });
     }
     None

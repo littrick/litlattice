@@ -34,6 +34,14 @@
 //! Postgres token store, the keyring and the site's GitLab auth providers for
 //! the runtime `GetOAuthContext` lookup (docs §70).
 //!
+//! Ported kind: Azure DevOps (`internal/authz/providers/azuredevops`). Every
+//! connection with `enforcePermissions` is merged into one provider (the
+//! baseline's `urns` is the fixed `azuredevops:authzprovider`), carrying the
+//! union of the configured `orgs` and `projects`. The provider snapshots the
+//! site's `auth.providers` and `externalURL` for the runtime
+//! `GetOAuthContext(refreshToken)` lookup; `ProvidersFromConfig` rebuilds the
+//! providers on every sync, so a site-config change is picked up then.
+//!
 //! Not ported yet: GitHub App authentication (`gitHubAppDetails` /
 //! `githubAppInstallationID`) is reported as a serious problem because the
 //! installation-token auther is not available; connections of the other kinds
@@ -50,6 +58,11 @@ use sg_keyring::Keyring;
 use sqlx::postgres::PgPool;
 use url::Url;
 
+use super::authz_azuredevops::{
+    AzureDevOpsConnection as AzureDevOpsProviderConnection, AzureDevOpsProvider,
+    AzureDevOpsProviderOptions, TYPE_AZUREDEVOPS,
+};
+use super::authz_azuredevops_client::{azuredevops_oauth_providers, AZURE_DEVOPS_API_URL};
 use super::authz_bitbucketcloud::{
     bitbucketcloud_oauth_providers, BitbucketCloudOAuthProvider, BitbucketCloudProvider,
     TYPE_BITBUCKETCLOUD,
@@ -144,6 +157,12 @@ struct GerritConnection {
     config: Value,
 }
 
+/// One parsed Azure DevOps external service.
+struct AzureDevOpsConnection {
+    service: ExternalService,
+    config: Value,
+}
+
 /// `featureflag.FromContext(ctx)` as attached by the perms syncer's
 /// `WithFlags(ctx, db.FeatureFlags())`: the global (non-rollout) value of
 /// `gitLabProjectVisibilityExperimental`. Any storage error or a rollout flag
@@ -190,6 +209,7 @@ pub async fn providers_from_config(
     let mut gitlab_conns = Vec::new();
     let mut bitbucketcloud_conns = Vec::new();
     let mut gerrit_conns = Vec::new();
+    let mut azuredevops_conns = Vec::new();
     let mut serious_problems = Vec::new();
     let mut after_id = 0_i64;
 
@@ -233,6 +253,8 @@ pub async fn providers_from_config(
                 bitbucketcloud_conns.push(BitbucketCloudConnection { service, config });
             } else if service.kind == "GERRIT" {
                 gerrit_conns.push(GerritConnection { service, config });
+            } else if service.kind == "AZUREDEVOPS" {
+                azuredevops_conns.push(AzureDevOpsConnection { service, config });
             }
             // Other kinds are not ported yet; see the module docs.
         }
@@ -256,19 +278,24 @@ pub async fn providers_from_config(
         opts,
     );
     let gerrit = gerrit_new_authz_providers(&gerrit_conns, keyring, opts);
+    let azuredevops =
+        azuredevops_new_authz_providers(&azuredevops_conns, site, keyring, pool, opts);
 
     let mut providers = github.providers;
     providers.extend(gitlab.providers);
     providers.extend(bitbucketcloud.providers);
     providers.extend(gerrit.providers);
+    providers.extend(azuredevops.providers);
     let mut warnings = github.warnings;
     warnings.extend(gitlab.warnings);
     warnings.extend(bitbucketcloud.warnings);
     warnings.extend(gerrit.warnings);
+    warnings.extend(azuredevops.warnings);
     let mut invalid_connections = github.invalid_connections;
     invalid_connections.extend(gitlab.invalid_connections);
     invalid_connections.extend(bitbucketcloud.invalid_connections);
     invalid_connections.extend(gerrit.invalid_connections);
+    invalid_connections.extend(azuredevops.invalid_connections);
 
     ProviderInitResult {
         providers,
@@ -277,6 +304,7 @@ pub async fn providers_from_config(
             serious_problems.extend(gitlab.serious_problems);
             serious_problems.extend(bitbucketcloud.serious_problems);
             serious_problems.extend(gerrit.serious_problems);
+            serious_problems.extend(azuredevops.serious_problems);
             serious_problems
         },
         warnings,
@@ -678,6 +706,107 @@ fn new_gerrit_authz_provider(
     let provider = GerritProvider::new(urn, service_id, Arc::new(client))
         .with_user_external_account_key(keyring.user_external_account_key());
     Ok(Some(Arc::new(provider)))
+}
+
+/// `azuredevops.NewAuthzProviders`: every `enforcePermissions` connection is
+/// merged into one provider (the configured `orgs`/`projects` are unioned).
+fn azuredevops_new_authz_providers(
+    conns: &[AzureDevOpsConnection],
+    site: &SiteConfiguration,
+    keyring: &Keyring,
+    pool: &PgPool,
+    opts: &ProvidersOptions,
+) -> ProviderInitResult {
+    let mut result = ProviderInitResult::default();
+
+    let mut provider_conns = Vec::new();
+    for conn in conns {
+        if !conn
+            .config
+            .get("enforcePermissions")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            continue;
+        }
+
+        provider_conns.push(AzureDevOpsProviderConnection {
+            urn: sg_extsvc::urn(&conn.service.kind, conn.service.id),
+            username: config_string(&conn.config, "username"),
+            token: config_string(&conn.config, "token"),
+            orgs: config_string_array(&conn.config, "orgs"),
+            projects: config_string_array(&conn.config, "projects"),
+        });
+    }
+
+    if provider_conns.is_empty() {
+        return result;
+    }
+
+    // `licensing.Check(licensing.FeatureACLs)`.
+    if let Some(message) = &opts.acls_license_error {
+        result.invalid_connections.push(TYPE_AZUREDEVOPS.to_owned());
+        result.serious_problems.push(message.clone());
+        return result;
+    }
+
+    let options = AzureDevOpsProviderOptions {
+        api_url: AZURE_DEVOPS_API_URL.to_owned(),
+        // `azuredevops.MockVisualStudioAppURL` is a test-only seam.
+        visual_studio_app_url: None,
+        oauth_providers: azuredevops_oauth_providers(site),
+        external_url: site
+            .raw()
+            .get("externalURL")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+    };
+
+    let http = reqwest::Client::new();
+    let token_store = Arc::new(PgOAuthTokenStore::new(
+        pool.clone(),
+        keyring.user_external_account_key(),
+    ));
+    match AzureDevOpsProvider::new(
+        provider_conns,
+        options,
+        token_store,
+        keyring.user_external_account_key(),
+        http,
+    ) {
+        Ok(provider) => result.providers.push(Arc::new(provider)),
+        Err(err) => {
+            result.invalid_connections.push(TYPE_AZUREDEVOPS.to_owned());
+            result.serious_problems.push(err);
+        }
+    }
+
+    result
+}
+
+/// `config["<key>"]` as a string, defaulting to the Go zero value.
+fn config_string(config: &Value, key: &str) -> String {
+    config
+        .get(key)
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned()
+}
+
+/// `config["<key>"]` as a `[]string` (JSON `null` / missing → nil).
+fn config_string_array(config: &Value, key: &str) -> Vec<String> {
+    config
+        .get(key)
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// One `schema.GitHubAuthProvider` entry the warning path reads.
@@ -1289,5 +1418,98 @@ mod tests {
         assert!(
             err.starts_with("Could not parse URL for GitLab instance \"https://exa mple.com\": ")
         );
+    }
+
+    fn azuredevops_conn(config: Value) -> AzureDevOpsConnection {
+        AzureDevOpsConnection {
+            service: ExternalService {
+                id: 1,
+                kind: "AZUREDEVOPS".to_owned(),
+                display_name: String::new(),
+                config: String::new(),
+                encryption_key_id: String::new(),
+                last_sync_at: None,
+                next_sync_at: None,
+                unrestricted: false,
+                has_webhooks: None,
+                code_host_id: None,
+            },
+            config,
+        }
+    }
+
+    fn build_azuredevops_providers(
+        conns: &[AzureDevOpsConnection],
+        opts: &ProvidersOptions,
+    ) -> ProviderInitResult {
+        let keyring = Keyring::default();
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://unused@localhost/unused")
+            .expect("lazy pool");
+        azuredevops_new_authz_providers(conns, &SiteConfiguration::default(), &keyring, &pool, opts)
+    }
+
+    #[tokio::test]
+    async fn azuredevops_without_enforce_permissions_builds_no_provider() {
+        // The connection is enabled, so the license check would run if it
+        // were not filtered out first.
+        let conn = azuredevops_conn(json!({
+            "url": "https://dev.azure.com",
+            "token": "t",
+            "orgs": ["o"]
+        }));
+        let opts = ProvidersOptions {
+            acls_license_error: Some("acls unavailable".to_owned()),
+            ..ProvidersOptions::default()
+        };
+        let result = build_azuredevops_providers(&[conn], &opts);
+        assert!(result.providers.is_empty());
+        assert!(result.invalid_connections.is_empty());
+        assert!(result.serious_problems.is_empty());
+    }
+
+    #[tokio::test]
+    async fn azuredevops_acls_license_error_is_a_serious_problem() {
+        let conn = azuredevops_conn(json!({
+            "url": "https://dev.azure.com",
+            "token": "t",
+            "orgs": ["o"],
+            "enforcePermissions": true
+        }));
+        let opts = ProvidersOptions {
+            acls_license_error: Some("acls unavailable".to_owned()),
+            ..ProvidersOptions::default()
+        };
+        let result = build_azuredevops_providers(&[conn], &opts);
+        assert!(result.providers.is_empty());
+        assert_eq!(
+            result.invalid_connections,
+            vec![TYPE_AZUREDEVOPS.to_owned()]
+        );
+        assert_eq!(result.serious_problems, vec!["acls unavailable"]);
+    }
+
+    #[tokio::test]
+    async fn azuredevops_enforced_connections_merge_into_one_provider() {
+        let conns = [
+            azuredevops_conn(json!({
+                "url": "https://dev.azure.com",
+                "token": "t",
+                "orgs": ["a"],
+                "projects": ["p/x"],
+                "enforcePermissions": true
+            })),
+            azuredevops_conn(json!({
+                "url": "https://dev.azure.com",
+                "token": "t",
+                "orgs": ["b"],
+                "enforcePermissions": true
+            })),
+        ];
+        let result = build_azuredevops_providers(&conns, &options());
+        assert_eq!(result.providers.len(), 1);
+        assert_eq!(result.providers[0].urn(), "azuredevops:authzprovider");
+        assert_eq!(result.providers[0].service_type(), TYPE_AZUREDEVOPS);
+        assert_eq!(result.providers[0].service_id(), "https://dev.azure.com/");
     }
 }

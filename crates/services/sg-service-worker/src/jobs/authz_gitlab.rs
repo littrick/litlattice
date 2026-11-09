@@ -243,6 +243,7 @@ pub fn get_oauth_context(
             client_id: provider.client_id.clone(),
             client_secret: provider.client_secret.clone(),
             token_url: format!("{gl_url}/oauth/token"),
+            custom_query_params: std::collections::BTreeMap::new(),
         });
     }
     None
