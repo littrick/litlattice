@@ -51,6 +51,8 @@ pub mod authz_gitlab_client;
 pub mod authz_providers;
 pub mod batches;
 pub mod batches_scheduler;
+pub mod bitbucket_project_permissions;
+pub mod bitbucket_server_client;
 pub mod codehost_version_syncing;
 pub mod codeintel_metrics_reporter;
 pub mod codeintel_package_filter_applicator;
@@ -189,6 +191,9 @@ pub fn all_jobs() -> Vec<(&'static str, Arc<dyn Job>)> {
                 }
                 "batches-janitor" => Arc::new(batches::BatchesJanitor::new()),
                 "batches-scheduler" => Arc::new(batches_scheduler::BatchesScheduler::new()),
+                "bitbucket-project-permissions" => {
+                    Arc::new(bitbucket_project_permissions::BitbucketProjectPermissionsJob::new())
+                }
                 "cody-gateway-usage-check" => Arc::new(codygateway::CodyGatewayUsageCheck),
                 "cody-llm-token-counter" => Arc::new(completions::CodyLlmTokenCounter),
                 "event-logs-janitor" => Arc::new(eventlogs::EventLogsJanitor),

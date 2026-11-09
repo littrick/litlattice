@@ -348,13 +348,31 @@ pub async fn set_repo_permissions_unrestricted(
     }
 
     let mut tx = pool.begin().await?;
-    legacy_set_repo_permissions_unrestricted(&mut tx, ids, unrestricted).await?;
-    if unrestricted {
-        set_unrestricted_markers(&mut tx, ids, now).await?;
-    } else {
-        unset_unrestricted_markers(&mut tx, ids).await?;
-    }
+    set_repo_permissions_unrestricted_tx(&mut tx, ids, unrestricted, now).await?;
     tx.commit().await?;
+    Ok(())
+}
+
+/// `SetRepoPermissionsUnrestricted` inside the caller's transaction (the
+/// Bitbucket-project handler calls it on a `Perms().Transact` store alongside
+/// `SetRepoPerms` and `SetRepoPendingPermissions`, so all three commit or roll
+/// back together).
+pub async fn set_repo_permissions_unrestricted_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    ids: &[i32],
+    unrestricted: bool,
+    now: OffsetDateTime,
+) -> Result<(), sqlx::Error> {
+    if ids.is_empty() {
+        return Ok(());
+    }
+
+    legacy_set_repo_permissions_unrestricted(tx, ids, unrestricted).await?;
+    if unrestricted {
+        set_unrestricted_markers(tx, ids, now).await?;
+    } else {
+        unset_unrestricted_markers(tx, ids).await?;
+    }
     Ok(())
 }
 
