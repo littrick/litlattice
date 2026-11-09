@@ -9,7 +9,7 @@
 //! - `path.Clean` canonicalization with a 301, keeping the trailing slash;
 //! - routes matched in registration order on the decoded `URL.Path`
 //!   (`/git/{RepoName:.*}/info/refs`, `/git/{RepoName:.*}/git-upload-pack`,
-//!   `/ping`);
+//!   `/lsif/upload`, `/scip/upload`, `/compute/stream`, `/ping`);
 //! - a path match with the wrong method answers 405 with no body;
 //! - everything else falls through to the custom `no route` 404.
 //!
@@ -17,6 +17,12 @@
 //! (`gitServiceHandler.redirectToGitServer`); the `JsonMiddleware` wrapper
 //! already set `Content-Type: application/json`, so the redirect carries that
 //! header and Go's `http.Redirect` skips its HTML body.
+//!
+//! `/lsif/upload` and `/scip/upload` (POST) and `/compute/stream` (GET/POST)
+//! resolve to `enterprise.DefaultServices`' handlers in this build:
+//! `makeNotFoundHandler` answers 404 with the
+//! `<name> is only available in enterprise` body (sniffed as `text/plain`),
+//! and `/scip/upload` (HEAD) is the 200 `noopHandler`.
 
 use bytes::Bytes;
 use http::header::{self, HeaderValue};
@@ -34,6 +40,9 @@ const PING_PATH: &str = "/ping";
 const GIT_PREFIX: &str = "/git/";
 const INFO_REFS: &str = "/info/refs";
 const UPLOAD_PACK: &str = "/git-upload-pack";
+const LSIF_UPLOAD_PATH: &str = "/lsif/upload";
+const SCIP_UPLOAD_PATH: &str = "/scip/upload";
+const COMPUTE_STREAM_PATH: &str = "/compute/stream";
 
 /// The route a request resolved to, before the method is checked.
 #[derive(Debug, PartialEq, Eq)]
@@ -41,13 +50,20 @@ enum Route {
     Ping,
     InfoRefs { repo: String },
     UploadPack { repo: String },
+    LsifUpload,
+    ScipUpload,
+    ComputeStream,
 }
 
 impl Route {
     fn allows(&self, method: &Method) -> bool {
         match self {
             Route::Ping | Route::InfoRefs { .. } => method == Method::GET,
-            Route::UploadPack { .. } => method == Method::GET || method == Method::POST,
+            Route::UploadPack { .. } | Route::ComputeStream => {
+                method == Method::GET || method == Method::POST
+            }
+            Route::LsifUpload => method == Method::POST,
+            Route::ScipUpload => method == Method::POST || method == Method::HEAD,
         }
     }
 }
@@ -79,39 +95,64 @@ pub fn internal_response<B>(req: &Request<B>, live: &LiveConfig) -> Response<Box
     };
     if !route.allows(req.method()) {
         // gorilla `methodNotAllowed`: status only, no body.
-        let mut response = Response::new(tonic::body::boxed(Full::new(Bytes::new())));
-        *response.status_mut() = StatusCode::METHOD_NOT_ALLOWED;
-        return response;
+        return empty_response(StatusCode::METHOD_NOT_ALLOWED);
     }
     if matched_path.len() != decoded.len() {
-        return strict_slash_redirect(matched_path, req.uri().query());
+        return strict_slash_redirect(req.method(), matched_path, req.uri().query());
     }
 
     match route {
         Route::Ping => text_response(StatusCode::OK, "text/plain; charset=utf-8", "pong", false),
         Route::InfoRefs { repo } => redirect_to_git_server(req, &repo, INFO_REFS, live),
         Route::UploadPack { repo } => redirect_to_git_server(req, &repo, UPLOAD_PACK, live),
+        Route::LsifUpload => enterprise_not_found("code intel upload"),
+        Route::ScipUpload if req.method() == Method::HEAD => empty_response(StatusCode::OK),
+        Route::ScipUpload => enterprise_not_found("code intel upload"),
+        Route::ComputeStream => enterprise_not_found("compute streaming endpoint"),
     }
 }
 
 /// `routeRegexpGroup.setMatch`'s strict-slash branch: `http.Redirect` to the
 /// path without its trailing slash. The route handler is replaced, so the
-/// `JsonMiddleware` content type is absent and Go's HTML body is written.
-fn strict_slash_redirect(path: &str, query: Option<&str>) -> Response<BoxBody> {
+/// `JsonMiddleware` content type is absent. Go's `http.Redirect` sets the
+/// `text/html` type for GET and HEAD but only writes the HTML body for GET.
+fn strict_slash_redirect(method: &Method, path: &str, query: Option<&str>) -> Response<BoxBody> {
     let mut location = escape_path(path);
     if let Some(query) = query {
         location.push('?');
         location.push_str(query);
     }
-    let body = format!(
-        "<a href=\"{}\">Moved Permanently</a>.\n\n",
-        html_escape(&location)
-    );
-    located_with_body(
-        StatusCode::MOVED_PERMANENTLY,
-        hex_escape_non_ascii(&location),
-        Some("text/html; charset=utf-8"),
-        body,
+    let location = hex_escape_non_ascii(&location);
+    match *method {
+        Method::GET => {
+            let body = format!(
+                "<a href=\"{}\">Moved Permanently</a>.\n\n",
+                html_escape(&location)
+            );
+            located_with_body(
+                StatusCode::MOVED_PERMANENTLY,
+                location,
+                Some("text/html; charset=utf-8"),
+                body,
+            )
+        }
+        Method::HEAD => located_with_body(
+            StatusCode::MOVED_PERMANENTLY,
+            location,
+            Some("text/html; charset=utf-8"),
+            Bytes::new(),
+        ),
+        _ => located(StatusCode::MOVED_PERMANENTLY, location, None),
+    }
+}
+
+/// `enterprise.makeNotFoundHandler`: raw 404 write, sniffed as `text/plain`.
+fn enterprise_not_found(name: &str) -> Response<BoxBody> {
+    text_response(
+        StatusCode::NOT_FOUND,
+        "text/plain; charset=utf-8",
+        &format!("{name} is only available in enterprise"),
+        false,
     )
 }
 
@@ -136,6 +177,15 @@ fn html_escape(input: &str) -> String {
 fn match_route(path: &str) -> Option<Route> {
     if path == PING_PATH {
         return Some(Route::Ping);
+    }
+    if path == LSIF_UPLOAD_PATH {
+        return Some(Route::LsifUpload);
+    }
+    if path == SCIP_UPLOAD_PATH {
+        return Some(Route::ScipUpload);
+    }
+    if path == COMPUTE_STREAM_PATH {
+        return Some(Route::ComputeStream);
     }
     let rest = path.strip_prefix(GIT_PREFIX)?;
     if let Some(repo) = rest.strip_suffix(INFO_REFS) {
@@ -224,6 +274,13 @@ fn located_with_body(
             .headers_mut()
             .insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
     }
+    response
+}
+
+/// A status-only response (no body, no `Content-Type`).
+fn empty_response(status: StatusCode) -> Response<BoxBody> {
+    let mut response = Response::new(tonic::body::boxed(Full::new(Bytes::new())));
+    *response.status_mut() = status;
     response
 }
 
@@ -453,6 +510,52 @@ mod tests {
         assert_eq!(
             internal_response(&request(Method::POST, "/git/x/info/refs/"), &live()).status(),
             StatusCode::METHOD_NOT_ALLOWED
+        );
+    }
+
+    #[tokio::test]
+    async fn enterprise_routes_answer_like_the_default_services() {
+        let lsif = internal_response(&request(Method::POST, "/lsif/upload"), &live());
+        assert_eq!(lsif.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            lsif.headers().get(header::CONTENT_TYPE).unwrap(),
+            "text/plain; charset=utf-8"
+        );
+        let body = lsif.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(
+            &body[..],
+            b"code intel upload is only available in enterprise"
+        );
+
+        let head = internal_response(&request(Method::HEAD, "/scip/upload"), &live());
+        assert_eq!(head.status(), StatusCode::OK);
+        assert!(head.headers().get(header::CONTENT_TYPE).is_none());
+
+        let compute = internal_response(&request(Method::GET, "/compute/stream"), &live());
+        assert_eq!(compute.status(), StatusCode::NOT_FOUND);
+        let body = compute.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(
+            &body[..],
+            b"compute streaming endpoint is only available in enterprise"
+        );
+
+        assert_eq!(
+            internal_response(&request(Method::GET, "/lsif/upload"), &live()).status(),
+            StatusCode::METHOD_NOT_ALLOWED
+        );
+        assert_eq!(
+            internal_response(&request(Method::HEAD, "/compute/stream"), &live()).status(),
+            StatusCode::METHOD_NOT_ALLOWED
+        );
+
+        // StrictSlash: `http.Redirect` only writes the HTML body for GET.
+        let post = internal_response(&request(Method::POST, "/lsif/upload/"), &live());
+        assert_eq!(post.status(), StatusCode::MOVED_PERMANENTLY);
+        assert!(post.headers().get(header::CONTENT_TYPE).is_none());
+        let get = internal_response(&request(Method::GET, "/compute/stream/"), &live());
+        assert_eq!(
+            get.headers().get(header::CONTENT_TYPE).unwrap(),
+            "text/html; charset=utf-8"
         );
     }
 
