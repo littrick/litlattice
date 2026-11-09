@@ -10,6 +10,9 @@ publish.workspace = true
 base64 = { workspace = true }
 # HMAC-MD5 for the CRAM-MD5 SMTP authentication mechanism.
 md5 = { workspace = true }
+# The html2text port reuses the library's exact regexes for tag/link/entity
+# classification, so it keeps `regex` rather than hand-rolling them.
+regex = { workspace = true }
 # STARTTLS. See the workspace comment on the provider choice.
 rustls = { workspace = true }
 rustls-native-certs = { workspace = true }

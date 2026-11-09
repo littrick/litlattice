@@ -28,12 +28,17 @@
 //! Mandrill/additional headers, `Email.Bytes()`, and delivery through the
 //! [`smtp`] client (EHLO/HELO, STARTTLS, AUTH PLAIN/CRAM-MD5, MAIL/RCPT/DATA).
 //!
-//! Not ported: the `html2text` fallback for templates without a `Text` body and
-//! MIME attachments. [`parse_template`] returns
-//! [`TxEmailError::Html2TextNotPorted`] instead of emitting a divergent body.
+//! [`parse_template`] derives the plain-text body from the HTML template with
+//! [`html2text`] when `Templates::text` is empty, exactly like the baseline's
+//! `html2text.HTML2Text`.
+//!
+//! Not ported: MIME attachments (the baseline's `txemail` never attaches
+//! files).
 
 mod address;
 mod escape;
+pub mod html2text;
+mod html2text_entities;
 mod mail;
 mod mime;
 pub mod send;
@@ -110,12 +115,6 @@ impl RenderedMessage {
 pub enum TxEmailError {
     #[error("template: {0}")]
     Template(#[from] TemplateError),
-    // Go's ParseTemplate derives the text body with html2text.HTML2Text when
-    // `Text` is empty. Porting that converter is a separate slice; returning an
-    // explicit error keeps the gap visible instead of rendering a different
-    // plain-text body.
-    #[error("text body is empty and the html2text fallback is not ported")]
-    Html2TextNotPorted,
 }
 
 /// Parsed form of [`Templates`].
@@ -142,11 +141,15 @@ impl ParsedTemplates {
 
 /// Port of `txemail.ParseTemplate`.
 pub fn parse_template(input: &Templates) -> Result<ParsedTemplates, TxEmailError> {
-    if input.text.is_empty() {
-        return Err(TxEmailError::Html2TextNotPorted);
-    }
+    // `ParseTemplate`: when no plain-text body is provided, derive it from the
+    // HTML source with `html2text.HTML2Text` before parsing it as a template.
+    let text_source = if input.text.is_empty() {
+        html2text::html2text(&input.html)
+    } else {
+        input.text.clone()
+    };
     let subject = template::Template::parse(trim_space(&input.subject), TemplateMode::Text)?;
-    let text = template::Template::parse(trim_space(&input.text), TemplateMode::Text)?;
+    let text = template::Template::parse(trim_space(&text_source), TemplateMode::Text)?;
     let html = template::Template::parse(trim_space(&input.html), TemplateMode::Html)?;
     Ok(ParsedTemplates {
         subject,
@@ -259,13 +262,18 @@ mod tests {
     }
 
     #[test]
-    fn reports_the_html2text_gap() {
-        let error = parse_template(&Templates {
+    fn derives_the_text_body_from_html_when_empty() {
+        let parsed = parse_template(&Templates {
             subject: "s".to_owned(),
-            html: "<p>x</p>".to_owned(),
+            html: "<p>Hello {{.Name}}</p><p>Bye</p>".to_owned(),
             text: String::new(),
         })
-        .expect_err("fallback not ported");
-        assert!(matches!(error, TxEmailError::Html2TextNotPorted));
+        .expect("derived text template");
+        let (_, text, html) = parsed
+            .render(&serde_json::json!({"Name": "A"}))
+            .expect("render");
+        // html2text runs on the template source, so the action survives.
+        assert_eq!(text, "Hello A\r\n\r\nBye");
+        assert_eq!(html, "<p>Hello A</p><p>Bye</p>");
     }
 }
