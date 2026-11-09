@@ -10,11 +10,16 @@
 //! * `code_monitors.trigger_jobs_log_deleter` — `PeriodicGoroutine` every
 //!   hour calling `DeleteOldTriggerJobs(eventRetentionInDays=30)`.
 //!
-//! The trigger/action workers, their resetters, the search execution and the
-//! email/webhook/slack action senders are **not** ported yet, so the job is
-//! intentionally absent from the registry ([`crate::jobs::all_jobs`] keeps
-//! returning the `UnportedJob` error for `codemonitors-job`). Registering it
-//! while `Routines` returns a subset would silently drop trigger execution.
+//! M9.8cl adds [`super::code_monitor_actions`]: the action payload layer
+//! (webhook JSON, Slack blocks, e-mail template data) and the webhook/Slack
+//! HTTP delivery, ported 1:1 and differentially verified.
+//!
+//! Still **not** ported: the trigger/action workers and their resetters, the
+//! trigger search execution and the e-mail transport/templates. The job is
+//! therefore intentionally absent from the registry ([`crate::jobs::all_jobs`]
+//! keeps returning the `UnportedJob` error for `codemonitors-job`).
+//! Registering it while `Routines` returns a subset would silently drop
+//! trigger execution.
 //!
 //! Baseline facts reproduced here:
 //!
