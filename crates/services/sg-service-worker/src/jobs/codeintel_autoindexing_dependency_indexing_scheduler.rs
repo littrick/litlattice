@@ -154,9 +154,12 @@ impl fmt::Display for HandleError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             HandleError::Message(message) => f.write_str(message),
-            // Not part of the differential contract (the harness compares the
-            // sorted individual texts); this keeps logging readable.
-            HandleError::Multiple(errors) => f.write_str(&errors.join("\n")),
+            // `errors.Append(nil, errs...)`: `N errors occurred:` plus one
+            // `\n\t* ` entry per error (the worker stores this text in
+            // `failure_message`).
+            HandleError::Multiple(errors) => {
+                f.write_str(&crate::config::combine_errors(errors).unwrap_or_default())
+            }
         }
     }
 }

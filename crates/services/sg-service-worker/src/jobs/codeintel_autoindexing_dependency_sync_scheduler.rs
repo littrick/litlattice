@@ -203,9 +203,12 @@ impl std::fmt::Display for SyncSchedulerError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             SyncSchedulerError::Message(message) => f.write_str(message),
-            // Not part of the differential contract (the harness compares the
-            // sorted individual texts); this keeps logging readable.
-            SyncSchedulerError::Multiple(errors) => f.write_str(&errors.join("\n")),
+            // `errors.Append(nil, errs...)`: `N errors occurred:` plus one
+            // `\n\t* ` entry per error (the worker stores this text in
+            // `failure_message`).
+            SyncSchedulerError::Multiple(errors) => {
+                f.write_str(&crate::config::combine_errors(errors).unwrap_or_default())
+            }
         }
     }
 }

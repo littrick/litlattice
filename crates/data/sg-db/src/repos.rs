@@ -236,6 +236,36 @@ ORDER BY id
             .collect()
     }
 
+    /// `Repos.ListMinimalRepos(ctx, ReposListOptions{Names: names})` reduced to
+    /// the names the dependency indexing scheduler reads back. The baseline
+    /// compares `lower(name::text) COLLATE "C"` against the lowercased names,
+    /// excludes soft-deleted and blocked repositories (the default list
+    /// conditions) and orders by `name` (the handler passes
+    /// `OrderBy: {Field: RepoListName}`); the returned `name` keeps the stored
+    /// casing.
+    pub async fn list_minimal_repos_by_names(
+        &self,
+        names: &[String],
+    ) -> Result<Vec<String>, sqlx::Error> {
+        if names.is_empty() {
+            return Ok(Vec::new());
+        }
+        let lower_names: Vec<String> = names.iter().map(|name| name.to_lowercase()).collect();
+        let rows = sqlx::query(
+            r#"
+SELECT name
+FROM repo
+WHERE deleted_at IS NULL AND blocked IS NULL
+  AND lower(name::text) COLLATE "C" = ANY($1::text[])
+ORDER BY name
+"#,
+        )
+        .bind(&lower_names)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(|row| row.try_get("name")).collect()
+    }
+
     /// `Repos.ListMinimalRepos(ctx, ReposListOptions{NoCloned: true})`: the
     /// repositories that gitserver has not finished cloning yet. The baseline
     /// joins `gitserver_repos` and keeps `clone_status IN ('not_cloned',

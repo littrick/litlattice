@@ -5,6 +5,8 @@
 //! `repo_id`. Writes keep the baseline's `IS DISTINCT FROM` / `EXCLUDED`
 //! clauses, so repeating an update does not touch `updated_at`.
 
+use std::collections::HashMap;
+
 use sqlx::postgres::PgPool;
 use sqlx::types::time::OffsetDateTime;
 use sqlx::Row;
@@ -383,6 +385,38 @@ WHERE r.name = $1::citext
             return Ok(None);
         };
         Ok(Some(scan_gitserver_repo(&row)?))
+    }
+
+    /// `GetByNames`: the clone status of every named repository that has a
+    /// `gitserver_repos` row, keyed by its stored name. `repo.name` is
+    /// `citext`, so the comparison is case-insensitive; an empty input makes
+    /// no query and returns an empty map (the baseline's `ANY` over an empty
+    /// array returns no rows).
+    pub async fn get_by_names(
+        &self,
+        names: &[String],
+    ) -> Result<HashMap<String, CloneStatus>, sqlx::Error> {
+        if names.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let rows = sqlx::query(
+            r#"
+SELECT r.name, gr.clone_status
+FROM gitserver_repos gr
+JOIN repo r ON r.id = gr.repo_id
+WHERE r.name = ANY ($1::citext[])
+"#,
+        )
+        .bind(names)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|row| {
+                let name: String = row.try_get("name")?;
+                let status: String = row.try_get("clone_status")?;
+                Ok((name, CloneStatus::parse(&status)))
+            })
+            .collect()
     }
 
     /// `LogCorruption`: prepend `{"time": <now>, "reason": <reason>}` to

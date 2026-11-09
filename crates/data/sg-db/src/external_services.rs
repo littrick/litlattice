@@ -309,6 +309,37 @@ WHERE id = $1 AND deleted_at IS NULL
         tx.commit().await?;
         Ok(())
     }
+
+    /// `ExternalServices().Upsert` reduced to the only column the dependency
+    /// sync scheduler changes: `next_sync_at`. The baseline passes the row it
+    /// just listed, so every other column is written back unchanged
+    /// (`updated_at = excluded.updated_at` leaves `updated_at` untouched);
+    /// the worker job does not re-validate, re-encrypt or re-attach a code
+    /// host. A missing row is an error: the baseline's upsert would take its
+    /// INSERT branch and fail on the NOT NULL columns.
+    ///
+    /// See `docs/modules/06_worker.md` §130 for the documented deviations.
+    pub async fn set_next_sync_at(
+        &self,
+        id: i64,
+        next_sync_at: OffsetDateTime,
+    ) -> Result<(), ExternalServiceError> {
+        let result = sqlx::query(
+            r#"
+UPDATE external_services
+SET next_sync_at = $2
+WHERE id = $1
+"#,
+        )
+        .bind(id)
+        .bind(next_sync_at)
+        .execute(&self.pool)
+        .await?;
+        if result.rows_affected() == 0 {
+            return Err(ExternalServiceError::NotFound { id });
+        }
+        Ok(())
+    }
 }
 
 /// `calcUnrestricted` with `permissionsUserMapping` disabled (the worker's

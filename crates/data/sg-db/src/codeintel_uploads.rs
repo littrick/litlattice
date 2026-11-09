@@ -12,7 +12,9 @@
 //!   `UpdateSourcedCommits` and `ProcessSourcedCommits` /
 //!   `ProcessStaleSourcedCommits`;
 //! * `SourcedCommitsWithoutCommittedAt` / `UpdateCommittedAt` /
-//!   `SetRepositoryAsDirty` (the `codeintel-upload-backfiller` job).
+//!   `SetRepositoryAsDirty` (the `codeintel-upload-backfiller` job);
+//! * `ReferencesForUpload` and a `GetUploadByID` subset (`id`, `indexer`) for
+//!   the `codeintel-autoindexing-dependency-scheduler` handlers.
 //!
 //! Every SQL string is copied from the baseline store; migrations stay owned
 //! by the Go `migrator`. Two deliberate equivalences:
@@ -1268,3 +1270,78 @@ WHERE decode($2, 'hex') < c.commit_bytea
 ORDER BY c.commit_bytea
 LIMIT {limit}
 "#;
+
+/// `store.ReferencesForUpload` scans a `PackageReferenceScanner`: one row per
+/// `lsif_references` entry, ordered by `(scheme, manager, name, version)`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UploadReference {
+    pub dump_id: i32,
+    pub scheme: String,
+    pub manager: String,
+    pub name: String,
+    pub version: String,
+}
+
+const REFERENCES_FOR_UPLOAD_QUERY: &str = "
+SELECT r.dump_id, r.scheme, r.manager, r.name, r.version
+FROM lsif_references r
+WHERE dump_id = $1
+ORDER BY r.scheme, r.manager, r.name, r.version
+";
+
+/// `store.ReferencesForUpload`: the upload's package references in scan
+/// order. The baseline streams the rows; the handlers consume the whole scan,
+/// so the rows are returned as a vector.
+pub async fn references_for_upload(
+    pool: &PgPool,
+    upload_id: i32,
+) -> Result<Vec<UploadReference>, sqlx::Error> {
+    let rows = sqlx::query(REFERENCES_FOR_UPLOAD_QUERY)
+        .bind(upload_id)
+        .fetch_all(pool)
+        .await?;
+    rows.into_iter()
+        .map(|row| {
+            Ok(UploadReference {
+                dump_id: row.try_get("dump_id")?,
+                scheme: row.try_get("scheme")?,
+                manager: row.try_get("manager")?,
+                name: row.try_get("name")?,
+                version: row.try_get("version")?,
+            })
+        })
+        .collect()
+}
+
+/// The columns of `shared.Upload` the dependency-scheduler handlers read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UploadHeader {
+    pub id: i32,
+    pub indexer: String,
+}
+
+/// `getUploadByIDQuery` reduced to `id` + `indexer`, with the baseline's
+/// `repo.deleted_at IS NULL AND u.state != 'deleted'` conditions. The handlers
+/// run with an internal actor, so `AuthzQueryConds` is `TRUE` and omitted
+/// (`scanFirstUpload` returns `exists == false` when no row matches).
+const GET_UPLOAD_BY_ID_QUERY: &str = "
+SELECT u.id, u.indexer
+FROM lsif_uploads u
+JOIN repo ON repo.id = u.repository_id
+WHERE repo.deleted_at IS NULL AND u.state != 'deleted' AND u.id = $1
+";
+
+/// `store.GetUploadByID` subset used by `shouldIndexDependencies`.
+pub async fn get_upload_by_id(pool: &PgPool, id: i32) -> Result<Option<UploadHeader>, sqlx::Error> {
+    let row = sqlx::query(GET_UPLOAD_BY_ID_QUERY)
+        .bind(id)
+        .fetch_optional(pool)
+        .await?;
+    row.map(|row| {
+        Ok(UploadHeader {
+            id: row.try_get("id")?,
+            indexer: row.try_get("indexer")?,
+        })
+    })
+    .transpose()
+}
