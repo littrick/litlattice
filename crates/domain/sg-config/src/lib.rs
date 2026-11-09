@@ -22,6 +22,7 @@
 //! `conf.Watch`-style consumer.
 
 pub mod cloud;
+pub mod store;
 
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
