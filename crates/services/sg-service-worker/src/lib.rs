@@ -37,6 +37,7 @@ pub mod env;
 pub mod framework;
 pub mod health;
 pub mod jobs;
+pub mod paths;
 pub mod registry;
 pub mod telemetry;
 

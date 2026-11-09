@@ -63,6 +63,7 @@ pub mod codehost_version_syncing;
 pub mod codeintel_autoindexing_enqueuer;
 pub mod codeintel_autoindexing_jobselector;
 pub mod codeintel_autoindexing_package_inference;
+pub mod codeintel_autoindexing_path_patterns;
 pub mod codeintel_autoindexing_scheduler;
 pub mod codeintel_metrics_reporter;
 pub mod codeintel_package_filter_applicator;
