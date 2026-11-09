@@ -11,11 +11,13 @@
 
 pub mod config;
 pub mod debug;
+pub mod goimportpath;
 pub mod health;
 pub mod ipallowlist;
 pub mod middleware;
 pub mod mux;
 pub mod service;
+pub mod tenant;
 pub mod version;
 
 pub use service::{service_name, FrontendService, SERVICE_NAME};
