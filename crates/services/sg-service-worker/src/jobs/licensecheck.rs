@@ -580,7 +580,7 @@ struct LicenseCheckResponseData {
 
 /// `IsLicenseValid`: a missing flag means valid; unparseable values also mean
 /// valid (the baseline's `Value.Bool()` error path).
-async fn is_license_valid(kv: &KeyValue) -> bool {
+pub(crate) async fn is_license_valid(kv: &KeyValue) -> bool {
     match kv.get_string(LICENSE_VALIDITY_STORE_KEY).await {
         Ok(None) => true,
         Ok(Some(raw)) => match raw.as_str() {

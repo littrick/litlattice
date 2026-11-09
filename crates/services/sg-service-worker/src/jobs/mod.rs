@@ -78,6 +78,7 @@ pub mod insights_backfill_store;
 pub mod insights_data_prune;
 pub mod insights_data_retention;
 pub mod insights_enqueuer;
+pub mod insights_job;
 pub mod insights_license_check;
 pub mod insights_pings;
 pub mod insights_query_runner;
@@ -254,6 +255,7 @@ pub fn all_jobs() -> Vec<(&'static str, Arc<dyn Job>)> {
                 "insights-data-retention-job" => {
                     Arc::new(insights_data_retention::InsightsDataRetentionJob)
                 }
+                "insights-job" => Arc::new(insights_job::InsightsJob),
                 "insights-query-runner-job" => {
                     Arc::new(insights_query_runner::InsightsQueryRunnerJob)
                 }

@@ -283,6 +283,49 @@ pub fn check_acls_error(license_key: &str) -> Option<String> {
     )
 }
 
+/// `licensing.Check(licensing.FeatureCodeInsights)`: whether the Code Insights
+/// background jobs may run. The caller supplies `licensing.IsLicenseValid()`
+/// (the Redis-backed validity flag, valid when absent) because that state is
+/// not part of the license key.
+///
+/// Error text mirrors the baseline: a parse failure is wrapped as
+/// `checking feature "code-insights" activation: <err>`, an invalidated
+/// license yields `Sourcegraph license is no longer valid`, and a valid
+/// license whose plan lacks the feature yields `featureNotActivatedError`'s
+/// upgrade message.
+pub fn check_code_insights(license_key: &str, license_valid: bool) -> Result<(), String> {
+    let info = configured_license_info(license_key)
+        .map_err(|err| format!("checking feature \"code-insights\" activation: {err}"))?;
+    if !license_valid {
+        return Err("Sourcegraph license is no longer valid".to_owned());
+    }
+    code_insights_for(&info)
+}
+
+/// `BasicFeature("code-insights").Check`: an explicit `code-insights` tag
+/// grants the feature, otherwise `internal/licensing/data.go` enables it for
+/// the old enterprise, enterprise-1, air-gapped enterprise and
+/// code-intelligence-platform plans (not enterprise-0, team-0, the free plans
+/// or Cody enterprise).
+fn code_insights_for(info: &Info) -> Result<(), String> {
+    if info.has_tag("code-insights")
+        || matches!(
+            info.plan(),
+            Plan::OldEnterprise
+                | Plan::Enterprise1
+                | Plan::AirGappedEnterprise
+                | Plan::CodeIntelligencePlatform
+        )
+    {
+        return Ok(());
+    }
+    Err(
+        "The feature \"code-insights\" is not activated in your Sourcegraph license. \
+         Upgrade your Sourcegraph subscription to use this feature."
+            .to_owned(),
+    )
+}
+
 /// `BasicFeature("acls").Check`: an explicit `acls` tag grants the feature,
 /// otherwise `internal/licensing/data.go` enables it for every plan except
 /// the free plans (`free-0`, `free-1`).
@@ -659,6 +702,61 @@ mod tests {
             }),
             PrivateRepositories::Unrestricted
         );
+    }
+
+    #[test]
+    fn code_insights_follow_the_plan_table() {
+        // No configured key: the implicit free-1 plan has no Code Insights.
+        let err = check_code_insights("", true).expect_err("free plan must not include insights");
+        assert_eq!(
+            err,
+            "The feature \"code-insights\" is not activated in your Sourcegraph license. \
+             Upgrade your Sourcegraph subscription to use this feature."
+        );
+        // Unparseable keys fail activation with the baseline's wrapper text.
+        let err = check_code_insights("not a key", true).expect_err("invalid key");
+        assert!(
+            err.starts_with("checking feature \"code-insights\" activation: "),
+            "{err}"
+        );
+        // `Check` fails a valid license that the license server invalidated.
+        assert_eq!(
+            check_code_insights("", false).unwrap_err(),
+            "Sourcegraph license is no longer valid"
+        );
+
+        let plan = |tag: &str| Info {
+            tags: vec![tag.to_owned()],
+            ..Info::default()
+        };
+        for tag in [
+            "plan:old-enterprise-0",
+            "plan:enterprise-1",
+            "plan:enterprise-air-gap-0",
+            "plan:code-ai-enterprise-0",
+        ] {
+            assert_eq!(code_insights_for(&plan(tag)), Ok(()), "{tag}");
+        }
+        for tag in [
+            "plan:team-0",
+            "plan:enterprise-0",
+            "plan:free-0",
+            "plan:free-1",
+            "plan:cody-enterprise-0",
+        ] {
+            assert!(code_insights_for(&plan(tag)).is_err(), "{tag}");
+        }
+        // An explicit tag overrides the plan, like `BasicFeature.Check`.
+        assert_eq!(
+            code_insights_for(&Info {
+                tags: vec!["plan:free-1".to_owned(), " code-insights ".to_owned()],
+                ..Info::default()
+            }),
+            Ok(())
+        );
+        // No plan tag at all: `PlanFromTags` falls back to the old enterprise
+        // plan, which includes Code Insights.
+        assert_eq!(code_insights_for(&Info::default()), Ok(()));
     }
 
     #[test]
