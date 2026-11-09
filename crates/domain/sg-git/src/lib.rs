@@ -476,6 +476,22 @@ impl GitserverClient {
         Ok(files)
     }
 
+    /// `gitserver.Client.FirstEverCommit`: the first commit ever made to the
+    /// repository on the default branch. A response without a commit is the
+    /// zero commit, matching `gitdomain.CommitFromProto(nil)`.
+    pub async fn first_ever_commit(&self, repo: &str) -> Result<Commit, Error> {
+        let mut client = self.client_for(repo).await?;
+        let context = format!("first ever commit {repo}");
+        let response = client
+            .first_ever_commit(pb::FirstEverCommitRequest {
+                repo_name: repo.to_owned(),
+            })
+            .await
+            .map_err(|status| translate_status(status, &context))?;
+        let commit = response.into_inner().commit.unwrap_or_default();
+        Ok(commit_from_proto(commit))
+    }
+
     /// `gitserver.Client.GetCommit`.
     pub async fn get_commit(&self, repo: &str, commit: &str) -> Result<Commit, Error> {
         let mut client = self.client_for(repo).await?;

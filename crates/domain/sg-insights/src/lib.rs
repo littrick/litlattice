@@ -22,6 +22,10 @@
 //! - [`compression`] (`internal/insights/compression`): backfill plan
 //!   compression over sample times, with the gitserver commit index injected
 //!   through [`compression::CommitFetcher`].
+//! - [`gitserver`] (`internal/insights/gitserver`): the commit client used by
+//!   compression and the backfiller (`RecentCommits` / `FirstCommit` with its
+//!   in-memory first-commit cache), over the [`sg_git::GitserverClient`]
+//!   transport.
 //!
 //! Not ported here: `aggregation` (it needs search results), the storage-bound
 //! scheduler/iterator methods (`BackfillStore`, `PersistentRepoIterator`
@@ -30,6 +34,7 @@
 
 pub mod compression;
 pub mod discovery;
+pub mod gitserver;
 pub mod iterator;
 pub mod priority;
 pub mod scheduler;
