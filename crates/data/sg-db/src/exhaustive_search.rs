@@ -43,6 +43,8 @@
 //! Migrations stay owned by the Go `migrator`; every SQL string below is
 //! copied from the baseline store.
 
+use std::time::Duration;
+
 use sqlx::postgres::{PgPool, PgRow};
 use sqlx::types::time::OffsetDateTime;
 use sqlx::Row;
@@ -470,7 +472,6 @@ fn scan_worker_job(row: &PgRow) -> Result<WorkerJob, sqlx::Error> {
     })
 }
 
-#[allow(dead_code)] // used by the exhaustive worker stores (next slice)
 fn scan_repo_job(row: &PgRow) -> Result<ExhaustiveSearchRepoJob, sqlx::Error> {
     Ok(ExhaustiveSearchRepoJob {
         worker: scan_worker_job(row)?,
@@ -483,7 +484,6 @@ fn scan_repo_job(row: &PgRow) -> Result<ExhaustiveSearchRepoJob, sqlx::Error> {
     })
 }
 
-#[allow(dead_code)] // used by the exhaustive worker stores (next slice)
 fn scan_rev_job(row: &PgRow) -> Result<ExhaustiveSearchRepoRevisionJob, sqlx::Error> {
     Ok(ExhaustiveSearchRepoRevisionJob {
         worker: scan_worker_job(row)?,
@@ -894,4 +894,531 @@ pub async fn get_query_repo_rev(
         },
         initiator_id: row.try_get("initiator_id")?,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Worker stores (`NewExhaustiveSearchJobWorkerStore` and friends)
+// ---------------------------------------------------------------------------
+
+/// `maxNumResets` shared by the three exhaustive worker store options.
+pub const WORKER_MAX_NUM_RESETS: i32 = 5;
+/// `maxNumRetries` shared by the three exhaustive worker store options.
+pub const WORKER_MAX_NUM_RETRIES: i32 = 3;
+/// `StalledMaxAge` (seconds) shared by the three options.
+pub const WORKER_STALLED_MAX_AGE_SECS: i64 = 60;
+/// `RetryAfter` (seconds) shared by the three options.
+pub const WORKER_RETRY_AFTER_SECS: i64 = 5;
+/// `defaultResetFailureMessage`.
+pub const WORKER_RESET_FAILURE_MESSAGE: &str =
+    "job processor died while handling this message too many times";
+
+const EXHAUSTIVE_SEARCH_JOBS_TABLE: &str = "exhaustive_search_jobs";
+const EXHAUSTIVE_SEARCH_REPO_JOBS_TABLE: &str = "exhaustive_search_repo_jobs";
+const EXHAUSTIVE_SEARCH_REPO_REVISION_JOBS_TABLE: &str = "exhaustive_search_repo_revision_jobs";
+
+/// The dequeue projection of `exhaustive_search_jobs`: the generic store
+/// substitutes the columns updated by dequeue with the new values.
+const JOB_DEQUEUE_COLUMNS: &str = "id, initiator_id, 'processing' AS state, query, \
+     NULL AS failure_message, $1 AS started_at, NULL AS finished_at, process_after, \
+     num_resets, num_failures, $3 AS worker_hostname, cancel, created_at, \
+     updated_at, is_aggregated";
+
+/// The dequeue projection of `exhaustive_search_repo_jobs`.
+const REPO_DEQUEUE_COLUMNS: &str = "id, 'processing' AS state, repo_id, ref_spec, \
+     search_job_id, NULL AS failure_message, $1 AS started_at, NULL AS finished_at, \
+     process_after, num_resets, num_failures, $3 AS worker_hostname, cancel, \
+     created_at, updated_at";
+
+/// The dequeue projection of `exhaustive_search_repo_revision_jobs`.
+const REV_DEQUEUE_COLUMNS: &str = "id, 'processing' AS state, search_repo_job_id, \
+     revision, NULL AS failure_message, $1 AS started_at, NULL AS finished_at, \
+     process_after, num_resets, num_failures, $3 AS worker_hostname, cancel, \
+     created_at, updated_at";
+
+/// `dbworkerstore.Dequeue` for the exhaustive tables. The order expression is
+/// the baseline's `state = 'errored', updated_at DESC`, qualified with the
+/// table name (the baseline uses `exhaustive_search_<table>.state` in the
+/// order expression).
+fn dequeue_query(table: &str, select_columns: &str) -> String {
+    format!(
+        r#"WITH potential_candidates AS (
+	SELECT
+		id AS candidate_id,
+		ROW_NUMBER() OVER (ORDER BY {table}.state = 'errored', {table}.updated_at DESC) AS candidate_order
+	FROM {table}
+	WHERE
+		(
+			(
+				state = 'queued' AND
+				(process_after IS NULL OR process_after <= $1)
+			) OR (
+				$2 > 0 AND
+				state = 'errored' AND
+				$1 - finished_at > ($2 * '1 second'::interval)
+			)
+		)
+	ORDER BY {table}.state = 'errored', {table}.updated_at DESC
+	LIMIT 50
+),
+candidate AS (
+	SELECT id FROM {table}
+	JOIN potential_candidates pc ON pc.candidate_id = id
+	WHERE
+		state IN ('queued', 'errored')
+	ORDER BY pc.candidate_order
+	FOR UPDATE OF {table} SKIP LOCKED
+	LIMIT 1
+),
+updated_record AS (
+	UPDATE {table}
+	SET
+		state = 'processing',
+		started_at = $1,
+		last_heartbeat_at = $1,
+		finished_at = NULL,
+		failure_message = NULL,
+		execution_logs = NULL,
+		worker_hostname = $3
+	WHERE id IN (SELECT id FROM candidate)
+)
+SELECT {select_columns}
+FROM {table}
+WHERE id IN (SELECT id FROM candidate)"#
+    )
+}
+
+async fn worker_dequeue<R>(
+    pool: &PgPool,
+    table: &str,
+    select_columns: &str,
+    scan: fn(&PgRow) -> Result<R, sqlx::Error>,
+    worker_hostname: &str,
+    now: OffsetDateTime,
+) -> Result<Option<R>, String> {
+    let sql = dequeue_query(table, select_columns);
+    let row = sqlx::query(&sql)
+        .bind(now)
+        .bind(WORKER_RETRY_AFTER_SECS)
+        .bind(worker_hostname)
+        .fetch_optional(pool)
+        .await
+        .map_err(|err| err.to_string())?;
+    match row {
+        Some(row) => scan(&row).map(Some).map_err(|err| err.to_string()),
+        None => Ok(None),
+    }
+}
+
+async fn worker_heartbeat(
+    pool: &PgPool,
+    table: &str,
+    ids: &[i32],
+    now: OffsetDateTime,
+) -> Result<(Vec<i32>, Vec<i32>), String> {
+    if ids.is_empty() {
+        return Ok((Vec::new(), Vec::new()));
+    }
+
+    let sql = format!(
+        r#"WITH alive_candidates AS (
+	SELECT id
+	FROM {table}
+	WHERE id = ANY($1) AND state = 'processing'
+	ORDER BY id ASC
+	FOR UPDATE
+)
+UPDATE {table}
+SET last_heartbeat_at = $2
+WHERE id IN (SELECT id FROM alive_candidates)
+RETURNING id, cancel"#
+    );
+    let rows = sqlx::query(&sql)
+        .bind(ids)
+        .bind(now)
+        .fetch_all(pool)
+        .await
+        .map_err(|err| err.to_string())?;
+
+    let mut known = Vec::with_capacity(rows.len());
+    let mut canceled = Vec::new();
+    for row in &rows {
+        let id: i32 = row.try_get("id").map_err(|err| err.to_string())?;
+        let cancel: bool = row.try_get("cancel").map_err(|err| err.to_string())?;
+        known.push(id);
+        if cancel {
+            canceled.push(id);
+        }
+    }
+    known.sort_unstable();
+    canceled.sort_unstable();
+    Ok((known, canceled))
+}
+
+async fn worker_mark_complete(pool: &PgPool, table: &str, id: i32) -> Result<bool, String> {
+    let sql = format!(
+        "UPDATE {table}\nSET state = 'completed', finished_at = clock_timestamp()\n\
+         WHERE id = $1 AND state = 'processing'"
+    );
+    let result = sqlx::query(&sql)
+        .bind(id)
+        .execute(pool)
+        .await
+        .map_err(|err| err.to_string())?;
+    Ok(result.rows_affected() > 0)
+}
+
+async fn worker_mark_errored(
+    pool: &PgPool,
+    table: &str,
+    id: i32,
+    failure_message: &str,
+) -> Result<bool, String> {
+    let sql = format!(
+        "UPDATE {table}\n\
+         SET state = CASE WHEN cancel THEN 'canceled' WHEN num_failures + 1 >= $3 THEN 'failed' ELSE 'errored' END,\n\
+         \tfinished_at = clock_timestamp(),\n\
+         \tfailure_message = $2,\n\
+         \tnum_failures = CASE WHEN cancel THEN num_failures ELSE num_failures + 1 END\n\
+         WHERE id = $1 AND state = 'processing'"
+    );
+    let result = sqlx::query(&sql)
+        .bind(id)
+        .bind(failure_message)
+        .bind(WORKER_MAX_NUM_RETRIES)
+        .execute(pool)
+        .await
+        .map_err(|err| err.to_string())?;
+    Ok(result.rows_affected() > 0)
+}
+
+async fn worker_mark_failed(
+    pool: &PgPool,
+    table: &str,
+    id: i32,
+    failure_message: &str,
+) -> Result<bool, String> {
+    let sql = format!(
+        "UPDATE {table}\n\
+         SET state = CASE WHEN cancel THEN 'canceled' ELSE 'failed' END,\n\
+         \tfinished_at = clock_timestamp(),\n\
+         \tfailure_message = $2,\n\
+         \tnum_failures = CASE WHEN cancel THEN num_failures ELSE num_failures + 1 END\n\
+         WHERE id = $1 AND state = 'processing'"
+    );
+    let result = sqlx::query(&sql)
+        .bind(id)
+        .bind(failure_message)
+        .execute(pool)
+        .await
+        .map_err(|err| err.to_string())?;
+    Ok(result.rows_affected() > 0)
+}
+
+fn worker_heartbeat_ages(
+    now: OffsetDateTime,
+    rows: Vec<PgRow>,
+) -> Result<Vec<(i32, Duration)>, String> {
+    let mut ages = Vec::with_capacity(rows.len());
+    for row in &rows {
+        let id: i32 = row.try_get("id").map_err(|err| err.to_string())?;
+        let last_heartbeat: Option<OffsetDateTime> = row
+            .try_get("last_heartbeat_at")
+            .map_err(|err| err.to_string())?;
+        let age = match last_heartbeat {
+            Some(last) => Duration::try_from(now - last).unwrap_or(Duration::ZERO),
+            None => Duration::ZERO,
+        };
+        ages.push((id, age));
+    }
+    ages.sort_by_key(|(id, _)| *id);
+    Ok(ages)
+}
+
+async fn worker_reset_stalled(
+    pool: &PgPool,
+    table: &str,
+    now: OffsetDateTime,
+) -> Result<(Vec<(i32, Duration)>, Vec<(i32, Duration)>), String> {
+    let reset_sql = format!(
+        r#"WITH stalled AS (
+	SELECT id FROM {table}
+	WHERE
+		state = 'processing' AND
+		$1 - last_heartbeat_at > ($2 * '1 second'::interval) AND
+		num_resets < $3
+	FOR UPDATE SKIP LOCKED
+)
+UPDATE {table}
+SET
+	state = 'queued',
+	queued_at = clock_timestamp(),
+	started_at = null,
+	num_resets = num_resets + 1
+WHERE id IN (SELECT id FROM stalled)
+RETURNING id, last_heartbeat_at"#
+    );
+    let reset_rows = sqlx::query(&reset_sql)
+        .bind(now)
+        .bind(WORKER_STALLED_MAX_AGE_SECS)
+        .bind(WORKER_MAX_NUM_RESETS)
+        .fetch_all(pool)
+        .await
+        .map_err(|err| err.to_string())?;
+
+    let failed_sql = format!(
+        r#"WITH stalled AS (
+	SELECT id FROM {table}
+	WHERE
+		state = 'processing' AND
+		$1 - last_heartbeat_at > ($2 * '1 second'::interval) AND
+		num_resets >= $3
+	FOR UPDATE SKIP LOCKED
+)
+UPDATE {table}
+SET
+	state = 'failed',
+	finished_at = clock_timestamp(),
+	failure_message = $4
+WHERE id IN (SELECT id FROM stalled)
+RETURNING id, last_heartbeat_at"#
+    );
+    let failed_rows = sqlx::query(&failed_sql)
+        .bind(now)
+        .bind(WORKER_STALLED_MAX_AGE_SECS)
+        .bind(WORKER_MAX_NUM_RESETS)
+        .bind(WORKER_RESET_FAILURE_MESSAGE)
+        .fetch_all(pool)
+        .await
+        .map_err(|err| err.to_string())?;
+
+    Ok((
+        worker_heartbeat_ages(now, reset_rows)?,
+        worker_heartbeat_ages(now, failed_rows)?,
+    ))
+}
+
+/// `NewExhaustiveSearchJobWorkerStore` over `exhaustive_search_jobs`.
+#[derive(Clone)]
+pub struct ExhaustiveSearchJobWorkerStore {
+    pool: PgPool,
+}
+
+impl ExhaustiveSearchJobWorkerStore {
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
+
+    pub fn pool(&self) -> &PgPool {
+        &self.pool
+    }
+
+    pub async fn dequeue(
+        &self,
+        worker_hostname: &str,
+        now: OffsetDateTime,
+    ) -> Result<Option<ExhaustiveSearchJob>, String> {
+        worker_dequeue(
+            &self.pool,
+            EXHAUSTIVE_SEARCH_JOBS_TABLE,
+            JOB_DEQUEUE_COLUMNS,
+            scan_job_without_agg_state,
+            worker_hostname,
+            now,
+        )
+        .await
+    }
+
+    pub async fn heartbeat(
+        &self,
+        ids: &[i32],
+        now: OffsetDateTime,
+    ) -> Result<(Vec<i32>, Vec<i32>), String> {
+        worker_heartbeat(&self.pool, EXHAUSTIVE_SEARCH_JOBS_TABLE, ids, now).await
+    }
+
+    pub async fn mark_complete(&self, id: i32) -> Result<bool, String> {
+        worker_mark_complete(&self.pool, EXHAUSTIVE_SEARCH_JOBS_TABLE, id).await
+    }
+
+    pub async fn mark_errored(&self, id: i32, failure_message: &str) -> Result<bool, String> {
+        worker_mark_errored(
+            &self.pool,
+            EXHAUSTIVE_SEARCH_JOBS_TABLE,
+            id,
+            failure_message,
+        )
+        .await
+    }
+
+    pub async fn mark_failed(&self, id: i32, failure_message: &str) -> Result<bool, String> {
+        worker_mark_failed(
+            &self.pool,
+            EXHAUSTIVE_SEARCH_JOBS_TABLE,
+            id,
+            failure_message,
+        )
+        .await
+    }
+
+    /// `ResetStalled`: `(reset-to-queued, reset-to-failed)` with the age of
+    /// the last heartbeat.
+    pub async fn reset_stalled_at(
+        &self,
+        now: OffsetDateTime,
+    ) -> Result<(Vec<(i32, Duration)>, Vec<(i32, Duration)>), String> {
+        worker_reset_stalled(&self.pool, EXHAUSTIVE_SEARCH_JOBS_TABLE, now).await
+    }
+}
+
+fn scan_job_without_agg_state(row: &PgRow) -> Result<ExhaustiveSearchJob, sqlx::Error> {
+    scan_job(row, false)
+}
+
+/// `NewRepoSearchJobWorkerStore` over `exhaustive_search_repo_jobs`.
+#[derive(Clone)]
+pub struct ExhaustiveSearchRepoJobWorkerStore {
+    pool: PgPool,
+}
+
+impl ExhaustiveSearchRepoJobWorkerStore {
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
+
+    pub fn pool(&self) -> &PgPool {
+        &self.pool
+    }
+
+    pub async fn dequeue(
+        &self,
+        worker_hostname: &str,
+        now: OffsetDateTime,
+    ) -> Result<Option<ExhaustiveSearchRepoJob>, String> {
+        worker_dequeue(
+            &self.pool,
+            EXHAUSTIVE_SEARCH_REPO_JOBS_TABLE,
+            REPO_DEQUEUE_COLUMNS,
+            scan_repo_job,
+            worker_hostname,
+            now,
+        )
+        .await
+    }
+
+    pub async fn heartbeat(
+        &self,
+        ids: &[i32],
+        now: OffsetDateTime,
+    ) -> Result<(Vec<i32>, Vec<i32>), String> {
+        worker_heartbeat(&self.pool, EXHAUSTIVE_SEARCH_REPO_JOBS_TABLE, ids, now).await
+    }
+
+    pub async fn mark_complete(&self, id: i32) -> Result<bool, String> {
+        worker_mark_complete(&self.pool, EXHAUSTIVE_SEARCH_REPO_JOBS_TABLE, id).await
+    }
+
+    pub async fn mark_errored(&self, id: i32, failure_message: &str) -> Result<bool, String> {
+        worker_mark_errored(
+            &self.pool,
+            EXHAUSTIVE_SEARCH_REPO_JOBS_TABLE,
+            id,
+            failure_message,
+        )
+        .await
+    }
+
+    pub async fn mark_failed(&self, id: i32, failure_message: &str) -> Result<bool, String> {
+        worker_mark_failed(
+            &self.pool,
+            EXHAUSTIVE_SEARCH_REPO_JOBS_TABLE,
+            id,
+            failure_message,
+        )
+        .await
+    }
+
+    pub async fn reset_stalled_at(
+        &self,
+        now: OffsetDateTime,
+    ) -> Result<(Vec<(i32, Duration)>, Vec<(i32, Duration)>), String> {
+        worker_reset_stalled(&self.pool, EXHAUSTIVE_SEARCH_REPO_JOBS_TABLE, now).await
+    }
+}
+
+/// `NewRevSearchJobWorkerStore` over
+/// `exhaustive_search_repo_revision_jobs`.
+#[derive(Clone)]
+pub struct ExhaustiveSearchRepoRevisionJobWorkerStore {
+    pool: PgPool,
+}
+
+impl ExhaustiveSearchRepoRevisionJobWorkerStore {
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
+
+    pub fn pool(&self) -> &PgPool {
+        &self.pool
+    }
+
+    pub async fn dequeue(
+        &self,
+        worker_hostname: &str,
+        now: OffsetDateTime,
+    ) -> Result<Option<ExhaustiveSearchRepoRevisionJob>, String> {
+        worker_dequeue(
+            &self.pool,
+            EXHAUSTIVE_SEARCH_REPO_REVISION_JOBS_TABLE,
+            REV_DEQUEUE_COLUMNS,
+            scan_rev_job,
+            worker_hostname,
+            now,
+        )
+        .await
+    }
+
+    pub async fn heartbeat(
+        &self,
+        ids: &[i32],
+        now: OffsetDateTime,
+    ) -> Result<(Vec<i32>, Vec<i32>), String> {
+        worker_heartbeat(
+            &self.pool,
+            EXHAUSTIVE_SEARCH_REPO_REVISION_JOBS_TABLE,
+            ids,
+            now,
+        )
+        .await
+    }
+
+    pub async fn mark_complete(&self, id: i32) -> Result<bool, String> {
+        worker_mark_complete(&self.pool, EXHAUSTIVE_SEARCH_REPO_REVISION_JOBS_TABLE, id).await
+    }
+
+    pub async fn mark_errored(&self, id: i32, failure_message: &str) -> Result<bool, String> {
+        worker_mark_errored(
+            &self.pool,
+            EXHAUSTIVE_SEARCH_REPO_REVISION_JOBS_TABLE,
+            id,
+            failure_message,
+        )
+        .await
+    }
+
+    pub async fn mark_failed(&self, id: i32, failure_message: &str) -> Result<bool, String> {
+        worker_mark_failed(
+            &self.pool,
+            EXHAUSTIVE_SEARCH_REPO_REVISION_JOBS_TABLE,
+            id,
+            failure_message,
+        )
+        .await
+    }
+
+    pub async fn reset_stalled_at(
+        &self,
+        now: OffsetDateTime,
+    ) -> Result<(Vec<(i32, Duration)>, Vec<(i32, Duration)>), String> {
+        worker_reset_stalled(&self.pool, EXHAUSTIVE_SEARCH_REPO_REVISION_JOBS_TABLE, now).await
+    }
 }

@@ -74,6 +74,7 @@ pub mod eventlogs;
 pub mod executors;
 pub mod executors_metrics;
 pub mod executors_multiqueue_metrics;
+pub mod exhaustive_search_workers;
 pub mod github_apps_installation;
 pub mod gitserver;
 pub mod insights_backfill_handler;
