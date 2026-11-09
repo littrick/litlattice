@@ -109,23 +109,9 @@ pub struct PackageReferences {
     pub close_error: Option<String>,
 }
 
-/// `dependencies.MinimalPackageRepoRef`.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct MinimalPackageRepoRef {
-    pub name: String,
-    pub scheme: String,
-    pub blocked: bool,
-    pub last_checked_at: Option<OffsetDateTime>,
-    pub versions: Vec<MinimalPackageRepoRefVersion>,
-}
-
-/// `dependencies.MinimalPackageRepoRefVersion`.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct MinimalPackageRepoRefVersion {
-    pub version: String,
-    pub blocked: bool,
-    pub last_checked_at: Option<OffsetDateTime>,
-}
+/// `dependencies.MinimalPackageRepoRef` / `MinimalPackageRepoRefVersion` are
+/// shared with the `sg-db` implementation added in M9.8di.
+pub use sg_db::codeintel_dependencies::{MinimalPackageRepoRef, MinimalPackageRepoRefVersion};
 
 /// The part of `InsertPackageRepoRefs`' result the handler reads: the lengths
 /// of the returned new-reference and new-version slices.

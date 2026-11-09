@@ -256,13 +256,15 @@ mod tests {
             blocked: false,
             versions: versions
                 .iter()
-                .map(|(id, version)| PackageRepoRefVersion {
-                    id: *id,
+                .map(|(version_id, version)| PackageRepoRefVersion {
+                    id: *version_id,
+                    package_ref_id: id,
                     version: (*version).to_owned(),
                     blocked: false,
                     last_checked_at: None,
                 })
                 .collect(),
+            last_checked_at: None,
         }
     }
 
