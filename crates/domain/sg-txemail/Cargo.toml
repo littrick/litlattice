@@ -8,6 +8,11 @@ publish.workspace = true
 
 [dependencies]
 base64 = { workspace = true }
+# HMAC-MD5 for the CRAM-MD5 SMTP authentication mechanism.
+md5 = { workspace = true }
+# STARTTLS. See the workspace comment on the provider choice.
+rustls = { workspace = true }
+rustls-native-certs = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 # `Email::bytes` formats the `Date` header in local time like Go's

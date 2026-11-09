@@ -56,6 +56,13 @@ google-cloud-kms-v1 = "1"
 # credential provider supplied by `google-cloud-auth` already enables the
 # shared TLS stack.
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+# STARTTLS for `sg-txemail`'s SMTP transport. The default provider is kept so
+# this crate and `reqwest` agree on one crypto backend (enabling a second
+# provider feature in the same build would make `ClientConfig::builder` panic).
+rustls = "0.23"
+# Go's `tls.Config` uses the platform certificate store; mirror it instead of
+# pinning webpki-roots so operator-installed CAs keep working.
+rustls-native-certs = "0.8"
 # tree-sitter grammars vendored from the exact parser sources used by the Go
 # baseline (github.com/smacker/go-tree-sitter @ 233c2f923ac7). Published crate
 # versions track different grammar commits, so runtimes must not be swapped.

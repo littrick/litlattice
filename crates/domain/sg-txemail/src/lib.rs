@@ -1,9 +1,8 @@
 #![forbid(unsafe_code)]
 
-//! `sg-txemail`: transactional e-mail template parsing and rendering.
+//! `sg-txemail`: transactional e-mail template parsing, rendering and delivery.
 //!
-//! Port of `internal/txemail` (Go baseline) covering everything up to — but not
-//! including — MIME assembly and SMTP delivery:
+//! Port of `internal/txemail` (Go baseline):
 //!
 //! * [`Templates`] / [`Message`] mirror `txtypes.Templates` and
 //!   `txtypes.Message`.
@@ -25,21 +24,28 @@
 //! [`Email`] plus [`Email::bytes`] port `jordan-wright/email`'s `Bytes()` for
 //! the no-attachment case that `txemail` uses (see [`mime`]).
 //!
-//! Not ported in this slice: the `html2text` fallback for templates without a
-//! `Text` body, MIME attachments, and the SMTP transport (`txemail.Send`).
-//! [`parse_template`] returns [`TxEmailError::Html2TextNotPorted`] instead of
-//! emitting a divergent body.
+//! [`send`] and [`prepare_email`] port `txemail.Send`: configuration checks,
+//! Mandrill/additional headers, `Email.Bytes()`, and delivery through the
+//! [`smtp`] client (EHLO/HELO, STARTTLS, AUTH PLAIN/CRAM-MD5, MAIL/RCPT/DATA).
+//!
+//! Not ported: the `html2text` fallback for templates without a `Text` body and
+//! MIME attachments. [`parse_template`] returns
+//! [`TxEmailError::Html2TextNotPorted`] instead of emitting a divergent body.
 
 mod address;
 mod escape;
 mod mail;
 mod mime;
+pub mod send;
+pub mod smtp;
 mod template;
 
 use std::collections::BTreeMap;
 
 pub use address::mail_address;
 pub use mime::{Email, MimeError, MimeRuntime};
+pub use send::{prepare_email, send, Header, SendConfig, SendError, SmtpConfig};
+pub use smtp::Client as SmtpClient;
 pub use template::{TemplateError, TemplateMode};
 
 /// `txtypes.Templates`: subject plus HTML and plain-text bodies.
