@@ -32,11 +32,18 @@
 //!   differential harness pins `InferenceConcurrency=1` for the cases with
 //!   more than one failure.
 //!
-//! Not ported: the on-demand scheduler (`NewOnDemandScheduler`, the
-//! `codeintel_autoindex_queue` table) and the `IndexEnqueuer` production
-//! implementation (`internal/codeintel/autoindexing/internal/enqueuer` and
-//! its inference pipeline). Because of the latter the
-//! `codeintel-autoindexing-scheduler` job is still not registered.
+//! [`handle_on_demand_scheduler`] ports the other half of the same file
+//! (`NewOnDemandScheduler`): when auto-indexing is enabled, claim up to
+//! `OnDemandBatchsize` unprocessed `codeintel_autoindex_queue` rows in one
+//! transaction (`ORDER BY queued_at`, `FOR UPDATE SKIP LOCKED`), enqueue each
+//! `(repository_id, rev)` pair and mark the rows processed. Any enqueue error
+//! aborts (and rolls back) the batch; unlike the periodic scheduler it does
+//! not special-case `RevisionNotFound`.
+//!
+//! Not ported: the `IndexEnqueuer` production implementation
+//! (`internal/codeintel/autoindexing/internal/enqueuer` and its inference
+//! pipeline). Because of that the `codeintel-autoindexing-scheduler` job is
+//! still not registered.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -44,6 +51,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use sg_config::{LiveConfig, SiteConfiguration};
 use sg_core::{ConfigError, EnvReader};
+use sg_db::codeintel_autoindex_queue::{get_queued_repo_rev, mark_repo_revs_as_processed};
 use sg_db::codeintel_policies::{self, GetConfigurationPoliciesOptions};
 use sg_db::repos::RepoStore;
 use sg_db::reposcheduler::{RepoScanStore, RepositoryBatchOptions};
@@ -530,6 +538,129 @@ async fn handle_repository(
     }
 }
 
+/// `scheduler.NewOnDemandScheduler`'s `HandlerFunc`.
+///
+/// Claims the oldest unprocessed `codeintel_autoindex_queue` rows inside one
+/// transaction, enqueues each `(repository_id, rev)` pair and marks the
+/// claimed rows processed. The baseline returns the enqueuer/store errors
+/// bare (no wrapper) and does not special-case `RevisionNotFound`, so the
+/// first failure aborts the batch and the transaction rolls back.
+pub async fn handle_on_demand_scheduler(
+    frontend: &PgPool,
+    site: &SiteConfiguration,
+    enqueuer: &dyn IndexEnqueuer,
+    batch_size: i64,
+) -> Result<(), String> {
+    if !auto_indexing_enabled(site) {
+        return Ok(());
+    }
+
+    // `s.WithTransaction(ctx, func(tx store.Store) error { ... })`
+    let mut tx = frontend.begin().await.map_err(|err| err.to_string())?;
+    let repo_revs = get_queued_repo_rev(&mut tx, batch_size)
+        .await
+        .map_err(|err| err.to_string())?;
+
+    let mut ids = Vec::with_capacity(repo_revs.len());
+    for repo_rev in repo_revs {
+        // Dropping `tx` on the `?` rolls the batch back, so no row is marked
+        // processed when an enqueue fails (same as the baseline).
+        enqueuer
+            .queue_auto_index_jobs(repo_rev.repository_id, &repo_rev.rev, "", false, false)
+            .await
+            .map_err(QueueAutoIndexJobsError::into_message)?;
+        ids.push(repo_rev.id);
+    }
+
+    mark_repo_revs_as_processed(&mut tx, &ids)
+        .await
+        .map_err(|err| err.to_string())?;
+    tx.commit().await.map_err(|err| err.to_string())?;
+    Ok(())
+}
+
+impl QueueAutoIndexJobsError {
+    /// The error text the baseline returns from `QueueAutoIndexJobs`.
+    ///
+    /// The periodic scheduler only needs the `RevisionNotFound` variant, so
+    /// the trait does not carry the baseline error value's `Repo`/`Spec`
+    /// fields. The on-demand scheduler returns the error bare; this port
+    /// formats the zero value (`&gitdomain.RevisionNotFoundError{}`, which is
+    /// what the differential harness's fake returns).
+    fn into_message(self) -> String {
+        match self {
+            QueueAutoIndexJobsError::RevisionNotFound => "revision not found: @".to_owned(),
+            QueueAutoIndexJobsError::Other(err) => err,
+        }
+    }
+}
+
+/// The on-demand handler's `HandlerFunc`.
+pub struct OnDemandSchedulerHandler {
+    frontend: PgPool,
+    live_config: Arc<LiveConfig>,
+    enqueuer: Arc<dyn IndexEnqueuer>,
+    batch_size: i64,
+}
+
+impl OnDemandSchedulerHandler {
+    pub fn new(
+        frontend: PgPool,
+        live_config: Arc<LiveConfig>,
+        enqueuer: Arc<dyn IndexEnqueuer>,
+        batch_size: i64,
+    ) -> Self {
+        Self {
+            frontend,
+            live_config,
+            enqueuer,
+            batch_size,
+        }
+    }
+}
+
+#[async_trait]
+impl Handler for OnDemandSchedulerHandler {
+    async fn handle(&self, _ctx: CancellationToken) -> Result<(), HandlerError> {
+        handle_on_demand_scheduler(
+            &self.frontend,
+            &self.live_config.current().site,
+            self.enqueuer.as_ref(),
+            self.batch_size,
+        )
+        .await
+        .map_err(HandlerError::new)
+    }
+}
+
+/// `goroutine.WithName("codeintel.autoindexing-ondemand-scheduler")`.
+pub const ON_DEMAND_ROUTINE_NAME: &str = "codeintel.autoindexing-ondemand-scheduler";
+
+/// `goroutine.WithDescription("schedule autoindexing jobs for explicitly
+/// requested repo+revhash combinations")`.
+pub const ON_DEMAND_ROUTINE_DESCRIPTION: &str =
+    "schedule autoindexing jobs for explicitly requested repo+revhash combinations";
+
+/// `scheduler.NewOnDemandScheduler`: the on-demand routine.
+pub fn new_on_demand_scheduler_routine(
+    frontend: PgPool,
+    live_config: Arc<LiveConfig>,
+    enqueuer: Arc<dyn IndexEnqueuer>,
+    batch_size: i64,
+    interval: Duration,
+) -> BackgroundRoutine {
+    PeriodicRoutine::new(Arc::new(OnDemandSchedulerHandler::new(
+        frontend,
+        live_config,
+        enqueuer,
+        batch_size,
+    )))
+    .with_name(ON_DEMAND_ROUTINE_NAME)
+    .with_description(ON_DEMAND_ROUTINE_DESCRIPTION)
+    .with_interval(interval)
+    .into()
+}
+
 /// The periodic handler's `HandlerFunc`.
 pub struct SchedulerHandler {
     frontend: PgPool,
@@ -573,8 +704,8 @@ impl Handler for SchedulerHandler {
     }
 }
 
-/// `scheduler.NewScheduler`: the periodic routine (the on-demand scheduler is
-/// not ported yet).
+/// `scheduler.NewScheduler`: the periodic routine. The on-demand routine is
+/// [`new_on_demand_scheduler_routine`].
 pub fn new_scheduler_routine(
     frontend: PgPool,
     live_config: Arc<LiveConfig>,
@@ -713,6 +844,32 @@ mod tests {
         assert_eq!(
             site.codeintel_autoindexing_policy_repository_match_limit(),
             -1
+        );
+    }
+
+    #[test]
+    fn on_demand_errors_are_returned_bare() {
+        // The zero-value `&gitdomain.RevisionNotFoundError{}` formats as
+        // "revision not found: @"; the on-demand scheduler returns it as-is.
+        assert_eq!(
+            QueueAutoIndexJobsError::RevisionNotFound.into_message(),
+            "revision not found: @"
+        );
+        assert_eq!(
+            QueueAutoIndexJobsError::Other("boom".to_owned()).into_message(),
+            "boom"
+        );
+    }
+
+    #[test]
+    fn on_demand_routine_metadata_matches_the_baseline() {
+        assert_eq!(
+            ON_DEMAND_ROUTINE_NAME,
+            "codeintel.autoindexing-ondemand-scheduler"
+        );
+        assert_eq!(
+            ON_DEMAND_ROUTINE_DESCRIPTION,
+            "schedule autoindexing jobs for explicitly requested repo+revhash combinations"
         );
     }
 }
