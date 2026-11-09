@@ -17,6 +17,7 @@ pub mod ipallowlist;
 pub mod middleware;
 pub mod mux;
 pub mod service;
+pub mod site_config_file;
 pub mod tenant;
 pub mod version;
 

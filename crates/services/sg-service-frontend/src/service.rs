@@ -35,8 +35,8 @@ pub fn service_name() -> &'static str {
 pub struct FrontendService {
     config: Option<FrontendConfig>,
     version: Version,
-    /// The `conf.Get()` snapshot. The configuration service is not ported
-    /// yet, so this stays empty (IP allowlist disabled) until then.
+    /// The `conf.Get()` snapshot: the merged `SITE_CONFIG_FILE` at configure
+    /// time, empty until the configuration service is ported.
     site_config: SiteConfiguration,
     allowlist_env: AllowlistEnv,
 }
@@ -91,6 +91,13 @@ impl Service for FrontendService {
     fn configure(&mut self, env: &mut EnvReader) -> Result<(), ConfigError> {
         self.config = Some(FrontendConfig::load(env)?);
         self.allowlist_env = AllowlistEnv::from_env();
+        // Baseline `serve_cmd.go:135`: `overrideSiteConfig` fails startup when
+        // the file cannot be read or merged.
+        if let Some(site_config) = crate::site_config_file::load_from_env().map_err(|err| {
+            ConfigError::new(format!("failed to apply site config overrides: {err}"))
+        })? {
+            self.site_config = site_config;
+        }
         Ok(())
     }
 
