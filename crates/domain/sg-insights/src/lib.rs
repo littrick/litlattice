@@ -10,12 +10,20 @@
 //!   [`sg_search_query`]'s plan and [`sg_insights_query`]'s query builder.
 //! - [`timeseries`] (`internal/insights/timeseries`): sample-interval stepping
 //!   (including Go's `AddDate` normalization) and sample-point construction.
+//! - [`scheduler`] (`internal/insights/scheduler`): the pure backfill decision
+//!   helpers (state enum, error threshold, series query parsing, incomplete
+//!   reasons).
+//! - [`iterator`] (`internal/insights/scheduler/iterator`): the pure
+//!   repository-iterator state machine (peeking, error accounting, retries).
 //! - [`types`]: the subset of `internal/insights/types` those modules need.
 //!
 //! Not ported here: `aggregation`/`compression` (they need search results and
-//! gitserver commit indexes) and anything that touches insight storage; see
-//! `docs/modules/06_worker.md`.
+//! gitserver commit indexes), the storage-bound scheduler/iterator methods
+//! (`BackfillStore`, `PersistentRepoIterator` persistence) and anything else
+//! that touches insight storage; see `docs/modules/06_worker.md`.
 
+pub mod iterator;
 pub mod priority;
+pub mod scheduler;
 pub mod timeseries;
 pub mod types;
