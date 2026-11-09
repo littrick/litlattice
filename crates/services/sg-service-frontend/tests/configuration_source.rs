@@ -6,8 +6,9 @@
 //! `SG_CONFIG_SOURCE_SCENARIO`. Each scenario resets the table itself.
 
 use sg_config::server::ConfigurationSource;
+use sg_config::RawUnified;
 use sg_service_frontend::configuration_source::DbConfigurationSource;
-use sqlx::PgPool;
+use sqlx::{PgPool, Row};
 
 fn flat(input: &str) -> String {
     input
@@ -29,6 +30,58 @@ async fn rows(pool: &PgPool) -> i64 {
         .fetch_one(pool)
         .await
         .expect("count")
+}
+
+/// The latest row: `(id, author_user_id, contents)`, NULL author as 0.
+async fn latest(pool: &PgPool) -> (i32, i32, String) {
+    let row = sqlx::query(
+        "SELECT id, author_user_id, contents FROM critical_and_site_config \
+         ORDER BY id DESC LIMIT 1",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("latest");
+    let id: i32 = row.try_get("id").expect("id");
+    let author: Option<i32> = row.try_get("author_user_id").expect("author");
+    let contents: String = row.try_get("contents").expect("contents");
+    (id, author.unwrap_or(0), contents)
+}
+
+/// The schema requires `auth.providers` (the custom check rejects an empty
+/// list), so the write scenarios use the smallest valid document.
+const NEW_SITE: &str = r#"{"auth.providers":[{"type":"builtin","allowSignup":true}]}"#;
+
+fn print_write(scenario: &str, result: Result<(), String>, rows: i64, latest: (i32, i32, String)) {
+    match result {
+        Ok(()) => println!("cw {scenario} write-err=nil rows={rows}"),
+        Err(err) => println!("cw {scenario} write-err={} rows={rows}", flat(&err)),
+    }
+    println!(
+        "cw {scenario} latest id={} author={} contents={}",
+        latest.0,
+        latest.1,
+        flat(&latest.2)
+    );
+}
+
+async fn write_case(
+    pool: &PgPool,
+    source: &DbConfigurationSource,
+    scenario: &str,
+    last_id: i32,
+    author_user_id: i32,
+) {
+    let result = source
+        .write(
+            RawUnified {
+                site: NEW_SITE.to_owned(),
+                ..RawUnified::default()
+            },
+            last_id,
+            author_user_id,
+        )
+        .await;
+    print_write(scenario, result, rows(pool).await, latest(pool).await);
 }
 
 fn print_raw(tag: &str, result: Result<sg_config::RawUnified, String>, rows: i64) {
@@ -85,6 +138,30 @@ async fn configuration_source_harness() {
             reset(&pool).await;
             let result = source.read().await;
             print_raw("dev", result, rows(&pool).await);
+        }
+        "write-ok" => {
+            reset(&pool).await;
+            let raw = source.read().await.expect("seed read");
+            write_case(&pool, &source, "write-ok", raw.id, 3).await;
+        }
+        "write-stale" => {
+            reset(&pool).await;
+            let raw = source.read().await.expect("seed read");
+            write_case(&pool, &source, "write-stale", raw.id + 100, 3).await;
+        }
+        "write-empty" => {
+            reset(&pool).await;
+            write_case(&pool, &source, "write-empty", 0, 3).await;
+        }
+        "write-author" => {
+            reset(&pool).await;
+            let raw = source.read().await.expect("seed read");
+            write_case(&pool, &source, "write-author", raw.id, 7).await;
+        }
+        "write-zero-author" => {
+            reset(&pool).await;
+            let raw = source.read().await.expect("seed read");
+            write_case(&pool, &source, "write-zero-author", raw.id, 0).await;
         }
         other => panic!("unknown scenario {other}"),
     }
