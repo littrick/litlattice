@@ -6,11 +6,15 @@
 //!
 //! The baseline job registers twelve routines (exporter, coordinator,
 //! mapper ×2, reducer, janitor ×7) and five configs. This port registers the
-//! ten routines whose store dependencies are already available
-//! (mapper ×2, reducer, janitor ×7) in the baseline order, and still loads
-//! and validates all five configs so the worker's environment variables keep
-//! their meaning:
+//! eleven routines whose dependencies are now available in the baseline order,
+//! and still loads and validates all five configs so the worker's environment
+//! variables keep their meaning:
 //!
+//! * `codeintel.ranking.symbol-exporter`
+//!   (`exporter.exportRankingGraph`: SCIP documents → ranking definitions,
+//!   references and initial path ranks; the document stream reads the
+//!   code-intel database from `ServiceConnections.CodeIntelPostgresDSN`,
+//!   while the writes stay on the frontend database);
 //! * `codeintel.ranking.file-reference-count-mapper`
 //!   (`mapper.mapRankingGraph`: `InsertPathCountInputs`);
 //! * `codeintel.ranking.file-reference-count-seed-mapper`
@@ -23,9 +27,6 @@
 //! Deferred (documented in
 //! `dev/rs/docs/overviews/m9_8dr_ranking_background_jobs_overview.md` §2.3):
 //!
-//! * `codeintel.ranking.symbol-exporter` needs the ranking lsifstore (SCIP
-//!   document reads) and a `scip.SymbolFormatter` equivalent; the worker
-//!   crate does not depend on `sg-scip` and `sg-scip` has no formatter yet;
 //! * `codeintel.ranking.coordinator` needs a cron expression parser
 //!   (`cronexpr`, default `@weekly`); the workspace has no cron crate.
 //!
@@ -40,14 +41,22 @@
 //! (records processed/altered) are not ported; the store return values are
 //! still computed, and the differential harness observes the rows instead.
 
+use std::collections::HashSet;
+use std::io::Read;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use flate2::read::GzDecoder;
+use prost::Message;
 use sg_config::{LiveConfig, SiteConfiguration};
 use sg_core::{ConfigError, EnvReader};
 use sg_db::codeintel_ranking;
-use sqlx::PgPool;
+use sg_scip::canonicalize_symbol;
+use sg_scip::scip::{Document, SymbolRole};
+use sqlx::{PgConnection, PgPool, Row};
+use tokio_stream::StreamExt;
 use tokio_util::sync::CancellationToken;
 
 use super::{get_interval, Job, JobConfig, JobDeps};
@@ -57,6 +66,12 @@ use crate::framework::BackgroundRoutine;
 
 /// `rankingJob.Description`.
 pub const JOB_DESCRIPTION: &str = "";
+
+/// `exporter.NewSymbolExporter`'s routine name.
+pub const EXPORTER_ROUTINE_NAME: &str = "codeintel.ranking.symbol-exporter";
+/// `exporter.NewSymbolExporter`'s routine description.
+pub const EXPORTER_ROUTINE_DESCRIPTION: &str =
+    "Exports SCIP data to ranking definitions and reference tables.";
 
 /// `mapper.NewMapper`'s routine name.
 pub const MAPPER_ROUTINE_NAME: &str = "codeintel.ranking.file-reference-count-mapper";
@@ -625,9 +640,9 @@ impl Job for RankingFileReferenceCounter {
         ]
     }
 
-    /// `rankingJob.Routines`. The exporter and coordinator routines are
-    /// deferred (see the module docs); their configs above are still loaded
-    /// so their environment variables keep their meaning.
+    /// `rankingJob.Routines`. The coordinator routine is deferred (see the
+    /// module docs); its config is still loaded so its environment variables
+    /// keep their meaning.
     async fn routines(
         &self,
         deps: &JobDeps,
@@ -638,8 +653,39 @@ impl Job for RankingFileReferenceCounter {
         let mapper_batch_size = self.mapper.batch_size();
         let reducer_batch_size = self.reducer.batch_size();
 
-        let mut routines: Vec<BackgroundRoutine> = Vec::with_capacity(10);
+        // `codeintel.InitServices`: the exporter's lsifstore runs on the
+        // separate code-intel database configured by the frontend
+        // (`ServiceConnections.CodeIntelPostgresDSN`).
+        let unified = deps.live_config.current();
+        if unified
+            .service_connections
+            .code_intel_postgres_dsn
+            .is_empty()
+        {
+            return Err("code_intel_postgres_dsn is not configured by the frontend".to_owned());
+        }
+        let codeintel_pool =
+            sg_db::connect(&unified.service_connections.code_intel_postgres_dsn, 10)
+                .await
+                .map_err(|err| format!("connecting to the codeintel database: {err}"))?;
 
+        let mut routines: Vec<BackgroundRoutine> = Vec::with_capacity(11);
+
+        routines.push(
+            PeriodicRoutine::new(Arc::new(RankingExporterHandler {
+                pool: pool.clone(),
+                codeintel_pool,
+                live_config: Arc::clone(&live_config),
+                read_batch_size: self.exporter.read_batch_size(),
+                write_batch_size: self.exporter.write_batch_size(),
+            }))
+            .with_name(EXPORTER_ROUTINE_NAME)
+            .with_description(EXPORTER_ROUTINE_DESCRIPTION)
+            .with_interval(self.exporter.interval())
+            .into(),
+        );
+        // `codeintel.ranking.coordinator` belongs here in the baseline order;
+        // it is deferred until a cron expression parser is available.
         routines.push(
             PeriodicRoutine::new(Arc::new(RankingMapperHandler {
                 pool: pool.clone(),
@@ -695,6 +741,215 @@ impl Job for RankingFileReferenceCounter {
 /// The current site configuration snapshot (`conf.Get()`).
 fn current_site(live_config: &LiveConfig) -> Arc<sg_config::Unified> {
     live_config.current()
+}
+
+/// `getDocumentsByUploadIDQuery`
+/// (`internal/codeintel/ranking/internal/lsifstore/stream.go`).
+const GET_DOCUMENTS_BY_UPLOAD_ID_QUERY: &str = r#"
+SELECT
+	sid.document_path,
+	sd.raw_scip_payload
+FROM codeintel_scip_document_lookup sid
+JOIN codeintel_scip_documents sd ON sd.id = sid.document_id
+WHERE sid.upload_id = $1
+ORDER BY sid.document_path
+"#;
+
+/// Errors raised by [`export_ranking_graph`]: the baseline wraps the store,
+/// gzip and protobuf failures and logs them per upload.
+#[derive(Debug)]
+pub enum ExportError {
+    Sql(sqlx::Error),
+    Io(std::io::Error),
+    Decode(prost::DecodeError),
+}
+
+impl std::fmt::Display for ExportError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Sql(err) => write!(f, "ranking exporter query failed: {err}"),
+            Self::Io(err) => write!(f, "ranking exporter decompression failed: {err}"),
+            Self::Decode(err) => write!(f, "ranking exporter SCIP decode failed: {err}"),
+        }
+    }
+}
+
+impl std::error::Error for ExportError {}
+
+impl From<sqlx::Error> for ExportError {
+    fn from(err: sqlx::Error) -> Self {
+        Self::Sql(err)
+    }
+}
+
+impl From<std::io::Error> for ExportError {
+    fn from(err: std::io::Error) -> Self {
+        Self::Io(err)
+    }
+}
+
+impl From<prost::DecodeError> for ExportError {
+    fn from(err: prost::DecodeError) -> Self {
+        Self::Decode(err)
+    }
+}
+
+/// `exporter.exportRankingGraph`: stream the SCIP documents of every upload
+/// that has not yet been exported for the root graph key, write the ranking
+/// definitions/references for each document and its initial path ranks — all
+/// inside one transaction on the frontend database — and return
+/// `(uploads, definitions, references)`.
+///
+/// The baseline wires two stores over two databases: the ranking store runs on
+/// the frontend DB, while the lsifstore that streams the SCIP documents runs
+/// on the code-intel DB (`ServiceConnections.CodeIntelPostgresDSN`). Both are
+/// given here; the document stream uses its own transaction on
+/// `codeintel_pool`, committed before the store transaction, exactly like the
+/// nested `baseLsifStore.WithTransaction`. The gate, the upload selection and
+/// the per-document writes follow the baseline; metrics and logs are not
+/// ported.
+pub async fn export_ranking_graph(
+    store_pool: &PgPool,
+    codeintel_pool: &PgPool,
+    site: &SiteConfiguration,
+    read_batch_size: i64,
+    write_batch_size: i64,
+) -> Result<(i64, i64, i64), ExportError> {
+    if !document_reference_counts_enabled(site) {
+        return Ok((0, 0, 0));
+    }
+
+    let graph_key = root_graph_key(site);
+    let mut tx = store_pool.begin().await?;
+    let mut lsif_tx = codeintel_pool.begin().await?;
+
+    let uploads =
+        codeintel_ranking::get_uploads_for_ranking_on(&mut *tx, &graph_key, read_batch_size)
+            .await?;
+    let num_uploads = uploads.len() as i64;
+    let mut num_definitions = 0i64;
+    let mut num_references = 0i64;
+
+    for upload in &uploads {
+        let mut document_paths: Vec<String> = Vec::new();
+
+        // `InsertDefinitionsAndReferencesForDocument`: rows are read from the
+        // code-intel database in `document_path` order and processed one
+        // document at a time.
+        let mut rows = sqlx::query(GET_DOCUMENTS_BY_UPLOAD_ID_QUERY)
+            .bind(upload.upload_id)
+            .fetch(&mut *lsif_tx);
+        while let Some(row) = rows.next().await {
+            let row = row?;
+            let path: String = row.try_get("document_path")?;
+            let compressed: Vec<u8> = row.try_get("raw_scip_payload")?;
+            let document = Document::decode(decompress(&compressed)?.as_slice())?;
+
+            let (definitions, references) = set_definitions_and_references_for_upload(
+                &mut *tx,
+                &graph_key,
+                write_batch_size,
+                upload,
+                &path,
+                &document,
+            )
+            .await?;
+
+            document_paths.push(path);
+            num_definitions += definitions;
+            num_references += references;
+        }
+
+        codeintel_ranking::insert_initial_path_ranks_on(
+            &mut *tx,
+            upload.exported_upload_id,
+            &document_paths,
+            write_batch_size,
+            &graph_key,
+        )
+        .await?;
+    }
+
+    lsif_tx.commit().await?;
+    tx.commit().await?;
+    Ok((num_uploads, num_definitions, num_references))
+}
+
+/// `exporter.setDefinitionsAndReferencesForUpload`: definitions first (the
+/// same symbol string is emitted at most once per document), then references
+/// (definition occurrences and symbols already defined in this document are
+/// skipped).
+async fn set_definitions_and_references_for_upload(
+    conn: &mut PgConnection,
+    graph_key: &str,
+    batch_size: i64,
+    upload: &codeintel_ranking::ExportedUpload,
+    path: &str,
+    document: &Document,
+) -> Result<(i64, i64), sqlx::Error> {
+    let document_path = join_document_path(&upload.root, path);
+
+    let mut seen_definitions: HashSet<&str> = HashSet::new();
+    let mut definitions: Vec<codeintel_ranking::RankingDefinition> = Vec::new();
+    for occurrence in &document.occurrences {
+        if occurrence.symbol_roles & (SymbolRole::Definition as i32) == 0 {
+            continue;
+        }
+        if seen_definitions.contains(occurrence.symbol.as_str()) {
+            continue;
+        }
+        if let Some(checksum) = canonicalize_symbol(&occurrence.symbol) {
+            definitions.push(codeintel_ranking::RankingDefinition {
+                exported_upload_id: upload.exported_upload_id,
+                symbol_checksum: checksum,
+                document_path: document_path.clone(),
+            });
+            seen_definitions.insert(occurrence.symbol.as_str());
+        }
+    }
+
+    let num_definitions = definitions.len() as i64;
+    codeintel_ranking::insert_definitions_for_ranking_on(conn, graph_key, &definitions).await?;
+
+    let mut references: Vec<[u8; 16]> = Vec::new();
+    for occurrence in &document.occurrences {
+        if occurrence.symbol_roles & (SymbolRole::Definition as i32) != 0 {
+            continue;
+        }
+        if seen_definitions.contains(occurrence.symbol.as_str()) {
+            continue;
+        }
+        if let Some(checksum) = canonicalize_symbol(&occurrence.symbol) {
+            references.push(checksum);
+        }
+    }
+
+    let num_references = references.len() as i64;
+    codeintel_ranking::insert_references_for_ranking_on(
+        conn,
+        graph_key,
+        batch_size,
+        upload.exported_upload_id,
+        &references,
+    )
+    .await?;
+
+    Ok((num_definitions, num_references))
+}
+
+/// `filepath.Join(upload.Root, path)`. `Path::join` does not clean `.`/`..`
+/// the way Go's `filepath.Join` does; upload roots and SCIP document paths are
+/// already clean, so the two agree on the inputs the exporter sees.
+fn join_document_path(root: &str, path: &str) -> String {
+    Path::new(root).join(path).to_string_lossy().into_owned()
+}
+
+/// `shared.Decompressor.Decompress`: gunzip the stored SCIP payload.
+fn decompress(payload: &[u8]) -> Result<Vec<u8>, std::io::Error> {
+    let mut decoder = GzDecoder::new(payload);
+    let mut decompressed = Vec::new();
+    decoder.read_to_end(&mut decompressed)?;
+    Ok(decompressed)
 }
 
 /// `mapper.mapRankingGraph`: `InsertPathCountInputs` for the newest
@@ -821,6 +1076,33 @@ pub async fn run_janitor(
     }
 }
 
+struct RankingExporterHandler {
+    pool: PgPool,
+    /// The code-intel database the SCIP document stream reads from
+    /// (`ServiceConnections.CodeIntelPostgresDSN`).
+    codeintel_pool: PgPool,
+    live_config: Arc<LiveConfig>,
+    read_batch_size: i64,
+    write_batch_size: i64,
+}
+
+#[async_trait]
+impl Handler for RankingExporterHandler {
+    async fn handle(&self, _ctx: CancellationToken) -> Result<(), HandlerError> {
+        let unified = current_site(&self.live_config);
+        export_ranking_graph(
+            &self.pool,
+            &self.codeintel_pool,
+            &unified.site,
+            self.read_batch_size,
+            self.write_batch_size,
+        )
+        .await
+        .map(|_| ())
+        .map_err(|err| HandlerError::new(err.to_string()))
+    }
+}
+
 struct RankingMapperHandler {
     pool: PgPool,
     live_config: Arc<LiveConfig>,
@@ -906,6 +1188,11 @@ mod tests {
         assert_eq!(job.description(), JOB_DESCRIPTION);
         // exporter, coordinator, mapper, reducer, janitor
         assert_eq!(job.configs().len(), 5);
+        assert_eq!(EXPORTER_ROUTINE_NAME, "codeintel.ranking.symbol-exporter");
+        assert_eq!(
+            EXPORTER_ROUTINE_DESCRIPTION,
+            "Exports SCIP data to ranking definitions and reference tables."
+        );
         assert_eq!(
             MAPPER_ROUTINE_NAME,
             "codeintel.ranking.file-reference-count-mapper"
@@ -1008,6 +1295,14 @@ mod tests {
             derivative_graph_key_for_prefix(&configured, "2026-11"),
             "prod_2_eu.2026_11"
         );
+    }
+
+    #[test]
+    fn document_paths_join_like_filepath_join() {
+        assert_eq!(join_document_path("", "a/b.go"), "a/b.go");
+        assert_eq!(join_document_path("src", "a/b.go"), "src/a/b.go");
+        assert_eq!(join_document_path("src/", "a/b.go"), "src/a/b.go");
+        assert_eq!(join_document_path("/", "a.go"), "/a.go");
     }
 
     #[test]

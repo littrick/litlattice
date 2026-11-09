@@ -25,6 +25,7 @@ sg-objectstorage = { path = "../../data/sg-objectstorage" }
 sg-proto = { path = "../../net/sg-proto" }
 sg-rcache = { path = "../../data/sg-rcache" }
 sg-redis = { path = "../../data/sg-redis" }
+sg-scip = { path = "../../domain/sg-scip" }
 sg-txemail = { path = "../../domain/sg-txemail" }
 sg-zoekt = { path = "../../domain/sg-zoekt" }
 async-trait = { workspace = true }

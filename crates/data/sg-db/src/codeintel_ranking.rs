@@ -34,7 +34,7 @@
 
 use std::collections::BTreeMap;
 
-use sqlx::postgres::PgPool;
+use sqlx::postgres::{PgPool, PgRow};
 use sqlx::types::time::OffsetDateTime;
 use sqlx::{PgConnection, QueryBuilder, Row};
 
@@ -419,17 +419,34 @@ pub async fn get_uploads_for_ranking(
         .fetch_all(pool)
         .await?;
 
-    rows.into_iter()
-        .map(|row| {
-            Ok(ExportedUpload {
-                upload_id: row.try_get("upload_id")?,
-                exported_upload_id: row.try_get("id")?,
-                repo: row.try_get("repository_name")?,
-                repo_id: row.try_get("repository_id")?,
-                root: row.try_get("root")?,
-            })
-        })
-        .collect()
+    rows.into_iter().map(exported_upload_from_row).collect()
+}
+
+/// [`get_uploads_for_ranking`] against an open connection, so the ranking
+/// exporter registers exports and reads them back inside its transaction.
+pub async fn get_uploads_for_ranking_on(
+    conn: &mut PgConnection,
+    graph_key: &str,
+    batch_size: i64,
+) -> Result<Vec<ExportedUpload>, sqlx::Error> {
+    let rows = sqlx::query(GET_UPLOADS_FOR_RANKING_QUERY)
+        .bind(graph_key)
+        .bind(batch_size)
+        .bind(graph_key)
+        .fetch_all(&mut *conn)
+        .await?;
+
+    rows.into_iter().map(exported_upload_from_row).collect()
+}
+
+fn exported_upload_from_row(row: PgRow) -> Result<ExportedUpload, sqlx::Error> {
+    Ok(ExportedUpload {
+        upload_id: row.try_get("upload_id")?,
+        exported_upload_id: row.try_get("id")?,
+        repo: row.try_get("repository_name")?,
+        repo_id: row.try_get("repository_id")?,
+        root: row.try_get("root")?,
+    })
 }
 
 const VACUUM_ABANDONED_EXPORTED_UPLOADS_QUERY: &str = r#"
@@ -1523,9 +1540,9 @@ pub async fn insert_definitions_for_ranking(
 }
 
 /// [`insert_definitions_for_ranking`] against an open connection, so
-/// [`insert_initial_path_ranks`] writes its sentinel definitions through the
-/// same transaction as the initial-path rows.
-async fn insert_definitions_for_ranking_on(
+/// [`insert_initial_path_ranks`] and the ranking exporter write their
+/// definitions through the same transaction as their other writes.
+pub async fn insert_definitions_for_ranking_on(
     conn: &mut PgConnection,
     graph_key: &str,
     definitions: &[RankingDefinition],
@@ -1562,12 +1579,32 @@ pub async fn insert_references_for_ranking(
     exported_upload_id: i32,
     references: &[[u8; 16]],
 ) -> Result<(), sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    insert_references_for_ranking_on(
+        &mut *tx,
+        graph_key,
+        batch_size,
+        exported_upload_id,
+        references,
+    )
+    .await?;
+    tx.commit().await
+}
+
+/// [`insert_references_for_ranking`] against an open connection, so the
+/// ranking exporter writes references through its outer transaction.
+pub async fn insert_references_for_ranking_on(
+    conn: &mut PgConnection,
+    graph_key: &str,
+    batch_size: i64,
+    exported_upload_id: i32,
+    references: &[[u8; 16]],
+) -> Result<(), sqlx::Error> {
     let batches = chunks_for_batch_size(references, batch_size);
     if batches.is_empty() {
         return Ok(());
     }
 
-    let mut tx = pool.begin().await?;
     for checksums in batches {
         // One row per batch; the checksums are spelled out as `ARRAY[...]` so
         // only scalar `bytea` parameters are bound (the empty `symbol_names`
@@ -1588,9 +1625,9 @@ pub async fn insert_references_for_ranking(
         builder.push("]::bytea[], ");
         builder.push_bind(graph_key);
         builder.push(")");
-        builder.build().execute(&mut *tx).await?;
+        builder.build().execute(&mut *conn).await?;
     }
-    tx.commit().await
+    Ok(())
 }
 
 /// `createInitialPathTemporaryTableQuery` (`store/paths.go`).
@@ -1620,9 +1657,30 @@ pub async fn insert_initial_path_ranks(
     graph_key: &str,
 ) -> Result<(), sqlx::Error> {
     let mut tx = pool.begin().await?;
+    insert_initial_path_ranks_on(
+        &mut *tx,
+        exported_upload_id,
+        document_paths,
+        batch_size,
+        graph_key,
+    )
+    .await?;
+    tx.commit().await
+}
 
+/// [`insert_initial_path_ranks`] against an open connection, so the ranking
+/// exporter shares its outer transaction. The temporary table persists for the
+/// lifetime of that transaction, exactly as the baseline's nested transaction
+/// does (later uploads see rows staged by earlier ones).
+pub async fn insert_initial_path_ranks_on(
+    conn: &mut PgConnection,
+    exported_upload_id: i32,
+    document_paths: &[String],
+    batch_size: i64,
+    graph_key: &str,
+) -> Result<(), sqlx::Error> {
     sqlx::query(CREATE_INITIAL_PATH_TEMPORARY_TABLE_QUERY)
-        .execute(&mut *tx)
+        .execute(&mut *conn)
         .await?;
 
     for paths in chunks_for_batch_size(document_paths, batch_size) {
@@ -1637,13 +1695,13 @@ pub async fn insert_initial_path_ranks(
             builder.push_bind(path.as_str());
         }
         builder.push("]::text[])");
-        builder.build().execute(&mut *tx).await?;
+        builder.build().execute(&mut *conn).await?;
     }
 
     sqlx::query(INSERT_INITIAL_PATH_RANK_COUNTS_QUERY)
         .bind(exported_upload_id)
         .bind(graph_key)
-        .execute(&mut *tx)
+        .execute(&mut *conn)
         .await?;
 
     let definitions: Vec<RankingDefinition> = document_paths
@@ -1654,9 +1712,9 @@ pub async fn insert_initial_path_ranks(
             document_path: document_path.clone(),
         })
         .collect();
-    insert_definitions_for_ranking_on(&mut *tx, graph_key, &definitions).await?;
+    insert_definitions_for_ranking_on(&mut *conn, graph_key, &definitions).await?;
 
-    tx.commit().await
+    Ok(())
 }
 
 #[cfg(test)]
