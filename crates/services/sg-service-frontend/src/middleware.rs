@@ -253,9 +253,11 @@ pub fn external_handler_with_live(
     allowlist_env: AllowlistEnv,
     version: Bytes,
 ) -> sg_http::HttpHandler {
+    let api_live = Arc::clone(&live);
     let middleware = Arc::new(LiveMiddleware::new(live, allowlist_env));
     Arc::new(move |mut req: Request<Incoming>| {
         let middleware = Arc::clone(&middleware);
+        let api_live = Arc::clone(&api_live);
         let version = version.clone();
         Box::pin(async move {
             let derived = middleware.current();
@@ -266,7 +268,13 @@ pub fn external_handler_with_live(
                 derived.forbid_all,
                 derived.trace_url_template.as_deref(),
                 &derived.security.external_url,
-                |req| mux::route(req, &derived.security, mux::not_found_dispatch),
+                |req| {
+                    let request: &Request<Incoming> = req;
+                    mux::route(request, &derived.security, |route| match route {
+                        mux::Route::Api => crate::external_api::api_response(request, &api_live),
+                        other => mux::not_found_dispatch(other),
+                    })
+                },
             )
         })
     })

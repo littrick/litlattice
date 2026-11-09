@@ -17,6 +17,7 @@ pub mod configuration_source;
 pub mod configuration_startup;
 pub mod debug;
 pub mod deploy_defaults;
+pub mod external_api;
 pub mod goimportpath;
 pub mod health;
 pub mod internal_api;

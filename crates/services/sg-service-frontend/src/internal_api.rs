@@ -116,7 +116,11 @@ pub fn internal_response<B>(req: &Request<B>, live: &LiveConfig) -> Response<Box
 /// path without its trailing slash. The route handler is replaced, so the
 /// `JsonMiddleware` content type is absent. Go's `http.Redirect` sets the
 /// `text/html` type for GET and HEAD but only writes the HTML body for GET.
-fn strict_slash_redirect(method: &Method, path: &str, query: Option<&str>) -> Response<BoxBody> {
+pub(crate) fn strict_slash_redirect(
+    method: &Method,
+    path: &str,
+    query: Option<&str>,
+) -> Response<BoxBody> {
     let mut location = escape_path(path);
     if let Some(query) = query {
         location.push('?');
@@ -147,7 +151,7 @@ fn strict_slash_redirect(method: &Method, path: &str, query: Option<&str>) -> Re
 }
 
 /// `enterprise.makeNotFoundHandler`: raw 404 write, sniffed as `text/plain`.
-fn enterprise_not_found(name: &str) -> Response<BoxBody> {
+pub(crate) fn enterprise_not_found(name: &str) -> Response<BoxBody> {
     text_response(
         StatusCode::NOT_FOUND,
         "text/plain; charset=utf-8",
@@ -248,7 +252,7 @@ fn go_path_join(repo: &str, git_path: &str) -> String {
 
 /// A 3xx response with `Location` and, when the baseline set one, a
 /// `Content-Type`.
-fn located(
+pub(crate) fn located(
     status: StatusCode,
     location: String,
     content_type: Option<&'static str>,
@@ -278,7 +282,7 @@ fn located_with_body(
 }
 
 /// A status-only response (no body, no `Content-Type`).
-fn empty_response(status: StatusCode) -> Response<BoxBody> {
+pub(crate) fn empty_response(status: StatusCode) -> Response<BoxBody> {
     let mut response = Response::new(tonic::body::boxed(Full::new(Bytes::new())));
     *response.status_mut() = status;
     response
@@ -295,7 +299,7 @@ fn no_route() -> Response<BoxBody> {
 }
 
 /// `http.Error`'s body + headers (`nosniff`) or a plain sniffed text response.
-fn text_response(
+pub(crate) fn text_response(
     status: StatusCode,
     content_type: &str,
     body: &str,
@@ -314,7 +318,7 @@ fn text_response(
 
 /// Go `URL.Path` decoding: `%XX` becomes a byte; invalid escapes are kept
 /// literally (the Go server instead rejects them with 400).
-fn decode_path(path: &str) -> String {
+pub(crate) fn decode_path(path: &str) -> String {
     let bytes = path.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut index = 0;
@@ -349,7 +353,7 @@ const HEX: [char; 16] = [
 
 /// Go `escape(s, encodePath)`: keeps unreserved characters and the reserved
 /// set except `?`, escaping everything else as uppercase `%XX`.
-fn escape_path(path: &str) -> String {
+pub(crate) fn escape_path(path: &str) -> String {
     let mut out = String::with_capacity(path.len());
     for &byte in path.as_bytes() {
         if should_escape_path(byte) {
@@ -374,7 +378,7 @@ fn should_escape_path(byte: u8) -> bool {
 }
 
 /// `net/http`'s `hexEscapeNonASCII`.
-fn hex_escape_non_ascii(input: &str) -> String {
+pub(crate) fn hex_escape_non_ascii(input: &str) -> String {
     if input.is_ascii() {
         return input.to_owned();
     }
