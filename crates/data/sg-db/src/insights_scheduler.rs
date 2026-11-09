@@ -17,6 +17,8 @@
 //! (the paged admin-queue SQL) and the worker wiring. They will follow with
 //! the backfill worker port.
 
+use std::collections::{BTreeMap, HashMap};
+
 use sqlx::postgres::{PgConnection, PgPool, PgRow};
 use sqlx::types::time::{OffsetDateTime, PrimitiveDateTime, UtcOffset};
 use sqlx::Row;
@@ -516,6 +518,42 @@ pub async fn update_repo_iterator(
     runtime_duration: i64,
 ) -> Result<RepoIterator, sqlx::Error> {
     let mut conn = pool.acquire().await?;
+    let progress = update_repo_iterator_in(
+        &mut conn,
+        id,
+        success_count,
+        cursor_offset,
+        runtime_duration,
+    )
+    .await?;
+    let mut iterator = load_iterator_on(&mut conn, id).await?;
+    // Keep the returned progress fields (the pure callers read these).
+    iterator.percent_complete = progress.percent_complete;
+    iterator.success_count = progress.success_count;
+    iterator.cursor = progress.cursor;
+    iterator.runtime_duration = progress.runtime_duration;
+    Ok(iterator)
+}
+
+/// The progress columns `updateRepoIterator` returns.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct IteratorProgress {
+    pub percent_complete: f64,
+    pub success_count: i32,
+    pub cursor: i32,
+    /// `time.Duration` in nanoseconds.
+    pub runtime_duration: i64,
+}
+
+/// `PersistentRepoIterator.updateRepoIterator` on an existing connection or
+/// transaction.
+pub async fn update_repo_iterator_in(
+    conn: &mut PgConnection,
+    id: i32,
+    success_count: i32,
+    cursor_offset: i32,
+    runtime_duration: i64,
+) -> Result<IteratorProgress, sqlx::Error> {
     let row = sqlx::query(
         "UPDATE repo_iterator \
          SET percent_complete = COALESCE((($1 + success_count)::float / NULLIF(total_count, 0)::float), 0), \
@@ -529,15 +567,14 @@ pub async fn update_repo_iterator(
     .bind(cursor_offset)
     .bind(runtime_duration)
     .bind(id)
-    .fetch_one(&mut *conn)
+    .fetch_one(conn)
     .await?;
-    let mut iterator = load_iterator_on(&mut conn, id).await?;
-    // Keep the returned progress fields (the pure callers read these).
-    iterator.percent_complete = row.try_get("percent_complete")?;
-    iterator.success_count = row.try_get("success_count")?;
-    iterator.cursor = row.try_get("repo_cursor")?;
-    iterator.runtime_duration = row.try_get("runtime_duration")?;
-    Ok(iterator)
+    Ok(IteratorProgress {
+        percent_complete: row.try_get("percent_complete")?,
+        success_count: row.try_get("success_count")?,
+        cursor: row.try_get("repo_cursor")?,
+        runtime_duration: row.try_get("runtime_duration")?,
+    })
 }
 
 /// `insertIterationError`: insert the first error for a repo (failure count
@@ -551,12 +588,23 @@ pub async fn insert_iteration_error(
     repo_id: i32,
     message: &str,
 ) -> Result<(), sqlx::Error> {
+    let mut conn = pool.acquire().await?;
+    insert_iteration_error_in(&mut conn, iterator_id, errors, repo_id, message).await
+}
+
+/// `insertIterationError` on an existing connection or transaction.
+pub async fn insert_iteration_error_in(
+    conn: &mut PgConnection,
+    iterator_id: i32,
+    errors: &mut Vec<IterationError>,
+    repo_id: i32,
+    message: &str,
+) -> Result<(), sqlx::Error> {
     if iterator_id == 0 {
         return Err(invalid_series_backfill(
             "invalid iterator to insert iterator error",
         ));
     }
-    let mut conn = pool.acquire().await?;
     if let Some(existing) = errors.iter_mut().find(|err| err.repo_id == repo_id) {
         existing.failure_count += 1;
         sqlx::query(
@@ -591,11 +639,373 @@ pub async fn insert_iteration_error(
 /// `doFinishN`'s delete path: drop a repo's recorded error after a retry
 /// succeeds. The caller looks up the error id.
 pub async fn delete_iteration_error(pool: &PgPool, error_id: i32) -> Result<(), sqlx::Error> {
+    let mut conn = pool.acquire().await?;
+    delete_iteration_error_in(&mut conn, error_id).await
+}
+
+/// `deleteIterationError` on an existing connection or transaction.
+pub async fn delete_iteration_error_in(
+    conn: &mut PgConnection,
+    error_id: i32,
+) -> Result<(), sqlx::Error> {
     sqlx::query("DELETE FROM repo_iterator_errors WHERE id = $1")
         .bind(error_id)
-        .execute(pool)
+        .execute(conn)
         .await?;
     Ok(())
+}
+
+// -------------------------------------------------------------------------
+// PersistentRepoIterator: the advancing half of the iterator
+// `internal/insights/scheduler/iterator/repo_iterator.go`
+// -------------------------------------------------------------------------
+
+/// `iterator.IterationConfig` for the storage-bound methods. `OnTerminal` is
+/// the [`TerminalHandler`] passed to [`PersistentRepoIterator::finish_page`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct IterationConfig {
+    pub max_failures: i32,
+}
+
+/// `config.OnTerminal`: called (inside the finish transaction) when a repo
+/// reaches `max_failures`.
+///
+/// The handler writes one incomplete datapoint per sample time, so the callback
+/// receives the transaction connection.
+#[async_trait::async_trait]
+pub trait TerminalHandler: Send {
+    async fn on_terminal(
+        &mut self,
+        conn: &mut PgConnection,
+        repo_id: i32,
+        error: &str,
+    ) -> Result<(), String>;
+}
+
+/// The finish closure returned by `NextPageWithFinish` / `NextRetryWithFinish`.
+///
+/// The Go closure captures the page repos and the start timestamp; callers
+/// must call [`PersistentRepoIterator::finish_page`] exactly once, otherwise
+/// the cursor never advances.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FinishHandle {
+    pub repos: Vec<i32>,
+    pub start: OffsetDateTime,
+    pub is_retry: bool,
+}
+
+/// `iterator.PersistentRepoIterator` loaded from the database plus the
+/// in-memory retry/terminal state the pure struct keeps.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PersistentRepoIterator {
+    pub row: RepoIterator,
+    /// `terminalErrors`.
+    pub terminal_errors: BTreeMap<i32, IterationError>,
+    /// `retryRepos`.
+    pub retry_repos: Vec<i32>,
+    /// `retryCursor`.
+    pub retry_cursor: usize,
+}
+
+impl PersistentRepoIterator {
+    /// `iterator.Load` (also loads `repo_iterator_errors`), including the
+    /// baseline's cursor bounds check.
+    pub async fn load(pool: &PgPool, id: i32) -> Result<Self, sqlx::Error> {
+        let mut conn = pool.acquire().await?;
+        Self::load_in(&mut conn, id).await
+    }
+
+    pub async fn load_in(conn: &mut PgConnection, id: i32) -> Result<Self, sqlx::Error> {
+        let iterator = load_iterator_on(conn, id).await?;
+        iterator.into_persistent()
+    }
+
+    /// `HasMore`.
+    pub fn has_more(&self) -> bool {
+        (self.row.cursor as usize) < self.row.repos.len()
+    }
+
+    /// `HasErrors`.
+    pub fn has_errors(&self) -> bool {
+        !self.row.errors.is_empty()
+    }
+
+    /// `HasTerminalErrors` (baseline checks `errors`, not `terminalErrors`).
+    pub fn has_terminal_errors(&self) -> bool {
+        !self.row.errors.is_empty()
+    }
+
+    /// `ErroredRepos`.
+    pub fn errored_repos(&self) -> usize {
+        self.row.errors.len()
+    }
+
+    /// `TotalErrors`.
+    pub fn total_errors(&self) -> i64 {
+        self.row
+            .errors
+            .iter()
+            .chain(self.terminal_errors.values())
+            .map(|err| i64::from(err.failure_count))
+            .sum()
+    }
+
+    /// `errorMap.FailureCount`.
+    pub fn failure_count(&self, repo: i32) -> i32 {
+        self.row
+            .errors
+            .iter()
+            .find(|err| err.repo_id == repo)
+            .map(|err| err.failure_count)
+            .unwrap_or(0)
+    }
+
+    /// `Errors`, loaded order (the caller sorts for output).
+    pub fn errors(&self) -> &[IterationError] {
+        &self.row.errors
+    }
+
+    /// `NextPageWithFinish`: the next `page_size` repos, or `None` when the
+    /// iterator is complete or the cursor is past the end.
+    ///
+    /// `now` is the clock reading Go takes as `itrStart`.
+    pub fn next_page_with_finish(
+        &self,
+        page_size: usize,
+        now: OffsetDateTime,
+    ) -> Option<(Vec<i32>, FinishHandle)> {
+        let offset = self.row.cursor as usize;
+        if self.row.completed_at.is_some() || offset >= self.row.repos.len() {
+            return None;
+        }
+        let repos = peek_n(offset, page_size, &self.row.repos);
+        Some((
+            repos.clone(),
+            FinishHandle {
+                repos,
+                start: now,
+                is_retry: false,
+            },
+        ))
+    }
+
+    /// `NextRetryWithFinish`: the next repo to retry, skipping (and
+    /// terminating) repos already at `max_failures`.
+    pub fn next_retry_with_finish(
+        &mut self,
+        config: IterationConfig,
+        now: OffsetDateTime,
+    ) -> Option<(i32, FinishHandle)> {
+        if self.retry_repos.is_empty() {
+            self.reset_retry(config);
+        }
+        loop {
+            if self.row.completed_at.is_some() {
+                return None;
+            }
+            let current = *self.retry_repos.get(self.retry_cursor)?;
+            if config.max_failures > 0 && self.failure_count(current) >= config.max_failures {
+                // This repo has exceeded its retry count: skip it.
+                self.retry_cursor += 1;
+                self.set_repo_terminal(current);
+                continue;
+            }
+            return Some((
+                current,
+                FinishHandle {
+                    repos: vec![current],
+                    start: now,
+                    is_retry: true,
+                },
+            ));
+        }
+    }
+
+    /// `resetRetry`: rebuild the retry list, moving repos at `max_failures`
+    /// into the terminal set.
+    pub fn reset_retry(&mut self, config: IterationConfig) {
+        self.retry_cursor = 0;
+        let mut terminal = BTreeMap::new();
+        let mut remaining = Vec::new();
+        let mut retry = Vec::new();
+        for err in std::mem::take(&mut self.row.errors) {
+            if config.max_failures > 0 && err.failure_count >= config.max_failures {
+                terminal.insert(err.repo_id, err);
+            } else {
+                retry.push(err.repo_id);
+                remaining.push(err);
+            }
+        }
+        self.row.errors = remaining;
+        self.terminal_errors = terminal;
+        self.retry_repos = retry;
+    }
+
+    /// `setRepoTerminal`.
+    pub fn set_repo_terminal(&mut self, repo_id: i32) {
+        if let Some(err) = self
+            .row
+            .errors
+            .iter()
+            .position(|err| err.repo_id == repo_id)
+            .map(|index| self.row.errors.remove(index))
+        {
+            self.terminal_errors.insert(repo_id, err);
+        }
+    }
+
+    /// `doFinishN`: advance the cursor and record errors in a new
+    /// transaction.
+    ///
+    /// `maybe_errors` maps a repo to its failure message; `end` is the clock
+    /// reading Go takes as `itrEnd`.
+    pub async fn finish_page(
+        &mut self,
+        pool: &PgPool,
+        handle: &FinishHandle,
+        maybe_errors: &HashMap<i32, String>,
+        config: IterationConfig,
+        end: OffsetDateTime,
+        on_terminal: &mut dyn TerminalHandler,
+    ) -> Result<(), String> {
+        let mut tx = pool.begin().await.map_err(|err| err.to_string())?;
+        let result = self
+            .finish_page_in(&mut tx, handle, maybe_errors, config, end, on_terminal)
+            .await;
+        match result {
+            Ok(()) => tx.commit().await.map_err(|err| err.to_string()),
+            Err(err) => {
+                let _ = tx.rollback().await;
+                Err(err)
+            }
+        }
+    }
+
+    /// `doFinishN` on the caller's transaction (used by the handler's finish
+    /// path so the iterator update and the backfill state change commit
+    /// together).
+    pub async fn finish_page_in(
+        &mut self,
+        conn: &mut PgConnection,
+        handle: &FinishHandle,
+        maybe_errors: &HashMap<i32, String>,
+        config: IterationConfig,
+        end: OffsetDateTime,
+        on_terminal: &mut dyn TerminalHandler,
+    ) -> Result<(), String> {
+        let errors_count = handle
+            .repos
+            .iter()
+            .filter(|repo| maybe_errors.contains_key(repo))
+            .count();
+        let successful = i32::try_from(handle.repos.len() - errors_count).unwrap_or(0);
+        let cursor_offset = if handle.is_retry {
+            0
+        } else {
+            i32::try_from(handle.repos.len()).unwrap_or(0)
+        };
+        let duration = (end - handle.start).whole_nanoseconds() as i64;
+
+        if self.row.started_at.is_none() {
+            sqlx::query("UPDATE repo_iterator SET started_at = $1 WHERE Id = $2")
+                .bind(handle.start)
+                .bind(self.row.id)
+                .execute(&mut *conn)
+                .await
+                .map_err(|err| format!("stampStartedAt: {err}"))?;
+            self.row.started_at = Some(utc_wall_clock(handle.start));
+        }
+        let progress =
+            update_repo_iterator_in(conn, self.row.id, successful, cursor_offset, duration)
+                .await
+                .map_err(|err| {
+                    format!("unable to update repo iterator id: {}: {err}", self.row.id)
+                })?;
+        self.row.percent_complete = progress.percent_complete;
+        self.row.success_count = progress.success_count;
+        self.row.cursor = progress.cursor;
+        self.row.runtime_duration = progress.runtime_duration;
+
+        for repo_id in &handle.repos {
+            if let Some(message) = maybe_errors.get(repo_id) {
+                insert_iteration_error_in(
+                    conn,
+                    self.row.id,
+                    &mut self.row.errors,
+                    *repo_id,
+                    message,
+                )
+                .await
+                .map_err(|err| {
+                    format!(
+                        "unable to upsert error for repo iterator id: {}: {err}",
+                        self.row.id
+                    )
+                })?;
+                if config.max_failures != 0 && self.failure_count(*repo_id) >= config.max_failures {
+                    on_terminal
+                        .on_terminal(conn, *repo_id, message)
+                        .await
+                        .map_err(|err| format!("iterator.OnTerminal: {err}"))?;
+                    self.set_repo_terminal(*repo_id);
+                }
+            } else if handle.is_retry {
+                if let Some(error_id) = self
+                    .row
+                    .errors
+                    .iter()
+                    .find(|err| err.repo_id == *repo_id)
+                    .map(|err| err.id)
+                {
+                    delete_iteration_error_in(&mut *conn, error_id)
+                        .await
+                        .map_err(|err| format!("deleteIteratorError: {err}"))?;
+                    self.row.errors.retain(|err| err.repo_id != *repo_id);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// `PersistentRepoIterator.MarkComplete` on an existing connection.
+    pub async fn mark_complete_in(
+        &mut self,
+        conn: &mut PgConnection,
+        now: OffsetDateTime,
+    ) -> Result<(), sqlx::Error> {
+        mark_complete_on(conn, self.row.id, now).await?;
+        self.row.completed_at = Some(utc_wall_clock(now));
+        self.row.percent_complete = 1.0;
+        Ok(())
+    }
+}
+
+impl RepoIterator {
+    /// Wrap a loaded row into the advancing iterator.
+    pub fn into_persistent(self) -> Result<PersistentRepoIterator, sqlx::Error> {
+        if self.cursor > self.repos.len() as i32 {
+            return Err(invalid_series_backfill(&format!(
+                "invalid repo iterator state Id:{} cursor:{} length:{}",
+                self.id,
+                self.cursor,
+                self.repos.len()
+            )));
+        }
+        Ok(PersistentRepoIterator {
+            row: self,
+            terminal_errors: BTreeMap::new(),
+            retry_repos: Vec::new(),
+            retry_cursor: 0,
+        })
+    }
+}
+
+fn peek_n(offset: usize, num: usize, repos: &[i32]) -> Vec<i32> {
+    if offset >= repos.len() {
+        return Vec::new();
+    }
+    let end = offset.saturating_add(num).min(repos.len());
+    repos[offset..end].to_vec()
 }
 
 #[cfg(test)]

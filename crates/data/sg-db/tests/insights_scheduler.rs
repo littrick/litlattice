@@ -13,6 +13,7 @@
 //! The backfill corpus runs first (it creates repo iterator 201), then the
 //! iterator corpus, which references the ids the fixture sequences produce.
 
+use std::collections::HashMap;
 use std::io::Write;
 
 use sg_db::insights_scheduler as is;
@@ -454,6 +455,167 @@ async fn run_queue_corpus(pool: &PgPool, corpus_path: &str) {
     }
 }
 
+struct AdvanceTerminals {
+    repos: Vec<i32>,
+}
+
+#[async_trait::async_trait]
+impl is::TerminalHandler for AdvanceTerminals {
+    async fn on_terminal(
+        &mut self,
+        _conn: &mut sqlx::PgConnection,
+        repo_id: i32,
+        _error: &str,
+    ) -> Result<(), String> {
+        self.repos.push(repo_id);
+        Ok(())
+    }
+}
+
+fn parse_error_spec(spec: &str) -> HashMap<i32, String> {
+    let mut errors = HashMap::new();
+    if spec == "-" {
+        return errors;
+    }
+    for part in spec.split(';') {
+        let (repo, message) = part
+            .split_once('=')
+            .unwrap_or_else(|| panic!("bad error spec {part:?}"));
+        errors.insert(atoi(repo), message.to_owned());
+    }
+    errors
+}
+
+fn fmt_repos(repos: &[i32]) -> String {
+    if repos.is_empty() {
+        "-".to_owned()
+    } else {
+        repos
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+}
+
+fn print_persistent_state(label: &str, itr: &is::PersistentRepoIterator) {
+    println!(
+        "it state id={} label={} more={} haserrors={} terminal={} errored={} total={} retryrepos={} retrycursor={}",
+        itr.row.id,
+        label,
+        itr.has_more(),
+        itr.has_errors(),
+        itr.has_terminal_errors(),
+        itr.errored_repos(),
+        itr.total_errors(),
+        itr.retry_repos.len(),
+        itr.retry_cursor
+    );
+}
+
+async fn run_advance_corpus(pool: &PgPool, corpus_path: &str) {
+    let corpus = std::fs::read_to_string(corpus_path).expect("read advance corpus");
+    for line in corpus.lines() {
+        if line.is_empty() {
+            continue;
+        }
+        let parts: Vec<&str> = line.split('\t').collect();
+        match parts[0] {
+            "state" => {
+                let id = atoi(parts[1]);
+                let itr = is::PersistentRepoIterator::load(pool, id)
+                    .await
+                    .expect("LoadWithClock");
+                print_persistent_state(parts[1], &itr);
+                print_iterator("state", &itr.row);
+            }
+            "page" => {
+                let id = atoi(parts[1]);
+                let page_size = usize::try_from(atoi(parts[2])).expect("page size");
+                let config = is::IterationConfig {
+                    max_failures: atoi(parts[3]),
+                };
+                let base = parse_time(parts[4]);
+                let end = base + time::Duration::milliseconds(i64::from(atoi(parts[5])));
+                let mut itr = is::PersistentRepoIterator::load(pool, id)
+                    .await
+                    .expect("LoadWithClock");
+                let mut terminals = AdvanceTerminals { repos: Vec::new() };
+                let maybe_errors = parse_error_spec(parts[6]);
+                match itr.next_page_with_finish(page_size, base) {
+                    None => println!("it page id={} ok=false repos=- terminal=-", id),
+                    Some((repos, handle)) => {
+                        itr.finish_page(pool, &handle, &maybe_errors, config, end, &mut terminals)
+                            .await
+                            .expect("finish");
+                        println!(
+                            "it page id={} ok=true repos={} terminal={}",
+                            id,
+                            fmt_repos(&repos),
+                            fmt_repos(&terminals.repos)
+                        );
+                    }
+                }
+                let fresh = is::load_iterator(pool, id).await.expect("Load iterator");
+                print_iterator("page-db", &fresh);
+            }
+            "retry" => {
+                let id = atoi(parts[1]);
+                let config = is::IterationConfig {
+                    max_failures: atoi(parts[2]),
+                };
+                let base = parse_time(parts[3]);
+                let end = base + time::Duration::milliseconds(i64::from(atoi(parts[4])));
+                let mut itr = is::PersistentRepoIterator::load(pool, id)
+                    .await
+                    .expect("LoadWithClock");
+                let mut terminals = AdvanceTerminals { repos: Vec::new() };
+                let maybe_errors = parse_error_spec(parts[5]);
+                match itr.next_retry_with_finish(config, base) {
+                    None => println!("it retry id={} ok=false repo=- terminal=-", id),
+                    Some((repo, handle)) => {
+                        itr.finish_page(pool, &handle, &maybe_errors, config, end, &mut terminals)
+                            .await
+                            .expect("finish");
+                        println!(
+                            "it retry id={} ok=true repo={} terminal={}",
+                            id,
+                            repo,
+                            fmt_repos(&terminals.repos)
+                        );
+                    }
+                }
+                let fresh = is::load_iterator(pool, id).await.expect("Load iterator");
+                print_iterator("retry-db", &fresh);
+            }
+            "complete" => {
+                let id = atoi(parts[1]);
+                let now = parse_time(parts[2]);
+                is::mark_complete(pool, id, now)
+                    .await
+                    .expect("MarkComplete");
+                let fresh = is::load_iterator(pool, id).await.expect("Load iterator");
+                print_iterator("complete", &fresh);
+            }
+            "restart" => {
+                let id = atoi(parts[1]);
+                is::restart_iterator(pool, id).await.expect("Restart");
+                let fresh = is::load_iterator(pool, id).await.expect("Load iterator");
+                print_iterator("restart", &fresh);
+            }
+            "load" => {
+                let id = atoi(parts[1]);
+                match is::PersistentRepoIterator::load(pool, id).await {
+                    Err(err) => println!("it load id={} result=error:{}", id, err_text(&err)),
+                    Ok(itr) => print_iterator("load", &itr.row),
+                }
+            }
+            other => panic!("unknown op {other:?}"),
+        }
+        std::io::stdout().flush().expect("flush");
+    }
+}
+
 #[tokio::test]
 async fn insights_scheduler_db_parity() {
     let Ok(dsn) = std::env::var("SG_QTEST_INSIGHTS_DSN") else {
@@ -462,15 +624,17 @@ async fn insights_scheduler_db_parity() {
     if dsn.is_empty() {
         return;
     }
-    let (Ok(backfill_corpus), Ok(iterator_corpus), Ok(queue_corpus)) = (
-        std::env::var("SG_INSIGHTS_SCHEDULER_DB_BACKFILL_CORPUS"),
-        std::env::var("SG_INSIGHTS_SCHEDULER_DB_ITERATOR_CORPUS"),
-        std::env::var("SG_INSIGHTS_SCHEDULER_DB_QUEUE_CORPUS"),
-    ) else {
-        return;
-    };
     let pool = PgPool::connect(&dsn).await.expect("connect database");
-    run_backfill_corpus(&pool, &backfill_corpus).await;
-    run_iterator_corpus(&pool, &iterator_corpus).await;
-    run_queue_corpus(&pool, &queue_corpus).await;
+    if let Ok(corpus) = std::env::var("SG_INSIGHTS_SCHEDULER_DB_BACKFILL_CORPUS") {
+        run_backfill_corpus(&pool, &corpus).await;
+    }
+    if let Ok(corpus) = std::env::var("SG_INSIGHTS_SCHEDULER_DB_ITERATOR_CORPUS") {
+        run_iterator_corpus(&pool, &corpus).await;
+    }
+    if let Ok(corpus) = std::env::var("SG_INSIGHTS_SCHEDULER_DB_QUEUE_CORPUS") {
+        run_queue_corpus(&pool, &corpus).await;
+    }
+    if let Ok(corpus) = std::env::var("SG_INSIGHTS_SCHEDULER_DB_ADVANCE_CORPUS") {
+        run_advance_corpus(&pool, &corpus).await;
+    }
 }
