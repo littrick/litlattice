@@ -74,6 +74,7 @@ pub mod codeintel_dependency_jobs;
 pub mod codeintel_metrics_reporter;
 pub mod codeintel_package_filter_applicator;
 pub mod codeintel_policies_repository_matcher;
+pub mod codeintel_ranking_file_reference_counter;
 pub mod codeintel_syntactic_indexing_scheduler;
 pub mod codeintel_upload_backfiller;
 pub mod codeintel_upload_expirer;
@@ -255,6 +256,9 @@ pub fn all_jobs() -> Vec<(&'static str, Arc<dyn Job>)> {
                 ),
                 "codeintel-autoindexing-dependency-scheduler" => Arc::new(
                     codeintel_autoindexing_dependency_scheduler::AutoindexingDependencyScheduler::new(),
+                ),
+                "codeintel-ranking-file-reference-counter" => Arc::new(
+                    codeintel_ranking_file_reference_counter::RankingFileReferenceCounter::new(),
                 ),
                 "codeintel-syntactic-indexing-scheduler" => Arc::new(
                     codeintel_syntactic_indexing_scheduler::SyntacticIndexingScheduler::new(),
