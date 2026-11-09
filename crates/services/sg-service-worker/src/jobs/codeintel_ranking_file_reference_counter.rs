@@ -150,59 +150,14 @@ pub const VACUUM_UPLOADS_BATCH_SIZE: i64 = 100;
 /// `janitor.vacuumMiscRecordsBatchSize`.
 pub const VACUUM_MISC_RECORDS_BATCH_SIZE: i64 = 10_000;
 
-/// `conf.CodeIntelRankingDocumentReferenceCountsEnabled`: the site setting
-/// `codeIntelRanking.documentReferenceCountsEnabled`, defaulting to `false`
-/// when absent (a non-boolean value is treated as absent, like the schema
-/// generated config field's zero value).
-pub fn document_reference_counts_enabled(site: &SiteConfiguration) -> bool {
-    site.raw()
-        .get("codeIntelRanking.documentReferenceCountsEnabled")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false)
-}
-
-/// `conf.CodeIntelRankingDocumentReferenceCountsGraphKey`: the site setting
-/// `codeIntelRanking.documentReferenceCountsGraphKey`, defaulting to `"dev"`
-/// when absent or empty.
-pub fn document_reference_counts_graph_key(site: &SiteConfiguration) -> String {
-    site.raw()
-        .get("codeIntelRanking.documentReferenceCountsGraphKey")
-        .and_then(serde_json::Value::as_str)
-        .filter(|value| !value.is_empty())
-        .unwrap_or(codeintel_ranking::DEFAULT_DOCUMENT_REFERENCE_COUNTS_GRAPH_KEY)
-        .to_owned()
-}
-
-/// `rankingshared.GraphKey()`: `NewGraphKey(conf...GraphKey())`.
-pub fn root_graph_key(site: &SiteConfiguration) -> String {
-    codeintel_ranking::new_graph_key(&document_reference_counts_graph_key(site))
-}
-
-/// `rankingshared.DerivativeGraphKeyFromPrefix`: encodes the configured root
-/// and appends the encoded prefix.
-pub fn derivative_graph_key_for_prefix(site: &SiteConfiguration, prefix: &str) -> String {
-    codeintel_ranking::derivative_graph_key_from_prefix(
-        &document_reference_counts_graph_key(site),
-        prefix,
-    )
-}
-
-/// `conf.CodeIntelRankingDocumentReferenceCountsCronExpression`: parse the
-/// site setting `codeIntelRanking.documentReferenceCountsCronExpression`,
-/// defaulting to `@weekly` when the setting is absent. A present but empty
-/// value is parsed as-is and therefore fails, exactly like the baseline's
-/// `cronexpr.Parse("")`.
-pub fn document_reference_counts_cron_expression(
-    site: &SiteConfiguration,
-) -> Result<sg_cronexpr::Expression, sg_cronexpr::ParseError> {
-    match site
-        .raw()
-        .get("codeIntelRanking.documentReferenceCountsCronExpression")
-    {
-        Some(serde_json::Value::String(expression)) => sg_cronexpr::Expression::parse(expression),
-        _ => sg_cronexpr::Expression::parse("@weekly"),
-    }
-}
+/// Site-configuration helpers shared with the frontend ranking service. The
+/// implementations live in `sg-codeintel-ranking` so the coordinator, exporter
+/// and service layer read one source; these re-exports keep the job's public
+/// API unchanged.
+pub use sg_codeintel_ranking::{
+    derivative_graph_key_for_prefix, document_reference_counts_cron_expression,
+    document_reference_counts_enabled, document_reference_counts_graph_key, root_graph_key,
+};
 
 macro_rules! getter {
     ($name:ident, $field:ident, $ty:ty) => {

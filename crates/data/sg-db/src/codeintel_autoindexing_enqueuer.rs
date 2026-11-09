@@ -322,15 +322,10 @@ pub async fn insert_jobs(
         .map(|row| row.get::<i64, _>(0))
         .collect();
 
-    let mut id_list = String::new();
-    let mut index = 1;
-    for _ in 0..ids.len() {
-        if index > 1 {
-            id_list.push(',');
-        }
-        id_list.push_str(&format!("${index}"));
-        index += 1;
-    }
+    let id_list = (1..=ids.len())
+        .map(|index| format!("${index}"))
+        .collect::<Vec<_>>()
+        .join(",");
     let select_sql = GET_AUTO_INDEX_JOBS_BY_IDS_SQL.replace("%s", &id_list);
     let mut query = sqlx::query(&select_sql);
     for id in &ids {

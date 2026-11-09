@@ -8,6 +8,7 @@ publish.workspace = true
 
 [dependencies]
 sg-codeintel = { path = "../../domain/sg-codeintel" }
+sg-codeintel-ranking = { path = "../../domain/sg-codeintel-ranking" }
 sg-config = { path = "../../domain/sg-config" }
 sg-core = { path = "../../base/sg-core" }
 sg-cronexpr = { path = "../../domain/sg-cronexpr" }

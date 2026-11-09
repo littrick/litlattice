@@ -1,0 +1,18 @@
+[package]
+name = "sg-codeintel-ranking"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+sg-config = { path = "../sg-config" }
+sg-cronexpr = { path = "../sg-cronexpr" }
+sg-db = { path = "../../data/sg-db" }
+serde_json = { workspace = true }
+sqlx = { workspace = true }
+time = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

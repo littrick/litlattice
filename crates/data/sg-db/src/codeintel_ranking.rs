@@ -1535,7 +1535,7 @@ pub async fn insert_definitions_for_ranking(
     definitions: &[RankingDefinition],
 ) -> Result<(), sqlx::Error> {
     let mut tx = pool.begin().await?;
-    insert_definitions_for_ranking_on(&mut *tx, graph_key, definitions).await?;
+    insert_definitions_for_ranking_on(&mut tx, graph_key, definitions).await?;
     tx.commit().await
 }
 
@@ -1581,7 +1581,7 @@ pub async fn insert_references_for_ranking(
 ) -> Result<(), sqlx::Error> {
     let mut tx = pool.begin().await?;
     insert_references_for_ranking_on(
-        &mut *tx,
+        &mut tx,
         graph_key,
         batch_size,
         exported_upload_id,
@@ -1658,7 +1658,7 @@ pub async fn insert_initial_path_ranks(
 ) -> Result<(), sqlx::Error> {
     let mut tx = pool.begin().await?;
     insert_initial_path_ranks_on(
-        &mut *tx,
+        &mut tx,
         exported_upload_id,
         document_paths,
         batch_size,
