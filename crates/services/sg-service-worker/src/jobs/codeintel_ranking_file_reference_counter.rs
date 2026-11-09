@@ -5,16 +5,18 @@
 //! the `codeintel-ranking-file-reference-counter` job.
 //!
 //! The baseline job registers twelve routines (exporter, coordinator,
-//! mapper ×2, reducer, janitor ×7) and five configs. This port registers the
-//! eleven routines whose dependencies are now available in the baseline order,
-//! and still loads and validates all five configs so the worker's environment
-//! variables keep their meaning:
+//! mapper ×2, reducer, janitor ×7) and five configs. This port registers all
+//! twelve in the baseline order and loads/validates all five configs so the
+//! worker's environment variables keep their meaning:
 //!
 //! * `codeintel.ranking.symbol-exporter`
 //!   (`exporter.exportRankingGraph`: SCIP documents → ranking definitions,
 //!   references and initial path ranks; the document stream reads the
 //!   code-intel database from `ServiceConnections.CodeIntelPostgresDSN`,
 //!   while the writes stay on the frontend database);
+//! * `codeintel.ranking.file-reference-count-coordinator`
+//!   (`coordinator.NewCoordinator`: bump the derivative graph key when the
+//!   configured cron expression is due, then `Coordinate` the newest graph);
 //! * `codeintel.ranking.file-reference-count-mapper`
 //!   (`mapper.mapRankingGraph`: `InsertPathCountInputs`);
 //! * `codeintel.ranking.file-reference-count-seed-mapper`
@@ -23,12 +25,6 @@
 //!   (`reducer.reduceRankingGraph`: `InsertPathRanks`);
 //! * the seven `codeintel.ranking.*-janitor` routines
 //!   ([`JanitorKind`]).
-//!
-//! Deferred (documented in
-//! `dev/rs/docs/overviews/m9_8dr_ranking_background_jobs_overview.md` §2.3):
-//!
-//! * `codeintel.ranking.coordinator` needs a cron expression parser
-//!   (`cronexpr`, default `@weekly`); the workspace has no cron crate.
 //!
 //! Every handler is gated on
 //! `conf.CodeIntelRankingDocumentReferenceCountsEnabled()` (site setting
@@ -55,6 +51,7 @@ use sg_core::{ConfigError, EnvReader};
 use sg_db::codeintel_ranking;
 use sg_scip::canonicalize_symbol;
 use sg_scip::scip::{Document, SymbolRole};
+use sqlx::types::time::OffsetDateTime;
 use sqlx::{PgConnection, PgPool, Row};
 use tokio_stream::StreamExt;
 use tokio_util::sync::CancellationToken;
@@ -72,6 +69,12 @@ pub const EXPORTER_ROUTINE_NAME: &str = "codeintel.ranking.symbol-exporter";
 /// `exporter.NewSymbolExporter`'s routine description.
 pub const EXPORTER_ROUTINE_DESCRIPTION: &str =
     "Exports SCIP data to ranking definitions and reference tables.";
+
+/// `coordinator.NewCoordinator`'s routine name.
+pub const COORDINATOR_ROUTINE_NAME: &str = "codeintel.ranking.file-reference-count-coordinator";
+/// `coordinator.NewCoordinator`'s routine description.
+pub const COORDINATOR_ROUTINE_DESCRIPTION: &str =
+    "Coordinates the state of the file reference count map and reduce jobs.";
 
 /// `mapper.NewMapper`'s routine name.
 pub const MAPPER_ROUTINE_NAME: &str = "codeintel.ranking.file-reference-count-mapper";
@@ -182,6 +185,23 @@ pub fn derivative_graph_key_for_prefix(site: &SiteConfiguration, prefix: &str) -
         &document_reference_counts_graph_key(site),
         prefix,
     )
+}
+
+/// `conf.CodeIntelRankingDocumentReferenceCountsCronExpression`: parse the
+/// site setting `codeIntelRanking.documentReferenceCountsCronExpression`,
+/// defaulting to `@weekly` when the setting is absent. A present but empty
+/// value is parsed as-is and therefore fails, exactly like the baseline's
+/// `cronexpr.Parse("")`.
+pub fn document_reference_counts_cron_expression(
+    site: &SiteConfiguration,
+) -> Result<sg_cronexpr::Expression, sg_cronexpr::ParseError> {
+    match site
+        .raw()
+        .get("codeIntelRanking.documentReferenceCountsCronExpression")
+    {
+        Some(serde_json::Value::String(expression)) => sg_cronexpr::Expression::parse(expression),
+        _ => sg_cronexpr::Expression::parse("@weekly"),
+    }
 }
 
 macro_rules! getter {
@@ -640,9 +660,7 @@ impl Job for RankingFileReferenceCounter {
         ]
     }
 
-    /// `rankingJob.Routines`. The coordinator routine is deferred (see the
-    /// module docs); its config is still loaded so its environment variables
-    /// keep their meaning.
+    /// `rankingJob.Routines`, in the baseline order.
     async fn routines(
         &self,
         deps: &JobDeps,
@@ -669,7 +687,7 @@ impl Job for RankingFileReferenceCounter {
                 .await
                 .map_err(|err| format!("connecting to the codeintel database: {err}"))?;
 
-        let mut routines: Vec<BackgroundRoutine> = Vec::with_capacity(11);
+        let mut routines: Vec<BackgroundRoutine> = Vec::with_capacity(12);
 
         routines.push(
             PeriodicRoutine::new(Arc::new(RankingExporterHandler {
@@ -684,8 +702,16 @@ impl Job for RankingFileReferenceCounter {
             .with_interval(self.exporter.interval())
             .into(),
         );
-        // `codeintel.ranking.coordinator` belongs here in the baseline order;
-        // it is deferred until a cron expression parser is available.
+        routines.push(
+            PeriodicRoutine::new(Arc::new(RankingCoordinatorHandler {
+                pool: pool.clone(),
+                live_config: Arc::clone(&live_config),
+            }))
+            .with_name(COORDINATOR_ROUTINE_NAME)
+            .with_description(COORDINATOR_ROUTINE_DESCRIPTION)
+            .with_interval(self.coordinator.interval())
+            .into(),
+        );
         routines.push(
             PeriodicRoutine::new(Arc::new(RankingMapperHandler {
                 pool: pool.clone(),
@@ -952,6 +978,45 @@ fn decompress(payload: &[u8]) -> Result<Vec<u8>, std::io::Error> {
     Ok(decompressed)
 }
 
+/// `coordinator.NewCoordinator`'s handler: when the cron expression is due,
+/// bump the derivative graph key, then `Coordinate` the newest graph.
+///
+/// The baseline logs and continues when the cron expression is invalid
+/// (`Illegal ranking cron expression`). That warning is not ported; the
+/// control flow is identical: skip the due check, then run `Coordinate` on the
+/// newest prefix.
+pub async fn run_coordinator(pool: &PgPool, site: &SiteConfiguration) -> Result<(), sqlx::Error> {
+    if !document_reference_counts_enabled(site) {
+        return Ok(());
+    }
+
+    match document_reference_counts_cron_expression(site) {
+        // `conf` only logs a warning; a parse failure does not abort the tick.
+        Err(_) => {}
+        Ok(expression) => {
+            let (_, previous) = codeintel_ranking::derivative_graph_key_or_bump(pool).await?;
+
+            // `time.Until(expr.Next(previous)) <= 0`: Go's zero time (no
+            // occurrence) is always in the past; otherwise compare instants.
+            let overdue = match expression.next(previous) {
+                None => true,
+                Some(next) => next <= OffsetDateTime::now_utc(),
+            };
+            if overdue {
+                codeintel_ranking::bump_derivative_graph_key(pool).await?;
+            }
+        }
+    }
+
+    let (prefix, _) = codeintel_ranking::derivative_graph_key_or_bump(pool).await?;
+    codeintel_ranking::coordinate(
+        pool,
+        &derivative_graph_key_for_prefix(site, &prefix),
+        OffsetDateTime::now_utc(),
+    )
+    .await
+}
+
 /// `mapper.mapRankingGraph`: `InsertPathCountInputs` for the newest
 /// derivative graph key.
 pub async fn map_ranking_graph(
@@ -1103,6 +1168,21 @@ impl Handler for RankingExporterHandler {
     }
 }
 
+struct RankingCoordinatorHandler {
+    pool: PgPool,
+    live_config: Arc<LiveConfig>,
+}
+
+#[async_trait]
+impl Handler for RankingCoordinatorHandler {
+    async fn handle(&self, _ctx: CancellationToken) -> Result<(), HandlerError> {
+        let unified = current_site(&self.live_config);
+        run_coordinator(&self.pool, &unified.site)
+            .await
+            .map_err(|err| HandlerError::new(err.to_string()))
+    }
+}
+
 struct RankingMapperHandler {
     pool: PgPool,
     live_config: Arc<LiveConfig>,
@@ -1192,6 +1272,14 @@ mod tests {
         assert_eq!(
             EXPORTER_ROUTINE_DESCRIPTION,
             "Exports SCIP data to ranking definitions and reference tables."
+        );
+        assert_eq!(
+            COORDINATOR_ROUTINE_NAME,
+            "codeintel.ranking.file-reference-count-coordinator"
+        );
+        assert_eq!(
+            COORDINATOR_ROUTINE_DESCRIPTION,
+            "Coordinates the state of the file reference count map and reduce jobs."
         );
         assert_eq!(
             MAPPER_ROUTINE_NAME,
@@ -1295,6 +1383,57 @@ mod tests {
             derivative_graph_key_for_prefix(&configured, "2026-11"),
             "prod_2_eu.2026_11"
         );
+    }
+
+    #[test]
+    fn cron_expression_defaults_to_weekly() {
+        let expression = document_reference_counts_cron_expression(&site("{}"))
+            .expect("the default @weekly expression parses");
+        let from = time::Date::from_calendar_date(2024, time::Month::November, 6)
+            .expect("valid date")
+            .midnight()
+            .assume_utc()
+            + time::Duration::hours(12);
+        let expected = time::Date::from_calendar_date(2024, time::Month::November, 10)
+            .expect("valid date")
+            .midnight()
+            .assume_utc();
+        assert_eq!(expression.next(from), Some(expected));
+    }
+
+    #[test]
+    fn cron_expression_uses_the_site_setting_and_reports_parse_errors() {
+        let configured =
+            site(r#"{"codeIntelRanking.documentReferenceCountsCronExpression": "0 0 * * * *"}"#);
+        assert!(document_reference_counts_cron_expression(&configured).is_ok());
+
+        // Present but empty: the baseline parses "" and fails.
+        let empty = site(r#"{"codeIntelRanking.documentReferenceCountsCronExpression": ""}"#);
+        assert_eq!(
+            document_reference_counts_cron_expression(&empty)
+                .expect_err("empty expression")
+                .to_string(),
+            "missing field(s)"
+        );
+
+        let invalid = site(r#"{"codeIntelRanking.documentReferenceCountsCronExpression": "bad"}"#);
+        assert!(document_reference_counts_cron_expression(&invalid).is_err());
+    }
+
+    #[tokio::test]
+    async fn coordinator_gate_off_does_not_touch_the_database() {
+        // A lazy pool to an unreachable address: the gate must return before
+        // any query is attempted.
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://ranking:ranking@127.0.0.1:1/none")
+            .expect("lazy pool");
+        assert!(run_coordinator(&pool, &site("{}")).await.is_ok());
+        assert!(run_coordinator(
+            &pool,
+            &site(r#"{"codeIntelRanking.documentReferenceCountsEnabled": false}"#)
+        )
+        .await
+        .is_ok());
     }
 
     #[test]
