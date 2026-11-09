@@ -101,6 +101,78 @@ pub fn default_site_config(value: &str) -> Result<SiteConfiguration, String> {
     SiteConfiguration::parse(json).map_err(|err| err.to_string())
 }
 
+/// `confdefaults.DevAndTesting.Site` after `conf.RedactAndHashSecrets`
+/// (`internal/conf/validate.go:371-465`).
+const DEV_AND_TESTING_REDACTED: &str = r#"{
+  "auth.providers": [
+    {
+      "allowSignup": true,
+      "type": "builtin"
+    }
+  ],
+}"#;
+
+/// `confdefaults.DockerContainer.Site` after `RedactAndHashSecrets`.
+const DOCKER_CONTAINER_REDACTED: &str = r#"{
+  // The externally accessible URL for Sourcegraph (i.e., what you type into your browser)
+  // This is required to be configured for Sourcegraph to work correctly.
+  // "externalURL": "https://sourcegraph.example.com",
+  "auth.providers": [
+    {
+      "allowSignup": true,
+      "type": "builtin"
+    }
+  ]
+}"#;
+
+/// `confdefaults.KubernetesOrDockerComposeOrPureDocker.Site` after
+/// `RedactAndHashSecrets`. The `builtin` provider's `allowSignup: false` is
+/// omitted from the redacted copy (`allowSignup` has `omitempty`), and
+/// `jsonc.Format` keeps the comments, drops blank lines and indents with two
+/// spaces.
+const KUBERNETES_OR_DOCKER_COMPOSE_OR_PURE_DOCKER_REDACTED: &str = r#"{
+  // The externally accessible URL for Sourcegraph (i.e., what you type into your browser)
+  // This is required to be configured for Sourcegraph to work correctly.
+  // "externalURL": "https://sourcegraph.example.com",
+  // The authentication provider to use for identifying and signing in users.
+  // Only one entry is supported.
+  //
+  // The builtin auth provider with signup disallowed (shown below) means that
+  // after the initial site admin signs in, all other users must be invited.
+  //
+  // Other providers are documented at https://sourcegraph.com/docs/admin/auth.
+  "auth.providers": [
+    {
+      "type": "builtin"
+    }
+  ],
+}"#;
+
+/// `RedactAndHashSecrets(Default).Site` for the deployment's default
+/// document.
+///
+/// The baseline redacts with `jsonc`, which is not ported: the default
+/// documents are fixed constants, so their redacted forms are stored as
+/// byte-for-byte snapshots (verified against the Go implementation by
+/// `run_conf_db_source_diff.sh`). Arbitrary user-written configurations are
+/// still not accepted (the DB write path is unported).
+pub fn default_site_config_redacted_json(deploy_type: &str) -> Result<&'static str, String> {
+    match resolve_deploy_type(deploy_type) {
+        "dev" => Ok(DEV_AND_TESTING_REDACTED),
+        "docker-container" => Ok(DOCKER_CONTAINER_REDACTED),
+        // Same aliases as `default_site_config_json`.
+        "kubernetes" | "k8s" | "cluster" | "helm" | "kustomize" | "k3s" | "appliance"
+        | "docker-compose" | "pure-docker" => {
+            Ok(KUBERNETES_OR_DOCKER_COMPOSE_OR_PURE_DOCKER_REDACTED)
+        }
+        other => Err(format!(
+            "The 'DEPLOY_TYPE' environment variable is invalid. Expected one of: \
+             \"kubernetes\", \"docker-compose\", \"pure-docker\", \"docker-container\", \
+             \"dev\", \"helm\". Got: {other:?}"
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -168,5 +240,21 @@ mod tests {
              \"kubernetes\", \"docker-compose\", \"pure-docker\", \"docker-container\", \
              \"dev\", \"helm\". Got: \"bogus\""
         );
+        let err = default_site_config_redacted_json("bogus").expect_err("invalid");
+        assert!(err.ends_with("Got: \"bogus\""), "{err}");
+    }
+
+    #[test]
+    fn redacted_snapshots_are_valid_jsonc_and_share_the_raw_shape() {
+        for value in ["dev", "docker-container", "kubernetes", "docker-compose"] {
+            let raw = default_site_config_json(value).expect("raw");
+            let redacted = default_site_config_redacted_json(value).expect("redacted");
+            for document in [raw, redacted] {
+                // JSONC with comments: `SiteConfiguration::parse` strips them.
+                let site = SiteConfiguration::parse(document).expect("parse");
+                assert_eq!(providers(&site).len(), 1, "{value}");
+            }
+            assert!(!redacted.contains("allowSignup\": false"), "{value}");
+        }
     }
 }
