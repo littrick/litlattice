@@ -39,6 +39,8 @@ pub mod adminanalytics;
 pub mod auth_sourcegraph_operator_cleaner;
 pub mod authz_bitbucketcloud;
 pub mod authz_bitbucketcloud_client;
+pub mod authz_gerrit;
+pub mod authz_gerrit_client;
 pub mod authz_github;
 pub mod authz_github_client;
 pub mod authz_github_user;

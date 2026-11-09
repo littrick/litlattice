@@ -28,7 +28,6 @@ use serde::Deserialize;
 
 use super::authz_github_user::OAuthBearerToken;
 
-/// `extsvc.TypeBitbucketCloud`.
 /// `extsvc.TypeBitbucketCloud` (`VariantBitbucketCloud.AsType()`).
 pub const TYPE_BITBUCKETCLOUD: &str = "bitbucketCloud";
 /// `UrlFromConfig`'s default.

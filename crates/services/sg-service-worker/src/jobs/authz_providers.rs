@@ -55,6 +55,8 @@ use super::authz_bitbucketcloud::{
     TYPE_BITBUCKETCLOUD,
 };
 use super::authz_bitbucketcloud_client::{BitbucketCloudAuth, BitbucketCloudRestClient};
+use super::authz_gerrit::{GerritProvider, TYPE_GERRIT};
+use super::authz_gerrit_client::GerritRestClient;
 use super::authz_github::{
     GithubRepoPermsProvider, GroupsCache, MemoryGroupsCache, RedisGroupsCache,
 };
@@ -136,6 +138,12 @@ struct BitbucketCloudConnection {
     config: Value,
 }
 
+/// One parsed Gerrit external service.
+struct GerritConnection {
+    service: ExternalService,
+    config: Value,
+}
+
 /// `featureflag.FromContext(ctx)` as attached by the perms syncer's
 /// `WithFlags(ctx, db.FeatureFlags())`: the global (non-rollout) value of
 /// `gitLabProjectVisibilityExperimental`. Any storage error or a rollout flag
@@ -181,6 +189,7 @@ pub async fn providers_from_config(
     let mut github_conns = Vec::new();
     let mut gitlab_conns = Vec::new();
     let mut bitbucketcloud_conns = Vec::new();
+    let mut gerrit_conns = Vec::new();
     let mut serious_problems = Vec::new();
     let mut after_id = 0_i64;
 
@@ -222,6 +231,8 @@ pub async fn providers_from_config(
                 gitlab_conns.push(GitlabConnection { service, config });
             } else if service.kind == "BITBUCKETCLOUD" {
                 bitbucketcloud_conns.push(BitbucketCloudConnection { service, config });
+            } else if service.kind == "GERRIT" {
+                gerrit_conns.push(GerritConnection { service, config });
             }
             // Other kinds are not ported yet; see the module docs.
         }
@@ -244,16 +255,20 @@ pub async fn providers_from_config(
         pool,
         opts,
     );
+    let gerrit = gerrit_new_authz_providers(&gerrit_conns, keyring, opts);
 
     let mut providers = github.providers;
     providers.extend(gitlab.providers);
     providers.extend(bitbucketcloud.providers);
+    providers.extend(gerrit.providers);
     let mut warnings = github.warnings;
     warnings.extend(gitlab.warnings);
     warnings.extend(bitbucketcloud.warnings);
+    warnings.extend(gerrit.warnings);
     let mut invalid_connections = github.invalid_connections;
     invalid_connections.extend(gitlab.invalid_connections);
     invalid_connections.extend(bitbucketcloud.invalid_connections);
+    invalid_connections.extend(gerrit.invalid_connections);
 
     ProviderInitResult {
         providers,
@@ -261,6 +276,7 @@ pub async fn providers_from_config(
             serious_problems.extend(github.serious_problems);
             serious_problems.extend(gitlab.serious_problems);
             serious_problems.extend(bitbucketcloud.serious_problems);
+            serious_problems.extend(gerrit.serious_problems);
             serious_problems
         },
         warnings,
@@ -588,6 +604,79 @@ fn new_bitbucketcloud_authz_provider(
         authn_providers.to_vec(),
     )
     .with_user_external_account_key(keyring.user_external_account_key());
+    Ok(Some(Arc::new(provider)))
+}
+
+/// `gerrit.NewAuthzProviders`: one provider per connection with authorization
+/// enabled; construction failures are serious problems for `extsvc.TypeGerrit`.
+fn gerrit_new_authz_providers(
+    conns: &[GerritConnection],
+    keyring: &Keyring,
+    opts: &ProvidersOptions,
+) -> ProviderInitResult {
+    let mut result = ProviderInitResult::default();
+    for conn in conns {
+        match new_gerrit_authz_provider(conn, keyring, opts) {
+            Ok(Some(provider)) => result.providers.push(provider),
+            Ok(None) => {}
+            Err(err) => {
+                result.invalid_connections.push(TYPE_GERRIT.to_owned());
+                result.serious_problems.push(err);
+            }
+        }
+    }
+    result
+}
+
+/// `gerrit.NewProvider`: `Ok(None)` when authorization is disabled, `Err` for
+/// the baseline's "serious problems".
+fn new_gerrit_authz_provider(
+    conn: &GerritConnection,
+    keyring: &Keyring,
+    opts: &ProvidersOptions,
+) -> Result<Option<Arc<dyn AuthzProvider>>, String> {
+    let Some(_authorization) = conn
+        .config
+        .get("authorization")
+        .filter(|value| !value.is_null())
+    else {
+        return Ok(None);
+    };
+
+    if let Some(message) = &opts.acls_license_error {
+        return Err(message.clone());
+    }
+
+    // `url.Parse(conn.Url)`; a parse failure makes `NewProvider` return nil.
+    // Rust's parser is stricter than Go's for scheme-less input, which the
+    // schema already rejects (docs §72.3).
+    let raw_url = conn
+        .config
+        .get("url")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let base_url = Url::parse(raw_url)
+        .map_err(|err| format!("Could not parse URL for Gerrit instance {raw_url:?}: {err}"))?;
+    // `extsvc.NewCodeHost` normalises the parsed URL in place and `NewClient`
+    // holds the same pointer, so requests resolve against the normalised URL.
+    let service_id = normalize_base_url(&base_url);
+    let client_url = Url::parse(&service_id).map_err(|err| err.to_string())?;
+    let urn = sg_extsvc::urn(&conn.service.kind, conn.service.id);
+
+    let username = conn
+        .config
+        .get("username")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let password = conn
+        .config
+        .get("password")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let client = GerritRestClient::new(client_url, username, password);
+
+    let provider = GerritProvider::new(urn, service_id, Arc::new(client))
+        .with_user_external_account_key(keyring.user_external_account_key());
     Ok(Some(Arc::new(provider)))
 }
 
