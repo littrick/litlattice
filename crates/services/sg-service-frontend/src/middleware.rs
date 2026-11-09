@@ -156,12 +156,6 @@ pub fn external_response<B>(
     })
 }
 
-/// `newInternalHTTPHandler`'s mux once every `/.internal/` route is registered;
-/// none are ported yet, so every path is the mux 404.
-pub fn internal_response<B>(_req: &Request<B>) -> Response<BoxBody> {
-    go_not_found()
-}
-
 /// The hyper entry point for the external listener.
 pub fn external_handler(
     version: Bytes,
@@ -278,9 +272,14 @@ pub fn external_handler_with_live(
     })
 }
 
-/// The hyper entry point for the internal listener.
-pub fn internal_handler() -> sg_http::HttpHandler {
-    std::sync::Arc::new(|req: Request<Incoming>| Box::pin(async move { internal_response(&req) }))
+/// The hyper entry point for the internal listener. The gitserver shard
+/// list and pins are read from the live configuration per request, like the
+/// baseline's `atomicGitServerConns` (which follows `conf.Get`).
+pub fn internal_handler(live: Arc<LiveConfig>) -> sg_http::HttpHandler {
+    std::sync::Arc::new(move |req: Request<Incoming>| {
+        let live = Arc::clone(&live);
+        Box::pin(async move { crate::internal_api::internal_response(&req, &live) })
+    })
 }
 
 #[cfg(test)]

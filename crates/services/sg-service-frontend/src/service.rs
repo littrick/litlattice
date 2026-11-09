@@ -170,6 +170,7 @@ impl Service for FrontendService {
         if let Some((addr, listener)) = internal {
             let shutdown = ctx.shutdown.clone();
             let store = Arc::clone(wiring.store());
+            let live = Arc::clone(wiring.live());
             background.spawn(async move {
                 // `httpapi.go:397` registers the configuration service on the
                 // internal gRPC server; `serve_cmd.go:397` multiplexes gRPC
@@ -180,7 +181,7 @@ impl Service for FrontendService {
                         crate::configuration_api::ConfigApi::new(store),
                     ),
                 );
-                let handler = middleware::internal_handler();
+                let handler = middleware::internal_handler(live);
                 if let Err(err) = sg_http::serve(listener, routes, handler, shutdown).await {
                     tracing::error!(addr, error = %err, "frontend internal server failed");
                 }

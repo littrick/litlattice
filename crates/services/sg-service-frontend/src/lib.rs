@@ -19,6 +19,7 @@ pub mod debug;
 pub mod deploy_defaults;
 pub mod goimportpath;
 pub mod health;
+pub mod internal_api;
 pub mod ipallowlist;
 pub mod middleware;
 pub mod mux;
