@@ -12,6 +12,7 @@
 pub mod config;
 pub mod debug;
 pub mod health;
+pub mod ipallowlist;
 pub mod middleware;
 pub mod service;
 pub mod version;

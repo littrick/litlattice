@@ -44,6 +44,14 @@ pub type HttpFuture = Pin<Box<dyn Future<Output = Response<BoxBody>> + Send>>;
 /// Plain-HTTP branch of the multiplexer.
 pub type HttpHandler = Arc<dyn Fn(Request<Incoming>) -> HttpFuture + Send + Sync>;
 
+/// The accepting peer address, inserted into every request's extensions.
+///
+/// Go's `http.Request.RemoteAddr` is `IP:port` with IPv6 in brackets;
+/// `SocketAddr::to_string` produces the same shape. The IP allowlist
+/// middleware splits it exactly like `net.SplitHostPort`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RemoteAddr(pub String);
+
 /// Exact port of the Go multiplex predicate. `Header.Get` returns the first
 /// value and `strings.Contains` is case-sensitive.
 pub fn is_grpc<B>(req: &Request<B>) -> bool {
@@ -99,7 +107,8 @@ pub async fn serve(
                 let http = http.clone();
                 let watcher = graceful.watcher();
                 connections.spawn(async move {
-                    let service = service_fn(move |req: Request<Incoming>| {
+                    let service = service_fn(move |mut req: Request<Incoming>| {
+                        req.extensions_mut().insert(RemoteAddr(peer.to_string()));
                         let routes = routes.clone();
                         let http = http.clone();
                         async move { dispatch(req, routes, http).await }
@@ -148,7 +157,8 @@ pub async fn serve_http(
                 let http = http.clone();
                 let watcher = graceful.watcher();
                 connections.spawn(async move {
-                    let service = service_fn(move |req: Request<Incoming>| {
+                    let service = service_fn(move |mut req: Request<Incoming>| {
+                        req.extensions_mut().insert(RemoteAddr(peer.to_string()));
                         let http = http.clone();
                         async move { Ok::<_, std::convert::Infallible>(http(req).await) }
                     });
@@ -209,7 +219,12 @@ async fn dispatch(
 
 #[cfg(test)]
 mod tests {
-    use super::listen;
+    use super::{listen, serve_http, HttpHandler, RemoteAddr};
+    use http::{Request, Response};
+    use hyper::body::Incoming;
+    use std::sync::{Arc, Mutex};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio_util::sync::CancellationToken;
 
     #[tokio::test]
     async fn binds_go_style_wildcard_addresses() {
@@ -219,5 +234,40 @@ mod tests {
             .expect("local addr")
             .ip()
             .is_unspecified());
+    }
+
+    #[tokio::test]
+    async fn requests_carry_the_peer_address() {
+        let listener = listen("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        let shutdown = CancellationToken::new();
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let tx = Arc::new(Mutex::new(Some(tx)));
+        let http: HttpHandler = Arc::new(move |req: Request<Incoming>| {
+            let remote = req.extensions().get::<RemoteAddr>().cloned();
+            if let Some(tx) = tx.lock().expect("sender lock").take() {
+                let _ = tx.send(remote);
+            }
+            Box::pin(async { Response::new(tonic::body::empty_body()) })
+        });
+
+        let token = shutdown.clone();
+        let server = tokio::spawn(async move { serve_http(listener, http, token).await });
+
+        let mut stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        let client_addr = stream.local_addr().expect("client addr");
+        stream
+            .write_all(b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+            .await
+            .expect("write");
+        let mut buffer = [0u8; 128];
+        let _ = stream.read(&mut buffer).await;
+
+        let remote = rx.await.expect("handler ran").expect("RemoteAddr inserted");
+        assert_eq!(remote.0, client_addr.to_string());
+
+        shutdown.cancel();
+        server.await.expect("server task").expect("server");
     }
 }

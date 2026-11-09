@@ -15,7 +15,10 @@ use async_trait::async_trait;
 use sg_core::{ConfigError, EnvReader, Service, ServiceContext, ServiceError};
 use tokio::task::JoinSet;
 
+use sg_config::SiteConfiguration;
+
 use crate::config::FrontendConfig;
+use crate::ipallowlist::{self, AllowlistEnv};
 use crate::version::Version;
 use crate::{debug, middleware};
 
@@ -31,6 +34,10 @@ pub fn service_name() -> &'static str {
 pub struct FrontendService {
     config: Option<FrontendConfig>,
     version: Version,
+    /// The `conf.Get()` snapshot. The configuration service is not ported
+    /// yet, so this stays empty (IP allowlist disabled) until then.
+    site_config: SiteConfiguration,
+    allowlist_env: AllowlistEnv,
 }
 
 impl FrontendService {
@@ -38,15 +45,29 @@ impl FrontendService {
         Self {
             config: None,
             version: Version::load(),
+            site_config: SiteConfiguration::default(),
+            allowlist_env: AllowlistEnv::default(),
         }
     }
 
     /// Test hook: pin the version string instead of reading `/version.txt`.
     pub fn with_version(version: Version) -> Self {
         Self {
-            config: None,
             version,
+            ..Self::new()
         }
+    }
+
+    /// Test hook: the site configuration snapshot the middleware chain reads.
+    pub fn with_site_config(mut self, site_config: SiteConfiguration) -> Self {
+        self.site_config = site_config;
+        self
+    }
+
+    /// Test hook: pin the `AUTH_ALLOWED_IP_ADDRESS_*` overrides.
+    pub fn with_ip_allowlist_env(mut self, env: AllowlistEnv) -> Self {
+        self.allowlist_env = env;
+        self
     }
 
     pub fn config(&self) -> Option<&FrontendConfig> {
@@ -68,6 +89,7 @@ impl Service for FrontendService {
 
     fn configure(&mut self, env: &mut EnvReader) -> Result<(), ConfigError> {
         self.config = Some(FrontendConfig::load(env)?);
+        self.allowlist_env = AllowlistEnv::from_env();
         Ok(())
     }
 
@@ -128,10 +150,12 @@ impl Service for FrontendService {
         ctx.ready.mark_ready();
         ready.store(true, Ordering::SeqCst);
 
+        let allowlist = ipallowlist::compile(&self.site_config, &self.allowlist_env).map(Arc::new);
+
         tracing::info!(addr = %external_addr, "frontend listening");
         let served = sg_http::serve_http(
             external,
-            middleware::external_handler(self.version.bytes()),
+            middleware::external_handler(self.version.bytes(), allowlist),
             ctx.shutdown.clone(),
         )
         .await;
@@ -155,7 +179,7 @@ mod tests {
     fn service_with_config(config: FrontendConfig) -> FrontendService {
         FrontendService {
             config: Some(config),
-            version: Version::dev(),
+            ..FrontendService::with_version(Version::dev())
         }
     }
 

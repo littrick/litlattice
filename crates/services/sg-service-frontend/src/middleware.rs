@@ -1,16 +1,17 @@
 #![forbid(unsafe_code)]
 
-//! The outer half of `newExternalHTTPHandler`'s middleware chain that needs no
-//! site configuration:
+//! The outer half of `newExternalHTTPHandler`'s middleware chain:
 //!
 //! ```text
-//! BlackHole → healthCheck → ServeMux
+//! ipAllowlist → BlackHole → healthCheck → ServeMux
 //! ```
 //!
 //! The baseline wraps the mux with `ipAllowlist → tenant → instrumentation →
 //! tracepkg → ForbidAll → GoGet → BlackHole → healthCheck → gcontext → Trace`;
 //! the remaining layers need live site configuration, metrics or the request
 //! context and land in later slices (docs/overviews/m9_8dx §2.3).
+
+use std::sync::Arc;
 
 use bytes::Bytes;
 use http::{header, Request, Response, StatusCode};
@@ -19,6 +20,7 @@ use hyper::body::Incoming;
 use tonic::body::BoxBody;
 
 use crate::health;
+use crate::ipallowlist::{self, IpAllowlistConfig};
 
 /// `middleware.isBlackhole`.
 pub fn is_blackhole<B>(req: &Request<B>) -> bool {
@@ -85,6 +87,23 @@ pub fn external_response_with_next<B>(
     next()
 }
 
+/// The chain with the baseline's outermost layer: `ipAllowlist` runs before
+/// BlackHole and healthCheck, so a denied `/healthz` is a 403. `None` means
+/// the allowlist is disabled (`configResolver()` returned nil).
+pub fn external_response_with_ipallowlist<B>(
+    req: &Request<B>,
+    version: &Bytes,
+    allowlist: Option<&IpAllowlistConfig>,
+    next: impl FnOnce() -> Response<BoxBody>,
+) -> Response<BoxBody> {
+    if let Some(allowlist) = allowlist {
+        if let Err(error) = allowlist.is_authorized(req) {
+            return ipallowlist::forbidden_response(&error);
+        }
+    }
+    external_response_with_next(req, version, next)
+}
+
 /// `newExternalHTTPHandler` without its config-dependent layers.
 pub fn external_response<B>(req: &Request<B>, version: &Bytes) -> Response<BoxBody> {
     external_response_with_next(req, version, go_not_found)
@@ -97,10 +116,16 @@ pub fn internal_response<B>(_req: &Request<B>) -> Response<BoxBody> {
 }
 
 /// The hyper entry point for the external listener.
-pub fn external_handler(version: Bytes) -> sg_http::HttpHandler {
-    std::sync::Arc::new(move |req: Request<Incoming>| {
+pub fn external_handler(
+    version: Bytes,
+    allowlist: Option<Arc<IpAllowlistConfig>>,
+) -> sg_http::HttpHandler {
+    Arc::new(move |req: Request<Incoming>| {
         let version = version.clone();
-        Box::pin(async move { external_response(&req, &version) })
+        let allowlist = allowlist.clone();
+        Box::pin(async move {
+            external_response_with_ipallowlist(&req, &version, allowlist.as_deref(), go_not_found)
+        })
     })
 }
 
