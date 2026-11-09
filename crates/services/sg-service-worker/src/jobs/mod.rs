@@ -86,6 +86,7 @@ pub mod ratelimit;
 pub mod repo_embedding_janitor;
 pub mod repo_embedding_scheduler;
 pub mod repostatistics;
+pub mod sourcegraph_accounts_notifications;
 pub mod telemetry_gateway_exporter;
 pub mod usage_telemetry;
 pub mod users;
@@ -272,6 +273,9 @@ pub fn all_jobs() -> Vec<(&'static str, Arc<dyn Job>)> {
                 }
                 "repo-statistics-compactor" => Arc::new(repostatistics::RepoStatisticsCompactor),
                 "repo-statistics-resetter" => Arc::new(repostatistics::RepoStatisticsResetter),
+                "sourcegraph-accounts-notifications-subscriber" => Arc::new(
+                    sourcegraph_accounts_notifications::SourcegraphAccountsNotificationsSubscriber::new(),
+                ),
                 "telemetrygateway-exporter" => {
                     Arc::new(telemetry_gateway_exporter::TelemetryGatewayExporter::new())
                 }
