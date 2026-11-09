@@ -12,7 +12,11 @@ publish.workspace = true
 doctest = false
 
 [dependencies]
+md5 = { workspace = true }
 prost = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
 
 [build-dependencies]
 prost-build = { workspace = true }
