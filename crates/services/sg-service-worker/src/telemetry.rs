@@ -217,20 +217,20 @@ pub fn telemetry_events_export_mode(
 }
 
 /// `strconv.ParseBool` for the environment flags read by the baseline.
-fn parse_go_bool(raw: &str) -> bool {
+pub(crate) fn parse_go_bool(raw: &str) -> bool {
     matches!(raw, "1" | "t" | "T" | "TRUE" | "true" | "True")
 }
 
 /// `env.MustGetBool` / `dotcom.SourcegraphDotComMode` (toleration of Go's
 /// boolean spellings).
-fn env_bool(name: &str) -> bool {
+pub(crate) fn env_bool(name: &str) -> bool {
     std::env::var(name)
         .map(|raw| parse_go_bool(&raw))
         .unwrap_or(false)
 }
 
 /// `os.Getenv(name) == "true"` (the legacy export toggle is exact-match).
-fn env_exact_true(name: &str) -> bool {
+pub(crate) fn env_exact_true(name: &str) -> bool {
     std::env::var(name).as_deref() == Ok("true")
 }
 

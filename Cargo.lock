@@ -4269,6 +4269,7 @@ dependencies = [
  "sqlx",
  "time",
  "tokio",
+ "tokio-stream",
  "tokio-util",
  "tonic 0.12.3",
  "tracing",

@@ -133,6 +133,109 @@ pub async fn queue_events_for_export(
     Ok(())
 }
 
+/// One row read by [`list_for_export`]: the event ID and its serialized
+/// protobuf payload (`telemetry_events_export_queue.payload_pb`). Decoding the
+/// payload into a `telemetrygateway.v1.Event` is the caller's job (the
+/// baseline's store does it, and so does the Rust job, which owns the
+/// `sg-proto` dependency).
+#[derive(Debug, Clone)]
+pub struct ExportQueueRow {
+    pub id: String,
+    pub payload_pb: Vec<u8>,
+}
+
+/// `telemetryEventsExportQueueStore.ListForExport`:
+///
+/// ```sql
+/// SELECT id, payload_pb
+/// FROM telemetry_events_export_queue
+/// WHERE exported_at IS NULL
+/// ORDER BY timestamp ASC
+/// LIMIT $1
+/// ```
+///
+/// The baseline unmarshals each payload and skips (but does not delete) events
+/// whose payload is corrupt; that step happens in the caller.
+pub async fn list_for_export(
+    pool: &PgPool,
+    limit: i64,
+) -> Result<Vec<ExportQueueRow>, sqlx::Error> {
+    let rows = sqlx::query_as::<_, (String, Vec<u8>)>(
+        "SELECT id, payload_pb \
+         FROM telemetry_events_export_queue \
+         WHERE exported_at IS NULL \
+         ORDER BY timestamp ASC \
+         LIMIT $1",
+    )
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|(id, payload_pb)| ExportQueueRow { id, payload_pb })
+        .collect())
+}
+
+/// `telemetryEventsExportQueueStore.MarkAsExported`:
+/// `UPDATE ... SET exported_at = NOW() WHERE id = ANY($1)`.
+pub async fn mark_as_exported(pool: &PgPool, event_ids: &[String]) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE telemetry_events_export_queue \
+         SET exported_at = NOW() \
+         WHERE id = ANY($1)",
+    )
+    .bind(event_ids)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// `telemetryEventsExportQueueStore.DeletedExported`: delete events exported
+/// before `before`, returning the number of affected rows.
+pub async fn deleted_exported(
+    pool: &PgPool,
+    before: OffsetDateTime,
+) -> Result<i64, sqlx::Error> {
+    let result = sqlx::query(
+        "DELETE FROM telemetry_events_export_queue \
+         WHERE exported_at IS NOT NULL \
+         AND exported_at < $1",
+    )
+    .bind(before)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() as i64)
+}
+
+/// `telemetryEventsExportQueueStore.CountUnexported`: the number of events not
+/// yet exported and the timestamp of the oldest such event (`None` when the
+/// queue is empty, matching Go's `sql.NullTime` zero value).
+pub async fn count_unexported(
+    pool: &PgPool,
+) -> Result<(i64, Option<OffsetDateTime>), sqlx::Error> {
+    let row: (i64, Option<OffsetDateTime>) = sqlx::query_as(
+        "SELECT COUNT(*), MIN(timestamp) \
+         FROM telemetry_events_export_queue \
+         WHERE exported_at IS NULL",
+    )
+    .fetch_one(pool)
+    .await?;
+    Ok(row)
+}
+
+/// `telemetryEventsExportQueueStore.CountRecentlyExported`.
+pub async fn count_recently_exported(pool: &PgPool) -> Result<i64, sqlx::Error> {
+    let (count,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) \
+         FROM telemetry_events_export_queue \
+         WHERE exported_at IS NOT NULL",
+    )
+    .fetch_one(pool)
+    .await?;
+    Ok(count)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

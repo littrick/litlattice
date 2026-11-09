@@ -40,6 +40,7 @@ sha2 = { workspace = true, features = ["oid"] }
 sqlx = { workspace = true }
 time = { workspace = true }
 tokio = { workspace = true }
+tokio-stream = { workspace = true, features = ["net"] }
 tokio-util = { workspace = true }
 tonic = { workspace = true }
 tracing = { workspace = true }
