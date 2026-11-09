@@ -72,6 +72,7 @@ pub mod executors_metrics;
 pub mod executors_multiqueue_metrics;
 pub mod github_apps_installation;
 pub mod gitserver;
+pub mod insights_backfill_handler;
 pub mod insights_backfill_store;
 pub mod insights_data_retention;
 pub mod insights_query_runner;

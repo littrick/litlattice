@@ -355,3 +355,40 @@ impl SeriesRepoIterator {
         }
     }
 }
+
+/// The Go `discovery.RepoIterator` interface. Callers consume the dispatcher's
+/// result through this trait so a test double can fail in `ForEach` (the enum
+/// alone only wraps real iterators).
+#[async_trait]
+pub trait RepoIter: Send + Sync {
+    async fn for_each(
+        &self,
+        each: &mut (dyn for<'a> FnMut(&'a str, i64) -> Result<(), String> + Send),
+    ) -> Result<(), String>;
+}
+
+#[async_trait]
+impl RepoIter for RepoIterator {
+    async fn for_each(
+        &self,
+        each: &mut (dyn for<'a> FnMut(&'a str, i64) -> Result<(), String> + Send),
+    ) -> Result<(), String> {
+        RepoIterator::for_each(self, each).await
+    }
+}
+
+/// The Go `discovery.SeriesRepoIterator` interface, so callers (and tests) can
+/// substitute the dispatcher.
+#[async_trait]
+pub trait SeriesRepoSelector: Send + Sync {
+    async fn for_series(&self, series: &SeriesScope) -> Result<Box<dyn RepoIter>, String>;
+}
+
+#[async_trait]
+impl SeriesRepoSelector for SeriesRepoIterator {
+    async fn for_series(&self, series: &SeriesScope) -> Result<Box<dyn RepoIter>, String> {
+        Ok(Box::new(
+            SeriesRepoIterator::for_series(self, series).await?,
+        ))
+    }
+}

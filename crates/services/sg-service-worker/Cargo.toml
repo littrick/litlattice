@@ -15,6 +15,7 @@ sg-encryption = { path = "../../domain/sg-encryption" }
 sg-extsvc = { path = "../../domain/sg-extsvc" }
 sg-git = { path = "../../domain/sg-git" }
 sg-http = { path = "../../net/sg-http" }
+sg-insights = { path = "../../domain/sg-insights" }
 sg-keyring = { path = "../../domain/sg-keyring" }
 sg-licensing = { path = "../../domain/sg-licensing" }
 sg-metrics = { path = "../../base/sg-metrics" }

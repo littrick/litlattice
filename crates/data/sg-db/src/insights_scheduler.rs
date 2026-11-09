@@ -117,6 +117,14 @@ async fn load_backfill_on(conn: &mut PgConnection, id: i32) -> Result<SeriesBack
     series_backfill_from_row(&row)
 }
 
+/// `BackfillStore.LoadBackfill` on an existing connection or transaction.
+pub async fn load_backfill_in(
+    conn: &mut PgConnection,
+    id: i32,
+) -> Result<SeriesBackfill, sqlx::Error> {
+    load_backfill_on(conn, id).await
+}
+
 /// `BackfillStore.LoadSeriesBackfills`.
 pub async fn load_series_backfills(
     pool: &PgPool,
@@ -156,6 +164,15 @@ pub async fn set_failed(pool: &PgPool, id: i32) -> Result<SeriesBackfill, sqlx::
     set_state_on(&mut conn, id, "failed").await
 }
 
+/// `SeriesBackfill.setState` on an existing connection or transaction.
+pub async fn set_state_in(
+    conn: &mut PgConnection,
+    id: i32,
+    state: &str,
+) -> Result<(), sqlx::Error> {
+    set_state_on(conn, id, state).await.map(|_| ())
+}
+
 /// `SeriesBackfill.SetScope`: create the repo iterator and point the backfill
 /// at it, moving the backfill to `processing` (one transaction, as in Go).
 pub async fn set_scope(
@@ -181,6 +198,29 @@ pub async fn set_scope(
     let iterator = load_iterator_on(&mut tx, iterator_id).await?;
     tx.commit().await?;
     Ok((backfill, iterator))
+}
+
+/// `SeriesBackfill.SetScope` inside the caller's transaction: create the repo
+/// iterator and point the backfill at it, moving it to `processing`.
+pub async fn set_scope_in(
+    conn: &mut PgConnection,
+    backfill_id: i32,
+    repos: &[i32],
+    cost: f64,
+    now: OffsetDateTime,
+) -> Result<SeriesBackfill, sqlx::Error> {
+    let iterator_id = insert_iterator(conn, repos, now).await?;
+    sqlx::query(
+        "UPDATE insight_series_backfill SET repo_iterator_id = $1, estimated_cost = $2, \
+         state = $3 WHERE id = $4",
+    )
+    .bind(iterator_id)
+    .bind(cost)
+    .bind("processing")
+    .bind(backfill_id)
+    .execute(&mut *conn)
+    .await?;
+    load_backfill_on(conn, backfill_id).await
 }
 
 /// `SeriesBackfill.SetLowestPriority`: if this backfill is not already the
@@ -261,6 +301,14 @@ pub async fn initial_backfill(
 pub async fn enqueue_backfill(pool: &PgPool, backfill_id: i32) -> Result<(), sqlx::Error> {
     let mut conn = pool.acquire().await?;
     enqueue_backfill_on(&mut conn, backfill_id).await
+}
+
+/// `enqueueBackfill` inside the caller's transaction.
+pub async fn enqueue_backfill_in(
+    conn: &mut PgConnection,
+    backfill_id: i32,
+) -> Result<(), sqlx::Error> {
+    enqueue_backfill_on(conn, backfill_id).await
 }
 
 async fn enqueue_backfill_on(conn: &mut PgConnection, backfill_id: i32) -> Result<(), sqlx::Error> {
