@@ -144,6 +144,14 @@ pub struct ExhaustiveSearchRepoRevisionJob {
     pub updated_at: OffsetDateTime,
 }
 
+/// `cmd/worker/internal/search/janitor.go`'s `job`: a search job that has not
+/// been aggregated yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnaggregatedSearchJob {
+    pub id: i64,
+    pub initiator_id: i32,
+}
+
 /// `types.SearchJobLog`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SearchJobLog {
@@ -363,6 +371,22 @@ FROM exhaustive_search_repo_revision_jobs rjj
 JOIN exhaustive_search_repo_jobs rj ON rjj.search_repo_job_id = rj.id
 JOIN repo r ON r.id = rj.repo_id
 ";
+
+/// `listSearchJobs`'s query.
+pub const LIST_UNAGGREGATED_SEARCH_JOBS_SQL: &str =
+    "SELECT id, initiator_id FROM exhaustive_search_jobs WHERE is_aggregated = false";
+
+/// `updateSearchJobStatus`'s query.
+pub const UPDATE_SEARCH_JOB_STATE_SQL: &str =
+    "UPDATE exhaustive_search_jobs SET state = $1 WHERE id = $2";
+
+/// `deleteRepoJobs`'s query.
+pub const DELETE_SEARCH_JOB_REPO_JOBS_SQL: &str =
+    "DELETE FROM exhaustive_search_repo_jobs WHERE search_job_id = $1";
+
+/// `setJobAsAggregated`'s query.
+pub const SET_SEARCH_JOB_AGGREGATED_SQL: &str =
+    "UPDATE exhaustive_search_jobs SET is_aggregated = true WHERE id = $1";
 
 /// `getAggregateStateTable` with the three references to the job id bound as
 /// `$1`. The correlated form used by the list/get projections is
@@ -815,6 +839,63 @@ pub async fn get_job_logs(
         });
     }
     Ok(jobs)
+}
+
+/// `listSearchJobs`: search jobs that haven't been aggregated yet.
+///
+/// Deliberately unordered, like the baseline query.
+pub async fn list_unaggregated_search_jobs(
+    pool: &PgPool,
+) -> Result<Vec<UnaggregatedSearchJob>, Error> {
+    let rows = sqlx::query(LIST_UNAGGREGATED_SEARCH_JOBS_SQL)
+        .fetch_all(pool)
+        .await?;
+    let mut jobs = Vec::with_capacity(rows.len());
+    for row in &rows {
+        jobs.push(UnaggregatedSearchJob {
+            id: i64::from(row.try_get::<i32, _>("id")?),
+            initiator_id: row.try_get("initiator_id")?,
+        });
+    }
+    Ok(jobs)
+}
+
+/// `updateSearchJobStatus` inside the janitor's transaction.
+pub async fn update_search_job_state_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    id: i64,
+    state: &str,
+) -> Result<(), Error> {
+    sqlx::query(UPDATE_SEARCH_JOB_STATE_SQL)
+        .bind(state)
+        .bind(id)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
+/// `deleteRepoJobs` inside the janitor's transaction.
+pub async fn delete_repo_jobs_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    search_job_id: i64,
+) -> Result<(), Error> {
+    sqlx::query(DELETE_SEARCH_JOB_REPO_JOBS_SQL)
+        .bind(search_job_id)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
+/// `setJobAsAggregated` inside the janitor's transaction.
+pub async fn set_search_job_aggregated_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    id: i64,
+) -> Result<(), Error> {
+    sqlx::query(SET_SEARCH_JOB_AGGREGATED_SQL)
+        .bind(id)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
 }
 
 fn validate_repo_job(repo_id: i32, search_job_id: i64, ref_spec: &str) -> Result<(), Error> {

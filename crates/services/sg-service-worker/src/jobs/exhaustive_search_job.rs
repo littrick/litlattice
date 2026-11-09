@@ -22,9 +22,13 @@
 //! `all_jobs()` yet: without a production factory enabling it would only fail
 //! at startup.
 //!
-//! Not ported yet: the janitor (`search_jobs_janitor`, needs the object-storage
-//! log writer), `service.NewSearcherFake`, and the `exhaustive-search-job`
-//! registration.
+//! The janitor (`search_jobs_janitor`) lives in
+//! [`crate::jobs::exhaustive_search_janitor`] and is assembled by
+//! [`new_search_job_routines`] too, with the blobstore injected.
+//!
+//! Not ported yet: the concrete object storage behind
+//! `JobLogsBlobStore`, `service.NewSearcherFake`, and the
+//! `exhaustive-search-job` registration.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -305,7 +309,7 @@ impl DbWorkerHandler<ExhaustiveSearchRepoRevisionJobWorkerStore>
 
 /// `errors.Append(err, closeErr)` for the handler's two-error case: a
 /// `MultiError` renders `N errors occurred:` followed by `\n\t* ` entries.
-fn append_errors(first: Option<String>, second: Option<String>) -> Option<String> {
+pub(crate) fn append_errors(first: Option<String>, second: Option<String>) -> Option<String> {
     match (first, second) {
         (None, None) => None,
         (Some(err), None) | (None, Some(err)) => Some(err),
@@ -416,12 +420,13 @@ pub fn new_exhaustive_search_repo_revision_worker_resetter(
 }
 
 /// `searchJob.newSearchJobRoutines` after the database, upload store and
-/// searcher factory have been resolved: the six routines (three workers, three
-/// resetters). The janitor is not ported yet.
+/// searcher factory have been resolved: the seven routines (three workers,
+/// three resetters, the janitor).
 pub fn new_search_job_routines(
     pool: PgPool,
     new_searcher: Arc<dyn NewSearcher>,
     writer_factory: Arc<dyn MatchWriterFactory>,
+    blob_store: Arc<dyn crate::jobs::exhaustive_search_janitor::JobLogsBlobStore>,
     config: &SearchJobConfig,
 ) -> Vec<BackgroundRoutine> {
     let search_worker_store = Arc::new(new_exhaustive_search_job_worker_store(pool.clone()));
@@ -464,6 +469,14 @@ pub fn new_search_job_routines(
         Arc::clone(&rev_worker_store),
     ));
 
+    let janitor_pool = pool.clone();
+    let janitor_service: Arc<dyn crate::jobs::exhaustive_search_janitor::JanitorService> =
+        Arc::new(crate::jobs::exhaustive_search_janitor::PgJanitorService::new(pool, blob_store));
+    let janitor = crate::jobs::exhaustive_search_janitor::new_search_jobs_janitor_routine(
+        janitor_pool,
+        janitor_service,
+    );
+
     vec![
         BackgroundRoutine::DbBacked(search_worker as Arc<dyn DbBackedRoutine>),
         BackgroundRoutine::DbBacked(repo_worker as Arc<dyn DbBackedRoutine>),
@@ -471,6 +484,7 @@ pub fn new_search_job_routines(
         BackgroundRoutine::DbBacked(search_resetter as Arc<dyn DbBackedRoutine>),
         BackgroundRoutine::DbBacked(repo_resetter as Arc<dyn DbBackedRoutine>),
         BackgroundRoutine::DbBacked(rev_resetter as Arc<dyn DbBackedRoutine>),
+        janitor,
     ]
 }
 
