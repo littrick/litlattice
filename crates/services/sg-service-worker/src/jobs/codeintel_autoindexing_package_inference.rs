@@ -182,7 +182,7 @@ impl NpmPackageName {
 }
 
 /// `ParseNpmPackageFromPackageSyntax` → `ParseNpmVersionedPackage(name + "@0")`.
-fn parse_npm_package_from_package_syntax(package_name: &str) -> Option<NpmPackageName> {
+pub(crate) fn parse_npm_package_from_package_syntax(package_name: &str) -> Option<NpmPackageName> {
     let dependency = format!("{package_name}@0");
     // `scopedPackageNameRegex` requires a final `@version`; a name containing
     // `@` therefore cannot leave the version segment empty or misplaced.
