@@ -302,6 +302,34 @@ pub trait OrganizationsConnectionStore: Send + Sync {
     ) -> Result<OrganizationsConnectionData, String>;
 }
 
+/// The result of prefetching `User.organizations` for one user id
+/// (`UserResolver.Organizations`, `user.go:546-562`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UserOrganizationsLookup {
+    Found(Vec<OrgData>),
+    /// A database failure, surfaced as the resolver error.
+    Error(String),
+}
+
+/// Data for nested resolver fields that need their own async lookups,
+/// prefetched once per request and shared by every object through an `Arc`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NestedPrefetch {
+    pub user_organizations: HashMap<i32, UserOrganizationsLookup>,
+}
+
+/// The database seam for `User.organizations` (`db.Orgs().GetByUserID` plus
+/// the viewer's organization memberships).
+#[async_trait]
+pub trait UserOrganizationsStore: Send + Sync {
+    async fn organizations_for_user(
+        &self,
+        user_id: i32,
+        viewer_uid: i32,
+        viewer_site_admin: bool,
+    ) -> Result<Vec<OrgData>, String>;
+}
+
 /// `organizationsArgs` from the GraphQL arguments (`orgs.go:15-25`).
 pub fn organizations_args(arguments: &Arguments) -> OrganizationsArgs {
     OrganizationsArgs {
@@ -377,6 +405,107 @@ pub async fn prefetch_organizations_connections(
         connections.insert(args, lookup);
     }
     connections
+}
+
+/// One `User` object waiting for its `organizations` field to be prefetched.
+struct UserJob {
+    user: UserData,
+    selections: Vec<RootField>,
+}
+
+/// Prefetch nested resolver data for every `User` reachable from the already
+/// prefetched root fields (`Query.currentUser`, `Query.user`,
+/// `Query.users.nodes`). Currently this covers `User.organizations`
+/// (`user.go:546-562`); the worklist keeps the traversal iterative so deeper
+/// object graphs can reuse it later.
+///
+/// Authorization mirrors `auth.CheckSiteAdminOrSameUserFromActor`: the data is
+/// only fetched when the baseline would reach the query, the field resolver
+/// still reports the folded error otherwise.
+pub async fn prefetch_nested(
+    store: &dyn UserOrganizationsStore,
+    fields: &[RootField],
+    current_user: Option<&UserData>,
+    users: &HashMap<UserKey, UserLookup>,
+    users_connections: &HashMap<UsersArgs, UsersConnectionLookup>,
+    actor: Actor,
+    viewer_site_admin: bool,
+) -> NestedPrefetch {
+    let mut queue: Vec<UserJob> = Vec::new();
+    for field in fields {
+        match field.name.as_str() {
+            "currentUser" => {
+                if let Some(user) = current_user {
+                    queue.push(UserJob {
+                        user: user.clone(),
+                        selections: field.selections.clone(),
+                    });
+                }
+            }
+            "user" => {
+                let UserArg::Key(key) = user_arg(&field.arguments) else {
+                    continue;
+                };
+                if let Some(UserLookup::Found(user)) = users.get(&key) {
+                    queue.push(UserJob {
+                        user: user.clone(),
+                        selections: field.selections.clone(),
+                    });
+                }
+            }
+            "users" => {
+                let args = users_args(&field.arguments);
+                let Some(UsersConnectionLookup::Found(data)) = users_connections.get(&args) else {
+                    continue;
+                };
+                let node_selections: Vec<&RootField> = field
+                    .selections
+                    .iter()
+                    .filter(|selection| selection.name == "nodes")
+                    .collect();
+                for nodes in node_selections {
+                    for user in &data.users {
+                        queue.push(UserJob {
+                            user: user.clone(),
+                            selections: nodes.selections.clone(),
+                        });
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut nested = NestedPrefetch::default();
+    while let Some(job) = queue.pop() {
+        if !job
+            .selections
+            .iter()
+            .any(|selection| selection.name == "organizations")
+        {
+            continue;
+        }
+        if nested.user_organizations.contains_key(&job.user.id) {
+            continue;
+        }
+        let authorized = match actor {
+            Actor::User { uid } if uid == job.user.id => true,
+            _ => viewer_site_admin,
+        };
+        if !authorized {
+            continue;
+        }
+        let lookup = match store
+            .organizations_for_user(job.user.id, viewer_uid(actor), viewer_site_admin)
+            .await
+        {
+            Ok(orgs) => UserOrganizationsLookup::Found(orgs),
+            Err(error) => UserOrganizationsLookup::Error(error),
+        };
+        nested.user_organizations.insert(job.user.id, lookup);
+    }
+
+    nested
 }
 
 /// The `repo` row fields the `Repository` resolvers read (one
@@ -633,6 +762,7 @@ impl FrontendRootResolver {
                 organizations,
                 organizations_connections,
                 viewer_site_admin,
+                nested: Arc::new(NestedPrefetch::default()),
             },
         }
     }
@@ -672,6 +802,17 @@ struct QueryRoot {
     /// The viewer's `users.site_admin`; see
     /// `auth.CheckSiteAdminOrSameUserFromActor`.
     viewer_site_admin: bool,
+    /// Nested resolver data prefetched for this request (see
+    /// [`prefetch_nested`]); attached to every `User` object the root builds.
+    nested: Arc<NestedPrefetch>,
+}
+
+impl FrontendRootResolver {
+    /// Attach the request's nested prefetch data.
+    pub fn with_nested(mut self, nested: Arc<NestedPrefetch>) -> Self {
+        self.query.nested = nested;
+        self
+    }
 }
 
 impl ObjectValue for QueryRoot {
@@ -692,7 +833,9 @@ impl ObjectValue for QueryRoot {
             "currentUser" => match actor {
                 Actor::Anonymous => Ok(Some(FieldValue::Null)),
                 Actor::User { .. } => match &self.user {
-                    Some(user) => Ok(Some(FieldValue::Object(Arc::new(user.clone())))),
+                    Some(user) => Ok(Some(FieldValue::Object(Arc::new(
+                        user.clone().with_nested(self.nested.clone()),
+                    )))),
                     None => Ok(Some(FieldValue::Null)),
                 },
             },
@@ -720,7 +863,8 @@ impl ObjectValue for QueryRoot {
             "user" => match user_arg(arguments) {
                 UserArg::Key(key) => match self.users.get(&key) {
                     Some(UserLookup::Found(data)) => Ok(Some(FieldValue::Object(Arc::new(
-                        UserObject::from_data_as_viewer(data.clone(), self.viewer_site_admin),
+                        UserObject::from_data_as_viewer(data.clone(), self.viewer_site_admin)
+                            .with_nested(self.nested.clone()),
                     )))),
                     Some(UserLookup::NotFound) => Ok(Some(FieldValue::Null)),
                     Some(UserLookup::Error(message)) => Err(ExecError::new(message.clone())),
@@ -738,7 +882,8 @@ impl ObjectValue for QueryRoot {
                 match self.users_connections.get(&args) {
                     Some(UsersConnectionLookup::Found(data)) => {
                         Ok(Some(FieldValue::Object(Arc::new(
-                            UsersConnectionObject::from_data(data.clone(), self.viewer_site_admin),
+                            UsersConnectionObject::from_data(data.clone(), self.viewer_site_admin)
+                                .with_nested(self.nested.clone()),
                         ))))
                     }
                     Some(UsersConnectionLookup::Error(message)) => {
@@ -798,6 +943,9 @@ pub struct UserObject {
     /// The viewer's `users.site_admin` (`false` for anonymous actors and for
     /// objects built without a viewer, e.g. transport tests).
     viewer_site_admin: bool,
+    /// Nested resolver data prefetched for this request (initially empty for
+    /// objects built by unit tests/transport tests).
+    nested: Arc<NestedPrefetch>,
 }
 
 impl UserObject {
@@ -805,6 +953,7 @@ impl UserObject {
         Self {
             data,
             viewer_site_admin: false,
+            nested: Arc::new(NestedPrefetch::default()),
         }
     }
 
@@ -812,7 +961,18 @@ impl UserObject {
         Self {
             data,
             viewer_site_admin,
+            nested: Arc::new(NestedPrefetch::default()),
         }
+    }
+
+    /// Attach the request's nested prefetch data (see [`prefetch_nested`]).
+    pub fn with_nested(mut self, nested: Arc<NestedPrefetch>) -> Self {
+        self.nested = nested;
+        self
+    }
+
+    pub fn user_data(&self) -> &UserData {
+        &self.data
     }
 
     /// `auth.CheckSiteAdminOrSameUserFromActor`: the internal actor and
@@ -902,6 +1062,25 @@ impl ObjectValue for UserObject {
             "viewerCanAdminister" => Ok(Some(FieldValue::Json(Json::Bool(
                 self.can_administer(actor),
             )))),
+            // `UserResolver.Organizations` (`user.go:546-562`): the same
+            // folded authorization error, then the static `GetByUserID`
+            // connection.
+            "organizations" => {
+                if !self.can_administer(actor) {
+                    return Err(ExecError::new(MUST_BE_SITE_ADMIN_OR_SAME_USER));
+                }
+                match self.nested.user_organizations.get(&self.data.id) {
+                    Some(UserOrganizationsLookup::Found(orgs)) => Ok(Some(FieldValue::Object(
+                        Arc::new(OrgConnectionStaticObject {
+                            nodes: orgs.clone(),
+                        }),
+                    ))),
+                    Some(UserOrganizationsLookup::Error(message)) => {
+                        Err(ExecError::new(message.clone()))
+                    }
+                    None => Ok(None),
+                }
+            }
             "tosAccepted" => Ok(Some(FieldValue::Json(Json::Bool(self.data.tos_accepted)))),
             _ => Ok(None),
         }
@@ -914,6 +1093,7 @@ impl ObjectValue for UserObject {
 pub struct UsersConnectionObject {
     data: UsersConnectionData,
     viewer_site_admin: bool,
+    nested: Arc<NestedPrefetch>,
 }
 
 impl UsersConnectionObject {
@@ -921,7 +1101,14 @@ impl UsersConnectionObject {
         Self {
             data,
             viewer_site_admin,
+            nested: Arc::new(NestedPrefetch::default()),
         }
+    }
+
+    /// Attach the request's nested prefetch data (see [`prefetch_nested`]).
+    pub fn with_nested(mut self, nested: Arc<NestedPrefetch>) -> Self {
+        self.nested = nested;
+        self
     }
 
     /// `userConnectionResolver.PageInfo` (`users.go:122-144`). Returns
@@ -961,10 +1148,10 @@ impl ObjectValue for UsersConnectionObject {
                     .users
                     .iter()
                     .map(|user| {
-                        FieldValue::Object(Arc::new(UserObject::from_data_as_viewer(
-                            user.clone(),
-                            self.viewer_site_admin,
-                        )))
+                        FieldValue::Object(Arc::new(
+                            UserObject::from_data_as_viewer(user.clone(), self.viewer_site_admin)
+                                .with_nested(self.nested.clone()),
+                        ))
                     })
                     .collect(),
                 element_type: Some("User"),
@@ -1078,6 +1265,40 @@ impl ObjectValue for OrgObject {
             "viewerIsMember" => Ok(Some(FieldValue::Json(Json::Bool(
                 self.data.viewer_is_member,
             )))),
+            _ => Ok(None),
+        }
+    }
+}
+
+/// `orgConnectionStaticResolver` (`orgs.go:71-82`): `nodes` and `totalCount`
+/// from an already-fetched slice. The SDL `OrgConnection` type exposes no
+/// `pageInfo` field, so the baseline's `HasNextPage(false)` is not reachable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrgConnectionStaticObject {
+    nodes: Vec<OrgData>,
+}
+
+impl ObjectValue for OrgConnectionStaticObject {
+    fn type_name(&self) -> &'static str {
+        "OrgConnection"
+    }
+
+    fn field(
+        &self,
+        field: &str,
+        _arguments: &Arguments,
+        _actor: Actor,
+    ) -> Result<Option<FieldValue>, ExecError> {
+        match field {
+            "nodes" => Ok(Some(FieldValue::List {
+                element_type: Some("Org"),
+                items: self
+                    .nodes
+                    .iter()
+                    .map(|org| FieldValue::Object(Arc::new(OrgObject::from_data(org.clone()))))
+                    .collect(),
+            })),
+            "totalCount" => Ok(Some(FieldValue::Json(Json::Int(self.nodes.len() as i64)))),
             _ => Ok(None),
         }
     }
@@ -1302,7 +1523,8 @@ mod tests {
                          createdAt: DateTime! updatedAt: DateTime \
                          siteAdmin: Boolean! tosAccepted: Boolean! \
                          builtinAuth: Boolean! email: String! \
-                         viewerCanAdminister: Boolean! } \
+                         viewerCanAdminister: Boolean! \
+                         organizations: OrgConnection! } \
              type UserConnection { nodes: [User!]! totalCount: Int! pageInfo: PageInfo! } \
              type PageInfo { endCursor: String hasNextPage: Boolean! } \
              enum UserActivePeriod { TODAY THIS_WEEK THIS_MONTH ALL_TIME } \
@@ -1813,6 +2035,130 @@ mod tests {
                 &admin,
             ),
             r#"{"data":{"organizations":{"nodes":[{"name":"m9fj-team"}],"totalCount":1}}}"#
+        );
+    }
+
+    fn roots_with_user_organizations(
+        user: UserData,
+        viewer_site_admin: bool,
+        organizations: Vec<(i32, UserOrganizationsLookup)>,
+    ) -> FrontendRootResolver {
+        let nested = Arc::new(NestedPrefetch {
+            user_organizations: organizations.into_iter().collect(),
+        });
+        let users = HashMap::from([(
+            UserKey::Username(user.username.clone()),
+            UserLookup::Found(user),
+        )]);
+        FrontendRootResolver::with_prefetched_organizations(
+            None,
+            HashMap::new(),
+            users,
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            viewer_site_admin,
+        )
+        .with_nested(nested)
+    }
+
+    #[test]
+    fn user_organizations_returns_static_org_connection() {
+        let schema = schema();
+        let mut team = org(7, "team", Some("Team"));
+        team.viewer_can_administer = true;
+        team.viewer_is_member = true;
+        let roots = roots_with_user_organizations(
+            user().data,
+            false,
+            vec![(
+                1,
+                UserOrganizationsLookup::Found(vec![team, org(9, "other", None)]),
+            )],
+        );
+        assert_eq!(
+            run(
+                &schema,
+                "{ user(username: \"alice\") { organizations { nodes { name displayName \
+                  viewerCanAdminister viewerIsMember } totalCount } } }",
+                Actor::User { uid: 1 },
+                &roots,
+            ),
+            r#"{"data":{"user":{"organizations":{"nodes":[{"name":"team","displayName":"Team","viewerCanAdminister":true,"viewerIsMember":true},{"name":"other","displayName":null,"viewerCanAdminister":false,"viewerIsMember":false}],"totalCount":2}}}}"#
+        );
+    }
+
+    #[test]
+    fn user_organizations_requires_same_user_or_site_admin() {
+        let schema = schema();
+        let roots = roots_with_user_organizations(user().data, false, vec![]);
+        let expected = r#"{"errors":[{"message":"must be authenticated as the authorized user or site admin","path":["user","organizations"]}],"data":{"user":null}}"#;
+        assert_eq!(
+            run(
+                &schema,
+                "{ user(username: \"alice\") { organizations { nodes { name } } } }",
+                Actor::User { uid: 2 },
+                &roots,
+            ),
+            expected
+        );
+        assert_eq!(
+            run(
+                &schema,
+                "{ user(username: \"alice\") { organizations { nodes { name } } } }",
+                Actor::Anonymous,
+                &roots,
+            ),
+            expected
+        );
+    }
+
+    #[test]
+    fn user_organizations_lookup_error_is_reported() {
+        let schema = schema();
+        let roots = roots_with_user_organizations(
+            user().data,
+            false,
+            vec![(1, UserOrganizationsLookup::Error("boom".to_owned()))],
+        );
+        assert_eq!(
+            run(
+                &schema,
+                "{ user(username: \"alice\") { organizations { nodes { name } } } }",
+                Actor::User { uid: 1 },
+                &roots,
+            ),
+            r#"{"errors":[{"message":"boom","path":["user","organizations"]}],"data":{"user":null}}"#
+        );
+    }
+
+    #[test]
+    fn current_user_organizations_use_nested_prefetch() {
+        let schema = schema();
+        let nested = Arc::new(NestedPrefetch {
+            user_organizations: HashMap::from([(
+                1,
+                UserOrganizationsLookup::Found(vec![org(7, "team", Some("Team"))]),
+            )]),
+        });
+        let roots = FrontendRootResolver::with_prefetched_organizations(
+            Some(user()),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            false,
+        )
+        .with_nested(nested);
+        assert_eq!(
+            run(
+                &schema,
+                "{ currentUser { organizations { nodes { name } totalCount } } }",
+                Actor::User { uid: 1 },
+                &roots,
+            ),
+            r#"{"data":{"currentUser":{"organizations":{"nodes":[{"name":"team"}],"totalCount":1}}}}"#
         );
     }
 

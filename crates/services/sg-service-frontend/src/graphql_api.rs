@@ -300,6 +300,8 @@ pub struct SchemaGraphqlDeps {
     /// `Query.organizations`'s database seam; `None` in transport-only tests.
     organizations_connections:
         Option<Arc<dyn crate::graphql_resolvers::OrganizationsConnectionStore>>,
+    /// `User.organizations`'s database seam; `None` in transport-only tests.
+    user_organizations: Option<Arc<dyn crate::graphql_resolvers::UserOrganizationsStore>>,
 }
 
 impl SchemaGraphqlDeps {
@@ -312,6 +314,7 @@ impl SchemaGraphqlDeps {
             users_connections: None,
             organizations: None,
             organizations_connections: None,
+            user_organizations: None,
         }
     }
 
@@ -334,7 +337,10 @@ impl SchemaGraphqlDeps {
             users: Some(Arc::new(crate::user_store::PgUserStore::new(pool.clone()))),
             users_connections: Some(Arc::new(crate::user_store::PgUserStore::new(pool.clone()))),
             organizations: Some(Arc::new(crate::org_store::PgOrgStore::new(pool.clone()))),
-            organizations_connections: Some(Arc::new(crate::org_store::PgOrgStore::new(pool))),
+            organizations_connections: Some(Arc::new(crate::org_store::PgOrgStore::new(
+                pool.clone(),
+            ))),
+            user_organizations: Some(Arc::new(crate::org_store::PgOrgStore::new(pool))),
         }
     }
 
@@ -378,6 +384,7 @@ impl SchemaGraphqlDeps {
             users_connections: None,
             organizations: None,
             organizations_connections: None,
+            user_organizations: None,
         }
     }
 }
@@ -390,11 +397,10 @@ impl GraphqlDeps for SchemaGraphqlDeps {
         // no current user (the baseline would surface a resolver error; no
         // resolver-level error plumbing exists for DB failures yet).
         let mut site_admin = false;
-        let user = match (request.actor, self.session.as_ref()) {
+        let current_user = match (request.actor, self.session.as_ref()) {
             (Actor::User { uid }, Some(session)) => match session.profiles.profile(uid).await {
-                Ok(profile) => profile.map(|profile| {
+                Ok(profile) => profile.inspect(|profile| {
                     site_admin = profile.site_admin;
-                    crate::graphql_resolvers::UserObject::from_data(profile)
                 }),
                 Err(error) => {
                     tracing::error!(uid, %error, "failed to look up current user");
@@ -460,6 +466,22 @@ impl GraphqlDeps for SchemaGraphqlDeps {
             }
             None => std::collections::HashMap::new(),
         };
+        let nested = match &self.user_organizations {
+            Some(store) => Arc::new(
+                crate::graphql_resolvers::prefetch_nested(
+                    store.as_ref(),
+                    &fields,
+                    current_user.as_ref(),
+                    &users,
+                    &users_connections,
+                    request.actor,
+                    site_admin,
+                )
+                .await,
+            ),
+            None => Arc::new(crate::graphql_resolvers::NestedPrefetch::default()),
+        };
+        let user = current_user.map(crate::graphql_resolvers::UserObject::from_data);
         let roots = crate::graphql_resolvers::FrontendRootResolver::with_prefetched_organizations(
             user,
             repositories,
@@ -468,7 +490,8 @@ impl GraphqlDeps for SchemaGraphqlDeps {
             organizations,
             organizations_connections,
             site_admin,
-        );
+        )
+        .with_nested(nested);
         let response = sg_graphql::exec::execute_with(&self.schema, exec_request, Some(&roots));
         GraphqlResponse::from_exec(&response)
     }

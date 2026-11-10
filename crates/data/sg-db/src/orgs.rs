@@ -51,6 +51,25 @@ LIMIT 1
     Ok(row.as_ref().map(scan_org_row))
 }
 
+/// `orgStore.GetByUserID` (`internal/database/orgs.go:73-102`): the baseline
+/// query has no `ORDER BY`, so the row order is whatever PostgreSQL returns.
+pub async fn orgs_for_user(pool: &PgPool, user_id: i32) -> Result<Vec<OrgRecord>, sqlx::Error> {
+    let rows = sqlx::query(
+        r#"
+SELECT orgs.id, orgs.name, orgs.display_name, orgs.created_at, orgs.updated_at
+FROM org_members
+LEFT OUTER JOIN orgs ON org_members.org_id = orgs.id
+WHERE user_id = $1
+  AND orgs.deleted_at IS NULL
+"#,
+    )
+    .bind(user_id)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows.iter().map(scan_org_row).collect())
+}
+
 /// `database.OrgsListOptions` (`internal/database/orgs.go:136-141`). An empty
 /// `query` does not filter (the baseline checks `opt.Query != ""`).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

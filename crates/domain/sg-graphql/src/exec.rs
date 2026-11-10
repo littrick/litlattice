@@ -388,12 +388,92 @@ pub fn execute_with(
     }
 }
 
-/// A root field [`execute_with`] will resolve, with the same resolved
+/// A selected field [`execute_with`] will resolve, with the same resolved
 /// [`Arguments`] its resolver will receive.
+///
+/// `selections` recursively describes the sub-selections of object-returning
+/// fields (aliases merged, fragments flattened, `@skip`/`@include` applied,
+/// arguments resolved), so callers can prefetch nested resolver data before
+/// execution. Scalar/enum fields and fields without a resolvable composite
+/// type have no selections.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RootField {
     pub name: String,
     pub arguments: Arguments,
+    pub selections: Vec<RootField>,
+}
+
+/// The named type of `parent_type.field` after stripping non-null/list
+/// wrappers (`field_type` is rendered as e.g. `[User!]!`).
+fn named_field_type(schema: &Schema, parent_type: &str, field_name: &str) -> Option<String> {
+    let field = schema
+        .types
+        .get(parent_type)?
+        .fields
+        .iter()
+        .find(|def| def.name == field_name)?;
+    let mut name = field.field_type.as_str();
+    loop {
+        let trimmed = name
+            .trim_end_matches('!')
+            .trim_start_matches('[')
+            .trim_end_matches(']');
+        if trimmed == name {
+            break;
+        }
+        name = trimmed;
+    }
+    Some(name.to_owned())
+}
+
+fn is_composite_type(schema: &Schema, type_name: &str) -> bool {
+    matches!(
+        schema.types.get(type_name).map(|def| def.kind),
+        Some(TypeKind::Object | TypeKind::Interface | TypeKind::Union)
+    )
+}
+
+/// Flatten and resolve one selection level, recursing into composite fields.
+fn selected_fields<'a>(
+    schema: &Schema,
+    parent_type: &str,
+    selections: &[Selection<'a>],
+    fragments: &BTreeMap<String, &Fragment<'a>>,
+    variables: &BTreeMap<String, RtValue>,
+) -> Vec<RootField> {
+    let mut fields = Vec::new();
+    flatten_fields(parent_type, selections, fragments, variables, &mut fields);
+    apply_include_filter(&mut fields, variables);
+
+    fields
+        .into_iter()
+        .filter(|field| {
+            !matches!(
+                field.name.as_str(),
+                "__typename" | "__schema" | "__type" | "_service"
+            )
+        })
+        .map(|field| {
+            let arguments = collect_arguments(schema, parent_type, &field, variables);
+            let selections = named_field_type(schema, parent_type, &field.name)
+                .filter(|name| is_composite_type(schema, name))
+                .map(|name| {
+                    selected_fields(
+                        schema,
+                        &name,
+                        &field.selection_set.items,
+                        fragments,
+                        variables,
+                    )
+                })
+                .unwrap_or_default();
+            RootField {
+                name: field.name,
+                arguments,
+                selections,
+            }
+        })
+        .collect()
 }
 
 /// Parse `request` and return the root fields that [`execute_with`] will
@@ -455,30 +535,14 @@ pub fn root_fields(schema: &Schema, request: &ExecRequest<'_>) -> Vec<RootField>
         }
     }
 
-    let root_name = root_type_name(schema, kind).to_owned();
-    let mut fields = Vec::new();
-    flatten_fields(
-        &root_name,
+    let root_name = root_type_name(schema, kind);
+    selected_fields(
+        schema,
+        root_name,
         &selection_set.items,
         &fragments,
         &variables,
-        &mut fields,
-    );
-    apply_include_filter(&mut fields, &variables);
-
-    fields
-        .into_iter()
-        .filter(|field| {
-            !matches!(
-                field.name.as_str(),
-                "__typename" | "__schema" | "__type" | "_service"
-            )
-        })
-        .map(|field| RootField {
-            arguments: collect_arguments(schema, &root_name, &field, &variables),
-            name: field.name,
-        })
-        .collect()
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -2085,5 +2149,38 @@ mod tests {
             actor: Actor::Anonymous,
         };
         assert!(root_fields(&schema, &request).is_empty());
+    }
+
+    #[test]
+    fn root_fields_include_nested_selections() {
+        let schema = assemble_sdl(
+            "type Query { user(username: String): User } \
+             type User { id: ID! organizations: OrgConnection! } \
+             type OrgConnection { nodes: [Org!]! totalCount: Int! } \
+             type Org { name: String! }",
+        )
+        .unwrap();
+        let variables = serde_json::Map::new();
+        let request = ExecRequest {
+            query: r#"{ user(username: "a") { ...F orgs: organizations { nodes { name } totalCount } } }
+                      fragment F on User { id }"#,
+            operation_name: "",
+            variables: &variables,
+            actor: Actor::Anonymous,
+        };
+        let fields = root_fields(&schema, &request);
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields[0].name, "user");
+        let user = &fields[0].selections;
+        assert_eq!(user.len(), 2);
+        assert_eq!(user[0].name, "id");
+        assert!(user[0].selections.is_empty());
+        assert_eq!(user[1].name, "organizations");
+        assert_eq!(user[1].selections.len(), 2);
+        assert_eq!(user[1].selections[0].name, "nodes");
+        assert_eq!(user[1].selections[0].selections[0].name, "name");
+        assert!(user[1].selections[0].selections[0].selections.is_empty());
+        assert_eq!(user[1].selections[1].name, "totalCount");
+        assert!(user[1].selections[1].selections.is_empty());
     }
 }

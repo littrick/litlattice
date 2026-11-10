@@ -13,10 +13,11 @@ use sqlx::PgPool;
 
 use crate::graphql_resolvers::{
     OrgData, OrganizationStore, OrganizationsArgs, OrganizationsConnectionData,
-    OrganizationsConnectionStore,
+    OrganizationsConnectionStore, UserOrganizationsStore,
 };
 use sg_db::orgs::{
-    count_orgs, find_org_by_name, list_orgs, org_members_for_user, OrgRecord, OrgsListOptions,
+    count_orgs, find_org_by_name, list_orgs, org_members_for_user, orgs_for_user, OrgRecord,
+    OrgsListOptions,
 };
 
 pub struct PgOrgStore {
@@ -88,6 +89,40 @@ impl OrganizationStore for PgOrgStore {
         viewer_site_admin: bool,
     ) -> Result<Option<OrgData>, String> {
         self.lookup(name, viewer_uid, viewer_site_admin).await
+    }
+}
+
+#[async_trait]
+impl UserOrganizationsStore for PgOrgStore {
+    /// `db.Orgs().GetByUserID` plus the *viewer's* membership flags (the
+    /// `Org` nodes' `viewerCanAdminister`/`viewerIsMember` are relative to
+    /// the observer, not to `user_id`).
+    async fn organizations_for_user(
+        &self,
+        user_id: i32,
+        viewer_uid: i32,
+        viewer_site_admin: bool,
+    ) -> Result<Vec<OrgData>, String> {
+        let records = orgs_for_user(&self.pool, user_id)
+            .await
+            .map_err(|error| error.to_string())?;
+        let ids: Vec<i32> = records.iter().map(|org| org.id).collect();
+        let member_ids: HashSet<i32> = if viewer_uid == 0 {
+            HashSet::new()
+        } else {
+            org_members_for_user(&self.pool, viewer_uid, &ids)
+                .await
+                .map_err(|error| error.to_string())?
+                .into_iter()
+                .collect()
+        };
+        Ok(records
+            .into_iter()
+            .map(|record| {
+                let member = member_ids.contains(&record.id);
+                to_org_data(record, viewer_site_admin, member)
+            })
+            .collect())
     }
 }
 
