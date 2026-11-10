@@ -233,6 +233,152 @@ pub async fn prefetch_users_connections(
     connections
 }
 
+/// The `orgs` row fields the `Organization` resolvers read plus the viewer's
+/// authorization flags (`types.Org` + `auth.CheckOrgAccessOrSiteAdmin`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrgData {
+    pub id: i32,
+    pub name: String,
+    /// `NULL` stays `None`; `Org.displayName` is nullable.
+    pub display_name: Option<String>,
+    pub created_at: OffsetDateTime,
+    /// `Org.viewerCanAdminister`: a site admin or an organization member.
+    pub viewer_can_administer: bool,
+    /// `Org.viewerIsMember`: the actor is an organization member.
+    pub viewer_is_member: bool,
+}
+
+/// The result of prefetching one `Query.organization` root field.
+#[derive(Debug, Clone, PartialEq)]
+pub enum OrganizationLookup {
+    Found(OrgData),
+    /// `OrgNotFoundError` (`org not found: name <name>`), surfaced as the
+    /// resolver error; the field itself is nullable.
+    Error(String),
+}
+
+/// The database seam for `Query.organization` (`db.Orgs().GetByName` plus the
+/// viewer's membership row).
+#[async_trait]
+pub trait OrganizationStore: Send + Sync {
+    async fn organization(
+        &self,
+        name: &str,
+        viewer_uid: i32,
+        viewer_site_admin: bool,
+    ) -> Result<Option<OrgData>, String>;
+}
+
+/// `Query.organizations` arguments (`orgs.go:15-25`): `first` and `query`.
+/// `OrgConnection` has no `after`/`pageInfo`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct OrganizationsArgs {
+    pub first: Option<i32>,
+    pub query: Option<String>,
+}
+
+/// `orgConnectionResolver`'s nodes plus the count for the same options.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OrganizationsConnectionData {
+    pub orgs: Vec<OrgData>,
+    pub total_count: i32,
+}
+
+/// The result of prefetching one `Query.organizations` root field.
+#[derive(Debug, Clone, PartialEq)]
+pub enum OrganizationsConnectionLookup {
+    Found(OrganizationsConnectionData),
+    Error(String),
+}
+
+/// The database seam for `Query.organizations` (`db.Orgs().List`/`Count`).
+#[async_trait]
+pub trait OrganizationsConnectionStore: Send + Sync {
+    async fn organizations(
+        &self,
+        args: &OrganizationsArgs,
+        viewer_uid: i32,
+        viewer_site_admin: bool,
+    ) -> Result<OrganizationsConnectionData, String>;
+}
+
+/// `organizationsArgs` from the GraphQL arguments (`orgs.go:15-25`).
+pub fn organizations_args(arguments: &Arguments) -> OrganizationsArgs {
+    OrganizationsArgs {
+        first: arguments
+            .i64("first")
+            .and_then(|first| i32::try_from(first).ok()),
+        query: arguments.string("query").map(str::to_owned),
+    }
+}
+
+/// The viewer's database ID for membership checks (`0` = anonymous).
+fn viewer_uid(actor: Actor) -> i32 {
+    actor.uid().unwrap_or(0)
+}
+
+/// Look up every `Query.organization` root field in `fields`, deduplicated by
+/// name. The viewer's membership decides the two authorization flags.
+pub async fn prefetch_organizations(
+    store: &dyn OrganizationStore,
+    fields: &[RootField],
+    actor: Actor,
+    viewer_site_admin: bool,
+) -> HashMap<String, OrganizationLookup> {
+    let mut organizations = HashMap::new();
+    for field in fields {
+        if field.name != "organization" {
+            continue;
+        }
+        let Some(name) = field.arguments.string("name") else {
+            continue;
+        };
+        let name = name.to_owned();
+        if organizations.contains_key(&name) {
+            continue;
+        }
+        let lookup = match store
+            .organization(&name, viewer_uid(actor), viewer_site_admin)
+            .await
+        {
+            Ok(Some(data)) => OrganizationLookup::Found(data),
+            Ok(None) => OrganizationLookup::Error(format!("org not found: name {name}")),
+            Err(error) => OrganizationLookup::Error(error),
+        };
+        organizations.insert(name, lookup);
+    }
+    organizations
+}
+
+/// Look up every `Query.organizations` root field in `fields`, deduplicated by
+/// argument set.
+pub async fn prefetch_organizations_connections(
+    store: &dyn OrganizationsConnectionStore,
+    fields: &[RootField],
+    actor: Actor,
+    viewer_site_admin: bool,
+) -> HashMap<OrganizationsArgs, OrganizationsConnectionLookup> {
+    let mut connections = HashMap::new();
+    for field in fields {
+        if field.name != "organizations" {
+            continue;
+        }
+        let args = organizations_args(&field.arguments);
+        if connections.contains_key(&args) {
+            continue;
+        }
+        let lookup = match store
+            .organizations(&args, viewer_uid(actor), viewer_site_admin)
+            .await
+        {
+            Ok(data) => OrganizationsConnectionLookup::Found(data),
+            Err(error) => OrganizationsConnectionLookup::Error(error),
+        };
+        connections.insert(args, lookup);
+    }
+    connections
+}
+
 /// The `repo` row fields the `Repository` resolvers read (one
 /// `repoStore.GetByName` row).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -362,7 +508,15 @@ impl FrontendRootResolver {
     /// an authenticated actor has "no ported resolver" because the row cannot
     /// be loaded.
     pub fn new() -> Self {
-        Self::with_state(None, HashMap::new(), HashMap::new(), HashMap::new(), false)
+        Self::with_state(
+            None,
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            false,
+        )
     }
 
     /// The production resolver: `user` is the prefetched current user, if the
@@ -371,6 +525,8 @@ impl FrontendRootResolver {
         let viewer_site_admin = user.as_ref().is_some_and(|user| user.data.site_admin);
         Self::with_state(
             user,
+            HashMap::new(),
+            HashMap::new(),
             HashMap::new(),
             HashMap::new(),
             HashMap::new(),
@@ -389,6 +545,8 @@ impl FrontendRootResolver {
             repositories,
             HashMap::new(),
             HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
             viewer_site_admin,
         )
     }
@@ -402,7 +560,15 @@ impl FrontendRootResolver {
         users: HashMap<UserKey, UserLookup>,
         viewer_site_admin: bool,
     ) -> Self {
-        Self::with_state(user, repositories, users, HashMap::new(), viewer_site_admin)
+        Self::with_state(
+            user,
+            repositories,
+            users,
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            viewer_site_admin,
+        )
     }
 
     /// The production resolver with the prefetched `Query.users`
@@ -419,15 +585,43 @@ impl FrontendRootResolver {
             repositories,
             users,
             users_connections,
+            HashMap::new(),
+            HashMap::new(),
             viewer_site_admin,
         )
     }
 
+    /// The production resolver with the prefetched `Query.organization` /
+    /// `Query.organizations` results as well.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_prefetched_organizations(
+        user: Option<UserObject>,
+        repositories: HashMap<RepoKey, RepoLookup>,
+        users: HashMap<UserKey, UserLookup>,
+        users_connections: HashMap<UsersArgs, UsersConnectionLookup>,
+        organizations: HashMap<String, OrganizationLookup>,
+        organizations_connections: HashMap<OrganizationsArgs, OrganizationsConnectionLookup>,
+        viewer_site_admin: bool,
+    ) -> Self {
+        Self::with_state(
+            user,
+            repositories,
+            users,
+            users_connections,
+            organizations,
+            organizations_connections,
+            viewer_site_admin,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn with_state(
         user: Option<UserObject>,
         repositories: HashMap<RepoKey, RepoLookup>,
         users: HashMap<UserKey, UserLookup>,
         users_connections: HashMap<UsersArgs, UsersConnectionLookup>,
+        organizations: HashMap<String, OrganizationLookup>,
+        organizations_connections: HashMap<OrganizationsArgs, OrganizationsConnectionLookup>,
         viewer_site_admin: bool,
     ) -> Self {
         Self {
@@ -436,6 +630,8 @@ impl FrontendRootResolver {
                 repositories,
                 users,
                 users_connections,
+                organizations,
+                organizations_connections,
                 viewer_site_admin,
             },
         }
@@ -469,6 +665,10 @@ struct QueryRoot {
     users: HashMap<UserKey, UserLookup>,
     /// Prefetched `Query.users` connections, keyed by the argument set.
     users_connections: HashMap<UsersArgs, UsersConnectionLookup>,
+    /// Prefetched `Query.organization` results, keyed by the looked-up name.
+    organizations: HashMap<String, OrganizationLookup>,
+    /// Prefetched `Query.organizations` connections, keyed by the argument set.
+    organizations_connections: HashMap<OrganizationsArgs, OrganizationsConnectionLookup>,
     /// The viewer's `users.site_admin`; see
     /// `auth.CheckSiteAdminOrSameUserFromActor`.
     viewer_site_admin: bool,
@@ -542,6 +742,38 @@ impl ObjectValue for QueryRoot {
                         ))))
                     }
                     Some(UsersConnectionLookup::Error(message)) => {
+                        Err(ExecError::new(message.clone()))
+                    }
+                    None => Ok(None),
+                }
+            }
+            // `schemaResolver.Organization` (`org.go:24-38`): not-found is a
+            // resolver error (`org not found: name <name>`), not `null`.
+            "organization" => {
+                let Some(name) = arguments.string("name") else {
+                    return Ok(None);
+                };
+                match self.organizations.get(name) {
+                    Some(OrganizationLookup::Found(data)) => Ok(Some(FieldValue::Object(
+                        Arc::new(OrgObject::from_data(data.clone())),
+                    ))),
+                    Some(OrganizationLookup::Error(message)) => {
+                        Err(ExecError::new(message.clone()))
+                    }
+                    None => Ok(None),
+                }
+            }
+            // `schemaResolver.Organizations` (`orgs.go:15-30`): the
+            // site-admin check lives in `nodes`/`totalCount`.
+            "organizations" => {
+                let args = organizations_args(arguments);
+                match self.organizations_connections.get(&args) {
+                    Some(OrganizationsConnectionLookup::Found(data)) => {
+                        Ok(Some(FieldValue::Object(Arc::new(
+                            OrgConnectionObject::from_data(data.clone(), self.viewer_site_admin),
+                        ))))
+                    }
+                    Some(OrganizationsConnectionLookup::Error(message)) => {
                         Err(ExecError::new(message.clone()))
                     }
                     None => Ok(None),
@@ -781,6 +1013,140 @@ impl ObjectValue for PageInfoObject {
     }
 }
 
+/// `auth.ErrNotAuthenticated` (`internal/auth/orgs.go:12`).
+const NOT_AUTHENTICATED: &str = "not authenticated";
+
+/// `auth.ErrMustBeSiteAdmin` (`internal/auth/site_admin.go:14`).
+const MUST_BE_SITE_ADMIN: &str = "must be site admin";
+
+/// `OrgResolver` (`cmd/frontend/graphqlbackend/org.go:65`), limited to the
+/// fields backed by the `orgs` row and viewer authorization.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrgObject {
+    data: OrgData,
+}
+
+impl OrgObject {
+    pub fn from_data(data: OrgData) -> Self {
+        Self { data }
+    }
+
+    /// `relay.MarshalID("Org", id)`: `base64.URLEncoding("Org:" + json(id))`.
+    pub fn relay_id(id: i32) -> String {
+        base64::engine::general_purpose::URL_SAFE.encode(format!("Org:{id}"))
+    }
+}
+
+impl ObjectValue for OrgObject {
+    fn type_name(&self) -> &'static str {
+        "Org"
+    }
+
+    fn field(
+        &self,
+        field: &str,
+        _arguments: &Arguments,
+        _actor: Actor,
+    ) -> Result<Option<FieldValue>, ExecError> {
+        match field {
+            "id" => Ok(Some(FieldValue::Json(Json::Str(Self::relay_id(
+                self.data.id,
+            ))))),
+            "name" => Ok(Some(FieldValue::Json(Json::Str(self.data.name.clone())))),
+            // `OrgResolver.DisplayName` returns the row pointer as-is: NULL is
+            // `null`, an empty string stays `""`.
+            "displayName" => Ok(Some(match &self.data.display_name {
+                Some(display_name) => FieldValue::Json(Json::Str(display_name.clone())),
+                None => FieldValue::Null,
+            })),
+            "createdAt" => Ok(Some(FieldValue::Json(Json::Str(datetime_rfc3339(
+                self.data.created_at,
+            ))))),
+            // `OrgResolver.URL`: `"/organizations/" + name`.
+            "url" => Ok(Some(FieldValue::Json(Json::Str(format!(
+                "/organizations/{}",
+                self.data.name
+            ))))),
+            "settingsURL" => Ok(Some(FieldValue::Json(Json::Str(format!(
+                "/organizations/{}/settings",
+                self.data.name
+            ))))),
+            "namespaceName" => Ok(Some(FieldValue::Json(Json::Str(self.data.name.clone())))),
+            "viewerCanAdminister" => Ok(Some(FieldValue::Json(Json::Bool(
+                self.data.viewer_can_administer,
+            )))),
+            "viewerIsMember" => Ok(Some(FieldValue::Json(Json::Bool(
+                self.data.viewer_is_member,
+            )))),
+            _ => Ok(None),
+        }
+    }
+}
+
+/// `orgConnectionResolver` (`orgs.go:27-69`): `nodes` and `totalCount` each
+/// repeat the site-admin check before returning the prefetched data.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OrgConnectionObject {
+    data: OrganizationsConnectionData,
+    viewer_site_admin: bool,
+}
+
+impl OrgConnectionObject {
+    pub fn from_data(data: OrganizationsConnectionData, viewer_site_admin: bool) -> Self {
+        Self {
+            data,
+            viewer_site_admin,
+        }
+    }
+
+    /// `auth.CheckCurrentUserIsSiteAdmin`: anonymous is `not authenticated`,
+    /// an authenticated non-admin is `must be site admin`.
+    fn check_site_admin(&self, actor: Actor) -> Result<(), ExecError> {
+        match actor {
+            Actor::Anonymous => Err(ExecError::new(NOT_AUTHENTICATED)),
+            Actor::User { .. } if !self.viewer_site_admin => {
+                Err(ExecError::new(MUST_BE_SITE_ADMIN))
+            }
+            Actor::User { .. } => Ok(()),
+        }
+    }
+}
+
+impl ObjectValue for OrgConnectionObject {
+    fn type_name(&self) -> &'static str {
+        "OrgConnection"
+    }
+
+    fn field(
+        &self,
+        field: &str,
+        _arguments: &Arguments,
+        actor: Actor,
+    ) -> Result<Option<FieldValue>, ExecError> {
+        match field {
+            "nodes" => {
+                self.check_site_admin(actor)?;
+                Ok(Some(FieldValue::List {
+                    element_type: Some("Org"),
+                    items: self
+                        .data
+                        .orgs
+                        .iter()
+                        .map(|org| FieldValue::Object(Arc::new(OrgObject::from_data(org.clone()))))
+                        .collect(),
+                }))
+            }
+            "totalCount" => {
+                self.check_site_admin(actor)?;
+                Ok(Some(FieldValue::Json(Json::Int(
+                    self.data.total_count as i64,
+                ))))
+            }
+            _ => Ok(None),
+        }
+    }
+}
+
 /// `RepositoryResolver` (`cmd/frontend/graphqlbackend/repository.go`), limited
 /// to the fields present in the row returned by `repoStore.GetByName`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -927,6 +1293,8 @@ mod tests {
                           user(username: String, email: String, databaseID: Int): User \
                           users(first: Int, after: String, query: String, \
                                 activePeriod: UserActivePeriod, inactiveSince: DateTime): UserConnection! \
+                          organization(name: String!): Org \
+                          organizations(first: Int, query: String): OrgConnection! \
                           other: String } \
              type User { id: ID! databaseID: Int! username: String! \
                          displayName: String avatarURL: String \
@@ -938,6 +1306,11 @@ mod tests {
              type UserConnection { nodes: [User!]! totalCount: Int! pageInfo: PageInfo! } \
              type PageInfo { endCursor: String hasNextPage: Boolean! } \
              enum UserActivePeriod { TODAY THIS_WEEK THIS_MONTH ALL_TIME } \
+             type Org { id: ID! name: String! displayName: String \
+                        createdAt: DateTime! url: String! settingsURL: String \
+                        namespaceName: String! viewerCanAdminister: Boolean! \
+                        viewerIsMember: Boolean! } \
+             type OrgConnection { nodes: [Org!]! totalCount: Int! } \
              scalar DateTime",
         )
         .expect("schema")
@@ -1326,6 +1699,121 @@ mod tests {
             connections.iter().cloned().collect(),
             false,
         )
+    }
+
+    fn org(id: i32, name: &str, display_name: Option<&str>) -> OrgData {
+        OrgData {
+            id,
+            name: name.to_owned(),
+            display_name: display_name.map(str::to_owned),
+            created_at: at("2026-01-02T03:04:05.123456789Z"),
+            viewer_can_administer: false,
+            viewer_is_member: false,
+        }
+    }
+
+    fn roots_with_orgs(
+        organizations: &[(String, OrganizationLookup)],
+        organizations_connections: &[(OrganizationsArgs, OrganizationsConnectionLookup)],
+        viewer_site_admin: bool,
+    ) -> FrontendRootResolver {
+        FrontendRootResolver::with_prefetched_organizations(
+            None,
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            organizations.iter().cloned().collect(),
+            organizations_connections.iter().cloned().collect(),
+            viewer_site_admin,
+        )
+    }
+
+    #[test]
+    fn query_organization_returns_ported_fields() {
+        let schema = schema();
+        let mut data = org(7, "m9fj-team", Some("Team"));
+        data.viewer_can_administer = true;
+        data.viewer_is_member = true;
+        let roots = roots_with_orgs(
+            &[("m9fj-team".to_owned(), OrganizationLookup::Found(data))],
+            &[],
+            false,
+        );
+        assert_eq!(
+            run(
+                &schema,
+                "{ organization(name: \"m9fj-team\") { id name displayName createdAt url \
+                  settingsURL namespaceName viewerCanAdminister viewerIsMember } }",
+                Actor::Anonymous,
+                &roots,
+            ),
+            r#"{"data":{"organization":{"id":"T3JnOjc=","name":"m9fj-team","displayName":"Team","createdAt":"2026-01-02T03:04:05Z","url":"/organizations/m9fj-team","settingsURL":"/organizations/m9fj-team/settings","namespaceName":"m9fj-team","viewerCanAdminister":true,"viewerIsMember":true}}}"#
+        );
+    }
+
+    #[test]
+    fn query_organization_not_found_is_an_error() {
+        let schema = schema();
+        let roots = roots_with_orgs(
+            &[(
+                "missing".to_owned(),
+                OrganizationLookup::Error("org not found: name missing".to_owned()),
+            )],
+            &[],
+            false,
+        );
+        assert_eq!(
+            run(
+                &schema,
+                "{ organization(name: \"missing\") { name } }",
+                Actor::Anonymous,
+                &roots,
+            ),
+            r#"{"errors":[{"message":"org not found: name missing","path":["organization"]}],"data":{"organization":null}}"#
+        );
+    }
+
+    #[test]
+    fn query_organizations_requires_site_admin() {
+        let schema = schema();
+        let args = OrganizationsArgs {
+            first: None,
+            query: None,
+        };
+        let lookup = OrganizationsConnectionLookup::Found(OrganizationsConnectionData {
+            orgs: vec![org(7, "m9fj-team", None)],
+            total_count: 1,
+        });
+        let anonymous = roots_with_orgs(&[], &[(args.clone(), lookup.clone())], false);
+        assert_eq!(
+            run(
+                &schema,
+                "{ organizations { nodes { name } totalCount } }",
+                Actor::Anonymous,
+                &anonymous,
+            ),
+            r#"{"errors":[{"message":"not authenticated","path":["organizations","nodes"]}],"data":null}"#
+        );
+        let non_admin = roots_with_orgs(&[], &[(args.clone(), lookup.clone())], false);
+        assert_eq!(
+            run(
+                &schema,
+                "{ organizations { nodes { name } } }",
+                Actor::User { uid: 1 },
+                &non_admin,
+            ),
+            r#"{"errors":[{"message":"must be site admin","path":["organizations","nodes"]}],"data":null}"#
+        );
+        let admin = roots_with_orgs(&[], &[(args, lookup)], true);
+        assert_eq!(
+            run(
+                &schema,
+                "{ organizations { nodes { name } totalCount } }",
+                Actor::User { uid: 1 },
+                &admin,
+            ),
+            r#"{"data":{"organizations":{"nodes":[{"name":"m9fj-team"}],"totalCount":1}}}"#
+        );
     }
 
     #[test]

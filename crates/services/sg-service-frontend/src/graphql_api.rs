@@ -295,6 +295,11 @@ pub struct SchemaGraphqlDeps {
     users: Option<Arc<dyn crate::graphql_resolvers::UserLookupStore>>,
     /// `Query.users`'s database seam; `None` in transport-only tests.
     users_connections: Option<Arc<dyn crate::graphql_resolvers::UsersConnectionStore>>,
+    /// `Query.organization`'s database seam; `None` in transport-only tests.
+    organizations: Option<Arc<dyn crate::graphql_resolvers::OrganizationStore>>,
+    /// `Query.organizations`'s database seam; `None` in transport-only tests.
+    organizations_connections:
+        Option<Arc<dyn crate::graphql_resolvers::OrganizationsConnectionStore>>,
 }
 
 impl SchemaGraphqlDeps {
@@ -305,6 +310,8 @@ impl SchemaGraphqlDeps {
             repositories: None,
             users: None,
             users_connections: None,
+            organizations: None,
+            organizations_connections: None,
         }
     }
 
@@ -325,7 +332,9 @@ impl SchemaGraphqlDeps {
                 pool.clone(),
             ))),
             users: Some(Arc::new(crate::user_store::PgUserStore::new(pool.clone()))),
-            users_connections: Some(Arc::new(crate::user_store::PgUserStore::new(pool))),
+            users_connections: Some(Arc::new(crate::user_store::PgUserStore::new(pool.clone()))),
+            organizations: Some(Arc::new(crate::org_store::PgOrgStore::new(pool.clone()))),
+            organizations_connections: Some(Arc::new(crate::org_store::PgOrgStore::new(pool))),
         }
     }
 
@@ -367,6 +376,8 @@ impl SchemaGraphqlDeps {
             repositories: None,
             users: None,
             users_connections: None,
+            organizations: None,
+            organizations_connections: None,
         }
     }
 }
@@ -399,9 +410,9 @@ impl GraphqlDeps for SchemaGraphqlDeps {
             variables: request.variables,
             actor: request.actor,
         };
-        // `Query.repository`/`Query.user`/`Query.users` need async database
-        // lookups, so prefetch the root fields identified by the executor
-        // before executing.
+        // `Query.repository`/`Query.user`/`Query.users`/`Query.organization`/
+        // `Query.organizations` need async database lookups, so prefetch the
+        // root fields identified by the executor before executing.
         let fields = sg_graphql::exec::root_fields(&self.schema, &exec_request);
         let repositories = match &self.repositories {
             Some(store) => {
@@ -425,14 +436,39 @@ impl GraphqlDeps for SchemaGraphqlDeps {
             }
             None => std::collections::HashMap::new(),
         };
-        let roots =
-            crate::graphql_resolvers::FrontendRootResolver::with_user_and_repositories_and_users_connections(
-                user,
-                repositories,
-                users,
-                users_connections,
-                site_admin,
-            );
+        let organizations = match &self.organizations {
+            Some(store) => {
+                crate::graphql_resolvers::prefetch_organizations(
+                    store.as_ref(),
+                    &fields,
+                    request.actor,
+                    site_admin,
+                )
+                .await
+            }
+            None => std::collections::HashMap::new(),
+        };
+        let organizations_connections = match &self.organizations_connections {
+            Some(store) => {
+                crate::graphql_resolvers::prefetch_organizations_connections(
+                    store.as_ref(),
+                    &fields,
+                    request.actor,
+                    site_admin,
+                )
+                .await
+            }
+            None => std::collections::HashMap::new(),
+        };
+        let roots = crate::graphql_resolvers::FrontendRootResolver::with_prefetched_organizations(
+            user,
+            repositories,
+            users,
+            users_connections,
+            organizations,
+            organizations_connections,
+            site_admin,
+        );
         let response = sg_graphql::exec::execute_with(&self.schema, exec_request, Some(&roots));
         GraphqlResponse::from_exec(&response)
     }

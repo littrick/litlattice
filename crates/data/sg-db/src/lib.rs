@@ -32,6 +32,7 @@ pub mod github_apps;
 pub mod gitserver_repos;
 pub mod global_state;
 pub mod insights_scheduler;
+pub mod orgs;
 pub mod out_of_band_migrations;
 pub mod own_signal_configurations;
 pub mod permission_sync_jobs;
