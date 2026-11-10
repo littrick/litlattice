@@ -137,6 +137,7 @@ async fn graphql_user_organizations_harness() {
             prefetch_nested(
                 &org_store,
                 &org_store,
+                &org_store,
                 &fields,
                 current_user.as_ref(),
                 &users,

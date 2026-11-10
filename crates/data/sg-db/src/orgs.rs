@@ -1,8 +1,8 @@
 #![forbid(unsafe_code)]
 
-//! `internal/database/orgs.go` (`GetByName`, `List`, `Count`) and
-//! `internal/database/org_members.go` (`GetByOrgIDAndUserID`) for the
-//! `Query.organization` / `Query.organizations` resolvers.
+//! `internal/database/orgs.go` (`GetByID`, `GetByName`, `GetByUserID`, `List`,
+//! `Count`) and `internal/database/org_members.go` (`GetByOrgIDAndUserID`,
+//! `GetByUserID`) for the organization resolvers.
 //!
 //! Only the read paths the GraphQL resolvers need are ported; `orgs.name` is
 //! citext, so `GetByName` binds `$1::citext` (sqlx sends TEXT, and
@@ -45,6 +45,24 @@ LIMIT 1
 "#,
     )
     .bind(name)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(row.as_ref().map(scan_org_row))
+}
+
+/// `orgStore.GetByID` (`internal/database/orgs.go:103-112`): live
+/// organizations only; `Ok(None)` is the baseline `OrgNotFoundError`.
+pub async fn find_org_by_id(pool: &PgPool, id: i32) -> Result<Option<OrgRecord>, sqlx::Error> {
+    let row = sqlx::query(
+        r#"
+SELECT id, name, display_name, created_at, updated_at
+FROM orgs
+WHERE deleted_at IS NULL AND id = $1
+LIMIT 1
+"#,
+    )
+    .bind(id)
     .fetch_optional(pool)
     .await?;
 
@@ -138,4 +156,46 @@ pub async fn org_members_for_user(
         .bind(org_ids.to_vec())
         .fetch_all(pool)
         .await
+}
+
+/// One `org_members` row (`internal/types/types.go:955-961`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrgMembershipRecord {
+    pub id: i32,
+    pub org_id: i32,
+    pub user_id: i32,
+    pub created_at: OffsetDateTime,
+    pub updated_at: OffsetDateTime,
+}
+
+/// `orgMembersStore.GetByUserID` (`internal/database/org_members.go:66-68`):
+/// memberships of live users; the baseline has **no** `ORDER BY`, so rows come
+/// back in whatever order PostgreSQL returns.
+pub async fn org_memberships_for_user(
+    pool: &PgPool,
+    user_id: i32,
+) -> Result<Vec<OrgMembershipRecord>, sqlx::Error> {
+    let rows = sqlx::query(
+        r#"
+SELECT org_members.id, org_members.org_id, org_members.user_id,
+       org_members.created_at, org_members.updated_at
+FROM org_members
+INNER JOIN users ON org_members.user_id = users.id
+WHERE org_members.user_id = $1 AND users.deleted_at IS NULL
+"#,
+    )
+    .bind(user_id)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .iter()
+        .map(|row| OrgMembershipRecord {
+            id: row.get("id"),
+            org_id: row.get("org_id"),
+            user_id: row.get("user_id"),
+            created_at: row.get("created_at"),
+            updated_at: row.get("updated_at"),
+        })
+        .collect())
 }

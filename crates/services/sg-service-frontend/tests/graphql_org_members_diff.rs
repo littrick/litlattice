@@ -120,6 +120,7 @@ async fn graphql_org_members_harness() {
             prefetch_nested(
                 &store,
                 &store,
+                &store,
                 &fields,
                 None,
                 &HashMap::new(),

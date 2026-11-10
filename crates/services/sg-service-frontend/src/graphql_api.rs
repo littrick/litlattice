@@ -304,6 +304,9 @@ pub struct SchemaGraphqlDeps {
     user_organizations: Option<Arc<dyn crate::graphql_resolvers::UserOrganizationsStore>>,
     /// `Org.members`'s database seam; `None` in transport-only tests.
     org_members: Option<Arc<dyn crate::graphql_resolvers::OrgMembersStore>>,
+    /// `User.organizationMemberships`'s database seam; `None` in
+    /// transport-only tests.
+    org_memberships: Option<Arc<dyn crate::graphql_resolvers::OrgMembershipsStore>>,
 }
 
 impl SchemaGraphqlDeps {
@@ -318,6 +321,7 @@ impl SchemaGraphqlDeps {
             organizations_connections: None,
             user_organizations: None,
             org_members: None,
+            org_memberships: None,
         }
     }
 
@@ -344,7 +348,8 @@ impl SchemaGraphqlDeps {
                 pool.clone(),
             ))),
             user_organizations: Some(Arc::new(crate::org_store::PgOrgStore::new(pool.clone()))),
-            org_members: Some(Arc::new(crate::org_store::PgOrgStore::new(pool))),
+            org_members: Some(Arc::new(crate::org_store::PgOrgStore::new(pool.clone()))),
+            org_memberships: Some(Arc::new(crate::org_store::PgOrgStore::new(pool))),
         }
     }
 
@@ -390,6 +395,7 @@ impl SchemaGraphqlDeps {
             organizations_connections: None,
             user_organizations: None,
             org_members: None,
+            org_memberships: None,
         }
     }
 }
@@ -471,11 +477,16 @@ impl GraphqlDeps for SchemaGraphqlDeps {
             }
             None => std::collections::HashMap::new(),
         };
-        let nested = match (&self.user_organizations, &self.org_members) {
-            (Some(store), Some(members_store)) => Arc::new(
+        let nested = match (
+            &self.user_organizations,
+            &self.org_members,
+            &self.org_memberships,
+        ) {
+            (Some(store), Some(members_store), Some(memberships_store)) => Arc::new(
                 crate::graphql_resolvers::prefetch_nested(
                     store.as_ref(),
                     members_store.as_ref(),
+                    memberships_store.as_ref(),
                     &fields,
                     current_user.as_ref(),
                     &users,

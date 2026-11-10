@@ -13,16 +13,18 @@ use base64::Engine;
 use sqlx::PgPool;
 
 use crate::graphql_resolvers::{
-    maybe_query_is_id, MembersArgs, MembersConnectionData, OrgData, OrgMembersStore,
-    OrganizationStore, OrganizationsArgs, OrganizationsConnectionData,
-    OrganizationsConnectionStore, UserOrganizationsStore,
+    maybe_query_is_id, MembersArgs, MembersConnectionData, MembershipData, OrgData,
+    OrgMembersStore, OrgMembershipsStore, OrganizationStore, OrganizationsArgs,
+    OrganizationsConnectionData, OrganizationsConnectionStore, UserData, UserOrganizationsStore,
 };
 use crate::user_store::to_user_data;
 use sg_db::orgs::{
-    count_orgs, find_org_by_name, list_orgs, org_members_for_user, orgs_for_user, OrgRecord,
-    OrgsListOptions,
+    count_orgs, find_org_by_id, find_org_by_name, list_orgs, org_members_for_user,
+    org_memberships_for_user, orgs_for_user, OrgMembershipRecord, OrgRecord, OrgsListOptions,
 };
-use sg_db::users::{count_users, list_users_by_org, UsersListOptions, UsersPaginationArgs};
+use sg_db::users::{
+    count_users, get_session_user, list_users_by_org, UsersListOptions, UsersPaginationArgs,
+};
 
 pub struct PgOrgStore {
     pool: PgPool,
@@ -261,5 +263,57 @@ impl OrgMembersStore for PgOrgStore {
             after_present: args.after.is_some(),
             before_present: args.before.is_some(),
         })
+    }
+}
+
+fn to_membership_data(record: OrgMembershipRecord) -> MembershipData {
+    MembershipData {
+        id: record.id,
+        org_id: record.org_id,
+        user_id: record.user_id,
+        created_at: record.created_at,
+        updated_at: record.updated_at,
+    }
+}
+
+#[async_trait]
+impl OrgMembershipsStore for PgOrgStore {
+    /// `orgMembersStore.GetByUserID` (`org_members.go:66-68`): live users only,
+    /// no `ORDER BY`.
+    async fn memberships_for_user(&self, user_id: i32) -> Result<Vec<MembershipData>, String> {
+        let records = org_memberships_for_user(&self.pool, user_id)
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(records.into_iter().map(to_membership_data).collect())
+    }
+
+    /// `OrgByIDInt32` (`org.go:57-63`): `db.Orgs().GetByID` treats a missing
+    /// live org as `org not found: id <n>`; the `Org` node's viewer flags are
+    /// relative to the observer, like `Query.organization`.
+    async fn org_by_id(
+        &self,
+        org_id: i32,
+        viewer_uid: i32,
+        viewer_site_admin: bool,
+    ) -> Result<OrgData, String> {
+        let Some(record) = find_org_by_id(&self.pool, org_id)
+            .await
+            .map_err(|error| error.to_string())?
+        else {
+            return Err(format!("org not found: id {org_id}"));
+        };
+        let member = self.is_member(viewer_uid, &[record.id]).await?;
+        Ok(to_org_data(record, viewer_site_admin, member))
+    }
+
+    /// `UserByIDInt32` (`user.go:114-120`) with the primary email
+    /// (`userStore.getBySQL`); a missing live user is `user not found: [<n>]`.
+    async fn user_by_id(&self, user_id: i32) -> Result<UserData, String> {
+        let record = get_session_user(&self.pool, user_id)
+            .await
+            .map_err(|error| error.to_string())?;
+        record
+            .map(to_user_data)
+            .ok_or_else(|| format!("user not found: [{user_id}]"))
     }
 }
