@@ -270,6 +270,15 @@ pub trait GraphqlDeps: Send + Sync {
     }
 }
 
+/// The production anonymous rate limiter (`rate_limit.go:424-473`) and the
+/// configuration snapshot that drives its hourly limit. The baseline updates
+/// the watcher from `conf.Watch`; here every request re-reads
+/// `experimentalFeatures.rateLimitAnonymous` from [`LiveConfig`].
+struct RateLimitDeps {
+    watcher: crate::rate_limit::BasicLimitWatcher,
+    live: Arc<LiveConfig>,
+}
+
 /// The production session-authentication dependencies.
 struct SessionDeps {
     store: Arc<dyn SessionStore>,
@@ -310,6 +319,9 @@ pub struct SchemaGraphqlDeps {
     /// `Mutation.settingsMutation`'s write seam (the `settings` table);
     /// `None` in transport-only tests.
     pool: Option<sqlx::PgPool>,
+    /// Anonymous GraphQL rate limiter; `None` in transport-only tests and when
+    /// the frontend could not reach Redis at startup.
+    rate_limit: Option<RateLimitDeps>,
 }
 
 impl SchemaGraphqlDeps {
@@ -326,6 +338,7 @@ impl SchemaGraphqlDeps {
             org_members: None,
             org_memberships: None,
             pool: None,
+            rate_limit: None,
         }
     }
 
@@ -355,6 +368,7 @@ impl SchemaGraphqlDeps {
             org_members: Some(Arc::new(crate::org_store::PgOrgStore::new(pool.clone()))),
             org_memberships: Some(Arc::new(crate::org_store::PgOrgStore::new(pool.clone()))),
             pool: Some(pool),
+            rate_limit: None,
         }
     }
 
@@ -373,6 +387,18 @@ impl SchemaGraphqlDeps {
         users: Arc<dyn crate::graphql_resolvers::UserLookupStore>,
     ) -> Self {
         self.users = Some(users);
+        self
+    }
+
+    /// Production rate limiting (`serve_cmd.go:436-448`): the Redis-backed
+    /// GCRA watcher plus the live site configuration that carries
+    /// `experimentalFeatures.rateLimitAnonymous`.
+    pub fn with_rate_limit(
+        mut self,
+        watcher: crate::rate_limit::BasicLimitWatcher,
+        live: Arc<LiveConfig>,
+    ) -> Self {
+        self.rate_limit = Some(RateLimitDeps { watcher, live });
         self
     }
 
@@ -402,12 +428,23 @@ impl SchemaGraphqlDeps {
             org_members: None,
             org_memberships: None,
             pool: None,
+            rate_limit: None,
         }
     }
 }
 
 #[async_trait]
 impl GraphqlDeps for SchemaGraphqlDeps {
+    async fn rate_limit(&self, request: GraphqlRateLimitRequest<'_>) -> Option<RateLimitOutcome> {
+        let deps = self.rate_limit.as_ref()?;
+        // `conf.Watch`'s `updateFromConfig(e.RateLimitAnonymous)`: the site
+        // configuration drives the quota and the watcher disables itself for
+        // `limit <= 0`.
+        let limit = deps.live.current().site.rate_limit_anonymous();
+        deps.watcher.update_from_config(limit);
+        deps.watcher.check(request.args).await
+    }
+
     async fn exec(&self, request: GraphqlExecRequest<'_>) -> GraphqlResponse {
         // `CurrentUser` resolves `db.Users().GetByCurrentAuthUser`; prefetch
         // the row once per request. A lookup failure is logged and treated as
@@ -651,7 +688,19 @@ where
         }
     };
 
-    let request_name = req.uri().query().unwrap_or("unknown").to_owned();
+    // `graphql.go:116-119`: the raw query string names the request; an empty
+    // query (including a bare `?`) is "unknown".
+    let request_name = match req.uri().query() {
+        Some(query) if !query.is_empty() => query.to_owned(),
+        _ => "unknown".to_owned(),
+    };
+    // `graphql.go:120`: `search.GuessSource(r)`.
+    let request_source = crate::search_source::guess_source(
+        &req.headers()
+            .get(header::USER_AGENT)
+            .map(|value| String::from_utf8_lossy(value.as_bytes()).into_owned())
+            .unwrap_or_default(),
+    );
     let uid = get_uid(req.headers(), actor);
 
     let gzip = req
@@ -729,9 +778,7 @@ where
                     is_ip,
                     anonymous,
                     request_name: &request_name,
-                    // `search.GuessSource` is not ported; `trace.SourceOther`
-                    // is the fallback for non-browser clients.
-                    request_source: "other",
+                    request_source: &request_source,
                 },
             })
             .await;

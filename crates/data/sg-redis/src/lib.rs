@@ -272,6 +272,36 @@ impl KeyValue {
         }
         self.run(&mut cmd).await
     }
+
+    /// `TIME`: the Redis server clock as `(seconds, microseconds)`. Used by the
+    /// GCRA rate-limit store (`redigostore.GetWithTime`).
+    pub async fn time(&self) -> Result<(i64, i64), RedisError> {
+        self.run(&mut redis::cmd("TIME")).await
+    }
+
+    /// `GET` decoded as `int64`; `None` is redigo's `redis.ErrNil`.
+    pub async fn get_int(&self, key: &str) -> Result<Option<i64>, RedisError> {
+        self.run(redis::cmd("GET").arg(self.key(key))).await
+    }
+
+    /// `SETNX`: `true` when the key was set (it did not exist).
+    pub async fn set_nx(&self, key: &str, value: i64) -> Result<bool, RedisError> {
+        let set: i64 = self
+            .run(redis::cmd("SETNX").arg(self.key(key)).arg(value))
+            .await?;
+        Ok(set == 1)
+    }
+
+    /// `EVAL` with a single key; integer replies only (the GCRA compare-and-swap
+    /// Lua script returns 1/0 or a `key does not exist` error).
+    pub async fn eval_int(&self, script: &str, key: &str, args: &[i64]) -> Result<i64, RedisError> {
+        let mut cmd = redis::cmd("EVAL");
+        cmd.arg(script).arg(1).arg(self.key(key));
+        for arg in args {
+            cmd.arg(*arg);
+        }
+        self.run(&mut cmd).await
+    }
 }
 
 /// `redisKeyValue.prefix + prefix + ":"` (`WithPrefix`).

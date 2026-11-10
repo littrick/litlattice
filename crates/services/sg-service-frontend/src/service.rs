@@ -195,10 +195,28 @@ impl Service for FrontendService {
         // The assembled OSS schema is executed by `sg-graphql` (M9.8fb); the
         // session cookie authenticates external requests and the current-user
         // row backs `Query.currentUser` (M9.8fe).
-        let graphql_deps: Arc<dyn GraphqlDeps> = Arc::new(SchemaGraphqlDeps::with_session(
-            Arc::clone(&graphql_schema),
-            session_pool,
-        ));
+        let graphql_deps =
+            SchemaGraphqlDeps::with_session(Arc::clone(&graphql_schema), session_pool);
+        // `serve_cmd.go:436-448`: the anonymous GraphQL limiter stores GCRA
+        // state in the Redis cache pool (`gql:rl:` prefix). A redigo pool does
+        // not dial at construction (failures surface per request); here an
+        // unreachable Redis at startup only disables the limiter.
+        let graphql_deps: Arc<dyn GraphqlDeps> =
+            match sg_redis::KeyValue::connect(&sg_redis::cache_endpoint()).await {
+                Ok(kv) => {
+                    let watcher = crate::rate_limit::BasicLimitWatcher::new(Arc::new(
+                        crate::rate_limit::RedisGcraStore::new(kv),
+                    ));
+                    Arc::new(graphql_deps.with_rate_limit(watcher, Arc::clone(wiring.live())))
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        error = %error,
+                        "GraphQL rate limiter disabled: Redis is unreachable"
+                    );
+                    Arc::new(graphql_deps)
+                }
+            };
 
         if let Some((addr, listener)) = internal {
             let shutdown = ctx.shutdown.clone();

@@ -270,6 +270,20 @@ impl SiteConfiguration {
         self.bool_field("disableAutoGitUpdates")
     }
 
+    /// `conf.Get().ExperimentalFeatures.RateLimitAnonymous`
+    /// (`schema.ExperimentalFeatures.rateLimitAnonymous`): hourly anonymous
+    /// GraphQL rate limit; `0` disables the limiter. The baseline unmarshals
+    /// into a Go `int`, so a non-integer would invalidate the whole site
+    /// configuration; here it is treated as unset (0), matching the existing
+    /// accessors' leniency for field-level type errors.
+    pub fn rate_limit_anonymous(&self) -> i64 {
+        self.raw
+            .get("experimentalFeatures")
+            .and_then(|features| features.get("rateLimitAnonymous"))
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(0)
+    }
+
     /// `conf.GitLongCommandTimeout`: `siteConfig.gitLongCommandTimeout`
     /// seconds, defaulting to 2h. Non-positive values keep the default.
     pub fn git_long_command_timeout(&self) -> Duration {
@@ -1181,6 +1195,25 @@ mod tests {
             unified.site.git_max_concurrent_clones(),
             DEFAULT_GIT_MAX_CONCURRENT_CLONES
         );
+    }
+
+    #[test]
+    fn rate_limit_anonymous_reads_experimental_features() {
+        assert_eq!(SiteConfiguration::default().rate_limit_anonymous(), 0);
+        let site =
+            SiteConfiguration::parse(r#"{"experimentalFeatures": {"rateLimitAnonymous": 100}}"#)
+                .expect("parse");
+        assert_eq!(site.rate_limit_anonymous(), 100);
+        // Zero and negative values keep their value; the limiter disables
+        // itself for `limit <= 0` (`updateFromConfig`).
+        let disabled =
+            SiteConfiguration::parse(r#"{"experimentalFeatures": {"rateLimitAnonymous": 0}}"#)
+                .expect("parse");
+        assert_eq!(disabled.rate_limit_anonymous(), 0);
+        let non_integer =
+            SiteConfiguration::parse(r#"{"experimentalFeatures": {"rateLimitAnonymous": 1.5}}"#)
+                .expect("parse");
+        assert_eq!(non_integer.rate_limit_anonymous(), 0);
     }
 
     #[test]
