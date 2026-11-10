@@ -1713,6 +1713,10 @@ mod tests {
                 username: "alice".to_owned(),
                 display_name: String::new(),
                 avatar_url: String::new(),
+                created_at: fixed_created_at(),
+                updated_at: fixed_created_at(),
+                site_admin: false,
+                tos_accepted: false,
             }))
         }
     }

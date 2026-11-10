@@ -14,6 +14,8 @@ use std::path::Path;
 
 use serde::Deserialize;
 use serde_json::Map;
+use time::format_description::well_known::Rfc3339;
+use time::OffsetDateTime;
 
 use sg_graphql::exec::{execute_with, Actor, ExecRequest};
 use sg_graphql::schema::assemble_sdl;
@@ -32,7 +34,15 @@ type User {
   username: String!
   displayName: String
   avatarURL: String
+  url: String!
+  settingsURL: String
+  createdAt: DateTime!
+  updatedAt: DateTime
+  siteAdmin: Boolean!
+  tosAccepted: Boolean!
 }
+
+scalar DateTime
 ";
 
 #[derive(Deserialize)]
@@ -43,6 +53,14 @@ struct UserCase {
     display_name: String,
     #[serde(rename = "avatarURL")]
     avatar_url: String,
+    #[serde(rename = "createdAt")]
+    created_at: String,
+    #[serde(rename = "updatedAt")]
+    updated_at: String,
+    #[serde(rename = "siteAdmin")]
+    site_admin: bool,
+    #[serde(rename = "tosAccepted")]
+    tos_accepted: bool,
 }
 
 #[derive(Deserialize)]
@@ -65,11 +83,17 @@ fn graphql_user_harness() {
     let schema = assemble_sdl(SDL).expect("schema");
 
     for case in cases {
+        let created_at = OffsetDateTime::parse(&case.user.created_at, &Rfc3339).expect("createdAt");
+        let updated_at = OffsetDateTime::parse(&case.user.updated_at, &Rfc3339).expect("updatedAt");
         let user = UserObject::from_data(UserData {
             id: case.user.id,
             username: case.user.username,
             display_name: case.user.display_name,
             avatar_url: case.user.avatar_url,
+            created_at,
+            updated_at,
+            site_admin: case.user.site_admin,
+            tos_accepted: case.user.tos_accepted,
         });
         let roots = FrontendRootResolver::with_user(Some(user));
         let variables = Map::new();
@@ -79,7 +103,7 @@ fn graphql_user_harness() {
                 query: &case.query,
                 operation_name: "",
                 variables: &variables,
-                actor: Actor::User { uid: 1 },
+                actor: Actor::User { uid: case.user.id },
             },
             Some(&roots),
         );

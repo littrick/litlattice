@@ -432,7 +432,10 @@ pub struct UserSessionRecord {
     pub display_name: String,
     pub avatar_url: String,
     pub created_at: OffsetDateTime,
+    pub updated_at: OffsetDateTime,
     pub invalidated_sessions_at: OffsetDateTime,
+    pub site_admin: bool,
+    pub tos_accepted: bool,
 }
 
 /// `userStore.GetByID`: live users only (`deleted_at IS NULL`). `Ok(None)` is
@@ -443,7 +446,8 @@ pub async fn get_session_user(
 ) -> Result<Option<UserSessionRecord>, sqlx::Error> {
     let row = sqlx::query(
         r#"
-SELECT id, username, display_name, avatar_url, created_at, invalidated_sessions_at
+SELECT id, username, display_name, avatar_url, created_at, updated_at,
+       invalidated_sessions_at, site_admin, tos_accepted
 FROM users
 WHERE id = $1 AND deleted_at IS NULL
 LIMIT 1
@@ -463,7 +467,10 @@ LIMIT 1
             .get::<Option<String>, _>("avatar_url")
             .unwrap_or_default(),
         created_at: row.get("created_at"),
+        updated_at: row.get("updated_at"),
         invalidated_sessions_at: row.get("invalidated_sessions_at"),
+        site_admin: row.get("site_admin"),
+        tos_accepted: row.get("tos_accepted"),
     }))
 }
 

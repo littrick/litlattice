@@ -113,6 +113,10 @@ impl UserProfiles for PgSessionUsers {
                     username: record.username,
                     display_name: record.display_name,
                     avatar_url: record.avatar_url,
+                    created_at: record.created_at,
+                    updated_at: record.updated_at,
+                    site_admin: record.site_admin,
+                    tos_accepted: record.tos_accepted,
                 })
             })
     }

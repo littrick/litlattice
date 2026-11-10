@@ -23,14 +23,34 @@ use async_trait::async_trait;
 use base64::Engine;
 use sg_graphql::exec::{Actor, Arguments, ExecError, FieldValue, ObjectValue, RootResolver};
 use sg_graphql::json::Json;
+use time::{OffsetDateTime, UtcOffset};
 
-/// The `users` row fields the first DB-backed `User` resolvers read.
+/// The `users` row fields the DB-backed `User` resolvers read.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UserData {
     pub id: i32,
     pub username: String,
     pub display_name: String,
     pub avatar_url: String,
+    pub created_at: OffsetDateTime,
+    pub updated_at: OffsetDateTime,
+    pub site_admin: bool,
+    pub tos_accepted: bool,
+}
+
+/// `gqlutil.DateTime.MarshalJSON`: `json.Marshal(t.UTC().Format(time.RFC3339))`
+/// — UTC, seconds precision, no fractional part.
+fn datetime_rfc3339(t: OffsetDateTime) -> String {
+    let t = t.to_offset(UtcOffset::UTC);
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+        t.year(),
+        t.month() as u8,
+        t.day(),
+        t.hour(),
+        t.minute(),
+        t.second()
+    )
 }
 
 /// The database seam for `Query.currentUser` / `User` (`db.Users()`).
@@ -140,7 +160,7 @@ impl ObjectValue for UserObject {
         &self,
         field: &str,
         _arguments: &Arguments,
-        _actor: Actor,
+        actor: Actor,
     ) -> Result<Option<FieldValue>, ExecError> {
         match field {
             "id" => Ok(Some(FieldValue::Json(Json::Str(Self::relay_id(
@@ -161,6 +181,34 @@ impl ObjectValue for UserObject {
             } else {
                 FieldValue::Json(Json::Str(self.data.avatar_url.clone()))
             })),
+            // `UserResolver.URL`: `"/users/" + user.Username`.
+            "url" => Ok(Some(FieldValue::Json(Json::Str(format!(
+                "/users/{}",
+                self.data.username
+            ))))),
+            // `SettingsURL` is `url() + "/settings"` and is always non-nil.
+            "settingsURL" => Ok(Some(FieldValue::Json(Json::Str(format!(
+                "/users/{}/settings",
+                self.data.username
+            ))))),
+            "createdAt" => Ok(Some(FieldValue::Json(Json::Str(datetime_rfc3339(
+                self.data.created_at,
+            ))))),
+            // `UpdatedAt` always returns a non-nil DateTime (the users column
+            // is NOT NULL), although the schema field is nullable.
+            "updatedAt" => Ok(Some(FieldValue::Json(Json::Str(datetime_rfc3339(
+                self.data.updated_at,
+            ))))),
+            // `SiteAdmin` checks `CheckSiteAdminOrSameUserFromActor`. The
+            // same-user branch needs no database; the site-admin branch does,
+            // so another actor's view stays unported.
+            "siteAdmin" => match actor {
+                Actor::User { uid } if uid == self.data.id => {
+                    Ok(Some(FieldValue::Json(Json::Bool(self.data.site_admin))))
+                }
+                _ => Ok(None),
+            },
+            "tosAccepted" => Ok(Some(FieldValue::Json(Json::Bool(self.data.tos_accepted)))),
             _ => Ok(None),
         }
     }
@@ -177,7 +225,11 @@ mod tests {
         assemble_sdl(
             "type Query { currentUser: User other: String } \
              type User { id: ID! databaseID: Int! username: String! \
-                         displayName: String avatarURL: String createdAt: DateTime } \
+                         displayName: String avatarURL: String \
+                         url: String! settingsURL: String \
+                         createdAt: DateTime! updatedAt: DateTime \
+                         siteAdmin: Boolean! tosAccepted: Boolean! \
+                         builtinAuth: Boolean! } \
              scalar DateTime",
         )
         .expect("schema")
@@ -203,12 +255,21 @@ mod tests {
         .to_json()
     }
 
+    fn at(s: &str) -> OffsetDateTime {
+        use time::format_description::well_known::Rfc3339;
+        OffsetDateTime::parse(s, &Rfc3339).unwrap()
+    }
+
     fn user() -> UserObject {
         UserObject::from_data(UserData {
             id: 1,
             username: "alice".to_owned(),
             display_name: "Alice A.".to_owned(),
             avatar_url: "https://example.com/a.png".to_owned(),
+            created_at: at("2026-01-02T03:04:05.123456789Z"),
+            updated_at: at("2026-02-03T04:05:06+02:00"),
+            site_admin: true,
+            tos_accepted: true,
         })
     }
 
@@ -263,6 +324,10 @@ mod tests {
             username: "bob".to_owned(),
             display_name: String::new(),
             avatar_url: String::new(),
+            created_at: at("2026-01-02T03:04:05Z"),
+            updated_at: at("2026-01-02T03:04:05Z"),
+            site_admin: false,
+            tos_accepted: false,
         });
         assert_eq!(
             run(
@@ -276,16 +341,48 @@ mod tests {
     }
 
     #[test]
-    fn user_created_at_is_unported() {
+    fn user_url_created_updated_and_flags_resolve() {
+        let schema = schema();
+        // `DateTime.MarshalJSON` is UTC RFC3339 without fractional seconds; the
+        // `updatedAt` corpus value is +02:00 and must be converted.
+        assert_eq!(
+            run(
+                &schema,
+                "{ currentUser { url settingsURL createdAt updatedAt siteAdmin tosAccepted } }",
+                Actor::User { uid: 1 },
+                &FrontendRootResolver::with_user(Some(user()))
+            ),
+            r#"{"data":{"currentUser":{"url":"/users/alice","settingsURL":"/users/alice/settings","createdAt":"2026-01-02T03:04:05Z","updatedAt":"2026-02-03T02:05:06Z","siteAdmin":true,"tosAccepted":true}}}"#
+        );
+    }
+
+    #[test]
+    fn site_admin_for_another_actor_is_unported() {
+        // The baseline would query the database to see whether this actor is a
+        // site admin; only the same-user branch is ported.
         let schema = schema();
         assert_eq!(
             run(
                 &schema,
-                "{ currentUser { createdAt } }",
+                "{ currentUser { siteAdmin } }",
+                Actor::User { uid: 2 },
+                &FrontendRootResolver::with_user(Some(user()))
+            ),
+            r#"{"errors":[{"message":"GraphQL field \"siteAdmin\" of \"User\" has no ported resolver","path":["currentUser","siteAdmin"]}],"data":{"currentUser":null}}"#
+        );
+    }
+
+    #[test]
+    fn builtin_auth_is_unported() {
+        let schema = schema();
+        assert_eq!(
+            run(
+                &schema,
+                "{ currentUser { builtinAuth } }",
                 Actor::User { uid: 1 },
                 &FrontendRootResolver::with_user(Some(user()))
             ),
-            r#"{"errors":[{"message":"GraphQL field \"createdAt\" of \"User\" has no ported resolver","path":["currentUser","createdAt"]}],"data":{"currentUser":{"createdAt":null}}}"#
+            r#"{"errors":[{"message":"GraphQL field \"builtinAuth\" of \"User\" has no ported resolver","path":["currentUser","builtinAuth"]}],"data":{"currentUser":null}}"#
         );
     }
 
