@@ -534,8 +534,9 @@ LIMIT 1
 }
 
 /// `database.UsersListOptions` as `Query.users` fills it
-/// (`cmd/frontend/graphqlbackend/users.go:33-49`). `include_deleted` and
-/// `org_id` are not reachable from that resolver.
+/// (`cmd/frontend/graphqlbackend/users.go:33-49`). `include_deleted` is not
+/// reachable from that resolver; `org_id` is set by `Org.members`'s
+/// `Count` (`org.go:129-141`).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct UsersListOptions {
     /// `Query`: `username ILIKE %q% OR display_name ILIKE %q% OR id = n`.
@@ -545,6 +546,8 @@ pub struct UsersListOptions {
     pub query_id: Option<i32>,
     /// `UserIDs`; an empty list must return no rows (baseline `FALSE`).
     pub user_ids: Option<Vec<i32>>,
+    /// `OrgID`: only users with an `org_members` row for this organization.
+    pub org_id: Option<i32>,
     /// `InactiveSince`: users without a newer `event_logs` row.
     pub inactive_since: Option<OffsetDateTime>,
     /// `ExcludeSourcegraphOperators`.
@@ -577,6 +580,19 @@ fn push_users_where(builder: &mut QueryBuilder<'_, sqlx::Postgres>, opt: &UsersL
         } else {
             builder.push(" AND u.id = ANY(").push_bind(user_ids.clone());
             builder.push(")");
+        }
+    }
+    if let Some(org_id) = opt.org_id {
+        // `orgMembershipCond` (`internal/database/users.go:1199-1216`); the
+        // baseline only adds it when `OrgID != 0`.
+        if org_id != 0 {
+            builder
+                .push(
+                    " AND EXISTS (SELECT 1 FROM org_members WHERE org_members.user_id = \
+                     u.id AND org_members.org_id = ",
+                )
+                .push_bind(org_id)
+                .push(")");
         }
     }
     if let Some(inactive_since) = opt.inactive_since {
@@ -628,6 +644,108 @@ pub async fn count_users(pool: &PgPool, opt: &UsersListOptions) -> Result<i64, s
     push_users_where(&mut builder, opt);
     let row = builder.build().fetch_one(pool).await?;
     Ok(row.get::<i64, _>(0))
+}
+
+/// `database.PaginationArgs` as `membersConnectionStore.ComputeNodes` fills it
+/// (`internal/database/helpers.go:134-250`). The members resolver always
+/// orders by `id`; `first`/`last` already include the `+1` over-fetch.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UsersPaginationArgs {
+    /// `PaginationArgs.First` (SQL `LIMIT`, `pageSize + 1`).
+    pub first: Option<i32>,
+    /// `PaginationArgs.Last` (SQL `LIMIT`, `pageSize + 1`; reversed order).
+    pub last: Option<i32>,
+    /// `PaginationArgs.After` (already unmarshalled cursor value).
+    pub after: Option<i32>,
+    /// `PaginationArgs.Before` (already unmarshalled cursor value).
+    pub before: Option<i32>,
+    /// `PaginationArgs.Ascending`; `false` for `Org.members`.
+    pub ascending: bool,
+}
+
+/// `userStore.ListByOrg` (`internal/database/users.go:1170-1190`): the
+/// `orgMembershipCond`, `u.deleted_at IS NULL`, the query conditions and the
+/// cursor conditions, then `PaginationArgs.SQL()`'s ordering and `LIMIT`.
+pub async fn list_users_by_org(
+    pool: &PgPool,
+    org_id: i32,
+    query: Option<&str>,
+    query_id: Option<i32>,
+    pagination: &UsersPaginationArgs,
+) -> Result<Vec<UserSessionRecord>, sqlx::Error> {
+    let mut builder: QueryBuilder<'_, sqlx::Postgres> = QueryBuilder::new(
+        "SELECT u.id, u.username, u.display_name, u.avatar_url, u.created_at, \
+         u.updated_at, u.invalidated_sessions_at, u.site_admin, u.tos_accepted, \
+         COALESCE(ue.email, '') AS email \
+         FROM users u \
+         LEFT JOIN user_emails ue ON (ue.user_id = u.id AND ue.is_primary) \
+         WHERE EXISTS (SELECT 1 FROM org_members WHERE org_members.user_id = u.id \
+         AND org_members.org_id = ",
+    );
+    builder.push_bind(org_id);
+    builder.push(") AND u.deleted_at IS NULL");
+    // `newQueryCond` ignores `nil`/empty queries.
+    if let Some(query) = query {
+        if !query.is_empty() {
+            let pattern = format!("%{query}%");
+            builder
+                .push(" AND (u.username ILIKE ")
+                .push_bind(pattern.clone())
+                .push(" OR u.display_name ILIKE ")
+                .push_bind(pattern);
+            if let Some(id) = query_id {
+                builder.push(" OR u.id = ").push_bind(id);
+            }
+            builder.push(")");
+        }
+    }
+    // `PaginationArgs.SQL()`: tuple comparisons against the (single) `id`
+    // order column. `Ascending` is false for `Org.members`, so `after` uses
+    // `>` and `before` uses `<`; both flip when ascending.
+    if let Some(after) = pagination.after {
+        builder
+            .push(if pagination.ascending {
+                " AND (u.id) > ("
+            } else {
+                " AND (u.id) < ("
+            })
+            .push_bind(after)
+            .push(")");
+    }
+    if let Some(before) = pagination.before {
+        builder
+            .push(if pagination.ascending {
+                " AND (u.id) < ("
+            } else {
+                " AND (u.id) > ("
+            })
+            .push_bind(before)
+            .push(")");
+    }
+    let limit = if pagination.first.is_some() {
+        pagination.first
+    } else if pagination.last.is_some() {
+        pagination.last
+    } else {
+        None
+    };
+    // `first` → `OrderBy.Ascending`; `last` → the inverse; neither → the
+    // configured direction (with no `LIMIT`).
+    let ascending = match (pagination.first.is_some(), pagination.last.is_some()) {
+        (true, _) => pagination.ascending,
+        (false, true) => !pagination.ascending,
+        (false, false) => pagination.ascending,
+    };
+    builder.push(if ascending {
+        " ORDER BY u.id ASC"
+    } else {
+        " ORDER BY u.id DESC"
+    });
+    if let Some(limit) = limit {
+        builder.push(" LIMIT ").push_bind(limit);
+    }
+    let rows = builder.build().fetch_all(pool).await?;
+    Ok(rows.iter().map(scan_user_session_row).collect())
 }
 
 /// `eventLogStore.ListUniqueUsersAll` (`internal/database/event_logs.go:875-897`):

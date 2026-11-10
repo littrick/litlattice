@@ -131,13 +131,18 @@ async fn graphql_user_organizations_harness() {
         let fields = root_fields(&schema, &request);
         let users = prefetch_users(&users_store, &fields).await;
         let users_connections = prefetch_users_connections(&users_store, &fields).await;
+        let organizations = HashMap::new();
+        let organizations_connections = HashMap::new();
         let nested = Arc::new(
             prefetch_nested(
+                &org_store,
                 &org_store,
                 &fields,
                 current_user.as_ref(),
                 &users,
                 &users_connections,
+                &organizations,
+                &organizations_connections,
                 actor,
                 admin,
             )

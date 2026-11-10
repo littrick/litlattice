@@ -32,7 +32,7 @@ impl PgUserStore {
     }
 }
 
-fn to_user_data(record: sg_db::users::UserSessionRecord) -> UserData {
+pub(crate) fn to_user_data(record: sg_db::users::UserSessionRecord) -> UserData {
     UserData {
         id: record.id,
         username: record.username,

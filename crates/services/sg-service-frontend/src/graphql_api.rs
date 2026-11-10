@@ -302,6 +302,8 @@ pub struct SchemaGraphqlDeps {
         Option<Arc<dyn crate::graphql_resolvers::OrganizationsConnectionStore>>,
     /// `User.organizations`'s database seam; `None` in transport-only tests.
     user_organizations: Option<Arc<dyn crate::graphql_resolvers::UserOrganizationsStore>>,
+    /// `Org.members`'s database seam; `None` in transport-only tests.
+    org_members: Option<Arc<dyn crate::graphql_resolvers::OrgMembersStore>>,
 }
 
 impl SchemaGraphqlDeps {
@@ -315,6 +317,7 @@ impl SchemaGraphqlDeps {
             organizations: None,
             organizations_connections: None,
             user_organizations: None,
+            org_members: None,
         }
     }
 
@@ -340,7 +343,8 @@ impl SchemaGraphqlDeps {
             organizations_connections: Some(Arc::new(crate::org_store::PgOrgStore::new(
                 pool.clone(),
             ))),
-            user_organizations: Some(Arc::new(crate::org_store::PgOrgStore::new(pool))),
+            user_organizations: Some(Arc::new(crate::org_store::PgOrgStore::new(pool.clone()))),
+            org_members: Some(Arc::new(crate::org_store::PgOrgStore::new(pool))),
         }
     }
 
@@ -385,6 +389,7 @@ impl SchemaGraphqlDeps {
             organizations: None,
             organizations_connections: None,
             user_organizations: None,
+            org_members: None,
         }
     }
 }
@@ -466,20 +471,23 @@ impl GraphqlDeps for SchemaGraphqlDeps {
             }
             None => std::collections::HashMap::new(),
         };
-        let nested = match &self.user_organizations {
-            Some(store) => Arc::new(
+        let nested = match (&self.user_organizations, &self.org_members) {
+            (Some(store), Some(members_store)) => Arc::new(
                 crate::graphql_resolvers::prefetch_nested(
                     store.as_ref(),
+                    members_store.as_ref(),
                     &fields,
                     current_user.as_ref(),
                     &users,
                     &users_connections,
+                    &organizations,
+                    &organizations_connections,
                     request.actor,
                     site_admin,
                 )
                 .await,
             ),
-            None => Arc::new(crate::graphql_resolvers::NestedPrefetch::default()),
+            _ => Arc::new(crate::graphql_resolvers::NestedPrefetch::default()),
         };
         let user = current_user.map(crate::graphql_resolvers::UserObject::from_data);
         let roots = crate::graphql_resolvers::FrontendRootResolver::with_prefetched_organizations(

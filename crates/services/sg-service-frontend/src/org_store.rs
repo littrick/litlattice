@@ -9,16 +9,20 @@
 use std::collections::HashSet;
 
 use async_trait::async_trait;
+use base64::Engine;
 use sqlx::PgPool;
 
 use crate::graphql_resolvers::{
-    OrgData, OrganizationStore, OrganizationsArgs, OrganizationsConnectionData,
+    maybe_query_is_id, MembersArgs, MembersConnectionData, OrgData, OrgMembersStore,
+    OrganizationStore, OrganizationsArgs, OrganizationsConnectionData,
     OrganizationsConnectionStore, UserOrganizationsStore,
 };
+use crate::user_store::to_user_data;
 use sg_db::orgs::{
     count_orgs, find_org_by_name, list_orgs, org_members_for_user, orgs_for_user, OrgRecord,
     OrgsListOptions,
 };
+use sg_db::users::{count_users, list_users_by_org, UsersListOptions, UsersPaginationArgs};
 
 pub struct PgOrgStore {
     pool: PgPool,
@@ -162,6 +166,100 @@ impl OrganizationsConnectionStore for PgOrgStore {
                 })
                 .collect(),
             total_count: total_count as i32,
+        })
+    }
+}
+
+/// `UnmarshalUserID` (`user.go:126-129` + graph-gophers
+/// `relay.UnmarshalSpec`): base64 decode, skip the `kind:` prefix (the kind is
+/// **not** validated) and decode the remainder as an int32.
+fn unmarshal_user_id(cursor: &str) -> Result<i32, String> {
+    let decoded = base64::engine::general_purpose::URL_SAFE
+        .decode(cursor)
+        .map_err(|error| error.to_string())?;
+    let text = String::from_utf8_lossy(&decoded);
+    let Some((_, spec)) = text.split_once(':') else {
+        return Err("invalid graphql.ID".to_owned());
+    };
+    serde_json::from_str(spec).map_err(|error| error.to_string())
+}
+
+#[async_trait]
+impl OrgMembersStore for PgOrgStore {
+    /// `membersConnectionStore` (`org.go:123-173`) through
+    /// `gqlutil.ConnectionResolver`: `pageSize + 1` over-fetch, `last`
+    /// reversal, trailing/leading trim and the `OrgID` count.
+    async fn members(
+        &self,
+        org_id: i32,
+        args: &MembersArgs,
+    ) -> Result<MembersConnectionData, String> {
+        // `ConnectionResolver.Limit` + `ApplyMaxPageSize`
+        // (`connection_resolver.go:57-94`): 0 means 100, capped at 100.
+        let raw_limit = args.first.or(args.last).unwrap_or(0);
+        let page_size = if raw_limit == 0 {
+            100
+        } else {
+            raw_limit.min(100)
+        };
+        let sql_limit = page_size + 1;
+        // `paginationArgs`: `first` wins over `last` (the baseline's
+        // `else if`).
+        let (first, last) = if args.first.is_some() {
+            (Some(sql_limit), None)
+        } else if args.last.is_some() {
+            (None, Some(sql_limit))
+        } else {
+            (None, None)
+        };
+        let after = args.after.as_deref().map(unmarshal_user_id).transpose()?;
+        let before = args.before.as_deref().map(unmarshal_user_id).transpose()?;
+        let pagination = UsersPaginationArgs {
+            first,
+            last,
+            after,
+            before,
+            ascending: false,
+        };
+
+        let query = args.query.as_deref();
+        let query_id = query.and_then(maybe_query_is_id);
+        let total_count = count_users(
+            &self.pool,
+            &UsersListOptions {
+                query: query.map(str::to_owned),
+                query_id,
+                org_id: Some(org_id),
+                ..UsersListOptions::default()
+            },
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+        let mut records = list_users_by_org(&self.pool, org_id, query, query_id, &pagination)
+            .await
+            .map_err(|error| error.to_string())?;
+
+        let fetched_count = records.len() as i32;
+        if last.is_some() {
+            records.reverse();
+        }
+        if fetched_count > page_size {
+            if last.is_some() {
+                records.remove(0);
+            } else {
+                records.pop();
+            }
+        }
+
+        Ok(MembersConnectionData {
+            users: records.into_iter().map(to_user_data).collect(),
+            total_count: total_count as i32,
+            page_size,
+            fetched_count,
+            first_present: args.first.is_some(),
+            last_present: args.last.is_some(),
+            after_present: args.after.is_some(),
+            before_present: args.before.is_some(),
         })
     }
 }
