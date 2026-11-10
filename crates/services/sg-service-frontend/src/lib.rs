@@ -47,6 +47,7 @@ pub mod repository_store;
 pub mod search_client;
 pub mod search_contexts;
 pub mod search_job;
+pub mod search_jobutil_filters;
 pub mod search_source;
 pub mod search_stream;
 pub mod service;
