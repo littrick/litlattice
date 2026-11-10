@@ -49,6 +49,7 @@ pub mod search_contexts;
 pub mod search_job;
 pub mod search_jobutil_combinators;
 pub mod search_jobutil_filters;
+pub mod search_jobutil_repos;
 pub mod search_source;
 pub mod search_stream;
 pub mod service;
