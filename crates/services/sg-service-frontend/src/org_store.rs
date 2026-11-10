@@ -14,13 +14,15 @@ use sqlx::PgPool;
 use crate::graphql_resolvers::{
     maybe_query_is_id, MembersArgs, MembersConnectionData, MembershipData, OrgData,
     OrgMembersStore, OrgMembershipsStore, OrganizationStore, OrganizationsArgs,
-    OrganizationsConnectionData, OrganizationsConnectionStore, UserData, UserOrganizationsStore,
+    OrganizationsConnectionData, OrganizationsConnectionStore, SettingsData, UserData,
+    UserOrganizationsStore,
 };
 use crate::user_store::to_user_data;
 use sg_db::orgs::{
     count_orgs, find_org_by_id, find_org_by_name, list_orgs, org_members_for_user,
     org_memberships_for_user, orgs_for_user, OrgMembershipRecord, OrgRecord, OrgsListOptions,
 };
+use sg_db::settings::latest_for_user;
 use sg_db::users::{
     count_users, get_session_user, list_users_by_org, UsersListOptions, UsersPaginationArgs,
 };
@@ -307,5 +309,19 @@ impl OrgMembershipsStore for PgOrgStore {
         record
             .map(to_user_data)
             .ok_or_else(|| format!("user not found: [{user_id}]"))
+    }
+
+    /// `settingsStore.GetLatest` for a user subject
+    /// (`internal/database/settings.go:88-120`).
+    async fn latest_settings_for_user(&self, user_id: i32) -> Result<Option<SettingsData>, String> {
+        let record = latest_for_user(&self.pool, user_id)
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(record.map(|record| SettingsData {
+            id: record.id,
+            contents: record.contents,
+            created_at: record.created_at,
+            author_user_id: record.author_user_id,
+        }))
     }
 }

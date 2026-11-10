@@ -411,6 +411,10 @@ pub trait OrgMembershipsStore: Send + Sync {
 
     /// `UserByIDInt32` with the primary email (`UserSessionRecord`).
     async fn user_by_id(&self, user_id: i32) -> Result<UserData, String>;
+
+    /// `settingsStore.GetLatest` for `User.latestSettings`
+    /// (`internal/database/settings.go:88-120`).
+    async fn latest_settings_for_user(&self, user_id: i32) -> Result<Option<SettingsData>, String>;
 }
 
 /// Prefetched nodes for `Query.node` (`schemaResolver.Node`,
@@ -535,6 +539,25 @@ pub fn members_args(arguments: &Arguments) -> MembersArgs {
     }
 }
 
+/// A `settings` row as `settingsResolver` sees it (`settings.go:17-60`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SettingsData {
+    pub id: i32,
+    /// Raw JSONC contents (comments/trailing commas preserved).
+    pub contents: String,
+    pub created_at: OffsetDateTime,
+    /// Soft-deleted authors are reported as "no author" (SQL CASE).
+    pub author_user_id: Option<i32>,
+}
+
+/// `db.Settings().GetLatest` result for a user subject: `Found(None)` is the
+/// baseline's `nil, nil` (no settings row).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LatestSettingsLookup {
+    Found(Option<SettingsData>),
+    Error(String),
+}
+
 /// Data for nested resolver fields that need their own async lookups,
 /// prefetched once per request and shared by every object through an `Arc`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -546,8 +569,11 @@ pub struct NestedPrefetch {
     pub user_memberships: HashMap<i32, UserMembershipsLookup>,
     /// `OrganizationMembership.organization` (`OrgByIDInt32`) keyed by org id.
     pub orgs_by_id: HashMap<i32, OrgByIdLookup>,
-    /// `OrganizationMembership.user` (`UserByIDInt32`) keyed by user id.
+    /// `OrganizationMembership.user` (`UserByIDInt32`) and
+    /// `Settings.author` (`db.Users().GetByID`) keyed by user id.
     pub users_by_id: HashMap<i32, UserByIdLookup>,
+    /// `User.latestSettings` keyed by user id.
+    pub latest_settings: HashMap<i32, LatestSettingsLookup>,
 }
 
 /// The database seam for `User.organizations` (`db.Orgs().GetByUserID` plus
@@ -897,6 +923,44 @@ pub async fn prefetch_nested(
                             selections: nodes.selections.clone(),
                         });
                     }
+                }
+            }
+            // `User.latestSettings` (`user.go:374-389`): the same folded
+            // access check as `organizations`; the `settings.author` row is
+            // prefetched alongside (`settings.go:48-60`).
+            for _selection in job
+                .selections
+                .iter()
+                .filter(|selection| selection.name == "latestSettings")
+            {
+                if !authorized {
+                    continue;
+                }
+                if !nested.latest_settings.contains_key(&job.user.id) {
+                    let lookup = match memberships_store
+                        .latest_settings_for_user(job.user.id)
+                        .await
+                    {
+                        Ok(settings) => LatestSettingsLookup::Found(settings),
+                        Err(error) => LatestSettingsLookup::Error(error),
+                    };
+                    nested.latest_settings.insert(job.user.id, lookup);
+                    progress = true;
+                }
+                let author_id = match nested.latest_settings.get(&job.user.id) {
+                    Some(LatestSettingsLookup::Found(Some(settings))) => settings.author_user_id,
+                    _ => continue,
+                };
+                let Some(author_id) = author_id else {
+                    continue;
+                };
+                if !nested.users_by_id.contains_key(&author_id) {
+                    let lookup = match memberships_store.user_by_id(author_id).await {
+                        Ok(user) => UserByIdLookup::Found(user),
+                        Err(error) => UserByIdLookup::Error(error),
+                    };
+                    nested.users_by_id.insert(author_id, lookup);
+                    progress = true;
                 }
             }
         }
@@ -1669,7 +1733,115 @@ impl ObjectValue for UserObject {
                     None => Ok(None),
                 }
             }
+            // `UserResolver.LatestSettings` (`user.go:374-389`): the same
+            // folded authorization error as `email`, then the newest
+            // `settings` row for this user (null when none exists).
+            "latestSettings" => {
+                if !self.can_administer(actor) {
+                    return Err(ExecError::new(MUST_BE_SITE_ADMIN_OR_SAME_USER));
+                }
+                match self.nested.latest_settings.get(&self.data.id) {
+                    Some(LatestSettingsLookup::Found(settings)) => Ok(Some(match settings {
+                        Some(settings) => FieldValue::Object(Arc::new(SettingsObject {
+                            data: settings.clone(),
+                            subject: self.clone(),
+                            viewer_site_admin: self.viewer_site_admin,
+                            nested: self.nested.clone(),
+                        })),
+                        None => FieldValue::Null,
+                    })),
+                    Some(LatestSettingsLookup::Error(message)) => {
+                        Err(ExecError::new(message.clone()))
+                    }
+                    None => Ok(None),
+                }
+            }
             "tosAccepted" => Ok(Some(FieldValue::Json(Json::Bool(self.data.tos_accepted)))),
+            _ => Ok(None),
+        }
+    }
+}
+
+/// `settingsResolver` (`cmd/frontend/graphqlbackend/settings.go:17-60`),
+/// GraphQL type `Settings`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SettingsObject {
+    data: SettingsData,
+    /// The checked settings subject (the user whose settings these are).
+    subject: UserObject,
+    viewer_site_admin: bool,
+    nested: Arc<NestedPrefetch>,
+}
+
+impl ObjectValue for SettingsObject {
+    fn type_name(&self) -> &'static str {
+        "Settings"
+    }
+
+    fn field(
+        &self,
+        field: &str,
+        _arguments: &Arguments,
+        _actor: Actor,
+    ) -> Result<Option<FieldValue>, ExecError> {
+        match field {
+            "id" => Ok(Some(FieldValue::Json(Json::Int(i64::from(self.data.id))))),
+            // `SettingsResolver.Subject` returns the access-checked subject
+            // (`settings_subject.go:203-218`); for `User.latestSettings` it is
+            // this user.
+            "subject" => Ok(Some(FieldValue::Object(Arc::new(self.subject.clone())))),
+            // `SettingsResolver.Author` (`settings.go:48-60`): the author row,
+            // null when there is no author or the author was soft-deleted.
+            "author" => match self.data.author_user_id {
+                None => Ok(Some(FieldValue::Null)),
+                Some(author_id) => match self.nested.users_by_id.get(&author_id) {
+                    Some(UserByIdLookup::Found(user)) => Ok(Some(FieldValue::Object(Arc::new(
+                        UserObject::from_data_as_viewer(user.clone(), self.viewer_site_admin)
+                            .with_nested(self.nested.clone()),
+                    )))),
+                    Some(UserByIdLookup::Error(message)) => Err(ExecError::new(message.clone())),
+                    None => Ok(None),
+                },
+            },
+            "createdAt" => Ok(Some(FieldValue::Json(Json::Str(datetime_rfc3339(
+                self.data.created_at,
+            ))))),
+            "contents" => Ok(Some(FieldValue::Json(Json::Str(
+                self.data.contents.clone(),
+            )))),
+            // Deprecated alias (`settings.go:36-38`): same raw contents.
+            "configuration" => Ok(Some(FieldValue::Object(Arc::new(ConfigurationObject {
+                contents: self.data.contents.clone(),
+            })))),
+            _ => Ok(None),
+        }
+    }
+}
+
+/// Deprecated `Configuration` (`schema.graphql:7764-7779`): `messages` is
+/// always empty and `contents` mirrors `Settings.contents`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ConfigurationObject {
+    contents: String,
+}
+
+impl ObjectValue for ConfigurationObject {
+    fn type_name(&self) -> &'static str {
+        "Configuration"
+    }
+
+    fn field(
+        &self,
+        field: &str,
+        _arguments: &Arguments,
+        _actor: Actor,
+    ) -> Result<Option<FieldValue>, ExecError> {
+        match field {
+            "contents" => Ok(Some(FieldValue::Json(Json::Str(self.contents.clone())))),
+            "messages" => Ok(Some(FieldValue::List {
+                items: Vec::new(),
+                element_type: Some("String"),
+            })),
             _ => Ok(None),
         }
     }
@@ -3261,6 +3433,13 @@ mod tests {
                 .get(&user_id)
                 .cloned()
                 .ok_or_else(|| format!("user not found: [{user_id}]"))
+        }
+
+        async fn latest_settings_for_user(
+            &self,
+            _user_id: i32,
+        ) -> Result<Option<SettingsData>, String> {
+            Ok(None)
         }
     }
 
