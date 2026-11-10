@@ -35,6 +35,7 @@ pub mod session_auth;
 pub mod site_config_file;
 pub mod tenant;
 pub mod trace_headers;
+pub mod user_store;
 pub mod version;
 
 pub use service::{service_name, FrontendService, SERVICE_NAME};

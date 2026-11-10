@@ -291,6 +291,8 @@ pub struct SchemaGraphqlDeps {
     session: Option<SessionDeps>,
     /// `Query.repository`'s database seam; `None` in transport-only tests.
     repositories: Option<Arc<dyn crate::graphql_resolvers::RepositoryLookup>>,
+    /// `Query.user`'s database seam; `None` in transport-only tests.
+    users: Option<Arc<dyn crate::graphql_resolvers::UserLookupStore>>,
 }
 
 impl SchemaGraphqlDeps {
@@ -299,11 +301,12 @@ impl SchemaGraphqlDeps {
             schema,
             session: None,
             repositories: None,
+            users: None,
         }
     }
 
     /// Wire session authentication, the current-user lookup and the
-    /// repository lookup.
+    /// repository/user lookups.
     pub fn with_session(schema: Arc<sg_graphql::Schema>, pool: sqlx::PgPool) -> Self {
         let users = Arc::new(crate::session_auth::PgSessionUsers::new(pool.clone()));
         let profiles = Arc::new(crate::session_auth::PgSessionUsers::new(pool.clone()));
@@ -316,8 +319,9 @@ impl SchemaGraphqlDeps {
                 cookie_key: session_cookie_key(),
             }),
             repositories: Some(Arc::new(crate::repository_store::PgRepositoryStore::new(
-                pool,
+                pool.clone(),
             ))),
+            users: Some(Arc::new(crate::user_store::PgUserStore::new(pool))),
         }
     }
 
@@ -327,6 +331,15 @@ impl SchemaGraphqlDeps {
         repositories: Arc<dyn crate::graphql_resolvers::RepositoryLookup>,
     ) -> Self {
         self.repositories = Some(repositories);
+        self
+    }
+
+    /// Test hook: use a user lookup without a real database.
+    pub fn with_user_store(
+        mut self,
+        users: Arc<dyn crate::graphql_resolvers::UserLookupStore>,
+    ) -> Self {
+        self.users = Some(users);
         self
     }
 
@@ -348,6 +361,7 @@ impl SchemaGraphqlDeps {
                 cookie_key,
             }),
             repositories: None,
+            users: None,
         }
     }
 }
@@ -380,11 +394,12 @@ impl GraphqlDeps for SchemaGraphqlDeps {
             variables: request.variables,
             actor: request.actor,
         };
-        // `Query.repository` needs an async database lookup, so prefetch the
-        // root fields identified by the executor before executing.
+        // `Query.repository`/`Query.user` need async database lookups, so
+        // prefetch the root fields identified by the executor before
+        // executing.
+        let fields = sg_graphql::exec::root_fields(&self.schema, &exec_request);
         let repositories = match &self.repositories {
             Some(store) => {
-                let fields = sg_graphql::exec::root_fields(&self.schema, &exec_request);
                 crate::graphql_resolvers::prefetch_repositories(
                     store.as_ref(),
                     &fields,
@@ -395,10 +410,17 @@ impl GraphqlDeps for SchemaGraphqlDeps {
             }
             None => std::collections::HashMap::new(),
         };
-        let roots = crate::graphql_resolvers::FrontendRootResolver::with_user_and_repositories(
-            user,
-            repositories,
-        );
+        let users = match &self.users {
+            Some(store) => crate::graphql_resolvers::prefetch_users(store.as_ref(), &fields).await,
+            None => std::collections::HashMap::new(),
+        };
+        let roots =
+            crate::graphql_resolvers::FrontendRootResolver::with_user_and_repositories_and_users(
+                user,
+                repositories,
+                users,
+                site_admin,
+            );
         let response = sg_graphql::exec::execute_with(&self.schema, exec_request, Some(&roots));
         GraphqlResponse::from_exec(&response)
     }
@@ -1752,6 +1774,7 @@ mod tests {
                 updated_at: fixed_created_at(),
                 site_admin: false,
                 tos_accepted: false,
+                primary_email: String::new(),
             }))
         }
     }

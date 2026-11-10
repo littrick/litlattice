@@ -117,6 +117,7 @@ impl UserProfiles for PgSessionUsers {
                     updated_at: record.updated_at,
                     site_admin: record.site_admin,
                     tos_accepted: record.tos_accepted,
+                    primary_email: record.email,
                 })
             })
     }

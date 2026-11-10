@@ -28,7 +28,8 @@ use sg_graphql::exec::{
 use sg_graphql::json::Json;
 use time::{OffsetDateTime, UtcOffset};
 
-/// The `users` row fields the DB-backed `User` resolvers read.
+/// The `users` row fields the DB-backed `User` resolvers read, plus the
+/// primary `user_emails.email` (`userEmailsStore.GetPrimaryEmail`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UserData {
     pub id: i32,
@@ -39,6 +40,7 @@ pub struct UserData {
     pub updated_at: OffsetDateTime,
     pub site_admin: bool,
     pub tos_accepted: bool,
+    pub primary_email: String,
 }
 
 /// `gqlutil.DateTime.MarshalJSON`: `json.Marshal(t.UTC().Format(time.RFC3339))`
@@ -60,6 +62,82 @@ fn datetime_rfc3339(t: OffsetDateTime) -> String {
 #[async_trait]
 pub trait UserProfiles: Send + Sync {
     async fn profile(&self, uid: i32) -> Result<Option<UserData>, String>;
+}
+
+/// `Query.user`'s lookup key. The baseline checks the arguments in this
+/// order: `username`, then `databaseID`, then `email` (`user.go:38-56`).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum UserKey {
+    Username(String),
+    DatabaseId(i32),
+    Email(String),
+}
+
+/// The result of prefetching one `Query.user` lookup.
+#[derive(Debug, Clone, PartialEq)]
+pub enum UserLookup {
+    Found(UserData),
+    /// `errcode.IsNotFound` → GraphQL `null`.
+    NotFound,
+    /// A database failure, surfaced as the resolver error.
+    Error(String),
+}
+
+/// The database seam for `Query.user` (`db.Users().GetByUsername` /
+/// `GetByID` / `GetByVerifiedEmail`).
+#[async_trait]
+pub trait UserLookupStore: Send + Sync {
+    async fn lookup(&self, key: &UserKey) -> Result<Option<UserData>, String>;
+}
+
+/// What `Query.user` arguments ask for.
+enum UserArg {
+    Key(UserKey),
+    /// No argument: the baseline errors even though `databaseID` is
+    /// supported (`user.go:56-57`).
+    Missing,
+}
+
+fn user_arg(arguments: &Arguments) -> UserArg {
+    if let Some(username) = arguments.string("username") {
+        return UserArg::Key(UserKey::Username(username.to_owned()));
+    }
+    if let Some(id) = arguments
+        .i64("databaseID")
+        .and_then(|id| i32::try_from(id).ok())
+    {
+        return UserArg::Key(UserKey::DatabaseId(id));
+    }
+    if let Some(email) = arguments.string("email") {
+        return UserArg::Key(UserKey::Email(email.to_owned()));
+    }
+    UserArg::Missing
+}
+
+/// Look up every `Query.user` root field in `fields`, deduplicated by key.
+pub async fn prefetch_users(
+    store: &dyn UserLookupStore,
+    fields: &[RootField],
+) -> HashMap<UserKey, UserLookup> {
+    let mut users = HashMap::new();
+    for field in fields {
+        if field.name != "user" {
+            continue;
+        }
+        let UserArg::Key(key) = user_arg(&field.arguments) else {
+            continue;
+        };
+        if users.contains_key(&key) {
+            continue;
+        }
+        let lookup = match store.lookup(&key).await {
+            Ok(Some(data)) => UserLookup::Found(data),
+            Ok(None) => UserLookup::NotFound,
+            Err(error) => UserLookup::Error(error),
+        };
+        users.insert(key, lookup);
+    }
+    users
 }
 
 /// The `repo` row fields the `Repository` resolvers read (one
@@ -191,23 +269,14 @@ impl FrontendRootResolver {
     /// an authenticated actor has "no ported resolver" because the row cannot
     /// be loaded.
     pub fn new() -> Self {
-        Self {
-            query: QueryRoot {
-                user: None,
-                repositories: HashMap::new(),
-            },
-        }
+        Self::with_state(None, HashMap::new(), HashMap::new(), false)
     }
 
     /// The production resolver: `user` is the prefetched current user, if the
     /// actor is authenticated and the row still exists.
     pub fn with_user(user: Option<UserObject>) -> Self {
-        Self {
-            query: QueryRoot {
-                user,
-                repositories: HashMap::new(),
-            },
-        }
+        let viewer_site_admin = user.as_ref().is_some_and(|user| user.data.site_admin);
+        Self::with_state(user, HashMap::new(), HashMap::new(), viewer_site_admin)
     }
 
     /// The production resolver with the prefetched `Query.repository` rows.
@@ -215,8 +284,35 @@ impl FrontendRootResolver {
         user: Option<UserObject>,
         repositories: HashMap<RepoKey, RepoLookup>,
     ) -> Self {
+        let viewer_site_admin = user.as_ref().is_some_and(|user| user.data.site_admin);
+        Self::with_state(user, repositories, HashMap::new(), viewer_site_admin)
+    }
+
+    /// The production resolver with prefetched `Query.user` lookups and the
+    /// viewer's `users.site_admin` flag (which `User.siteAdmin`,
+    /// `User.email` and `User.viewerCanAdminister` consult).
+    pub fn with_user_and_repositories_and_users(
+        user: Option<UserObject>,
+        repositories: HashMap<RepoKey, RepoLookup>,
+        users: HashMap<UserKey, UserLookup>,
+        viewer_site_admin: bool,
+    ) -> Self {
+        Self::with_state(user, repositories, users, viewer_site_admin)
+    }
+
+    fn with_state(
+        user: Option<UserObject>,
+        repositories: HashMap<RepoKey, RepoLookup>,
+        users: HashMap<UserKey, UserLookup>,
+        viewer_site_admin: bool,
+    ) -> Self {
         Self {
-            query: QueryRoot { user, repositories },
+            query: QueryRoot {
+                user,
+                repositories,
+                users,
+                viewer_site_admin,
+            },
         }
     }
 }
@@ -244,6 +340,11 @@ struct QueryRoot {
     user: Option<UserObject>,
     /// Prefetched `Query.repository` results, keyed by the looked-up name/URI.
     repositories: HashMap<RepoKey, RepoLookup>,
+    /// Prefetched `Query.user` results, keyed by the lookup argument.
+    users: HashMap<UserKey, UserLookup>,
+    /// The viewer's `users.site_admin`; see
+    /// `auth.CheckSiteAdminOrSameUserFromActor`.
+    viewer_site_admin: bool,
 }
 
 impl ObjectValue for QueryRoot {
@@ -287,21 +388,66 @@ impl ObjectValue for QueryRoot {
                 RepositoryArg::CloneUrl => Ok(None),
                 RepositoryArg::Missing => Err(ExecError::new("neither name nor cloneURL given")),
             },
+            // `schemaResolver.User` (`user.go:30-73`): username, then
+            // databaseID, then verified email; not-found is `null`.
+            "user" => match user_arg(arguments) {
+                UserArg::Key(key) => match self.users.get(&key) {
+                    Some(UserLookup::Found(data)) => Ok(Some(FieldValue::Object(Arc::new(
+                        UserObject::from_data_as_viewer(data.clone(), self.viewer_site_admin),
+                    )))),
+                    Some(UserLookup::NotFound) => Ok(Some(FieldValue::Null)),
+                    Some(UserLookup::Error(message)) => Err(ExecError::new(message.clone())),
+                    // No prefetch was performed for this request.
+                    None => Ok(None),
+                },
+                UserArg::Missing => Err(ExecError::new(
+                    "must specify either username or email to look up a user",
+                )),
+            },
             _ => Ok(None),
         }
     }
 }
 
+/// `auth.ErrMustBeSiteAdminOrSameUser`. `CheckSiteAdminOrSameUserFromActor`
+/// collapses every failure (unauthenticated, non-admin, DB error) to this
+/// message (`internal/auth/site_admin.go:127-136`).
+const MUST_BE_SITE_ADMIN_OR_SAME_USER: &str =
+    "must be authenticated as the authorized user or site admin";
+
 /// `UserResolver` (`cmd/frontend/graphqlbackend/user.go:122-168`), limited to
-/// the fields backed by the current-user row.
+/// the fields backed by the user row and viewer authorization.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UserObject {
     data: UserData,
+    /// The viewer's `users.site_admin` (`false` for anonymous actors and for
+    /// objects built without a viewer, e.g. transport tests).
+    viewer_site_admin: bool,
 }
 
 impl UserObject {
     pub fn from_data(data: UserData) -> Self {
-        Self { data }
+        Self {
+            data,
+            viewer_site_admin: false,
+        }
+    }
+
+    pub fn from_data_as_viewer(data: UserData, viewer_site_admin: bool) -> Self {
+        Self {
+            data,
+            viewer_site_admin,
+        }
+    }
+
+    /// `auth.CheckSiteAdminOrSameUserFromActor`: the internal actor and
+    /// `actor.UID == subjectUserID` pass, otherwise the viewer must be a site
+    /// admin (resolved at prefetch time).
+    fn can_administer(&self, actor: Actor) -> bool {
+        match actor {
+            Actor::User { uid } if uid == self.data.id => true,
+            _ => self.viewer_site_admin,
+        }
     }
 
     /// `relay.MarshalID("User", id)`: `base64.URLEncoding("User:" + json(id))`.
@@ -358,15 +504,29 @@ impl ObjectValue for UserObject {
             "updatedAt" => Ok(Some(FieldValue::Json(Json::Str(datetime_rfc3339(
                 self.data.updated_at,
             ))))),
-            // `SiteAdmin` checks `CheckSiteAdminOrSameUserFromActor`. The
-            // same-user branch needs no database; the site-admin branch does,
-            // so another actor's view stays unported.
-            "siteAdmin" => match actor {
-                Actor::User { uid } if uid == self.data.id => {
-                    Ok(Some(FieldValue::Json(Json::Bool(self.data.site_admin))))
+            // `UserResolver.Email`: the primary email, visible to the user
+            // and site admins (`user.go:136-148`).
+            "email" => {
+                if !self.can_administer(actor) {
+                    return Err(ExecError::new(MUST_BE_SITE_ADMIN_OR_SAME_USER));
                 }
-                _ => Ok(None),
-            },
+                Ok(Some(FieldValue::Json(Json::Str(
+                    self.data.primary_email.clone(),
+                ))))
+            }
+            // `UserResolver.SiteAdmin` (`user.go:404-411`): same authorization
+            // as `email`.
+            "siteAdmin" => {
+                if !self.can_administer(actor) {
+                    return Err(ExecError::new(MUST_BE_SITE_ADMIN_OR_SAME_USER));
+                }
+                Ok(Some(FieldValue::Json(Json::Bool(self.data.site_admin))))
+            }
+            // `UserResolver.ViewerCanAdminister` (`user.go:574-588`):
+            // unauthorized becomes `false` instead of an error.
+            "viewerCanAdminister" => Ok(Some(FieldValue::Json(Json::Bool(
+                self.can_administer(actor),
+            )))),
             "tosAccepted" => Ok(Some(FieldValue::Json(Json::Bool(self.data.tos_accepted)))),
             _ => Ok(None),
         }
@@ -515,13 +675,16 @@ mod tests {
 
     fn schema() -> sg_graphql::Schema {
         assemble_sdl(
-            "type Query { currentUser: User other: String } \
+            "type Query { currentUser: User \
+                          user(username: String, email: String, databaseID: Int): User \
+                          other: String } \
              type User { id: ID! databaseID: Int! username: String! \
                          displayName: String avatarURL: String \
                          url: String! settingsURL: String \
                          createdAt: DateTime! updatedAt: DateTime \
                          siteAdmin: Boolean! tosAccepted: Boolean! \
-                         builtinAuth: Boolean! } \
+                         builtinAuth: Boolean! email: String! \
+                         viewerCanAdminister: Boolean! } \
              scalar DateTime",
         )
         .expect("schema")
@@ -562,6 +725,7 @@ mod tests {
             updated_at: at("2026-02-03T04:05:06+02:00"),
             site_admin: true,
             tos_accepted: true,
+            primary_email: "alice@example.com".to_owned(),
         })
     }
 
@@ -620,6 +784,7 @@ mod tests {
             updated_at: at("2026-01-02T03:04:05Z"),
             site_admin: false,
             tos_accepted: false,
+            primary_email: String::new(),
         });
         assert_eq!(
             run(
@@ -648,19 +813,228 @@ mod tests {
         );
     }
 
+    fn roots_with_users(
+        users: &[(UserKey, UserLookup)],
+        viewer_site_admin: bool,
+    ) -> FrontendRootResolver {
+        FrontendRootResolver::with_user_and_repositories_and_users(
+            None,
+            HashMap::new(),
+            users.iter().cloned().collect(),
+            viewer_site_admin,
+        )
+    }
+
+    fn bob() -> UserData {
+        UserData {
+            id: 2,
+            username: "bob".to_owned(),
+            display_name: "Bob B.".to_owned(),
+            avatar_url: String::new(),
+            created_at: at("2026-01-02T03:04:05Z"),
+            updated_at: at("2026-01-02T03:04:05Z"),
+            site_admin: false,
+            tos_accepted: false,
+            primary_email: "bob@example.com".to_owned(),
+        }
+    }
+
     #[test]
-    fn site_admin_for_another_actor_is_unported() {
-        // The baseline would query the database to see whether this actor is a
-        // site admin; only the same-user branch is ported.
+    fn query_user_resolves_each_lookup_key() {
+        let schema = schema();
+        let alice = user().data;
+        let roots = roots_with_users(
+            &[
+                (
+                    UserKey::Username("alice".to_owned()),
+                    UserLookup::Found(alice.clone()),
+                ),
+                (UserKey::DatabaseId(1), UserLookup::Found(alice.clone())),
+                (
+                    UserKey::Email("alice@example.com".to_owned()),
+                    UserLookup::Found(alice),
+                ),
+            ],
+            true,
+        );
+        assert_eq!(
+            run(
+                &schema,
+                "{ byName: user(username: \"alice\") { username } \
+                   byID: user(databaseID: 1) { username } \
+                   byEmail: user(email: \"alice@example.com\") { username } }",
+                Actor::Anonymous,
+                &roots,
+            ),
+            r#"{"data":{"byName":{"username":"alice"},"byID":{"username":"alice"},"byEmail":{"username":"alice"}}}"#
+        );
+    }
+
+    #[test]
+    fn query_user_prefers_username_over_email() {
+        // `user.go:38-56` checks username, then databaseID, then email.
+        let schema = schema();
+        let roots = roots_with_users(
+            &[(
+                UserKey::Username("alice".to_owned()),
+                UserLookup::Found(user().data),
+            )],
+            false,
+        );
+        assert_eq!(
+            run(
+                &schema,
+                "{ user(username: \"alice\", email: \"nobody@example.com\") { username } }",
+                Actor::Anonymous,
+                &roots,
+            ),
+            r#"{"data":{"user":{"username":"alice"}}}"#
+        );
+    }
+
+    #[test]
+    fn query_user_not_found_is_null() {
+        let schema = schema();
+        let roots = roots_with_users(
+            &[(UserKey::Username("ghost".to_owned()), UserLookup::NotFound)],
+            false,
+        );
+        assert_eq!(
+            run(
+                &schema,
+                "{ user(username: \"ghost\") { username } }",
+                Actor::Anonymous,
+                &roots,
+            ),
+            r#"{"data":{"user":null}}"#
+        );
+    }
+
+    #[test]
+    fn query_user_without_arguments_errors() {
+        // `user.go:56-57`: "must specify either username or email to look up
+        // a user" (even though `databaseID` is supported).
         let schema = schema();
         assert_eq!(
             run(
                 &schema,
-                "{ currentUser { siteAdmin } }",
-                Actor::User { uid: 2 },
-                &FrontendRootResolver::with_user(Some(user()))
+                "{ user { username } }",
+                Actor::Anonymous,
+                &roots_with_users(&[], false),
             ),
-            r#"{"errors":[{"message":"GraphQL field \"siteAdmin\" of \"User\" has no ported resolver","path":["currentUser","siteAdmin"]}],"data":{"currentUser":null}}"#
+            r#"{"errors":[{"message":"must specify either username or email to look up a user","path":["user"]}],"data":{"user":null}}"#
+        );
+    }
+
+    #[test]
+    fn query_user_database_error_is_reported() {
+        let schema = schema();
+        let roots = roots_with_users(
+            &[(
+                UserKey::Username("broken".to_owned()),
+                UserLookup::Error("connection reset".to_owned()),
+            )],
+            false,
+        );
+        assert_eq!(
+            run(
+                &schema,
+                "{ user(username: \"broken\") { username } }",
+                Actor::Anonymous,
+                &roots,
+            ),
+            r#"{"errors":[{"message":"connection reset","path":["user"]}],"data":{"user":null}}"#
+        );
+    }
+
+    #[test]
+    fn email_and_site_admin_require_self_or_site_admin() {
+        let schema = schema();
+        let bob = UserData { id: 2, ..bob() };
+        let roots = roots_with_users(
+            &[(UserKey::Username("bob".to_owned()), UserLookup::Found(bob))],
+            false,
+        );
+        // Another non-admin actor: the baseline collapses to the shared error.
+        assert_eq!(
+            run(
+                &schema,
+                "{ user(username: \"bob\") { email siteAdmin } }",
+                Actor::User { uid: 1 },
+                &roots,
+            ),
+            r#"{"errors":[{"message":"must be authenticated as the authorized user or site admin","path":["user","email"]}],"data":{"user":null}}"#
+        );
+        // The same user sees the primary email and flag.
+        assert_eq!(
+            run(
+                &schema,
+                "{ user(username: \"bob\") { username email siteAdmin } }",
+                Actor::User { uid: 2 },
+                &roots,
+            ),
+            r#"{"data":{"user":{"username":"bob","email":"bob@example.com","siteAdmin":false}}}"#
+        );
+    }
+
+    #[test]
+    fn site_admin_viewer_can_read_other_users_email_and_flag() {
+        // A site-admin viewer passes `CheckSiteAdminOrSameUserFromActor`.
+        let schema = schema();
+        let roots = roots_with_users(
+            &[(
+                UserKey::Username("bob".to_owned()),
+                UserLookup::Found(bob()),
+            )],
+            true,
+        );
+        assert_eq!(
+            run(
+                &schema,
+                "{ user(username: \"bob\") { email siteAdmin } }",
+                Actor::User { uid: 1 },
+                &roots,
+            ),
+            r#"{"data":{"user":{"email":"bob@example.com","siteAdmin":false}}}"#
+        );
+    }
+
+    #[test]
+    fn viewer_can_administer_is_false_without_erroring() {
+        let schema = schema();
+        let roots = roots_with_users(
+            &[(
+                UserKey::Username("bob".to_owned()),
+                UserLookup::Found(bob()),
+            )],
+            false,
+        );
+        assert_eq!(
+            run(
+                &schema,
+                "{ user(username: \"bob\") { viewerCanAdminister } }",
+                Actor::User { uid: 1 },
+                &roots,
+            ),
+            r#"{"data":{"user":{"viewerCanAdminister":false}}}"#
+        );
+        assert_eq!(
+            run(
+                &schema,
+                "{ user(username: \"bob\") { viewerCanAdminister } }",
+                Actor::User { uid: 2 },
+                &roots,
+            ),
+            r#"{"data":{"user":{"viewerCanAdminister":true}}}"#
+        );
+        assert_eq!(
+            run(
+                &schema,
+                "{ user(username: \"bob\") { viewerCanAdminister } }",
+                Actor::Anonymous,
+                &roots,
+            ),
+            r#"{"data":{"user":{"viewerCanAdminister":false}}}"#
         );
     }
 

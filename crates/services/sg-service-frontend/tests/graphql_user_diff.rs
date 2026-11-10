@@ -94,6 +94,7 @@ fn graphql_user_harness() {
             updated_at,
             site_admin: case.user.site_admin,
             tos_accepted: case.user.tos_accepted,
+            primary_email: String::new(),
         });
         let roots = FrontendRootResolver::with_user(Some(user));
         let variables = Map::new();

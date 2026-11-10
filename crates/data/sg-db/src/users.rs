@@ -420,11 +420,13 @@ LIMIT 1
     }))
 }
 
-/// The `users` fields session authentication and the first DB-backed
-/// `User` resolvers read (`db.Users().GetByID`,
-/// `internal/database/users.go:1330-1360`). `display_name`/`avatar_url` are
-/// nullable columns; the baseline's `types.User` fields are plain strings, so
-/// NULL maps to the empty string (which the resolvers turn back into null).
+/// The `users` fields session authentication and the DB-backed `User`
+/// resolvers read (`internal/database/users.go:1330-1360`).
+/// `display_name`/`avatar_url` are nullable columns; the baseline's
+/// `types.User` fields are plain strings, so NULL maps to the empty string
+/// (which the resolvers turn back into null). `email` is the primary
+/// `user_emails.email` (`userEmailsStore.GetPrimaryEmail`), empty when the
+/// user has none.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UserSessionRecord {
     pub id: i32,
@@ -436,28 +438,11 @@ pub struct UserSessionRecord {
     pub invalidated_sessions_at: OffsetDateTime,
     pub site_admin: bool,
     pub tos_accepted: bool,
+    pub email: String,
 }
 
-/// `userStore.GetByID`: live users only (`deleted_at IS NULL`). `Ok(None)` is
-/// the baseline's not-found error.
-pub async fn get_session_user(
-    pool: &PgPool,
-    id: i32,
-) -> Result<Option<UserSessionRecord>, sqlx::Error> {
-    let row = sqlx::query(
-        r#"
-SELECT id, username, display_name, avatar_url, created_at, updated_at,
-       invalidated_sessions_at, site_admin, tos_accepted
-FROM users
-WHERE id = $1 AND deleted_at IS NULL
-LIMIT 1
-"#,
-    )
-    .bind(id)
-    .fetch_optional(pool)
-    .await?;
-
-    Ok(row.map(|row| UserSessionRecord {
+fn scan_user_session_row(row: &sqlx::postgres::PgRow) -> UserSessionRecord {
+    UserSessionRecord {
         id: row.get("id"),
         username: row.get("username"),
         display_name: row
@@ -471,7 +456,81 @@ LIMIT 1
         invalidated_sessions_at: row.get("invalidated_sessions_at"),
         site_admin: row.get("site_admin"),
         tos_accepted: row.get("tos_accepted"),
-    }))
+        email: row.get("email"),
+    }
+}
+
+/// `userStore.GetByID`: live users only (`deleted_at IS NULL`). `Ok(None)` is
+/// the baseline's not-found error.
+pub async fn get_session_user(
+    pool: &PgPool,
+    id: i32,
+) -> Result<Option<UserSessionRecord>, sqlx::Error> {
+    let row = sqlx::query(
+        r#"
+SELECT u.id, u.username, u.display_name, u.avatar_url, u.created_at,
+       u.updated_at, u.invalidated_sessions_at, u.site_admin, u.tos_accepted,
+       COALESCE(ue.email, '') AS email
+FROM users u
+LEFT JOIN user_emails ue ON (ue.user_id = u.id AND ue.is_primary)
+WHERE u.id = $1 AND u.deleted_at IS NULL
+LIMIT 1
+"#,
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(row.as_ref().map(scan_user_session_row))
+}
+
+/// `userStore.GetByUsername` (`internal/database/users.go:996-998`):
+/// `username` is citext, so the comparison is case-insensitive.
+pub async fn find_user_by_username(
+    pool: &PgPool,
+    username: &str,
+) -> Result<Option<UserSessionRecord>, sqlx::Error> {
+    let row = sqlx::query(
+        r#"
+SELECT u.id, u.username, u.display_name, u.avatar_url, u.created_at,
+       u.updated_at, u.invalidated_sessions_at, u.site_admin, u.tos_accepted,
+       COALESCE(ue.email, '') AS email
+FROM users u
+LEFT JOIN user_emails ue ON (ue.user_id = u.id AND ue.is_primary)
+WHERE u.username = $1::citext AND u.deleted_at IS NULL
+LIMIT 1
+"#,
+    )
+    .bind(username)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(row.as_ref().map(scan_user_session_row))
+}
+
+/// `userStore.GetByVerifiedEmail` with the full `types.User` row: unverified
+/// matches are ignored; at most one user has a given verified address.
+pub async fn find_user_by_verified_email(
+    pool: &PgPool,
+    email: &str,
+) -> Result<Option<UserSessionRecord>, sqlx::Error> {
+    let row = sqlx::query(
+        r#"
+SELECT u.id, u.username, u.display_name, u.avatar_url, u.created_at,
+       u.updated_at, u.invalidated_sessions_at, u.site_admin, u.tos_accepted,
+       COALESCE(ue.email, '') AS email
+FROM users u
+LEFT JOIN user_emails ue ON (ue.user_id = u.id AND ue.is_primary)
+WHERE u.id = (SELECT user_id FROM user_emails WHERE email = $1::citext AND verified_at IS NOT NULL)
+  AND u.deleted_at IS NULL
+LIMIT 1
+"#,
+    )
+    .bind(email)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(row.as_ref().map(scan_user_session_row))
 }
 
 /// Subset of `types.User` used by `stream_blame.go`'s
@@ -496,7 +555,7 @@ pub async fn get_by_verified_email(
         r#"
 SELECT u.id, u.username, u.display_name, u.avatar_url
 FROM users u
-WHERE u.id = (SELECT user_id FROM user_emails WHERE email = $1 AND verified_at IS NOT NULL)
+WHERE u.id = (SELECT user_id FROM user_emails WHERE email = $1::citext AND verified_at IS NOT NULL)
   AND u.deleted_at IS NULL
 LIMIT 1
 "#,
