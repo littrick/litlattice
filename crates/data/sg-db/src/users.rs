@@ -20,7 +20,7 @@ use std::fmt;
 
 use serde_json::{json, Value};
 use sqlx::postgres::PgConnection;
-use sqlx::types::time::OffsetDateTime;
+use sqlx::types::time::{Date, OffsetDateTime};
 use sqlx::{PgPool, QueryBuilder, Row};
 
 use crate::telemetry_events::{bulk_insert_event_logs_on, EventLogRow};
@@ -531,6 +531,125 @@ LIMIT 1
     .await?;
 
     Ok(row.as_ref().map(scan_user_session_row))
+}
+
+/// `database.UsersListOptions` as `Query.users` fills it
+/// (`cmd/frontend/graphqlbackend/users.go:33-49`). `include_deleted` and
+/// `org_id` are not reachable from that resolver.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UsersListOptions {
+    /// `Query`: `username ILIKE %q% OR display_name ILIKE %q% OR id = n`.
+    pub query: Option<String>,
+    /// `database.maybeQueryIsID(query)`, precomputed by the caller: sg-db does
+    /// not depend on `base64`. Only consulted when `query` is set.
+    pub query_id: Option<i32>,
+    /// `UserIDs`; an empty list must return no rows (baseline `FALSE`).
+    pub user_ids: Option<Vec<i32>>,
+    /// `InactiveSince`: users without a newer `event_logs` row.
+    pub inactive_since: Option<OffsetDateTime>,
+    /// `ExcludeSourcegraphOperators`.
+    pub exclude_sourcegraph_operators: bool,
+    /// `LimitOffset.SQL()`: `Some((limit, offset))` emits
+    /// `LIMIT ... OFFSET ...`; `None` emits nothing.
+    pub limit_offset: Option<(i32, i32)>,
+}
+
+fn push_users_where(builder: &mut QueryBuilder<'_, sqlx::Postgres>, opt: &UsersListOptions) {
+    builder.push("u.deleted_at IS NULL");
+    if let Some(query) = &opt.query {
+        // `newQueryCond` ignores an empty query.
+        if !query.is_empty() {
+            let pattern = format!("%{query}%");
+            builder
+                .push(" AND (u.username ILIKE ")
+                .push_bind(pattern.clone())
+                .push(" OR u.display_name ILIKE ")
+                .push_bind(pattern);
+            if let Some(id) = opt.query_id {
+                builder.push(" OR u.id = ").push_bind(id);
+            }
+            builder.push(")");
+        }
+    }
+    if let Some(user_ids) = &opt.user_ids {
+        if user_ids.is_empty() {
+            builder.push(" AND FALSE");
+        } else {
+            builder.push(" AND u.id = ANY(").push_bind(user_ids.clone());
+            builder.push(")");
+        }
+    }
+    if let Some(inactive_since) = opt.inactive_since {
+        builder
+            .push(
+                " AND NOT EXISTS (SELECT 1 FROM event_logs WHERE event_logs.user_id = u.id \
+                 AND event_logs.timestamp >= ",
+            )
+            .push_bind(inactive_since)
+            .push(")");
+    }
+    if opt.exclude_sourcegraph_operators {
+        builder
+            .push(" AND NOT EXISTS (SELECT FROM user_external_accounts WHERE service_type = ")
+            .push_bind(SOURCEGRAPH_OPERATOR_PROVIDER_TYPE)
+            .push(" AND user_id = u.id)");
+    }
+}
+
+/// `userStore.List` (`internal/database/users.go:1116-1127`): the `listSQL`
+/// conditions, `ORDER BY id ASC` and the optional limit/offset.
+pub async fn list_users(
+    pool: &PgPool,
+    opt: &UsersListOptions,
+) -> Result<Vec<UserSessionRecord>, sqlx::Error> {
+    let mut builder: QueryBuilder<'_, sqlx::Postgres> = QueryBuilder::new(
+        "SELECT u.id, u.username, u.display_name, u.avatar_url, u.created_at, \
+         u.updated_at, u.invalidated_sessions_at, u.site_admin, u.tos_accepted, \
+         COALESCE(ue.email, '') AS email \
+         FROM users u \
+         LEFT JOIN user_emails ue ON (ue.user_id = u.id AND ue.is_primary) \
+         WHERE ",
+    );
+    push_users_where(&mut builder, opt);
+    builder.push(" ORDER BY u.id ASC");
+    if let Some((limit, offset)) = opt.limit_offset {
+        builder.push(" LIMIT ").push_bind(limit);
+        builder.push(" OFFSET ").push_bind(offset);
+    }
+    let rows = builder.build().fetch_all(pool).await?;
+    Ok(rows.iter().map(scan_user_session_row).collect())
+}
+
+/// `userStore.Count` (`internal/database/users.go:1070-1082`): the same
+/// conditions without ordering or pagination.
+pub async fn count_users(pool: &PgPool, opt: &UsersListOptions) -> Result<i64, sqlx::Error> {
+    let mut builder: QueryBuilder<'_, sqlx::Postgres> =
+        QueryBuilder::new("SELECT COUNT(*) FROM users u WHERE ");
+    push_users_where(&mut builder, opt);
+    let row = builder.build().fetch_one(pool).await?;
+    Ok(row.get::<i64, _>(0))
+}
+
+/// `eventLogStore.ListUniqueUsersAll` (`internal/database/event_logs.go:875-897`):
+/// distinct positive user IDs with an event whose UTC date falls in the
+/// inclusive `[start, end]` range. The baseline passes dates as `time.Time`
+/// midnights; binding `DATE` keeps the `DATE(...)` comparison identical.
+pub async fn list_unique_users_between(
+    pool: &PgPool,
+    start: Date,
+    end: Date,
+) -> Result<Vec<i32>, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT user_id FROM event_logs \
+         WHERE user_id > 0 \
+           AND DATE(TIMEZONE('UTC', timestamp)) >= $1 \
+           AND DATE(TIMEZONE('UTC', timestamp)) <= $2 \
+         GROUP BY user_id",
+    )
+    .bind(start)
+    .bind(end)
+    .fetch_all(pool)
+    .await
 }
 
 /// Subset of `types.User` used by `stream_blame.go`'s

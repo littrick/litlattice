@@ -140,6 +140,99 @@ pub async fn prefetch_users(
     users
 }
 
+/// `Query.users` arguments (`usersArgs`, `users.go:17-23`). `activePeriod`
+/// stays a raw string because the baseline stores it as `*string`; unknown
+/// values error at compute time.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct UsersArgs {
+    pub first: Option<i32>,
+    pub after: Option<String>,
+    pub query: Option<String>,
+    pub active_period: Option<String>,
+    /// `gqlutil.DateTime` input; parsed by the store so invalid scalar input
+    /// surfaces as a database-seam error.
+    pub inactive_since: Option<String>,
+}
+
+/// `userConnectionResolver.compute`'s result: the node rows and the count for
+/// the same options.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UsersConnectionData {
+    pub users: Vec<UserData>,
+    pub total_count: i32,
+    /// `UsersListOptions.LimitOffset.Limit` (`None` when unpaginated).
+    pub limit: Option<i32>,
+    /// `UsersListOptions.LimitOffset.Offset` (the parsed `after` cursor).
+    pub offset: i32,
+}
+
+/// The result of prefetching one `Query.users` root field.
+#[derive(Debug, Clone, PartialEq)]
+pub enum UsersConnectionLookup {
+    Found(UsersConnectionData),
+    /// A database/argument failure, surfaced as the resolver error.
+    Error(String),
+}
+
+/// The database seam for `Query.users` (`db.Users().List`/`Count`).
+#[async_trait]
+pub trait UsersConnectionStore: Send + Sync {
+    async fn list(&self, args: &UsersArgs) -> Result<UsersConnectionData, String>;
+}
+
+/// `usersArgs` from the GraphQL arguments. `first` is an `Int` (int32 in
+/// graph-gophers); only reachable values are kept.
+pub fn users_args(arguments: &Arguments) -> UsersArgs {
+    UsersArgs {
+        first: arguments
+            .i64("first")
+            .and_then(|first| i32::try_from(first).ok()),
+        after: arguments.string("after").map(str::to_owned),
+        query: arguments.string("query").map(str::to_owned),
+        active_period: arguments.string("activePeriod").map(str::to_owned),
+        inactive_since: arguments.string("inactiveSince").map(str::to_owned),
+    }
+}
+
+/// `database.maybeQueryIsID` (`internal/database/helpers.go:32-44`): a plain
+/// int32 or a graph-gophers Relay ID
+/// (`base64.URLEncoding(kind + ":" + json)`, kind not validated).
+pub fn maybe_query_is_id(query: &str) -> Option<i32> {
+    if let Ok(id) = query.parse::<i32>() {
+        return Some(id);
+    }
+    let decoded = base64::engine::general_purpose::URL_SAFE
+        .decode(query)
+        .ok()?;
+    let text = std::str::from_utf8(&decoded).ok()?;
+    let (_, spec) = text.split_once(':')?;
+    serde_json::from_str(spec).ok()
+}
+
+/// Look up every `Query.users` root field in `fields`, deduplicated by
+/// argument set.
+pub async fn prefetch_users_connections(
+    store: &dyn UsersConnectionStore,
+    fields: &[RootField],
+) -> HashMap<UsersArgs, UsersConnectionLookup> {
+    let mut connections = HashMap::new();
+    for field in fields {
+        if field.name != "users" {
+            continue;
+        }
+        let args = users_args(&field.arguments);
+        if connections.contains_key(&args) {
+            continue;
+        }
+        let lookup = match store.list(&args).await {
+            Ok(data) => UsersConnectionLookup::Found(data),
+            Err(error) => UsersConnectionLookup::Error(error),
+        };
+        connections.insert(args, lookup);
+    }
+    connections
+}
+
 /// The `repo` row fields the `Repository` resolvers read (one
 /// `repoStore.GetByName` row).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -269,14 +362,20 @@ impl FrontendRootResolver {
     /// an authenticated actor has "no ported resolver" because the row cannot
     /// be loaded.
     pub fn new() -> Self {
-        Self::with_state(None, HashMap::new(), HashMap::new(), false)
+        Self::with_state(None, HashMap::new(), HashMap::new(), HashMap::new(), false)
     }
 
     /// The production resolver: `user` is the prefetched current user, if the
     /// actor is authenticated and the row still exists.
     pub fn with_user(user: Option<UserObject>) -> Self {
         let viewer_site_admin = user.as_ref().is_some_and(|user| user.data.site_admin);
-        Self::with_state(user, HashMap::new(), HashMap::new(), viewer_site_admin)
+        Self::with_state(
+            user,
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            viewer_site_admin,
+        )
     }
 
     /// The production resolver with the prefetched `Query.repository` rows.
@@ -285,7 +384,13 @@ impl FrontendRootResolver {
         repositories: HashMap<RepoKey, RepoLookup>,
     ) -> Self {
         let viewer_site_admin = user.as_ref().is_some_and(|user| user.data.site_admin);
-        Self::with_state(user, repositories, HashMap::new(), viewer_site_admin)
+        Self::with_state(
+            user,
+            repositories,
+            HashMap::new(),
+            HashMap::new(),
+            viewer_site_admin,
+        )
     }
 
     /// The production resolver with prefetched `Query.user` lookups and the
@@ -297,13 +402,32 @@ impl FrontendRootResolver {
         users: HashMap<UserKey, UserLookup>,
         viewer_site_admin: bool,
     ) -> Self {
-        Self::with_state(user, repositories, users, viewer_site_admin)
+        Self::with_state(user, repositories, users, HashMap::new(), viewer_site_admin)
+    }
+
+    /// The production resolver with the prefetched `Query.users`
+    /// connections as well.
+    pub fn with_user_and_repositories_and_users_connections(
+        user: Option<UserObject>,
+        repositories: HashMap<RepoKey, RepoLookup>,
+        users: HashMap<UserKey, UserLookup>,
+        users_connections: HashMap<UsersArgs, UsersConnectionLookup>,
+        viewer_site_admin: bool,
+    ) -> Self {
+        Self::with_state(
+            user,
+            repositories,
+            users,
+            users_connections,
+            viewer_site_admin,
+        )
     }
 
     fn with_state(
         user: Option<UserObject>,
         repositories: HashMap<RepoKey, RepoLookup>,
         users: HashMap<UserKey, UserLookup>,
+        users_connections: HashMap<UsersArgs, UsersConnectionLookup>,
         viewer_site_admin: bool,
     ) -> Self {
         Self {
@@ -311,6 +435,7 @@ impl FrontendRootResolver {
                 user,
                 repositories,
                 users,
+                users_connections,
                 viewer_site_admin,
             },
         }
@@ -342,6 +467,8 @@ struct QueryRoot {
     repositories: HashMap<RepoKey, RepoLookup>,
     /// Prefetched `Query.user` results, keyed by the lookup argument.
     users: HashMap<UserKey, UserLookup>,
+    /// Prefetched `Query.users` connections, keyed by the argument set.
+    users_connections: HashMap<UsersArgs, UsersConnectionLookup>,
     /// The viewer's `users.site_admin`; see
     /// `auth.CheckSiteAdminOrSameUserFromActor`.
     viewer_site_admin: bool,
@@ -404,6 +531,22 @@ impl ObjectValue for QueryRoot {
                     "must specify either username or email to look up a user",
                 )),
             },
+            // `schemaResolver.Users` (`users.go:25-52`): the connection is
+            // computed asynchronously and prefetched.
+            "users" => {
+                let args = users_args(arguments);
+                match self.users_connections.get(&args) {
+                    Some(UsersConnectionLookup::Found(data)) => {
+                        Ok(Some(FieldValue::Object(Arc::new(
+                            UsersConnectionObject::from_data(data.clone(), self.viewer_site_admin),
+                        ))))
+                    }
+                    Some(UsersConnectionLookup::Error(message)) => {
+                        Err(ExecError::new(message.clone()))
+                    }
+                    None => Ok(None),
+                }
+            }
             _ => Ok(None),
         }
     }
@@ -528,6 +671,111 @@ impl ObjectValue for UserObject {
                 self.can_administer(actor),
             )))),
             "tosAccepted" => Ok(Some(FieldValue::Json(Json::Bool(self.data.tos_accepted)))),
+            _ => Ok(None),
+        }
+    }
+}
+
+/// `userConnectionResolver` (`users.go:62-144`): `nodes`, `totalCount` and
+/// `pageInfo`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UsersConnectionObject {
+    data: UsersConnectionData,
+    viewer_site_admin: bool,
+}
+
+impl UsersConnectionObject {
+    pub fn from_data(data: UsersConnectionData, viewer_site_admin: bool) -> Self {
+        Self {
+            data,
+            viewer_site_admin,
+        }
+    }
+
+    /// `userConnectionResolver.PageInfo` (`users.go:122-144`). Returns
+    /// `(hasNextPage, endCursor)`.
+    fn page_info(&self) -> (bool, Option<String>) {
+        // Without a limit we would have had all results.
+        let Some(limit) = self.data.limit else {
+            return (false, None);
+        };
+        let after = self.data.offset + self.data.users.len() as i32;
+        // Fewer results than the limit means we have everything.
+        if after < limit {
+            return (false, None);
+        }
+        if self.data.total_count > after {
+            return (true, Some(after.to_string()));
+        }
+        (false, None)
+    }
+}
+
+impl ObjectValue for UsersConnectionObject {
+    fn type_name(&self) -> &'static str {
+        "UserConnection"
+    }
+
+    fn field(
+        &self,
+        field: &str,
+        _arguments: &Arguments,
+        _actor: Actor,
+    ) -> Result<Option<FieldValue>, ExecError> {
+        match field {
+            "nodes" => Ok(Some(FieldValue::List {
+                items: self
+                    .data
+                    .users
+                    .iter()
+                    .map(|user| {
+                        FieldValue::Object(Arc::new(UserObject::from_data_as_viewer(
+                            user.clone(),
+                            self.viewer_site_admin,
+                        )))
+                    })
+                    .collect(),
+                element_type: Some("User"),
+            })),
+            "totalCount" => Ok(Some(FieldValue::Json(Json::Int(i64::from(
+                self.data.total_count,
+            ))))),
+            "pageInfo" => {
+                let (has_next_page, end_cursor) = self.page_info();
+                Ok(Some(FieldValue::Object(Arc::new(PageInfoObject {
+                    has_next_page,
+                    end_cursor,
+                }))))
+            }
+            _ => Ok(None),
+        }
+    }
+}
+
+/// `gqlutil.PageInfo` (`internal/gqlutil/page_info.go:3-21`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PageInfoObject {
+    has_next_page: bool,
+    end_cursor: Option<String>,
+}
+
+impl ObjectValue for PageInfoObject {
+    fn type_name(&self) -> &'static str {
+        "PageInfo"
+    }
+
+    fn field(
+        &self,
+        field: &str,
+        _arguments: &Arguments,
+        _actor: Actor,
+    ) -> Result<Option<FieldValue>, ExecError> {
+        match field {
+            "hasNextPage" => Ok(Some(FieldValue::Json(Json::Bool(self.has_next_page)))),
+            "endCursor" => Ok(Some(match &self.end_cursor {
+                Some(cursor) => FieldValue::Json(Json::Str(cursor.clone())),
+                None => FieldValue::Null,
+            })),
             _ => Ok(None),
         }
     }
@@ -677,6 +925,8 @@ mod tests {
         assemble_sdl(
             "type Query { currentUser: User \
                           user(username: String, email: String, databaseID: Int): User \
+                          users(first: Int, after: String, query: String, \
+                                activePeriod: UserActivePeriod, inactiveSince: DateTime): UserConnection! \
                           other: String } \
              type User { id: ID! databaseID: Int! username: String! \
                          displayName: String avatarURL: String \
@@ -685,6 +935,9 @@ mod tests {
                          siteAdmin: Boolean! tosAccepted: Boolean! \
                          builtinAuth: Boolean! email: String! \
                          viewerCanAdminister: Boolean! } \
+             type UserConnection { nodes: [User!]! totalCount: Int! pageInfo: PageInfo! } \
+             type PageInfo { endCursor: String hasNextPage: Boolean! } \
+             enum UserActivePeriod { TODAY THIS_WEEK THIS_MONTH ALL_TIME } \
              scalar DateTime",
         )
         .expect("schema")
@@ -1036,6 +1289,125 @@ mod tests {
             ),
             r#"{"data":{"user":{"viewerCanAdminister":false}}}"#
         );
+    }
+
+    fn connection(
+        users: Vec<UserData>,
+        total_count: i32,
+        limit: Option<i32>,
+        after: Option<&str>,
+        offset: i32,
+    ) -> (UsersArgs, UsersConnectionLookup) {
+        let args = UsersArgs {
+            first: limit,
+            after: after.map(str::to_owned),
+            query: None,
+            active_period: None,
+            inactive_since: None,
+        };
+        (
+            args,
+            UsersConnectionLookup::Found(UsersConnectionData {
+                users,
+                total_count,
+                limit,
+                offset,
+            }),
+        )
+    }
+
+    fn roots_with_connections(
+        connections: &[(UsersArgs, UsersConnectionLookup)],
+    ) -> FrontendRootResolver {
+        FrontendRootResolver::with_user_and_repositories_and_users_connections(
+            None,
+            HashMap::new(),
+            HashMap::new(),
+            connections.iter().cloned().collect(),
+            false,
+        )
+    }
+
+    #[test]
+    fn query_users_lists_nodes_and_total_count() {
+        let schema = schema();
+        let alice = user().data;
+        let roots = roots_with_connections(&[connection(vec![alice, bob()], 2, None, None, 0)]);
+        assert_eq!(
+            run(
+                &schema,
+                "{ users { nodes { username } totalCount pageInfo { hasNextPage endCursor } } }",
+                Actor::Anonymous,
+                &roots,
+            ),
+            r#"{"data":{"users":{"nodes":[{"username":"alice"},{"username":"bob"}],"totalCount":2,"pageInfo":{"hasNextPage":false,"endCursor":null}}}}"#
+        );
+    }
+
+    #[test]
+    fn query_users_page_info_matches_users_go() {
+        let schema = schema();
+        // `first: 2, after: "2"` over 10 users: after = 4 > total? no -> cursor.
+        let next_page = connection(vec![bob(), bob()], 10, Some(2), Some("2"), 2);
+        let roots = roots_with_connections(&[next_page]);
+        assert_eq!(
+            run(
+                &schema,
+                "{ users(first: 2, after: \"2\") { pageInfo { hasNextPage endCursor } } }",
+                Actor::Anonymous,
+                &roots,
+            ),
+            r#"{"data":{"users":{"pageInfo":{"hasNextPage":true,"endCursor":"4"}}}}"#
+        );
+
+        // A partial page: `after = offset + len(users)` is below the limit.
+        let last_page = connection(vec![bob(), bob()], 2, Some(5), None, 0);
+        let roots = roots_with_connections(&[last_page]);
+        assert_eq!(
+            run(
+                &schema,
+                "{ users(first: 5) { pageInfo { hasNextPage endCursor } } }",
+                Actor::Anonymous,
+                &roots,
+            ),
+            r#"{"data":{"users":{"pageInfo":{"hasNextPage":false,"endCursor":null}}}}"#
+        );
+
+        // Total equals the cursor: no next page.
+        let exhausted = connection(vec![bob(), bob()], 4, Some(2), Some("2"), 2);
+        let roots = roots_with_connections(&[exhausted]);
+        assert_eq!(
+            run(
+                &schema,
+                "{ users(first: 2, after: \"2\") { pageInfo { hasNextPage endCursor } } }",
+                Actor::Anonymous,
+                &roots,
+            ),
+            r#"{"data":{"users":{"pageInfo":{"hasNextPage":false,"endCursor":null}}}}"#
+        );
+    }
+
+    #[test]
+    fn query_users_without_prefetch_is_unported() {
+        let schema = schema();
+        assert_eq!(
+            run(
+                &schema,
+                "{ users { totalCount } }",
+                Actor::Anonymous,
+                &FrontendRootResolver::new(),
+            ),
+            r#"{"errors":[{"message":"GraphQL field \"users\" of \"Query\" has no ported resolver","path":["users"]}],"data":null}"#
+        );
+    }
+
+    #[test]
+    fn maybe_query_is_id_matches_the_baseline() {
+        assert_eq!(maybe_query_is_id("42"), Some(42));
+        assert_eq!(maybe_query_is_id("VXNlcjox"), Some(1));
+        assert_eq!(maybe_query_is_id("not-an-id"), None);
+        // graph-gophers does not validate the kind.
+        assert_eq!(maybe_query_is_id("UmVwb3NpdG9yeTo0Mg=="), Some(42));
     }
 
     #[test]
