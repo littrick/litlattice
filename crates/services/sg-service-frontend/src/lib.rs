@@ -19,6 +19,7 @@ pub mod configuration_api;
 pub mod configuration_server;
 pub mod configuration_source;
 pub mod configuration_startup;
+pub mod configuration_watch;
 pub mod debug;
 pub mod deploy_defaults;
 pub mod external_api;

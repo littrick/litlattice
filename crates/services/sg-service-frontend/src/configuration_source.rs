@@ -31,6 +31,10 @@ use sqlx::PgPool;
 use crate::{deploy_defaults, service_connections};
 
 /// `config.go`'s `configurationSource` (DB-backed).
+///
+/// Cloning shares the pool; the watcher (M9.8ge) gets its own handle while the
+/// configuration server keeps the original.
+#[derive(Clone)]
 pub struct DbConfigurationSource {
     pool: PgPool,
     default_site: &'static str,

@@ -9,12 +9,12 @@
 //!
 //! The baseline also starts an fsnotify watcher (`watchUpdate`,
 //! `config.go:366-441`) that re-runs the override whenever one of the files
-//! changes. That is not ported (the `notify` dependency is not in the
-//! workspace); edits to the files take effect on the next process start.
+//! changes. The workspace has no `notify` crate, so the watcher lives in
+//! [`crate::configuration_watch`] as a structured polling loop (documented
+//! deviation) that the frontend service spawns on its `JoinSet`.
 //!
-//! See `docs/overviews/m9_8el_frontend_config_startup_overview.md`.
+//! See `docs/overviews/m9_8ge_config_override_watch_overview.md`.
 
-use std::io;
 use std::path::PathBuf;
 
 use sg_config::server::ConfigurationSource;
@@ -63,17 +63,9 @@ pub async fn override_from_env(source: &DbConfigurationSource) -> Result<bool, S
 }
 
 /// Format a read error like Go's `os.ReadFile`: `open <path>: <reason>`.
-/// (Rust's `io::Error` Display is `No such file or directory (os error 2)`.)
 fn format_read_error(err: &SiteConfigFileError) -> String {
     match err {
-        SiteConfigFileError::Read { path, source } => {
-            let reason = match source.kind() {
-                io::ErrorKind::NotFound => "no such file or directory".to_owned(),
-                io::ErrorKind::PermissionDenied => "permission denied".to_owned(),
-                _ => source.to_string(),
-            };
-            format!("open {}: {reason}", path.display())
-        }
+        SiteConfigFileError::Read { path, source } => site_config_file::go_read_error(path, source),
         other => other.to_string(),
     }
 }
