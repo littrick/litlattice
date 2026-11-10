@@ -29,6 +29,8 @@
 //! - `/.api/{github,gitlab,bitbucket-server,bitbucket-cloud}-webhooks` (POST)
 //!   -> GitHub: 400 `Error validating payload` with no GitHub external
 //!   services; the others: the OSS empty handler's 200 empty response;
+//! - `/.api/opencodegraph` (POST) -> the `opencodegraph` feature flag is off,
+//!   so `JsonMiddleware`'s error handler answers 500 with an empty body;
 //! - anything else -> gorilla's default `http.NotFoundHandler`
 //!   (`404 page not found\n`, `nosniff`).
 //!
@@ -36,7 +38,7 @@
 //! routes (`/scim/v2`, `/registry`) are unaffected; matched template routes
 //! redirect a trailing slash away exactly like `http.Redirect`.
 
-use http::{Method, Request, Response, StatusCode};
+use http::{header, HeaderValue, Method, Request, Response, StatusCode};
 use tonic::body::BoxBody;
 use uuid::Uuid;
 
@@ -67,6 +69,7 @@ const GITHUB_WEBHOOKS_PATH: &str = "/.api/github-webhooks";
 const GITLAB_WEBHOOKS_PATH: &str = "/.api/gitlab-webhooks";
 const BITBUCKET_SERVER_WEBHOOKS_PATH: &str = "/.api/bitbucket-server-webhooks";
 const BITBUCKET_CLOUD_WEBHOOKS_PATH: &str = "/.api/bitbucket-cloud-webhooks";
+const OPENCODEGRAPH_PATH: &str = "/.api/opencodegraph";
 
 /// `srccli.MinimumVersion` (`internal/src-cli/consts.go:9`). The remote
 /// version cache is not ported, so `src_cli_version_handler.Version()`
@@ -111,6 +114,7 @@ enum Route {
     GitLabWebhooks,
     BitbucketServerWebhooks,
     BitbucketCloudWebhooks,
+    OpenCodeGraph,
 }
 
 impl Route {
@@ -138,7 +142,8 @@ impl Route {
             | Route::GitHubWebhooks
             | Route::GitLabWebhooks
             | Route::BitbucketServerWebhooks
-            | Route::BitbucketCloudWebhooks => method == Method::POST,
+            | Route::BitbucketCloudWebhooks
+            | Route::OpenCodeGraph => method == Method::POST,
         }
     }
 
@@ -219,6 +224,7 @@ pub fn api_response<B>(req: &Request<B>, _live: &LiveConfig) -> Response<BoxBody
         Route::GitLabWebhooks | Route::BitbucketServerWebhooks | Route::BitbucketCloudWebhooks => {
             empty_response(StatusCode::OK)
         }
+        Route::OpenCodeGraph => json_middleware_error_response(),
     }
 }
 
@@ -250,6 +256,9 @@ fn match_route(path: &str) -> Option<Route> {
     }
     if path == BITBUCKET_CLOUD_WEBHOOKS_PATH {
         return Some(Route::BitbucketCloudWebhooks);
+    }
+    if path == OPENCODEGRAPH_PATH {
+        return Some(Route::OpenCodeGraph);
     }
     if let Some(rest) = path.strip_prefix(BATCH_CHANGES_PREFIX) {
         if let Some((spec, file)) = batch_changes_file(rest) {
@@ -431,6 +440,27 @@ fn go_quote(value: &str) -> String {
     quoted
 }
 
+/// `JsonMiddleware` + `ErrorHandler.Handle` (`httpapi.go:405-453`) for a
+/// handler error: the middleware's `application/json` is overridden by
+/// `http.Error` to `text/plain; charset=utf-8`, `nosniff` is added,
+/// `Cache-Control: no-cache, max-age=0` is set, and — with
+/// `WriteErrBody=false` (the default) — only the trailing newline is
+/// written. `/.api/opencodegraph` takes this path with the default feature
+/// flags (`OpenCodeGraph is not enabled ...`, mapped to 500).
+fn json_middleware_error_response() -> Response<BoxBody> {
+    let mut response = text_response(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "text/plain; charset=utf-8",
+        "\n",
+        true,
+    );
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("no-cache, max-age=0"),
+    );
+    response
+}
+
 /// gorilla's default `NotFoundHandler` (`http.NotFoundHandler`).
 fn page_not_found() -> Response<BoxBody> {
     text_response(
@@ -556,6 +586,41 @@ mod tests {
             "/.api/gitlab-webhooks"
         );
         assert!(trailing.headers().get(header::CONTENT_TYPE).is_none());
+    }
+
+    #[tokio::test]
+    async fn opencodegraph_error_response() {
+        let live = live();
+        let response = api_response(&request(Method::POST, "/.api/opencodegraph"), &live);
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "text/plain; charset=utf-8"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(header::X_CONTENT_TYPE_OPTIONS)
+                .unwrap(),
+            "nosniff"
+        );
+        assert_eq!(
+            response.headers().get(header::CACHE_CONTROL).unwrap(),
+            "no-cache, max-age=0"
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body[..], b"\n");
+
+        assert_eq!(
+            api_response(&request(Method::GET, "/.api/opencodegraph"), &live).status(),
+            StatusCode::METHOD_NOT_ALLOWED
+        );
+        let trailing = api_response(&request(Method::POST, "/.api/opencodegraph/"), &live);
+        assert_eq!(trailing.status(), StatusCode::MOVED_PERMANENTLY);
+        assert_eq!(
+            trailing.headers().get(header::LOCATION).unwrap(),
+            "/.api/opencodegraph"
+        );
     }
 
     #[tokio::test]
