@@ -152,7 +152,20 @@ async fn graphql_settings_subject_harness() {
         let fields = root_fields(&schema, &request);
         let users = prefetch_users(&users_store, &fields).await;
         let organizations = prefetch_organizations(&org_store, &fields, actor, admin).await;
-        let nodes = prefetch_node_roots(&org_store, &repo_store, &fields, actor, admin).await;
+        let nodes = prefetch_node_roots(
+            &org_store,
+            &repo_store,
+            None,
+            None,
+            None,
+            None,
+            None,
+            "",
+            &fields,
+            actor,
+            admin,
+        )
+        .await;
         let nested = Arc::new(
             prefetch_nested(
                 &org_store,

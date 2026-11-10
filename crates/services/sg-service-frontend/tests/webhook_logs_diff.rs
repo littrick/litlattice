@@ -280,6 +280,7 @@ async fn webhook_logs_harness() {
             Some(&users),
             Some(webhook_key.clone()),
             Some(external_service_key.clone()),
+            "",
             actor,
             viewer_site_admin,
         )
