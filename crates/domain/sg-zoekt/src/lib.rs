@@ -17,6 +17,7 @@ pub mod file_ranking;
 pub mod global_query;
 pub mod go_regexp;
 pub mod horizontal;
+pub mod horizontal_searcher;
 pub mod index_options;
 pub mod indexed_repo_revs;
 pub mod indexers;
