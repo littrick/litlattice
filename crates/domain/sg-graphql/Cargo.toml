@@ -7,3 +7,5 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+graphql-parser = "0.4"
+serde_json = { workspace = true }

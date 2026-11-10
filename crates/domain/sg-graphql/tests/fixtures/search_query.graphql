@@ -1,0 +1,137 @@
+
+query Search($query: String!, $version: SearchVersion!, $patternType: SearchPatternType!) {
+  search(
+    query: $query
+    version: $version
+    patternType: $patternType
+  ) {
+    results {
+      __typename
+      limitHit
+      matchCount
+      approximateResultCount
+      missing {
+        name
+      }
+      cloning {
+        name
+      }
+      repositoriesCount
+      timedout {
+        name
+      }
+      indexUnavailable
+      dynamicFilters {
+        value
+        label
+        count
+        limitHit
+        kind
+      }
+      results {
+        __typename
+        ... on Repository {
+          id
+          name
+          label {
+            html
+          }
+          url
+          icon
+          detail {
+            html
+          }
+          matches {
+            url
+            body {
+              text
+              html
+            }
+            highlights {
+              line
+              character
+              length
+            }
+          }
+        }
+        ... on FileMatch {
+          file {
+            path
+            url
+            commit {
+              oid
+            }
+          }
+          repository {
+            name
+            url
+          }
+          revSpec {
+            __typename
+            ... on GitRef {
+              displayName
+              url
+            }
+            ... on GitRevSpecExpr {
+              expr
+              object {
+                commit {
+                  url
+                }
+              }
+            }
+            ... on GitObject {
+              abbreviatedOID
+              commit {
+                url
+              }
+            }
+          }
+          limitHit
+          symbols {
+            name
+            containerName
+            url
+            kind
+          }
+          lineMatches {
+            preview
+            lineNumber
+            offsetAndLengths
+          }
+        }
+        ... on CommitSearchResult {
+          label {
+            html
+          }
+          url
+          icon
+          detail {
+            html
+          }
+          matches {
+            url
+            body {
+              text
+              html
+            }
+            highlights {
+              line
+              character
+              length
+            }
+          }
+        }
+      }
+      alert {
+        title
+        description
+        proposedQueries {
+          description
+          query
+        }
+      }
+      elapsedMilliseconds
+    }
+  }
+}
