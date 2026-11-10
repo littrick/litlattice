@@ -288,6 +288,17 @@ impl Service for FrontendService {
                 .with_external_services(
                     Arc::new(
                         crate::external_services::PgExternalServiceConnectionStore::new(
+                            session_pool.clone(),
+                        ),
+                    ),
+                    Arc::clone(&keyring),
+                )
+                .with_webhook_logs(
+                    Arc::new(crate::webhook_logs::PgWebhookLogConnectionStore::new(
+                        session_pool.clone(),
+                    )),
+                    Arc::new(
+                        crate::external_services::PgExternalServiceConnectionStore::new(
                             session_pool,
                         ),
                     ),

@@ -53,6 +53,7 @@ pub mod temporary_settings;
 pub mod user_emails;
 pub mod user_external_accounts;
 pub mod users;
+pub mod webhook_logs;
 pub mod worker_queue;
 pub mod zoekt_repos;
 

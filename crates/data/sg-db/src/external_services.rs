@@ -307,6 +307,30 @@ WHERE deleted_at IS NULL
         Ok(count)
     }
 
+    /// `ExternalServices().GetByID` for the connection's node shape: the same
+    /// columns as [`Self::list_connection`], restricted to a live (not
+    /// soft-deleted) service. Used by `WebhookLog.externalService`.
+    pub async fn get_list_record_by_id(
+        &self,
+        id: i64,
+    ) -> Result<ExternalServiceListRecord, ExternalServiceError> {
+        let row = sqlx::query(
+            r#"
+SELECT id, kind, display_name, config, encryption_key_id,
+       created_at, updated_at, last_sync_at, next_sync_at,
+       unrestricted, creator_id, last_updater_id
+FROM external_services
+WHERE id = $1 AND deleted_at IS NULL
+"#,
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or(ExternalServiceError::NotFound { id })?;
+
+        list_record_from_row(row)
+    }
+
     /// `ExternalServices().RepoCount(ctx, id)`.
     pub async fn repo_count(&self, id: i64) -> Result<i32, ExternalServiceError> {
         let count = sqlx::query_scalar(

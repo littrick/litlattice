@@ -53,6 +53,7 @@ pub mod tenant;
 pub mod trace_headers;
 pub mod user_store;
 pub mod version;
+pub mod webhook_logs;
 
 pub use service::{service_name, FrontendService, SERVICE_NAME};
 pub use version::Version;
