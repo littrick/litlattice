@@ -26,6 +26,7 @@ use sg_config::LiveConfig;
 use crate::auth;
 use crate::blame::BlameDeps;
 use crate::goimportpath;
+use crate::graphql_api::GraphqlDeps;
 use crate::health;
 use crate::ipallowlist::{self, AllowlistEnv, IpAllowlistConfig};
 use crate::mux::{self, SecurityConfig};
@@ -299,6 +300,7 @@ pub fn external_handler_with_live(
     version: Bytes,
     blame_deps: Arc<dyn BlameDeps>,
     search_deps: Arc<dyn SearchDeps>,
+    graphql_deps: Arc<dyn GraphqlDeps>,
 ) -> sg_http::HttpHandler {
     let api_live = Arc::clone(&live);
     let middleware = Arc::new(LiveMiddleware::new(live, allowlist_env));
@@ -307,6 +309,7 @@ pub fn external_handler_with_live(
         let api_live = Arc::clone(&api_live);
         let blame_deps = Arc::clone(&blame_deps);
         let search_deps = Arc::clone(&search_deps);
+        let graphql_deps = Arc::clone(&graphql_deps);
         let version = version.clone();
         Box::pin(async move {
             let derived = middleware.current();
@@ -322,21 +325,28 @@ pub fn external_handler_with_live(
                     let api_live = Arc::clone(&api_live);
                     let blame_deps = Arc::clone(&blame_deps);
                     let search_deps = Arc::clone(&search_deps);
+                    let graphql_deps = Arc::clone(&graphql_deps);
                     Box::pin(async move {
-                        let request: &Request<Incoming> = req;
-                        mux::route_async(request, &security, |route| async move {
-                            match route {
-                                mux::Route::Api => {
-                                    crate::external_api::api_response_with_deps(
-                                        request,
-                                        &api_live,
-                                        blame_deps,
-                                        search_deps,
-                                    )
-                                    .await
+                        mux::route_async(req, &security, |route, request| {
+                            let api_live = Arc::clone(&api_live);
+                            let blame_deps = Arc::clone(&blame_deps);
+                            let search_deps = Arc::clone(&search_deps);
+                            let graphql_deps = Arc::clone(&graphql_deps);
+                            Box::pin(async move {
+                                match route {
+                                    mux::Route::Api => {
+                                        crate::external_api::api_response_with_deps(
+                                            request,
+                                            &api_live,
+                                            blame_deps,
+                                            search_deps,
+                                            graphql_deps,
+                                        )
+                                        .await
+                                    }
+                                    other => mux::not_found_dispatch(other),
                                 }
-                                other => mux::not_found_dispatch(other),
-                            }
+                            })
                         })
                         .await
                     })
@@ -350,10 +360,16 @@ pub fn external_handler_with_live(
 /// The hyper entry point for the internal listener. The gitserver shard
 /// list and pins are read from the live configuration per request, like the
 /// baseline's `atomicGitServerConns` (which follows `conf.Get`).
-pub fn internal_handler(live: Arc<LiveConfig>) -> sg_http::HttpHandler {
-    std::sync::Arc::new(move |req: Request<Incoming>| {
+pub fn internal_handler(
+    live: Arc<LiveConfig>,
+    graphql_deps: Arc<dyn GraphqlDeps>,
+) -> sg_http::HttpHandler {
+    std::sync::Arc::new(move |mut req: Request<Incoming>| {
         let live = Arc::clone(&live);
-        Box::pin(async move { crate::internal_api::internal_response(&req, &live) })
+        let graphql_deps = Arc::clone(&graphql_deps);
+        Box::pin(async move {
+            crate::internal_api::internal_response_with_deps(&mut req, &live, graphql_deps).await
+        })
     })
 }
 

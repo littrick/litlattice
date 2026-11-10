@@ -635,7 +635,7 @@ mod tests {
     use crate::external_api::{api_response_with_deps, route_for_test, Route};
     use crate::search_stream::{SearchDeps, UnavailableDeps};
     use http::Request;
-    use http_body_util::BodyExt;
+    use http_body_util::{BodyExt, Full};
     use sg_config::{ServiceConnections, SiteConfiguration, Unified};
     use std::sync::Mutex as StdMutex;
 
@@ -732,18 +732,27 @@ mod tests {
         }
     }
 
-    fn request(target: &str) -> Request<()> {
+    fn request(target: &str) -> Request<Full<bytes::Bytes>> {
         Request::builder()
             .method(http::Method::GET)
             .uri(target)
-            .body(())
+            .body(Full::new(bytes::Bytes::new()))
             .expect("request")
     }
 
     async fn run(deps: &Arc<FakeDeps>, target: &str) -> (StatusCode, http::HeaderMap, String) {
         let deps: Arc<dyn BlameDeps> = deps.clone();
         let search_deps: Arc<dyn SearchDeps> = Arc::new(UnavailableDeps);
-        let response = api_response_with_deps(&request(target), &live(), deps, search_deps).await;
+        let graphql_deps: Arc<dyn crate::graphql_api::GraphqlDeps> =
+            Arc::new(crate::graphql_api::UnportedGraphqlDeps);
+        let response = api_response_with_deps(
+            &mut request(target),
+            &live(),
+            deps,
+            search_deps,
+            graphql_deps,
+        )
+        .await;
         let status = response.status();
         let headers = response.headers().clone();
         let body = response

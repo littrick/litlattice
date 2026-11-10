@@ -20,6 +20,7 @@ pub mod debug;
 pub mod deploy_defaults;
 pub mod external_api;
 pub mod goimportpath;
+pub mod graphql_api;
 pub mod health;
 pub mod internal_api;
 pub mod ipallowlist;

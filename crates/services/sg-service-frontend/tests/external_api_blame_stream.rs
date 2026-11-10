@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use http::{header, Method, Request};
-use http_body_util::BodyExt;
+use http_body_util::{BodyExt, Full};
 use prost_types::Timestamp;
 use sg_config::{LiveConfig, ServiceConnections, SiteConfiguration, Unified};
 use sg_git::{BlameHunk, PreviousCommit, Signature};
@@ -224,17 +224,20 @@ impl BlameDeps for FakeDeps {
 }
 
 async fn run(deps: &Arc<FakeDeps>, name: &str, method: &str, target: &str) {
-    let request = Request::builder()
+    let mut request = Request::builder()
         .method(Method::from_bytes(method.as_bytes()).expect("method"))
         .uri(target)
-        .body(())
+        .body(Full::new(bytes::Bytes::new()))
         .expect("request");
     let search_deps: Arc<dyn SearchDeps> = Arc::new(UnavailableDeps);
+    let graphql_deps: Arc<dyn sg_service_frontend::graphql_api::GraphqlDeps> =
+        Arc::new(sg_service_frontend::graphql_api::UnportedGraphqlDeps);
     let response = api_response_with_deps(
-        &request,
+        &mut request,
         &live(),
         Arc::clone(deps) as Arc<dyn BlameDeps>,
         search_deps,
+        graphql_deps,
     )
     .await;
     let status = response.status().as_u16();

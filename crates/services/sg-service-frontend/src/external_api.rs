@@ -57,6 +57,7 @@ use uuid::Uuid;
 use sg_config::LiveConfig;
 
 use crate::blame::BlameDeps;
+use crate::graphql_api::{self, GraphqlDeps};
 use crate::internal_api::{
     decode_path, empty_response, enterprise_not_found, escape_path, hex_escape_non_ascii,
     http_redirect, located, strict_slash_redirect, text_response,
@@ -65,6 +66,7 @@ use crate::mux;
 
 const REGISTRY_PREFIX: &str = "/.api/registry";
 const SCIM_PREFIX: &str = "/.api/scim/v2";
+const GRAPHQL_PATH: &str = "/.api/graphql";
 const BATCH_CHANGES_PREFIX: &str = "/.api/files/batch-changes/";
 const LSIF_UPLOAD_PATH: &str = "/.api/lsif/upload";
 const SCIP_UPLOAD_PATH: &str = "/.api/scip/upload";
@@ -151,6 +153,7 @@ pub(crate) enum Route {
     BitbucketServerWebhooks,
     BitbucketCloudWebhooks,
     OpenCodeGraph,
+    Graphql,
     RepoShield {
         repo: String,
     },
@@ -189,6 +192,7 @@ impl Route {
             Route::RepoShield { .. } | Route::BlameStream { .. } | Route::SearchStream => {
                 method == Method::GET
             }
+            Route::Graphql => method == Method::POST,
             Route::WebhookUuid { .. }
             | Route::GitHubWebhooks
             | Route::GitLabWebhooks
@@ -217,17 +221,23 @@ pub fn api_response<B>(req: &Request<B>, _live: &LiveConfig) -> Response<BoxBody
 /// the database and gitserver (via [`BlameDeps`]) and streams its response.
 /// Every other route is the same synchronous dispatch as [`api_response`].
 pub async fn api_response_with_deps<B>(
-    req: &Request<B>,
-    _live: &LiveConfig,
+    req: &mut Request<B>,
+    live: &LiveConfig,
     deps: Arc<dyn BlameDeps>,
     search_deps: Arc<dyn crate::search_stream::SearchDeps>,
-) -> Response<BoxBody> {
-    match route_request(req) {
+    graphql_deps: Arc<dyn GraphqlDeps>,
+) -> Response<BoxBody>
+where
+    B: hyper::body::Body<Data = bytes::Bytes> + Unpin + Send,
+    B::Error: std::fmt::Display,
+{
+    match route_request(&*req) {
         Err(response) => response,
         Ok(Route::BlameStream { repo, rev, path }) => {
             crate::blame::blame_response(req, &repo, rev.as_deref(), &path, deps).await
         }
         Ok(Route::SearchStream) => crate::search_stream::search_response(req, search_deps).await,
+        Ok(Route::Graphql) => graphql_api::graphql_response(req, live, false, graphql_deps).await,
         Ok(route) => route_response(req, route),
     }
 }
@@ -283,7 +293,7 @@ fn route_response<B>(req: &Request<B>, route: Route) -> Response<BoxBody> {
         // Served by `api_response_with_deps`; the synchronous entry point
         // never has the dependencies and must not be used for blame or
         // search.
-        Route::BlameStream { .. } | Route::SearchStream => {
+        Route::BlameStream { .. } | Route::SearchStream | Route::Graphql => {
             empty_response(StatusCode::INTERNAL_SERVER_ERROR)
         }
         Route::Registry => registry_response(),
@@ -351,6 +361,9 @@ fn match_route(path: &str) -> Option<Route> {
     }
     if path == BITBUCKET_CLOUD_WEBHOOKS_PATH {
         return Some(Route::BitbucketCloudWebhooks);
+    }
+    if path == GRAPHQL_PATH {
+        return Some(Route::Graphql);
     }
     if path == OPENCODEGRAPH_PATH {
         return Some(Route::OpenCodeGraph);

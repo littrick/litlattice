@@ -21,6 +21,7 @@ use sg_config::SiteConfiguration;
 
 use crate::config::FrontendConfig;
 use crate::configuration_server;
+use crate::graphql_api::{GraphqlDeps, UnportedGraphqlDeps};
 use crate::ipallowlist::AllowlistEnv;
 use crate::version::Version;
 use crate::{debug, middleware};
@@ -174,11 +175,15 @@ impl Service for FrontendService {
         );
         let search_deps: Arc<dyn crate::search_stream::SearchDeps> =
             Arc::new(crate::search_stream::BackendDeps::new(search_pool));
+        // Schema assembly and resolvers are not ported yet: the transport is
+        // complete, execution answers a GraphQL error (see `graphql_api`).
+        let graphql_deps: Arc<dyn GraphqlDeps> = Arc::new(UnportedGraphqlDeps);
 
         if let Some((addr, listener)) = internal {
             let shutdown = ctx.shutdown.clone();
             let store = Arc::clone(wiring.store());
             let live = Arc::clone(wiring.live());
+            let graphql_deps = Arc::clone(&graphql_deps);
             background.spawn(async move {
                 // `httpapi.go:397` registers the configuration service on the
                 // internal gRPC server; `serve_cmd.go:397` multiplexes gRPC
@@ -189,7 +194,7 @@ impl Service for FrontendService {
                         crate::configuration_api::ConfigApi::new(store),
                     ),
                 );
-                let handler = middleware::internal_handler(live);
+                let handler = middleware::internal_handler(live, Arc::clone(&graphql_deps));
                 if let Err(err) = sg_http::serve(listener, routes, handler, shutdown).await {
                     tracing::error!(addr, error = %err, "frontend internal server failed");
                 }
@@ -215,6 +220,7 @@ impl Service for FrontendService {
                 self.version.bytes(),
                 blame_deps,
                 search_deps,
+                graphql_deps,
             ),
             ctx.shutdown.clone(),
         )

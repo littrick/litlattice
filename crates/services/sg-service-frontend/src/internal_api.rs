@@ -33,6 +33,7 @@ use tonic::body::BoxBody;
 use sg_config::LiveConfig;
 use sg_git::addresses::GitserverAddresses;
 
+use crate::graphql_api::{self, GraphqlDeps};
 use crate::mux;
 
 /// `/ping` (`internal.go:61-68`).
@@ -43,6 +44,7 @@ const UPLOAD_PACK: &str = "/git-upload-pack";
 const LSIF_UPLOAD_PATH: &str = "/lsif/upload";
 const SCIP_UPLOAD_PATH: &str = "/scip/upload";
 const COMPUTE_STREAM_PATH: &str = "/compute/stream";
+const GRAPHQL_PATH: &str = "/graphql";
 
 /// The route a request resolved to, before the method is checked.
 #[derive(Debug, PartialEq, Eq)]
@@ -53,6 +55,7 @@ enum Route {
     LsifUpload,
     ScipUpload,
     ComputeStream,
+    Graphql,
 }
 
 impl Route {
@@ -62,7 +65,7 @@ impl Route {
             Route::UploadPack { .. } | Route::ComputeStream => {
                 method == Method::GET || method == Method::POST
             }
-            Route::LsifUpload => method == Method::POST,
+            Route::LsifUpload | Route::Graphql => method == Method::POST,
             Route::ScipUpload => method == Method::POST || method == Method::HEAD,
         }
     }
@@ -70,6 +73,35 @@ impl Route {
 
 /// `Router.ServeHTTP` + the registered handlers.
 pub fn internal_response<B>(req: &Request<B>, live: &LiveConfig) -> Response<BoxBody> {
+    match route_request(req) {
+        Err(response) => response,
+        Ok(route) => route_response(req, route, live),
+    }
+}
+
+/// The dependency-carrying variant used by the internal listener:
+/// `/graphql` (POST) needs the request body and the GraphQL seams; every other
+/// route is the same synchronous dispatch as [`internal_response`].
+pub async fn internal_response_with_deps<B>(
+    req: &mut Request<B>,
+    live: &LiveConfig,
+    graphql_deps: std::sync::Arc<dyn GraphqlDeps>,
+) -> Response<BoxBody>
+where
+    B: hyper::body::Body<Data = Bytes> + Unpin + Send,
+    B::Error: std::fmt::Display,
+{
+    match route_request(&*req) {
+        Err(response) => response,
+        Ok(Route::Graphql) => graphql_api::graphql_response(req, live, true, graphql_deps).await,
+        Ok(route) => route_response(req, route, live),
+    }
+}
+
+/// The gorilla matching pipeline (clean redirect, strict slash, method), shared
+/// by both entry points.
+#[allow(clippy::result_large_err)] // The error is the short-circuit response.
+fn route_request<B>(req: &Request<B>) -> Result<Route, Response<BoxBody>> {
     let raw_path = req.uri().path();
     let decoded = decode_path(if raw_path.is_empty() { "/" } else { raw_path });
 
@@ -81,7 +113,7 @@ pub fn internal_response<B>(req: &Request<B>, live: &LiveConfig) -> Response<Box
             Some(query) => format!("{}?{query}", escape_path(&cleaned)),
             None => escape_path(&cleaned),
         };
-        return located(StatusCode::MOVED_PERMANENTLY, location, None);
+        return Err(located(StatusCode::MOVED_PERMANENTLY, location, None));
     }
 
     // `StrictSlash(true)`: the route regexp accepts one optional trailing
@@ -90,17 +122,24 @@ pub fn internal_response<B>(req: &Request<B>, live: &LiveConfig) -> Response<Box
         Some(route) => (route, decoded.as_str()),
         None => match decoded.strip_suffix('/').map(match_route) {
             Some(Some(route)) => (route, &decoded[..decoded.len() - 1]),
-            _ => return no_route(),
+            _ => return Err(no_route()),
         },
     };
     if !route.allows(req.method()) {
         // gorilla `methodNotAllowed`: status only, no body.
-        return empty_response(StatusCode::METHOD_NOT_ALLOWED);
+        return Err(empty_response(StatusCode::METHOD_NOT_ALLOWED));
     }
     if matched_path.len() != decoded.len() {
-        return strict_slash_redirect(req.method(), matched_path, req.uri().query());
+        return Err(strict_slash_redirect(
+            req.method(),
+            matched_path,
+            req.uri().query(),
+        ));
     }
+    Ok(route)
+}
 
+fn route_response<B>(req: &Request<B>, route: Route, live: &LiveConfig) -> Response<BoxBody> {
     match route {
         Route::Ping => text_response(StatusCode::OK, "text/plain; charset=utf-8", "pong", false),
         Route::InfoRefs { repo } => redirect_to_git_server(req, &repo, INFO_REFS, live),
@@ -109,6 +148,9 @@ pub fn internal_response<B>(req: &Request<B>, live: &LiveConfig) -> Response<Box
         Route::ScipUpload if req.method() == Method::HEAD => empty_response(StatusCode::OK),
         Route::ScipUpload => enterprise_not_found("code intel upload"),
         Route::ComputeStream => enterprise_not_found("compute streaming endpoint"),
+        // Served by `internal_response_with_deps`; the synchronous entry point
+        // never has the GraphQL dependencies.
+        Route::Graphql => empty_response(StatusCode::INTERNAL_SERVER_ERROR),
     }
 }
 
@@ -202,6 +244,9 @@ fn match_route(path: &str) -> Option<Route> {
     }
     if path == COMPUTE_STREAM_PATH {
         return Some(Route::ComputeStream);
+    }
+    if path == GRAPHQL_PATH {
+        return Some(Route::Graphql);
     }
     let rest = path.strip_prefix(GIT_PREFIX)?;
     if let Some(repo) = rest.strip_suffix(INFO_REFS) {

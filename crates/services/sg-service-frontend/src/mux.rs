@@ -153,31 +153,38 @@ pub fn route<B>(
     secure_headers(req, policy, &path, config, || dispatch(route))
 }
 
-/// [`route`] with an asynchronous inner handler (`/.api/blame/...`).
-pub async fn route_async<B, F, Fut>(
-    req: &Request<B>,
+/// [`route`] with an asynchronous inner handler (`/.api/blame/...`,
+/// `/.api/graphql`). The handler receives the request mutably so it can read
+/// a POST body.
+pub async fn route_async<B, F>(
+    req: &mut Request<B>,
     config: &SecurityConfig,
     dispatch: F,
 ) -> Response<BoxBody>
 where
-    F: FnOnce(Route) -> Fut,
-    Fut: std::future::Future<Output = Response<BoxBody>>,
+    B: Send,
+    F: for<'a> FnOnce(
+        Route,
+        &'a mut Request<B>,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Response<BoxBody>> + Send + 'a>,
+    >,
 {
     let escaped = req.uri().path();
     let escaped = if escaped.is_empty() { "/" } else { escaped };
     let cleaned = clean_path(escaped);
 
     if let Some(target) = trailing_slash_target(&cleaned) {
-        return moved_permanently(req, &redirect_location(req, target));
+        return moved_permanently(&*req, &redirect_location(&*req, target));
     }
     if cleaned != escaped {
-        return moved_permanently(req, &redirect_location(req, &cleaned));
+        return moved_permanently(&*req, &redirect_location(&*req, &cleaned));
     }
 
     let route = classify(&cleaned);
     let policy = route.policy();
     let path = route.path(&cleaned).to_owned();
-    secure_headers_async(req, policy, &path, config, || dispatch(route)).await
+    secure_headers_async(req, policy, &path, config, route, dispatch).await
 }
 
 /// `http.ServeMux` subtree matching for the four registered patterns.
@@ -265,22 +272,28 @@ pub fn secure_headers<B>(
 }
 
 /// [`secure_headers`] with an asynchronous inner handler.
-pub async fn secure_headers_async<B, F, Fut>(
-    req: &Request<B>,
+pub async fn secure_headers_async<B, F>(
+    req: &mut Request<B>,
     policy: CrossOriginPolicy,
     path: &str,
     config: &SecurityConfig,
+    route: Route,
     next: F,
 ) -> Response<BoxBody>
 where
-    F: FnOnce() -> Fut,
-    Fut: std::future::Future<Output = Response<BoxBody>>,
+    B: Send,
+    F: for<'a> FnOnce(
+        Route,
+        &'a mut Request<B>,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Response<BoxBody>> + Send + 'a>,
+    >,
 {
-    let cors = cors_request(req, policy, path, config);
+    let cors = cors_request(&*req, policy, path, config);
 
     let mut response = match &cors {
         Some(cors) if cors.preflight => empty_response(StatusCode::OK),
-        _ => next().await,
+        _ => next(route, req).await,
     };
 
     apply_security_headers(&mut response, cors);

@@ -34,7 +34,10 @@ async fn serve() -> (SocketAddr, tokio_util::sync::CancellationToken) {
         .expect("bind");
     let addr = listener.local_addr().expect("addr");
     let shutdown = tokio_util::sync::CancellationToken::new();
-    let handler = middleware::internal_handler(Arc::new(live()));
+    let handler = middleware::internal_handler(
+        Arc::new(live()),
+        Arc::new(sg_service_frontend::graphql_api::UnportedGraphqlDeps),
+    );
     let token = shutdown.clone();
     tokio::spawn(async move {
         let _ = sg_http::serve_http(listener, handler, token).await;
