@@ -393,6 +393,8 @@ pub struct SchemaGraphqlDeps {
     /// `Query.featureFlags` / `Query.featureFlag`'s database seam; `None` in
     /// transport-only tests.
     feature_flags: Option<Arc<dyn crate::graphql_resolvers::FeatureFlagStore>>,
+    /// `Query.repositories`'s database seam; `None` in transport-only tests.
+    repositories_connections: Option<Arc<dyn crate::repositories::RepositoriesConnectionStore>>,
 }
 
 impl SchemaGraphqlDeps {
@@ -416,6 +418,7 @@ impl SchemaGraphqlDeps {
             clone_urls: None,
             log_events: None,
             feature_flags: None,
+            repositories_connections: None,
         }
     }
 
@@ -452,7 +455,10 @@ impl SchemaGraphqlDeps {
             clone_urls: None,
             log_events: None,
             feature_flags: Some(Arc::new(
-                crate::feature_flag_store::PgFeatureFlagStore::new(pool),
+                crate::feature_flag_store::PgFeatureFlagStore::new(pool.clone()),
+            )),
+            repositories_connections: Some(Arc::new(
+                crate::repositories::PgRepositoriesConnectionStore::new(pool),
             )),
         }
     }
@@ -586,6 +592,7 @@ impl SchemaGraphqlDeps {
             clone_urls: None,
             log_events: None,
             feature_flags: None,
+            repositories_connections: None,
         }
     }
 }
@@ -894,6 +901,20 @@ impl GraphqlDeps for SchemaGraphqlDeps {
             }
             None => std::collections::HashMap::new(),
         };
+        // `Query.repositories`: the connection's page and total count are
+        // prefetched with the actor/viewer used by `AuthzQueryConds`.
+        let repositories_connections = match &self.repositories_connections {
+            Some(store) => {
+                crate::repositories::prefetch_repositories_connections(
+                    store.as_ref(),
+                    &fields,
+                    request.actor,
+                    site_admin,
+                )
+                .await
+            }
+            None => std::collections::HashMap::new(),
+        };
         let mut roots =
             crate::graphql_resolvers::FrontendRootResolver::with_prefetched_organizations(
                 user,
@@ -912,6 +933,7 @@ impl GraphqlDeps for SchemaGraphqlDeps {
             .with_feature_flags(feature_flags)
             .with_external_services(external_services)
             .with_webhook_logs(webhook_logs)
+            .with_repositories_connections(repositories_connections)
             .with_mutation(mutation);
         if let Some(client_configuration) = client_configuration {
             roots = roots.with_client_configuration(client_configuration);

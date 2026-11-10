@@ -2149,6 +2149,7 @@ impl FrontendRootResolver {
                 feature_flags: FeatureFlagRoots::default(),
                 external_services: HashMap::new(),
                 webhook_logs: HashMap::new(),
+                repositories_connections: HashMap::new(),
             },
             mutation: crate::settings_mutation::MutationRoot::default(),
         }
@@ -2269,6 +2270,12 @@ struct QueryRoot {
         crate::webhook_logs::GlobalWebhookLogsArgs,
         crate::webhook_logs::WebhookLogsConnectionLookup,
     >,
+    /// Prefetched `Query.repositories` connections (see
+    /// [`crate::repositories::prefetch_repositories_connections`]).
+    repositories_connections: HashMap<
+        crate::repositories::RepositoriesArgs,
+        crate::repositories::RepositoriesConnectionLookup,
+    >,
 }
 
 impl FrontendRootResolver {
@@ -2305,6 +2312,18 @@ impl FrontendRootResolver {
         >,
     ) -> Self {
         self.query.webhook_logs = webhook_logs;
+        self
+    }
+
+    /// Attach the request's `Query.repositories` prefetch data.
+    pub fn with_repositories_connections(
+        mut self,
+        repositories_connections: HashMap<
+            crate::repositories::RepositoriesArgs,
+            crate::repositories::RepositoriesConnectionLookup,
+        >,
+    ) -> Self {
+        self.query.repositories_connections = repositories_connections;
         self
     }
 }
@@ -2445,6 +2464,25 @@ impl ObjectValue for QueryRoot {
                     Err(ExecError::new("neither name nor cloneURL given"))
                 }
             },
+            // `schemaResolver.Repositories` (`repositories.go:105-292`): the
+            // connection's pages and total are computed asynchronously and
+            // prefetched.
+            "repositories" => {
+                let args = crate::repositories::repositories_args(arguments);
+                match self.repositories_connections.get(&args) {
+                    Some(crate::repositories::RepositoriesConnectionLookup::Found(data)) => {
+                        Ok(Some(FieldValue::Object(Arc::new(
+                            crate::repositories::RepositoriesConnectionObject::from_data(
+                                data.clone(),
+                            ),
+                        ))))
+                    }
+                    Some(crate::repositories::RepositoriesConnectionLookup::Error(message)) => {
+                        Err(ExecError::new(message.clone()))
+                    }
+                    None => Ok(None),
+                }
+            }
             // `schemaResolver.User` (`user.go:30-73`): username, then
             // databaseID, then verified email; not-found is `null`.
             "user" => match user_arg(arguments) {
@@ -3851,6 +3889,22 @@ pub struct ConnectionPageInfoObject {
 }
 
 impl ConnectionPageInfoObject {
+    /// Build the page info from an already-trimmed page boundary
+    /// (`gqlutil.ConnectionPageInfo` for `Query.repositories`).
+    pub fn new(
+        start_cursor: Option<String>,
+        end_cursor: Option<String>,
+        has_next_page: bool,
+        has_previous_page: bool,
+    ) -> Self {
+        Self {
+            end_cursor,
+            start_cursor,
+            has_next_page,
+            has_previous_page,
+        }
+    }
+
     fn from_data(data: &MembersConnectionData) -> Self {
         let has_next_page = if data.first_present {
             data.fetched_count > data.page_size

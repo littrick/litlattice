@@ -40,6 +40,7 @@ pub mod mux;
 pub mod org_store;
 pub mod parse_search_query;
 pub mod rate_limit;
+pub mod repositories;
 pub mod repository_store;
 pub mod search_source;
 pub mod search_stream;
