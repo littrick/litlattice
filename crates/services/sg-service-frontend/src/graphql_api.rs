@@ -35,6 +35,8 @@ use serde_json::{Map, Value};
 use tonic::body::BoxBody;
 
 use sg_config::{LiveConfig, SiteConfiguration};
+use sg_graphql::exec::{ExecError, ExecResponse, PathSegment};
+use sg_graphql::json::Json;
 use sg_graphql::{estimate_query_cost, QueryCost};
 
 /// `HTTAPI_GZIP_FILE_SIZE_LIMIT` default (`graphql.go:35`): 500 MiB of
@@ -87,15 +89,115 @@ impl QueryError {
 
 /// `graphql.Response` (`graph-gophers/graphql-go/graphql.go:175-179`):
 /// `errors,omitempty`, `data,omitempty` (a `json.RawMessage`), then
-/// `extensions,omitempty`.
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+/// `extensions,omitempty`. `data` stays raw: the baseline never re-marshals
+/// it, so its selection order and escaping belong to the executor.
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct GraphqlResponse {
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub errors: Vec<QueryError>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub data: Option<Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data: Option<String>,
     pub extensions: Option<Map<String, Value>>,
+}
+
+impl GraphqlResponse {
+    /// Map an [`ExecResponse`] onto the wire shape. Only non-empty
+    /// `locations`/`path` are serialized (`omitempty`).
+    pub fn from_exec(response: &ExecResponse) -> Self {
+        Self {
+            errors: response.errors.iter().map(query_error_from_exec).collect(),
+            data: response.data_json(),
+            extensions: None,
+        }
+    }
+
+    /// `json.Marshal(Response)`: fixed field order `errors, data,
+    /// extensions`, each omitted when empty; Go HTML escaping.
+    pub fn to_json(&self) -> Result<String, String> {
+        let mut entries: Vec<(&str, Json)> = Vec::new();
+        if !self.errors.is_empty() {
+            let errors = self
+                .errors
+                .iter()
+                .map(query_error_json)
+                .collect::<Result<Vec<_>, String>>()?;
+            entries.push(("errors", Json::Arr(errors)));
+        }
+        if let Some(data) = &self.data {
+            entries.push(("data", Json::Raw(data.clone())));
+        }
+        if let Some(extensions) = self.extensions.as_ref().filter(|map| !map.is_empty()) {
+            entries.push((
+                "extensions",
+                Json::from_serde(&Value::Object(extensions.clone()))?,
+            ));
+        }
+        let json = Json::obj(entries);
+        json.check_finite()?;
+        Ok(json.to_compact_string())
+    }
+}
+
+fn query_error_from_exec(error: &ExecError) -> QueryError {
+    QueryError {
+        message: error.message.clone(),
+        locations: (!error.locations.is_empty()).then(|| {
+            error
+                .locations
+                .iter()
+                .map(|location| Location {
+                    line: location.line as i64,
+                    column: location.column as i64,
+                })
+                .collect()
+        }),
+        path: (!error.path.is_empty()).then(|| {
+            error
+                .path
+                .iter()
+                .map(|segment| match segment {
+                    PathSegment::Field(name) => Value::String(name.clone()),
+                    PathSegment::Index(index) => Value::from(*index as u64),
+                })
+                .collect()
+        }),
+        extensions: None,
+    }
+}
+
+fn query_error_json(error: &QueryError) -> Result<Json, String> {
+    let mut entries: Vec<(&str, Json)> = vec![("message", Json::Str(error.message.clone()))];
+    if let Some(locations) = error.locations.as_ref().filter(|list| !list.is_empty()) {
+        entries.push((
+            "locations",
+            Json::Arr(
+                locations
+                    .iter()
+                    .map(|location| {
+                        Json::obj(vec![
+                            ("line", Json::Int(location.line)),
+                            ("column", Json::Int(location.column)),
+                        ])
+                    })
+                    .collect(),
+            ),
+        ));
+    }
+    if let Some(path) = error.path.as_ref().filter(|list| !list.is_empty()) {
+        entries.push((
+            "path",
+            Json::Arr(
+                path.iter()
+                    .map(Json::from_serde)
+                    .collect::<Result<Vec<_>, String>>()?,
+            ),
+        ));
+    }
+    if let Some(extensions) = error.extensions.as_ref().filter(|map| !map.is_empty()) {
+        entries.push((
+            "extensions",
+            Json::from_serde(&Value::Object(extensions.clone()))?,
+        ));
+    }
+    Ok(Json::obj(entries))
 }
 
 /// `graphQLQueryParams` (`graphql.go:235-239`).
@@ -153,7 +255,37 @@ pub trait GraphqlDeps: Send + Sync {
     }
 }
 
-/// The production placeholder until schema assembly/resolvers are ported.
+/// Production schema execution: the assembled OSS [`sg_graphql::Schema`],
+/// executed by `sg-graphql`'s introspection executor.
+///
+/// Business resolvers are not ported yet; those root fields surface the
+/// executor's `no ported resolver` error.
+pub struct SchemaGraphqlDeps {
+    schema: Arc<sg_graphql::Schema>,
+}
+
+impl SchemaGraphqlDeps {
+    pub fn new(schema: Arc<sg_graphql::Schema>) -> Self {
+        Self { schema }
+    }
+}
+
+#[async_trait]
+impl GraphqlDeps for SchemaGraphqlDeps {
+    async fn exec(&self, request: GraphqlExecRequest<'_>) -> GraphqlResponse {
+        let response = sg_graphql::exec::execute(
+            &self.schema,
+            sg_graphql::exec::ExecRequest {
+                query: request.query,
+                operation_name: request.operation_name,
+                variables: request.variables,
+            },
+        );
+        GraphqlResponse::from_exec(&response)
+    }
+}
+
+/// The placeholder used by tests that only exercise the transport.
 pub struct UnportedGraphqlDeps;
 
 #[async_trait]
@@ -301,8 +433,8 @@ where
             variables: &params.variables,
         })
         .await;
-    let body = match serde_json::to_vec(&response) {
-        Ok(body) => body,
+    let body = match response.to_json() {
+        Ok(body) => body.into_bytes(),
         Err(error) => {
             return handler_error(
                 &format!("failed to marshal GraphQL response: {error}"),
@@ -737,7 +869,7 @@ fn violation_response(violations: &[Violation], site: &SiteConfiguration) -> Res
         errors,
         ..GraphqlResponse::default()
     };
-    let mut body = serde_json::to_vec(&response).unwrap_or_default();
+    let mut body = response.to_json().unwrap_or_default().into_bytes();
     body.push(b'\n');
     text_response(StatusCode::BAD_REQUEST, "application/json", body, false)
 }
@@ -1153,7 +1285,7 @@ mod tests {
             &[],
             br#"{"query":"{ hello }"}"#,
             deps(GraphqlResponse {
-                data: Some(json!({"hello": "world"})),
+                data: Some(r#"{"hello":"world"}"#.to_owned()),
                 ..GraphqlResponse::default()
             }),
         )
@@ -1275,12 +1407,86 @@ mod tests {
             &[("content-encoding", "gzip")],
             &compressed,
             deps(GraphqlResponse {
-                data: Some(json!({"hello": "world"})),
+                data: Some(r#"{"hello":"world"}"#.to_owned()),
                 ..GraphqlResponse::default()
             }),
         )
         .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body, br#"{"data":{"hello":"world"}}"#);
+    }
+
+    #[test]
+    fn response_json_matches_go_encoding() {
+        let response = GraphqlResponse {
+            errors: vec![QueryError {
+                message: "bad <&>\u{2028}".to_owned(),
+                locations: Some(vec![Location { line: 3, column: 7 }]),
+                path: Some(vec![Value::String("x".to_owned()), Value::from(1)]),
+                extensions: Some(Map::from_iter([(
+                    "code".to_owned(),
+                    Value::String("E<".to_owned()),
+                )])),
+            }],
+            data: Some(r#"{"hello":"x\u003cy"}"#.to_owned()),
+            extensions: Some(Map::from_iter([(
+                "t".to_owned(),
+                Value::String("<".to_owned()),
+            )])),
+        };
+        assert_eq!(
+            response.to_json().expect("marshal"),
+            r#"{"errors":[{"message":"bad \u003c\u0026\u003e\u2028","locations":[{"line":3,"column":7}],"path":["x",1],"extensions":{"code":"E\u003c"}}],"data":{"hello":"x\u003cy"},"extensions":{"t":"\u003c"}}"#
+        );
+
+        assert_eq!(GraphqlResponse::default().to_json().unwrap(), "{}");
+        let errors_only = GraphqlResponse {
+            errors: vec![QueryError::new("boom")],
+            ..GraphqlResponse::default()
+        };
+        assert_eq!(
+            errors_only.to_json().unwrap(),
+            r#"{"errors":[{"message":"boom"}]}"#
+        );
+    }
+
+    #[tokio::test]
+    async fn schema_deps_executes_introspection_through_the_handler() {
+        let schema =
+            sg_graphql::schema::assemble_sdl("type Query { hello: String! }").expect("schema");
+        let deps: Arc<dyn GraphqlDeps> = Arc::new(SchemaGraphqlDeps::new(Arc::new(schema)));
+
+        let (status, _, body) = run(
+            "{}",
+            false,
+            Method::POST,
+            "/.api/graphql",
+            &[],
+            br#"{"query":"{ __schema { queryType { name } } }"}"#,
+            Arc::clone(&deps),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body,
+            br#"{"data":{"__schema":{"queryType":{"name":"Query"}}}}"#
+        );
+
+        let (status, _, body) = run(
+            "{}",
+            false,
+            Method::POST,
+            "/.api/graphql",
+            &[],
+            br#"{"query":"{ hello }"}"#,
+            deps,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let body = String::from_utf8(body).expect("utf8");
+        assert!(
+            body.starts_with(r#"{"errors":[{"message":"GraphQL field \"hello\" of \"Query\" has no ported resolver""#),
+            "unexpected body: {body}"
+        );
     }
 }

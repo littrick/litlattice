@@ -94,7 +94,14 @@ fn graphql_response(value: &Value) -> GraphqlResponse {
         response.errors = serde_json::from_value(errors.clone()).expect("errors");
     }
     if let Some(data) = value.get("data") {
-        response.data = Some(data.clone());
+        // The baseline embeds the executor's `json.RawMessage`; serialize the
+        // corpus value with the same Go-compatible writer so escaping and
+        // object key order are compared too.
+        response.data = Some(
+            sg_graphql::Json::from_serde(data)
+                .expect("data must be representable")
+                .to_compact_string(),
+        );
     }
     if let Some(extensions) = value.get("extensions") {
         response.extensions = serde_json::from_value(extensions.clone()).ok();

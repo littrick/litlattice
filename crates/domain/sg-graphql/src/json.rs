@@ -14,12 +14,70 @@ pub enum Json {
     Null,
     Bool(bool),
     Int(i64),
+    UInt(u64),
+    Float(f64),
     Str(String),
+    /// A pre-serialized JSON fragment, embedded verbatim (Go
+    /// `json.RawMessage`). The caller is responsible for valid, escaped JSON.
+    Raw(String),
     Arr(Vec<Json>),
     Obj(Vec<(String, Json)>),
 }
 
 impl Json {
+    /// Convert a `serde_json` value. Object keys keep `serde_json::Map`'s
+    /// iteration order; with `preserve_order` disabled this is the sorted
+    /// order Go uses for maps.
+    pub fn from_serde(value: &serde_json::Value) -> Result<Json, String> {
+        Ok(match value {
+            serde_json::Value::Null => Json::Null,
+            serde_json::Value::Bool(value) => Json::Bool(*value),
+            serde_json::Value::Number(number) => {
+                if let Some(value) = number.as_i64() {
+                    Json::Int(value)
+                } else if let Some(value) = number.as_u64() {
+                    Json::UInt(value)
+                } else {
+                    Json::Float(number.as_f64().expect("finite serde_json number"))
+                }
+            }
+            serde_json::Value::String(value) => Json::Str(value.clone()),
+            serde_json::Value::Array(items) => Json::Arr(
+                items
+                    .iter()
+                    .map(Json::from_serde)
+                    .collect::<Result<Vec<_>, _>>()?,
+            ),
+            serde_json::Value::Object(entries) => Json::Obj(
+                entries
+                    .iter()
+                    .map(|(key, value)| Ok((key.clone(), Json::from_serde(value)?)))
+                    .collect::<Result<Vec<_>, String>>()?,
+            ),
+        })
+    }
+
+    /// `encoding/json` rejects NaN and infinities.
+    pub fn check_finite(&self) -> Result<(), String> {
+        match self {
+            Json::Float(value) if !value.is_finite() => Err(format!(
+                "json: unsupported value: {}",
+                if value.is_nan() {
+                    "NaN"
+                } else if value.is_sign_positive() {
+                    "+Inf"
+                } else {
+                    "-Inf"
+                }
+            )),
+            Json::Arr(items) => items.iter().try_for_each(Json::check_finite),
+            Json::Obj(entries) => entries
+                .iter()
+                .try_for_each(|(_, value)| value.check_finite()),
+            _ => Ok(()),
+        }
+    }
+
     pub fn obj(entries: Vec<(&str, Json)>) -> Json {
         Json::Obj(
             entries
@@ -64,7 +122,10 @@ fn write_json(value: &Json, out: &mut String, mode: WriterMode, depth: usize) {
         Json::Null => out.push_str("null"),
         Json::Bool(value) => out.push_str(if *value { "true" } else { "false" }),
         Json::Int(value) => out.push_str(&value.to_string()),
+        Json::UInt(value) => out.push_str(&value.to_string()),
+        Json::Float(value) => write_go_float(*value, out),
         Json::Str(value) => write_go_string(value, out),
+        Json::Raw(value) => out.push_str(value),
         Json::Arr(items) => {
             if items.is_empty() {
                 out.push_str("[]");
@@ -133,6 +194,27 @@ fn indent(out: &mut String, depth: usize) {
     }
 }
 
+/// Go `encoding/json` float formatting (`encode.go:floatEncoder`):
+/// `'f'` for `1e-6 <= |v| < 1e21` (or zero), `'e'` otherwise, shortest
+/// round-trip digits, and Go's exponent spelling (`1e+21`, `1e-7`).
+fn write_go_float(value: f64, out: &mut String) {
+    debug_assert!(value.is_finite());
+    let abs = value.abs();
+    if abs != 0.0 && (abs < 1e-6 || abs >= 1e21) {
+        let formatted = format!("{value:e}");
+        match formatted.split_once('e') {
+            Some((mantissa, exponent)) if !exponent.starts_with('-') => {
+                out.push_str(mantissa);
+                out.push_str("e+");
+                out.push_str(exponent);
+            }
+            _ => out.push_str(&formatted),
+        }
+    } else {
+        out.push_str(&format!("{value}"));
+    }
+}
+
 /// Go `encoding/json` string escaping with HTML escaping enabled.
 pub fn write_go_string(value: &str, out: &mut String) {
     out.push('"');
@@ -175,6 +257,47 @@ mod tests {
         assert_eq!(
             value.to_indented_string(),
             "{\n\t\"a\": \"x\\u003cy\",\n\t\"b\": [\n\t\ttrue,\n\t\tnull\n\t],\n\t\"c\": {}\n}"
+        );
+    }
+
+    #[test]
+    fn floats_match_encoding_json() {
+        // Expected values from `json.Marshal(float64)` (Go 1.x).
+        let cases = [
+            (0.0, "0"),
+            (1.5, "1.5"),
+            (-2.25, "-2.25"),
+            (1e-6, "0.000001"),
+            (9.999e-7, "9.999e-7"),
+            (1e-7, "1e-7"),
+            (1.23e-7, "1.23e-7"),
+            (1e20, "100000000000000000000"),
+            (1e21, "1e+21"),
+            (1.23e21, "1.23e+21"),
+            (1e300, "1e+300"),
+            (-1e-300, "-1e-300"),
+            (1.0 / 3.0, "0.3333333333333333"),
+        ];
+        for (value, expected) in cases {
+            assert_eq!(Json::Float(value).to_compact_string(), expected);
+        }
+    }
+
+    #[test]
+    fn raw_and_serde_conversion() {
+        let serde = serde_json::json!({"b": 2, "a": [true, "x<y"], "c": 18446744073709551615u64});
+        let json = Json::from_serde(&serde).unwrap();
+        assert_eq!(
+            json.to_compact_string(),
+            r#"{"a":[true,"x\u003cy"],"b":2,"c":18446744073709551615}"#
+        );
+        assert_eq!(
+            Json::obj(vec![("data", Json::Raw("{\"x\":1}".to_owned()))]).to_compact_string(),
+            r#"{"data":{"x":1}}"#
+        );
+        assert!(
+            Json::Float(f64::NAN).check_finite().is_err(),
+            "NaN must be rejected"
         );
     }
 }

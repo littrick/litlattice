@@ -21,7 +21,7 @@ use sg_config::SiteConfiguration;
 
 use crate::config::FrontendConfig;
 use crate::configuration_server;
-use crate::graphql_api::{GraphqlDeps, UnportedGraphqlDeps};
+use crate::graphql_api::{GraphqlDeps, SchemaGraphqlDeps};
 use crate::ipallowlist::AllowlistEnv;
 use crate::version::Version;
 use crate::{debug, middleware};
@@ -156,8 +156,10 @@ impl Service for FrontendService {
         // `schema.graphql` + `outbound_webhooks.graphql` + `viewer.graphql`
         // (enterprise `OptionalResolver`s are nil). Resolvers and execution are
         // not ported yet, but assembling here keeps the fail-fast contract.
-        let graphql_schema = sg_graphql::schema::assemble_oss()
-            .map_err(|err| ServiceError::new(format!("failed to parse GraphQL schema: {err}")))?;
+        let graphql_schema =
+            Arc::new(sg_graphql::schema::assemble_oss().map_err(|err| {
+                ServiceError::new(format!("failed to parse GraphQL schema: {err}"))
+            })?);
         tracing::info!(
             types = graphql_schema.type_count(),
             query = graphql_schema.query_type.as_deref().unwrap_or("-"),
@@ -189,10 +191,10 @@ impl Service for FrontendService {
         );
         let search_deps: Arc<dyn crate::search_stream::SearchDeps> =
             Arc::new(crate::search_stream::BackendDeps::new(search_pool));
-        // The schema is assembled above (M9.8ez); resolvers and execution are
-        // not ported yet, so the transport answers a GraphQL error (see
-        // `graphql_api`).
-        let graphql_deps: Arc<dyn GraphqlDeps> = Arc::new(UnportedGraphqlDeps);
+        // The assembled OSS schema is executed by `sg-graphql` (M9.8fb);
+        // business resolvers are still unported (M9.8fc scope note).
+        let graphql_deps: Arc<dyn GraphqlDeps> =
+            Arc::new(SchemaGraphqlDeps::new(Arc::clone(&graphql_schema)));
 
         if let Some((addr, listener)) = internal {
             let shutdown = ctx.shutdown.clone();
