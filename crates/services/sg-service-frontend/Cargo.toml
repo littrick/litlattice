@@ -13,11 +13,13 @@ sg-db = { path = "../../data/sg-db" }
 sg-git = { path = "../../domain/sg-git" }
 sg-graphql = { path = "../../domain/sg-graphql" }
 sg-http = { path = "../../net/sg-http" }
+sg-jsonx = { path = "../../domain/sg-jsonx" }
 sg-metrics = { path = "../../base/sg-metrics" }
 sg-proto = { path = "../../net/sg-proto" }
 sg-redis = { path = "../../data/sg-redis" }
 sg-session = { path = "../../domain/sg-session" }
 sg-service-searcher = { path = "../sg-service-searcher" }
+sg-settings-schema = { path = "../../domain/sg-settings-schema" }
 async-trait = { workspace = true }
 base64 = { workspace = true }
 bytes = { workspace = true }

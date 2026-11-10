@@ -307,6 +307,9 @@ pub struct SchemaGraphqlDeps {
     /// `User.organizationMemberships`'s database seam; `None` in
     /// transport-only tests.
     org_memberships: Option<Arc<dyn crate::graphql_resolvers::OrgMembershipsStore>>,
+    /// `Mutation.settingsMutation`'s write seam (the `settings` table);
+    /// `None` in transport-only tests.
+    pool: Option<sqlx::PgPool>,
 }
 
 impl SchemaGraphqlDeps {
@@ -322,6 +325,7 @@ impl SchemaGraphqlDeps {
             user_organizations: None,
             org_members: None,
             org_memberships: None,
+            pool: None,
         }
     }
 
@@ -349,7 +353,8 @@ impl SchemaGraphqlDeps {
             ))),
             user_organizations: Some(Arc::new(crate::org_store::PgOrgStore::new(pool.clone()))),
             org_members: Some(Arc::new(crate::org_store::PgOrgStore::new(pool.clone()))),
-            org_memberships: Some(Arc::new(crate::org_store::PgOrgStore::new(pool))),
+            org_memberships: Some(Arc::new(crate::org_store::PgOrgStore::new(pool.clone()))),
+            pool: Some(pool),
         }
     }
 
@@ -396,6 +401,7 @@ impl SchemaGraphqlDeps {
             user_organizations: None,
             org_members: None,
             org_memberships: None,
+            pool: None,
         }
     }
 }
@@ -477,6 +483,22 @@ impl GraphqlDeps for SchemaGraphqlDeps {
             }
             None => std::collections::HashMap::new(),
         };
+        // `Mutation.settingsMutation`: the executor resolves fields
+        // synchronously, so run the (async) write path now. Only mutation
+        // operations perform side effects.
+        let mutation = match (&self.pool, &self.org_memberships) {
+            (Some(pool), Some(store)) if sg_graphql::exec::is_mutation_operation(&exec_request) => {
+                crate::settings_mutation::prefetch_settings_mutation(
+                    pool,
+                    store.as_ref(),
+                    &fields,
+                    request.actor,
+                    site_admin,
+                )
+                .await
+            }
+            _ => crate::settings_mutation::MutationRoot::default(),
+        };
         let nodes = match (&self.org_memberships, &self.repositories) {
             (Some(memberships_store), Some(repositories)) => {
                 crate::graphql_resolvers::prefetch_node_roots(
@@ -525,7 +547,8 @@ impl GraphqlDeps for SchemaGraphqlDeps {
             site_admin,
         )
         .with_nested(nested)
-        .with_nodes(nodes);
+        .with_nodes(nodes)
+        .with_mutation(mutation);
         let response = sg_graphql::exec::execute_with(&self.schema, exec_request, Some(&roots));
         GraphqlResponse::from_exec(&response)
     }

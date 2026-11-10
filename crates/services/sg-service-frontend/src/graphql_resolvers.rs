@@ -704,7 +704,7 @@ fn viewer_uid(actor: Actor) -> i32 {
 
 /// `auth.CheckOrgAccessOrSiteAdmin`'s error for an unauthorized viewer
 /// (`internal/auth/orgs.go:12,43`).
-fn org_access_error(actor: Actor) -> &'static str {
+pub(crate) fn org_access_error(actor: Actor) -> &'static str {
     match actor {
         Actor::Anonymous => "not authenticated",
         Actor::User { .. } => "current user is not an org member",
@@ -1711,6 +1711,8 @@ pub async fn prefetch_repositories(
 /// Root objects for the assembled OSS schema.
 pub struct FrontendRootResolver {
     query: QueryRoot,
+    /// `Mutation` root fields (`Mutation.settingsMutation`).
+    mutation: crate::settings_mutation::MutationRoot,
 }
 
 impl FrontendRootResolver {
@@ -1846,7 +1848,14 @@ impl FrontendRootResolver {
                 nested: Arc::new(NestedPrefetch::default()),
                 nodes: NodeRoots::default(),
             },
+            mutation: crate::settings_mutation::MutationRoot::default(),
         }
+    }
+
+    /// Attach the request's pre-executed `Mutation` root fields.
+    pub fn with_mutation(mut self, mutation: crate::settings_mutation::MutationRoot) -> Self {
+        self.mutation = mutation;
+        self
     }
 }
 
@@ -1860,6 +1869,8 @@ impl RootResolver for FrontendRootResolver {
     fn root(&self, root_type: &str) -> Option<&dyn ObjectValue> {
         if root_type == self.query.type_name() {
             Some(&self.query)
+        } else if root_type == self.mutation.type_name() {
+            Some(&self.mutation)
         } else {
             None
         }
@@ -2113,7 +2124,7 @@ impl ObjectValue for QueryRoot {
 /// `auth.ErrMustBeSiteAdminOrSameUser`. `CheckSiteAdminOrSameUserFromActor`
 /// collapses every failure (unauthenticated, non-admin, DB error) to this
 /// message (`internal/auth/site_admin.go:127-136`).
-const MUST_BE_SITE_ADMIN_OR_SAME_USER: &str =
+pub(crate) const MUST_BE_SITE_ADMIN_OR_SAME_USER: &str =
     "must be authenticated as the authorized user or site admin";
 
 /// `UserResolver` (`cmd/frontend/graphqlbackend/user.go:122-168`), limited to

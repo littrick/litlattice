@@ -614,6 +614,25 @@ pub fn root_fields(schema: &Schema, request: &ExecRequest<'_>) -> Vec<RootField>
     )
 }
 
+/// Whether the selected operation is a `mutation`. Callers that prefetch
+/// before [`execute_with`] use this to run one-shot side effects only for
+/// mutation requests.
+pub fn is_mutation_operation(request: &ExecRequest<'_>) -> bool {
+    let Ok(doc) = q::parse_query::<String>(request.query) else {
+        return false;
+    };
+    let mut operations: Vec<&Operation<'_>> = Vec::new();
+    for definition in &doc.definitions {
+        if let q::Definition::Operation(op) = definition {
+            operations.push(op);
+        }
+    }
+    matches!(
+        select_operation(&operations, request.operation_name),
+        Ok((OpKind::Mutation, ..))
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Operations and fragments
 // ---------------------------------------------------------------------------
