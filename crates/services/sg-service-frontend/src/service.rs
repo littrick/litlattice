@@ -279,11 +279,19 @@ impl Service for FrontendService {
                 .with_client_configuration(
                     Arc::new(
                         crate::client_configuration::PgExternalServiceConfigSource::new(
-                            session_pool,
+                            session_pool.clone(),
                         ),
                     ),
                     Arc::clone(&keyring),
                     Arc::clone(wiring.live()),
+                )
+                .with_external_services(
+                    Arc::new(
+                        crate::external_services::PgExternalServiceConnectionStore::new(
+                            session_pool,
+                        ),
+                    ),
+                    Arc::clone(&keyring),
                 )
                 .with_clone_urls(clone_url_resolver)
                 .with_log_events(log_events_store, Arc::clone(wiring.live()));

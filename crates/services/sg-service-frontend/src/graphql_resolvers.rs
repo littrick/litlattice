@@ -48,7 +48,7 @@ pub struct UserData {
 
 /// `gqlutil.DateTime.MarshalJSON`: `json.Marshal(t.UTC().Format(time.RFC3339))`
 /// — UTC, seconds precision, no fractional part.
-fn datetime_rfc3339(t: OffsetDateTime) -> String {
+pub(crate) fn datetime_rfc3339(t: OffsetDateTime) -> String {
     let t = t.to_offset(UtcOffset::UTC);
     format!(
         "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
@@ -2147,6 +2147,7 @@ impl FrontendRootResolver {
                 temporary_settings: None,
                 client_configuration: None,
                 feature_flags: FeatureFlagRoots::default(),
+                external_services: HashMap::new(),
             },
             mutation: crate::settings_mutation::MutationRoot::default(),
         }
@@ -2255,6 +2256,12 @@ struct QueryRoot {
     /// Prefetched `Query.featureFlags` / `Query.featureFlag` results (see
     /// [`prefetch_feature_flags`]).
     feature_flags: FeatureFlagRoots,
+    /// Prefetched `Query.externalServices` results (see
+    /// [`crate::external_services::prefetch_external_services`]).
+    external_services: HashMap<
+        crate::external_services::ExternalServicesArgs,
+        crate::external_services::ExternalServicesConnectionLookup,
+    >,
 }
 
 impl FrontendRootResolver {
@@ -2267,6 +2274,18 @@ impl FrontendRootResolver {
     /// Attach the request's `Query.node` prefetch data.
     pub fn with_nodes(mut self, nodes: NodeRoots) -> Self {
         self.query.nodes = nodes;
+        self
+    }
+
+    /// Attach the request's `Query.externalServices` prefetch data.
+    pub fn with_external_services(
+        mut self,
+        external_services: HashMap<
+            crate::external_services::ExternalServicesArgs,
+            crate::external_services::ExternalServicesConnectionLookup,
+        >,
+    ) -> Self {
+        self.query.external_services = external_services;
         self
     }
 }
@@ -2596,6 +2615,27 @@ impl ObjectValue for QueryRoot {
                 }
                 None => Ok(None),
             },
+            // `schemaResolver.ExternalServices`
+            // (`external_services.go:376-455`): site-admin only; the
+            // prefetched lookup carries the connection or its error.
+            "externalServices" => {
+                let args = crate::external_services::external_services_args(arguments);
+                match self.external_services.get(&args) {
+                    Some(crate::external_services::ExternalServicesConnectionLookup::Found(
+                        data,
+                    )) => Ok(Some(FieldValue::Object(Arc::new(
+                        crate::external_services::ExternalServicesConnectionObject::from_data(
+                            data.clone(),
+                            self.viewer_site_admin,
+                            self.nested.clone(),
+                        ),
+                    )))),
+                    Some(crate::external_services::ExternalServicesConnectionLookup::Error(
+                        message,
+                    )) => Err(ExecError::new(message.clone())),
+                    None => Ok(None),
+                }
+            }
             // `schemaResolver.ViewerSettings` (`settings_cascade.go:75-93`):
             // the current user's cascade, or the site cascade when anonymous
             // (or the row disappeared).
@@ -3374,6 +3414,16 @@ impl ObjectValue for UsersConnectionObject {
 pub struct PageInfoObject {
     has_next_page: bool,
     end_cursor: Option<String>,
+}
+
+impl PageInfoObject {
+    /// Build a `PageInfo` from an already-computed page boundary.
+    pub fn new(has_next_page: bool, end_cursor: Option<String>) -> Self {
+        Self {
+            has_next_page,
+            end_cursor,
+        }
+    }
 }
 
 impl ObjectValue for PageInfoObject {

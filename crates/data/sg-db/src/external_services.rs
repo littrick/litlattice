@@ -32,6 +32,27 @@ pub struct ExternalService {
     pub code_host_id: Option<i32>,
 }
 
+/// The `external_services` row as exposed by `Query.externalServices`
+/// (`cmd/frontend/graphqlbackend/external_service.go:120-290`). Unlike
+/// [`ExternalService`] this includes the audit columns the node resolver
+/// reads (`created_at`, `updated_at`, `creator_id`, `last_updater_id`); the
+/// `config` is still encrypted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternalServiceListRecord {
+    pub id: i64,
+    pub kind: String,
+    pub display_name: String,
+    pub config: String,
+    pub encryption_key_id: String,
+    pub created_at: OffsetDateTime,
+    pub updated_at: OffsetDateTime,
+    pub last_sync_at: Option<OffsetDateTime>,
+    pub next_sync_at: Option<OffsetDateTime>,
+    pub unrestricted: bool,
+    pub creator_id: Option<i32>,
+    pub last_updater_id: Option<i32>,
+}
+
 /// Lookup failures. The baseline's `GetByID` returns
 /// `externalServiceNotFoundError` for a missing or soft-deleted service and
 /// the raw database error otherwise.
@@ -224,6 +245,98 @@ LIMIT $3
         rows.into_iter().map(service_from_row).collect()
     }
 
+    /// `ExternalServices().List(ctx, ExternalServicesListOptions{AfterID,
+    /// RepoID, LimitOffset})` as used by `Query.externalServices`
+    /// (`cmd/frontend/graphqlbackend/external_services.go:384-398`):
+    /// live services, newest first, optionally restricted to a repo and to
+    /// ids below `after_id` (`after_id == 0` means no cursor). `limit` is
+    /// bound as NULL when absent (`LIMIT NULL` = every row).
+    pub async fn list_connection(
+        &self,
+        after_id: i64,
+        repo_id: i32,
+        limit: Option<i64>,
+    ) -> Result<Vec<ExternalServiceListRecord>, ExternalServiceError> {
+        let rows = sqlx::query(
+            r#"
+SELECT id, kind, display_name, config, encryption_key_id,
+       created_at, updated_at, last_sync_at, next_sync_at,
+       unrestricted, creator_id, last_updater_id
+FROM external_services
+WHERE deleted_at IS NULL
+  AND ($1 = 0 OR id < $1)
+  AND ($2 = 0 OR id IN (
+        SELECT external_service_id FROM external_service_repos WHERE repo_id = $2
+      ))
+ORDER BY id DESC
+LIMIT $3
+"#,
+        )
+        .bind(after_id)
+        .bind(repo_id)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(list_record_from_row).collect()
+    }
+
+    /// `ExternalServices().Count(ctx, opt)` for the connection: the same
+    /// predicates as [`Self::list_connection`] without pagination
+    /// (`Count` ignores `LimitOffset`). The caller resets `after_id` to 0
+    /// for `totalCount`.
+    pub async fn count_connection(
+        &self,
+        after_id: i64,
+        repo_id: i32,
+    ) -> Result<i64, ExternalServiceError> {
+        let count = sqlx::query_scalar(
+            r#"
+SELECT COUNT(*)
+FROM external_services
+WHERE deleted_at IS NULL
+  AND ($1 = 0 OR id < $1)
+  AND ($2 = 0 OR id IN (
+        SELECT external_service_id FROM external_service_repos WHERE repo_id = $2
+      ))
+"#,
+        )
+        .bind(after_id)
+        .bind(repo_id)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(count)
+    }
+
+    /// `ExternalServices().RepoCount(ctx, id)`.
+    pub async fn repo_count(&self, id: i64) -> Result<i32, ExternalServiceError> {
+        let count = sqlx::query_scalar(
+            "SELECT COUNT(*)::int FROM external_service_repos WHERE external_service_id = $1",
+        )
+        .bind(id)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(count)
+    }
+
+    /// `ExternalServices().GetLastSyncError(ctx, id)`: the most recent
+    /// completed/errored/failed sync job's `failure_message`, `None` when no
+    /// such job exists or the message is NULL/empty.
+    pub async fn last_sync_error(&self, id: i64) -> Result<Option<String>, ExternalServiceError> {
+        let message: Option<Option<String>> = sqlx::query_scalar(
+            r#"
+SELECT failure_message FROM external_service_sync_jobs
+WHERE external_service_id = $1
+AND state IN ('completed','errored','failed')
+ORDER BY finished_at DESC
+LIMIT 1
+"#,
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(message.flatten().filter(|message| !message.is_empty()))
+    }
+
     /// `ExternalServices().Upsert` reduced to what
     /// `codeintel-package-filter-applicator` changes: `next_sync_at` (and the
     /// code host the baseline's `ensureCodeHost` step would attach).
@@ -368,6 +481,25 @@ pub fn package_code_host_url(kind: &str) -> Option<&'static str> {
         "RUSTPACKAGES" => Some("RUSTPACKAGES"),
         _ => None,
     }
+}
+
+fn list_record_from_row(
+    row: sqlx::postgres::PgRow,
+) -> Result<ExternalServiceListRecord, ExternalServiceError> {
+    Ok(ExternalServiceListRecord {
+        id: row.try_get("id")?,
+        kind: row.try_get("kind")?,
+        display_name: row.try_get("display_name")?,
+        config: row.try_get("config")?,
+        encryption_key_id: row.try_get("encryption_key_id")?,
+        created_at: row.try_get("created_at")?,
+        updated_at: row.try_get("updated_at")?,
+        last_sync_at: row.try_get("last_sync_at")?,
+        next_sync_at: row.try_get("next_sync_at")?,
+        unrestricted: row.try_get("unrestricted")?,
+        creator_id: row.try_get("creator_id")?,
+        last_updater_id: row.try_get("last_updater_id")?,
+    })
 }
 
 fn service_from_row(row: sqlx::postgres::PgRow) -> Result<ExternalService, ExternalServiceError> {
