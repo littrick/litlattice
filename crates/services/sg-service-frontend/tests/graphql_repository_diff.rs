@@ -109,7 +109,7 @@ async fn graphql_repository_harness() {
             actor,
         };
         let fields = root_fields(&schema, &request);
-        let repositories = prefetch_repositories(&store, &fields, actor, admin).await;
+        let repositories = prefetch_repositories(&store, None, &fields, actor, admin).await;
         let roots = FrontendRootResolver::with_user_and_repositories(None, repositories);
         let response = execute_with(&schema, request, Some(&roots));
         let body = response.to_json();

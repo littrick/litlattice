@@ -11,6 +11,7 @@ sg-config = { path = "../../domain/sg-config" }
 sg-core = { path = "../../base/sg-core" }
 sg-db = { path = "../../data/sg-db" }
 sg-encryption = { path = "../../domain/sg-encryption" }
+sg-extsvc = { path = "../../domain/sg-extsvc" }
 sg-git = { path = "../../domain/sg-git" }
 sg-graphql = { path = "../../domain/sg-graphql" }
 sg-http = { path = "../../net/sg-http" }

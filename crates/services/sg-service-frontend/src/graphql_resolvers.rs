@@ -1759,12 +1759,14 @@ pub enum RepoLookup {
 pub enum RepoKey {
     Name(String),
     Uri(String),
+    /// A `cloneURL` resolved to this repository name by [`CloneUrlResolver`].
+    CloneUrl(String),
 }
 
 impl RepoKey {
     fn value(&self) -> &str {
         match self {
-            RepoKey::Name(value) | RepoKey::Uri(value) => value,
+            RepoKey::Name(value) | RepoKey::Uri(value) | RepoKey::CloneUrl(value) => value,
         }
     }
 }
@@ -1804,11 +1806,18 @@ pub trait RepositoryLookup: Send + Sync {
     ) -> Result<RepoLookup, String>;
 }
 
+/// `cloneurls.RepoSourceCloneURLToRepoName`'s seam: map a git clone URL to a
+/// repository name (`Ok(None)` when no configured code host matches).
+#[async_trait]
+pub trait CloneUrlResolver: Send + Sync {
+    async fn repo_name_by_clone_url(&self, clone_url: &str) -> Result<Option<String>, String>;
+}
+
 /// What `Query.repository` arguments ask for.
 enum RepositoryArg {
     Key(RepoKey),
-    /// `cloneURL` needs code-host configuration (`cloneurls`), not ported.
-    CloneUrl,
+    /// `cloneURL` mapped through [`CloneUrlResolver`].
+    CloneUrl(String),
     /// Neither `name`/`uri` nor `cloneURL`: the baseline errors.
     Missing,
 }
@@ -1822,8 +1831,8 @@ fn repository_arg(arguments: &Arguments) -> RepositoryArg {
     if let Some(uri) = arguments.string("uri") {
         return RepositoryArg::Key(RepoKey::Uri(uri.to_owned()));
     }
-    if arguments.string("cloneURL").is_some() {
-        return RepositoryArg::CloneUrl;
+    if let Some(clone_url) = arguments.string("cloneURL") {
+        return RepositoryArg::CloneUrl(clone_url.to_owned());
     }
     RepositoryArg::Missing
 }
@@ -1834,6 +1843,7 @@ fn repository_arg(arguments: &Arguments) -> RepositoryArg {
 /// unless `authz.enforceForSiteAdmins` is enabled (not read here).
 pub async fn prefetch_repositories(
     store: &dyn RepositoryLookup,
+    clone_urls: Option<&dyn CloneUrlResolver>,
     fields: &[RootField],
     actor: Actor,
     actor_site_admin: bool,
@@ -1845,22 +1855,54 @@ pub async fn prefetch_repositories(
         if field.name != "repository" {
             continue;
         }
-        let RepositoryArg::Key(key) = repository_arg(&field.arguments) else {
-            continue;
+        let (key, lookup) = match repository_arg(&field.arguments) {
+            RepositoryArg::Key(key) => {
+                let lookup = store
+                    .lookup(key.value(), authenticated_user_id, bypass_authz)
+                    .await
+                    .unwrap_or_else(RepoLookup::Error);
+                (key, lookup)
+            }
+            RepositoryArg::CloneUrl(clone_url) => {
+                let Some(lookup) = lookup_clone_url(
+                    store,
+                    clone_urls,
+                    &clone_url,
+                    authenticated_user_id,
+                    bypass_authz,
+                )
+                .await
+                else {
+                    continue;
+                };
+                (RepoKey::CloneUrl(clone_url), lookup)
+            }
+            RepositoryArg::Missing => continue,
         };
-        if repositories.contains_key(&key) {
-            continue;
-        }
-        let lookup = match store
-            .lookup(key.value(), authenticated_user_id, bypass_authz)
-            .await
-        {
-            Ok(lookup) => lookup,
-            Err(error) => RepoLookup::Error(error),
-        };
-        repositories.insert(key, lookup);
+        repositories.entry(key).or_insert(lookup);
     }
     repositories
+}
+
+/// `RepoSourceCloneURLToRepoName` followed by `GetByName`: an empty mapping
+/// is `null`, a mapping that fails to resolve is the resolver error, and a
+/// missing resolver (`None`) leaves the field unported for transport tests.
+async fn lookup_clone_url(
+    store: &dyn RepositoryLookup,
+    clone_urls: Option<&dyn CloneUrlResolver>,
+    clone_url: &str,
+    authenticated_user_id: i32,
+    bypass_authz: bool,
+) -> Option<RepoLookup> {
+    let resolver = clone_urls?;
+    Some(match resolver.repo_name_by_clone_url(clone_url).await {
+        Ok(Some(name)) => store
+            .lookup(&name, authenticated_user_id, bypass_authz)
+            .await
+            .unwrap_or_else(RepoLookup::Error),
+        Ok(None) => RepoLookup::NotFound,
+        Err(error) => RepoLookup::Error(error),
+    })
 }
 
 /// `Query.repositoryRedirect`'s lookup key. `hashedName` is checked first
@@ -1870,14 +1912,16 @@ pub async fn prefetch_repositories(
 pub enum RepositoryRedirectKey {
     Name(String),
     Hashed(String),
+    /// A `cloneURL` resolved through [`CloneUrlResolver`] (the key keeps the
+    /// original URL so dispatch can match it).
+    CloneUrl(String),
 }
 
 /// What `Query.repositoryRedirect` arguments ask for.
 pub enum RepositoryRedirectArg {
     Key(RepositoryRedirectKey),
-    /// `cloneURL` needs `internal/cloneurls` (code-host configuration), not
-    /// ported yet; reported as an unported resolver, like `Query.repository`.
-    CloneUrl,
+    /// `cloneURL` mapped through [`CloneUrlResolver`].
+    CloneUrl(String),
     /// Neither `name` nor `cloneURL` (nor `hashedName`): the baseline errors.
     Missing,
 }
@@ -1887,15 +1931,13 @@ pub enum RepositoryRedirectArg {
 /// `cloneURL`.
 pub fn repository_redirect_arg(arguments: &Arguments) -> RepositoryRedirectArg {
     if let Some(hashed_name) = arguments.string("hashedName") {
-        return RepositoryRedirectArg::Key(RepositoryRedirectKey::Hashed(
-            hashed_name.to_owned(),
-        ));
+        return RepositoryRedirectArg::Key(RepositoryRedirectKey::Hashed(hashed_name.to_owned()));
     }
     if let Some(name) = arguments.string("name") {
         return RepositoryRedirectArg::Key(RepositoryRedirectKey::Name(name.to_owned()));
     }
-    if arguments.string("cloneURL").is_some() {
-        return RepositoryRedirectArg::CloneUrl;
+    if let Some(clone_url) = arguments.string("cloneURL") {
+        return RepositoryRedirectArg::CloneUrl(clone_url.to_owned());
     }
     RepositoryRedirectArg::Missing
 }
@@ -1906,6 +1948,7 @@ pub fn repository_redirect_arg(arguments: &Arguments) -> RepositoryRedirectArg {
 /// (`errcode.IsNotFound` → GraphQL `null`).
 pub async fn prefetch_repository_redirects(
     store: &dyn RepositoryLookup,
+    clone_urls: Option<&dyn CloneUrlResolver>,
     fields: &[RootField],
     actor: Actor,
     actor_site_admin: bool,
@@ -1917,23 +1960,44 @@ pub async fn prefetch_repository_redirects(
         if field.name != "repositoryRedirect" {
             continue;
         }
-        let RepositoryRedirectArg::Key(key) = repository_redirect_arg(&field.arguments) else {
-            continue;
-        };
-        if redirects.contains_key(&key) {
-            continue;
-        }
-        let lookup = match &key {
-            RepositoryRedirectKey::Hashed(hashed_name) => store
-                .by_hashed_name(hashed_name, authenticated_user_id, bypass_authz)
-                .await,
-            RepositoryRedirectKey::Name(name) => {
-                store
-                    .lookup(name, authenticated_user_id, bypass_authz)
-                    .await
+        let (key, lookup) = match repository_redirect_arg(&field.arguments) {
+            RepositoryRedirectArg::Key(key) => {
+                let lookup = match &key {
+                    RepositoryRedirectKey::Hashed(hashed_name) => {
+                        store
+                            .by_hashed_name(hashed_name, authenticated_user_id, bypass_authz)
+                            .await
+                    }
+                    RepositoryRedirectKey::Name(name) => {
+                        store
+                            .lookup(name, authenticated_user_id, bypass_authz)
+                            .await
+                    }
+                    RepositoryRedirectKey::CloneUrl(value) => {
+                        store
+                            .lookup(value, authenticated_user_id, bypass_authz)
+                            .await
+                    }
+                };
+                (key, lookup.unwrap_or_else(RepoLookup::Error))
             }
+            RepositoryRedirectArg::CloneUrl(clone_url) => {
+                let Some(lookup) = lookup_clone_url(
+                    store,
+                    clone_urls,
+                    &clone_url,
+                    authenticated_user_id,
+                    bypass_authz,
+                )
+                .await
+                else {
+                    continue;
+                };
+                (RepositoryRedirectKey::CloneUrl(clone_url), lookup)
+            }
+            RepositoryRedirectArg::Missing => continue,
         };
-        redirects.insert(key, lookup.unwrap_or_else(RepoLookup::Error));
+        redirects.entry(key).or_insert(lookup);
     }
     redirects
 }
@@ -2277,7 +2341,20 @@ impl ObjectValue for QueryRoot {
                     // transport-only resolver); report the field as unported.
                     None => Ok(None),
                 },
-                RepositoryArg::CloneUrl => Ok(None),
+                RepositoryArg::CloneUrl(clone_url) => {
+                    match self.repositories.get(&RepoKey::CloneUrl(clone_url)) {
+                        Some(RepoLookup::Found(data)) => Ok(Some(FieldValue::Object(Arc::new(
+                            RepositoryObject::from_data(data.clone()),
+                        )))),
+                        Some(RepoLookup::NotFound) => Ok(Some(FieldValue::Null)),
+                        Some(RepoLookup::Blocked { name, reason }) => Err(ExecError::new(format!(
+                            "repository {name} has been blocked. reason: {reason}"
+                        ))),
+                        Some(RepoLookup::Error(message)) => Err(ExecError::new(message.clone())),
+                        // No prefetch (transport-only resolver).
+                        None => Ok(None),
+                    }
+                }
                 RepositoryArg::Missing => Err(ExecError::new("neither name nor cloneURL given")),
             },
             // `schemaResolver.RepositoryRedirect`
@@ -2298,8 +2375,22 @@ impl ObjectValue for QueryRoot {
                     // No prefetch was performed for this request.
                     None => Ok(None),
                 },
-                // `cloneURL` needs `internal/cloneurls`, not ported yet.
-                RepositoryRedirectArg::CloneUrl => Ok(None),
+                RepositoryRedirectArg::CloneUrl(clone_url) => {
+                    match self
+                        .repository_redirects
+                        .get(&RepositoryRedirectKey::CloneUrl(clone_url))
+                    {
+                        Some(RepoLookup::Found(data)) => Ok(Some(FieldValue::Object(Arc::new(
+                            RepositoryObject::from_data(data.clone()),
+                        )))),
+                        Some(RepoLookup::NotFound) => Ok(Some(FieldValue::Null)),
+                        Some(RepoLookup::Blocked { name, reason }) => Err(ExecError::new(format!(
+                            "repository {name} has been blocked. reason: {reason}"
+                        ))),
+                        Some(RepoLookup::Error(message)) => Err(ExecError::new(message.clone())),
+                        None => Ok(None),
+                    }
+                }
                 RepositoryRedirectArg::Missing => {
                     Err(ExecError::new("neither name nor cloneURL given"))
                 }
@@ -5388,10 +5479,7 @@ mod tests {
         .expect("schema")
     }
 
-    async fn run_repository_redirect(
-        query: &str,
-        lookups: &[(&str, RepoLookup)],
-    ) -> String {
+    async fn run_repository_redirect(query: &str, lookups: &[(&str, RepoLookup)]) -> String {
         let schema = redirect_schema();
         let variables = Map::new();
         let request = ExecRequest {
@@ -5408,7 +5496,7 @@ mod tests {
                 .collect(),
         );
         let redirects =
-            prefetch_repository_redirects(&store, &fields, Actor::Anonymous, false).await;
+            prefetch_repository_redirects(&store, None, &fields, Actor::Anonymous, false).await;
         let roots = FrontendRootResolver::new().with_repository_redirects(redirects);
         execute_with(&schema, request, Some(&roots)).to_json()
     }
@@ -5436,8 +5524,7 @@ mod tests {
 
     #[tokio::test]
     async fn repository_redirect_hashed_name_errors_when_missing() {
-        let body =
-            "{ repositoryRedirect(hashedName: \"abc\") { ... on Repository { name } } }";
+        let body = "{ repositoryRedirect(hashedName: \"abc\") { ... on Repository { name } } }";
         assert_eq!(
             run_repository_redirect(body, &[]).await,
             r#"{"errors":[{"message":"repo not found","path":["repositoryRedirect"]}],"data":{"repositoryRedirect":null}}"#
@@ -5491,7 +5578,7 @@ mod tests {
                 .map(|(key, value)| ((*key).to_owned(), value.clone()))
                 .collect(),
         );
-        let repositories = prefetch_repositories(&store, &fields, actor, false).await;
+        let repositories = prefetch_repositories(&store, None, &fields, actor, false).await;
         let roots = FrontendRootResolver::with_user_and_repositories(None, repositories);
         execute_with(&schema, request, Some(&roots)).to_json()
     }

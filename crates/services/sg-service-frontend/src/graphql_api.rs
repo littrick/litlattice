@@ -304,6 +304,13 @@ struct ClientConfigurationDeps {
     live: Arc<LiveConfig>,
 }
 
+/// `Query.repository(cloneURL:)` / `Query.repositoryRedirect(cloneURL:)`'s
+/// code-host mapping seam (`internal/cloneurls`), backed by the live site
+/// configuration, `external_services` and the keyring.
+struct CloneUrlDeps {
+    resolver: Arc<dyn crate::graphql_resolvers::CloneUrlResolver>,
+}
+
 /// `Mutation.logEvent` / `Mutation.logEvents`'s storage seams: the
 /// `event_logs` table (shared `pool`), `redispool.Store` for the all-time
 /// flags and the live site configuration (`experimentalFeatures.eventLogging`
@@ -358,6 +365,8 @@ pub struct SchemaGraphqlDeps {
     rate_limit: Option<RateLimitDeps>,
     /// `Query.clientConfiguration`'s seams; `None` in transport-only tests.
     client_configuration: Option<ClientConfigurationDeps>,
+    /// `cloneURL` mapping; `None` in transport-only tests.
+    clone_urls: Option<CloneUrlDeps>,
     /// `Mutation.logEvent(s)`'s seams; `None` in transport-only tests.
     log_events: Option<LogEventsDeps>,
 }
@@ -378,6 +387,7 @@ impl SchemaGraphqlDeps {
             pool: None,
             rate_limit: None,
             client_configuration: None,
+            clone_urls: None,
             log_events: None,
         }
     }
@@ -410,6 +420,7 @@ impl SchemaGraphqlDeps {
             pool: Some(pool),
             rate_limit: None,
             client_configuration: None,
+            clone_urls: None,
             log_events: None,
         }
     }
@@ -460,6 +471,16 @@ impl SchemaGraphqlDeps {
         self
     }
 
+    /// Enable `cloneURL` resolution for `Query.repository` /
+    /// `Query.repositoryRedirect` (`internal/cloneurls`).
+    pub fn with_clone_urls(
+        mut self,
+        resolver: Arc<dyn crate::graphql_resolvers::CloneUrlResolver>,
+    ) -> Self {
+        self.clone_urls = Some(CloneUrlDeps { resolver });
+        self
+    }
+
     /// Enable the deprecated `Mutation.logEvent` / `Mutation.logEvents`
     /// writes: the `event_logs` table (via `pool`), the store Redis pool and
     /// the live site configuration that gates logging.
@@ -500,6 +521,7 @@ impl SchemaGraphqlDeps {
             pool: None,
             rate_limit: None,
             client_configuration: None,
+            clone_urls: None,
             log_events: None,
         }
     }
@@ -546,10 +568,15 @@ impl GraphqlDeps for SchemaGraphqlDeps {
         // `Query.organizations` need async database lookups, so prefetch the
         // root fields identified by the executor before executing.
         let fields = sg_graphql::exec::root_fields(&self.schema, &exec_request);
+        let clone_urls = self
+            .clone_urls
+            .as_ref()
+            .map(|deps| deps.resolver.as_ref() as &dyn crate::graphql_resolvers::CloneUrlResolver);
         let repositories = match &self.repositories {
             Some(store) => {
                 crate::graphql_resolvers::prefetch_repositories(
                     store.as_ref(),
+                    clone_urls,
                     &fields,
                     request.actor,
                     site_admin,
@@ -564,6 +591,7 @@ impl GraphqlDeps for SchemaGraphqlDeps {
             Some(store) => {
                 crate::graphql_resolvers::prefetch_repository_redirects(
                     store.as_ref(),
+                    clone_urls,
                     &fields,
                     request.actor,
                     site_admin,

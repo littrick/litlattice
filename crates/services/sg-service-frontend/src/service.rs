@@ -241,6 +241,16 @@ impl Service for FrontendService {
         // session cookie authenticates external requests and the current-user
         // row backs `Query.currentUser` (M9.8fe). `Query.clientConfiguration`
         // reads `external_services` with that same pool.
+        let clone_url_resolver = Arc::new(crate::clone_urls::ConfiguredCloneUrlResolver {
+            first: Arc::new(crate::clone_urls::PgFirstRepoNameByCloneUrl::new(
+                session_pool.clone(),
+            )),
+            services: Arc::new(crate::clone_urls::PgCloneUrlServiceSource::new(
+                session_pool.clone(),
+            )),
+            live: Arc::clone(wiring.live()),
+            key: keyring.external_service_key(),
+        });
         let graphql_deps =
             SchemaGraphqlDeps::with_session(Arc::clone(&graphql_schema), session_pool.clone())
                 .with_client_configuration(
@@ -249,9 +259,10 @@ impl Service for FrontendService {
                             session_pool,
                         ),
                     ),
-                    keyring,
+                    Arc::clone(&keyring),
                     Arc::clone(wiring.live()),
                 )
+                .with_clone_urls(clone_url_resolver)
                 .with_log_events(log_events_store, Arc::clone(wiring.live()));
         // `serve_cmd.go:436-448`: the anonymous GraphQL limiter stores GCRA
         // state in the Redis cache pool (`gql:rl:` prefix). A redigo pool does

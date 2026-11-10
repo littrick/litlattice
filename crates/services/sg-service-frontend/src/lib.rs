@@ -13,6 +13,7 @@ pub mod audit;
 pub mod auth;
 pub mod blame;
 pub mod client_configuration;
+pub mod clone_urls;
 pub mod config;
 pub mod configuration_api;
 pub mod configuration_server;

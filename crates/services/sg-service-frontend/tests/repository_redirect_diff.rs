@@ -113,7 +113,7 @@ async fn repository_redirect_harness() {
             actor,
         };
         let fields = root_fields(&schema, &request);
-        let redirects = prefetch_repository_redirects(&store, &fields, actor, admin).await;
+        let redirects = prefetch_repository_redirects(&store, None, &fields, actor, admin).await;
         let roots = FrontendRootResolver::new().with_repository_redirects(redirects);
         let response = execute_with(&schema, request, Some(&roots));
 

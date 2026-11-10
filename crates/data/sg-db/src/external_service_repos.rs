@@ -620,6 +620,31 @@ fn row_to_stored_repo(row: sqlx::postgres::PgRow) -> Result<StoredRepo, sqlx::Er
     })
 }
 
+/// `repoStore.GetFirstRepoNameByCloneURL`
+/// (`internal/database/repos.go:1585-1608`): the first repo (by
+/// `repo.updated_at DESC`) whose external-service association carries exactly
+/// this clone URL. Returns `None` when no association matches. Like the
+/// baseline, there is no `deleted_at`/blocked filter here; callers re-apply the
+/// repository lookup semantics afterwards.
+pub async fn first_repo_name_by_clone_url(
+    pool: &PgPool,
+    clone_url: &str,
+) -> Result<Option<String>, sqlx::Error> {
+    sqlx::query_scalar(
+        r#"
+SELECT r.name
+FROM repo r
+JOIN external_service_repos esr ON r.id = esr.repo_id
+WHERE esr.clone_url = $1
+ORDER BY r.updated_at DESC
+LIMIT 1
+"#,
+    )
+    .bind(clone_url)
+    .fetch_optional(pool)
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
