@@ -52,6 +52,7 @@ pub mod settings_merge;
 pub mod settings_mutation;
 pub mod site_config_file;
 pub mod site_configuration_mutation;
+pub mod site_configuration_query;
 pub mod site_configuration_secrets;
 pub mod temporary_settings;
 pub mod tenant;
