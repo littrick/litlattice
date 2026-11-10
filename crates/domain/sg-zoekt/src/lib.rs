@@ -15,6 +15,7 @@ pub mod client;
 pub mod file_ranking;
 pub mod go_regexp;
 pub mod horizontal;
+pub mod index_options;
 pub mod languages;
 pub mod metered;
 pub mod proto;
