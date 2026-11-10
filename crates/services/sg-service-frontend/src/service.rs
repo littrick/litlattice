@@ -142,6 +142,7 @@ impl Service for FrontendService {
         let blame_pool = pool.clone();
         let search_pool = blame_pool.clone();
         let session_pool = pool.clone();
+        let settings_pool = pool.clone();
         let source = crate::configuration_source::DbConfigurationSource::new(pool)
             .map_err(ServiceError::new)?;
         crate::configuration_startup::override_from_env(&source)
@@ -149,6 +150,7 @@ impl Service for FrontendService {
             .map_err(|err| {
                 ServiceError::new(format!("failed to apply site config overrides: {err}"))
             })?;
+        let watch_source = source.clone();
         let wiring = configuration_server::FrontendConfigurationServer::start_with_source(
             source,
             ctx.shutdown.clone(),
@@ -157,6 +159,14 @@ impl Service for FrontendService {
         .map_err(|err| {
             ServiceError::new(format!("failed to initialize configuration service: {err}"))
         })?;
+        // Baseline `serve_cmd.go:147-149`: `overrideGlobalSettings` writes the
+        // `GLOBAL_SETTINGS_FILE` document to the `settings` table and fails
+        // startup when it cannot (outside `overrideExtSvcConfig`'s scope).
+        crate::configuration_watch::override_global_settings_from_env(&settings_pool)
+            .await
+            .map_err(|err| {
+                ServiceError::new(format!("failed to override global settings: {err}"))
+            })?;
 
         // Baseline `serve_cmd.go:213-219`: `graphqlbackend.NewSchema` assembles
         // the SDL and returns an error that aborts startup. The OSS schema is
@@ -192,6 +202,19 @@ impl Service for FrontendService {
 
         let ready = Arc::new(AtomicBool::new(false));
         let mut background = JoinSet::new();
+
+        // `overrideSiteConfig`/`overrideGlobalSettings` start one watcher each
+        // (`go watchUpdate`). The polling replacement runs on the service's
+        // JoinSet and observes the same shutdown token as the HTTP servers;
+        // `serve_cmd.go`'s watcher failures only log and never fail startup.
+        crate::configuration_watch::spawn_config_watchers(
+            &mut background,
+            watch_source,
+            settings_pool,
+            crate::configuration_watch::ConfigWatchPaths::from_env(),
+            crate::configuration_watch::DEFAULT_WATCH_INTERVAL,
+            ctx.shutdown.clone(),
+        );
 
         let blame_deps: Arc<dyn crate::blame::BlameDeps> = Arc::new(
             crate::blame::BackendDeps::new(blame_pool, Arc::clone(wiring.live())),

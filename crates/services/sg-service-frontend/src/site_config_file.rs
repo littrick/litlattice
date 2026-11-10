@@ -50,6 +50,19 @@ impl fmt::Display for SiteConfigFileError {
 
 impl std::error::Error for SiteConfigFileError {}
 
+/// Format an `io::Error` for `path` like Go's `os.ReadFile`:
+/// `open <path>: <reason>` (Rust's Display is
+/// `No such file or directory (os error 2)`).
+pub fn go_read_error(path: &std::path::Path, source: &io::Error) -> String {
+    let reason = match source.kind() {
+        io::ErrorKind::NotFound => "no such file or directory".to_owned(),
+        io::ErrorKind::PermissionDenied => "permission denied".to_owned(),
+        io::ErrorKind::IsADirectory => "is a directory".to_owned(),
+        _ => source.to_string(),
+    };
+    format!("open {}: {reason}", path.display())
+}
+
 /// `filepath.SplitList`: the empty value is an empty list, otherwise split on
 /// the Unix path-list separator.
 pub fn split_paths(value: &str) -> Vec<PathBuf> {
