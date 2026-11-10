@@ -369,6 +369,9 @@ pub struct SchemaGraphqlDeps {
     clone_urls: Option<CloneUrlDeps>,
     /// `Mutation.logEvent(s)`'s seams; `None` in transport-only tests.
     log_events: Option<LogEventsDeps>,
+    /// `Query.featureFlags` / `Query.featureFlag`'s database seam; `None` in
+    /// transport-only tests.
+    feature_flags: Option<Arc<dyn crate::graphql_resolvers::FeatureFlagStore>>,
 }
 
 impl SchemaGraphqlDeps {
@@ -389,6 +392,7 @@ impl SchemaGraphqlDeps {
             client_configuration: None,
             clone_urls: None,
             log_events: None,
+            feature_flags: None,
         }
     }
 
@@ -417,11 +421,14 @@ impl SchemaGraphqlDeps {
             user_organizations: Some(Arc::new(crate::org_store::PgOrgStore::new(pool.clone()))),
             org_members: Some(Arc::new(crate::org_store::PgOrgStore::new(pool.clone()))),
             org_memberships: Some(Arc::new(crate::org_store::PgOrgStore::new(pool.clone()))),
-            pool: Some(pool),
+            pool: Some(pool.clone()),
             rate_limit: None,
             client_configuration: None,
             clone_urls: None,
             log_events: None,
+            feature_flags: Some(Arc::new(
+                crate::feature_flag_store::PgFeatureFlagStore::new(pool),
+            )),
         }
     }
 
@@ -523,6 +530,7 @@ impl SchemaGraphqlDeps {
             client_configuration: None,
             clone_urls: None,
             log_events: None,
+            feature_flags: None,
         }
     }
 }
@@ -719,6 +727,21 @@ impl GraphqlDeps for SchemaGraphqlDeps {
             }
             None => crate::graphql_resolvers::NamespaceRoots::default(),
         };
+        // `Query.featureFlags` / `Query.featureFlag`: both are site-admin
+        // gated; the override namespaces reuse the user/org membership store.
+        let feature_flags = match (&self.feature_flags, &self.org_memberships) {
+            (Some(store), Some(namespaces)) => {
+                crate::graphql_resolvers::prefetch_feature_flags(
+                    store.as_ref(),
+                    namespaces.as_ref(),
+                    &fields,
+                    request.actor,
+                    site_admin,
+                )
+                .await
+            }
+            _ => crate::graphql_resolvers::FeatureFlagRoots::default(),
+        };
         let nested = match (
             &self.user_organizations,
             &self.org_members,
@@ -774,6 +797,7 @@ impl GraphqlDeps for SchemaGraphqlDeps {
             .with_namespaces(namespaces)
             .with_repository_redirects(repository_redirects)
             .with_temporary_settings(temporary_settings)
+            .with_feature_flags(feature_flags)
             .with_mutation(mutation);
         if let Some(client_configuration) = client_configuration {
             roots = roots.with_client_configuration(client_configuration);

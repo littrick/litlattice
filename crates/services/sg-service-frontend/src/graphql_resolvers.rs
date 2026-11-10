@@ -22,6 +22,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use base64::Engine;
+use sg_db::feature_flags::{FeatureFlag, FeatureFlagOverride};
 use sg_graphql::exec::{
     Actor, Arguments, ExecError, FieldValue, ObjectValue, RootField, RootResolver,
 };
@@ -2145,6 +2146,7 @@ impl FrontendRootResolver {
                 repository_redirects: HashMap::new(),
                 temporary_settings: None,
                 client_configuration: None,
+                feature_flags: FeatureFlagRoots::default(),
             },
             mutation: crate::settings_mutation::MutationRoot::default(),
         }
@@ -2186,6 +2188,13 @@ impl FrontendRootResolver {
         client_configuration: crate::client_configuration::ClientConfigurationLookup,
     ) -> Self {
         self.query.client_configuration = Some(client_configuration);
+        self
+    }
+
+    /// Attach the request's prefetched `Query.featureFlags` /
+    /// `Query.featureFlag` results.
+    pub fn with_feature_flags(mut self, feature_flags: FeatureFlagRoots) -> Self {
+        self.query.feature_flags = feature_flags;
         self
     }
 }
@@ -2243,6 +2252,9 @@ struct QueryRoot {
     /// Prefetched `Query.clientConfiguration` (see
     /// [`crate::client_configuration::prefetch_client_configuration`]).
     client_configuration: Option<crate::client_configuration::ClientConfigurationLookup>,
+    /// Prefetched `Query.featureFlags` / `Query.featureFlag` results (see
+    /// [`prefetch_feature_flags`]).
+    feature_flags: FeatureFlagRoots,
 }
 
 impl FrontendRootResolver {
@@ -2600,6 +2612,46 @@ impl ObjectValue for QueryRoot {
                     self.viewer_site_admin,
                     field == "viewerConfiguration",
                 )
+            }
+            // `schemaResolver.FeatureFlags` / `FeatureFlag`
+            // (`feature_flags.go:202-226`): both are site-admin gated; the
+            // prefetch carries the gate result and the database rows.
+            "featureFlags" => match &self.feature_flags.flags {
+                Some(FeatureFlagsLookup::Found(names)) => Ok(Some(FieldValue::List {
+                    element_type: Some("FeatureFlag"),
+                    items: names
+                        .iter()
+                        .filter_map(|name| self.feature_flags.registry.flags.get(name))
+                        .map(|data| {
+                            FieldValue::Object(Arc::new(FeatureFlagObject {
+                                data: data.clone(),
+                                registry: self.feature_flags.registry.clone(),
+                            }))
+                        })
+                        .collect(),
+                })),
+                Some(FeatureFlagsLookup::Error(message)) => Err(ExecError::new(message.clone())),
+                None => Ok(None),
+            },
+            "featureFlag" => {
+                let Some(name) = arguments.string("name") else {
+                    return Ok(None);
+                };
+                match self.feature_flags.flag.get(name) {
+                    Some(FeatureFlagLookup::Found(flag_name)) => {
+                        match self.feature_flags.registry.flags.get(flag_name) {
+                            Some(data) => {
+                                Ok(Some(FieldValue::Object(Arc::new(FeatureFlagObject {
+                                    data: data.clone(),
+                                    registry: self.feature_flags.registry.clone(),
+                                }))))
+                            }
+                            None => Err(ExecError::new("sql: no rows in result set")),
+                        }
+                    }
+                    Some(FeatureFlagLookup::Error(message)) => Err(ExecError::new(message.clone())),
+                    None => Ok(None),
+                }
             }
             _ => Ok(None),
         }
@@ -4026,6 +4078,360 @@ fn go_url_path(path: &str) -> String {
         }
     }
     escaped
+}
+
+/// The database seam for `Query.featureFlags` / `Query.featureFlag`
+/// (`internal/database/feature_flags.go:228-276,372-390`). `Ok(None)` is the
+/// baseline's `sql.ErrNoRows`; every other failure is surfaced verbatim.
+#[async_trait]
+pub trait FeatureFlagStore: Send + Sync {
+    async fn get_feature_flag(&self, name: &str) -> Result<Option<FeatureFlag>, String>;
+    async fn get_feature_flags(&self) -> Result<Vec<FeatureFlag>, String>;
+    async fn get_overrides_for_flag(&self, name: &str) -> Result<Vec<FeatureFlagOverride>, String>;
+}
+
+/// One `FeatureFlagOverride` plus the prefetched `namespace` lookup
+/// (`FeatureFlagOverrideResolver.Namespace`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct FeatureFlagOverrideData {
+    pub user_id: Option<i32>,
+    pub org_id: Option<i32>,
+    pub flag_name: String,
+    pub value: bool,
+    pub namespace: NamespaceLookup,
+}
+
+/// One `featureflag.FeatureFlag` plus its overrides. `overrides` keeps the
+/// database error so it is only surfaced when the field is selected, like the
+/// baseline's lazy `GetOverridesForFlag`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FeatureFlagData {
+    pub name: String,
+    pub bool_value: Option<bool>,
+    pub rollout: Option<i32>,
+    pub created_at: OffsetDateTime,
+    pub updated_at: OffsetDateTime,
+    pub overrides: Result<Vec<FeatureFlagOverrideData>, String>,
+}
+
+/// Prefetched flags keyed by `flag_name`, shared by the root fields and by
+/// `FeatureFlagOverride.targetFlag` (which reuses the same request snapshot).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct FeatureFlagRegistry {
+    pub flags: HashMap<String, FeatureFlagData>,
+}
+
+/// One prefetched `Query.featureFlags` result: flag names in database order,
+/// or the root error.
+#[derive(Debug, Clone, PartialEq)]
+pub enum FeatureFlagsLookup {
+    Found(Vec<String>),
+    Error(String),
+}
+
+/// One prefetched `Query.featureFlag(name)` result: the canonical flag name
+/// (a key into [`FeatureFlagRegistry`]) or the root error.
+#[derive(Debug, Clone, PartialEq)]
+pub enum FeatureFlagLookup {
+    Found(String),
+    Error(String),
+}
+
+/// Prefetched `Query.featureFlags` / `Query.featureFlag` results.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct FeatureFlagRoots {
+    pub flags: Option<FeatureFlagsLookup>,
+    pub flag: HashMap<String, FeatureFlagLookup>,
+    pub registry: Arc<FeatureFlagRegistry>,
+}
+
+/// `auth.CheckCurrentUserIsSiteAdmin` (`internal/auth/site_admin.go:20-39`).
+pub(crate) fn check_current_user_is_site_admin(
+    actor: Actor,
+    viewer_site_admin: bool,
+) -> Result<(), String> {
+    match actor {
+        Actor::Anonymous => Err(NOT_AUTHENTICATED.to_owned()),
+        Actor::User { .. } if !viewer_site_admin => Err(MUST_BE_SITE_ADMIN.to_owned()),
+        Actor::User { .. } => Ok(()),
+    }
+}
+
+/// Prefetch every `Query.featureFlags` / `Query.featureFlag` field in
+/// `fields`. Both roots are site-admin gated before any database access.
+pub async fn prefetch_feature_flags(
+    flags_store: &dyn FeatureFlagStore,
+    namespaces: &dyn OrgMembershipsStore,
+    fields: &[RootField],
+    actor: Actor,
+    viewer_site_admin: bool,
+) -> FeatureFlagRoots {
+    let mut registry: HashMap<String, FeatureFlagData> = HashMap::new();
+    let mut roots = FeatureFlagRoots::default();
+    for field in fields {
+        match field.name.as_str() {
+            "featureFlags" => {
+                if roots.flags.is_some() {
+                    continue;
+                }
+                if let Err(message) = check_current_user_is_site_admin(actor, viewer_site_admin) {
+                    roots.flags = Some(FeatureFlagsLookup::Error(message));
+                    continue;
+                }
+                match flags_store.get_feature_flags().await {
+                    Ok(flags) => {
+                        let mut names = Vec::with_capacity(flags.len());
+                        for flag in flags {
+                            let name = flag.name.clone();
+                            if !registry.contains_key(&name) {
+                                let data = feature_flag_data(
+                                    flags_store,
+                                    namespaces,
+                                    flag,
+                                    actor,
+                                    viewer_site_admin,
+                                )
+                                .await;
+                                registry.insert(name.clone(), data);
+                            }
+                            names.push(name);
+                        }
+                        roots.flags = Some(FeatureFlagsLookup::Found(names));
+                    }
+                    Err(message) => roots.flags = Some(FeatureFlagsLookup::Error(message)),
+                }
+            }
+            "featureFlag" => {
+                let Some(name) = field.arguments.string("name") else {
+                    continue;
+                };
+                if roots.flag.contains_key(name) {
+                    continue;
+                }
+                if let Err(message) = check_current_user_is_site_admin(actor, viewer_site_admin) {
+                    roots
+                        .flag
+                        .insert(name.to_owned(), FeatureFlagLookup::Error(message));
+                    continue;
+                }
+                match flags_store.get_feature_flag(name).await {
+                    Ok(Some(flag)) => {
+                        let flag_name = flag.name.clone();
+                        if !registry.contains_key(&flag_name) {
+                            let data = feature_flag_data(
+                                flags_store,
+                                namespaces,
+                                flag,
+                                actor,
+                                viewer_site_admin,
+                            )
+                            .await;
+                            registry.insert(flag_name.clone(), data);
+                        }
+                        roots
+                            .flag
+                            .insert(name.to_owned(), FeatureFlagLookup::Found(flag_name));
+                    }
+                    // `scanFeatureFlag` returns `sql.ErrNoRows`.
+                    Ok(None) => {
+                        roots.flag.insert(
+                            name.to_owned(),
+                            FeatureFlagLookup::Error("sql: no rows in result set".to_owned()),
+                        );
+                    }
+                    Err(message) => {
+                        roots
+                            .flag
+                            .insert(name.to_owned(), FeatureFlagLookup::Error(message));
+                    }
+                };
+            }
+            _ => {}
+        }
+    }
+    roots.registry = Arc::new(FeatureFlagRegistry { flags: registry });
+    roots
+}
+
+/// Load one flag's overrides and their `User`/`Org` namespaces. An overrides
+/// query failure is kept for the `overrides` field; a missing namespace is
+/// the baseline's `UserByIDInt32`/`OrgByIDInt32` error.
+async fn feature_flag_data(
+    flags_store: &dyn FeatureFlagStore,
+    namespaces: &dyn OrgMembershipsStore,
+    flag: FeatureFlag,
+    actor: Actor,
+    viewer_site_admin: bool,
+) -> FeatureFlagData {
+    let overrides = match flags_store.get_overrides_for_flag(&flag.name).await {
+        Ok(overrides) => {
+            let mut data = Vec::with_capacity(overrides.len());
+            for override_row in overrides {
+                let namespace = match (override_row.user_id, override_row.org_id) {
+                    (Some(user_id), _) => match namespaces.user_by_id(user_id).await {
+                        Ok(user) => NamespaceLookup::User(user),
+                        Err(message) => NamespaceLookup::Error(message),
+                    },
+                    (None, Some(org_id)) => {
+                        match namespaces
+                            .org_by_id(org_id, viewer_uid(actor), viewer_site_admin)
+                            .await
+                        {
+                            Ok(org) => NamespaceLookup::Org(org),
+                            Err(message) => NamespaceLookup::Error(message),
+                        }
+                    }
+                    (None, None) => {
+                        NamespaceLookup::Error("one of userID or orgID must be set".to_owned())
+                    }
+                };
+                data.push(FeatureFlagOverrideData {
+                    user_id: override_row.user_id,
+                    org_id: override_row.org_id,
+                    flag_name: override_row.flag_name,
+                    value: override_row.value,
+                    namespace,
+                });
+            }
+            Ok(data)
+        }
+        Err(message) => Err(message),
+    };
+    FeatureFlagData {
+        name: flag.name,
+        bool_value: flag.bool_value,
+        rollout: flag.rollout,
+        created_at: flag.created_at,
+        updated_at: flag.updated_at,
+        overrides,
+    }
+}
+
+/// `relay.MarshalID("FeatureFlagOverride", overrideSpec{...})`
+/// (`feature_flags.go:110-130`): Go's `json.Marshal` field order is `UserID`,
+/// `OrgID`, `FlagName`; nil pointers are `null`.
+fn marshal_feature_flag_override_id(
+    user_id: Option<i32>,
+    org_id: Option<i32>,
+    flag_name: &str,
+) -> String {
+    let user_id = user_id.map_or_else(|| "null".to_owned(), |id| id.to_string());
+    let org_id = org_id.map_or_else(|| "null".to_owned(), |id| id.to_string());
+    let flag_name = match serde_json::to_string(flag_name) {
+        Ok(encoded) => encoded,
+        Err(_) => "\"\"".to_owned(),
+    };
+    base64::engine::general_purpose::URL_SAFE.encode(format!(
+        "FeatureFlagOverride:{{\"UserID\":{user_id},\"OrgID\":{org_id},\"FlagName\":{flag_name}}}"
+    ))
+}
+
+/// The concrete `FeatureFlagBoolean` / `FeatureFlagRollout` union members
+/// (`feature_flags.go:19-80`).
+pub struct FeatureFlagObject {
+    data: FeatureFlagData,
+    registry: Arc<FeatureFlagRegistry>,
+}
+
+impl ObjectValue for FeatureFlagObject {
+    fn type_name(&self) -> &'static str {
+        if self.data.bool_value.is_some() {
+            "FeatureFlagBoolean"
+        } else {
+            "FeatureFlagRollout"
+        }
+    }
+
+    fn field(
+        &self,
+        field: &str,
+        _arguments: &Arguments,
+        _actor: Actor,
+    ) -> Result<Option<FieldValue>, ExecError> {
+        match field {
+            "name" => Ok(Some(FieldValue::Json(Json::Str(self.data.name.clone())))),
+            "value" => match self.data.bool_value {
+                Some(value) => Ok(Some(FieldValue::Json(Json::Bool(value)))),
+                None => Ok(None),
+            },
+            "rolloutBasisPoints" => match self.data.rollout {
+                Some(rollout) => Ok(Some(FieldValue::Json(Json::Int(rollout as i64)))),
+                None => Ok(None),
+            },
+            "createdAt" => Ok(Some(FieldValue::Json(Json::Str(datetime_rfc3339(
+                self.data.created_at,
+            ))))),
+            "updatedAt" => Ok(Some(FieldValue::Json(Json::Str(datetime_rfc3339(
+                self.data.updated_at,
+            ))))),
+            "overrides" => match &self.data.overrides {
+                Ok(overrides) => Ok(Some(FieldValue::List {
+                    element_type: Some("FeatureFlagOverride"),
+                    items: overrides
+                        .iter()
+                        .map(|override_data| {
+                            FieldValue::Object(Arc::new(FeatureFlagOverrideObject {
+                                data: override_data.clone(),
+                                registry: self.registry.clone(),
+                            }))
+                        })
+                        .collect(),
+                })),
+                Err(message) => Err(ExecError::new(message.clone())),
+            },
+            _ => Ok(None),
+        }
+    }
+}
+
+/// `FeatureFlagOverrideResolver` (`feature_flags.go:90-116`).
+pub struct FeatureFlagOverrideObject {
+    data: FeatureFlagOverrideData,
+    registry: Arc<FeatureFlagRegistry>,
+}
+
+impl ObjectValue for FeatureFlagOverrideObject {
+    fn type_name(&self) -> &'static str {
+        "FeatureFlagOverride"
+    }
+
+    fn field(
+        &self,
+        field: &str,
+        _arguments: &Arguments,
+        _actor: Actor,
+    ) -> Result<Option<FieldValue>, ExecError> {
+        match field {
+            "id" => Ok(Some(FieldValue::Json(Json::Str(
+                marshal_feature_flag_override_id(
+                    self.data.user_id,
+                    self.data.org_id,
+                    &self.data.flag_name,
+                ),
+            )))),
+            "value" => Ok(Some(FieldValue::Json(Json::Bool(self.data.value)))),
+            "namespace" => match &self.data.namespace {
+                NamespaceLookup::User(data) => Ok(Some(FieldValue::Object(Arc::new(
+                    UserObject::from_data_as_viewer(data.clone(), false),
+                )))),
+                NamespaceLookup::Org(data) => Ok(Some(FieldValue::Object(Arc::new(
+                    OrgObject::from_data_as_viewer(data.clone(), false),
+                )))),
+                NamespaceLookup::NotFound => Err(ExecError::new("namespace not found")),
+                NamespaceLookup::Error(message) => Err(ExecError::new(message.clone())),
+            },
+            // `FeatureFlagOverrideResolver.TargetFlag` re-queries the owning
+            // flag; the request snapshot already contains it.
+            "targetFlag" => match self.registry.flags.get(&self.data.flag_name) {
+                Some(data) => Ok(Some(FieldValue::Object(Arc::new(FeatureFlagObject {
+                    data: data.clone(),
+                    registry: self.registry.clone(),
+                })))),
+                None => Err(ExecError::new("sql: no rows in result set")),
+            },
+            _ => Ok(None),
+        }
+    }
 }
 
 #[cfg(test)]
