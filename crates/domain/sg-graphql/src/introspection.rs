@@ -19,42 +19,14 @@
 //! [`to_json`] reproduces those bytes exactly, including Go's HTML escaping
 //! (`<`, `>`, `&` and U+2028/U+2029 are written as `\uXXXX`).
 
+use crate::json::Json;
 use crate::schema::{DirectiveDef, DirectiveUse, FieldDef, InputValueDef, Schema, TypeKind};
 
 /// The Relay introspection JSON for `schema`, byte-identical to
 /// `(*graphql.Schema).ToJSON()`.
 pub fn to_json(schema: &Schema) -> String {
     let root = Json::Obj(vec![("__schema".to_owned(), schema_obj(schema))]);
-    let mut out = String::with_capacity(1024);
-    write_json(&root, &mut out, 0);
-    out
-}
-
-/// An insertion-ordered JSON value (the baseline preserves selection order).
-enum Json {
-    Null,
-    Bool(bool),
-    Str(String),
-    Arr(Vec<Json>),
-    Obj(Vec<(String, Json)>),
-}
-
-impl Json {
-    fn obj(entries: Vec<(&str, Json)>) -> Json {
-        Json::Obj(
-            entries
-                .into_iter()
-                .map(|(key, value)| (key.to_owned(), value))
-                .collect(),
-        )
-    }
-
-    fn opt_str(value: Option<&str>) -> Json {
-        match value.filter(|value| !value.is_empty()) {
-            Some(value) => Json::Str(value.to_owned()),
-            None => Json::Null,
-        }
-    }
+    root.to_indented_string()
 }
 
 fn schema_obj(schema: &Schema) -> Json {
@@ -269,81 +241,6 @@ fn named_ref(schema: &Schema, name: &str) -> Json {
         ("name", Json::Str(name.to_owned())),
         ("ofType", Json::Null),
     ])
-}
-
-/// Serialize like Go's `json.MarshalIndent(v, "", "\t")`.
-fn write_json(value: &Json, out: &mut String, depth: usize) {
-    match value {
-        Json::Null => out.push_str("null"),
-        Json::Bool(value) => out.push_str(if *value { "true" } else { "false" }),
-        Json::Str(value) => write_go_string(value, out),
-        Json::Arr(items) => {
-            if items.is_empty() {
-                out.push_str("[]");
-                return;
-            }
-            out.push_str("[\n");
-            for (index, item) in items.iter().enumerate() {
-                indent(out, depth + 1);
-                write_json(item, out, depth + 1);
-                if index + 1 < items.len() {
-                    out.push(',');
-                }
-                out.push('\n');
-            }
-            indent(out, depth);
-            out.push(']');
-        }
-        Json::Obj(entries) => {
-            if entries.is_empty() {
-                out.push_str("{}");
-                return;
-            }
-            out.push_str("{\n");
-            for (index, (key, item)) in entries.iter().enumerate() {
-                indent(out, depth + 1);
-                write_go_string(key, out);
-                out.push_str(": ");
-                write_json(item, out, depth + 1);
-                if index + 1 < entries.len() {
-                    out.push(',');
-                }
-                out.push('\n');
-            }
-            indent(out, depth);
-            out.push('}');
-        }
-    }
-}
-
-fn indent(out: &mut String, depth: usize) {
-    for _ in 0..depth {
-        out.push('\t');
-    }
-}
-
-/// Go `encoding/json` string escaping with HTML escaping enabled.
-fn write_go_string(value: &str, out: &mut String) {
-    out.push('"');
-    for ch in value.chars() {
-        match ch {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            '\u{08}' => out.push_str("\\b"),
-            '\u{0c}' => out.push_str("\\f"),
-            '<' => out.push_str("\\u003c"),
-            '>' => out.push_str("\\u003e"),
-            '&' => out.push_str("\\u0026"),
-            '\u{2028}' => out.push_str("\\u2028"),
-            '\u{2029}' => out.push_str("\\u2029"),
-            ch if (ch as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", ch as u32)),
-            ch => out.push(ch),
-        }
-    }
-    out.push('"');
 }
 
 #[cfg(test)]

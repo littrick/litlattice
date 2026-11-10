@@ -282,6 +282,9 @@ pub struct Schema {
     /// Object definitions in SDL order (including the meta `_Service`), used
     /// to derive interface `possibleTypes` like the baseline's `s.Objects`.
     pub object_order: Vec<String>,
+    /// The user SDL passed to `NewSchema` (`strings.Join(schemas, "\n")`),
+    /// returned by `_Service.sdl`. The vendored meta schema is not included.
+    pub schema_string: String,
 }
 
 impl Schema {
@@ -419,7 +422,10 @@ pub fn assemble_sdl(sdl: &str) -> Result<Schema, SchemaError> {
     let document = gql::parse_schema::<String>(&source)
         .map_err(|err| SchemaError::new(format!("parse error: {err}")))?;
 
-    let mut schema = Schema::default();
+    let mut schema = Schema {
+        schema_string: sdl.to_owned(),
+        ..Schema::default()
+    };
     let mut extensions: Vec<gql::TypeExtension<'_, String>> = Vec::new();
 
     for definition in &document.definitions {
