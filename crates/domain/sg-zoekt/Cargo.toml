@@ -18,13 +18,12 @@ regex = { workspace = true }
 regex-syntax = { workspace = true }
 roaring = "0.10"
 serde = { workspace = true }
+serde_json = { workspace = true }
 sg-search-query = { path = "../sg-search-query" }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 tonic = { workspace = true }
-
-[dev-dependencies]
-serde_json = { workspace = true }
+url = { workspace = true }
 
 [build-dependencies]
 tonic-build = { workspace = true }

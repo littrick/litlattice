@@ -19,6 +19,7 @@ pub mod horizontal;
 pub mod index_options;
 pub mod indexed_repo_revs;
 pub mod indexers;
+pub mod indexserver;
 pub mod languages;
 pub mod metered;
 pub mod proto;
