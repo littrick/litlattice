@@ -62,10 +62,54 @@ pub async fn override_from_env(source: &DbConfigurationSource) -> Result<bool, S
     override_site_config(source, &paths).await
 }
 
+/// `conf.MustValidateDefaults` (`internal/conf/validate.go:556-574`),
+/// called from `serve_cmd.go:140` right after the configuration service is
+/// initialized. The baseline panics on a bad default document; the port
+/// returns the same panic text as a startup error.
+pub fn validate_default_site_configs() -> Result<(), String> {
+    sg_site_schema::must_validate_defaults()
+}
+
 /// Format a read error like Go's `os.ReadFile`: `open <path>: <reason>`.
 fn format_read_error(err: &SiteConfigFileError) -> String {
     match err {
         SiteConfigFileError::Read { path, source } => site_config_file::go_read_error(path, source),
         other => other.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn must_validate_defaults_passes_for_all_three_documents() {
+        validate_default_site_configs().expect("default deployment configs validate");
+    }
+
+    #[test]
+    fn embedded_confdefaults_match_the_deploy_defaults_documents() {
+        let deploy_types = [
+            ("DevAndTesting", "dev"),
+            ("DockerContainer", "docker-container"),
+            (
+                "KubernetesOrDockerComposeOrPureDocker",
+                // Any Kubernetes alias shares this document.
+                "kubernetes",
+            ),
+        ];
+        for ((name, document), (expected_name, deploy_type)) in
+            sg_site_schema::confdefaults::DEFAULT_CONFIGS
+                .iter()
+                .zip(deploy_types)
+        {
+            assert_eq!(*name, expected_name);
+            assert_eq!(
+                *document,
+                crate::deploy_defaults::default_site_config_json(deploy_type)
+                    .expect("default document"),
+                "{name}"
+            );
+        }
     }
 }

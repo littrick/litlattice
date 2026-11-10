@@ -160,6 +160,11 @@ impl Service for FrontendService {
         .map_err(|err| {
             ServiceError::new(format!("failed to initialize configuration service: {err}"))
         })?;
+        // Baseline `serve_cmd.go:140`: `conf.MustValidateDefaults()` runs right
+        // after `InitConfigurationServerFrontendOnly` and panics on a bad
+        // default deployment document. The port surfaces the same text as a
+        // startup error.
+        crate::configuration_startup::validate_default_site_configs().map_err(ServiceError::new)?;
         // Baseline `serve_cmd.go:147-149`: `overrideGlobalSettings` writes the
         // `GLOBAL_SETTINGS_FILE` document to the `settings` table and fails
         // startup when it cannot (outside `overrideExtSvcConfig`'s scope).
