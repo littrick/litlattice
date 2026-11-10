@@ -151,6 +151,7 @@ impl Service for FrontendService {
                 ServiceError::new(format!("failed to apply site config overrides: {err}"))
             })?;
         let watch_source = source.clone();
+        let extsvc_source = source.clone();
         let wiring = configuration_server::FrontendConfigurationServer::start_with_source(
             source,
             ctx.shutdown.clone(),
@@ -207,6 +208,7 @@ impl Service for FrontendService {
         // (`go watchUpdate`). The polling replacement runs on the service's
         // JoinSet and observes the same shutdown token as the HTTP servers;
         // `serve_cmd.go`'s watcher failures only log and never fail startup.
+        let extsvc_pool = settings_pool.clone();
         crate::configuration_watch::spawn_config_watchers(
             &mut background,
             watch_source,
@@ -244,6 +246,27 @@ impl Service for FrontendService {
                 }
             });
         }
+        // `serve_cmd.go:153`: `overrideExtSvcConfig` runs after the keyring is
+        // initialized so it can decrypt existing configs and encrypt new ones.
+        // It fails startup when the file cannot be applied; the watcher below
+        // only logs, like `watchUpdate`.
+        crate::extsvc_config_file::override_ext_svc_config_from_env(
+            &extsvc_source,
+            &extsvc_pool,
+            keyring.external_service_key(),
+        )
+        .await
+        .map_err(|err| {
+            ServiceError::new(format!("failed to override external service config: {err}"))
+        })?;
+        crate::extsvc_config_file::spawn_extsvc_config_watcher(
+            &mut background,
+            extsvc_source,
+            extsvc_pool,
+            keyring.external_service_key(),
+            crate::configuration_watch::DEFAULT_WATCH_INTERVAL,
+            ctx.shutdown.clone(),
+        );
         // `Mutation.logEvent(s)` writes the `user_activity:*` all-time flags
         // through `redispool.Store`. Like the rate limiter below, a redigo
         // pool does not dial until the first command; an unreachable Redis at

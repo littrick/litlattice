@@ -477,6 +477,156 @@ WHERE id = $1
         }
         Ok(())
     }
+
+    /// `ExternalServices().Create` for the `EXTSVC_CONFIG_FILE` startup path
+    /// (`internal/database/external_services.go:531`). The caller has already
+    /// decrypted, validated and encrypted the config (or left it plaintext
+    /// with an empty key ID when no keyring is configured) and computed the
+    /// derived fields in `recalculateFields`.
+    ///
+    /// Deviations: `ensureCodeHost` is not ported, so `code_host_id` is left
+    /// NULL; `creator_id`/`last_updater_id` are NULL like the unauthenticated
+    /// startup path.
+    pub async fn create_from_config(
+        &self,
+        kind: &str,
+        display_name: &str,
+        config: &str,
+        encryption_key_id: &str,
+        unrestricted: bool,
+        has_webhooks: Option<bool>,
+    ) -> Result<i64, ExternalServiceError> {
+        let id: i64 = sqlx::query_scalar(
+            r#"
+INSERT INTO external_services
+    (kind, display_name, config, encryption_key_id, created_at, updated_at,
+     unrestricted, has_webhooks)
+VALUES ($1, $2, $3, $4, NOW(), NOW(), $5, $6)
+RETURNING id
+"#,
+        )
+        .bind(kind)
+        .bind(display_name)
+        .bind(config)
+        .bind(encryption_key_id)
+        .bind(unrestricted)
+        .bind(has_webhooks)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(id)
+    }
+
+    /// `ExternalServices().Update` with only the fields the
+    /// `EXTSVC_CONFIG_FILE` path sets (`DisplayName` + `Config`, see
+    /// `internal/database/external_services.go:814`): bump `updated_at` and
+    /// trigger an immediate sync with `next_sync_at = NOW()`, as the baseline
+    /// does when the config changes. `ensureCodeHost`/`code_host_id` is not
+    /// ported (deviation), and neither are the token/sync-timestamp fields.
+    pub async fn update_config(
+        &self,
+        id: i64,
+        display_name: &str,
+        config: &str,
+        encryption_key_id: &str,
+        unrestricted: bool,
+        has_webhooks: Option<bool>,
+    ) -> Result<(), ExternalServiceError> {
+        let result = sqlx::query(
+            r#"
+UPDATE external_services
+SET display_name = $2,
+    config = $3,
+    encryption_key_id = $4,
+    unrestricted = $5,
+    has_webhooks = $6,
+    last_updater_id = NULL,
+    next_sync_at = NOW(),
+    updated_at = NOW()
+WHERE id = $1 AND deleted_at IS NULL
+"#,
+        )
+        .bind(id)
+        .bind(display_name)
+        .bind(config)
+        .bind(encryption_key_id)
+        .bind(unrestricted)
+        .bind(has_webhooks)
+        .execute(&self.pool)
+        .await?;
+        if result.rows_affected() == 0 {
+            return Err(ExternalServiceError::NotFound { id });
+        }
+        Ok(())
+    }
+
+    /// `ExternalServices().Delete` (`internal/database/external_services.go:947`)
+    /// reduced to its database effects: drop `external_service_repos` for the
+    /// service, soft-delete repositories orphaned by that, then soft-delete
+    /// the service itself. `updated_at` is left untouched, like the baseline.
+    ///
+    /// Deviations: cancelling/waiting for `external_service_sync_jobs` is not
+    /// ported (the startup path runs before any sync job exists).
+    pub async fn delete_soft(&self, id: i64) -> Result<(), ExternalServiceError> {
+        let mut tx = self.pool.begin().await?;
+
+        let exists = sqlx::query_scalar::<_, i64>(
+            "SELECT id FROM external_services WHERE id = $1 AND deleted_at IS NULL FOR UPDATE",
+        )
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if exists.is_none() {
+            tx.rollback().await?;
+            return Err(ExternalServiceError::NotFound { id });
+        }
+
+        let repo_ids: Vec<i32> = sqlx::query_scalar(
+            r#"
+DELETE FROM external_service_repos
+WHERE external_service_id = $1
+RETURNING repo_id
+"#,
+        )
+        .bind(id)
+        .fetch_all(&mut *tx)
+        .await?;
+
+        if !repo_ids.is_empty() {
+            sqlx::query(
+                r#"
+UPDATE repo
+SET name = soft_deleted_repository_name(name),
+    deleted_at = NOW()
+WHERE deleted_at IS NULL
+  AND id = ANY($1)
+  AND NOT EXISTS (
+      SELECT FROM external_service_repos WHERE repo_id = repo.id
+  )
+"#,
+            )
+            .bind(&repo_ids)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        let result = sqlx::query(
+            r#"
+UPDATE external_services
+SET deleted_at = NOW()
+WHERE id = $1 AND deleted_at IS NULL
+"#,
+        )
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+        if result.rows_affected() == 0 {
+            tx.rollback().await?;
+            return Err(ExternalServiceError::NotFound { id });
+        }
+
+        tx.commit().await?;
+        Ok(())
+    }
 }
 
 /// `calcUnrestricted` with `permissionsUserMapping` disabled (the worker's

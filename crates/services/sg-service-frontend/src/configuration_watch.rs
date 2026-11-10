@@ -155,12 +155,12 @@ fn config_override_updates() -> &'static IntCounterVec {
 
 /// What the watcher remembers about one path. `None` means "did not exist".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct FileStamp {
+pub(crate) struct FileStamp {
     modified: Option<SystemTime>,
     len: u64,
 }
 
-fn file_stamp(path: &Path) -> io::Result<Option<FileStamp>> {
+pub(crate) fn file_stamp(path: &Path) -> io::Result<Option<FileStamp>> {
     match fs::metadata(path) {
         Ok(meta) => Ok(Some(FileStamp {
             modified: meta.modified().ok(),
@@ -343,7 +343,7 @@ fn record_watch_error(path: &Path, err: &io::Error) {
         .inc();
 }
 
-fn record_update_result(files: &[PathBuf], result: Result<bool, String>) {
+pub(crate) fn record_update_result(files: &[PathBuf], result: Result<bool, String>) {
     match result {
         Ok(true) => {
             tracing::info!(
