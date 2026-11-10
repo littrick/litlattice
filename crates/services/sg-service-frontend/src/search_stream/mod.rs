@@ -20,6 +20,7 @@ pub mod events;
 pub mod filters;
 pub mod json;
 pub mod progress;
+pub mod zoekt_results;
 
 pub use args::parse_url_query;
 

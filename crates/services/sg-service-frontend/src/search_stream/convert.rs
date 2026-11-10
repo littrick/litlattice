@@ -194,6 +194,31 @@ impl SymbolMatch {
     }
 }
 
+/// `result.compareSymbolMatches`: equal when the line and symbol identity
+/// fields match (character/path/language are deliberately ignored).
+fn same_symbol(a: &SymbolMatch, b: &SymbolMatch) -> bool {
+    a.symbol.line == b.symbol.line
+        && a.symbol.name == b.symbol.name
+        && a.symbol.kind == b.symbol.kind
+        && a.symbol.parent == b.symbol.parent
+        && a.symbol.parent_kind == b.symbol.parent_kind
+}
+
+/// `result.DedupSymbols`: drop duplicates among **adjacent** entries.
+///
+/// The list is not sorted; only consecutive matches with the same line and
+/// symbol identity are removed.
+pub fn dedup_symbols(symbols: Vec<SymbolMatch>) -> Vec<SymbolMatch> {
+    let mut dedup: Vec<SymbolMatch> = Vec::with_capacity(symbols.len());
+    for symbol in symbols {
+        let duplicate = dedup.last().is_some_and(|last| same_symbol(&symbol, last));
+        if !duplicate {
+            dedup.push(symbol);
+        }
+    }
+    dedup
+}
+
 /// `result.FileMatch`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FileMatch {
