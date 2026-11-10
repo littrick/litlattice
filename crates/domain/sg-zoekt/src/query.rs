@@ -5,6 +5,13 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use sg_search_query::basic::{Basic, RepoHasFileContentArgs};
+use sg_search_query::fields::{FIELD_FILE, FIELD_LANG};
+use sg_search_query::labels::Labels;
+use sg_search_query::node::{Node, OperatorKind};
+
+use crate::go_regexp::{self, Literal};
+use crate::languages;
 use crate::proto;
 use crate::proto::q;
 
@@ -266,6 +273,333 @@ fn flatten(query: Query) -> (Query, bool) {
             )
         }
         other => (other, false),
+    }
+}
+
+// -------------------------------------------------- query conversion
+//
+// `internal/search/zoekt/query.go`: `QueryToZoektQuery` and its helpers.
+
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Error::InvalidRegexp { pattern, message } => {
+                write!(f, "invalid regexp {pattern:?}: {message}")
+            }
+            Error::Predicate(message) => write!(f, "{message}"),
+            Error::BrokenInvariant(message) => write!(f, "broken invariant: {message}"),
+        }
+    }
+}
+
+impl std::error::Error for Error {}
+
+impl Error {
+    fn invalid_regexp(pattern: &str, message: impl Into<String>) -> Error {
+        Error::InvalidRegexp {
+            pattern: pattern.to_owned(),
+            message: message.into(),
+        }
+    }
+}
+
+/// Failure converting a Sourcegraph query to a zoekt query.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Error {
+    /// `regexp/syntax.Parse` rejected a pattern.
+    InvalidRegexp { pattern: String, message: String },
+    /// A typed predicate's arguments did not parse. The baseline panics; the
+    /// port propagates the error instead.
+    Predicate(String),
+    /// A node kind the conversion does not handle (`toZoektPattern`'s
+    /// unreachable branches).
+    BrokenInvariant(String),
+}
+
+/// `result.Types` bitset. Only the bits the conversion observes are modeled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ResultTypes(u16);
+
+impl ResultTypes {
+    /// `result.TypeRepo`.
+    pub const REPO: u16 = 1;
+    /// `result.TypeSymbol`.
+    pub const SYMBOL: u16 = 2;
+    /// `result.TypeFile`.
+    pub const FILE: u16 = 4;
+    /// `result.TypePath`.
+    pub const PATH: u16 = 8;
+    /// `result.TypeDiff`.
+    pub const DIFF: u16 = 16;
+    /// `result.TypeCommit`.
+    pub const COMMIT: u16 = 32;
+    /// `result.TypeStructural`.
+    pub const STRUCTURAL: u16 = 64;
+
+    /// `Types.Has`.
+    pub fn has(self, kind: u16) -> bool {
+        self.0 & kind != 0
+    }
+
+    /// `Types.With`.
+    pub fn with(self, kind: u16) -> ResultTypes {
+        ResultTypes(self.0 | kind)
+    }
+
+    /// The default when a query has no `type:` filters:
+    /// `TypeFile | TypePath | TypeRepo`.
+    pub fn file_path_repo() -> ResultTypes {
+        ResultTypes(Self::FILE | Self::PATH | Self::REPO)
+    }
+
+    /// `type:file` with no path matches.
+    pub fn file_only() -> ResultTypes {
+        ResultTypes(Self::FILE)
+    }
+
+    /// `type:path` with no content matches.
+    pub fn path_only() -> ResultTypes {
+        ResultTypes(Self::PATH)
+    }
+}
+
+/// `search.Features` bits the conversion reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Features {
+    /// `ContentBasedLangFilters`: use zoekt's native `Language` filters instead
+    /// of file regexps.
+    pub content_based_lang_filters: bool,
+}
+
+/// `search.IndexedRequestType`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum IndexedRequestType {
+    /// `search.TextRequest`.
+    #[default]
+    Text,
+    /// `search.SymbolRequest`.
+    Symbol,
+}
+
+/// `QueryToZoektQuery`: convert one basic query to a zoekt query.
+///
+/// Result types drive whether a pattern matches file paths, content, or both
+/// (see `toZoektPattern`). Excluded languages and files become `Not` nodes;
+/// `repo:has.*` filters become typed (repo-scoped) child queries.
+pub fn from_basic(
+    basic: &Basic,
+    result_types: ResultTypes,
+    features: &Features,
+    indexed_request_type: IndexedRequestType,
+) -> Result<Query, Error> {
+    let is_case_sensitive = basic.is_case_sensitive();
+
+    let mut and = Vec::new();
+    if let Some(pattern) = &basic.pattern {
+        and.push(to_zoekt_pattern(
+            pattern,
+            is_case_sensitive,
+            result_types.has(ResultTypes::FILE),
+            result_types.has(ResultTypes::PATH),
+            indexed_request_type,
+        )?);
+    }
+
+    // `file:` and `-file:` filters.
+    let (files_include, files_exclude) = basic.include_exclude_values(FIELD_FILE);
+
+    // `lang:` and `-lang:` filters. By default a language becomes a
+    // case-insensitive file regexp; with content-based detection it becomes a
+    // native zoekt `Language` filter.
+    let (lang_include, lang_exclude) = basic.include_exclude_values(FIELD_LANG);
+    if features.content_based_lang_filters {
+        for lang in &lang_include {
+            and.push(to_lang_filter(lang));
+        }
+        for lang in &lang_exclude {
+            and.push(Query::Not(Box::new(to_lang_filter(lang))));
+        }
+    } else {
+        let include: Vec<String> = lang_include
+            .iter()
+            .map(|lang| languages::lang_to_file_regexp(lang))
+            .collect();
+        let exclude: Vec<String> = lang_exclude
+            .iter()
+            .map(|lang| languages::lang_to_file_regexp(lang))
+            .collect();
+        and.extend(to_file_filters(&include, &exclude, false)?);
+    }
+
+    and.extend(to_file_filters(
+        &files_include,
+        &files_exclude,
+        is_case_sensitive,
+    )?);
+
+    let mut repo_has_filters = Vec::new();
+    for filter in basic.repo_has_file_content().map_err(Error::Predicate)? {
+        repo_has_filters.push(query_for_file_content_args(&filter, is_case_sensitive));
+    }
+    if !repo_has_filters.is_empty() {
+        and.push(Query::And(repo_has_filters));
+    }
+
+    Ok(Query::And(and).simplify())
+}
+
+/// `toLangFilter`.
+fn to_lang_filter(lang: &str) -> Query {
+    Query::Language(languages::get_language_by_name_or_alias(lang).to_owned())
+}
+
+/// `toFileFilters`: convert file regexp patterns to zoekt file filters.
+fn to_file_filters(
+    files_include: &[String],
+    files_exclude: &[String],
+    is_case_sensitive: bool,
+) -> Result<Vec<Query>, Error> {
+    let mut filters = Vec::new();
+    for pattern in files_include {
+        filters.push(parse_re(pattern, true, false, is_case_sensitive)?);
+    }
+    if !files_exclude.is_empty() {
+        let union = languages::union_regexps(files_exclude);
+        let query = parse_re(&union, true, false, is_case_sensitive)?;
+        filters.push(Query::Not(Box::new(query)));
+    }
+    Ok(filters)
+}
+
+/// `QueryForFileContentArgs`: path/content regexps scoped to repository
+/// matches, optionally negated.
+fn query_for_file_content_args(opt: &RepoHasFileContentArgs, case_sensitive: bool) -> Query {
+    let mut children = Vec::new();
+    if !opt.path.is_empty() {
+        children.push(Query::Regexp {
+            regexp: opt.path.clone(),
+            file_name: true,
+            content: false,
+            case_sensitive,
+        });
+    }
+    if !opt.content.is_empty() {
+        children.push(Query::Regexp {
+            regexp: opt.content.clone(),
+            file_name: false,
+            content: true,
+            case_sensitive,
+        });
+    }
+    let mut query = Query::Type {
+        child: Box::new(Query::And(children)),
+        kind: TypeKind::Repo,
+    };
+    if opt.negated {
+        query = Query::Not(Box::new(query));
+    }
+    query.simplify()
+}
+
+/// `toZoektPattern`: fold a pattern AST into a zoekt query.
+fn to_zoekt_pattern(
+    expression: &Node,
+    is_case_sensitive: bool,
+    pattern_matches_content: bool,
+    pattern_matches_path: bool,
+    typ: IndexedRequestType,
+) -> Result<Query, Error> {
+    match expression {
+        Node::Operator(operator) => {
+            let mut children = Vec::with_capacity(operator.operands.len());
+            for operand in &operator.operands {
+                children.push(to_zoekt_pattern(
+                    operand,
+                    is_case_sensitive,
+                    pattern_matches_content,
+                    pattern_matches_path,
+                    typ,
+                )?);
+            }
+            match operator.kind {
+                OperatorKind::Or => Ok(Query::Or(children)),
+                OperatorKind::And => Ok(Query::And(children)),
+                OperatorKind::Concat => Err(Error::BrokenInvariant(format!(
+                    "don't know what to do with node {:?} in toZoektPattern",
+                    operator.kind
+                ))),
+            }
+        }
+        Node::Pattern(pattern) => {
+            let file_name_only = pattern_matches_path && !pattern_matches_content;
+            let content_only = !pattern_matches_path && pattern_matches_content;
+
+            let mut query = parse_re(
+                &pattern.regexp_pattern(),
+                file_name_only,
+                content_only,
+                is_case_sensitive,
+            )?;
+
+            if typ == IndexedRequestType::Symbol {
+                query = Query::Symbol(Box::new(query));
+            }
+            if pattern.negated {
+                query = Query::Not(Box::new(query));
+            }
+            if pattern.annotation.labels.is_set(Labels::BOOST) {
+                query = Query::Boost {
+                    child: Box::new(query),
+                    boost: ZOEKT_SCORE_BOOST,
+                };
+            }
+            Ok(query)
+        }
+        Node::Parameter(_) => Err(Error::BrokenInvariant(
+            "don't know what to do with node Parameter in toZoektPattern".to_owned(),
+        )),
+    }
+}
+
+/// `zoektquery.ParseRe`: parse a pattern and classify it as a substring when
+/// the Go regexp parser would produce `OpLiteral`. Literal detection happens
+/// after `OptimizeRegexp`, which is why capturing groups can still become
+/// substrings.
+fn parse_re(
+    pattern: &str,
+    file_name_only: bool,
+    content_only: bool,
+    case_sensitive: bool,
+) -> Result<Query, Error> {
+    match go_regexp::parse(pattern) {
+        Ok(Literal::Empty) => Ok(Query::Regexp {
+            regexp: String::new(),
+            file_name: file_name_only,
+            content: content_only,
+            case_sensitive,
+        }),
+        Ok(Literal::Literal { text, .. }) => Ok(Query::Substring {
+            pattern: text,
+            case_sensitive,
+            file_name: file_name_only,
+            content: content_only,
+        }),
+        Ok(Literal::NonLiteral) => {
+            go_regexp::validate(pattern)
+                .map_err(|message| Error::invalid_regexp(pattern, message))?;
+            Ok(Query::Regexp {
+                regexp: pattern.to_owned(),
+                file_name: file_name_only,
+                content: content_only,
+                case_sensitive,
+            })
+        }
+        Err(go_regexp::InvalidSyntax) => {
+            let message = go_regexp::validate(pattern)
+                .err()
+                .unwrap_or_else(|| "invalid regular expression".to_owned());
+            Err(Error::invalid_regexp(pattern, message))
+        }
     }
 }
 
@@ -532,5 +866,153 @@ mod tests {
             panic!("expected file name set");
         };
         assert_eq!(names.set, vec!["a.go", "b.go", "c.go"]);
+    }
+
+    // ------------------------------------------------ from_basic (baseline
+    // `internal/search/zoekt/query_test.go`)
+
+    use sg_search_query::parse_regexp;
+    use sg_search_query::transformer::to_basic_query;
+
+    fn convert(
+        input: &str,
+        result_types: ResultTypes,
+        features: Features,
+        typ: IndexedRequestType,
+    ) -> Query {
+        let nodes = parse_regexp(input).unwrap_or_else(|err| panic!("{input:?}: {err}"));
+        let basic = to_basic_query(&nodes).unwrap_or_else(|err| panic!("{input:?}: {err}"));
+        from_basic(&basic, result_types, &features, typ)
+            .unwrap_or_else(|err| panic!("{input:?}: {err}"))
+    }
+
+    fn regexp(pattern: &str, file_name: bool, content: bool, case_sensitive: bool) -> Query {
+        Query::Regexp {
+            regexp: pattern.to_owned(),
+            file_name,
+            content,
+            case_sensitive,
+        }
+    }
+
+    fn substring(pattern: &str, file_name: bool, content: bool, case_sensitive: bool) -> Query {
+        Query::Substring {
+            pattern: pattern.to_owned(),
+            case_sensitive,
+            file_name,
+            content,
+        }
+    }
+
+    #[test]
+    fn converts_plain_literals_with_result_type_scoping() {
+        assert_eq!(
+            convert(
+                "foo patterntype:regexp",
+                ResultTypes::file_path_repo(),
+                Features::default(),
+                IndexedRequestType::Text,
+            ),
+            substring("foo", false, false, false)
+        );
+        assert_eq!(
+            convert(
+                "test type:path",
+                ResultTypes::path_only(),
+                Features::default(),
+                IndexedRequestType::Text,
+            ),
+            substring("test", true, false, false)
+        );
+        assert_eq!(
+            convert(
+                "test type:file patterntype:literal",
+                ResultTypes::file_only(),
+                Features::default(),
+                IndexedRequestType::Text,
+            ),
+            substring("test", false, true, false)
+        );
+        assert_eq!(
+            convert(
+                "foo case:yes",
+                ResultTypes::file_path_repo(),
+                Features::default(),
+                IndexedRequestType::Text,
+            ),
+            substring("foo", false, false, true)
+        );
+    }
+
+    #[test]
+    fn converts_file_filters_and_languages() {
+        assert_eq!(
+            convert(
+                r"file:\.go$",
+                ResultTypes::file_path_repo(),
+                Features::default(),
+                IndexedRequestType::Text,
+            ),
+            regexp(r"\.go$", true, false, false)
+        );
+        // Language filters are file regexps and stay case insensitive.
+        assert_eq!(
+            convert(
+                "lang:go",
+                ResultTypes::file_path_repo(),
+                Features::default(),
+                IndexedRequestType::Text,
+            ),
+            regexp(r"(?i)\.go$", true, false, false)
+        );
+        // With content-based detection they are native Language nodes.
+        assert_eq!(
+            convert(
+                "lang:go lang:typescript -lang:markdown",
+                ResultTypes::file_path_repo(),
+                Features {
+                    content_based_lang_filters: true,
+                },
+                IndexedRequestType::Text,
+            ),
+            Query::And(vec![
+                Query::Language("Go".to_owned()),
+                Query::Language("TypeScript".to_owned()),
+                Query::Not(Box::new(Query::Language("Markdown".to_owned()))),
+            ])
+        );
+    }
+
+    #[test]
+    fn converts_repo_has_filters() {
+        assert_eq!(
+            convert(
+                "repo:has.content(foo)",
+                ResultTypes::file_path_repo(),
+                Features::default(),
+                IndexedRequestType::Text,
+            ),
+            Query::Type {
+                child: Box::new(regexp("foo", false, true, false)),
+                kind: TypeKind::Repo,
+            }
+        );
+    }
+
+    #[test]
+    fn wraps_symbol_requests_and_reports_invalid_patterns() {
+        assert_eq!(
+            convert(
+                "foo",
+                ResultTypes::file_path_repo(),
+                Features::default(),
+                IndexedRequestType::Symbol,
+            ),
+            Query::Symbol(Box::new(substring("foo", false, false, false)))
+        );
+        assert!(matches!(
+            parse_re("[", true, false, false),
+            Err(Error::InvalidRegexp { .. })
+        ));
     }
 }

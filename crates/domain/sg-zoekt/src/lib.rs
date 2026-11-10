@@ -10,6 +10,8 @@
 //! (`v0.0.0-20240808144359-20c496e3680f`).
 
 pub mod client;
+pub mod go_regexp;
+pub mod languages;
 pub mod proto;
 pub mod query;
 pub mod types;
