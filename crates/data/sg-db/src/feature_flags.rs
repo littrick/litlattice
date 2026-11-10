@@ -130,6 +130,26 @@ impl FeatureFlagOverride {
     }
 }
 
+/// One of `featureflag.FeatureFlagBool` / `FeatureFlagRollout` as accepted by
+/// the create/update mutations (`CreateBool` / `CreateRollout`,
+/// `internal/database/feature_flags.go:157-176`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FeatureFlagKind {
+    Bool(bool),
+    Rollout(i32),
+}
+
+impl FeatureFlagKind {
+    /// `(flag_type, bool_value, rollout)` as the baseline spreads them into
+    /// the INSERT/UPDATE statements.
+    fn columns(self) -> (&'static str, Option<bool>, Option<i32>) {
+        match self {
+            Self::Bool(value) => ("bool", Some(value), None),
+            Self::Rollout(rollout) => ("rollout", None, Some(rollout)),
+        }
+    }
+}
+
 /// `flag_name, flag_type, bool_value, rollout, created_at, updated_at`.
 type FeatureFlagRow = (
     String,
@@ -167,6 +187,113 @@ pub async fn get_feature_flag(pool: &PgPool, name: &str) -> Result<FeatureFlag, 
     FeatureFlag::from_columns(
         name, &flag_type, bool_value, rollout, created_at, updated_at,
     )
+}
+
+/// `INSERT ... RETURNING` shared by the create/update mutations
+/// (`internal/database/feature_flags.go:70-112`). The baseline also returns
+/// `deleted_at`; it is always `NULL` for a freshly created/updated row and is
+/// not part of the GraphQL object, so it is not selected here.
+const CREATE_FEATURE_FLAG: &str = r#"
+INSERT INTO feature_flags (
+	flag_name,
+	flag_type,
+	bool_value,
+	rollout
+) VALUES (
+	$1,
+	$2::feature_flag_type,
+	$3,
+	$4
+) RETURNING
+	flag_name,
+	flag_type::text,
+	bool_value,
+	rollout,
+	created_at,
+	updated_at
+"#;
+
+/// `featureFlagStore.CreateFeatureFlag`.
+pub async fn create_feature_flag(
+    pool: &PgPool,
+    name: &str,
+    kind: FeatureFlagKind,
+) -> Result<FeatureFlag, FeatureFlagError> {
+    let (flag_type, bool_value, rollout) = kind.columns();
+    let (name, flag_type, bool_value, rollout, created_at, updated_at): FeatureFlagRow =
+        sqlx::query_as(CREATE_FEATURE_FLAG)
+            .bind(name)
+            .bind(flag_type)
+            .bind(bool_value)
+            .bind(rollout)
+            .fetch_one(pool)
+            .await?;
+    FeatureFlag::from_columns(
+        name, &flag_type, bool_value, rollout, created_at, updated_at,
+    )
+}
+
+/// `UPDATE ... RETURNING` for
+/// `internal/database/feature_flags.go:114-155`. `updated_at = NOW()` mirrors
+/// the baseline; a missing row yields no `RETURNING` row, i.e. the baseline's
+/// `sql.ErrNoRows`.
+const UPDATE_FEATURE_FLAG: &str = r#"
+UPDATE feature_flags
+SET
+	flag_type = $1::feature_flag_type,
+	bool_value = $2,
+	rollout = $3,
+	updated_at = NOW()
+WHERE flag_name = $4
+RETURNING
+	flag_name,
+	flag_type::text,
+	bool_value,
+	rollout,
+	created_at,
+	updated_at
+"#;
+
+/// `featureFlagStore.UpdateFeatureFlag`.
+pub async fn update_feature_flag(
+    pool: &PgPool,
+    name: &str,
+    kind: FeatureFlagKind,
+) -> Result<FeatureFlag, FeatureFlagError> {
+    let (flag_type, bool_value, rollout) = kind.columns();
+    let row: Option<FeatureFlagRow> = sqlx::query_as(UPDATE_FEATURE_FLAG)
+        .bind(flag_type)
+        .bind(bool_value)
+        .bind(rollout)
+        .bind(name)
+        .fetch_optional(pool)
+        .await?;
+    let (name, flag_type, bool_value, rollout, created_at, updated_at) =
+        row.ok_or(FeatureFlagError::NotFound)?;
+    FeatureFlag::from_columns(
+        name, &flag_type, bool_value, rollout, created_at, updated_at,
+    )
+}
+
+/// `featureFlagStore.DeleteFeatureFlag`
+/// (`internal/database/feature_flags.go:157-168`): soft delete by renaming the
+/// row with a random suffix and setting `deleted_at`. As in the baseline, a
+/// missing row affects zero rows and is not an error.
+const DELETE_FEATURE_FLAG: &str = r#"
+UPDATE feature_flags
+SET
+	flag_name = flag_name || '-DELETED-' || TRUNC(random() * 1000000)::varchar(255),
+	deleted_at = now()
+WHERE flag_name = $1
+"#;
+
+/// `featureFlagStore.DeleteFeatureFlag`.
+pub async fn delete_feature_flag(pool: &PgPool, name: &str) -> Result<(), FeatureFlagError> {
+    sqlx::query(DELETE_FEATURE_FLAG)
+        .bind(name)
+        .execute(pool)
+        .await?;
+    Ok(())
 }
 
 /// `featureFlagStore.GetFeatureFlags` (`internal/database/feature_flags.go:247-276`):

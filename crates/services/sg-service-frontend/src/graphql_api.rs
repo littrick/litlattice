@@ -724,6 +724,24 @@ impl GraphqlDeps for SchemaGraphqlDeps {
         for (field, outcome) in temporary_settings_writes {
             mutation = mutation.with_temporary_settings(field, outcome);
         }
+        // `Mutation.createFeatureFlag` / `updateFeatureFlag` /
+        // `deleteFeatureFlag`: site-admin gated writes through the
+        // `feature_flags` table (`feature_flags.go:236-288`).
+        if let (Some(store), Some(namespaces)) = (&self.feature_flags, &self.org_memberships) {
+            if is_mutation {
+                let outcomes = crate::feature_flag_mutations::prefetch_feature_flag_mutations(
+                    store.as_ref(),
+                    namespaces.as_ref(),
+                    &fields,
+                    request.actor,
+                    site_admin,
+                )
+                .await;
+                for (field, outcome) in outcomes {
+                    mutation = mutation.with_feature_flag_mutation(field, outcome);
+                }
+            }
+        }
         let nodes = match (&self.org_memberships, &self.repositories) {
             (Some(memberships_store), Some(repositories)) => {
                 crate::graphql_resolvers::prefetch_node_roots(

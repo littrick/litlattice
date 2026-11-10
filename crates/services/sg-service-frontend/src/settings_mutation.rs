@@ -78,9 +78,23 @@ pub struct MutationRoot {
     /// `editTemporarySettings` outcomes
     /// (`crate::temporary_settings::prefetch_temporary_settings_mutations`).
     temporary_settings: HashMap<String, Result<(), String>>,
+    /// `Mutation.createFeatureFlag` / `updateFeatureFlag` /
+    /// `deleteFeatureFlag` outcomes
+    /// (`crate::feature_flag_mutations::prefetch_feature_flag_mutations`).
+    feature_flags: HashMap<String, crate::feature_flag_mutations::FeatureFlagMutationOutcome>,
 }
 
 impl MutationRoot {
+    /// Attach a prefetched feature-flag mutation outcome.
+    pub fn with_feature_flag_mutation(
+        mut self,
+        field: impl Into<String>,
+        outcome: crate::feature_flag_mutations::FeatureFlagMutationOutcome,
+    ) -> Self {
+        self.feature_flags.insert(field.into(), outcome);
+        self
+    }
+
     /// Attach a prefetched temporary-settings write outcome.
     pub fn with_temporary_settings(
         mut self,
@@ -144,6 +158,31 @@ impl ObjectValue for MutationRoot {
                 Some(Err(message)) => Err(ExecError::new(message.clone())),
                 None => Ok(None),
             },
+            // `schemaResolver.CreateFeatureFlag` / `UpdateFeatureFlag` return
+            // the written flag (union `FeatureFlag`); `DeleteFeatureFlag`
+            // returns a non-nil `&EmptyResponse{}`.
+            "createFeatureFlag" | "updateFeatureFlag" | "deleteFeatureFlag" => {
+                match self.feature_flags.get(field) {
+                    Some(crate::feature_flag_mutations::FeatureFlagMutationOutcome::Flag(
+                        data,
+                        registry,
+                    )) => Ok(Some(FieldValue::Object(Arc::new(
+                        crate::graphql_resolvers::FeatureFlagObject::new(
+                            (**data).clone(),
+                            registry.clone(),
+                        ),
+                    )))),
+                    Some(crate::feature_flag_mutations::FeatureFlagMutationOutcome::Empty) => {
+                        Ok(Some(FieldValue::Object(Arc::new(
+                            crate::temporary_settings::EmptyResponseObject,
+                        ))))
+                    }
+                    Some(crate::feature_flag_mutations::FeatureFlagMutationOutcome::Error(
+                        message,
+                    )) => Err(ExecError::new(message.clone())),
+                    None => Ok(None),
+                }
+            }
             // `schemaResolver.LogUserEvent` has been a no-op since PR 38826.
             "logUserEvent" => Ok(Some(FieldValue::Null)),
             // `OverwriteTemporarySettings` / `EditTemporarySettings` return a

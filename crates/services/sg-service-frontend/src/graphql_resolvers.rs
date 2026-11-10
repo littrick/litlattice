@@ -22,7 +22,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use base64::Engine;
-use sg_db::feature_flags::{FeatureFlag, FeatureFlagOverride};
+use sg_db::feature_flags::{FeatureFlag, FeatureFlagKind, FeatureFlagOverride};
 use sg_graphql::exec::{
     Actor, Arguments, ExecError, FieldValue, ObjectValue, RootField, RootResolver,
 };
@@ -4130,14 +4130,26 @@ fn go_url_path(path: &str) -> String {
     escaped
 }
 
-/// The database seam for `Query.featureFlags` / `Query.featureFlag`
-/// (`internal/database/feature_flags.go:228-276,372-390`). `Ok(None)` is the
-/// baseline's `sql.ErrNoRows`; every other failure is surfaced verbatim.
+/// The database seam for `Query.featureFlags` / `Query.featureFlag` and the
+/// create/update/delete mutations (`internal/database/feature_flags.go`).
+/// `Ok(None)` is the baseline's `sql.ErrNoRows`; every other failure is
+/// surfaced verbatim.
 #[async_trait]
 pub trait FeatureFlagStore: Send + Sync {
     async fn get_feature_flag(&self, name: &str) -> Result<Option<FeatureFlag>, String>;
     async fn get_feature_flags(&self) -> Result<Vec<FeatureFlag>, String>;
     async fn get_overrides_for_flag(&self, name: &str) -> Result<Vec<FeatureFlagOverride>, String>;
+    async fn create_feature_flag(
+        &self,
+        name: &str,
+        kind: FeatureFlagKind,
+    ) -> Result<FeatureFlag, String>;
+    async fn update_feature_flag(
+        &self,
+        name: &str,
+        kind: FeatureFlagKind,
+    ) -> Result<FeatureFlag, String>;
+    async fn delete_feature_flag(&self, name: &str) -> Result<(), String>;
 }
 
 /// One `FeatureFlagOverride` plus the prefetched `namespace` lookup
@@ -4306,7 +4318,7 @@ pub async fn prefetch_feature_flags(
 /// Load one flag's overrides and their `User`/`Org` namespaces. An overrides
 /// query failure is kept for the `overrides` field; a missing namespace is
 /// the baseline's `UserByIDInt32`/`OrgByIDInt32` error.
-async fn feature_flag_data(
+pub(crate) async fn feature_flag_data(
     flags_store: &dyn FeatureFlagStore,
     namespaces: &dyn OrgMembershipsStore,
     flag: FeatureFlag,
@@ -4381,6 +4393,12 @@ fn marshal_feature_flag_override_id(
 pub struct FeatureFlagObject {
     data: FeatureFlagData,
     registry: Arc<FeatureFlagRegistry>,
+}
+
+impl FeatureFlagObject {
+    pub(crate) fn new(data: FeatureFlagData, registry: Arc<FeatureFlagRegistry>) -> Self {
+        Self { data, registry }
+    }
 }
 
 impl ObjectValue for FeatureFlagObject {

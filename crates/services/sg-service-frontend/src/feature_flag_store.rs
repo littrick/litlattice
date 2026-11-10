@@ -2,14 +2,16 @@
 
 //! Production adapter for [`crate::graphql_resolvers::FeatureFlagStore`]:
 //! `db.FeatureFlags().GetFeatureFlag` / `GetFeatureFlags` /
-//! `GetOverridesForFlag` (`internal/database/feature_flags.go:228-276,372-390`).
+//! `GetOverridesForFlag` / `CreateFeatureFlag` / `UpdateFeatureFlag` /
+//! `DeleteFeatureFlag` (`internal/database/feature_flags.go`).
 
 use async_trait::async_trait;
 use sqlx::PgPool;
 
 use crate::graphql_resolvers::FeatureFlagStore;
 use sg_db::feature_flags::{
-    get_feature_flag, get_feature_flags, get_overrides_for_flag, FeatureFlag, FeatureFlagError,
+    create_feature_flag, delete_feature_flag, get_feature_flag, get_feature_flags,
+    get_overrides_for_flag, update_feature_flag, FeatureFlag, FeatureFlagError, FeatureFlagKind,
     FeatureFlagOverride,
 };
 
@@ -48,6 +50,32 @@ impl FeatureFlagStore for PgFeatureFlagStore {
 
     async fn get_overrides_for_flag(&self, name: &str) -> Result<Vec<FeatureFlagOverride>, String> {
         get_overrides_for_flag(&self.pool, name)
+            .await
+            .map_err(error_text)
+    }
+
+    async fn create_feature_flag(
+        &self,
+        name: &str,
+        kind: FeatureFlagKind,
+    ) -> Result<FeatureFlag, String> {
+        create_feature_flag(&self.pool, name, kind)
+            .await
+            .map_err(error_text)
+    }
+
+    async fn update_feature_flag(
+        &self,
+        name: &str,
+        kind: FeatureFlagKind,
+    ) -> Result<FeatureFlag, String> {
+        update_feature_flag(&self.pool, name, kind)
+            .await
+            .map_err(error_text)
+    }
+
+    async fn delete_feature_flag(&self, name: &str) -> Result<(), String> {
+        delete_feature_flag(&self.pool, name)
             .await
             .map_err(error_text)
     }
