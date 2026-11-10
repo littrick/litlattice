@@ -12,11 +12,13 @@
 pub mod aggregate;
 pub mod cached;
 pub mod client;
+pub mod dialer;
 pub mod file_ranking;
 pub mod go_regexp;
 pub mod horizontal;
 pub mod index_options;
 pub mod indexed_repo_revs;
+pub mod indexers;
 pub mod languages;
 pub mod metered;
 pub mod proto;
