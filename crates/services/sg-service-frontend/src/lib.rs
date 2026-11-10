@@ -33,6 +33,7 @@ pub mod search_stream;
 pub mod service;
 pub mod service_connections;
 pub mod session_auth;
+pub mod settings_merge;
 pub mod site_config_file;
 pub mod tenant;
 pub mod trace_headers;

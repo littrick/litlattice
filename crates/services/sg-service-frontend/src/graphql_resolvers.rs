@@ -28,6 +28,8 @@ use sg_graphql::exec::{
 use sg_graphql::json::Json;
 use time::{OffsetDateTime, UtcOffset};
 
+use crate::settings_merge::{final_settings, DEFAULT_SETTINGS_CONTENTS};
+
 /// The `users` row fields the DB-backed `User` resolvers read, plus the
 /// primary `user_emails.email` (`userEmailsStore.GetPrimaryEmail`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -578,9 +580,12 @@ pub enum LatestSettingsLookup {
 }
 
 /// The checked `SettingsSubject` a `Query.settingsSubject` or
-/// `Settings.subject` resolves to (`settings_subject.go:93-123`).
+/// `Settings.subject` resolves to (`settings_subject.go:93-123`). `Default`
+/// is only reachable through `SettingsCascade.subjects`
+/// (`defaultSettingsResolver`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SettingsSubjectData {
+    Default,
     User(UserData),
     Org(OrgData),
     Site,
@@ -591,6 +596,57 @@ pub enum SettingsSubjectData {
 pub enum SettingsSubjectLookup {
     Found(SettingsSubjectData),
     Error(String),
+}
+
+/// The subject a `settingsCascade` belongs to (`settings_cascade.go:17-28`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CascadeKey {
+    Default,
+    Site,
+    User(i32),
+    Org(i32),
+}
+
+/// One entry of `SettingsCascade.subjects`: the checked subject and its
+/// prefetched `latestSettings` (`resolversForSubjects`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CascadeSubjectEntry {
+    pub subject: SettingsSubjectData,
+    pub latest: LatestSettingsLookup,
+}
+
+/// `settings.Final`: the merged JSON string or the error it would report.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CascadeFinalLookup {
+    Found(String),
+    Error(String),
+}
+
+/// A prefetched `settingsCascade` (`settings_cascade.go:17-99`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SettingsCascadeData {
+    pub entries: Vec<CascadeSubjectEntry>,
+    pub final_lookup: CascadeFinalLookup,
+}
+
+/// A prefetched `SettingsCascade` result, keyed by [`CascadeKey`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CascadeLookup {
+    Found(SettingsCascadeData),
+    Error(String),
+}
+
+/// `defaultSettingsResolver`'s synthetic `latestSettings` row
+/// (`default_settings.go:35-45`): ID 0, Go zero `createdAt`, no author.
+fn default_settings_data() -> SettingsData {
+    SettingsData {
+        id: 0,
+        contents: DEFAULT_SETTINGS_CONTENTS.to_owned(),
+        // 0001-01-01T00:00:00Z, Go's `time.Time{}`.
+        created_at: OffsetDateTime::from_unix_timestamp(-62_135_596_800)
+            .expect("0001-01-01 is representable"),
+        author_user_id: None,
+    }
 }
 
 /// Data for nested resolver fields that need their own async lookups,
@@ -615,6 +671,8 @@ pub struct NestedPrefetch {
     pub site_latest_settings: Option<LatestSettingsLookup>,
     /// `Query.settingsSubject` results keyed by the raw Relay ID.
     pub settings_subjects: HashMap<String, SettingsSubjectLookup>,
+    /// Prefetched `settingsCascade` values keyed by subject.
+    pub settings_cascades: HashMap<CascadeKey, CascadeLookup>,
 }
 
 /// The database seam for `User.organizations` (`db.Orgs().GetByUserID` plus
@@ -651,6 +709,169 @@ fn org_access_error(actor: Actor) -> &'static str {
         Actor::Anonymous => "not authenticated",
         Actor::User { .. } => "current user is not an org member",
     }
+}
+
+/// `settings.RelevantSubjects` + `settings.Final` + `resolversForSubjects`
+/// (`internal/settings/settings.go:137-290`,
+/// `cmd/frontend/graphqlbackend/settings_cascade.go:30-58`): builds the
+/// ordered subject list, fetches each subject's latest settings (filling the
+/// shared `latest_settings`/`org_latest_settings`/`site_latest_settings`
+/// maps), prefetches the authors, and computes the merged `final` JSON.
+// The data is fetched once per cascade key; the long parameter list mirrors
+// the stores each branch needs.
+#[allow(clippy::too_many_arguments)]
+async fn prefetch_cascade(
+    user_orgs: &dyn UserOrganizationsStore,
+    memberships: &dyn OrgMembershipsStore,
+    key: CascadeKey,
+    known_user: Option<&UserData>,
+    known_org: Option<&OrgData>,
+    nested: &mut NestedPrefetch,
+    viewer_uid: i32,
+    viewer_site_admin: bool,
+    actor: Actor,
+) -> CascadeLookup {
+    let mut subjects: Vec<SettingsSubjectData> = vec![SettingsSubjectData::Default];
+    let mut latest: Vec<LatestSettingsLookup> =
+        vec![LatestSettingsLookup::Found(Some(default_settings_data()))];
+    if key != CascadeKey::Default {
+        let site_lookup = match nested.site_latest_settings.clone() {
+            Some(lookup) => lookup,
+            None => {
+                let lookup = match memberships.latest_settings_for_site().await {
+                    Ok(settings) => LatestSettingsLookup::Found(settings),
+                    Err(error) => LatestSettingsLookup::Error(error),
+                };
+                nested.site_latest_settings = Some(lookup.clone());
+                lookup
+            }
+        };
+        subjects.push(SettingsSubjectData::Site);
+        latest.push(site_lookup);
+    }
+    match key {
+        CascadeKey::Default | CascadeKey::Site => {}
+        CascadeKey::Org(org_id) => {
+            let org = match known_org {
+                Some(org) => org.clone(),
+                None => match memberships
+                    .org_by_id(org_id, viewer_uid, viewer_site_admin)
+                    .await
+                {
+                    Ok(org) => org,
+                    Err(error) => return CascadeLookup::Error(error),
+                },
+            };
+            let lookup = match nested.org_latest_settings.get(&org_id) {
+                Some(lookup) => lookup.clone(),
+                None => {
+                    let lookup = match memberships.latest_settings_for_org(org_id).await {
+                        Ok(settings) => LatestSettingsLookup::Found(settings),
+                        Err(error) => LatestSettingsLookup::Error(error),
+                    };
+                    nested.org_latest_settings.insert(org_id, lookup.clone());
+                    lookup
+                }
+            };
+            subjects.push(SettingsSubjectData::Org(org));
+            latest.push(lookup);
+        }
+        CascadeKey::User(user_id) => {
+            let user = match known_user {
+                Some(user) => user.clone(),
+                None => match memberships.user_by_id(user_id).await {
+                    Ok(user) => user,
+                    Err(error) => return CascadeLookup::Error(error),
+                },
+            };
+            // `db.Orgs().GetByUserID`, then the stable sort by id.
+            let mut orgs = match user_orgs
+                .organizations_for_user(user_id, viewer_uid, viewer_site_admin)
+                .await
+            {
+                Ok(orgs) => orgs,
+                Err(error) => return CascadeLookup::Error(error),
+            };
+            orgs.sort_by_key(|org| org.id);
+            for org in &orgs {
+                // `resolversForSubjects` runs
+                // `settingsSubjectForNodeAndCheckAccess` on every org.
+                if !org.viewer_can_administer {
+                    return CascadeLookup::Error(org_access_error(actor).to_owned());
+                }
+                let lookup = match nested.org_latest_settings.get(&org.id) {
+                    Some(lookup) => lookup.clone(),
+                    None => {
+                        let lookup = match memberships.latest_settings_for_org(org.id).await {
+                            Ok(settings) => LatestSettingsLookup::Found(settings),
+                            Err(error) => LatestSettingsLookup::Error(error),
+                        };
+                        nested.org_latest_settings.insert(org.id, lookup.clone());
+                        lookup
+                    }
+                };
+                subjects.push(SettingsSubjectData::Org(org.clone()));
+                latest.push(lookup);
+            }
+            let lookup = match nested.latest_settings.get(&user_id) {
+                Some(lookup) => lookup.clone(),
+                None => {
+                    let lookup = match memberships.latest_settings_for_user(user_id).await {
+                        Ok(settings) => LatestSettingsLookup::Found(settings),
+                        Err(error) => LatestSettingsLookup::Error(error),
+                    };
+                    nested.latest_settings.insert(user_id, lookup.clone());
+                    lookup
+                }
+            };
+            subjects.push(SettingsSubjectData::User(user));
+            latest.push(lookup);
+        }
+    }
+
+    let mut contents: Vec<Option<&str>> = Vec::with_capacity(latest.len());
+    for lookup in &latest {
+        match lookup {
+            LatestSettingsLookup::Found(Some(settings)) => {
+                contents.push(Some(settings.contents.as_str()))
+            }
+            LatestSettingsLookup::Found(None) => contents.push(None),
+            LatestSettingsLookup::Error(error) => {
+                return CascadeLookup::Error(error.clone());
+            }
+        }
+    }
+    let final_lookup = match final_settings(&contents) {
+        Ok(merged) => CascadeFinalLookup::Found(merged),
+        Err(error) => CascadeFinalLookup::Error(error),
+    };
+
+    // `Settings.author` for every subject in `subjects`.
+    for lookup in &latest {
+        let LatestSettingsLookup::Found(Some(settings)) = lookup else {
+            continue;
+        };
+        let Some(author_id) = settings.author_user_id else {
+            continue;
+        };
+        if nested.users_by_id.contains_key(&author_id) {
+            continue;
+        }
+        let author = match memberships.user_by_id(author_id).await {
+            Ok(user) => UserByIdLookup::Found(user),
+            Err(error) => UserByIdLookup::Error(error),
+        };
+        nested.users_by_id.insert(author_id, author);
+    }
+
+    CascadeLookup::Found(SettingsCascadeData {
+        entries: subjects
+            .into_iter()
+            .zip(latest)
+            .map(|(subject, latest)| CascadeSubjectEntry { subject, latest })
+            .collect(),
+        final_lookup,
+    })
 }
 
 /// Look up every `Query.organization` root field in `fields`, deduplicated by
@@ -770,10 +991,10 @@ pub async fn prefetch_nested(
     let mut user_queue: Vec<UserJob> = Vec::new();
     let mut org_queue: Vec<OrgJob> = Vec::new();
     let mut membership_queue: Vec<MembershipJob> = Vec::new();
-    // `Query.settingsSubject` results and the global (Site) settings row,
-    // populated below and moved onto `nested` after the field loop.
-    let mut settings_subjects: HashMap<String, SettingsSubjectLookup> = HashMap::new();
-    let mut site_latest_settings: Option<LatestSettingsLookup> = None;
+    // The prefetch is built incrementally: `Query.settingsSubject` results,
+    // the global (Site) settings row and the `settingsCascade` values are
+    // written straight into `nested` so later lookups can reuse them.
+    let mut nested = NestedPrefetch::default();
     let mut site_settings_fetched = false;
     let mut site_author_ids: Vec<i32> = Vec::new();
     for field in fields {
@@ -903,7 +1124,7 @@ pub async fn prefetch_nested(
                 let Some(id) = field.arguments.string("id") else {
                     continue;
                 };
-                if settings_subjects.contains_key(id) {
+                if nested.settings_subjects.contains_key(id) {
                     continue;
                 }
                 let Some(kind) = relay_kind(id) else {
@@ -977,24 +1198,68 @@ pub async fn prefetch_nested(
                                         site_author_ids.push(author_id);
                                     }
                                 }
-                                site_latest_settings = Some(lookup);
+                                nested.site_latest_settings = Some(lookup);
+                            }
+                            // `Site.SettingsCascade` (`site.go:161-171`):
+                            // no access check for the site subject.
+                            let wants_cascade = field.selections.iter().any(|selection| {
+                                matches!(
+                                    selection.name.as_str(),
+                                    "settingsCascade" | "configurationCascade"
+                                )
+                            });
+                            if wants_cascade
+                                && !nested.settings_cascades.contains_key(&CascadeKey::Site)
+                            {
+                                let cascade = prefetch_cascade(
+                                    store,
+                                    memberships_store,
+                                    CascadeKey::Site,
+                                    None,
+                                    None,
+                                    &mut nested,
+                                    viewer_uid(actor),
+                                    viewer_site_admin,
+                                    actor,
+                                )
+                                .await;
+                                nested.settings_cascades.insert(CascadeKey::Site, cascade);
                             }
                             SettingsSubjectLookup::Found(SettingsSubjectData::Site)
                         }
                     },
                     _ => SettingsSubjectLookup::Error("invalid id".to_owned()),
                 };
-                settings_subjects.insert(id.to_owned(), lookup);
+                nested.settings_subjects.insert(id.to_owned(), lookup);
+            }
+            // `Query.viewerSettings` (`settings_cascade.go:75-93`): the
+            // current user's subject, or the site subject when anonymous /
+            // the row is gone.
+            "viewerSettings" | "viewerConfiguration" => {
+                let key = match (actor, current_user) {
+                    (Actor::User { uid }, Some(user)) if user.id == uid => CascadeKey::User(uid),
+                    _ => CascadeKey::Site,
+                };
+                if !nested.settings_cascades.contains_key(&key) {
+                    let cascade = prefetch_cascade(
+                        store,
+                        memberships_store,
+                        key,
+                        current_user,
+                        None,
+                        &mut nested,
+                        viewer_uid(actor),
+                        viewer_site_admin,
+                        actor,
+                    )
+                    .await;
+                    nested.settings_cascades.insert(key, cascade);
+                }
             }
             _ => {}
         }
     }
 
-    let mut nested = NestedPrefetch {
-        settings_subjects,
-        site_latest_settings,
-        ..Default::default()
-    };
     for author_id in site_author_ids {
         if nested.users_by_id.contains_key(&author_id) {
             continue;
@@ -1124,6 +1389,36 @@ pub async fn prefetch_nested(
                     progress = true;
                 }
             }
+            // `User.SettingsCascade` (`user.go:391-401`): the same folded
+            // access check as `latestSettings`; the cascade is prefetched for
+            // the authorized viewer.
+            for _selection in job.selections.iter().filter(|selection| {
+                matches!(
+                    selection.name.as_str(),
+                    "settingsCascade" | "configurationCascade"
+                )
+            }) {
+                if !authorized {
+                    continue;
+                }
+                let key = CascadeKey::User(job.user.id);
+                if !nested.settings_cascades.contains_key(&key) {
+                    let cascade = prefetch_cascade(
+                        store,
+                        memberships_store,
+                        key,
+                        Some(&job.user),
+                        None,
+                        &mut nested,
+                        viewer_uid(actor),
+                        viewer_site_admin,
+                        actor,
+                    )
+                    .await;
+                    nested.settings_cascades.insert(key, cascade);
+                    progress = true;
+                }
+            }
         }
         // Org level: `Org.members`; every returned user whose `nodes`
         // selection is present becomes a user job (their `organizations` may
@@ -1189,6 +1484,35 @@ pub async fn prefetch_nested(
                         }
                     }
                     nested.org_latest_settings.insert(job.org.id, lookup);
+                    progress = true;
+                }
+            }
+            // `Org.SettingsCascade` (`org.go:194-204`): the org access check
+            // then the cascade for this org.
+            for _selection in job.selections.iter().filter(|selection| {
+                matches!(
+                    selection.name.as_str(),
+                    "settingsCascade" | "configurationCascade"
+                )
+            }) {
+                if !job.org.viewer_can_administer {
+                    continue;
+                }
+                let key = CascadeKey::Org(job.org.id);
+                if !nested.settings_cascades.contains_key(&key) {
+                    let cascade = prefetch_cascade(
+                        store,
+                        memberships_store,
+                        key,
+                        None,
+                        Some(&job.org),
+                        &mut nested,
+                        viewer_uid(actor),
+                        viewer_site_admin,
+                        actor,
+                    )
+                    .await;
+                    nested.settings_cascades.insert(key, cascade);
                     progress = true;
                 }
             }
@@ -1764,6 +2088,23 @@ impl ObjectValue for QueryRoot {
                     _ => Err(ExecError::new("invalid id")),
                 }
             }
+            // `schemaResolver.ViewerSettings` (`settings_cascade.go:75-93`):
+            // the current user's cascade, or the site cascade when anonymous
+            // (or the row disappeared).
+            "viewerSettings" | "viewerConfiguration" => {
+                let key = match (actor, &self.user) {
+                    (Actor::User { uid }, Some(user)) if user.data.id == uid => {
+                        CascadeKey::User(uid)
+                    }
+                    _ => CascadeKey::Site,
+                };
+                cascade_field(
+                    &self.nested,
+                    key,
+                    self.viewer_site_admin,
+                    field == "viewerConfiguration",
+                )
+            }
             _ => Ok(None),
         }
     }
@@ -1970,6 +2311,19 @@ impl ObjectValue for UserObject {
                 }
             }
             "tosAccepted" => Ok(Some(FieldValue::Json(Json::Bool(self.data.tos_accepted)))),
+            // `UserResolver.SettingsCascade` (`user.go:391-401`): the folded
+            // access check, then the prefetched cascade.
+            "settingsCascade" | "configurationCascade" => {
+                if !self.can_administer(actor) {
+                    return Err(ExecError::new(MUST_BE_SITE_ADMIN_OR_SAME_USER));
+                }
+                cascade_field(
+                    &self.nested,
+                    CascadeKey::User(self.data.id),
+                    self.viewer_site_admin,
+                    field == "configurationCascade",
+                )
+            }
             _ => Ok(None),
         }
     }
@@ -2023,9 +2377,9 @@ impl ObjectValue for SettingsObject {
                 self.data.contents.clone(),
             )))),
             // Deprecated alias (`settings.go:36-38`): same raw contents.
-            "configuration" => Ok(Some(FieldValue::Object(Arc::new(ConfigurationObject {
-                contents: self.data.contents.clone(),
-            })))),
+            "configuration" => Ok(Some(FieldValue::Object(Arc::new(
+                ConfigurationObject::new(self.data.contents.clone()),
+            )))),
             _ => Ok(None),
         }
     }
@@ -2035,6 +2389,7 @@ impl ObjectValue for SettingsObject {
 /// field selections are delegated to the concrete subject object.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SettingsSubjectObject {
+    Default(DefaultSettingsObject),
     User(UserObject),
     Org(OrgObject),
     Site(SiteObject),
@@ -2049,6 +2404,10 @@ impl SettingsSubjectObject {
         nested: Arc<NestedPrefetch>,
     ) -> Self {
         match data {
+            SettingsSubjectData::Default => Self::Default(DefaultSettingsObject {
+                viewer_site_admin,
+                nested,
+            }),
             SettingsSubjectData::User(data) => Self::User(
                 UserObject::from_data_as_viewer(data, viewer_site_admin).with_nested(nested),
             ),
@@ -2066,6 +2425,7 @@ impl SettingsSubjectObject {
 impl ObjectValue for SettingsSubjectObject {
     fn type_name(&self) -> &'static str {
         match self {
+            Self::Default(default) => default.type_name(),
             Self::User(user) => user.type_name(),
             Self::Org(org) => org.type_name(),
             Self::Site(site) => site.type_name(),
@@ -2079,6 +2439,7 @@ impl ObjectValue for SettingsSubjectObject {
         actor: Actor,
     ) -> Result<Option<FieldValue>, ExecError> {
         match self {
+            Self::Default(default) => default.field(field, arguments, actor),
             Self::User(user) => user.field(field, arguments, actor),
             Self::Org(org) => org.field(field, arguments, actor),
             Self::Site(site) => site.field(field, arguments, actor),
@@ -2136,16 +2497,35 @@ impl ObjectValue for SiteObject {
             )))),
             "viewerCanAdminister" => Ok(Some(FieldValue::Json(Json::Bool(self.viewer_site_admin)))),
             "latestSettings" => self.latest_settings(),
+            // `siteResolver.SettingsCascade` (`site.go:161-171`): no access
+            // check for the site subject.
+            "settingsCascade" | "configurationCascade" => cascade_field(
+                &self.nested,
+                CascadeKey::Site,
+                self.viewer_site_admin,
+                field == "configurationCascade",
+            ),
             _ => Ok(None),
         }
     }
 }
 
-/// Deprecated `Configuration` (`schema.graphql:7764-7779`): `messages` is
-/// always empty and `contents` mirrors `Settings.contents`.
+/// Deprecated `Configuration` (`schema.graphql:7764-7779`): `contents`
+/// mirrors `Settings.contents` / `SettingsCascade.final`; `messages` is empty
+/// except for `SettingsCascade.merged`'s error text.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ConfigurationObject {
     contents: String,
+    messages: Vec<String>,
+}
+
+impl ConfigurationObject {
+    fn new(contents: String) -> Self {
+        Self {
+            contents,
+            messages: Vec::new(),
+        }
+    }
 }
 
 impl ObjectValue for ConfigurationObject {
@@ -2162,9 +2542,192 @@ impl ObjectValue for ConfigurationObject {
         match field {
             "contents" => Ok(Some(FieldValue::Json(Json::Str(self.contents.clone())))),
             "messages" => Ok(Some(FieldValue::List {
-                items: Vec::new(),
+                items: self
+                    .messages
+                    .iter()
+                    .map(|message| FieldValue::Json(Json::Str(message.clone())))
+                    .collect(),
                 element_type: Some("String"),
             })),
+            _ => Ok(None),
+        }
+    }
+}
+
+/// `settingsCascade` (`settings_cascade.go:17-58`): the relevant subjects,
+/// the merged `final` JSON and the deprecated `merged` `Configuration`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SettingsCascadeObject {
+    entries: Vec<CascadeSubjectEntry>,
+    final_lookup: CascadeFinalLookup,
+    viewer_site_admin: bool,
+    nested: Arc<NestedPrefetch>,
+}
+
+impl SettingsCascadeObject {
+    fn from_data(
+        data: &SettingsCascadeData,
+        viewer_site_admin: bool,
+        nested: Arc<NestedPrefetch>,
+    ) -> Self {
+        Self {
+            entries: data.entries.clone(),
+            final_lookup: data.final_lookup.clone(),
+            viewer_site_admin,
+            nested,
+        }
+    }
+
+    fn subjects(&self) -> FieldValue {
+        FieldValue::List {
+            items: self
+                .entries
+                .iter()
+                .map(|entry| {
+                    FieldValue::Object(Arc::new(SettingsSubjectObject::from_data(
+                        entry.subject.clone(),
+                        self.viewer_site_admin,
+                        self.nested.clone(),
+                    )))
+                })
+                .collect(),
+            element_type: Some("SettingsSubject"),
+        }
+    }
+
+    /// `SettingsCascade.Final` (`settings_cascade.go:46-58`).
+    fn final_contents(&self) -> Result<String, ExecError> {
+        match &self.final_lookup {
+            CascadeFinalLookup::Found(merged) => Ok(merged.clone()),
+            CascadeFinalLookup::Error(message) => Err(ExecError::new(message.clone())),
+        }
+    }
+
+    /// `SettingsCascade.Merged` (`settings_cascade.go:61-73`): errors become
+    /// `messages` and an empty `contents`; the field itself never fails.
+    fn merged(&self) -> ConfigurationObject {
+        match &self.final_lookup {
+            CascadeFinalLookup::Found(merged) => ConfigurationObject::new(merged.clone()),
+            CascadeFinalLookup::Error(message) => ConfigurationObject {
+                contents: String::new(),
+                messages: vec![message.clone()],
+            },
+        }
+    }
+}
+
+impl ObjectValue for SettingsCascadeObject {
+    fn type_name(&self) -> &'static str {
+        "SettingsCascade"
+    }
+
+    fn field(
+        &self,
+        field: &str,
+        _arguments: &Arguments,
+        _actor: Actor,
+    ) -> Result<Option<FieldValue>, ExecError> {
+        match field {
+            "subjects" => Ok(Some(self.subjects())),
+            "final" => Ok(Some(FieldValue::Json(Json::Str(self.final_contents()?)))),
+            "merged" => Ok(Some(FieldValue::Object(Arc::new(self.merged())))),
+            _ => Ok(None),
+        }
+    }
+}
+
+/// Deprecated `ConfigurationCascade` (`schema.graphql:7723-7735`): the same
+/// object without the `final` field.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ConfigurationCascadeObject {
+    inner: SettingsCascadeObject,
+}
+
+impl ObjectValue for ConfigurationCascadeObject {
+    fn type_name(&self) -> &'static str {
+        "ConfigurationCascade"
+    }
+
+    fn field(
+        &self,
+        field: &str,
+        _arguments: &Arguments,
+        _actor: Actor,
+    ) -> Result<Option<FieldValue>, ExecError> {
+        match field {
+            "subjects" => Ok(Some(self.inner.subjects())),
+            "merged" => Ok(Some(FieldValue::Object(Arc::new(self.inner.merged())))),
+            _ => Ok(None),
+        }
+    }
+}
+
+/// Look up a prefetched cascade for `key` and wrap it as the requested
+/// GraphQL type (`SettingsCascade` or the deprecated `ConfigurationCascade`).
+fn cascade_field(
+    nested: &Arc<NestedPrefetch>,
+    key: CascadeKey,
+    viewer_site_admin: bool,
+    configuration: bool,
+) -> Result<Option<FieldValue>, ExecError> {
+    match nested.settings_cascades.get(&key) {
+        Some(CascadeLookup::Found(data)) => {
+            let cascade = SettingsCascadeObject::from_data(data, viewer_site_admin, nested.clone());
+            Ok(Some(if configuration {
+                FieldValue::Object(Arc::new(ConfigurationCascadeObject { inner: cascade }))
+            } else {
+                FieldValue::Object(Arc::new(cascade))
+            }))
+        }
+        Some(CascadeLookup::Error(message)) => Err(ExecError::new(message.clone())),
+        None => Ok(None),
+    }
+}
+
+/// `defaultSettingsResolver`'s GraphQL object (`default_settings.go`): only
+/// reachable through `SettingsCascade.subjects`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DefaultSettingsObject {
+    viewer_site_admin: bool,
+    nested: Arc<NestedPrefetch>,
+}
+
+impl DefaultSettingsObject {
+    /// `relay.MarshalID("DefaultSettings", "DefaultSettings")`.
+    pub fn relay_id() -> String {
+        base64::engine::general_purpose::URL_SAFE.encode("DefaultSettings:\"DefaultSettings\"")
+    }
+}
+
+impl ObjectValue for DefaultSettingsObject {
+    fn type_name(&self) -> &'static str {
+        "DefaultSettings"
+    }
+
+    fn field(
+        &self,
+        field: &str,
+        _arguments: &Arguments,
+        _actor: Actor,
+    ) -> Result<Option<FieldValue>, ExecError> {
+        match field {
+            "id" => Ok(Some(FieldValue::Json(Json::Str(Self::relay_id())))),
+            // `LatestSettings` (`default_settings.go:35-45`) returns the
+            // synthetic default row without touching the database.
+            "latestSettings" => Ok(Some(FieldValue::Object(Arc::new(SettingsObject {
+                data: default_settings_data(),
+                subject: SettingsSubjectObject::Default(self.clone()),
+                viewer_site_admin: self.viewer_site_admin,
+                nested: self.nested.clone(),
+            })))),
+            "settingsURL" => Ok(Some(FieldValue::Null)),
+            "viewerCanAdminister" => Ok(Some(FieldValue::Json(Json::Bool(false)))),
+            "settingsCascade" | "configurationCascade" => cascade_field(
+                &self.nested,
+                CascadeKey::Default,
+                self.viewer_site_admin,
+                field == "configurationCascade",
+            ),
             _ => Ok(None),
         }
     }
@@ -2394,6 +2957,19 @@ impl ObjectValue for OrgObject {
             "viewerIsMember" => Ok(Some(FieldValue::Json(Json::Bool(
                 self.data.viewer_is_member,
             )))),
+            // `OrgResolver.SettingsCascade` (`org.go:194-204`): the org
+            // access check, then the prefetched cascade.
+            "settingsCascade" | "configurationCascade" => {
+                if !self.data.viewer_can_administer {
+                    return Err(ExecError::new(org_access_error(actor)));
+                }
+                cascade_field(
+                    &self.nested,
+                    CascadeKey::Org(self.data.id),
+                    self.viewer_site_admin,
+                    field == "configurationCascade",
+                )
+            }
             // `OrgResolver.Members` (`org.go:100-121`): a gqlutil
             // `ConnectionResolver`, prefetched once per argument set. In OSS
             // mode there is no dotcom membership gate.
