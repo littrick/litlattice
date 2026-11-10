@@ -9,7 +9,9 @@
 //! verbatim from the pinned module version
 //! (`v0.0.0-20240808144359-20c496e3680f`).
 
+pub mod aggregate;
 pub mod client;
+pub mod file_ranking;
 pub mod go_regexp;
 pub mod languages;
 pub mod proto;
