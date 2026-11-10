@@ -40,6 +40,10 @@ pub enum Error {
     },
     /// `gitdomain.RevisionNotFoundError` (`RevisionNotFoundPayload`).
     RevisionNotFound { repo: String, spec: String },
+    /// `*os.PathError{Op: "open", Path: path, Err: os.ErrNotExist}` from a
+    /// `FileNotFoundPayload`; only `gitserver.Client.StreamBlameFile` maps the
+    /// payload this way (the handler checks `os.IsNotExist`).
+    FileNotExist { path: String },
     /// Any other failure.
     Message(String),
 }
@@ -66,12 +70,20 @@ impl Error {
     pub fn is_revision_not_found(&self) -> bool {
         matches!(self, Self::RevisionNotFound { .. })
     }
+
+    /// `os.IsNotExist` for the `*os.PathError` that `StreamBlameFile` returns
+    /// for a `FileNotFoundPayload` (and for nothing else).
+    pub fn is_file_not_exist(&self) -> bool {
+        matches!(self, Self::FileNotExist { .. })
+    }
 }
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::NotFound(message) | Self::Message(message) => f.write_str(message),
+            // `os.PathError.Error()`.
+            Self::FileNotExist { path } => write!(f, "open {path}: file does not exist"),
             Self::RepoNotFound { repo, .. } => write!(f, "repo not found: {repo}"),
             Self::RevisionNotFound { repo, spec } => {
                 write!(f, "revision not found: {repo}@{spec}")
@@ -196,6 +208,42 @@ pub struct ChangedFile {
     pub path: String,
     pub status: ChangeStatus,
 }
+
+/// `gitdomain.PreviousCommit`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreviousCommit {
+    pub commit_id: String,
+    pub filename: String,
+}
+
+/// `gitdomain.Signature` (`json:"Name,omitempty"`, `"Email,omitempty"`,
+/// `"Date"`). An absent timestamp is the Unix epoch, like
+/// `(*timestamppb.Timestamp)(nil).AsTime()`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Signature {
+    pub name: String,
+    pub email: String,
+    pub date: Option<prost_types::Timestamp>,
+}
+
+/// `gitdomain.Hunk` as returned by `gitserver.Client.StreamBlameFile`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlameHunk {
+    pub start_line: u32,
+    pub end_line: u32,
+    pub start_byte: u32,
+    pub end_byte: u32,
+    pub commit_id: String,
+    pub previous_commit: Option<PreviousCommit>,
+    pub author: Signature,
+    pub message: String,
+    pub filename: String,
+}
+
+/// The streaming result of `gitserver.Client.StreamBlameFile`
+/// (`gitserver.HunkReader`). The first error `Recv` returns is surfaced as the
+/// first item, matching `grpcBlameHunkReader.Read`.
+pub type BlameHunkStream = Pin<Box<dyn Stream<Item = Result<BlameHunk, Error>> + Send>>;
 
 #[derive(Debug, Default)]
 pub struct GitserverClient {
@@ -371,6 +419,66 @@ impl GitserverClient {
         }
     }
 
+    /// `gitserver.Client.StreamBlameFile` with `BlameOptions{NewestCommit}`:
+    /// the first `Recv` is awaited so a missing file (`FileNotFoundPayload`)
+    /// surfaces as [`Error::FileNotExist`] before any response is written,
+    /// exactly like `grpcBlameHunkReader`'s deferred first-hunk error.
+    pub async fn stream_blame_file(
+        &self,
+        repo: &str,
+        path: &str,
+        newest_commit: &str,
+    ) -> Result<BlameHunkStream, Error> {
+        let addr = self
+            .addr_for(repo)
+            .ok_or_else(|| Error::Message("no gitserver address configured".to_owned()))?
+            .to_owned();
+        self.stream_blame_file_at(&addr, repo, path, newest_commit)
+            .await
+    }
+
+    /// `StreamBlameFile` against an explicitly resolved shard. Callers that
+    /// have the site configuration (pins) resolve the address through
+    /// [`addresses::GitserverAddresses::addr_for_repo`]; this client only
+    /// knows the plain shard list.
+    pub async fn stream_blame_file_at(
+        &self,
+        addr: &str,
+        repo: &str,
+        path: &str,
+        newest_commit: &str,
+    ) -> Result<BlameHunkStream, Error> {
+        let mut client = self.client(addr).await?;
+        // Own the request fields: the returned stream is `'static`.
+        let path = path.to_owned();
+        let context = format!("blame file {repo}:{path}");
+        let mut response = client
+            .blame(pb::BlameRequest {
+                repo_name: repo.to_owned(),
+                commit: newest_commit.to_owned(),
+                path: path.as_bytes().to_vec(),
+                ignore_whitespace: false,
+                range: None,
+            })
+            .await
+            .map_err(|status| blame_status_error(status, &path, &context))?
+            .into_inner();
+
+        let first = response
+            .message()
+            .await
+            .map_err(|status| blame_status_error(status, &path, &context))?
+            .map(|response| hunk_from_proto(response.hunk, &context));
+
+        let first = tokio_stream::iter(first);
+        let rest = response.map(move |item| {
+            item.map_err(|status| blame_status_error(status, &path, &context))
+                .and_then(|response| hunk_from_proto(response.hunk, &context))
+        });
+
+        Ok(Box::pin(first.chain(rest)))
+    }
+
     /// `gitserver.Client.ResolveRevision`. `ensure_revision` maps to the
     /// request's optional field (the baseline only sets it when true).
     pub async fn resolve_revision(
@@ -379,7 +487,24 @@ impl GitserverClient {
         revspec: &str,
         ensure_revision: bool,
     ) -> Result<String, Error> {
-        let mut client = self.client_for(repo).await?;
+        let addr = self
+            .addr_for(repo)
+            .ok_or_else(|| Error::Message("no gitserver address configured".to_owned()))?
+            .to_owned();
+        self.resolve_revision_at(&addr, repo, revspec, ensure_revision)
+            .await
+    }
+
+    /// `ResolveRevision` against an explicitly resolved shard (site-config
+    /// pins; see [`Self::stream_blame_file_at`]).
+    pub async fn resolve_revision_at(
+        &self,
+        addr: &str,
+        repo: &str,
+        revspec: &str,
+        ensure_revision: bool,
+    ) -> Result<String, Error> {
+        let mut client = self.client(addr).await?;
         let context = format!("resolve revision {repo}@{revspec}");
         let response = client
             .resolve_revision(pb::ResolveRevisionRequest {
@@ -665,6 +790,63 @@ fn translate_status(status: tonic::Status, context: &str) -> Error {
     } else {
         Error::Message(message)
     }
+}
+
+/// `gitserver.Client.StreamBlameFile`'s error mapping. A `FileNotFoundPayload`
+/// becomes the baseline's `*os.PathError{Op:"open", Err:os.ErrNotExist}`
+/// (`grpcBlameHunkReader` callers check `os.IsNotExist`); every other status
+/// goes through the shared payload translation.
+fn blame_status_error(status: tonic::Status, path: &str, context: &str) -> Error {
+    if let Ok(rpc) = payloads::RpcStatus::decode(status.details()) {
+        for any in &rpc.details {
+            if any.type_url.ends_with("gitserver.v1.FileNotFoundPayload") {
+                return Error::FileNotExist {
+                    path: path.to_owned(),
+                };
+            }
+        }
+    }
+    translate_status(status, context)
+}
+
+/// `gitdomain.HunkFromBlameProto`. The baseline returns a nil `*Hunk` for a
+/// response without a hunk and the handler then panics; a drop-in server
+/// answers with a stream error instead.
+fn hunk_from_proto(hunk: Option<pb::BlameHunk>, context: &str) -> Result<BlameHunk, Error> {
+    let Some(hunk) = hunk else {
+        return Err(Error::Message(format!(
+            "{context}: blame response without a hunk"
+        )));
+    };
+    let author = hunk.author.map_or_else(
+        || Signature {
+            name: String::new(),
+            email: String::new(),
+            date: None,
+        },
+        |author| Signature {
+            // The baseline converts the bytes to a Go string, which keeps
+            // invalid UTF-8; `from_utf8_lossy` replaces it, like the JSON
+            // encoder does.
+            name: String::from_utf8_lossy(&author.name).into_owned(),
+            email: author.email,
+            date: author.date,
+        },
+    );
+    Ok(BlameHunk {
+        start_line: hunk.start_line,
+        end_line: hunk.end_line,
+        start_byte: hunk.start_byte,
+        end_byte: hunk.end_byte,
+        commit_id: hunk.commit,
+        previous_commit: hunk.previous_commit.map(|previous| PreviousCommit {
+            commit_id: previous.commit,
+            filename: previous.filename,
+        }),
+        author,
+        message: hunk.message,
+        filename: hunk.filename,
+    })
 }
 
 /// Payloads carried in `grpc-status-details-bin` (`google.rpc.Status`). The

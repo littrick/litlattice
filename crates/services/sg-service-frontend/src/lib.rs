@@ -10,6 +10,7 @@
 //! records what each missing layer is supposed to do.
 
 pub mod auth;
+pub mod blame;
 pub mod config;
 pub mod configuration_api;
 pub mod configuration_server;

@@ -419,3 +419,42 @@ LIMIT 1
         created_at: row.get("created_at"),
     }))
 }
+
+/// Subset of `types.User` used by `stream_blame.go`'s
+/// `BlameHunkUserResponse`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserProfile {
+    pub id: i32,
+    pub username: String,
+    pub display_name: String,
+    pub avatar_url: String,
+}
+
+/// `userStore.GetByVerifiedEmail`
+/// (`internal/database/users.go:989-994`): the user with the specified
+/// verified email address, if any. Users whose matching email is unverified
+/// are not returned; at most one user may have a given verified address.
+pub async fn get_by_verified_email(
+    pool: &PgPool,
+    email: &str,
+) -> Result<Option<UserProfile>, sqlx::Error> {
+    let row = sqlx::query(
+        r#"
+SELECT u.id, u.username, u.display_name, u.avatar_url
+FROM users u
+WHERE u.id = (SELECT user_id FROM user_emails WHERE email = $1 AND verified_at IS NOT NULL)
+  AND u.deleted_at IS NULL
+LIMIT 1
+"#,
+    )
+    .bind(email)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(row.map(|row| UserProfile {
+        id: row.get("id"),
+        username: row.get("username"),
+        display_name: row.get("display_name"),
+        avatar_url: row.get("avatar_url"),
+    }))
+}

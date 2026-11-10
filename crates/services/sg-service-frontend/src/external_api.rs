@@ -35,6 +35,11 @@
 //!   `CountGoImporters` error on self-hosted instances, mapped by the same
 //!   `ErrorHandler.Handle` contract to a 500 with an empty body; the route
 //!   reproduces `routevar.Repo`'s gorilla template;
+//! - `/.api/blame/{Repo}{@rev}/-/stream/{Path:.*}` (GET) ->
+//!   `handleStreamBlame`'s SSE stream (`event: hunk`/`event: done`), with
+//!   `routevar.RepoRevSuffix`'s optional `@rev`; served by the async
+//!   [`api_response_with_deps`], the synchronous [`api_response`] only
+//!   classifies the route;
 //! - anything else -> gorilla's default `http.NotFoundHandler`
 //!   (`404 page not found\n`, `nosniff`).
 //!
@@ -42,7 +47,7 @@
 //! routes (`/scim/v2`, `/registry`) are unaffected; matched template routes
 //! redirect a trailing slash away exactly like `http.Redirect`.
 
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use http::{header, HeaderValue, Method, Request, Response, StatusCode};
 use regex::Regex;
@@ -51,6 +56,7 @@ use uuid::Uuid;
 
 use sg_config::LiveConfig;
 
+use crate::blame::BlameDeps;
 use crate::internal_api::{
     decode_path, empty_response, enterprise_not_found, escape_path, hex_escape_non_ascii,
     http_redirect, located, strict_slash_redirect, text_response,
@@ -105,30 +111,55 @@ const LSIF_DEPRECATION_MESSAGE: &str = "Sourcegraph v4.5+ no longer accepts LSIF
 
 /// The route a request resolved to, before the method is checked.
 #[derive(Debug, PartialEq, Eq)]
-enum Route {
+pub(crate) enum Route {
     Registry,
     Scim,
-    BatchesFile { spec: String, file: String },
-    BatchesFileUpload { spec: String },
+    BatchesFile {
+        spec: String,
+        file: String,
+    },
+    BatchesFileUpload {
+        spec: String,
+    },
     LsifUpload,
     ScipUpload,
     ComputeStream,
-    InsightsExport { id: String },
-    SearchExportJsonl { id: String },
-    SearchExportLog { id: String },
+    InsightsExport {
+        id: String,
+    },
+    SearchExportJsonl {
+        id: String,
+    },
+    SearchExportLog {
+        id: String,
+    },
     ChatCompletionsStream,
     CodeCompletions,
     SrcCliVersions,
-    SrcCli { rest: String },
+    SrcCli {
+        rest: String,
+    },
     ClientConfig,
     ModelConfig,
-    WebhookUuid { uuid: String },
+    WebhookUuid {
+        uuid: String,
+    },
     GitHubWebhooks,
     GitLabWebhooks,
     BitbucketServerWebhooks,
     BitbucketCloudWebhooks,
     OpenCodeGraph,
-    RepoShield { repo: String },
+    RepoShield {
+        repo: String,
+    },
+    BlameStream {
+        repo: String,
+        /// The `Rev` route variable without its `@` (`None` when the URL had
+        /// no revspec).
+        rev: Option<String>,
+        /// The raw `{Path:.*}` variable (still with its leading slash).
+        path: String,
+    },
 }
 
 impl Route {
@@ -152,7 +183,7 @@ impl Route {
             Route::SrcCli { .. } | Route::ClientConfig | Route::ModelConfig => {
                 method == Method::GET
             }
-            Route::RepoShield { .. } => method == Method::GET,
+            Route::RepoShield { .. } | Route::BlameStream { .. } => method == Method::GET,
             Route::WebhookUuid { .. }
             | Route::GitHubWebhooks
             | Route::GitLabWebhooks
@@ -171,6 +202,33 @@ impl Route {
 
 /// The subrouter's `ServeHTTP` + the registered handlers.
 pub fn api_response<B>(req: &Request<B>, _live: &LiveConfig) -> Response<BoxBody> {
+    match route_request(req) {
+        Err(response) => response,
+        Ok(route) => route_response(req, route),
+    }
+}
+
+/// The async variant used by the external listener: `/.api/blame/...` needs
+/// the database and gitserver (via [`BlameDeps`]) and streams its response.
+/// Every other route is the same synchronous dispatch as [`api_response`].
+pub async fn api_response_with_deps<B>(
+    req: &Request<B>,
+    _live: &LiveConfig,
+    deps: Arc<dyn BlameDeps>,
+) -> Response<BoxBody> {
+    match route_request(req) {
+        Err(response) => response,
+        Ok(Route::BlameStream { repo, rev, path }) => {
+            crate::blame::blame_response(req, &repo, rev.as_deref(), &path, deps).await
+        }
+        Ok(route) => route_response(req, route),
+    }
+}
+
+/// The gorilla matching pipeline (clean redirect, route, method, trailing
+/// slash), shared by both entry points.
+#[allow(clippy::result_large_err)] // The error is the short-circuit response.
+fn route_request<B>(req: &Request<B>) -> Result<Route, Response<BoxBody>> {
     let raw_path = req.uri().path();
     let decoded = decode_path(if raw_path.is_empty() { "/" } else { raw_path });
 
@@ -181,35 +239,43 @@ pub fn api_response<B>(req: &Request<B>, _live: &LiveConfig) -> Response<BoxBody
             Some(query) => format!("{}?{query}", escape_path(&cleaned)),
             None => escape_path(&cleaned),
         };
-        return located(
+        return Err(located(
             StatusCode::MOVED_PERMANENTLY,
             hex_escape_non_ascii(&location),
             None,
-        );
+        ));
     }
 
     let route = match match_route(&decoded) {
         Some(route) => route,
         None => match decoded.strip_suffix('/').map(match_route) {
             Some(Some(route)) => route,
-            _ => return page_not_found(),
+            _ => return Err(page_not_found()),
         },
     };
     if !route.allows(req.method()) {
-        return empty_response(StatusCode::METHOD_NOT_ALLOWED);
+        return Err(empty_response(StatusCode::METHOD_NOT_ALLOWED));
     }
     // gorilla appends `[/]?` to every non-prefix path regexp and redirects
     // when the request's trailing slash differs from the template's. All the
     // registered templates end without a slash.
     if decoded.ends_with('/') && !route.is_prefix() {
-        return strict_slash_redirect(
+        return Err(strict_slash_redirect(
             req.method(),
             &decoded[..decoded.len() - 1],
             req.uri().query(),
-        );
+        ));
     }
 
+    Ok(route)
+}
+
+/// The synchronous handlers (everything but `/.api/blame/...`).
+fn route_response<B>(req: &Request<B>, route: Route) -> Response<BoxBody> {
     match route {
+        // Served by `api_response_with_deps`; the synchronous entry point
+        // never has the dependencies and must not be used for blame.
+        Route::BlameStream { .. } => empty_response(StatusCode::INTERNAL_SERVER_ERROR),
         Route::Registry => registry_response(),
         Route::Scim => enterprise_not_found("SCIM handler"),
         Route::BatchesFile { .. } if req.method() == Method::HEAD => {
@@ -336,7 +402,21 @@ fn match_route(path: &str) -> Option<Route> {
             repo: caps["Repo"].to_owned(),
         });
     }
+    if let Some(caps) = blame_regex().captures(path) {
+        let rev = caps.name("Rev").map(|rev| rev.as_str().to_owned());
+        return Some(Route::BlameStream {
+            repo: caps["Repo"].to_owned(),
+            rev,
+            path: caps["Path"].to_owned(),
+        });
+    }
     None
+}
+
+/// Test-only access to the route classifier.
+#[cfg(test)]
+pub(crate) fn route_for_test(path: &str) -> Option<Route> {
+    match_route(path)
 }
 
 /// `repo.Path("/shield")` under the `/.api/repos/{Repo}/-/` subrouter
@@ -353,6 +433,20 @@ fn repo_shield_regex() -> &'static Regex {
             r"^/\.api/repos/(?P<Repo>{REPO_PATTERN})/-/shield$"
         ))
         .expect("repo shield route regexp")
+    })
+}
+
+/// `/.api/blame/{Repo}{Rev}/-/stream/{Path:.*}` (`httpapi.go:165`) with
+/// `routevar.RepoRevSuffix` = `{Rev:(?:@<RevPattern>)?}`. `RevPattern` is the
+/// same component pattern as `RepoPattern`; the gorilla var includes the `@`,
+/// which the handler strips through `routevar.ToRepoRev`.
+fn blame_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| {
+        Regex::new(&format!(
+            r"^/\.api/blame/(?P<Repo>{REPO_PATTERN})(?:@(?P<Rev>{REPO_PATTERN}))?/-/stream/(?P<Path>.*)$"
+        ))
+        .expect("blame stream route regexp")
     })
 }
 

@@ -24,6 +24,7 @@ use tonic::body::BoxBody;
 use sg_config::LiveConfig;
 
 use crate::auth;
+use crate::blame::BlameDeps;
 use crate::goimportpath;
 use crate::health;
 use crate::ipallowlist::{self, AllowlistEnv, IpAllowlistConfig};
@@ -145,6 +146,49 @@ pub fn external_response_with_ipallowlist<B>(
     response
 }
 
+/// [`external_response_with_ipallowlist`] with an asynchronous inner handler,
+/// used by the external listener where `/.api/blame/...` awaits the database
+/// and gitserver before the response status is known.
+pub async fn external_response_with_ipallowlist_async<'a, B, F>(
+    req: &'a mut Request<B>,
+    version: &Bytes,
+    allowlist: Option<&IpAllowlistConfig>,
+    forbid_all: bool,
+    trace_url_template: Option<&str>,
+    external_url: &str,
+    next: F,
+) -> Response<BoxBody>
+where
+    F: for<'b> FnOnce(
+        &'b mut Request<B>,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Response<BoxBody>> + Send + 'b>,
+    >,
+{
+    if let Some(allowlist) = allowlist {
+        if let Err(error) = allowlist.is_authorized(req) {
+            return ipallowlist::forbidden_response(&error);
+        }
+    }
+    if let Err(response) = tenant::external_tenant_from_hostname(req, tenant::fixed_tenant_one) {
+        return response;
+    }
+    let trace = trace_headers::TraceIds::generate();
+    let mut response = if forbid_all {
+        auth::forbidden_response()
+    } else if let Some(response) = goimportpath::response(req, external_url) {
+        response
+    } else if is_blackhole(req) {
+        blackhole_response()
+    } else if let Some(response) = health::health_check(req.uri().path(), version) {
+        response
+    } else {
+        next(req).await
+    };
+    trace_headers::apply(&mut response, &trace, trace_url_template, external_url);
+    response
+}
+
 /// `newExternalHTTPHandler` without its config-dependent layers.
 pub fn external_response<B>(
     req: &mut Request<B>,
@@ -252,16 +296,18 @@ pub fn external_handler_with_live(
     live: Arc<LiveConfig>,
     allowlist_env: AllowlistEnv,
     version: Bytes,
+    blame_deps: Arc<dyn BlameDeps>,
 ) -> sg_http::HttpHandler {
     let api_live = Arc::clone(&live);
     let middleware = Arc::new(LiveMiddleware::new(live, allowlist_env));
     Arc::new(move |mut req: Request<Incoming>| {
         let middleware = Arc::clone(&middleware);
         let api_live = Arc::clone(&api_live);
+        let blame_deps = Arc::clone(&blame_deps);
         let version = version.clone();
         Box::pin(async move {
             let derived = middleware.current();
-            external_response_with_ipallowlist(
+            external_response_with_ipallowlist_async(
                 &mut req,
                 &version,
                 derived.allowlist.as_deref(),
@@ -269,13 +315,27 @@ pub fn external_handler_with_live(
                 derived.trace_url_template.as_deref(),
                 &derived.security.external_url,
                 |req| {
-                    let request: &Request<Incoming> = req;
-                    mux::route(request, &derived.security, |route| match route {
-                        mux::Route::Api => crate::external_api::api_response(request, &api_live),
-                        other => mux::not_found_dispatch(other),
+                    let security = derived.security.clone();
+                    let api_live = Arc::clone(&api_live);
+                    let blame_deps = Arc::clone(&blame_deps);
+                    Box::pin(async move {
+                        let request: &Request<Incoming> = req;
+                        mux::route_async(request, &security, |route| async move {
+                            match route {
+                                mux::Route::Api => {
+                                    crate::external_api::api_response_with_deps(
+                                        request, &api_live, blame_deps,
+                                    )
+                                    .await
+                                }
+                                other => mux::not_found_dispatch(other),
+                            }
+                        })
+                        .await
                     })
                 },
             )
+            .await
         })
     })
 }

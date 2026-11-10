@@ -32,6 +32,7 @@ fn classify(err: &Error) -> &'static str {
         } => "clone_in_progress",
         Error::RepoNotFound { .. } => "repo_not_found",
         Error::NotFound(_) => "not_found",
+        Error::FileNotExist { .. } => "not_found",
         Error::Message(_) => "other",
     }
 }

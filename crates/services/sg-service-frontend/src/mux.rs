@@ -153,6 +153,33 @@ pub fn route<B>(
     secure_headers(req, policy, &path, config, || dispatch(route))
 }
 
+/// [`route`] with an asynchronous inner handler (`/.api/blame/...`).
+pub async fn route_async<B, F, Fut>(
+    req: &Request<B>,
+    config: &SecurityConfig,
+    dispatch: F,
+) -> Response<BoxBody>
+where
+    F: FnOnce(Route) -> Fut,
+    Fut: std::future::Future<Output = Response<BoxBody>>,
+{
+    let escaped = req.uri().path();
+    let escaped = if escaped.is_empty() { "/" } else { escaped };
+    let cleaned = clean_path(escaped);
+
+    if let Some(target) = trailing_slash_target(&cleaned) {
+        return moved_permanently(req, &redirect_location(req, target));
+    }
+    if cleaned != escaped {
+        return moved_permanently(req, &redirect_location(req, &cleaned));
+    }
+
+    let route = classify(&cleaned);
+    let policy = route.policy();
+    let path = route.path(&cleaned).to_owned();
+    secure_headers_async(req, policy, &path, config, || dispatch(route)).await
+}
+
 /// `http.ServeMux` subtree matching for the four registered patterns.
 fn classify(path: &str) -> Route {
     if path == "/.api" || path.starts_with("/.api/") {
@@ -233,6 +260,34 @@ pub fn secure_headers<B>(
         _ => next(),
     };
 
+    apply_security_headers(&mut response, cors);
+    response
+}
+
+/// [`secure_headers`] with an asynchronous inner handler.
+pub async fn secure_headers_async<B, F, Fut>(
+    req: &Request<B>,
+    policy: CrossOriginPolicy,
+    path: &str,
+    config: &SecurityConfig,
+    next: F,
+) -> Response<BoxBody>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Response<BoxBody>>,
+{
+    let cors = cors_request(req, policy, path, config);
+
+    let mut response = match &cors {
+        Some(cors) if cors.preflight => empty_response(StatusCode::OK),
+        _ => next().await,
+    };
+
+    apply_security_headers(&mut response, cors);
+    response
+}
+
+fn apply_security_headers(response: &mut Response<BoxBody>, cors: Option<CorsRequest>) {
     let headers = response.headers_mut();
     headers
         .entry(header::X_CONTENT_TYPE_OPTIONS)
@@ -252,7 +307,6 @@ pub fn secure_headers<B>(
             headers.insert(name, value);
         }
     }
-    response
 }
 
 struct CorsRequest {
