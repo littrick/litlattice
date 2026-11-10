@@ -310,6 +310,8 @@ struct ClientConfigurationDeps {
 struct ExternalServicesDeps {
     store: Arc<dyn crate::external_services::ExternalServiceConnectionStore>,
     keyring: Arc<sg_keyring::Keyring>,
+    /// `conf.ExternalURL()` for `ExternalService.webhookURL`.
+    live: Arc<LiveConfig>,
 }
 
 /// `Query.webhookLogs`'s dependencies: the `webhook_logs` table, the
@@ -319,6 +321,8 @@ struct WebhookLogsDeps {
     logs: Arc<dyn crate::webhook_logs::WebhookLogConnectionStore>,
     external_services: Arc<dyn crate::external_services::ExternalServiceConnectionStore>,
     keyring: Arc<sg_keyring::Keyring>,
+    /// `conf.ExternalURL()` for `WebhookLog.externalService.webhookURL`.
+    live: Arc<LiveConfig>,
 }
 
 /// `Query.repository(cloneURL:)` / `Query.repositoryRedirect(cloneURL:)`'s
@@ -509,8 +513,13 @@ impl SchemaGraphqlDeps {
         mut self,
         store: Arc<dyn crate::external_services::ExternalServiceConnectionStore>,
         keyring: Arc<sg_keyring::Keyring>,
+        live: Arc<LiveConfig>,
     ) -> Self {
-        self.external_services = Some(ExternalServicesDeps { store, keyring });
+        self.external_services = Some(ExternalServicesDeps {
+            store,
+            keyring,
+            live,
+        });
         self
     }
 
@@ -522,11 +531,13 @@ impl SchemaGraphqlDeps {
         logs: Arc<dyn crate::webhook_logs::WebhookLogConnectionStore>,
         external_services: Arc<dyn crate::external_services::ExternalServiceConnectionStore>,
         keyring: Arc<sg_keyring::Keyring>,
+        live: Arc<LiveConfig>,
     ) -> Self {
         self.webhook_logs = Some(WebhookLogsDeps {
             logs,
             external_services,
             keyring,
+            live,
         });
         self
     }
@@ -620,6 +631,15 @@ impl GraphqlDeps for SchemaGraphqlDeps {
             },
             _ => None,
         };
+
+        // `conf.ExternalURL()` for the `ExternalService.webhookURL` fields.
+        let external_url = self
+            .external_services
+            .as_ref()
+            .map(|deps| deps.live.as_ref())
+            .or_else(|| self.webhook_logs.as_ref().map(|deps| deps.live.as_ref()))
+            .map(|live| crate::log_events::external_url(&live.current().site).to_owned())
+            .unwrap_or_default();
 
         let exec_request = sg_graphql::exec::ExecRequest {
             query: request.query,
@@ -778,6 +798,25 @@ impl GraphqlDeps for SchemaGraphqlDeps {
                 crate::graphql_resolvers::prefetch_node_roots(
                     memberships_store.as_ref(),
                     repositories.as_ref(),
+                    self.external_services
+                        .as_ref()
+                        .map(|deps| deps.store.as_ref()),
+                    self.webhook_logs.as_ref().map(|deps| deps.logs.as_ref()),
+                    self.users.as_ref().map(|users| {
+                        users.as_ref() as &dyn crate::graphql_resolvers::UserLookupStore
+                    }),
+                    self.external_services
+                        .as_ref()
+                        .and_then(|deps| deps.keyring.external_service_key())
+                        .or_else(|| {
+                            self.webhook_logs
+                                .as_ref()
+                                .and_then(|deps| deps.keyring.external_service_key())
+                        }),
+                    self.webhook_logs
+                        .as_ref()
+                        .and_then(|deps| deps.keyring.webhook_log_key()),
+                    &external_url,
                     &fields,
                     request.actor,
                     site_admin,
@@ -815,7 +854,7 @@ impl GraphqlDeps for SchemaGraphqlDeps {
             }
             _ => crate::graphql_resolvers::FeatureFlagRoots::default(),
         };
-        let nested = match (
+        let mut nested = match (
             &self.user_organizations,
             &self.org_members,
             &self.org_memberships,
@@ -865,6 +904,7 @@ impl GraphqlDeps for SchemaGraphqlDeps {
                         users.as_ref() as &dyn crate::graphql_resolvers::UserLookupStore
                     }),
                     deps.keyring.external_service_key(),
+                    &external_url,
                     &fields,
                     request.actor,
                     user.as_ref().map(|user| user.user_data()),
@@ -886,6 +926,7 @@ impl GraphqlDeps for SchemaGraphqlDeps {
                     }),
                     deps.keyring.webhook_log_key(),
                     deps.keyring.external_service_key(),
+                    &external_url,
                     &fields,
                     request.actor,
                     site_admin,
@@ -894,6 +935,34 @@ impl GraphqlDeps for SchemaGraphqlDeps {
             }
             None => std::collections::HashMap::new(),
         };
+        // `ExternalService.webhookLogs` is a nested connection; prefetch it
+        // wherever an `ExternalService` selection set includes it. The field
+        // is not part of the OSS SDL in this snapshot (overview §0), so this
+        // is data-layer only, but keeps the resolver semantics aligned.
+        if let (Some(logs_deps), Some(services_deps)) =
+            (&self.webhook_logs, &self.external_services)
+        {
+            let nested_webhook_logs = crate::webhook_logs::prefetch_external_service_webhook_logs(
+                logs_deps.logs.as_ref(),
+                services_deps.store.as_ref(),
+                self.users
+                    .as_ref()
+                    .map(|users| users.as_ref() as &dyn crate::graphql_resolvers::UserLookupStore),
+                logs_deps.keyring.webhook_log_key(),
+                services_deps.keyring.external_service_key(),
+                &external_url,
+                &fields,
+                &external_services,
+                &webhook_logs,
+                &nodes,
+                request.actor,
+                site_admin,
+            )
+            .await;
+            if !nested_webhook_logs.is_empty() {
+                Arc::make_mut(&mut nested).external_service_webhook_logs = nested_webhook_logs;
+            }
+        }
         let mut roots =
             crate::graphql_resolvers::FrontendRootResolver::with_prefetched_organizations(
                 user,

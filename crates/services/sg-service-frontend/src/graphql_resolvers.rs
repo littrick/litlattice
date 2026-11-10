@@ -23,6 +23,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use base64::Engine;
 use sg_db::feature_flags::{FeatureFlag, FeatureFlagKind, FeatureFlagOverride};
+use sg_encryption::Key;
 use sg_graphql::exec::{
     Actor, Arguments, ExecError, FieldValue, ObjectValue, RootField, RootResolver,
 };
@@ -450,6 +451,12 @@ pub struct NodeRoots {
     pub orgs: HashMap<i32, OrgByIdLookup>,
     /// `repositoryByID` results keyed by repo.id.
     pub repositories: HashMap<i32, RepoLookup>,
+    /// `externalServiceByID` results keyed by the raw Relay ID (the gate and
+    /// ID validation errors are preserved per ID).
+    pub external_services:
+        HashMap<String, Result<crate::external_services::ExternalServiceNodeData, String>>,
+    /// `webhookLogByID` results keyed by the raw Relay ID.
+    pub webhook_logs: HashMap<String, Result<crate::webhook_logs::WebhookLogNodeData, String>>,
 }
 
 /// `relay.UnmarshalKind`: URL-safe base64 decode and take the prefix before
@@ -488,13 +495,21 @@ pub fn unmarshal_relay_spec_string(id: &str) -> Result<String, String> {
 }
 
 /// Look up every `Query.node` root field in `fields`, dispatching on the Relay
-/// kind. Ported kinds are `User` (`UserByID`), `Org` (`OrgByID`) and
-/// `Repository` (`repositoryByID`); other kinds are left to the resolver,
+/// kind. Ported kinds are `User` (`UserByID`), `Org` (`OrgByID`),
+/// `Repository` (`repositoryByID`), `ExternalService` (`externalServiceByID`)
+/// and `WebhookLog` (`webhookLogByID`); other kinds are left to the resolver,
 /// which reports `invalid id` (errata: the baseline dispatches to resolvers
 /// that are not ported yet).
+#[allow(clippy::too_many_arguments)]
 pub async fn prefetch_node_roots(
     memberships_store: &dyn OrgMembershipsStore,
     repositories: &dyn RepositoryLookup,
+    external_services: Option<&dyn crate::external_services::ExternalServiceConnectionStore>,
+    webhook_logs: Option<&dyn crate::webhook_logs::WebhookLogConnectionStore>,
+    users: Option<&dyn UserLookupStore>,
+    external_service_key: Option<Arc<dyn Key>>,
+    webhook_key: Option<Arc<dyn Key>>,
+    external_url: &str,
     fields: &[RootField],
     actor: Actor,
     viewer_site_admin: bool,
@@ -510,50 +525,96 @@ pub async fn prefetch_node_roots(
         let Some(kind) = relay_kind(id) else {
             continue;
         };
-        let Ok(node_id) = unmarshal_relay_id(id) else {
-            continue;
-        };
         match kind.as_str() {
-            "User" => {
-                if roots.users.contains_key(&node_id) {
+            "ExternalService" => {
+                let Some(store) = external_services else {
+                    continue;
+                };
+                if roots.external_services.contains_key(id) {
                     continue;
                 }
-                let lookup = match memberships_store.user_by_id(node_id).await {
-                    Ok(user) => UserByIdLookup::Found(user),
-                    Err(error) => UserByIdLookup::Error(error),
-                };
-                roots.users.insert(node_id, lookup);
+                let lookup = crate::external_services::external_service_node_by_id(
+                    store,
+                    users,
+                    external_service_key.clone(),
+                    external_url,
+                    id,
+                    actor,
+                    viewer_site_admin,
+                )
+                .await;
+                roots.external_services.insert(id.to_owned(), lookup);
             }
-            // `OrgByID` does not validate the spec's kind (`UnmarshalOrgID`
-            // is only used by the deprecated `Query.org`, which the schema
-            // does not expose).
-            "Org" => {
-                if roots.orgs.contains_key(&node_id) {
+            "WebhookLog" => {
+                let (Some(logs_store), Some(services_store)) = (webhook_logs, external_services)
+                else {
+                    continue;
+                };
+                if roots.webhook_logs.contains_key(id) {
                     continue;
                 }
-                let lookup = match memberships_store
-                    .org_by_id(node_id, viewer_uid(actor), viewer_site_admin)
-                    .await
-                {
-                    Ok(org) => OrgByIdLookup::Found(org),
-                    Err(error) => OrgByIdLookup::Error(error),
-                };
-                roots.orgs.insert(node_id, lookup);
+                let lookup = crate::webhook_logs::webhook_log_node_by_id(
+                    logs_store,
+                    services_store,
+                    users,
+                    webhook_key.clone(),
+                    external_service_key.clone(),
+                    external_url,
+                    id,
+                    actor,
+                    viewer_site_admin,
+                )
+                .await;
+
+                roots.webhook_logs.insert(id.to_owned(), lookup);
             }
-            "Repository" => {
-                if roots.repositories.contains_key(&node_id) {
+            _ => {
+                let Ok(node_id) = unmarshal_relay_id(id) else {
                     continue;
-                }
-                let lookup = match repositories
-                    .by_id(node_id, viewer_uid(actor), viewer_site_admin)
-                    .await
-                {
-                    Ok(lookup) => lookup,
-                    Err(error) => RepoLookup::Error(error),
                 };
-                roots.repositories.insert(node_id, lookup);
+                match kind.as_str() {
+                    "User" => {
+                        if roots.users.contains_key(&node_id) {
+                            continue;
+                        }
+                        let lookup = match memberships_store.user_by_id(node_id).await {
+                            Ok(user) => UserByIdLookup::Found(user),
+                            Err(error) => UserByIdLookup::Error(error),
+                        };
+                        roots.users.insert(node_id, lookup);
+                    }
+                    // `OrgByID` does not validate the spec's kind
+                    // (`UnmarshalOrgID` is only used by the deprecated
+                    // `Query.org`, which the schema does not expose).
+                    "Org" => {
+                        if roots.orgs.contains_key(&node_id) {
+                            continue;
+                        }
+                        let lookup = match memberships_store
+                            .org_by_id(node_id, viewer_uid(actor), viewer_site_admin)
+                            .await
+                        {
+                            Ok(org) => OrgByIdLookup::Found(org),
+                            Err(error) => OrgByIdLookup::Error(error),
+                        };
+                        roots.orgs.insert(node_id, lookup);
+                    }
+                    "Repository" => {
+                        if roots.repositories.contains_key(&node_id) {
+                            continue;
+                        }
+                        let lookup = match repositories
+                            .by_id(node_id, viewer_uid(actor), viewer_site_admin)
+                            .await
+                        {
+                            Ok(lookup) => lookup,
+                            Err(error) => RepoLookup::Error(error),
+                        };
+                        roots.repositories.insert(node_id, lookup);
+                    }
+                    _ => {}
+                }
             }
-            _ => {}
         }
     }
     roots
@@ -818,6 +879,12 @@ pub struct NestedPrefetch {
     pub settings_subjects: HashMap<String, SettingsSubjectLookup>,
     /// Prefetched `settingsCascade` values keyed by subject.
     pub settings_cascades: HashMap<CascadeKey, CascadeLookup>,
+    /// `ExternalService.webhookLogs` connections keyed by external service id
+    /// and argument set.
+    pub external_service_webhook_logs: HashMap<
+        (i64, crate::webhook_logs::WebhookLogsArgs),
+        crate::webhook_logs::WebhookLogsConnectionLookup,
+    >,
 }
 
 /// The database seam for `User.organizations` (`db.Orgs().GetByUserID` plus
@@ -2330,6 +2397,52 @@ fn namespace_value(
     }
 }
 
+impl QueryRoot {
+    /// The int32-spec `Query.node` kinds. `relay.UnmarshalSpec` is shared by
+    /// User/Org/Repository; none validates the Relay kind.
+    fn node_int32(&self, kind: &str, id: &str) -> Result<Option<FieldValue>, ExecError> {
+        match kind {
+            "User" => {
+                let node_id = unmarshal_relay_id(id).map_err(ExecError::new)?;
+                match self.nodes.users.get(&node_id) {
+                    Some(UserByIdLookup::Found(data)) => Ok(Some(FieldValue::Object(Arc::new(
+                        UserObject::from_data_as_viewer(data.clone(), self.viewer_site_admin)
+                            .with_nested(self.nested.clone()),
+                    )))),
+                    Some(UserByIdLookup::Error(message)) => Err(ExecError::new(message.clone())),
+                    None => Ok(None),
+                }
+            }
+            "Org" => {
+                let node_id = unmarshal_relay_id(id).map_err(ExecError::new)?;
+                match self.nodes.orgs.get(&node_id) {
+                    Some(OrgByIdLookup::Found(data)) => Ok(Some(FieldValue::Object(Arc::new(
+                        OrgObject::from_data_as_viewer(data.clone(), self.viewer_site_admin)
+                            .with_nested(self.nested.clone()),
+                    )))),
+                    Some(OrgByIdLookup::Error(message)) => Err(ExecError::new(message.clone())),
+                    None => Ok(None),
+                }
+            }
+            "Repository" => {
+                let node_id = unmarshal_relay_id(id).map_err(ExecError::new)?;
+                match self.nodes.repositories.get(&node_id) {
+                    Some(RepoLookup::Found(data)) => Ok(Some(FieldValue::Object(Arc::new(
+                        RepositoryObject::from_data(data.clone()),
+                    )))),
+                    Some(RepoLookup::NotFound) => Ok(Some(FieldValue::Null)),
+                    Some(RepoLookup::Blocked { name, reason }) => Err(ExecError::new(format!(
+                        "repository {name} has been blocked. reason: {reason}"
+                    ))),
+                    Some(RepoLookup::Error(message)) => Err(ExecError::new(message.clone())),
+                    None => Ok(None),
+                }
+            }
+            _ => Err(ExecError::new("invalid id")),
+        }
+    }
+}
+
 impl ObjectValue for QueryRoot {
     fn type_name(&self) -> &'static str {
         "Query"
@@ -2516,8 +2629,9 @@ impl ObjectValue for QueryRoot {
                 }
             }
             // `schemaResolver.Node` (`node.go:21-39`): dispatch on the Relay
-            // kind. Ported kinds: User/Org/Repository; unknown kinds are
-            // `invalid id` (the baseline only knows its registered kinds).
+            // kind. Ported kinds: User/Org/Repository/ExternalService/
+            // WebhookLog; unknown kinds are `invalid id` (the baseline only
+            // knows its registered kinds).
             "node" => {
                 let Some(id) = arguments.string("id") else {
                     return Ok(None);
@@ -2525,43 +2639,33 @@ impl ObjectValue for QueryRoot {
                 let Some(kind) = relay_kind(id) else {
                     return Err(ExecError::new("invalid id"));
                 };
-                let node_id = unmarshal_relay_id(id).map_err(ExecError::new)?;
+                // The int64 kinds (`relay.UnmarshalSpec` into int64) and the
+                // int32 kinds are parsed per branch: `UnmarshalExternalServiceID`
+                // validates the Relay kind while the others do not.
                 match kind.as_str() {
-                    "User" => match self.nodes.users.get(&node_id) {
-                        Some(UserByIdLookup::Found(data)) => {
-                            Ok(Some(FieldValue::Object(Arc::new(
-                                UserObject::from_data_as_viewer(
-                                    data.clone(),
-                                    self.viewer_site_admin,
-                                )
-                                .with_nested(self.nested.clone()),
-                            ))))
-                        }
-                        Some(UserByIdLookup::Error(message)) => {
-                            Err(ExecError::new(message.clone()))
-                        }
-                        None => Ok(None),
-                    },
-                    "Org" => match self.nodes.orgs.get(&node_id) {
-                        Some(OrgByIdLookup::Found(data)) => Ok(Some(FieldValue::Object(Arc::new(
-                            OrgObject::from_data_as_viewer(data.clone(), self.viewer_site_admin)
-                                .with_nested(self.nested.clone()),
+                    "ExternalService" => match self.nodes.external_services.get(id) {
+                        Some(Ok(data)) => Ok(Some(FieldValue::Object(Arc::new(
+                            crate::external_services::ExternalServiceObject::from_data(
+                                data.clone(),
+                                self.viewer_site_admin,
+                                self.nested.clone(),
+                            ),
                         )))),
-                        Some(OrgByIdLookup::Error(message)) => Err(ExecError::new(message.clone())),
+                        Some(Err(message)) => Err(ExecError::new(message.clone())),
                         None => Ok(None),
                     },
-                    "Repository" => match self.nodes.repositories.get(&node_id) {
-                        Some(RepoLookup::Found(data)) => Ok(Some(FieldValue::Object(Arc::new(
-                            RepositoryObject::from_data(data.clone()),
+                    "WebhookLog" => match self.nodes.webhook_logs.get(id) {
+                        Some(Ok(data)) => Ok(Some(FieldValue::Object(Arc::new(
+                            crate::webhook_logs::WebhookLogObject::from_data(
+                                data.clone(),
+                                self.viewer_site_admin,
+                                self.nested.clone(),
+                            ),
                         )))),
-                        Some(RepoLookup::NotFound) => Ok(Some(FieldValue::Null)),
-                        Some(RepoLookup::Blocked { name, reason }) => Err(ExecError::new(format!(
-                            "repository {name} has been blocked. reason: {reason}"
-                        ))),
-                        Some(RepoLookup::Error(message)) => Err(ExecError::new(message.clone())),
+                        Some(Err(message)) => Err(ExecError::new(message.clone())),
                         None => Ok(None),
                     },
-                    _ => Err(ExecError::new("invalid id")),
+                    _ => self.node_int32(kind.as_str(), id),
                 }
             }
             // `schemaResolver.ParseSearchQuery` (`parse_search_query.go:49-61`):
@@ -6227,6 +6331,7 @@ mod tests {
             users: HashMap::from([(1, UserByIdLookup::Found(member_user(1, "alice")))]),
             orgs: HashMap::from([(7, OrgByIdLookup::Found(org(7, "team", Some("Team"))))]),
             repositories: HashMap::from([(9, RepoLookup::Found(repository_data("a/b")))]),
+            ..NodeRoots::default()
         };
         let user_id = relay_id("User", 1);
         let org_id = relay_id("Org", 7);
@@ -6256,6 +6361,7 @@ mod tests {
                     reason: "dmca".to_owned(),
                 },
             )]),
+            ..NodeRoots::default()
         };
         let roots = empty_roots().with_nodes(nodes.clone());
         let query = format!("{{ node(id: \"{}\") {{ id }} }}", relay_id("User", 5));
@@ -6330,8 +6436,20 @@ mod tests {
         assert_eq!(fields[0].type_conditions.len(), 1);
         assert_eq!(fields[0].type_conditions[0].0, "User");
 
-        let nodes =
-            prefetch_node_roots(&memberships_store, &repositories, &fields, actor, false).await;
+        let nodes = prefetch_node_roots(
+            &memberships_store,
+            &repositories,
+            None,
+            None,
+            None,
+            None,
+            None,
+            "",
+            &fields,
+            actor,
+            false,
+        )
+        .await;
         let user_store =
             FakeUserOrganizationsStore(HashMap::from([(5, vec![org(8, "sub", None)])]));
         let members_store = FakeOrgMembersStore(HashMap::new());

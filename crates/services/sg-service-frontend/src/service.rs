@@ -292,6 +292,7 @@ impl Service for FrontendService {
                         ),
                     ),
                     Arc::clone(&keyring),
+                    Arc::clone(wiring.live()),
                 )
                 .with_webhook_logs(
                     Arc::new(crate::webhook_logs::PgWebhookLogConnectionStore::new(
@@ -303,6 +304,7 @@ impl Service for FrontendService {
                         ),
                     ),
                     Arc::clone(&keyring),
+                    Arc::clone(wiring.live()),
                 )
                 .with_clone_urls(clone_url_resolver)
                 .with_log_events(log_events_store, Arc::clone(wiring.live()));

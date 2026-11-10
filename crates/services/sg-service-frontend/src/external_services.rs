@@ -11,9 +11,15 @@
 //! (`internal/types/secret.go:39-119`) and lazily fetch `creator`,
 //! `lastUpdater`, `repoCount` and `lastSyncError`.
 //!
-//! Not ported (see the M9.8gh overview §3.1): `url`, `webhookURL`,
-//! `rateLimiterState`, `checkConnection`, `hasConnectionCheck`, `syncJobs`,
-//! `webhookLogs`, and every mutation.
+//! M9.8gk ports the remaining read-only node fields: `url`
+//! (`extsvc.UniqueCodeHostIdentifier`), `webhookURL` (per-kind
+//! `extsvc.WebhookURL` + enable switch), `rateLimiterState` (always `null` in
+//! this snapshot; see the M9.8gk overview §3.1), `hasConnectionCheck`
+//! (`availabilityCheck`) and `webhookLogs` (the M9.8gi connection).
+//!
+//! Not ported: `checkConnection` (code-host probing), `syncJobs` (syncer
+//! write path), and every mutation. Note that `webhookURL` and
+//! `webhookLogs` are not part of the OSS SDL in this snapshot (overview §0).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -30,7 +36,11 @@ use sg_jsonx::{
 };
 
 use crate::graphql_resolvers::{
-    datetime_rfc3339, relay_kind, PageInfoObject, UserData, UserKey, UserLookupStore, UserObject,
+    check_current_user_is_site_admin, datetime_rfc3339, relay_kind, PageInfoObject, UserData,
+    UserKey, UserLookupStore, UserObject,
+};
+use crate::webhook_logs::{
+    webhook_logs_args, WebhookLogConnectionObject, WebhookLogsConnectionLookup,
 };
 
 /// `types.RedactedSecret`.
@@ -60,7 +70,7 @@ pub fn unmarshal_repository_id(raw: &str) -> Result<i32, String> {
     i32::try_from(value).map_err(|_| "value out of range".to_owned())
 }
 
-fn relay_spec_i64(raw: &str) -> Result<i64, String> {
+pub(crate) fn relay_spec_i64(raw: &str) -> Result<i64, String> {
     let decoded = base64::engine::general_purpose::URL_SAFE
         .decode(raw)
         .map_err(|error| error.to_string())?;
@@ -168,13 +178,18 @@ impl ExternalServiceConnectionStore for PgExternalServiceConnectionStore {
 }
 
 /// One `ExternalService` node, with every lazily-resolved field precomputed.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExternalServiceNodeData {
     pub id: i64,
     pub kind: String,
     pub display_name: String,
     /// `RedactedConfig` (decrypted, secrets replaced by [`REDACTED_SECRET`]).
     pub config: String,
+    /// `extsvc.UniqueCodeHostIdentifier` (`ExternalService.url`).
+    pub url: Result<String, String>,
+    /// `ExternalService.webhookURL`; `Ok(None)` is the baseline's `nil`
+    /// ("no webhook URL can be built for this kind / webhooks disabled").
+    pub webhook_url: Result<Option<String>, String>,
     pub created_at: time::OffsetDateTime,
     pub updated_at: time::OffsetDateTime,
     pub creator: Option<UserData>,
@@ -186,6 +201,8 @@ pub struct ExternalServiceNodeData {
     pub next_sync_at: Option<time::OffsetDateTime>,
     pub unrestricted: bool,
     pub supports_repo_exclusion: bool,
+    /// `availabilityCheck[kind]` (`ExternalService.hasConnectionCheck`).
+    pub has_connection_check: bool,
 }
 
 /// An `ExternalServiceConnection` page.
@@ -207,11 +224,13 @@ pub enum ExternalServicesConnectionLookup {
 /// `schemaResolver.ExternalServices` (`external_services.go:376-398`),
 /// including the site-admin gate, cursor parsing and the connection's
 /// `Nodes`/`TotalCount`/`PageInfo` computation.
+#[allow(clippy::too_many_arguments)]
 pub async fn external_services(
     args: &ExternalServicesArgs,
     store: &dyn ExternalServiceConnectionStore,
     users: Option<&dyn UserLookupStore>,
     key: Option<Arc<dyn Key>>,
+    external_url: &str,
     actor: Actor,
     current_user: Option<&UserData>,
 ) -> ExternalServicesConnectionLookup {
@@ -275,44 +294,20 @@ pub async fn external_services(
     let mut user_cache: HashMap<i32, Result<Option<UserData>, String>> = HashMap::new();
     let mut nodes = Vec::with_capacity(records.len());
     for record in records {
-        let config = match redacted_config(&record, key.as_deref()).await {
-            Ok(config) => config,
+        let node = match node_data_from_record(
+            record,
+            store,
+            users,
+            key.clone(),
+            external_url,
+            &mut user_cache,
+        )
+        .await
+        {
+            Ok(node) => node,
             Err(message) => return ExternalServicesConnectionLookup::Error(message),
         };
-        let repo_count = match store.repo_count(record.id).await {
-            Ok(count) => count,
-            Err(message) => return ExternalServicesConnectionLookup::Error(message),
-        };
-        let last_sync_error = match store.last_sync_error(record.id).await {
-            Ok(error) => error,
-            Err(message) => return ExternalServicesConnectionLookup::Error(message),
-        };
-        let creator = match lookup_user(users, &mut user_cache, record.creator_id).await {
-            Ok(user) => user,
-            Err(message) => return ExternalServicesConnectionLookup::Error(message),
-        };
-        let last_updater = match lookup_user(users, &mut user_cache, record.last_updater_id).await {
-            Ok(user) => user,
-            Err(message) => return ExternalServicesConnectionLookup::Error(message),
-        };
-        nodes.push(ExternalServiceNodeData {
-            id: record.id,
-            supports_repo_exclusion: supports_repo_exclusion(&record.kind),
-            kind: record.kind,
-            display_name: record.display_name,
-            config,
-            created_at: record.created_at,
-            updated_at: record.updated_at,
-            creator,
-            last_updater,
-            // `List` never populates the resolver's `warning` field.
-            warning: None,
-            last_sync_error,
-            repo_count,
-            last_sync_at: record.last_sync_at,
-            next_sync_at: record.next_sync_at,
-            unrestricted: record.unrestricted,
-        });
+        nodes.push(node);
     }
 
     ExternalServicesConnectionLookup::Found(ExternalServicesConnectionData {
@@ -331,21 +326,67 @@ pub async fn external_service_by_id(
     store: &dyn ExternalServiceConnectionStore,
     users: Option<&dyn UserLookupStore>,
     key: Option<Arc<dyn Key>>,
+    external_url: &str,
     id: i64,
 ) -> Result<ExternalServiceNodeData, String> {
     let record = store.get_by_id(id).await?;
-    let config = redacted_config(&record, key.as_deref()).await?;
+    let mut user_cache: HashMap<i32, Result<Option<UserData>, String>> = HashMap::new();
+    node_data_from_record(record, store, users, key, external_url, &mut user_cache).await
+}
+
+/// `schemaResolver.Node`'s `externalServiceByID` branch (`node.go`,
+/// `external_service.go:71-84`, `:90-99`): site-admin gate, Relay kind
+/// validation, then `GetByID` (soft-deleted services are not found).
+#[allow(clippy::too_many_arguments)]
+pub async fn external_service_node_by_id(
+    store: &dyn ExternalServiceConnectionStore,
+    users: Option<&dyn UserLookupStore>,
+    key: Option<Arc<dyn Key>>,
+    external_url: &str,
+    raw_id: &str,
+    actor: Actor,
+    viewer_site_admin: bool,
+) -> Result<ExternalServiceNodeData, String> {
+    check_current_user_is_site_admin(actor, viewer_site_admin)?;
+    let id = unmarshal_external_service_id(raw_id)?;
+    external_service_by_id(store, users, key, external_url, id).await
+}
+
+/// Build one node's data: decrypt `config` once, then derive the redacted
+/// config, `url` (`extsvc.UniqueCodeHostIdentifier`), `webhookURL` and the
+/// eagerly-prefetched relation counts.
+async fn node_data_from_record(
+    record: ExternalServiceListRecord,
+    store: &dyn ExternalServiceConnectionStore,
+    users: Option<&dyn UserLookupStore>,
+    key: Option<Arc<dyn Key>>,
+    external_url: &str,
+    user_cache: &mut HashMap<i32, Result<Option<UserData>, String>>,
+) -> Result<ExternalServiceNodeData, String> {
+    let raw = maybe_decrypt(key.as_deref(), &record.config, &record.encryption_key_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    // `ExternalService.RedactedConfig` short-circuits on an empty config.
+    let config = if raw.is_empty() {
+        raw.clone()
+    } else {
+        redact_config(&record.kind, &raw)?
+    };
+    let url = unique_code_host_identifier(&record.kind, &raw);
+    let webhook_url = webhook_url(&record.kind, record.id, &raw, external_url);
     let repo_count = store.repo_count(record.id).await?;
     let last_sync_error = store.last_sync_error(record.id).await?;
-    let mut user_cache: HashMap<i32, Result<Option<UserData>, String>> = HashMap::new();
-    let creator = lookup_user(users, &mut user_cache, record.creator_id).await?;
-    let last_updater = lookup_user(users, &mut user_cache, record.last_updater_id).await?;
+    let creator = lookup_user(users, user_cache, record.creator_id).await?;
+    let last_updater = lookup_user(users, user_cache, record.last_updater_id).await?;
     Ok(ExternalServiceNodeData {
         id: record.id,
         supports_repo_exclusion: supports_repo_exclusion(&record.kind),
+        has_connection_check: has_connection_check(&record.kind),
         kind: record.kind,
         display_name: record.display_name,
         config,
+        url,
+        webhook_url,
         created_at: record.created_at,
         updated_at: record.updated_at,
         creator,
@@ -379,10 +420,12 @@ async fn lookup_user(
 }
 
 /// Prefetch every selected `Query.externalServices` field.
+#[allow(clippy::too_many_arguments)]
 pub async fn prefetch_external_services(
     store: &dyn ExternalServiceConnectionStore,
     users: Option<&dyn UserLookupStore>,
     key: Option<Arc<dyn Key>>,
+    external_url: &str,
     fields: &[RootField],
     actor: Actor,
     current_user: Option<&UserData>,
@@ -396,7 +439,16 @@ pub async fn prefetch_external_services(
         if connections.contains_key(&args) {
             continue;
         }
-        let lookup = external_services(&args, store, users, key.clone(), actor, current_user).await;
+        let lookup = external_services(
+            &args,
+            store,
+            users,
+            key.clone(),
+            external_url,
+            actor,
+            current_user,
+        )
+        .await;
         connections.insert(args, lookup);
     }
     connections
@@ -417,18 +469,289 @@ fn supports_repo_exclusion(kind: &str) -> bool {
     )
 }
 
-/// `ExternalService.RedactedConfig` (`internal/types/secret.go:39-119`).
-async fn redacted_config(
-    record: &ExternalServiceListRecord,
-    key: Option<&dyn Key>,
-) -> Result<String, String> {
-    let raw = maybe_decrypt(key, &record.config, &record.encryption_key_id)
-        .await
-        .map_err(|error| error.to_string())?;
-    if raw.is_empty() {
-        return Ok(raw);
+/// `availabilityCheck` (`external_service.go:345-347`).
+fn has_connection_check(kind: &str) -> bool {
+    matches!(
+        kind.to_ascii_uppercase().as_str(),
+        "AZUREDEVOPS" | "BITBUCKETCLOUD" | "BITBUCKETSERVER" | "GITHUB" | "GITLAB" | "PERFORCE"
+    )
+}
+
+/// `extsvc.Variant` (`internal/extsvc/types.go:180-290`). `AsKind` is upper
+/// case and `AsType` is the camelCase form of the same letters, so a single
+/// case-insensitive match against the concatenation covers both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Variant {
+    AwsCodeCommit,
+    AzureDevOps,
+    BitbucketCloud,
+    BitbucketServer,
+    Gerrit,
+    GitHub,
+    GitLab,
+    Gitolite,
+    GoModules,
+    JvmPackages,
+    NpmPackages,
+    Other,
+    Pagure,
+    Perforce,
+    Phabricator,
+    PythonPackages,
+    RubyPackages,
+    RustPackages,
+}
+
+impl Variant {
+    /// `VariantValueOf` (`types.go:265-273`): case-insensitive `AsKind` or
+    /// `AsType`; both lowercase to the same string.
+    fn from_kind(kind: &str) -> Option<Self> {
+        match kind.to_ascii_lowercase().as_str() {
+            "awscodecommit" => Some(Self::AwsCodeCommit),
+            "azuredevops" => Some(Self::AzureDevOps),
+            "bitbucketcloud" => Some(Self::BitbucketCloud),
+            "bitbucketserver" => Some(Self::BitbucketServer),
+            "gerrit" => Some(Self::Gerrit),
+            "github" => Some(Self::GitHub),
+            "gitlab" => Some(Self::GitLab),
+            "gitolite" => Some(Self::Gitolite),
+            "gomodules" => Some(Self::GoModules),
+            "jvmpackages" => Some(Self::JvmPackages),
+            "npmpackages" => Some(Self::NpmPackages),
+            "other" => Some(Self::Other),
+            "pagure" => Some(Self::Pagure),
+            "perforce" => Some(Self::Perforce),
+            "phabricator" => Some(Self::Phabricator),
+            "pythonpackages" => Some(Self::PythonPackages),
+            "rubypackages" => Some(Self::RubyPackages),
+            "rustpackages" => Some(Self::RustPackages),
+            _ => None,
+        }
     }
-    redact_config(&record.kind, &raw)
+
+    /// `Variant.AsKind()` (`types.go:240-242`).
+    fn as_kind(self) -> &'static str {
+        match self {
+            Self::AwsCodeCommit => "AWSCODECOMMIT",
+            Self::AzureDevOps => "AZUREDEVOPS",
+            Self::BitbucketCloud => "BITBUCKETCLOUD",
+            Self::BitbucketServer => "BITBUCKETSERVER",
+            Self::Gerrit => "GERRIT",
+            Self::GitHub => "GITHUB",
+            Self::GitLab => "GITLAB",
+            Self::Gitolite => "GITOLITE",
+            Self::GoModules => "GOMODULES",
+            Self::JvmPackages => "JVMPACKAGES",
+            Self::NpmPackages => "NPMPACKAGES",
+            Self::Other => "OTHER",
+            Self::Pagure => "PAGURE",
+            Self::Perforce => "PERFORCE",
+            Self::Phabricator => "PHABRICATOR",
+            Self::PythonPackages => "PYTHONPACKAGES",
+            Self::RubyPackages => "RUBYPACKAGES",
+            Self::RustPackages => "RUSTPACKAGES",
+        }
+    }
+
+    /// `Variant.WebhookURLPath()` (`types.go:257-259`); empty for kinds that
+    /// do not support webhooks.
+    fn webhook_url_path(self) -> &'static str {
+        match self {
+            Self::BitbucketCloud => "bitbucket-cloud-webhooks",
+            Self::BitbucketServer => "bitbucket-server-webhooks",
+            Self::GitHub => "github-webhooks",
+            Self::GitLab => "gitlab-webhooks",
+            _ => "",
+        }
+    }
+}
+
+/// `jsonc.Unmarshal` on an external service config: comments and trailing
+/// commas are accepted; syntax errors and an empty document are errors.
+fn parse_config(config: &str) -> Result<JsonValue, String> {
+    let (value, errors) = parse(
+        config,
+        ParseOptions {
+            comments: true,
+            trailing_commas: true,
+        },
+    );
+    if let Some(error) = errors.first() {
+        return Err(format!(
+            "parsing external service config: {}",
+            error.code_name()
+        ));
+    }
+    value.ok_or_else(|| "parsing external service config: unexpected end of JSON input".to_owned())
+}
+
+fn config_property<'a>(value: &'a JsonValue, property: &str) -> Option<&'a JsonValue> {
+    match value {
+        JsonValue::Object(object) => object.get(property),
+        _ => None,
+    }
+}
+
+/// A config string property; missing/null is the Go zero value `""`, a
+/// non-string value is an unmarshal error.
+fn config_string(value: &JsonValue, property: &str) -> Result<String, String> {
+    match config_property(value, property) {
+        None | Some(JsonValue::Null) => Ok(String::new()),
+        Some(JsonValue::String(text)) => Ok(text.clone()),
+        Some(_) => Err("parsing external service config: expected a string".to_owned()),
+    }
+}
+
+/// `extsvc.NormalizeBaseURL` (`internal/extsvc/codehost.go:86-93`): host
+/// lowercased, path gets a trailing `/`. `url.Parse` accepts relative values
+/// too (e.g. a gitolite `host`); those are treated as a bare path.
+fn normalize_base_url(raw: &str) -> String {
+    match url::Url::parse(raw) {
+        Ok(mut parsed) => {
+            let path = parsed.path();
+            if !path.ends_with('/') {
+                let with_slash = format!("{path}/");
+                parsed.set_path(&with_slash);
+            }
+            parsed.to_string()
+        }
+        Err(_) => {
+            if raw.ends_with('/') {
+                raw.to_owned()
+            } else {
+                format!("{raw}/")
+            }
+        }
+    }
+}
+
+/// `extsvc.UniqueCodeHostIdentifier` (`internal/extsvc/types.go:796-856`).
+fn unique_code_host_identifier(kind: &str, config: &str) -> Result<String, String> {
+    let Some(variant) = Variant::from_kind(kind) else {
+        return Err(format!("unknown external service kind {kind:?}"));
+    };
+    let value = parse_config(config)?;
+    match variant {
+        Variant::AwsCodeCommit => Ok(format!(
+            "{}:{}",
+            config_string(&value, "region")?,
+            config_string(&value, "accessKeyID")?
+        )),
+        Variant::Perforce => config_string(&value, "p4.port"),
+        Variant::GoModules
+        | Variant::JvmPackages
+        | Variant::NpmPackages
+        | Variant::PythonPackages
+        | Variant::RubyPackages
+        | Variant::RustPackages => Ok(variant.as_kind().to_owned()),
+        Variant::Gitolite => Ok(normalize_base_url(&config_string(&value, "host")?)),
+        Variant::GitLab
+        | Variant::GitHub
+        | Variant::AzureDevOps
+        | Variant::BitbucketServer
+        | Variant::BitbucketCloud
+        | Variant::Gerrit
+        | Variant::Phabricator
+        | Variant::Other
+        | Variant::Pagure => Ok(normalize_base_url(&config_string(&value, "url")?)),
+    }
+}
+
+/// True when the property is present and not JSON `null` (Go pointer/slice
+/// nil checks after `jsonc.Unmarshal`).
+fn config_non_null(value: &JsonValue, property: &str) -> Result<bool, String> {
+    match config_property(value, property) {
+        None | Some(JsonValue::Null) => Ok(false),
+        Some(JsonValue::Object(_)) => Ok(true),
+        Some(_) => Err("parsing external service config: expected an object".to_owned()),
+    }
+}
+
+/// `len(config.Webhooks) > 0` for the slice-valued webhook config fields.
+fn config_webhooks_present(value: &JsonValue, property: &str) -> Result<bool, String> {
+    match config_property(value, property) {
+        None | Some(JsonValue::Null) => Ok(false),
+        Some(JsonValue::Array(items)) => Ok(!items.is_empty()),
+        Some(_) => Err("parsing external service config: expected an array".to_owned()),
+    }
+}
+
+/// `extsvc.WebhookURL` (`internal/extsvc/types.go:481-530`) plus the
+/// per-kind enable switch in `external_service.go:208-246`. `Ok(None)` is
+/// the baseline's `nil` (unsupported kind or webhooks not configured).
+fn webhook_url(
+    kind: &str,
+    id: i64,
+    config: &str,
+    external_url: &str,
+) -> Result<Option<String>, String> {
+    let Some(variant) = Variant::from_kind(kind) else {
+        return Err(format!("unknown external service kind {kind:?}"));
+    };
+    let path = variant.webhook_url_path();
+    if path.is_empty() {
+        return Ok(None);
+    }
+    let value = parse_config(config)?;
+
+    // `url.Parse(externalURL)`; keep the authority and any existing query
+    // parameters, then replace the path (`u.Path = ...`).
+    let mut params: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
+    let mut base = String::new();
+    match url::Url::parse(external_url) {
+        Ok(mut parsed) => {
+            for (key, value) in url::form_urlencoded::parse(parsed.query().unwrap_or("").as_bytes())
+            {
+                params
+                    .entry(key.into_owned())
+                    .or_default()
+                    .push(value.into_owned());
+            }
+            parsed.set_path(&format!("/.api/{path}"));
+            let rendered = parsed.to_string();
+            let end = rendered.find(['?', '#']).unwrap_or(rendered.len());
+            base.push_str(&rendered[..end]);
+        }
+        // Go's `url.Parse` accepts relative values, but its `String()` would
+        // only contain the (replaced) path, so the relative form is the same.
+        Err(_) => base.push_str(&format!(".api/{path}")),
+    }
+    params.insert("externalServiceID".to_owned(), vec![id.to_string()]);
+    if variant == Variant::BitbucketCloud {
+        params.insert(
+            "secret".to_owned(),
+            vec![config_string(&value, "webhookSecret")?],
+        );
+    }
+    let mut serializer = url::form_urlencoded::Serializer::new(String::new());
+    for (key, values) in &params {
+        for value in values {
+            serializer.append_pair(key, value);
+        }
+    }
+    let encoded = serializer.finish();
+    let url = format!("{base}?{encoded}");
+
+    // `external_service.go:225-243`: only the four webhook-capable kinds are
+    // ever assigned, and only when the config enables webhooks.
+    let enabled = match variant {
+        Variant::BitbucketCloud => !config_string(&value, "webhookSecret")?.is_empty(),
+        Variant::BitbucketServer => {
+            let direct = config_non_null(&value, "webhooks")?;
+            let via_plugin = match config_property(&value, "plugin") {
+                None | Some(JsonValue::Null) => false,
+                Some(plugin @ JsonValue::Object(_)) => config_non_null(plugin, "webhooks")?,
+                Some(_) => {
+                    return Err("parsing external service config: expected an object".to_owned())
+                }
+            };
+            direct || via_plugin
+        }
+        Variant::GitHub | Variant::GitLab => config_webhooks_present(&value, "webhooks")?,
+        _ => false,
+    };
+    Ok(enabled.then_some(url))
 }
 
 /// Replace the kind's secret properties in the raw JSONC document, keeping
@@ -707,7 +1030,7 @@ impl ObjectValue for ExternalServiceObject {
     fn field(
         &self,
         field: &str,
-        _arguments: &Arguments,
+        arguments: &Arguments,
         _actor: Actor,
     ) -> Result<Option<FieldValue>, ExecError> {
         match field {
@@ -746,11 +1069,51 @@ impl ObjectValue for ExternalServiceObject {
             "supportsRepoExclusion" => Ok(Some(FieldValue::Json(Json::Bool(
                 self.data.supports_repo_exclusion,
             )))),
+            // `ExternalService.URL` (`external_service.go:128-144`).
+            "url" => match &self.data.url {
+                Ok(url) => Ok(Some(FieldValue::Json(Json::Str(url.clone())))),
+                Err(message) => Err(ExecError::new(message.clone())),
+            },
+            // `ExternalService.WebhookURL` (`external_service.go:208-246`).
+            "webhookURL" => match &self.data.webhook_url {
+                Ok(Some(url)) => Ok(Some(FieldValue::Json(Json::Str(url.clone())))),
+                Ok(None) => Ok(Some(FieldValue::Null)),
+                Err(message) => Err(ExecError::new(message.clone())),
+            },
+            // `ExternalService.RateLimiterState` (`external_service.go:146-158`)
+            // reads the Redis-backed global limiter; this snapshot has no such
+            // state source, so "no limiter state" is `null` (overview §3.1).
+            "rateLimiterState" => Ok(Some(FieldValue::Null)),
+            // `ExternalService.HasConnectionCheck` (`external_service.go:345-347`).
+            "hasConnectionCheck" => Ok(Some(FieldValue::Json(Json::Bool(
+                self.data.has_connection_check,
+            )))),
+            // `ExternalService.WebhookLogs` (`external_service.go:287-293`):
+            // the M9.8gi connection restricted to this service id.
+            "webhookLogs" => {
+                let args = webhook_logs_args(arguments);
+                match self
+                    .nested
+                    .external_service_webhook_logs
+                    .get(&(self.data.id, args))
+                {
+                    Some(WebhookLogsConnectionLookup::Found(data)) => Ok(Some(FieldValue::Object(
+                        Arc::new(WebhookLogConnectionObject::from_data(
+                            data.clone(),
+                            self.viewer_site_admin,
+                            self.nested.clone(),
+                        )),
+                    ))),
+                    Some(WebhookLogsConnectionLookup::Error(message)) => {
+                        Err(ExecError::new(message.clone()))
+                    }
+                    None => Ok(None),
+                }
+            }
             // Explicit "not ported" rather than the executor's generic
-            // missing-resolver error (overview §3.1).
-            "url" | "webhookURL" | "rateLimiterState" | "checkConnection"
-            | "hasConnectionCheck" | "syncJobs" | "webhookLogs" => Err(ExecError::new(format!(
-                "ExternalService.{field} is not ported (M9.8gh)"
+            // missing-resolver error.
+            "checkConnection" | "syncJobs" => Err(ExecError::new(format!(
+                "ExternalService.{field} is not ported (M9.8gk)"
             ))),
             _ => Ok(None),
         }

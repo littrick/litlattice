@@ -195,6 +195,7 @@ async fn external_services_harness() {
             &store,
             Some(&users),
             Some(key.clone()),
+            "",
             actor,
             current_user.as_ref(),
         )
