@@ -330,7 +330,8 @@ impl Service for FrontendService {
                     Arc::clone(wiring.live()),
                 )
                 .with_clone_urls(clone_url_resolver)
-                .with_log_events(log_events_store, Arc::clone(wiring.live()));
+                .with_log_events(log_events_store, Arc::clone(wiring.live()))
+                .with_site_configuration(Arc::clone(wiring.store()), Arc::clone(wiring.server()));
         // `serve_cmd.go:436-448`: the anonymous GraphQL limiter stores GCRA
         // state in the Redis cache pool (`gql:rl:` prefix). A redigo pool does
         // not dial at construction (failures surface per request); here an

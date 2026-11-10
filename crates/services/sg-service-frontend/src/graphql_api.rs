@@ -397,6 +397,9 @@ pub struct SchemaGraphqlDeps {
     /// `Query.featureFlags` / `Query.featureFlag`'s database seam; `None` in
     /// transport-only tests.
     feature_flags: Option<Arc<dyn crate::graphql_resolvers::FeatureFlagStore>>,
+    /// `Mutation.updateSiteConfiguration`'s configuration store/server seams;
+    /// `None` in transport-only tests.
+    site_configuration: Option<crate::site_configuration_mutation::SiteConfigurationDeps>,
     /// `Query.repositories`'s database seam; `None` in transport-only tests.
     repositories_connections: Option<Arc<dyn crate::repositories::RepositoriesConnectionStore>>,
 }
@@ -422,6 +425,7 @@ impl SchemaGraphqlDeps {
             clone_urls: None,
             log_events: None,
             feature_flags: None,
+            site_configuration: None,
             repositories_connections: None,
         }
     }
@@ -461,6 +465,7 @@ impl SchemaGraphqlDeps {
             feature_flags: Some(Arc::new(
                 crate::feature_flag_store::PgFeatureFlagStore::new(pool.clone()),
             )),
+            site_configuration: None,
             repositories_connections: Some(Arc::new(
                 crate::repositories::PgRepositoriesConnectionStore::new(pool),
             )),
@@ -570,6 +575,18 @@ impl SchemaGraphqlDeps {
         self
     }
 
+    /// Enable `Mutation.updateSiteConfiguration`: the process' raw
+    /// configuration store and its configuration server.
+    pub fn with_site_configuration(
+        mut self,
+        store: Arc<sg_config::store::ConfigStore>,
+        server: Arc<crate::configuration_server::DbConfigServer>,
+    ) -> Self {
+        self.site_configuration =
+            Some(crate::site_configuration_mutation::SiteConfigurationDeps { store, server });
+        self
+    }
+
     /// Test hook: inject the store/user lookup without Redis or Postgres.
     #[cfg(test)]
     fn with_session_parts(
@@ -603,6 +620,7 @@ impl SchemaGraphqlDeps {
             clone_urls: None,
             log_events: None,
             feature_flags: None,
+            site_configuration: None,
             repositories_connections: None,
         }
     }
@@ -797,6 +815,24 @@ impl GraphqlDeps for SchemaGraphqlDeps {
                 .await;
                 for (field, outcome) in outcomes {
                     mutation = mutation.with_feature_flag_mutation(field, outcome);
+                }
+            }
+        }
+        // `Mutation.updateSiteConfiguration`: site-admin gated write through
+        // the configuration server (`site.go:294-362`).
+        if let (Some(pool), Some(deps)) = (&self.pool, &self.site_configuration) {
+            if is_mutation {
+                let outcomes =
+                    crate::site_configuration_mutation::prefetch_update_site_configuration(
+                        pool,
+                        deps,
+                        &fields,
+                        request.actor,
+                        site_admin,
+                    )
+                    .await;
+                for (field, outcome) in outcomes {
+                    mutation = mutation.with_site_configuration(field, outcome);
                 }
             }
         }
