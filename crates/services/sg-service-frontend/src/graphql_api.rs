@@ -208,11 +208,26 @@ fn query_error_json(error: &QueryError) -> Result<Json, String> {
 }
 
 /// `graphQLQueryParams` (`graphql.go:235-239`).
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct GraphqlQueryParams {
     pub query: String,
     pub operation_name: String,
     pub variables: Map<String, Value>,
+    /// Go leaves `Variables` nil when the field is absent or `null`; the
+    /// in-memory [`Map`] cannot express that, but the audit log can
+    /// (`"null"` vs `"{}"`).
+    pub variables_are_nil: bool,
+}
+
+impl Default for GraphqlQueryParams {
+    fn default() -> Self {
+        Self {
+            query: String::new(),
+            operation_name: String::new(),
+            variables: Map::new(),
+            variables_are_nil: true,
+        }
+    }
 }
 
 /// A request handed to [`GraphqlDeps::exec`] (`schema.Exec` arguments).
@@ -758,9 +773,37 @@ where
         .map(|(key, value)| (key.clone(), value.clone()))
         .collect();
 
-    // `graphql.go:140-150`: from here on every return path observes the
-    // request duration (`defer instrumentGraphQL`).
-    let mut timer = RequestTimer::new(&params.query, &request_name);
+    // `graphql.go:147-151`: `defer instrumentGraphQL; recordAuditLog`, i.e.
+    // from here on every return path observes the duration and (when enabled)
+    // writes the audit log.
+    let audit_context = crate::audit::GraphqlAuditContext {
+        actor: crate::audit::AuditActor::new(
+            actor.uid(),
+            match actor {
+                Actor::User { .. } => String::new(),
+                Actor::Anonymous => actor_anonymous_uid(req.headers()),
+            },
+        ),
+        client: crate::audit::client_info(
+            req.headers(),
+            req.extensions()
+                .get::<sg_http::RemoteAddr>()
+                .map(|remote| remote.0.as_str()),
+        ),
+        query: params.query.clone(),
+        variables_json: crate::audit::GraphqlAuditContext::variables_json(
+            if params.variables_are_nil {
+                None
+            } else {
+                Some(&params.variables)
+            },
+        ),
+        request_name: request_name.clone(),
+        request_source: request_source.clone(),
+        successful: true,
+    };
+    let site = live.current().site.clone();
+    let mut timer = RequestTimer::new(&params.query, &request_name, site, audit_context);
 
     // Calculating the cost is cheaper than validating the schema
     // (`graphql.go:159`).
@@ -838,7 +881,8 @@ where
     text_response(StatusCode::OK, "application/json", body, false)
 }
 
-/// The `defer instrumentGraphQL(traceData)` (`graphql.go:146-150`).
+/// The `defer instrumentGraphQL(traceData); recordAuditLog(...)`
+/// (`graphql.go:146-151`); `Drop` runs the two in that order.
 ///
 /// `exec_start` stays [`None`] on the pre-execution return paths (cost
 /// violations, 429), where the baseline computes `time.Since(time.Time{})`
@@ -850,16 +894,30 @@ struct RequestTimer {
     success: bool,
     started: Instant,
     exec_start: Option<Instant>,
+    /// Site config snapshot for `recordAuditLog`; the baseline reads
+    /// `conf.SiteConfig()` in the deferred call, but a whole request sees a
+    /// stable config in practice.
+    site: SiteConfiguration,
+    /// `recordAuditLog(traceData)`; gating and formatting happen in `Drop`
+    /// because the audit log is part of the same defer as the metric.
+    audit: crate::audit::GraphqlAuditContext,
 }
 
 impl RequestTimer {
-    fn new(query: &str, route: &str) -> Self {
+    fn new(
+        query: &str,
+        route: &str,
+        site: SiteConfiguration,
+        audit: crate::audit::GraphqlAuditContext,
+    ) -> Self {
         Self {
             mutation: crate::graphql_metrics::is_mutation_query(query),
             route: route.to_owned(),
             success: true,
             started: Instant::now(),
             exec_start: None,
+            site,
+            audit,
         }
     }
 
@@ -887,6 +945,11 @@ impl Drop for RequestTimer {
             self.success,
             seconds,
         );
+        // `recordAuditLog` runs after `instrumentGraphQL` in the same defer.
+        self.audit.successful = self.success;
+        if let Some(record) = crate::audit::graphql_record(&self.site, &self.audit) {
+            record.emit(&crate::audit::log_level_from_env());
+        }
     }
 }
 
@@ -1010,6 +1073,20 @@ fn anonymous_uid(headers: &HeaderMap) -> Option<String> {
     None
 }
 
+/// `AnonymousUIDMiddleware` (`internal/actor/http.go:180-205`): the cookie is
+/// authoritative, and the `X-Sourcegraph-Actor-Anonymous-UID` propagation
+/// header is consulted only when there is no cookie. Used for the audit
+/// actor's ID; `getUID` deliberately keeps its own cookie-only lookup.
+fn actor_anonymous_uid(headers: &HeaderMap) -> String {
+    if let Some(uid) = anonymous_uid(headers) {
+        return uid;
+    }
+    headers
+        .get("x-sourcegraph-actor-anonymous-uid")
+        .map(|value| String::from_utf8_lossy(value.as_bytes()).into_owned())
+        .unwrap_or_default()
+}
+
 // ---------------------------------------------------------------------------
 // Request body decoding
 // ---------------------------------------------------------------------------
@@ -1058,7 +1135,10 @@ fn decode_params(body: &[u8]) -> Result<GraphqlQueryParams, String> {
         } else if key.eq_ignore_ascii_case("variables") {
             params.variables = match value {
                 Value::Null => Map::new(),
-                Value::Object(variables) => variables,
+                Value::Object(variables) => {
+                    params.variables_are_nil = false;
+                    variables
+                }
                 other => {
                     return Err(format!(
                         "json: cannot unmarshal {} into Go struct field \
@@ -1808,6 +1888,27 @@ mod tests {
             get_uid(&headers, Actor::User { uid: 42 }),
             ("42".to_owned(), false, false)
         );
+    }
+
+    #[test]
+    fn audit_actor_uid_prefers_cookie_over_propagation_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-sourcegraph-actor-anonymous-uid",
+            HeaderValue::from_static("header-uid"),
+        );
+        assert_eq!(actor_anonymous_uid(&headers), "header-uid");
+        headers.insert(
+            header::COOKIE,
+            HeaderValue::from_static("sourcegraphAnonymousUid=cookie-uid"),
+        );
+        assert_eq!(actor_anonymous_uid(&headers), "cookie-uid");
+        headers.insert(
+            header::COOKIE,
+            HeaderValue::from_static("sourcegraphAnonymousUid="),
+        );
+        // An empty cookie is authoritative: the header fallback is not used.
+        assert_eq!(actor_anonymous_uid(&headers), "");
     }
 
     #[tokio::test]

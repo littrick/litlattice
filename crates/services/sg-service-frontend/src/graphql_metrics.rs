@@ -154,19 +154,21 @@ mod tests {
 
     #[test]
     fn observes_cost_with_actor_type_label() {
-        observe_cost("anonymous", 3);
+        // Unique label so concurrent handler tests observing real actor types
+        // cannot change this sample's count.
+        observe_cost("m9fv-test-actor", 3);
         let text = sg_metrics::render_default();
         assert!(
-            text.contains("src_graphql_cost_distribution_count{actor_type=\"anonymous\"} 1"),
+            text.contains("src_graphql_cost_distribution_count{actor_type=\"m9fv-test-actor\"} 1"),
             "{text}"
         );
     }
 
     #[test]
     fn early_returns_land_in_the_infinite_bucket() {
-        observe_request_duration(false, "unknown", true, PRE_EXEC_DURATION_SECONDS);
+        observe_request_duration(false, "m9fv-test-route", true, PRE_EXEC_DURATION_SECONDS);
         let text = sg_metrics::render_default();
-        let suffix = "src_graphql_request_duration_seconds_bucket{mutation=\"false\",route=\"unknown\",success=\"true\",le=\"+Inf\"} 1";
+        let suffix = "src_graphql_request_duration_seconds_bucket{mutation=\"false\",route=\"m9fv-test-route\",success=\"true\",le=\"+Inf\"} 1";
         assert!(text.contains(suffix), "{text}");
     }
 }
