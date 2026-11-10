@@ -415,6 +415,13 @@ pub trait OrgMembershipsStore: Send + Sync {
     /// `settingsStore.GetLatest` for `User.latestSettings`
     /// (`internal/database/settings.go:88-120`).
     async fn latest_settings_for_user(&self, user_id: i32) -> Result<Option<SettingsData>, String>;
+
+    /// `settingsStore.GetLatest` for `Org.latestSettings` (`org_id = <id>`).
+    async fn latest_settings_for_org(&self, org_id: i32) -> Result<Option<SettingsData>, String>;
+
+    /// `settingsStore.GetLatest` for `Site.latestSettings` (global settings:
+    /// `user_id IS NULL AND org_id IS NULL`).
+    async fn latest_settings_for_site(&self) -> Result<Option<SettingsData>, String>;
 }
 
 /// Prefetched nodes for `Query.node` (`schemaResolver.Node`,
@@ -442,6 +449,18 @@ pub fn relay_kind(id: &str) -> Option<String> {
 /// `relay.UnmarshalSpec` for an int32 ID: decode, skip the kind prefix (the
 /// kind is **not** validated here) and parse the remaining JSON as an int32.
 pub fn unmarshal_relay_id(id: &str) -> Result<i32, String> {
+    let decoded = base64::engine::general_purpose::URL_SAFE
+        .decode(id)
+        .map_err(|error| error.to_string())?;
+    let text = String::from_utf8_lossy(&decoded);
+    let Some((_, spec)) = text.split_once(':') else {
+        return Err("invalid graphql.ID".to_owned());
+    };
+    serde_json::from_str(spec).map_err(|error| error.to_string())
+}
+
+/// `relay.UnmarshalSpec` for a string ID (used by `Site` IDs).
+pub fn unmarshal_relay_spec_string(id: &str) -> Result<String, String> {
     let decoded = base64::engine::general_purpose::URL_SAFE
         .decode(id)
         .map_err(|error| error.to_string())?;
@@ -550,11 +569,27 @@ pub struct SettingsData {
     pub author_user_id: Option<i32>,
 }
 
-/// `db.Settings().GetLatest` result for a user subject: `Found(None)` is the
+/// `db.Settings().GetLatest` result for a subject: `Found(None)` is the
 /// baseline's `nil, nil` (no settings row).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LatestSettingsLookup {
     Found(Option<SettingsData>),
+    Error(String),
+}
+
+/// The checked `SettingsSubject` a `Query.settingsSubject` or
+/// `Settings.subject` resolves to (`settings_subject.go:93-123`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SettingsSubjectData {
+    User(UserData),
+    Org(OrgData),
+    Site,
+}
+
+/// A prefetched `Query.settingsSubject(id)` result, keyed by the raw Relay ID.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SettingsSubjectLookup {
+    Found(SettingsSubjectData),
     Error(String),
 }
 
@@ -574,6 +609,12 @@ pub struct NestedPrefetch {
     pub users_by_id: HashMap<i32, UserByIdLookup>,
     /// `User.latestSettings` keyed by user id.
     pub latest_settings: HashMap<i32, LatestSettingsLookup>,
+    /// `Org.latestSettings` keyed by org id.
+    pub org_latest_settings: HashMap<i32, LatestSettingsLookup>,
+    /// `Site.latestSettings` (global settings, `None` when not prefetched).
+    pub site_latest_settings: Option<LatestSettingsLookup>,
+    /// `Query.settingsSubject` results keyed by the raw Relay ID.
+    pub settings_subjects: HashMap<String, SettingsSubjectLookup>,
 }
 
 /// The database seam for `User.organizations` (`db.Orgs().GetByUserID` plus
@@ -601,6 +642,15 @@ pub fn organizations_args(arguments: &Arguments) -> OrganizationsArgs {
 /// The viewer's database ID for membership checks (`0` = anonymous).
 fn viewer_uid(actor: Actor) -> i32 {
     actor.uid().unwrap_or(0)
+}
+
+/// `auth.CheckOrgAccessOrSiteAdmin`'s error for an unauthorized viewer
+/// (`internal/auth/orgs.go:12,43`).
+fn org_access_error(actor: Actor) -> &'static str {
+    match actor {
+        Actor::Anonymous => "not authenticated",
+        Actor::User { .. } => "current user is not an org member",
+    }
 }
 
 /// Look up every `Query.organization` root field in `fields`, deduplicated by
@@ -720,6 +770,12 @@ pub async fn prefetch_nested(
     let mut user_queue: Vec<UserJob> = Vec::new();
     let mut org_queue: Vec<OrgJob> = Vec::new();
     let mut membership_queue: Vec<MembershipJob> = Vec::new();
+    // `Query.settingsSubject` results and the global (Site) settings row,
+    // populated below and moved onto `nested` after the field loop.
+    let mut settings_subjects: HashMap<String, SettingsSubjectLookup> = HashMap::new();
+    let mut site_latest_settings: Option<LatestSettingsLookup> = None;
+    let mut site_settings_fetched = false;
+    let mut site_author_ids: Vec<i32> = Vec::new();
     for field in fields {
         match field.name.as_str() {
             "currentUser" => {
@@ -839,11 +895,116 @@ pub async fn prefetch_nested(
                     _ => {}
                 }
             }
+            // `Query.settingsSubject(id)` (`settings_subject.go:16-23`):
+            // `nodeByID` dispatch, then `settingsSubjectForNodeAndCheckAccess`.
+            // User/Org access failures are reported on this field, exactly like
+            // the baseline; `Site` has no access check.
+            "settingsSubject" => {
+                let Some(id) = field.arguments.string("id") else {
+                    continue;
+                };
+                if settings_subjects.contains_key(id) {
+                    continue;
+                }
+                let Some(kind) = relay_kind(id) else {
+                    continue;
+                };
+                let lookup = match kind.as_str() {
+                    "User" => match unmarshal_relay_id(id) {
+                        Err(error) => SettingsSubjectLookup::Error(error),
+                        Ok(user_id) => match memberships_store.user_by_id(user_id).await {
+                            Err(error) => SettingsSubjectLookup::Error(error),
+                            Ok(user) => {
+                                let authorized = match actor {
+                                    Actor::User { uid } if uid == user.id => true,
+                                    _ => viewer_site_admin,
+                                };
+                                if !authorized {
+                                    SettingsSubjectLookup::Error(
+                                        MUST_BE_SITE_ADMIN_OR_SAME_USER.to_owned(),
+                                    )
+                                } else {
+                                    user_queue.push(UserJob {
+                                        user: user.clone(),
+                                        selections: field.selections.clone(),
+                                    });
+                                    SettingsSubjectLookup::Found(SettingsSubjectData::User(user))
+                                }
+                            }
+                        },
+                    },
+                    "Org" => match unmarshal_relay_id(id) {
+                        Err(error) => SettingsSubjectLookup::Error(error),
+                        Ok(org_id) => match memberships_store
+                            .org_by_id(org_id, viewer_uid(actor), viewer_site_admin)
+                            .await
+                        {
+                            Err(error) => SettingsSubjectLookup::Error(error),
+                            Ok(org) => {
+                                if !org.viewer_can_administer {
+                                    SettingsSubjectLookup::Error(org_access_error(actor).to_owned())
+                                } else {
+                                    org_queue.push(OrgJob {
+                                        org: org.clone(),
+                                        selections: field.selections.clone(),
+                                    });
+                                    SettingsSubjectLookup::Found(SettingsSubjectData::Org(org))
+                                }
+                            }
+                        },
+                    },
+                    // `siteByGQLID` (`site.go:51-61`): the spec must be the
+                    // `"site"` singleton.
+                    "Site" => match unmarshal_relay_spec_string(id) {
+                        Err(error) => SettingsSubjectLookup::Error(error),
+                        Ok(site_id) if site_id != "site" => {
+                            SettingsSubjectLookup::Error(format!("site not found: {site_id:?}"))
+                        }
+                        Ok(_) => {
+                            let wants_settings = field
+                                .selections
+                                .iter()
+                                .any(|selection| selection.name == "latestSettings");
+                            if wants_settings && !site_settings_fetched {
+                                site_settings_fetched = true;
+                                let lookup =
+                                    match memberships_store.latest_settings_for_site().await {
+                                        Ok(settings) => LatestSettingsLookup::Found(settings),
+                                        Err(error) => LatestSettingsLookup::Error(error),
+                                    };
+                                if let LatestSettingsLookup::Found(Some(settings)) = &lookup {
+                                    if let Some(author_id) = settings.author_user_id {
+                                        site_author_ids.push(author_id);
+                                    }
+                                }
+                                site_latest_settings = Some(lookup);
+                            }
+                            SettingsSubjectLookup::Found(SettingsSubjectData::Site)
+                        }
+                    },
+                    _ => SettingsSubjectLookup::Error("invalid id".to_owned()),
+                };
+                settings_subjects.insert(id.to_owned(), lookup);
+            }
             _ => {}
         }
     }
 
-    let mut nested = NestedPrefetch::default();
+    let mut nested = NestedPrefetch {
+        settings_subjects,
+        site_latest_settings,
+        ..Default::default()
+    };
+    for author_id in site_author_ids {
+        if nested.users_by_id.contains_key(&author_id) {
+            continue;
+        }
+        let lookup = match memberships_store.user_by_id(author_id).await {
+            Ok(user) => UserByIdLookup::Found(user),
+            Err(error) => UserByIdLookup::Error(error),
+        };
+        nested.users_by_id.insert(author_id, lookup);
+    }
     loop {
         let mut progress = false;
         // User level: `User.organizations` and `User.organizationMemberships`;
@@ -998,6 +1159,37 @@ pub async fn prefetch_nested(
                             selections: nodes.selections.clone(),
                         });
                     }
+                }
+            }
+            // `Org.latestSettings` (`org.go:176-195`): the same org access
+            // check as `settingsSubjectForNodeAndCheckAccess`; the author row
+            // is prefetched alongside (`settings.go:48-60`).
+            for _selection in job
+                .selections
+                .iter()
+                .filter(|selection| selection.name == "latestSettings")
+            {
+                if !job.org.viewer_can_administer {
+                    continue;
+                }
+                if !nested.org_latest_settings.contains_key(&job.org.id) {
+                    let lookup = match memberships_store.latest_settings_for_org(job.org.id).await {
+                        Ok(settings) => LatestSettingsLookup::Found(settings),
+                        Err(error) => LatestSettingsLookup::Error(error),
+                    };
+                    if let LatestSettingsLookup::Found(Some(settings)) = &lookup {
+                        if let Some(author_id) = settings.author_user_id {
+                            if !nested.users_by_id.contains_key(&author_id) {
+                                let author = match memberships_store.user_by_id(author_id).await {
+                                    Ok(user) => UserByIdLookup::Found(user),
+                                    Err(error) => UserByIdLookup::Error(error),
+                                };
+                                nested.users_by_id.insert(author_id, author);
+                            }
+                        }
+                    }
+                    nested.org_latest_settings.insert(job.org.id, lookup);
+                    progress = true;
                 }
             }
         }
@@ -1401,6 +1593,27 @@ impl ObjectValue for QueryRoot {
         actor: Actor,
     ) -> Result<Option<FieldValue>, ExecError> {
         match field {
+            // `schemaResolver.SettingsSubject` (`settings_subject.go:16-23`):
+            // `nodeByID` dispatch + `settingsSubjectForNodeAndCheckAccess`;
+            // User/Org access failures are reported here.
+            "settingsSubject" => {
+                let Some(id) = arguments.string("id") else {
+                    return Ok(None);
+                };
+                match self.nested.settings_subjects.get(id) {
+                    Some(SettingsSubjectLookup::Found(data)) => Ok(Some(FieldValue::Object(
+                        Arc::new(SettingsSubjectObject::from_data(
+                            data.clone(),
+                            self.viewer_site_admin,
+                            self.nested.clone(),
+                        )),
+                    ))),
+                    Some(SettingsSubjectLookup::Error(message)) => {
+                        Err(ExecError::new(message.clone()))
+                    }
+                    None => Ok(None),
+                }
+            }
             // `CurrentUser` -> `db.Users().GetByCurrentAuthUser`: anonymous
             // actors get `nil`; an authenticated actor gets the prefetched row
             // (or `nil` if it disappeared between authentication and here).
@@ -1744,7 +1957,7 @@ impl ObjectValue for UserObject {
                     Some(LatestSettingsLookup::Found(settings)) => Ok(Some(match settings {
                         Some(settings) => FieldValue::Object(Arc::new(SettingsObject {
                             data: settings.clone(),
-                            subject: self.clone(),
+                            subject: SettingsSubjectObject::User(self.clone()),
                             viewer_site_admin: self.viewer_site_admin,
                             nested: self.nested.clone(),
                         })),
@@ -1767,8 +1980,8 @@ impl ObjectValue for UserObject {
 #[derive(Debug, Clone, PartialEq)]
 pub struct SettingsObject {
     data: SettingsData,
-    /// The checked settings subject (the user whose settings these are).
-    subject: UserObject,
+    /// The checked settings subject these settings belong to.
+    subject: SettingsSubjectObject,
     viewer_site_admin: bool,
     nested: Arc<NestedPrefetch>,
 }
@@ -1813,6 +2026,116 @@ impl ObjectValue for SettingsObject {
             "configuration" => Ok(Some(FieldValue::Object(Arc::new(ConfigurationObject {
                 contents: self.data.contents.clone(),
             })))),
+            _ => Ok(None),
+        }
+    }
+}
+
+/// A checked `SettingsSubject` (`settings_subject.go:93-123`): the interface
+/// field selections are delegated to the concrete subject object.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SettingsSubjectObject {
+    User(UserObject),
+    Org(OrgObject),
+    Site(SiteObject),
+}
+
+impl SettingsSubjectObject {
+    /// Build the GraphQL object for a prefetched subject, attaching the
+    /// request's nested data.
+    pub fn from_data(
+        data: SettingsSubjectData,
+        viewer_site_admin: bool,
+        nested: Arc<NestedPrefetch>,
+    ) -> Self {
+        match data {
+            SettingsSubjectData::User(data) => Self::User(
+                UserObject::from_data_as_viewer(data, viewer_site_admin).with_nested(nested),
+            ),
+            SettingsSubjectData::Org(data) => Self::Org(
+                OrgObject::from_data_as_viewer(data, viewer_site_admin).with_nested(nested),
+            ),
+            SettingsSubjectData::Site => Self::Site(SiteObject {
+                viewer_site_admin,
+                nested,
+            }),
+        }
+    }
+}
+
+impl ObjectValue for SettingsSubjectObject {
+    fn type_name(&self) -> &'static str {
+        match self {
+            Self::User(user) => user.type_name(),
+            Self::Org(org) => org.type_name(),
+            Self::Site(site) => site.type_name(),
+        }
+    }
+
+    fn field(
+        &self,
+        field: &str,
+        arguments: &Arguments,
+        actor: Actor,
+    ) -> Result<Option<FieldValue>, ExecError> {
+        match self {
+            Self::User(user) => user.field(field, arguments, actor),
+            Self::Org(org) => org.field(field, arguments, actor),
+            Self::Site(site) => site.field(field, arguments, actor),
+        }
+    }
+}
+
+/// `siteResolver` as a `SettingsSubject` (`site.go:92,134-157,166`): only the
+/// interface fields are ported. `Query.settingsSubject` performs no access
+/// check for the site subject (`settings_subject.go:93-123`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SiteObject {
+    viewer_site_admin: bool,
+    nested: Arc<NestedPrefetch>,
+}
+
+impl SiteObject {
+    /// `relay.MarshalID("Site", "site")`.
+    pub fn relay_id() -> String {
+        base64::engine::general_purpose::URL_SAFE.encode("Site:\"site\"")
+    }
+
+    fn latest_settings(&self) -> Result<Option<FieldValue>, ExecError> {
+        match &self.nested.site_latest_settings {
+            Some(LatestSettingsLookup::Found(Some(settings))) => {
+                Ok(Some(FieldValue::Object(Arc::new(SettingsObject {
+                    data: settings.clone(),
+                    subject: SettingsSubjectObject::Site(self.clone()),
+                    viewer_site_admin: self.viewer_site_admin,
+                    nested: self.nested.clone(),
+                }))))
+            }
+            Some(LatestSettingsLookup::Found(None)) => Ok(Some(FieldValue::Null)),
+            Some(LatestSettingsLookup::Error(message)) => Err(ExecError::new(message.clone())),
+            None => Ok(None),
+        }
+    }
+}
+
+impl ObjectValue for SiteObject {
+    fn type_name(&self) -> &'static str {
+        "Site"
+    }
+
+    fn field(
+        &self,
+        field: &str,
+        _arguments: &Arguments,
+        _actor: Actor,
+    ) -> Result<Option<FieldValue>, ExecError> {
+        match field {
+            "id" => Ok(Some(FieldValue::Json(Json::Str(Self::relay_id())))),
+            "settingsURL" => Ok(Some(FieldValue::Json(Json::Str(
+                "/site-admin/global-settings".to_owned(),
+            )))),
+            "viewerCanAdminister" => Ok(Some(FieldValue::Json(Json::Bool(self.viewer_site_admin)))),
+            "latestSettings" => self.latest_settings(),
             _ => Ok(None),
         }
     }
@@ -2017,13 +2340,35 @@ impl ObjectValue for OrgObject {
         &self,
         field: &str,
         arguments: &Arguments,
-        _actor: Actor,
+        actor: Actor,
     ) -> Result<Option<FieldValue>, ExecError> {
         match field {
             "id" => Ok(Some(FieldValue::Json(Json::Str(Self::relay_id(
                 self.data.id,
             ))))),
             "name" => Ok(Some(FieldValue::Json(Json::Str(self.data.name.clone())))),
+            // `OrgResolver.LatestSettings` (`org.go:176-195`): the org access
+            // check (`settingsSubjectForNodeAndCheckAccess`) then `GetLatest`.
+            "latestSettings" => {
+                if !self.data.viewer_can_administer {
+                    return Err(ExecError::new(org_access_error(actor)));
+                }
+                match self.nested.org_latest_settings.get(&self.data.id) {
+                    Some(LatestSettingsLookup::Found(Some(settings))) => {
+                        Ok(Some(FieldValue::Object(Arc::new(SettingsObject {
+                            data: settings.clone(),
+                            subject: SettingsSubjectObject::Org(self.clone()),
+                            viewer_site_admin: self.viewer_site_admin,
+                            nested: self.nested.clone(),
+                        }))))
+                    }
+                    Some(LatestSettingsLookup::Found(None)) => Ok(Some(FieldValue::Null)),
+                    Some(LatestSettingsLookup::Error(message)) => {
+                        Err(ExecError::new(message.clone()))
+                    }
+                    None => Ok(None),
+                }
+            }
             // `OrgResolver.DisplayName` returns the row pointer as-is: NULL is
             // `null`, an empty string stays `""`.
             "displayName" => Ok(Some(match &self.data.display_name {
@@ -3439,6 +3784,17 @@ mod tests {
             &self,
             _user_id: i32,
         ) -> Result<Option<SettingsData>, String> {
+            Ok(None)
+        }
+
+        async fn latest_settings_for_org(
+            &self,
+            _org_id: i32,
+        ) -> Result<Option<SettingsData>, String> {
+            Ok(None)
+        }
+
+        async fn latest_settings_for_site(&self) -> Result<Option<SettingsData>, String> {
             Ok(None)
         }
     }

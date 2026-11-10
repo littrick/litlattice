@@ -22,7 +22,7 @@ use sg_db::orgs::{
     count_orgs, find_org_by_id, find_org_by_name, list_orgs, org_members_for_user,
     org_memberships_for_user, orgs_for_user, OrgMembershipRecord, OrgRecord, OrgsListOptions,
 };
-use sg_db::settings::latest_for_user;
+use sg_db::settings::{latest_for_org, latest_for_site, latest_for_user};
 use sg_db::users::{
     count_users, get_session_user, list_users_by_org, UsersListOptions, UsersPaginationArgs,
 };
@@ -317,11 +317,31 @@ impl OrgMembershipsStore for PgOrgStore {
         let record = latest_for_user(&self.pool, user_id)
             .await
             .map_err(|error| error.to_string())?;
-        Ok(record.map(|record| SettingsData {
-            id: record.id,
-            contents: record.contents,
-            created_at: record.created_at,
-            author_user_id: record.author_user_id,
-        }))
+        Ok(record.map(to_settings_data))
+    }
+
+    /// `settingsStore.GetLatest` for `Org.latestSettings` (`org_id = <id>`).
+    async fn latest_settings_for_org(&self, org_id: i32) -> Result<Option<SettingsData>, String> {
+        let record = latest_for_org(&self.pool, org_id)
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(record.map(to_settings_data))
+    }
+
+    /// `settingsStore.GetLatest` for `Site.latestSettings` (global settings).
+    async fn latest_settings_for_site(&self) -> Result<Option<SettingsData>, String> {
+        let record = latest_for_site(&self.pool)
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(record.map(to_settings_data))
+    }
+}
+
+fn to_settings_data(record: sg_db::settings::SettingsRecord) -> SettingsData {
+    SettingsData {
+        id: record.id,
+        contents: record.contents,
+        created_at: record.created_at,
+        author_user_id: record.author_user_id,
     }
 }
