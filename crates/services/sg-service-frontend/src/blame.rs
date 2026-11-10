@@ -633,6 +633,7 @@ fn go_time_rfc3339_nano(date: Option<&Timestamp>) -> String {
 mod tests {
     use super::*;
     use crate::external_api::{api_response_with_deps, route_for_test, Route};
+    use crate::search_stream::{SearchDeps, UnavailableDeps};
     use http::Request;
     use http_body_util::BodyExt;
     use sg_config::{ServiceConnections, SiteConfiguration, Unified};
@@ -741,7 +742,8 @@ mod tests {
 
     async fn run(deps: &Arc<FakeDeps>, target: &str) -> (StatusCode, http::HeaderMap, String) {
         let deps: Arc<dyn BlameDeps> = deps.clone();
-        let response = api_response_with_deps(&request(target), &live(), deps).await;
+        let search_deps: Arc<dyn SearchDeps> = Arc::new(UnavailableDeps);
+        let response = api_response_with_deps(&request(target), &live(), deps, search_deps).await;
         let status = response.status();
         let headers = response.headers().clone();
         let body = response

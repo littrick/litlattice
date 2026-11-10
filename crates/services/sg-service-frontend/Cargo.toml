@@ -14,8 +14,10 @@ sg-git = { path = "../../domain/sg-git" }
 sg-http = { path = "../../net/sg-http" }
 sg-metrics = { path = "../../base/sg-metrics" }
 sg-proto = { path = "../../net/sg-proto" }
+sg-service-searcher = { path = "../sg-service-searcher" }
 async-trait = { workspace = true }
 bytes = { workspace = true }
+flate2 = { workspace = true }
 http = { workspace = true }
 http-body-util = { workspace = true }
 hyper = { workspace = true }
@@ -29,6 +31,7 @@ tokio-stream = { workspace = true }
 tokio-util = { workspace = true }
 tonic = { workspace = true }
 tracing = { workspace = true }
+url = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]

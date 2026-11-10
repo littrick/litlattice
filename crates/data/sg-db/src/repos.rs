@@ -398,6 +398,120 @@ impl RepoStore {
     }
 }
 
+/// One entry of `types.SearchedRepo`, the metadata used to decorate search
+/// results (`internal/database/repos.go:339-405`, `Repos().Metadata`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SearchedRepo {
+    pub id: i32,
+    pub name: String,
+    /// `repo.description` (NULL scans as the empty string, like the
+    /// baseline's `dbutil.NullString`).
+    pub description: String,
+    pub fork: bool,
+    pub archived: bool,
+    pub private: bool,
+    /// `repo.stars` (NULL scans as 0, like `dbutil.NullInt`).
+    pub stars: i32,
+    /// `gr.last_fetched` from `gitserver_repos`.
+    pub last_fetched: Option<OffsetDateTime>,
+    /// `(SELECT json_object_agg(key, value) FROM repo_kvps ...)`; `None`
+    /// when the subquery returns NULL (or `{}`).
+    pub key_value_pairs: Option<serde_json::Value>,
+    /// `repo.topics`; `None` when the array is empty (`repoTopics.Scan`
+    /// converts `{}` to a nil slice).
+    pub topics: Option<Vec<String>>,
+}
+
+impl RepoStore {
+    /// `Repos().Metadata(ids...)`: the limited column set the frontend
+    /// search stream uses to decorate matches. Repositories missing from the
+    /// result set (deleted or unknown IDs) are simply absent. Order follows
+    /// `ORDER BY repo.id`; callers map by ID, so it does not matter.
+    pub async fn metadata(&self, ids: &[i32]) -> Result<Vec<SearchedRepo>, sqlx::Error> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let rows = sqlx::query(
+            r#"
+SELECT
+	repo.id,
+	repo.name,
+	repo.description,
+	repo.fork,
+	repo.archived,
+	repo.private,
+	repo.stars,
+	gr.last_fetched,
+	(SELECT json_object_agg(key, value) FROM repo_kvps WHERE repo_kvps.repo_id = repo.id) AS key_value_pairs,
+	repo.topics
+FROM repo
+LEFT JOIN gitserver_repos gr ON gr.repo_id = repo.id
+WHERE repo.deleted_at IS NULL AND repo.id = ANY($1)
+ORDER BY repo.id
+"#,
+        )
+        .bind(ids)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.iter()
+            .map(|row| {
+                let topics: Option<Vec<String>> = row.try_get("topics")?;
+                // The baseline scans `{}` into a nil slice; `json_object_agg`
+                // over an empty table yields NULL.
+                let key_value_pairs: Option<serde_json::Value> = row.try_get("key_value_pairs")?;
+                Ok(SearchedRepo {
+                    id: row.try_get("id")?,
+                    name: row.try_get("name")?,
+                    description: row.try_get::<Option<String>, _>("description")?.unwrap_or_default(),
+                    fork: row.try_get("fork")?,
+                    archived: row.try_get("archived")?,
+                    private: row.try_get("private")?,
+                    stars: row.try_get::<Option<i32>, _>("stars")?.unwrap_or(0),
+                    last_fetched: row.try_get("last_fetched")?,
+                    key_value_pairs: key_value_pairs.filter(|v| !is_empty_json_object(v)),
+                    topics: topics.filter(|t| !t.is_empty()),
+                })
+            })
+            .collect()
+    }
+
+    /// Best-effort ID → name lookup for the streaming progress "skipped"
+    /// lists and `RepoNamer` (`Repos().StreamMinimalRepos` with `IDs` only,
+    /// `ORDER BY id`). Unknown IDs are absent from the result, matching the
+    /// baseline's best-effort callback (callers fall back to
+    /// `UNKNOWN{ID=...}`).
+    pub async fn minimal_repo_names_by_ids(
+        &self,
+        ids: &[i32],
+    ) -> Result<Vec<(i32, String)>, sqlx::Error> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let rows = sqlx::query(
+            r#"
+SELECT id, name
+FROM repo
+WHERE deleted_at IS NULL AND id = ANY($1)
+ORDER BY id
+"#,
+        )
+        .bind(ids)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(|row| Ok((row.try_get("id")?, row.try_get("name")?)))
+            .collect()
+    }
+}
+
+/// `json_object_agg` returns `{}` (not NULL) when the filtered set is empty
+/// in some PostgreSQL versions; the baseline treats an empty map as nil
+/// because `encoding/json` omits it either way.
+fn is_empty_json_object(value: &serde_json::Value) -> bool {
+    matches!(value, serde_json::Value::Object(map) if map.is_empty())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

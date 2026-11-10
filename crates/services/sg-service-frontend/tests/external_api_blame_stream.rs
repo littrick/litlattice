@@ -19,6 +19,7 @@ use sg_service_frontend::blame::{
     UserError,
 };
 use sg_service_frontend::external_api::api_response_with_deps;
+use sg_service_frontend::search_stream::{SearchDeps, UnavailableDeps};
 
 fn live() -> LiveConfig {
     let site = SiteConfiguration::parse("{}").expect("site");
@@ -228,8 +229,14 @@ async fn run(deps: &Arc<FakeDeps>, name: &str, method: &str, target: &str) {
         .uri(target)
         .body(())
         .expect("request");
-    let response =
-        api_response_with_deps(&request, &live(), Arc::clone(deps) as Arc<dyn BlameDeps>).await;
+    let search_deps: Arc<dyn SearchDeps> = Arc::new(UnavailableDeps);
+    let response = api_response_with_deps(
+        &request,
+        &live(),
+        Arc::clone(deps) as Arc<dyn BlameDeps>,
+        search_deps,
+    )
+    .await;
     let status = response.status().as_u16();
     let field = |name: &http::HeaderName| match response.headers().get(name) {
         None => "-".to_owned(),

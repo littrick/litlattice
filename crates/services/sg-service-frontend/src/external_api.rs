@@ -83,6 +83,8 @@ const GITLAB_WEBHOOKS_PATH: &str = "/.api/gitlab-webhooks";
 const BITBUCKET_SERVER_WEBHOOKS_PATH: &str = "/.api/bitbucket-server-webhooks";
 const BITBUCKET_CLOUD_WEBHOOKS_PATH: &str = "/.api/bitbucket-cloud-webhooks";
 const OPENCODEGRAPH_PATH: &str = "/.api/opencodegraph";
+/// `httpapi.go:172`: `m.Path("/search/stream").Methods("GET")`.
+const SEARCH_STREAM_PATH: &str = "/.api/search/stream";
 
 /// `routevar.RepoPattern` (`routevar/repo.go:30-35`) after
 /// `namedToNonCapturingGroups`: the gorilla `{Repo:...}` template body. A
@@ -152,6 +154,7 @@ pub(crate) enum Route {
     RepoShield {
         repo: String,
     },
+    SearchStream,
     BlameStream {
         repo: String,
         /// The `Rev` route variable without its `@` (`None` when the URL had
@@ -183,7 +186,9 @@ impl Route {
             Route::SrcCli { .. } | Route::ClientConfig | Route::ModelConfig => {
                 method == Method::GET
             }
-            Route::RepoShield { .. } | Route::BlameStream { .. } => method == Method::GET,
+            Route::RepoShield { .. } | Route::BlameStream { .. } | Route::SearchStream => {
+                method == Method::GET
+            }
             Route::WebhookUuid { .. }
             | Route::GitHubWebhooks
             | Route::GitLabWebhooks
@@ -215,12 +220,14 @@ pub async fn api_response_with_deps<B>(
     req: &Request<B>,
     _live: &LiveConfig,
     deps: Arc<dyn BlameDeps>,
+    search_deps: Arc<dyn crate::search_stream::SearchDeps>,
 ) -> Response<BoxBody> {
     match route_request(req) {
         Err(response) => response,
         Ok(Route::BlameStream { repo, rev, path }) => {
             crate::blame::blame_response(req, &repo, rev.as_deref(), &path, deps).await
         }
+        Ok(Route::SearchStream) => crate::search_stream::search_response(req, search_deps).await,
         Ok(route) => route_response(req, route),
     }
 }
@@ -274,8 +281,11 @@ fn route_request<B>(req: &Request<B>) -> Result<Route, Response<BoxBody>> {
 fn route_response<B>(req: &Request<B>, route: Route) -> Response<BoxBody> {
     match route {
         // Served by `api_response_with_deps`; the synchronous entry point
-        // never has the dependencies and must not be used for blame.
-        Route::BlameStream { .. } => empty_response(StatusCode::INTERNAL_SERVER_ERROR),
+        // never has the dependencies and must not be used for blame or
+        // search.
+        Route::BlameStream { .. } | Route::SearchStream => {
+            empty_response(StatusCode::INTERNAL_SERVER_ERROR)
+        }
         Route::Registry => registry_response(),
         Route::Scim => enterprise_not_found("SCIM handler"),
         Route::BatchesFile { .. } if req.method() == Method::HEAD => {
@@ -396,6 +406,9 @@ fn match_route(path: &str) -> Option<Route> {
     }
     if path == MODEL_CONFIG_PATH {
         return Some(Route::ModelConfig);
+    }
+    if path == SEARCH_STREAM_PATH {
+        return Some(Route::SearchStream);
     }
     if let Some(caps) = repo_shield_regex().captures(path) {
         return Some(Route::RepoShield {

@@ -23,10 +23,7 @@ pub enum SiteConfigFileError {
     /// `os.ReadFile` failed.
     Read { path: PathBuf, source: io::Error },
     /// `jsonc.Unmarshal` failed: `failed to parse JSON in %s: %v`.
-    Parse {
-        path: PathBuf,
-        message: String,
-    },
+    Parse { path: PathBuf, message: String },
     /// The file's top-level JSON value is not an object (`json.Unmarshal`
     /// into `map[string]*json.RawMessage`).
     NotObject { path: PathBuf },
@@ -210,9 +207,10 @@ mod tests {
             "// leading comment\n{\n  // first comment\n  \"first\": \"file\",\n} // trailing comment\n",
         );
         write(&second, "{\"second\": \"file\"}");
-        let merged =
-            String::from_utf8(read_site_config_file(&[first.clone(), second.clone()]).expect("read"))
-                .expect("utf8");
+        let merged = String::from_utf8(
+            read_site_config_file(&[first.clone(), second.clone()]).expect("read"),
+        )
+        .expect("utf8");
         let expected = format!(
             "// merged SITE_CONFIG_FILE\n{{\n  // BEGIN {}\n  \"first\": \"file\",\n  // END {}\n  // BEGIN {}\n  \"second\": \"file\",\n  // END {}\n}}",
             first.display(),
@@ -232,16 +230,22 @@ mod tests {
             &path,
             "{\n  \"search.index.branches\": {\n    \"github.com/sourcegraph/sourcegraph\": [\"3.17\", \"v3.0.0\"],\n    \"github.com/go-yaml/yaml\": [\"v2\", \"v3\"]\n  }\n}",
         );
-        write(&other, "{\"observability.alerts\": [ {\"level\":\"warning\"} ]}");
+        write(
+            &other,
+            "{\"observability.alerts\": [ {\"level\":\"warning\"} ]}",
+        );
         let merged =
             String::from_utf8(read_site_config_file(&[path.clone(), other]).expect("read"))
                 .expect("utf8");
         assert!(merged.contains(
             "  \"search.index.branches\": {\n    \"github.com/go-yaml/yaml\": [\n      \"v2\",\n      \"v3\"\n    ],\n    \"github.com/sourcegraph/sourcegraph\": [\n      \"3.17\",\n      \"v3.0.0\"\n    ]\n  },"
         ), "{merged}");
-        assert!(merged.contains(
-            "  \"observability.alerts\": [\n    {\n      \"level\": \"warning\"\n    }\n  ],"
-        ), "{merged}");
+        assert!(
+            merged.contains(
+                "  \"observability.alerts\": [\n    {\n      \"level\": \"warning\"\n    }\n  ],"
+            ),
+            "{merged}"
+        );
     }
 
     #[test]

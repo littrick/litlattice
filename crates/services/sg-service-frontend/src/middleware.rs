@@ -29,6 +29,7 @@ use crate::goimportpath;
 use crate::health;
 use crate::ipallowlist::{self, AllowlistEnv, IpAllowlistConfig};
 use crate::mux::{self, SecurityConfig};
+use crate::search_stream::SearchDeps;
 use crate::tenant;
 use crate::trace_headers;
 
@@ -297,6 +298,7 @@ pub fn external_handler_with_live(
     allowlist_env: AllowlistEnv,
     version: Bytes,
     blame_deps: Arc<dyn BlameDeps>,
+    search_deps: Arc<dyn SearchDeps>,
 ) -> sg_http::HttpHandler {
     let api_live = Arc::clone(&live);
     let middleware = Arc::new(LiveMiddleware::new(live, allowlist_env));
@@ -304,6 +306,7 @@ pub fn external_handler_with_live(
         let middleware = Arc::clone(&middleware);
         let api_live = Arc::clone(&api_live);
         let blame_deps = Arc::clone(&blame_deps);
+        let search_deps = Arc::clone(&search_deps);
         let version = version.clone();
         Box::pin(async move {
             let derived = middleware.current();
@@ -318,13 +321,17 @@ pub fn external_handler_with_live(
                     let security = derived.security.clone();
                     let api_live = Arc::clone(&api_live);
                     let blame_deps = Arc::clone(&blame_deps);
+                    let search_deps = Arc::clone(&search_deps);
                     Box::pin(async move {
                         let request: &Request<Incoming> = req;
                         mux::route_async(request, &security, |route| async move {
                             match route {
                                 mux::Route::Api => {
                                     crate::external_api::api_response_with_deps(
-                                        request, &api_live, blame_deps,
+                                        request,
+                                        &api_live,
+                                        blame_deps,
+                                        search_deps,
                                     )
                                     .await
                                 }

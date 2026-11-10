@@ -25,6 +25,7 @@ pub mod internal_api;
 pub mod ipallowlist;
 pub mod middleware;
 pub mod mux;
+pub mod search_stream;
 pub mod service;
 pub mod service_connections;
 pub mod site_config_file;

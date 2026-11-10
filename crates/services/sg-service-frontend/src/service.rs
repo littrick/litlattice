@@ -133,6 +133,7 @@ impl Service for FrontendService {
             .await
             .map_err(ServiceError::new)?;
         let blame_pool = pool.clone();
+        let search_pool = blame_pool.clone();
         let source = crate::configuration_source::DbConfigurationSource::new(pool)
             .map_err(ServiceError::new)?;
         crate::configuration_startup::override_from_env(&source)
@@ -171,6 +172,8 @@ impl Service for FrontendService {
         let blame_deps: Arc<dyn crate::blame::BlameDeps> = Arc::new(
             crate::blame::BackendDeps::new(blame_pool, Arc::clone(wiring.live())),
         );
+        let search_deps: Arc<dyn crate::search_stream::SearchDeps> =
+            Arc::new(crate::search_stream::BackendDeps::new(search_pool));
 
         if let Some((addr, listener)) = internal {
             let shutdown = ctx.shutdown.clone();
@@ -211,6 +214,7 @@ impl Service for FrontendService {
                 self.allowlist_env.clone(),
                 self.version.bytes(),
                 blame_deps,
+                search_deps,
             ),
             ctx.shutdown.clone(),
         )
