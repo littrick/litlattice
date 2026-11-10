@@ -35,7 +35,7 @@ use serde_json::{Map, Value};
 use tonic::body::BoxBody;
 
 use sg_config::{LiveConfig, SiteConfiguration};
-use sg_graphql::exec::{ExecError, ExecResponse, PathSegment};
+use sg_graphql::exec::{Actor, ExecError, ExecResponse, PathSegment};
 use sg_graphql::json::Json;
 use sg_graphql::{estimate_query_cost, QueryCost};
 
@@ -214,6 +214,7 @@ pub struct GraphqlExecRequest<'a> {
     pub query: &'a str,
     pub operation_name: &'a str,
     pub variables: &'a Map<String, Value>,
+    pub actor: Actor,
 }
 
 /// `graphqlbackend.LimiterArgs` (`rate_limit.go:395-403`).
@@ -262,24 +263,30 @@ pub trait GraphqlDeps: Send + Sync {
 /// executor's `no ported resolver` error.
 pub struct SchemaGraphqlDeps {
     schema: Arc<sg_graphql::Schema>,
+    roots: crate::graphql_resolvers::FrontendRootResolver,
 }
 
 impl SchemaGraphqlDeps {
     pub fn new(schema: Arc<sg_graphql::Schema>) -> Self {
-        Self { schema }
+        Self {
+            schema,
+            roots: crate::graphql_resolvers::FrontendRootResolver::new(),
+        }
     }
 }
 
 #[async_trait]
 impl GraphqlDeps for SchemaGraphqlDeps {
     async fn exec(&self, request: GraphqlExecRequest<'_>) -> GraphqlResponse {
-        let response = sg_graphql::exec::execute(
+        let response = sg_graphql::exec::execute_with(
             &self.schema,
             sg_graphql::exec::ExecRequest {
                 query: request.query,
                 operation_name: request.operation_name,
                 variables: request.variables,
+                actor: request.actor,
             },
+            Some(&self.roots),
         );
         GraphqlResponse::from_exec(&response)
     }
@@ -431,6 +438,7 @@ where
             query: &params.query,
             operation_name: &params.operation_name,
             variables: &params.variables,
+            actor: Actor::Anonymous,
         })
         .await;
     let body = match response.to_json() {

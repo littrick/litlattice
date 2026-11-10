@@ -10,7 +10,7 @@
 
 use std::env;
 
-use sg_graphql::exec::{execute, ExecRequest};
+use sg_graphql::exec::{execute, Actor, ExecRequest};
 use sg_graphql::schema::assemble_oss;
 use sha2::{Digest, Sha256};
 
@@ -38,6 +38,7 @@ fn dump_executor_corpus() {
                 query,
                 operation_name,
                 variables: &variables,
+                actor: Actor::Anonymous,
             },
         );
         let body = response.to_json();
