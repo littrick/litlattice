@@ -52,5 +52,6 @@ uuid = { workspace = true }
 bytes = { workspace = true }
 http = { workspace = true }
 http-body-util = { workspace = true }
+roaring = "0.10"
 tokio = { workspace = true }
 tonic = { workspace = true }

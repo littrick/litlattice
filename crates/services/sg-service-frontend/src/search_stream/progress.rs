@@ -54,6 +54,16 @@ impl RepoStatusMap {
         self.m.is_empty()
     }
 
+    /// Every `(id, status)` pair in ascending ID order. Exposed for callers
+    /// that observe the full status map (differential harnesses); the
+    /// baseline iterates with `Iterate`.
+    pub fn entries(&self) -> Vec<(i32, u8)> {
+        let mut entries: Vec<(i32, u8)> =
+            self.m.iter().map(|(id, status)| (*id, *status)).collect();
+        entries.sort_unstable_by_key(|(id, _)| *id);
+        entries
+    }
+
     /// `Filter`, returning the matching IDs in ascending order (the baseline
     /// sorts in `getRepos`).
     pub fn filter(&self, mask: u8) -> Vec<i32> {
