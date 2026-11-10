@@ -40,6 +40,7 @@ pub mod middleware;
 pub mod mux;
 pub mod org_store;
 pub mod parse_search_query;
+pub mod ranking_graphql;
 pub mod rate_limit;
 pub mod repositories;
 pub mod repository_store;
