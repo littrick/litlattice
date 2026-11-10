@@ -17,6 +17,7 @@ sg-jsonx = { path = "../../domain/sg-jsonx" }
 sg-metrics = { path = "../../base/sg-metrics" }
 sg-proto = { path = "../../net/sg-proto" }
 sg-redis = { path = "../../data/sg-redis" }
+sg-search-query = { path = "../../domain/sg-search-query" }
 sg-session = { path = "../../domain/sg-session" }
 sg-service-searcher = { path = "../sg-service-searcher" }
 sg-settings-schema = { path = "../../domain/sg-settings-schema" }

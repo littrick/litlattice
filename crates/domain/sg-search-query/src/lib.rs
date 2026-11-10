@@ -10,9 +10,9 @@
 //! `and`/`or` expressions.
 //!
 //! Not ported in this slice: predicate argument semantics (`Predicate.Unmarshal`),
-//! `Plan`/`Basic` construction (`Pipeline`), repository revision parsing and
-//! the JSON printers (`ToJSON`/`PrettyJSON`). Predicate syntax is still scanned and labeled
-//! `IsPredicate` so parse trees match the baseline.
+//! repository revision parsing and `PrettyJSON`. Predicate syntax is still
+//! scanned and labeled `IsPredicate` so parse trees match the baseline.
+//! `ToJSON` is ported as [`to_json`] (M9.8fx).
 
 pub mod basic;
 pub mod fields;
@@ -34,6 +34,6 @@ pub use node::{
 };
 pub use parser::{parse, ParseError, SearchType};
 pub use pipeline::{parse_regexp, pipeline, pipeline_query};
-pub use printer::string_human;
+pub use printer::{string_human, to_json};
 pub use range::{Position, Range};
 pub use transformer::add_regexp_field;

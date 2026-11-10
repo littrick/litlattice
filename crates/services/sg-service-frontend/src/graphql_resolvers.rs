@@ -2100,6 +2100,34 @@ impl ObjectValue for QueryRoot {
                 }
             }
             // `schemaResolver.ViewerSettings` (`settings_cascade.go:75-93`):
+            // `schemaResolver.ParseSearchQuery` (`parse_search_query.go:49-61`):
+            // synchronous, no database. `PARSE_TREE` is ported; `JOB_TREE`
+            // reports an explicit "not ported" error (see the module docs).
+            "parseSearchQuery" => {
+                let args = crate::parse_search_query::ParseSearchQueryArgs {
+                    query: arguments.string("query").unwrap_or_default().to_owned(),
+                    pattern_type: arguments
+                        .string("patternType")
+                        .unwrap_or("standard")
+                        .to_owned(),
+                    output_phase: arguments
+                        .string("outputPhase")
+                        .unwrap_or(crate::parse_search_query::PARSE_TREE)
+                        .to_owned(),
+                    output_format: arguments
+                        .string("outputFormat")
+                        .unwrap_or(crate::parse_search_query::JSON)
+                        .to_owned(),
+                    output_verbosity: arguments
+                        .string("outputVerbosity")
+                        .unwrap_or(crate::parse_search_query::BASIC)
+                        .to_owned(),
+                };
+                match crate::parse_search_query::parse_search_query(&args) {
+                    Ok(json) => Ok(Some(FieldValue::Json(Json::Str(json)))),
+                    Err(message) => Err(ExecError::new(message)),
+                }
+            }
             // the current user's cascade, or the site cascade when anonymous
             // (or the row disappeared).
             "viewerSettings" | "viewerConfiguration" => {
@@ -3555,6 +3583,10 @@ mod tests {
                           organization(name: String!): Org \
                           organizations(first: Int, query: String): OrgConnection! \
                           node(id: ID!): Node \
+                          parseSearchQuery(query: String, patternType: SearchPatternType, \
+                                           outputPhase: SearchQueryOutputPhase, \
+                                           outputFormat: SearchQueryOutputFormat, \
+                                           outputVerbosity: SearchQueryOutputVerbosity): String! \
                           other: String } \
              interface Node { id: ID! } \
              type Repository implements Node { id: ID! name: String! \
@@ -3586,6 +3618,10 @@ mod tests {
                                         pageInfo: ConnectionPageInfo! } \
              type ConnectionPageInfo { endCursor: String startCursor: String \
                                        hasNextPage: Boolean! hasPreviousPage: Boolean! } \
+             enum SearchPatternType { standard literal regexp structural keyword } \
+             enum SearchQueryOutputPhase { PARSE_TREE JOB_TREE } \
+             enum SearchQueryOutputFormat { JSON SEXP MERMAID } \
+             enum SearchQueryOutputVerbosity { MINIMAL BASIC MAXIMAL } \
              scalar DateTime",
         )
         .expect("schema")
@@ -3641,6 +3677,44 @@ mod tests {
                 &FrontendRootResolver::new()
             ),
             r#"{"data":{"currentUser":null}}"#
+        );
+    }
+
+    #[test]
+    fn parse_search_query_uses_schema_defaults_and_returns_the_tree() {
+        let schema = schema();
+        let response = run(
+            &schema,
+            r#"{ parseSearchQuery(query: "foo") }"#,
+            Actor::Anonymous,
+            &FrontendRootResolver::new(),
+        );
+        let value: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(
+            value["data"]["parseSearchQuery"],
+            serde_json::Value::String(
+                r#"[{"value":"foo","negated":false,"labels":["Literal"],"range":{"start":{"line":0,"column":0},"end":{"line":0,"column":3}}}]"#
+                    .to_owned()
+            )
+        );
+    }
+
+    #[test]
+    fn parse_search_query_reports_unsupported_output_options() {
+        let schema = schema();
+        let response = run(
+            &schema,
+            r#"{ parseSearchQuery(query: "foo", outputFormat: SEXP) }"#,
+            Actor::Anonymous,
+            &FrontendRootResolver::new(),
+        );
+        let value: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(
+            value["errors"][0]["message"],
+            serde_json::Value::String(
+                "unsupported output options for PARSE_TREE, only JSON output with BASIC verbosity is supported"
+                    .to_owned()
+            )
         );
     }
 
