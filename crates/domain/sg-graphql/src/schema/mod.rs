@@ -17,20 +17,26 @@
 //! - `extend` targets an existing type of the same kind, and extension fields,
 //!   interfaces, union members, enum values and input fields must not collide
 //!   with what the base definition (or a *previous* extension) already
-//!   declared;
+//!   declared (`extend scalar` is a syntax error in the baseline parser);
 //! - `schema { ... }` entries must resolve; without one, `Query`, `Mutation`
 //!   and `Subscription` are inferred by name;
 //! - every field/argument/input-field type reference must resolve to a defined
 //!   type or a built-in scalar;
 //! - object/interface types implementing an interface must provide all of its
 //!   fields (by name);
-//! - union members must be object types.
+//! - union members must be object types;
+//! - directive *usages* resolve against the directive definitions and receive
+//!   the definitions' default arguments (this is where the default
+//!   `@deprecated(reason: "No longer supported")` comes from).
 //!
-//! Directives are parsed but not otherwise validated: the only directive the
-//! OSS SDL uses is `@deprecated`, which is built in. Execution, introspection
-//! (`__*` types) and resolvers are not ported here.
+//! The model retains everything introspection needs (descriptions, directive
+//! usage, default values) and includes the full graph-gophers meta schema
+//! (`internal/schema/meta.go`): the five built-in scalars, the four built-in
+//! directives, the `__*` introspection types and `_Service`. Relay JSON is
+//! produced by [`crate::introspection`]; query execution and resolvers are not
+//! ported yet.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fmt;
 
 use graphql_parser::schema as gql;
@@ -98,28 +104,158 @@ impl TypeKind {
             TypeKind::InputObject => "input_object",
         }
     }
+
+    /// The `__TypeKind` name used by introspection (`types.Kind()`).
+    pub fn introspection_str(self) -> &'static str {
+        match self {
+            TypeKind::Scalar => "SCALAR",
+            TypeKind::Object => "OBJECT",
+            TypeKind::Interface => "INTERFACE",
+            TypeKind::Union => "UNION",
+            TypeKind::Enum => "ENUM",
+            TypeKind::InputObject => "INPUT_OBJECT",
+        }
+    }
+}
+
+/// A GraphQL literal as written in the SDL, retaining enough structure to
+/// reproduce graph-gophers' `types.Value.String()` rendering used by
+/// introspection's `defaultValue`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ValueLiteral {
+    Null,
+    Boolean(bool),
+    Enum(String),
+    Int(String),
+    Float(String),
+    String(String),
+    List(Vec<ValueLiteral>),
+    Object(Vec<(String, ValueLiteral)>),
+}
+
+impl ValueLiteral {
+    /// `types.Value.String()`: primitives are printed from the source token
+    /// text (strings keep their quotes), lists as `[a, b]`, objects as
+    /// `{k: v}`.
+    pub fn render(&self) -> String {
+        match self {
+            ValueLiteral::Null => "null".to_owned(),
+            ValueLiteral::Boolean(value) => value.to_string(),
+            ValueLiteral::Enum(value) | ValueLiteral::Int(value) | ValueLiteral::Float(value) => {
+                value.clone()
+            }
+            ValueLiteral::String(value) => quote_graphql_string(value),
+            ValueLiteral::List(values) => {
+                let items: Vec<String> = values.iter().map(ValueLiteral::render).collect();
+                format!("[{}]", items.join(", "))
+            }
+            ValueLiteral::Object(fields) => {
+                let items: Vec<String> = fields
+                    .iter()
+                    .map(|(name, value)| format!("{name}: {}", value.render()))
+                    .collect();
+                format!("{{{}}}", items.join(", "))
+            }
+        }
+    }
+}
+
+/// Quote a string the way the source token would appear (graph-gophers keeps
+/// `scanner`'s token text including quotes).
+fn quote_graphql_string(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('"');
+    for ch in value.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{08}' => out.push_str("\\b"),
+            '\u{0c}' => out.push_str("\\f"),
+            ch if (ch as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", ch as u32)),
+            ch => out.push(ch),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// A resolved directive usage: the definition's default arguments have been
+/// appended (mirrors `internal/schema.resolveDirectives`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirectiveUse {
+    pub name: String,
+    /// Arguments in source order followed by the definition defaults; the
+    /// value is `None` when the definition argument has no default.
+    pub args: Vec<(String, Option<ValueLiteral>)>,
+}
+
+impl DirectiveUse {
+    pub fn argument(&self, name: &str) -> Option<&ValueLiteral> {
+        self.args
+            .iter()
+            .find(|(arg, _)| arg == name)
+            .and_then(|(_, value)| value.as_ref())
+    }
+
+    /// `reason` for `@deprecated`, defaulting like the built-in definition.
+    pub fn deprecation_reason(&self) -> Option<String> {
+        if self.name != "deprecated" {
+            return None;
+        }
+        match self.argument("reason") {
+            Some(ValueLiteral::String(reason)) => Some(reason.clone()),
+            Some(other) => Some(other.render()),
+            None => Some("No longer supported".to_owned()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirectiveDef {
+    pub name: String,
+    pub description: Option<String>,
+    /// Upper-case `__DirectiveLocation` names, in definition order.
+    pub locations: Vec<String>,
+    pub args: Vec<InputValueDef>,
+    pub repeatable: bool,
 }
 
 /// A field argument or an input-object field.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InputValueDef {
     pub name: String,
+    pub description: Option<String>,
     /// Rendered GraphQL type, e.g. `[String!]!`.
     pub value_type: String,
+    pub default_value: Option<ValueLiteral>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FieldDef {
     pub name: String,
+    pub description: Option<String>,
     /// Rendered GraphQL type, e.g. `[String!]!`.
     pub field_type: String,
     pub args: Vec<InputValueDef>,
+    pub directives: Vec<DirectiveUse>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnumValueDef {
+    pub name: String,
+    pub description: Option<String>,
+    pub directives: Vec<DirectiveUse>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TypeDef {
     pub name: String,
     pub kind: TypeKind,
+    pub description: Option<String>,
+    pub directives: Vec<DirectiveUse>,
     /// Object/interface fields.
     pub fields: Vec<FieldDef>,
     /// Input-object fields.
@@ -129,7 +265,7 @@ pub struct TypeDef {
     /// Union members.
     pub union_members: Vec<String>,
     /// Enum values.
-    pub enum_values: Vec<String>,
+    pub enum_values: Vec<EnumValueDef>,
 }
 
 /// The assembled schema: the type map plus root operation types.
@@ -139,10 +275,13 @@ pub struct Schema {
     pub query_type: Option<String>,
     pub mutation_type: Option<String>,
     pub subscription_type: Option<String>,
-    /// Directive definitions seen in the SDL (built-ins are not recorded).
-    pub directives: BTreeSet<String>,
+    /// Directive definitions (built-ins from the meta schema are included).
+    pub directives: BTreeMap<String, DirectiveDef>,
     /// Whether the SDL contained an explicit `schema { ... }` definition.
     pub has_schema_definition: bool,
+    /// Object definitions in SDL order (including the meta `_Service`), used
+    /// to derive interface `possibleTypes` like the baseline's `s.Objects`.
+    pub object_order: Vec<String>,
 }
 
 impl Schema {
@@ -191,8 +330,10 @@ impl Schema {
                     }
                 }
                 TypeKind::Enum => {
-                    if !def.enum_values.is_empty() {
-                        lines.push(format!("e {name} {}", join_sorted(&def.enum_values)));
+                    let values: Vec<String> =
+                        def.enum_values.iter().map(|v| v.name.clone()).collect();
+                    if !values.is_empty() {
+                        lines.push(format!("e {name} {}", join_sorted(&values)));
                     }
                 }
                 TypeKind::Scalar => {}
@@ -204,6 +345,24 @@ impl Schema {
             }
         }
         lines
+    }
+
+    /// The Relay introspection JSON (`(*graphql.Schema).ToJSON`), byte for
+    /// byte.
+    pub fn to_json(&self) -> String {
+        crate::introspection::to_json(self)
+    }
+
+    /// Objects implementing `interface`, in definition order (baseline
+    /// `InterfaceTypeDefinition.PossibleTypes`).
+    pub fn possible_types(&self, interface: &str) -> Vec<&TypeDef> {
+        self.object_order
+            .iter()
+            .filter_map(|name| self.types.get(name))
+            .filter(|def| {
+                def.kind == TypeKind::Object && def.interfaces.iter().any(|i| i == interface)
+            })
+            .collect()
     }
 }
 
@@ -239,22 +398,15 @@ pub fn assemble(sdls: &[&str]) -> Result<Schema, SchemaError> {
     assemble_sdl(&sdls.join("\n"))
 }
 
-/// The always-present meta types graph-gophers parses before user SDL
-/// (`internal/schema/meta.go`). Only the parts that surface in the schema
-/// shape are kept: the built-in scalars and the federation `_Service` object.
-/// The `__*` introspection types are supplied by the executor, not by schema
-/// assembly, and are therefore not modelled here.
-const META_SDL: &str = "\
-scalar Int
-scalar Float
-scalar String
-scalar Boolean
-scalar ID
-
-type _Service {
-  sdl: String!
-}
-";
+/// The always-present meta schema graph-gophers parses before user SDL
+/// (`internal/schema/meta.go`): the built-in scalars, built-in directives,
+/// `__*` introspection types and the federation `_Service` object.
+///
+/// The baseline parses its meta schema with `useStringDescriptions=false`, so
+/// the descriptions come from the `#` comments in `metaSrc`. graphql-parser
+/// ignores comments, so the vendored copy turns every comment into a
+/// description block string with the identical text.
+const META_SDL: &str = include_str!("sdl/meta.graphql");
 
 /// Parse and validate a single GraphQL SDL document.
 pub fn assemble_sdl(sdl: &str) -> Result<Schema, SchemaError> {
@@ -281,13 +433,19 @@ pub fn assemble_sdl(sdl: &str) -> Result<Schema, SchemaError> {
             }
             gql::Definition::TypeDefinition(def) => {
                 let ty = convert_type_def(def)?;
+                if ty.kind == TypeKind::Object {
+                    // `s.Objects` receives every object definition in parse
+                    // order; it drives interface `possibleTypes`.
+                    schema.object_order.push(ty.name.clone());
+                }
                 // The baseline assigns into the type map without a duplicate
                 // check: the last definition wins.
                 schema.types.insert(ty.name.clone(), ty);
             }
             gql::Definition::TypeExtension(ext) => extensions.push(ext.clone()),
             gql::Definition::DirectiveDefinition(def) => {
-                schema.directives.insert(def.name.clone());
+                let directive = convert_directive_def(def);
+                schema.directives.insert(directive.name.clone(), directive);
             }
         }
     }
@@ -296,13 +454,16 @@ pub fn assemble_sdl(sdl: &str) -> Result<Schema, SchemaError> {
         apply_extension(&mut schema.types, extension)?;
     }
 
-    validate(&schema)
+    resolve_all_directives(&mut schema)?;
+    validate(schema)
 }
 
 fn convert_type_def(def: &gql::TypeDefinition<'_, String>) -> Result<TypeDef, SchemaError> {
     let mut ty = TypeDef {
         name: String::new(),
         kind: TypeKind::Scalar,
+        description: None,
+        directives: Vec::new(),
         fields: Vec::new(),
         input_fields: Vec::new(),
         interfaces: Vec::new(),
@@ -313,50 +474,148 @@ fn convert_type_def(def: &gql::TypeDefinition<'_, String>) -> Result<TypeDef, Sc
         gql::TypeDefinition::Scalar(scalar) => {
             ty.name = scalar.name.clone();
             ty.kind = TypeKind::Scalar;
+            ty.description = scalar.description.clone();
+            ty.directives = convert_directives(&scalar.directives);
         }
         gql::TypeDefinition::Object(object) => {
             ty.name = object.name.clone();
             ty.kind = TypeKind::Object;
+            ty.description = object.description.clone();
+            ty.directives = convert_directives(&object.directives);
             ty.interfaces = object.implements_interfaces.clone();
             ty.fields = object.fields.iter().map(convert_field).collect();
         }
         gql::TypeDefinition::Interface(interface) => {
             ty.name = interface.name.clone();
             ty.kind = TypeKind::Interface;
+            ty.description = interface.description.clone();
+            ty.directives = convert_directives(&interface.directives);
             ty.interfaces = interface.implements_interfaces.clone();
             ty.fields = interface.fields.iter().map(convert_field).collect();
         }
         gql::TypeDefinition::Union(union) => {
             ty.name = union.name.clone();
             ty.kind = TypeKind::Union;
+            ty.description = union.description.clone();
+            ty.directives = convert_directives(&union.directives);
             ty.union_members = union.types.clone();
         }
         gql::TypeDefinition::Enum(enum_def) => {
             ty.name = enum_def.name.clone();
             ty.kind = TypeKind::Enum;
-            ty.enum_values = enum_def.values.iter().map(|v| v.name.clone()).collect();
+            ty.description = enum_def.description.clone();
+            ty.directives = convert_directives(&enum_def.directives);
+            ty.enum_values = enum_def
+                .values
+                .iter()
+                .map(|value| EnumValueDef {
+                    name: value.name.clone(),
+                    description: value.description.clone(),
+                    directives: convert_directives(&value.directives),
+                })
+                .collect();
         }
         gql::TypeDefinition::InputObject(input) => {
             ty.name = input.name.clone();
             ty.kind = TypeKind::InputObject;
+            ty.description = input.description.clone();
+            ty.directives = convert_directives(&input.directives);
             ty.input_fields = input.fields.iter().map(convert_input_value).collect();
         }
     }
     Ok(ty)
 }
 
+fn convert_directive_def(def: &gql::DirectiveDefinition<'_, String>) -> DirectiveDef {
+    DirectiveDef {
+        name: def.name.clone(),
+        description: def.description.clone(),
+        locations: def.locations.iter().map(directive_location_str).collect(),
+        args: def.arguments.iter().map(convert_input_value).collect(),
+        repeatable: def.repeatable,
+    }
+}
+
+fn directive_location_str(location: &gql::DirectiveLocation) -> String {
+    use gql::DirectiveLocation::*;
+    match location {
+        Query => "QUERY",
+        Mutation => "MUTATION",
+        Subscription => "SUBSCRIPTION",
+        Field => "FIELD",
+        FragmentDefinition => "FRAGMENT_DEFINITION",
+        FragmentSpread => "FRAGMENT_SPREAD",
+        InlineFragment => "INLINE_FRAGMENT",
+        Schema => "SCHEMA",
+        Scalar => "SCALAR",
+        Object => "OBJECT",
+        FieldDefinition => "FIELD_DEFINITION",
+        ArgumentDefinition => "ARGUMENT_DEFINITION",
+        Interface => "INTERFACE",
+        Union => "UNION",
+        Enum => "ENUM",
+        EnumValue => "ENUM_VALUE",
+        InputObject => "INPUT_OBJECT",
+        InputFieldDefinition => "INPUT_FIELD_DEFINITION",
+        VariableDefinition => "VARIABLE_DEFINITION",
+    }
+    .to_owned()
+}
+
 fn convert_field(field: &gql::Field<'_, String>) -> FieldDef {
     FieldDef {
         name: field.name.clone(),
+        description: field.description.clone(),
         field_type: render_type(&field.field_type),
         args: field.arguments.iter().map(convert_input_value).collect(),
+        directives: convert_directives(&field.directives),
     }
 }
 
 fn convert_input_value(value: &gql::InputValue<'_, String>) -> InputValueDef {
     InputValueDef {
         name: value.name.clone(),
+        description: value.description.clone(),
         value_type: render_type(&value.value_type),
+        default_value: value.default_value.as_ref().map(convert_value),
+    }
+}
+
+fn convert_directives(directives: &[gql::Directive<'_, String>]) -> Vec<DirectiveUse> {
+    directives
+        .iter()
+        .map(|directive| DirectiveUse {
+            name: directive.name.clone(),
+            args: directive
+                .arguments
+                .iter()
+                .map(|(name, value)| (name.clone(), Some(convert_value(value))))
+                .collect(),
+        })
+        .collect()
+}
+
+fn convert_value(value: &gql::Value<'_, String>) -> ValueLiteral {
+    match value {
+        gql::Value::Variable(name) => ValueLiteral::Enum(format!("${name}")),
+        gql::Value::Int(number) => ValueLiteral::Int(
+            number
+                .as_i64()
+                .map(|value| value.to_string())
+                .unwrap_or_default(),
+        ),
+        gql::Value::Float(value) => ValueLiteral::Float(value.to_string()),
+        gql::Value::String(value) => ValueLiteral::String(value.clone()),
+        gql::Value::Boolean(value) => ValueLiteral::Boolean(*value),
+        gql::Value::Null => ValueLiteral::Null,
+        gql::Value::Enum(name) => ValueLiteral::Enum(name.clone()),
+        gql::Value::List(values) => ValueLiteral::List(values.iter().map(convert_value).collect()),
+        gql::Value::Object(fields) => ValueLiteral::Object(
+            fields
+                .iter()
+                .map(|(name, value)| (name.clone(), convert_value(value)))
+                .collect(),
+        ),
     }
 }
 
@@ -397,6 +656,13 @@ fn apply_extension(
     types: &mut BTreeMap<String, TypeDef>,
     ext: &gql::TypeExtension<'_, String>,
 ) -> Result<(), SchemaError> {
+    // The baseline parser only has parseExtension cases for type/enum/
+    // interface/union/input; `extend scalar` is a syntax error there.
+    if matches!(ext, gql::TypeExtension::Scalar(_)) {
+        return Err(SchemaError::new(
+            "parse error: unexpected \"scalar\" after extend",
+        ));
+    }
     let name = extension_name(ext).to_owned();
     let kind = extension_kind(ext);
     let target = types
@@ -410,7 +676,7 @@ fn apply_extension(
     }
 
     match ext {
-        gql::TypeExtension::Scalar(_) => {}
+        gql::TypeExtension::Scalar(_) => unreachable!("rejected above"),
         gql::TypeExtension::Object(extension) => {
             check_new_fields(&name, &target.fields, &extension.fields)?;
             check_new_interfaces(&name, &target.interfaces, &extension.implements_interfaces)?;
@@ -443,7 +709,7 @@ fn apply_extension(
         }
         gql::TypeExtension::Enum(extension) => {
             for value in &extension.values {
-                if target.enum_values.contains(&value.name) {
+                if target.enum_values.iter().any(|v| v.name == value.name) {
                     return Err(SchemaError::new(format!(
                         "enum value {:?} already declared in {name:?}",
                         value.name
@@ -452,7 +718,11 @@ fn apply_extension(
             }
             target
                 .enum_values
-                .extend(extension.values.iter().map(|v| v.name.clone()));
+                .extend(extension.values.iter().map(|value| EnumValueDef {
+                    name: value.name.clone(),
+                    description: value.description.clone(),
+                    directives: convert_directives(&value.directives),
+                }));
         }
         gql::TypeExtension::InputObject(extension) => {
             for field in &extension.fields {
@@ -502,11 +772,87 @@ fn check_new_interfaces(
     Ok(())
 }
 
+/// Resolve every directive usage against the (meta + user) directive
+/// definitions: validate name/location/argument names, reject repeated
+/// non-repeatable directives and append the definitions' default arguments
+/// (`internal/schema.resolveDirectives`). Input-object fields and field
+/// arguments are not checked, matching the baseline.
+fn resolve_all_directives(schema: &mut Schema) -> Result<(), SchemaError> {
+    let definitions = &schema.directives;
+    for def in schema.types.values_mut() {
+        let location = match def.kind {
+            TypeKind::Scalar => "SCALAR",
+            TypeKind::Object => "OBJECT",
+            TypeKind::Interface => "INTERFACE",
+            TypeKind::Union => "UNION",
+            TypeKind::Enum => "ENUM",
+            TypeKind::InputObject => "INPUT_OBJECT",
+        };
+        resolve_directives(definitions, &mut def.directives, location)?;
+        for field in &mut def.fields {
+            resolve_directives(definitions, &mut field.directives, "FIELD_DEFINITION")?;
+        }
+        for value in &mut def.enum_values {
+            resolve_directives(definitions, &mut value.directives, "ENUM_VALUE")?;
+        }
+    }
+    Ok(())
+}
+
+fn resolve_directives(
+    definitions: &BTreeMap<String, DirectiveDef>,
+    uses: &mut [DirectiveUse],
+    location: &str,
+) -> Result<(), SchemaError> {
+    // Validate first (immutable), then append the default arguments.
+    for (index, directive) in uses.iter().enumerate() {
+        let Some(definition) = definitions.get(&directive.name) else {
+            return Err(SchemaError::new(format!(
+                "directive {:?} not found",
+                directive.name
+            )));
+        };
+        if !definition.locations.iter().any(|known| known == location) {
+            return Err(SchemaError::new(format!(
+                "invalid location {location:?} for directive {:?}",
+                directive.name
+            )));
+        }
+        for (arg, _) in &directive.args {
+            if !definition.args.iter().any(|known| &known.name == arg) {
+                return Err(SchemaError::new(format!(
+                    "invalid argument {arg:?} for directive {:?}",
+                    directive.name
+                )));
+            }
+        }
+        if !definition.repeatable && uses[..index].iter().any(|p| p.name == directive.name) {
+            return Err(SchemaError::new(format!(
+                "non repeatable directive {:?} can not be repeated",
+                directive.name
+            )));
+        }
+    }
+    for directive in uses.iter_mut() {
+        let Some(definition) = definitions.get(&directive.name) else {
+            continue;
+        };
+        for arg in &definition.args {
+            if !directive.args.iter().any(|(name, _)| name == &arg.name) {
+                directive
+                    .args
+                    .push((arg.name.clone(), arg.default_value.clone()));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn type_exists(schema: &Schema, name: &str) -> bool {
     schema.types.contains_key(name) || is_builtin_scalar(name)
 }
 
-fn validate(schema: &Schema) -> Result<Schema, SchemaError> {
+fn validate(schema: Schema) -> Result<Schema, SchemaError> {
     // Root operation types: explicit `schema { ... }` entries must resolve;
     // otherwise the conventional names are inferred (graph-gophers only infers
     // when no schema definition was present).
@@ -515,7 +861,7 @@ fn validate(schema: &Schema) -> Result<Schema, SchemaError> {
         (schema.mutation_type.clone(), "mutation"),
         (schema.subscription_type.clone(), "subscription"),
     ];
-    let mut schema = schema.clone();
+    let mut schema = schema;
     schema.query_type = None;
     schema.mutation_type = None;
     schema.subscription_type = None;
@@ -548,6 +894,19 @@ fn validate(schema: &Schema) -> Result<Schema, SchemaError> {
                 }
             }
             None => {}
+        }
+    }
+
+    // Directive argument types resolve like every other type reference.
+    for directive in schema.directives.values() {
+        for arg in &directive.args {
+            let named = named_type_str(&arg.value_type);
+            if !type_exists(&schema, named) {
+                return Err(SchemaError::new(format!(
+                    "unknown type {named:?} for directive @{} argument {}",
+                    directive.name, arg.name
+                )));
+            }
         }
     }
 
@@ -644,6 +1003,10 @@ mod tests {
         format!("schema {{ query: Query }}\ntype Query {{ hello: String }}\n{body}")
     }
 
+    fn enum_names(def: &TypeDef) -> Vec<&str> {
+        def.enum_values.iter().map(|v| v.name.as_str()).collect()
+    }
+
     #[test]
     fn oss_schema_assembles() {
         let schema = assemble_oss().expect("OSS schema must assemble");
@@ -659,6 +1022,44 @@ mod tests {
         assert!(query_fields.contains(&"outboundWebhooks"));
         // From viewer.graphql.
         assert!(query_fields.contains(&"viewer"));
+    }
+
+    #[test]
+    fn meta_schema_is_complete() {
+        let schema = assemble_oss().unwrap();
+        for name in BUILTIN_SCALARS {
+            assert_eq!(schema.types[name].kind, TypeKind::Scalar, "{name}");
+        }
+        assert_eq!(schema.types["_Service"].kind, TypeKind::Object);
+        // All __* introspection types come from the meta schema.
+        for name in [
+            "__Schema",
+            "__Type",
+            "__TypeKind",
+            "__Field",
+            "__InputValue",
+            "__EnumValue",
+            "__Directive",
+            "__DirectiveLocation",
+        ] {
+            assert!(schema.types.contains_key(name), "{name}");
+        }
+        // Built-in directive definitions, sorted by BTreeMap iteration.
+        let names: Vec<&str> = schema.directives.keys().map(String::as_str).collect();
+        assert_eq!(names, vec!["deprecated", "include", "skip", "specifiedBy"]);
+        assert_eq!(
+            schema.directives["deprecated"].locations,
+            vec!["FIELD_DEFINITION", "ENUM_VALUE", "ARGUMENT_DEFINITION"]
+        );
+        // Meta descriptions survive (comments converted to block strings).
+        assert_eq!(
+            schema.types["String"].description.as_deref(),
+            Some(
+                "The `String` scalar type represents textual data, represented as UTF-8 \
+                 character sequences. The String type is most often used by GraphQL to \
+                 represent free-form human-readable text."
+            )
+        );
     }
 
     #[test]
@@ -715,6 +1116,18 @@ mod tests {
     }
 
     #[test]
+    fn extending_a_scalar_is_rejected() {
+        // graphql-parser already rejects a directive-less scalar extension;
+        // the baseline rejects every `extend scalar`.
+        assert!(assemble_sdl(&format!("{}\nextend scalar Query", doc(""))).is_err());
+        assert!(assemble_sdl(&format!(
+            "{}\nextend scalar Query @specifiedBy(url: \"x\")",
+            doc("")
+        ))
+        .is_err());
+    }
+
+    #[test]
     fn extension_field_collision_is_an_error() {
         let err = assemble_sdl(&format!(
             "{}\nextend type Query {{ hello: String }}",
@@ -730,7 +1143,7 @@ mod tests {
         // pre-extension state only.
         let schema =
             assemble_sdl(&format!("{}\nextend enum E {{ B B }}", doc("enum E { A }"))).unwrap();
-        assert_eq!(schema.types["E"].enum_values, vec!["A", "B", "B"]);
+        assert_eq!(enum_names(&schema.types["E"]), vec!["A", "B", "B"]);
     }
 
     #[test]
@@ -794,5 +1207,55 @@ mod tests {
     #[test]
     fn parse_errors_are_reported() {
         assert!(assemble_sdl("type {").is_err());
+    }
+
+    #[test]
+    fn descriptions_and_deprecations_are_retained() {
+        let schema = assemble_sdl(&format!(
+            "{}\ntype Query2 {{\n  \"\"\"Old field.\"\"\"\n  old: String @deprecated\n  gone: String @deprecated(reason: \"use old\")\n}}",
+            doc("")
+        ))
+        .unwrap();
+        let query2 = &schema.types["Query2"];
+        assert_eq!(query2.fields[0].description.as_deref(), Some("Old field."));
+        let deprecated = &query2.fields[0].directives[0];
+        assert_eq!(deprecated.name, "deprecated");
+        assert_eq!(
+            deprecated.deprecation_reason().as_deref(),
+            Some("No longer supported")
+        );
+        assert_eq!(
+            query2.fields[1].directives[0]
+                .deprecation_reason()
+                .as_deref(),
+            Some("use old")
+        );
+    }
+
+    #[test]
+    fn unknown_directives_are_rejected() {
+        let err = assemble_sdl(&format!(
+            "{}\ntype Query2 {{ x: String @unknown }}",
+            doc("")
+        ))
+        .unwrap_err();
+        assert!(err.message().contains("not found"), "{err}");
+    }
+
+    #[test]
+    fn directive_defaults_are_rendered_like_gophers() {
+        assert_eq!(
+            ValueLiteral::String("No longer supported".to_owned()).render(),
+            "\"No longer supported\""
+        );
+        assert_eq!(ValueLiteral::Int("40".to_owned()).render(), "40");
+        assert_eq!(
+            ValueLiteral::List(vec![
+                ValueLiteral::Int("1".to_owned()),
+                ValueLiteral::Enum("A".to_owned())
+            ])
+            .render(),
+            "[1, A]"
+        );
     }
 }
