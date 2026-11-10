@@ -18,6 +18,20 @@ use crate::proto::q;
 /// `query.ZoektScoreBoost` (`internal/search/query/helpers.go`).
 pub const ZOEKT_SCORE_BOOST: f64 = 20.0;
 
+// `zoektquery.RawConfig` flags (`zoekt/query/query.go:42-49`).
+/// `query.RcOnlyPublic`.
+pub const RC_ONLY_PUBLIC: u64 = 1;
+/// `query.RcOnlyPrivate`.
+pub const RC_ONLY_PRIVATE: u64 = 1 << 1;
+/// `query.RcOnlyForks`.
+pub const RC_ONLY_FORKS: u64 = 1 << 2;
+/// `query.RcNoForks`.
+pub const RC_NO_FORKS: u64 = 2 << 2;
+/// `query.RcOnlyArchived`.
+pub const RC_ONLY_ARCHIVED: u64 = 1 << 4;
+/// `query.RcNoArchived`.
+pub const RC_NO_ARCHIVED: u64 = 2 << 4;
+
 /// `query.BranchRepos`: a branch plus the Sourcegraph repo IDs to match.
 /// `repos` is the portable-roaring serialization z oekt expects on the wire.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -286,6 +300,14 @@ impl std::fmt::Display for Error {
             Error::InvalidRegexp { pattern, message } => {
                 write!(f, "invalid regexp {pattern:?}: {message}")
             }
+            Error::InvalidRepoFilter { pattern, message } => {
+                // `errors.Wrapf(err, "invalid regex for -repo filter %q", pat)`.
+                write!(
+                    f,
+                    "invalid regex for -repo filter {}: {message}",
+                    go_quote(pattern)
+                )
+            }
             Error::Predicate(message) => write!(f, "{message}"),
             Error::BrokenInvariant(message) => write!(f, "broken invariant: {message}"),
         }
@@ -308,6 +330,9 @@ impl Error {
 pub enum Error {
     /// `regexp/syntax.Parse` rejected a pattern.
     InvalidRegexp { pattern: String, message: String },
+    /// `DefaultGlobalQueryScope` rejected a `-repo` filter; wraps the Go
+    /// regexp syntax error with the `errors.Wrapf` message.
+    InvalidRepoFilter { pattern: String, message: String },
     /// A typed predicate's arguments did not parse. The baseline panics; the
     /// port propagates the error instead.
     Predicate(String),
@@ -766,7 +791,15 @@ impl std::fmt::Display for Query {
             Query::BranchesRepos(list) => {
                 f.write_str("(branchesrepos")?;
                 for branch in list {
-                    write!(f, " {}=repo-list", branch.branch)?;
+                    // `BranchesRepos.String` prints the cardinality when it
+                    // is larger than one, and the bitmap itself otherwise.
+                    let bitmap = roaring::RoaringBitmap::deserialize_from(&branch.repos[..])
+                        .unwrap_or_default();
+                    if bitmap.len() > 1 {
+                        write!(f, " {}:{}", branch.branch, bitmap.len())?;
+                    } else {
+                        write!(f, " {}={}", branch.branch, roaring_string(&bitmap))?;
+                    }
                 }
                 f.write_str(")")
             }
@@ -852,6 +885,12 @@ fn write_joined(f: &mut std::fmt::Formatter<'_>, children: &[Query]) -> std::fmt
         write!(f, "{child}")?;
     }
     Ok(())
+}
+
+/// `roaring.Bitmap.String`: `{}` when empty, `{id}` / `{id,id}` otherwise.
+fn roaring_string(bitmap: &roaring::RoaringBitmap) -> String {
+    let ids: Vec<String> = bitmap.iter().map(|id| id.to_string()).collect();
+    format!("{{{}}}", ids.join(","))
 }
 
 /// `strconv.Quote` for the subset `fmt.Sprintf("%q", s)` exercises here.
