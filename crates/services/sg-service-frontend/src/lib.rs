@@ -30,6 +30,7 @@ pub mod mux;
 pub mod search_stream;
 pub mod service;
 pub mod service_connections;
+pub mod session_auth;
 pub mod site_config_file;
 pub mod tenant;
 pub mod trace_headers;

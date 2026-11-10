@@ -15,8 +15,11 @@ sg-graphql = { path = "../../domain/sg-graphql" }
 sg-http = { path = "../../net/sg-http" }
 sg-metrics = { path = "../../base/sg-metrics" }
 sg-proto = { path = "../../net/sg-proto" }
+sg-redis = { path = "../../data/sg-redis" }
+sg-session = { path = "../../domain/sg-session" }
 sg-service-searcher = { path = "../sg-service-searcher" }
 async-trait = { workspace = true }
+base64 = { workspace = true }
 bytes = { workspace = true }
 flate2 = { workspace = true }
 http = { workspace = true }
@@ -42,4 +45,3 @@ http = { workspace = true }
 http-body-util = { workspace = true }
 tokio = { workspace = true }
 tonic = { workspace = true }
-base64 = { workspace = true }

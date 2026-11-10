@@ -38,6 +38,8 @@ use sg_config::{LiveConfig, SiteConfiguration};
 use sg_graphql::exec::{Actor, ExecError, ExecResponse, PathSegment};
 use sg_graphql::json::Json;
 use sg_graphql::{estimate_query_cost, QueryCost};
+use sg_session::auth::{self, SessionAuthOutcome, SessionStore, SessionUserLookup};
+use sg_session::{AnonymousReason, COOKIE_NAME};
 
 /// `HTTAPI_GZIP_FILE_SIZE_LIMIT` default (`graphql.go:35`): 500 MiB of
 /// decompressed request body.
@@ -53,6 +55,10 @@ const COMPLEXITY_CODE: &str = "ErrQueryComplexityLimitExceeded";
 /// `rate_limit.go`'s disabled-watcher sentinel: the harness injects the
 /// enabled/fake variants.
 pub const UNKNOWN_UID: &str = "unknown";
+
+/// The header value `session.CookieMiddlewareWithCSRFSafety` adds to every
+/// external API response (`session.go:334`).
+const SESSION_VARY: &str = "Cookie, Authorization, X-Requested-With";
 
 // ---------------------------------------------------------------------------
 // Wire models (graph-gophers `graphql.Response` / `errors.QueryError`)
@@ -254,23 +260,77 @@ pub trait GraphqlDeps: Send + Sync {
     async fn rate_limit(&self, _request: GraphqlRateLimitRequest<'_>) -> Option<RateLimitOutcome> {
         None
     }
+
+    /// `session.authenticateByCookie`'s read path. The transport calls this
+    /// only for trusted external requests that carry an `sgs` cookie. The
+    /// default (also used by the differential harness) treats every request
+    /// as unauthenticated.
+    async fn authenticate(&self, _cookie: Option<&str>) -> SessionAuthOutcome {
+        SessionAuthOutcome::Anonymous(AnonymousReason::NoCookie)
+    }
+}
+
+/// The production session-authentication dependencies.
+struct SessionDeps {
+    store: Arc<dyn SessionStore>,
+    users: Arc<dyn SessionUserLookup>,
+    profiles: Arc<dyn crate::graphql_resolvers::UserProfiles>,
+    /// `SRC_SESSION_COOKIE_KEY` (empty by default in the baseline too).
+    cookie_key: Vec<u8>,
 }
 
 /// Production schema execution: the assembled OSS [`sg_graphql::Schema`],
 /// executed by `sg-graphql`'s introspection executor.
 ///
-/// Business resolvers are not ported yet; those root fields surface the
-/// executor's `no ported resolver` error.
+/// [`SchemaGraphqlDeps::new`] has no database/session dependencies (the
+/// transport tests); [`SchemaGraphqlDeps::with_session`] is the frontend
+/// wiring: it authenticates the `sgs` cookie and loads the current user for
+/// the DB-backed `User` fields.
 pub struct SchemaGraphqlDeps {
     schema: Arc<sg_graphql::Schema>,
-    roots: crate::graphql_resolvers::FrontendRootResolver,
+    session: Option<SessionDeps>,
 }
 
 impl SchemaGraphqlDeps {
     pub fn new(schema: Arc<sg_graphql::Schema>) -> Self {
         Self {
             schema,
-            roots: crate::graphql_resolvers::FrontendRootResolver::new(),
+            session: None,
+        }
+    }
+
+    /// Wire session authentication and the current-user lookup.
+    pub fn with_session(schema: Arc<sg_graphql::Schema>, pool: sqlx::PgPool) -> Self {
+        let users = Arc::new(crate::session_auth::PgSessionUsers::new(pool.clone()));
+        let profiles = Arc::new(crate::session_auth::PgSessionUsers::new(pool));
+        Self {
+            schema,
+            session: Some(SessionDeps {
+                store: Arc::new(crate::session_auth::RedisSessionStore::from_env()),
+                users,
+                profiles,
+                cookie_key: session_cookie_key(),
+            }),
+        }
+    }
+
+    /// Test hook: inject the store/user lookup without Redis or Postgres.
+    #[cfg(test)]
+    fn with_session_parts(
+        schema: Arc<sg_graphql::Schema>,
+        store: Arc<dyn SessionStore>,
+        users: Arc<dyn SessionUserLookup>,
+        profiles: Arc<dyn crate::graphql_resolvers::UserProfiles>,
+        cookie_key: Vec<u8>,
+    ) -> Self {
+        Self {
+            schema,
+            session: Some(SessionDeps {
+                store,
+                users,
+                profiles,
+                cookie_key,
+            }),
         }
     }
 }
@@ -278,6 +338,23 @@ impl SchemaGraphqlDeps {
 #[async_trait]
 impl GraphqlDeps for SchemaGraphqlDeps {
     async fn exec(&self, request: GraphqlExecRequest<'_>) -> GraphqlResponse {
+        // `CurrentUser` resolves `db.Users().GetByCurrentAuthUser`; prefetch
+        // the row once per request. A lookup failure is logged and treated as
+        // no current user (the baseline would surface a resolver error; no
+        // resolver-level error plumbing exists for DB failures yet).
+        let roots = match (request.actor, self.session.as_ref()) {
+            (Actor::User { uid }, Some(session)) => {
+                let user = match session.profiles.profile(uid).await {
+                    Ok(profile) => profile.map(crate::graphql_resolvers::UserObject::from_data),
+                    Err(error) => {
+                        tracing::error!(uid, %error, "failed to look up current user");
+                        None
+                    }
+                };
+                crate::graphql_resolvers::FrontendRootResolver::with_user(user)
+            }
+            _ => crate::graphql_resolvers::FrontendRootResolver::new(),
+        };
         let response = sg_graphql::exec::execute_with(
             &self.schema,
             sg_graphql::exec::ExecRequest {
@@ -286,10 +363,32 @@ impl GraphqlDeps for SchemaGraphqlDeps {
                 variables: request.variables,
                 actor: request.actor,
             },
-            Some(&self.roots),
+            Some(&roots),
         );
         GraphqlResponse::from_exec(&response)
     }
+
+    async fn authenticate(&self, cookie: Option<&str>) -> SessionAuthOutcome {
+        let Some(session) = self.session.as_ref() else {
+            return SessionAuthOutcome::Anonymous(AnonymousReason::NoCookie);
+        };
+        auth::authenticate(
+            session.store.as_ref(),
+            session.users.as_ref(),
+            &session.cookie_key,
+            cookie,
+            time::OffsetDateTime::now_utc(),
+        )
+        .await
+    }
+}
+
+/// `sessionCookieKey` is `SRC_SESSION_COOKIE_KEY` with an empty default; an
+/// empty HMAC key is valid (and is what an unconfigured OSS instance uses).
+fn session_cookie_key() -> Vec<u8> {
+    std::env::var("SRC_SESSION_COOKIE_KEY")
+        .unwrap_or_default()
+        .into_bytes()
 }
 
 /// The placeholder used by tests that only exercise the transport.
@@ -326,6 +425,28 @@ where
     B: Body<Data = Bytes> + Unpin,
     B::Error: fmt::Display,
 {
+    let mut response = graphql_response_inner(req, live, internal, deps).await;
+    // The session middleware adds `Vary` before doing anything else, so it is
+    // present on error responses too. The internal listener has no session
+    // middleware.
+    if !internal {
+        response
+            .headers_mut()
+            .append(header::VARY, HeaderValue::from_static(SESSION_VARY));
+    }
+    response
+}
+
+async fn graphql_response_inner<B>(
+    req: &mut Request<B>,
+    live: &LiveConfig,
+    internal: bool,
+    deps: Arc<dyn GraphqlDeps>,
+) -> Response<BoxBody>
+where
+    B: Body<Data = Bytes> + Unpin,
+    B::Error: fmt::Display,
+{
     let write_err_body = internal;
 
     // `serveGraphQL`'s defensive method check; the routers already answer 405.
@@ -333,8 +454,20 @@ where
         return handler_error("method must be POST", write_err_body);
     }
 
+    // `session.CookieMiddlewareWithCSRFSafety`: only trusted external requests
+    // authenticate from the cookie; the internal listener uses the actor
+    // header middleware instead (not ported), so it stays anonymous.
+    let actor = if internal {
+        Actor::Anonymous
+    } else {
+        match session_actor(req.headers(), live, deps.as_ref()).await {
+            Ok(actor) => actor,
+            Err(()) => return session_store_error(),
+        }
+    };
+
     let request_name = req.uri().query().unwrap_or("unknown").to_owned();
-    let uid = get_uid(req.headers());
+    let uid = get_uid(req.headers(), actor);
 
     let gzip = req
         .headers()
@@ -438,7 +571,7 @@ where
             query: &params.query,
             operation_name: &params.operation_name,
             variables: &params.variables,
-            actor: Actor::Anonymous,
+            actor,
         })
         .await;
     let body = match response.to_json() {
@@ -454,9 +587,12 @@ where
     text_response(StatusCode::OK, "application/json", body, false)
 }
 
-/// `getUID` (`graphql.go:259-273`) without the actor middleware: the Rust
-/// listener has no authenticated actor, so every request is anonymous.
-fn get_uid(headers: &HeaderMap) -> (String, bool, bool) {
+/// `getUID` (`graphql.go:259-273`): an authenticated actor wins, then the
+/// anonymous-UID cookie, then `X-Forwarded-For`.
+fn get_uid(headers: &HeaderMap, actor: Actor) -> (String, bool, bool) {
+    if let Actor::User { uid } = actor {
+        return (uid.to_string(), false, false);
+    }
     if let Some(uid) = anonymous_uid(headers) {
         if !uid.is_empty() {
             return (uid, false, true);
@@ -470,6 +606,80 @@ fn get_uid(headers: &HeaderMap) -> (String, bool, bool) {
         return (ip.to_owned(), true, true);
     }
     (UNKNOWN_UID.to_owned(), false, true)
+}
+
+/// `isTrustedOrigin` plus the `X-Requested-With` presence check from
+/// `CookieMiddlewareWithCSRFSafety` (`session.go:332-344`).
+fn is_trusted_request(headers: &HeaderMap, live: &LiveConfig) -> bool {
+    if headers.contains_key("x-requested-with") {
+        return true;
+    }
+    let origin = headers
+        .get(header::ORIGIN)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+    crate::mux::SecurityConfig::from_site_config(&live.current().site).is_trusted_origin(origin)
+}
+
+/// The `sgs` request cookie (`r.Cookie(cookieName)`). Untrusted requests never
+/// consult Redis (CSRF safety).
+async fn session_actor(
+    headers: &HeaderMap,
+    live: &LiveConfig,
+    deps: &dyn GraphqlDeps,
+) -> Result<Actor, ()> {
+    if !is_trusted_request(headers, live) {
+        return Ok(Actor::Anonymous);
+    }
+    let Some(cookie) = session_cookie(headers) else {
+        return Ok(Actor::Anonymous);
+    };
+    match deps.authenticate(Some(&cookie)).await {
+        SessionAuthOutcome::Authenticated { uid } => Ok(Actor::User { uid }),
+        SessionAuthOutcome::Anonymous(_) => Ok(Actor::Anonymous),
+        SessionAuthOutcome::StoreUnavailable => Err(()),
+    }
+}
+
+/// `r.Cookie("sgs")`: the first matching `Cookie` header value, unquoted.
+fn session_cookie(headers: &HeaderMap) -> Option<String> {
+    for value in headers.get_all(header::COOKIE) {
+        let Ok(cookies) = value.to_str() else {
+            continue;
+        };
+        for cookie in cookies.split(';') {
+            let cookie = cookie.trim();
+            let Some((name, value)) = cookie.split_once('=') else {
+                continue;
+            };
+            if name.trim() == COOKIE_NAME {
+                return Some(unquote_cookie_value(value.trim()));
+            }
+        }
+    }
+    None
+}
+
+/// `net/http` strips one pair of surrounding double quotes from request cookie
+/// values.
+fn unquote_cookie_value(value: &str) -> String {
+    value
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+        .unwrap_or(value)
+        .to_owned()
+}
+
+/// The baseline's Redis-error response: `w.WriteHeader(500)` then the message
+/// with no newline and no JSON content type (this middleware runs outside
+/// `JsonMiddleware`). It deliberately does not clear the cookie.
+fn session_store_error() -> Response<BoxBody> {
+    text_response(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "text/plain; charset=utf-8",
+        "failed to read session actor",
+        false,
+    )
 }
 
 /// `cookie.AnonymousUID` (`internal/cookie/cookie.go:9-30`): the first
@@ -1067,6 +1277,7 @@ mod tests {
     use http_body_util::{BodyExt, Full};
     use serde_json::json;
     use sg_config::{ServiceConnections, Unified};
+    use sg_session::auth::SessionStoreError;
 
     fn live(site: &str) -> LiveConfig {
         LiveConfig::new(Unified {
@@ -1271,16 +1482,29 @@ mod tests {
     }
 
     #[test]
-    fn uid_prefers_cookie_then_forwarded_for() {
+    fn uid_prefers_actor_then_cookie_then_forwarded_for() {
         let mut headers = HeaderMap::new();
-        assert_eq!(get_uid(&headers), ("unknown".to_owned(), false, true));
+        assert_eq!(
+            get_uid(&headers, Actor::Anonymous),
+            ("unknown".to_owned(), false, true)
+        );
         headers.insert("x-forwarded-for", HeaderValue::from_static("10.0.0.1"));
-        assert_eq!(get_uid(&headers), ("10.0.0.1".to_owned(), true, true));
+        assert_eq!(
+            get_uid(&headers, Actor::Anonymous),
+            ("10.0.0.1".to_owned(), true, true)
+        );
         headers.insert(
             header::COOKIE,
             HeaderValue::from_static("a=b; sourcegraphAnonymousUid=\"anon\" ; c=d"),
         );
-        assert_eq!(get_uid(&headers), ("anon".to_owned(), false, true));
+        assert_eq!(
+            get_uid(&headers, Actor::Anonymous),
+            ("anon".to_owned(), false, true)
+        );
+        assert_eq!(
+            get_uid(&headers, Actor::User { uid: 42 }),
+            ("42".to_owned(), false, false)
+        );
     }
 
     #[tokio::test]
@@ -1456,6 +1680,279 @@ mod tests {
             errors_only.to_json().unwrap(),
             r#"{"errors":[{"message":"boom"}]}"#
         );
+    }
+
+    struct FakeStore(Result<Option<Vec<u8>>, SessionStoreError>);
+
+    #[async_trait]
+    impl SessionStore for FakeStore {
+        async fn load(&self, _id: &str) -> Result<Option<Vec<u8>>, SessionStoreError> {
+            self.0.clone()
+        }
+    }
+
+    struct FakeUsers(Result<Option<sg_session::SessionUser>, String>);
+
+    #[async_trait]
+    impl SessionUserLookup for FakeUsers {
+        async fn get(&self, _uid: i32) -> Result<Option<sg_session::SessionUser>, String> {
+            self.0.clone()
+        }
+    }
+
+    struct FakeProfiles;
+
+    #[async_trait]
+    impl crate::graphql_resolvers::UserProfiles for FakeProfiles {
+        async fn profile(
+            &self,
+            uid: i32,
+        ) -> Result<Option<crate::graphql_resolvers::UserData>, String> {
+            Ok(Some(crate::graphql_resolvers::UserData {
+                id: uid,
+                username: "alice".to_owned(),
+                display_name: String::new(),
+                avatar_url: String::new(),
+            }))
+        }
+    }
+
+    fn current_user_schema() -> Arc<sg_graphql::Schema> {
+        Arc::new(
+            sg_graphql::schema::assemble_sdl(
+                "type Query { currentUser: User } \
+                 type User { id: ID! username: String! }",
+            )
+            .expect("schema"),
+        )
+    }
+
+    const CREATED_AT: &str = "2026-01-01T00:00:00Z";
+
+    fn fixed_created_at() -> time::OffsetDateTime {
+        time::OffsetDateTime::parse(CREATED_AT, &time::format_description::well_known::Rfc3339)
+            .expect("created at")
+    }
+
+    fn session_cookie_and_payload() -> (String, Vec<u8>) {
+        let now = time::OffsetDateTime::now_utc();
+        let info = sg_session::SessionInfo {
+            actor: Some(sg_session::Actor {
+                uid: 1,
+                ..Default::default()
+            }),
+            last_active: sg_session::GoTime(now),
+            expiry_period: 90 * 24 * 3_600 * 1_000_000_000,
+            user_created_at: sg_session::GoTime(fixed_created_at()),
+        };
+        let json = serde_json::to_vec(&info).expect("json");
+        let payload = sg_session::Session {
+            timestamp: 0,
+            id: "ID".to_owned(),
+            values: vec![("actor".to_owned(), json)],
+        }
+        .encode_redis();
+        let cookie = sg_session::securecookie::encode_session_id(
+            COOKIE_NAME,
+            b"",
+            now.unix_timestamp(),
+            "ID",
+        );
+        (cookie, payload)
+    }
+
+    fn session_user() -> sg_session::SessionUser {
+        sg_session::SessionUser {
+            id: 1,
+            created_at: fixed_created_at(),
+            invalidated_sessions_at: fixed_created_at() - time::Duration::days(1),
+        }
+    }
+
+    fn session_deps(
+        store: Result<Option<Vec<u8>>, SessionStoreError>,
+        users: Result<Option<sg_session::SessionUser>, String>,
+    ) -> Arc<dyn GraphqlDeps> {
+        Arc::new(SchemaGraphqlDeps::with_session_parts(
+            current_user_schema(),
+            Arc::new(FakeStore(store)),
+            Arc::new(FakeUsers(users)),
+            Arc::new(FakeProfiles),
+            Vec::new(),
+        ))
+    }
+
+    #[tokio::test]
+    async fn trusted_session_cookie_authenticates_current_user() {
+        let (cookie, payload) = session_cookie_and_payload();
+        let deps = session_deps(Ok(Some(payload)), Ok(Some(session_user())));
+        let cookie_header = format!("sgs={cookie}");
+        let (status, headers, body) = run(
+            "{}",
+            false,
+            Method::POST,
+            "/.api/graphql",
+            &[
+                ("x-requested-with", "sourcegraph"),
+                ("cookie", cookie_header.as_str()),
+            ],
+            br#"{"query":"{ currentUser { id username } }"}"#,
+            deps,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            header(&headers, header::VARY).as_deref(),
+            Some(SESSION_VARY)
+        );
+        assert_eq!(
+            body,
+            br#"{"data":{"currentUser":{"id":"VXNlcjox","username":"alice"}}}"#
+        );
+    }
+
+    #[tokio::test]
+    async fn trusted_origin_session_cookie_authenticates() {
+        let (cookie, payload) = session_cookie_and_payload();
+        let deps = session_deps(Ok(Some(payload)), Ok(Some(session_user())));
+        let cookie_header = format!("sgs={cookie}");
+        let (status, _, body) = run(
+            r#"{"externalURL":"https://example.com"}"#,
+            false,
+            Method::POST,
+            "/.api/graphql",
+            &[
+                ("origin", "https://example.com"),
+                ("cookie", cookie_header.as_str()),
+            ],
+            br#"{"query":"{ currentUser { username } }"}"#,
+            deps,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, br#"{"data":{"currentUser":{"username":"alice"}}}"#);
+    }
+
+    #[tokio::test]
+    async fn untrusted_requests_never_consult_the_session() {
+        let (cookie, _) = session_cookie_and_payload();
+        // A Redis failure would produce a 500 if the cookie were read.
+        let deps = session_deps(
+            Err(SessionStoreError("connection refused".to_owned())),
+            Ok(None),
+        );
+        let cookie_header = format!("sgs={cookie}");
+        for headers in [
+            vec![("cookie", cookie_header.as_str())],
+            vec![
+                ("origin", "https://evil.example"),
+                ("cookie", cookie_header.as_str()),
+            ],
+        ] {
+            let (status, _, body) = run(
+                r#"{"externalURL":"https://example.com"}"#,
+                false,
+                Method::POST,
+                "/.api/graphql",
+                &headers,
+                br#"{"query":"{ currentUser { username } }"}"#,
+                Arc::clone(&deps),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body, br#"{"data":{"currentUser":null}}"#);
+        }
+    }
+
+    #[tokio::test]
+    async fn redis_failure_is_the_baseline_500() {
+        let (cookie, _) = session_cookie_and_payload();
+        let deps = session_deps(
+            Err(SessionStoreError("connection refused".to_owned())),
+            Ok(None),
+        );
+        let cookie_header = format!("sgs={cookie}");
+        let (status, headers, body) = run(
+            "{}",
+            false,
+            Method::POST,
+            "/.api/graphql",
+            &[
+                ("x-requested-with", "sourcegraph"),
+                ("cookie", cookie_header.as_str()),
+            ],
+            br#"{"query":"{ currentUser { username } }"}"#,
+            deps,
+        )
+        .await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            header(&headers, header::CONTENT_TYPE).as_deref(),
+            Some("text/plain; charset=utf-8")
+        );
+        assert_eq!(
+            header(&headers, header::VARY).as_deref(),
+            Some(SESSION_VARY)
+        );
+        assert_eq!(body, b"failed to read session actor");
+    }
+
+    #[tokio::test]
+    async fn invalid_session_cookie_is_anonymous() {
+        let deps = session_deps(Ok(None), Ok(None));
+        let (status, _, body) = run(
+            "{}",
+            false,
+            Method::POST,
+            "/.api/graphql",
+            &[
+                ("x-requested-with", "sourcegraph"),
+                ("cookie", "sgs=garbage"),
+            ],
+            br#"{"query":"{ currentUser { username } }"}"#,
+            deps,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, br#"{"data":{"currentUser":null}}"#);
+    }
+
+    #[tokio::test]
+    async fn internal_requests_ignore_the_session_cookie() {
+        let (cookie, payload) = session_cookie_and_payload();
+        let deps = session_deps(Ok(Some(payload)), Ok(None));
+        let cookie_header = format!("sgs={cookie}");
+        let (status, headers, body) = run(
+            "{}",
+            true,
+            Method::POST,
+            "/graphql",
+            &[
+                ("x-requested-with", "sourcegraph"),
+                ("cookie", cookie_header.as_str()),
+            ],
+            br#"{"query":"{ currentUser { username } }"}"#,
+            deps,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(header(&headers, header::VARY), None);
+        assert_eq!(body, br#"{"data":{"currentUser":null}}"#);
+    }
+
+    #[test]
+    fn session_cookie_parsing_matches_net_http() {
+        let mut headers = HeaderMap::new();
+        assert_eq!(session_cookie(&headers), None);
+        headers.insert(
+            header::COOKIE,
+            HeaderValue::from_static("a=b; sgs=\"quoted\"; c=d"),
+        );
+        assert_eq!(session_cookie(&headers).as_deref(), Some("quoted"));
+        let mut headers = HeaderMap::new();
+        headers.insert(header::COOKIE, HeaderValue::from_static("sgs=first"));
+        headers.append(header::COOKIE, HeaderValue::from_static("sgs=second"));
+        assert_eq!(session_cookie(&headers).as_deref(), Some("first"));
     }
 
     #[tokio::test]

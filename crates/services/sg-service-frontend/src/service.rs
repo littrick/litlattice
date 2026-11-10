@@ -135,6 +135,7 @@ impl Service for FrontendService {
             .map_err(ServiceError::new)?;
         let blame_pool = pool.clone();
         let search_pool = blame_pool.clone();
+        let session_pool = pool.clone();
         let source = crate::configuration_source::DbConfigurationSource::new(pool)
             .map_err(ServiceError::new)?;
         crate::configuration_startup::override_from_env(&source)
@@ -191,10 +192,13 @@ impl Service for FrontendService {
         );
         let search_deps: Arc<dyn crate::search_stream::SearchDeps> =
             Arc::new(crate::search_stream::BackendDeps::new(search_pool));
-        // The assembled OSS schema is executed by `sg-graphql` (M9.8fb);
-        // business resolvers are still unported (M9.8fc scope note).
-        let graphql_deps: Arc<dyn GraphqlDeps> =
-            Arc::new(SchemaGraphqlDeps::new(Arc::clone(&graphql_schema)));
+        // The assembled OSS schema is executed by `sg-graphql` (M9.8fb); the
+        // session cookie authenticates external requests and the current-user
+        // row backs `Query.currentUser` (M9.8fe).
+        let graphql_deps: Arc<dyn GraphqlDeps> = Arc::new(SchemaGraphqlDeps::with_session(
+            Arc::clone(&graphql_schema),
+            session_pool,
+        ));
 
         if let Some((addr, listener)) = internal {
             let shutdown = ctx.shutdown.clone();

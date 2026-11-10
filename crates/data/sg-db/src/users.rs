@@ -420,6 +420,53 @@ LIMIT 1
     }))
 }
 
+/// The `users` fields session authentication and the first DB-backed
+/// `User` resolvers read (`db.Users().GetByID`,
+/// `internal/database/users.go:1330-1360`). `display_name`/`avatar_url` are
+/// nullable columns; the baseline's `types.User` fields are plain strings, so
+/// NULL maps to the empty string (which the resolvers turn back into null).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserSessionRecord {
+    pub id: i32,
+    pub username: String,
+    pub display_name: String,
+    pub avatar_url: String,
+    pub created_at: OffsetDateTime,
+    pub invalidated_sessions_at: OffsetDateTime,
+}
+
+/// `userStore.GetByID`: live users only (`deleted_at IS NULL`). `Ok(None)` is
+/// the baseline's not-found error.
+pub async fn get_session_user(
+    pool: &PgPool,
+    id: i32,
+) -> Result<Option<UserSessionRecord>, sqlx::Error> {
+    let row = sqlx::query(
+        r#"
+SELECT id, username, display_name, avatar_url, created_at, invalidated_sessions_at
+FROM users
+WHERE id = $1 AND deleted_at IS NULL
+LIMIT 1
+"#,
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(row.map(|row| UserSessionRecord {
+        id: row.get("id"),
+        username: row.get("username"),
+        display_name: row
+            .get::<Option<String>, _>("display_name")
+            .unwrap_or_default(),
+        avatar_url: row
+            .get::<Option<String>, _>("avatar_url")
+            .unwrap_or_default(),
+        created_at: row.get("created_at"),
+        invalidated_sessions_at: row.get("invalidated_sessions_at"),
+    }))
+}
+
 /// Subset of `types.User` used by `stream_blame.go`'s
 /// `BlameHunkUserResponse`.
 #[derive(Debug, Clone, PartialEq, Eq)]
