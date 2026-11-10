@@ -14,6 +14,7 @@ pub mod cached;
 pub mod client;
 pub mod dialer;
 pub mod file_ranking;
+pub mod global_query;
 pub mod go_regexp;
 pub mod horizontal;
 pub mod index_options;
