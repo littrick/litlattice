@@ -304,6 +304,15 @@ struct ClientConfigurationDeps {
     live: Arc<LiveConfig>,
 }
 
+/// `Mutation.logEvent` / `Mutation.logEvents`'s storage seams: the
+/// `event_logs` table (shared `pool`), `redispool.Store` for the all-time
+/// flags and the live site configuration (`experimentalFeatures.eventLogging`
+/// and `externalURL`).
+struct LogEventsDeps {
+    store: Option<Arc<sg_redis::KeyValue>>,
+    live: Arc<LiveConfig>,
+}
+
 /// The production session-authentication dependencies.
 struct SessionDeps {
     store: Arc<dyn SessionStore>,
@@ -349,6 +358,8 @@ pub struct SchemaGraphqlDeps {
     rate_limit: Option<RateLimitDeps>,
     /// `Query.clientConfiguration`'s seams; `None` in transport-only tests.
     client_configuration: Option<ClientConfigurationDeps>,
+    /// `Mutation.logEvent(s)`'s seams; `None` in transport-only tests.
+    log_events: Option<LogEventsDeps>,
 }
 
 impl SchemaGraphqlDeps {
@@ -367,6 +378,7 @@ impl SchemaGraphqlDeps {
             pool: None,
             rate_limit: None,
             client_configuration: None,
+            log_events: None,
         }
     }
 
@@ -398,6 +410,7 @@ impl SchemaGraphqlDeps {
             pool: Some(pool),
             rate_limit: None,
             client_configuration: None,
+            log_events: None,
         }
     }
 
@@ -447,6 +460,18 @@ impl SchemaGraphqlDeps {
         self
     }
 
+    /// Enable the deprecated `Mutation.logEvent` / `Mutation.logEvents`
+    /// writes: the `event_logs` table (via `pool`), the store Redis pool and
+    /// the live site configuration that gates logging.
+    pub fn with_log_events(
+        mut self,
+        store: Option<Arc<sg_redis::KeyValue>>,
+        live: Arc<LiveConfig>,
+    ) -> Self {
+        self.log_events = Some(LogEventsDeps { store, live });
+        self
+    }
+
     /// Test hook: inject the store/user lookup without Redis or Postgres.
     #[cfg(test)]
     fn with_session_parts(
@@ -475,6 +500,7 @@ impl SchemaGraphqlDeps {
             pool: None,
             rate_limit: None,
             client_configuration: None,
+            log_events: None,
         }
     }
 }
@@ -566,11 +592,12 @@ impl GraphqlDeps for SchemaGraphqlDeps {
             }
             None => std::collections::HashMap::new(),
         };
-        // `Mutation.settingsMutation`: the executor resolves fields
-        // synchronously, so run the (async) write path now. Only mutation
-        // operations perform side effects.
-        let mutation = match (&self.pool, &self.org_memberships) {
-            (Some(pool), Some(store)) if sg_graphql::exec::is_mutation_operation(&exec_request) => {
+        // `Mutation.settingsMutation` / `Mutation.logEvent(s)`: the executor
+        // resolves fields synchronously, so run the (async) write paths now.
+        // Only mutation operations perform side effects.
+        let is_mutation = sg_graphql::exec::is_mutation_operation(&exec_request);
+        let mut mutation = match (&self.pool, &self.org_memberships) {
+            (Some(pool), Some(store)) if is_mutation => {
                 crate::settings_mutation::prefetch_settings_mutation(
                     pool,
                     store.as_ref(),
@@ -582,6 +609,22 @@ impl GraphqlDeps for SchemaGraphqlDeps {
             }
             _ => crate::settings_mutation::MutationRoot::default(),
         };
+        if let (Some(pool), Some(deps)) = (&self.pool, &self.log_events) {
+            if is_mutation {
+                let site = deps.live.current();
+                let outcomes = crate::log_events::prefetch_log_events(
+                    pool,
+                    deps.store.as_deref(),
+                    &site.site,
+                    request.actor.uid().unwrap_or(0),
+                    &fields,
+                )
+                .await;
+                for (field, outcome) in outcomes {
+                    mutation = mutation.with_log_events(field, outcome);
+                }
+            }
+        }
         let nodes = match (&self.org_memberships, &self.repositories) {
             (Some(memberships_store), Some(repositories)) => {
                 crate::graphql_resolvers::prefetch_node_roots(

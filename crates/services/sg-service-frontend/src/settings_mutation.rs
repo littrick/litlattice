@@ -66,13 +66,27 @@ pub enum SettingsMutationPrefetch {
 }
 
 /// `Mutation` root (`schemaResolver.SettingsMutation` /
-/// `ConfigurationMutation`). Root fields are keyed by their schema name.
+/// `ConfigurationMutation` plus the deprecated log-event mutations). Root
+/// fields are keyed by their schema name.
 #[derive(Debug, Clone, Default)]
 pub struct MutationRoot {
     settings_mutations: HashMap<String, SettingsMutationPrefetch>,
+    /// `Mutation.logEvent` / `Mutation.logEvents` outcomes
+    /// (`crate::log_events::prefetch_log_events`).
+    log_events: HashMap<String, Result<(), String>>,
 }
 
 impl MutationRoot {
+    /// Attach a prefetched log-event write outcome.
+    pub fn with_log_events(
+        mut self,
+        field: impl Into<String>,
+        outcome: Result<(), String>,
+    ) -> Self {
+        self.log_events.insert(field.into(), outcome);
+        self
+    }
+
     pub fn with_settings_mutation(
         mut self,
         field: impl Into<String>,
@@ -108,6 +122,16 @@ impl ObjectValue for MutationRoot {
                     None => Ok(None),
                 }
             }
+            // `schemaResolver.LogEvent` / `LogEvents` return a nil
+            // `*EmptyResponse` on success (GraphQL `null`) and the write error
+            // otherwise.
+            "logEvent" | "logEvents" => match self.log_events.get(field) {
+                Some(Ok(())) => Ok(Some(FieldValue::Null)),
+                Some(Err(message)) => Err(ExecError::new(message.clone())),
+                None => Ok(None),
+            },
+            // `schemaResolver.LogUserEvent` has been a no-op since PR 38826.
+            "logUserEvent" => Ok(Some(FieldValue::Null)),
             _ => Ok(None),
         }
     }

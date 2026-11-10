@@ -124,6 +124,9 @@ impl Service for FrontendService {
         // `promauto` registers every GraphQL metric family at package init, so
         // they are scrapeable (with no samples) before the first request.
         crate::graphql_metrics::register();
+        // The same applies to the log-event search metrics
+        // (`user_usage_stats.go:288-352`).
+        crate::log_events_metrics::register();
         let config = self
             .config
             .clone()
@@ -218,6 +221,22 @@ impl Service for FrontendService {
                 }
             });
         }
+        // `Mutation.logEvent(s)` writes the `user_activity:*` all-time flags
+        // through `redispool.Store`. Like the rate limiter below, a redigo
+        // pool does not dial until the first command; an unreachable Redis at
+        // startup only turns the flag writes into errors for the affected
+        // events (the baseline behaves the same once the pool is broken).
+        let log_events_store = match sg_redis::KeyValue::connect(&sg_redis::store_endpoint()).await
+        {
+            Ok(kv) => Some(Arc::new(kv)),
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "log-event Redis store unavailable: user_activity flags will fail"
+                );
+                None
+            }
+        };
         // The assembled OSS schema is executed by `sg-graphql` (M9.8fb); the
         // session cookie authenticates external requests and the current-user
         // row backs `Query.currentUser` (M9.8fe). `Query.clientConfiguration`
@@ -232,7 +251,8 @@ impl Service for FrontendService {
                     ),
                     keyring,
                     Arc::clone(wiring.live()),
-                );
+                )
+                .with_log_events(log_events_store, Arc::clone(wiring.live()));
         // `serve_cmd.go:436-448`: the anonymous GraphQL limiter stores GCRA
         // state in the Redis cache pool (`gql:rl:` prefix). A redigo pool does
         // not dial at construction (failures surface per request); here an
