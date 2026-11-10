@@ -23,6 +23,7 @@ pub mod configuration_watch;
 pub mod debug;
 pub mod deploy_defaults;
 pub mod external_api;
+pub mod external_services;
 pub mod goimportpath;
 pub mod graphql_api;
 pub mod graphql_metrics;

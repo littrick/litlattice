@@ -304,6 +304,14 @@ struct ClientConfigurationDeps {
     live: Arc<LiveConfig>,
 }
 
+/// `Query.externalServices`'s dependencies: the `external_services` table and
+/// the keyring used to decrypt service configs. The user lookup comes from the
+/// shared `users` seam.
+struct ExternalServicesDeps {
+    store: Arc<dyn crate::external_services::ExternalServiceConnectionStore>,
+    keyring: Arc<sg_keyring::Keyring>,
+}
+
 /// `Query.repository(cloneURL:)` / `Query.repositoryRedirect(cloneURL:)`'s
 /// code-host mapping seam (`internal/cloneurls`), backed by the live site
 /// configuration, `external_services` and the keyring.
@@ -365,6 +373,8 @@ pub struct SchemaGraphqlDeps {
     rate_limit: Option<RateLimitDeps>,
     /// `Query.clientConfiguration`'s seams; `None` in transport-only tests.
     client_configuration: Option<ClientConfigurationDeps>,
+    /// `Query.externalServices`'s seams; `None` in transport-only tests.
+    external_services: Option<ExternalServicesDeps>,
     /// `cloneURL` mapping; `None` in transport-only tests.
     clone_urls: Option<CloneUrlDeps>,
     /// `Mutation.logEvent(s)`'s seams; `None` in transport-only tests.
@@ -387,6 +397,7 @@ impl SchemaGraphqlDeps {
             pool: None,
             rate_limit: None,
             client_configuration: None,
+            external_services: None,
             clone_urls: None,
             log_events: None,
         }
@@ -420,6 +431,7 @@ impl SchemaGraphqlDeps {
             pool: Some(pool),
             rate_limit: None,
             client_configuration: None,
+            external_services: None,
             clone_urls: None,
             log_events: None,
         }
@@ -468,6 +480,17 @@ impl SchemaGraphqlDeps {
             keyring,
             live,
         });
+        self
+    }
+
+    /// Enable `Query.externalServices`: the `external_services` table and the
+    /// keyring used to decrypt/redact service configs.
+    pub fn with_external_services(
+        mut self,
+        store: Arc<dyn crate::external_services::ExternalServiceConnectionStore>,
+        keyring: Arc<sg_keyring::Keyring>,
+    ) -> Self {
+        self.external_services = Some(ExternalServicesDeps { store, keyring });
         self
     }
 
@@ -521,6 +544,7 @@ impl SchemaGraphqlDeps {
             pool: None,
             rate_limit: None,
             client_configuration: None,
+            external_services: None,
             clone_urls: None,
             log_events: None,
         }
@@ -759,6 +783,24 @@ impl GraphqlDeps for SchemaGraphqlDeps {
             }
             None => None,
         };
+        // `Query.externalServices` is site-admin only; the prefetched lookup
+        // carries the connection or the authorization/argument error.
+        let external_services = match &self.external_services {
+            Some(deps) => {
+                crate::external_services::prefetch_external_services(
+                    deps.store.as_ref(),
+                    self.users.as_ref().map(|users| {
+                        users.as_ref() as &dyn crate::graphql_resolvers::UserLookupStore
+                    }),
+                    deps.keyring.external_service_key(),
+                    &fields,
+                    request.actor,
+                    user.as_ref().map(|user| user.user_data()),
+                )
+                .await
+            }
+            None => std::collections::HashMap::new(),
+        };
         let mut roots =
             crate::graphql_resolvers::FrontendRootResolver::with_prefetched_organizations(
                 user,
@@ -774,6 +816,7 @@ impl GraphqlDeps for SchemaGraphqlDeps {
             .with_namespaces(namespaces)
             .with_repository_redirects(repository_redirects)
             .with_temporary_settings(temporary_settings)
+            .with_external_services(external_services)
             .with_mutation(mutation);
         if let Some(client_configuration) = client_configuration {
             roots = roots.with_client_configuration(client_configuration);
