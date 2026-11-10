@@ -21,6 +21,7 @@ pub mod deploy_defaults;
 pub mod external_api;
 pub mod goimportpath;
 pub mod graphql_api;
+pub mod graphql_metrics;
 pub mod graphql_resolvers;
 pub mod health;
 pub mod internal_api;

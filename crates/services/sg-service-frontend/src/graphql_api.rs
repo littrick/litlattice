@@ -23,6 +23,7 @@ use std::future::poll_fn;
 use std::io::Read;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Instant;
 
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
@@ -757,9 +758,23 @@ where
         .map(|(key, value)| (key.clone(), value.clone()))
         .collect();
 
+    // `graphql.go:140-150`: from here on every return path observes the
+    // request duration (`defer instrumentGraphQL`).
+    let mut timer = RequestTimer::new(&params.query, &request_name);
+
     // Calculating the cost is cheaper than validating the schema
     // (`graphql.go:159`).
     if let Ok(cost) = estimate_query_cost(&params.query, &variables) {
+        // `graphql.go:168-169`: observed before the violation and rate-limit
+        // checks, so rejected requests still count.
+        crate::graphql_metrics::observe_cost(
+            &crate::graphql_metrics::actor_type_label(
+                internal,
+                matches!(actor, Actor::Anonymous),
+                &request_source,
+            ),
+            cost.field_count,
+        );
         if !internal {
             let site = live.current();
             let limits = rate_limits(&site.site);
@@ -798,6 +813,9 @@ where
         }
     }
 
+    // `graphql.go:220`: the duration histogram measures execution only; the
+    // timer's earlier phase was used for the pre-execution return paths.
+    timer.exec_started();
     let response = deps
         .exec(GraphqlExecRequest {
             query: &params.query,
@@ -806,6 +824,7 @@ where
             actor,
         })
         .await;
+    timer.finish(response.errors.is_empty());
     let body = match response.to_json() {
         Ok(body) => body.into_bytes(),
         Err(error) => {
@@ -817,6 +836,58 @@ where
     };
 
     text_response(StatusCode::OK, "application/json", body, false)
+}
+
+/// The `defer instrumentGraphQL(traceData)` (`graphql.go:146-150`).
+///
+/// `exec_start` stays [`None`] on the pre-execution return paths (cost
+/// violations, 429), where the baseline computes `time.Since(time.Time{})`
+/// and therefore records a `+Inf` observation. The exact seconds of that
+/// observation depend on the wall clock, so only its bucket is contractual.
+struct RequestTimer {
+    mutation: bool,
+    route: String,
+    success: bool,
+    started: Instant,
+    exec_start: Option<Instant>,
+}
+
+impl RequestTimer {
+    fn new(query: &str, route: &str) -> Self {
+        Self {
+            mutation: crate::graphql_metrics::is_mutation_query(query),
+            route: route.to_owned(),
+            success: true,
+            started: Instant::now(),
+            exec_start: None,
+        }
+    }
+
+    fn exec_started(&mut self) {
+        self.exec_start = Some(Instant::now());
+    }
+
+    fn finish(&mut self, success: bool) {
+        self.success = success;
+    }
+}
+
+impl Drop for RequestTimer {
+    fn drop(&mut self) {
+        let seconds = match self.exec_start {
+            Some(start) => start.elapsed().as_secs_f64(),
+            None => {
+                crate::graphql_metrics::PRE_EXEC_DURATION_SECONDS
+                    + self.started.elapsed().as_secs_f64()
+            }
+        };
+        crate::graphql_metrics::observe_request_duration(
+            self.mutation,
+            &self.route,
+            self.success,
+            seconds,
+        );
+    }
 }
 
 /// `getUID` (`graphql.go:259-273`): an authenticated actor wins, then the

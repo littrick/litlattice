@@ -121,6 +121,9 @@ impl Service for FrontendService {
     }
 
     async fn start(self: Box<Self>, ctx: ServiceContext) -> Result<(), ServiceError> {
+        // `promauto` registers every GraphQL metric family at package init, so
+        // they are scrapeable (with no samples) before the first request.
+        crate::graphql_metrics::register();
         let config = self
             .config
             .clone()
