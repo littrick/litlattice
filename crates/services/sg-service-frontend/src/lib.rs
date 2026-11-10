@@ -53,6 +53,7 @@ pub mod service_connections;
 pub mod session_auth;
 pub mod settings_merge;
 pub mod settings_mutation;
+pub mod site_config_change;
 pub mod site_config_file;
 pub mod site_configuration_mutation;
 pub mod site_configuration_query;
