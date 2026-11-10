@@ -82,6 +82,9 @@ pub struct MutationRoot {
     /// `deleteFeatureFlag` outcomes
     /// (`crate::feature_flag_mutations::prefetch_feature_flag_mutations`).
     feature_flags: HashMap<String, crate::feature_flag_mutations::FeatureFlagMutationOutcome>,
+    /// `Mutation.updateSiteConfiguration` outcomes
+    /// (`crate::site_configuration_mutation::prefetch_update_site_configuration`).
+    site_configuration: HashMap<String, Result<bool, String>>,
 }
 
 impl MutationRoot {
@@ -102,6 +105,16 @@ impl MutationRoot {
         outcome: Result<(), String>,
     ) -> Self {
         self.temporary_settings.insert(field.into(), outcome);
+        self
+    }
+
+    /// Attach a prefetched `updateSiteConfiguration` outcome.
+    pub fn with_site_configuration(
+        mut self,
+        field: impl Into<String>,
+        outcome: Result<bool, String>,
+    ) -> Self {
+        self.site_configuration.insert(field.into(), outcome);
         self
     }
 
@@ -183,6 +196,13 @@ impl ObjectValue for MutationRoot {
                     None => Ok(None),
                 }
             }
+            // `schemaResolver.UpdateSiteConfiguration` returns
+            // `configurationServer.NeedServerRestart()` (`site.go:362`).
+            "updateSiteConfiguration" => match self.site_configuration.get(field) {
+                Some(Ok(restart)) => Ok(Some(FieldValue::Json(Json::Bool(*restart)))),
+                Some(Err(message)) => Err(ExecError::new(message.clone())),
+                None => Ok(None),
+            },
             // `schemaResolver.LogUserEvent` has been a no-op since PR 38826.
             "logUserEvent" => Ok(Some(FieldValue::Null)),
             // `OverwriteTemporarySettings` / `EditTemporarySettings` return a

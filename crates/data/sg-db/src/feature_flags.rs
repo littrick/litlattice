@@ -11,6 +11,8 @@
 //! disagree; callers such as the aggregated users statistics job treat any
 //! error as "flag disabled".
 
+use std::collections::HashMap;
+
 use sqlx::postgres::PgPool;
 use sqlx::types::time::OffsetDateTime;
 
@@ -110,6 +112,55 @@ impl FeatureFlag {
     pub fn evaluate_global(&self) -> Option<bool> {
         self.bool_value
     }
+
+    /// `FeatureFlag.EvaluateForUser`: boolean flags return their value,
+    /// rollouts hash the little-endian user ID plus the flag name with FNV-1.
+    pub fn evaluate_for_user(&self, user_id: i32) -> bool {
+        match (self.bool_value, self.rollout) {
+            (Some(value), _) => value,
+            (None, Some(rollout)) => {
+                hash_user_and_flag(user_id, &self.name) % 10_000 < rollout as u32
+            }
+            // `from_columns` never produces this state.
+            (None, None) => false,
+        }
+    }
+
+    /// `FeatureFlag.EvaluateForAnonymousUser`: rollouts hash the anonymous UID
+    /// plus the flag name with FNV-1.
+    pub fn evaluate_for_anonymous_user(&self, anonymous_uid: &str) -> bool {
+        match (self.bool_value, self.rollout) {
+            (Some(value), _) => value,
+            (None, Some(rollout)) => {
+                hash_anonymous_user_and_flag(anonymous_uid, &self.name) % 10_000 < rollout as u32
+            }
+            // `from_columns` never produces this state.
+            (None, None) => false,
+        }
+    }
+}
+
+/// `hashUserAndFlag` (`internal/featureflag/featureflag.go:33-38`): FNV-1
+/// (multiply, then xor) over the little-endian `int32` user ID and the flag
+/// name. Note this is **not** FNV-1a.
+fn hash_user_and_flag(user_id: i32, flag_name: &str) -> u32 {
+    fnv1_32(&[&user_id.to_le_bytes(), flag_name.as_bytes()])
+}
+
+/// `hashAnonymousUserAndFlag` (`featureflag.go:53-58`).
+fn hash_anonymous_user_and_flag(anonymous_uid: &str, flag_name: &str) -> u32 {
+    fnv1_32(&[anonymous_uid.as_bytes(), flag_name.as_bytes()])
+}
+
+fn fnv1_32(parts: &[&[u8]]) -> u32 {
+    let mut hash: u32 = 0x811c_9dc5;
+    for part in parts {
+        for byte in *part {
+            hash = hash.wrapping_mul(0x0100_0193);
+            hash ^= u32::from(*byte);
+        }
+    }
+    hash
 }
 
 impl FeatureFlagOverride {
@@ -327,6 +378,98 @@ WHERE deleted_at IS NULL
         .collect()
 }
 
+/// `featureFlagStore.GetUserFlags`
+/// (`internal/database/feature_flags.go:490-576`): the effective value for
+/// every flag visible to the user, with user overrides beating org overrides
+/// and the newest org override winning per flag.
+const GET_USER_FLAGS: &str = r#"
+WITH user_overrides AS (
+	SELECT
+		flag_name,
+		flag_value
+	FROM feature_flag_overrides
+	WHERE namespace_user_id = $1
+		AND deleted_at IS NULL
+), org_overrides AS (
+	SELECT
+		DISTINCT ON (flag_name)
+		flag_name,
+		flag_value
+	FROM feature_flag_overrides
+	WHERE EXISTS (
+		SELECT org_id
+		FROM org_members
+		WHERE org_members.user_id = $1
+			AND feature_flag_overrides.namespace_org_id = org_members.org_id
+	) AND deleted_at IS NULL
+	ORDER BY flag_name, created_at desc
+)
+SELECT
+	COALESCE(ff.flag_name, uo.flag_name, oo.flag_name),
+	ff.flag_type::text,
+	ff.bool_value,
+	ff.rollout,
+	COALESCE(uo.flag_value, oo.flag_value) AS override
+FROM feature_flags ff
+FULL JOIN org_overrides oo ON ff.flag_name = oo.flag_name
+FULL JOIN user_overrides uo ON ff.flag_name = uo.flag_name
+WHERE deleted_at IS NULL
+"#;
+
+/// `flag_name, flag_type, bool_value, rollout, override`.
+type UserFlagRow = (
+    String,
+    Option<String>,
+    Option<bool>,
+    Option<i32>,
+    Option<bool>,
+);
+
+/// `GetUserFlags`.
+pub async fn get_user_flags(
+    pool: &PgPool,
+    user_id: i32,
+) -> Result<HashMap<String, bool>, FeatureFlagError> {
+    let rows: Vec<UserFlagRow> = sqlx::query_as(GET_USER_FLAGS)
+        .bind(user_id)
+        .fetch_all(pool)
+        .await?;
+
+    let mut flags = HashMap::with_capacity(rows.len());
+    for (name, flag_type, bool_value, rollout, override_value) in rows {
+        let value = if let Some(value) = override_value {
+            value
+        } else {
+            match flag_type.as_deref() {
+                Some("bool") => bool_value.ok_or(FeatureFlagError::InvalidColumnState)?,
+                Some("rollout") => {
+                    let rollout = rollout.ok_or(FeatureFlagError::InvalidColumnState)?;
+                    hash_user_and_flag(user_id, &name) % 10_000 < rollout as u32
+                }
+                _ => return Err(FeatureFlagError::InvalidColumnState),
+            }
+        };
+        flags.insert(name, value);
+    }
+    Ok(flags)
+}
+
+/// `featureFlagStore.GetGlobalFeatureFlags`
+/// (`internal/database/feature_flags.go:592-604`): only boolean flags are
+/// evaluatable without a user; rollouts are omitted.
+pub async fn get_global_feature_flags(
+    pool: &PgPool,
+) -> Result<HashMap<String, bool>, FeatureFlagError> {
+    let flags = get_feature_flags(pool).await?;
+    let mut values = HashMap::with_capacity(flags.len());
+    for flag in flags {
+        if let Some(value) = flag.evaluate_global() {
+            values.insert(flag.name, value);
+        }
+    }
+    Ok(values)
+}
+
 /// `featureFlagStore.GetOverridesForFlag`
 /// (`internal/database/feature_flags.go:372-390`): non-deleted overrides for
 /// one flag, in the database's physical row order (no `ORDER BY`).
@@ -394,6 +537,51 @@ mod tests {
             FeatureFlag::from_columns("f".into(), "mystery", Some(true), None, at(1), at(2)),
             Err(FeatureFlagError::InvalidColumnState)
         ));
+    }
+
+    #[test]
+    fn rollout_hashing_matches_the_baselines_fnv1() {
+        // Values computed with Go's `hash/fnv.New32` over the little-endian
+        // int32 user ID followed by the flag name.
+        assert_eq!(hash_user_and_flag(1, "auditlog-expansion"), 3193298911);
+        assert_eq!(hash_user_and_flag(2, "auditlog-expansion"), 2636226334);
+        assert_eq!(hash_user_and_flag(-1, "auditlog-expansion"), 3883836408);
+        assert_eq!(
+            hash_anonymous_user_and_flag("anonymous-uid", "auditlog-expansion"),
+            3717833776
+        );
+    }
+
+    #[test]
+    fn rollout_evaluation_is_below_the_basis_points_modulus() {
+        let flag = FeatureFlag::from_columns(
+            "auditlog-expansion".into(),
+            "rollout",
+            None,
+            Some(7000),
+            at(1),
+            at(2),
+        )
+        .expect("rollout");
+        assert!(!flag.evaluate_for_user(1), "8911 >= 7000");
+        assert!(flag.evaluate_for_user(2), "6334 < 7000");
+
+        let none = FeatureFlag::from_columns(
+            "auditlog-expansion".into(),
+            "rollout",
+            None,
+            Some(0),
+            at(1),
+            at(2),
+        )
+        .expect("rollout");
+        assert!(!none.evaluate_for_user(1));
+
+        let bool_flag =
+            FeatureFlag::from_columns("f".into(), "bool", Some(true), None, at(1), at(2))
+                .expect("bool");
+        assert!(bool_flag.evaluate_for_user(7));
+        assert!(bool_flag.evaluate_for_anonymous_user("anon"));
     }
 
     #[test]
