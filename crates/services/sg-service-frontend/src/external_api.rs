@@ -24,6 +24,11 @@
 //!   download filenames (302), else `http.NotFound`;
 //! - `/.api/client-config` and `/.api/modelconfig/supported-models.json`
 //!   (GET) -> `401 Unauthorized` without the auth/session middleware;
+//! - `/.api/webhooks/{webhook_uuid}` (POST) -> invalid UUID 400 (`%q`), else
+//!   the empty-table 404 `Could not find webhook with provided UUID.`;
+//! - `/.api/{github,gitlab,bitbucket-server,bitbucket-cloud}-webhooks` (POST)
+//!   -> GitHub: 400 `Error validating payload` with no GitHub external
+//!   services; the others: the OSS empty handler's 200 empty response;
 //! - anything else -> gorilla's default `http.NotFoundHandler`
 //!   (`404 page not found\n`, `nosniff`).
 //!
@@ -33,6 +38,7 @@
 
 use http::{Method, Request, Response, StatusCode};
 use tonic::body::BoxBody;
+use uuid::Uuid;
 
 use sg_config::LiveConfig;
 
@@ -56,6 +62,11 @@ const SRC_CLI_VERSIONS_PREFIX: &str = "/.api/src-cli/versions/";
 const SRC_CLI_PREFIX: &str = "/.api/src-cli/";
 const CLIENT_CONFIG_PATH: &str = "/.api/client-config";
 const MODEL_CONFIG_PATH: &str = "/.api/modelconfig/supported-models.json";
+const WEBHOOKS_PREFIX: &str = "/.api/webhooks/";
+const GITHUB_WEBHOOKS_PATH: &str = "/.api/github-webhooks";
+const GITLAB_WEBHOOKS_PATH: &str = "/.api/gitlab-webhooks";
+const BITBUCKET_SERVER_WEBHOOKS_PATH: &str = "/.api/bitbucket-server-webhooks";
+const BITBUCKET_CLOUD_WEBHOOKS_PATH: &str = "/.api/bitbucket-cloud-webhooks";
 
 /// `srccli.MinimumVersion` (`internal/src-cli/consts.go:9`). The remote
 /// version cache is not ported, so `src_cli_version_handler.Version()`
@@ -95,6 +106,11 @@ enum Route {
     SrcCli { rest: String },
     ClientConfig,
     ModelConfig,
+    WebhookUuid { uuid: String },
+    GitHubWebhooks,
+    GitLabWebhooks,
+    BitbucketServerWebhooks,
+    BitbucketCloudWebhooks,
 }
 
 impl Route {
@@ -118,6 +134,11 @@ impl Route {
             Route::SrcCli { .. } | Route::ClientConfig | Route::ModelConfig => {
                 method == Method::GET
             }
+            Route::WebhookUuid { .. }
+            | Route::GitHubWebhooks
+            | Route::GitLabWebhooks
+            | Route::BitbucketServerWebhooks
+            | Route::BitbucketCloudWebhooks => method == Method::POST,
         }
     }
 
@@ -193,6 +214,11 @@ pub fn api_response<B>(req: &Request<B>, _live: &LiveConfig) -> Response<BoxBody
         Route::SrcCliVersions => page_not_found(),
         Route::SrcCli { rest } => src_cli_response(req.method(), &rest),
         Route::ClientConfig | Route::ModelConfig => unauthorized_response(),
+        Route::WebhookUuid { uuid } => webhook_uuid_response(&uuid),
+        Route::GitHubWebhooks => webhook_validation_error(),
+        Route::GitLabWebhooks | Route::BitbucketServerWebhooks | Route::BitbucketCloudWebhooks => {
+            empty_response(StatusCode::OK)
+        }
     }
 }
 
@@ -205,6 +231,25 @@ fn match_route(path: &str) -> Option<Route> {
     }
     if path.starts_with(SCIM_PREFIX) {
         return Some(Route::Scim);
+    }
+    if let Some(rest) = path.strip_prefix(WEBHOOKS_PREFIX) {
+        if let Some(uuid) = single_segment(rest) {
+            return Some(Route::WebhookUuid {
+                uuid: uuid.to_owned(),
+            });
+        }
+    }
+    if path == GITHUB_WEBHOOKS_PATH {
+        return Some(Route::GitHubWebhooks);
+    }
+    if path == GITLAB_WEBHOOKS_PATH {
+        return Some(Route::GitLabWebhooks);
+    }
+    if path == BITBUCKET_SERVER_WEBHOOKS_PATH {
+        return Some(Route::BitbucketServerWebhooks);
+    }
+    if path == BITBUCKET_CLOUD_WEBHOOKS_PATH {
+        return Some(Route::BitbucketCloudWebhooks);
     }
     if let Some(rest) = path.strip_prefix(BATCH_CHANGES_PREFIX) {
         if let Some((spec, file)) = batch_changes_file(rest) {
@@ -331,6 +376,61 @@ fn unauthorized_response() -> Response<BoxBody> {
     )
 }
 
+/// `webhooks.GitHubWebhook.ServeHTTP` with no GitHub external services
+/// configured (`github_webhooks.go:26-50`): the legacy lookup returns a plain
+/// (non-NotFound) error, so the handler answers
+/// `http.Error(..., "Error validating payload", 400)`. Signature validation
+/// against configured external services and event dispatch are not ported.
+fn webhook_validation_error() -> Response<BoxBody> {
+    text_response(
+        StatusCode::BAD_REQUEST,
+        "text/plain; charset=utf-8",
+        "Error validating payload\n",
+        true,
+    )
+}
+
+/// `webhooks.handler` (`webhooks.go:186-245`) with an empty webhooks table:
+/// invalid UUIDs are rejected with `%q` quoting, well-formed UUIDs are not
+/// found. The DB lookup, secret decryption and code-host dispatch are not
+/// ported.
+fn webhook_uuid_response(uuid: &str) -> Response<BoxBody> {
+    if Uuid::parse_str(uuid).is_err() {
+        let body = format!("Could not parse UUID from URL path {}.\n", go_quote(uuid));
+        return text_response(
+            StatusCode::BAD_REQUEST,
+            "text/plain; charset=utf-8",
+            &body,
+            true,
+        );
+    }
+    text_response(
+        StatusCode::NOT_FOUND,
+        "text/plain; charset=utf-8",
+        "Could not find webhook with provided UUID.\n",
+        true,
+    )
+}
+
+/// Go's `fmt.Sprintf("%q", value)` for the ASCII path segments seen here.
+fn go_quote(value: &str) -> String {
+    let mut quoted = String::with_capacity(value.len() + 2);
+    quoted.push('"');
+    for ch in value.chars() {
+        match ch {
+            '"' => quoted.push_str("\\\""),
+            '\\' => quoted.push_str("\\\\"),
+            '\n' => quoted.push_str("\\n"),
+            '\r' => quoted.push_str("\\r"),
+            '\t' => quoted.push_str("\\t"),
+            ch if ch.is_control() => quoted.push_str(&format!("\\x{:02x}", ch as u32)),
+            ch => quoted.push(ch),
+        }
+    }
+    quoted.push('"');
+    quoted
+}
+
 /// gorilla's default `NotFoundHandler` (`http.NotFoundHandler`).
 fn page_not_found() -> Response<BoxBody> {
     text_response(
@@ -399,6 +499,63 @@ mod tests {
             api_response(&request(Method::GET, "/.api/search/export/.jsonl"), &live).status(),
             StatusCode::NOT_FOUND
         );
+    }
+
+    #[test]
+    fn webhook_routes() {
+        let live = live();
+
+        // OSS `emptyWebhookHandler`: raw 200, empty body, no Content-Type.
+        let gitlab = api_response(&request(Method::POST, "/.api/gitlab-webhooks"), &live);
+        assert_eq!(gitlab.status(), StatusCode::OK);
+        assert!(gitlab.headers().get(header::CONTENT_TYPE).is_none());
+
+        // No GitHub external services: `findAndValidateExternalService`
+        // returns a plain error -> 400.
+        let github = api_response(&request(Method::POST, "/.api/github-webhooks"), &live);
+        assert_eq!(github.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            github.headers().get(header::CONTENT_TYPE).unwrap(),
+            "text/plain; charset=utf-8"
+        );
+
+        // UUID parsing (google/uuid formats) and the empty webhooks table.
+        let invalid = api_response(&request(Method::POST, "/.api/webhooks/nope"), &live);
+        assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+        for uuid in [
+            "/.api/webhooks/00000000-0000-0000-0000-000000000000",
+            "/.api/webhooks/00000000000000000000000000000000",
+            "/.api/webhooks/urn:uuid:00000000-0000-0000-0000-000000000000",
+            "/.api/webhooks/%7B00000000-0000-0000-0000-000000000000%7D",
+        ] {
+            assert_eq!(
+                api_response(&request(Method::POST, uuid), &live).status(),
+                StatusCode::NOT_FOUND,
+                "{uuid}"
+            );
+        }
+        assert_eq!(
+            api_response(
+                &request(
+                    Method::GET,
+                    "/.api/webhooks/00000000-0000-0000-0000-000000000000"
+                ),
+                &live
+            )
+            .status(),
+            StatusCode::METHOD_NOT_ALLOWED
+        );
+        assert_eq!(
+            api_response(&request(Method::POST, "/.api/webhooks/"), &live).status(),
+            StatusCode::NOT_FOUND
+        );
+        let trailing = api_response(&request(Method::POST, "/.api/gitlab-webhooks/"), &live);
+        assert_eq!(trailing.status(), StatusCode::MOVED_PERMANENTLY);
+        assert_eq!(
+            trailing.headers().get(header::LOCATION).unwrap(),
+            "/.api/gitlab-webhooks"
+        );
+        assert!(trailing.headers().get(header::CONTENT_TYPE).is_none());
     }
 
     #[tokio::test]
