@@ -49,6 +49,7 @@ pub mod settings;
 pub mod sub_repo_perms;
 pub mod syntactic_indexing_jobs;
 pub mod telemetry_events;
+pub mod temporary_settings;
 pub mod user_emails;
 pub mod user_external_accounts;
 pub mod users;

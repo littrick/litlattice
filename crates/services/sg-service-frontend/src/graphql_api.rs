@@ -625,6 +625,31 @@ impl GraphqlDeps for SchemaGraphqlDeps {
                 }
             }
         }
+        // `Query.temporarySettings` and the two temporary-setting mutations
+        // share the `temporary_settings` table and the auth check
+        // (`temporary_settings.go:18-52`). A document is either a query or a
+        // mutation, so at most one side runs per request.
+        let (temporary_settings, temporary_settings_writes) = match &self.pool {
+            Some(pool) => {
+                let uid = request.actor.uid().unwrap_or(0);
+                let read =
+                    crate::temporary_settings::prefetch_temporary_settings(pool, uid, &fields)
+                        .await;
+                let writes = if is_mutation {
+                    crate::temporary_settings::prefetch_temporary_settings_mutations(
+                        pool, uid, &fields,
+                    )
+                    .await
+                } else {
+                    Vec::new()
+                };
+                (read, writes)
+            }
+            None => (None, Vec::new()),
+        };
+        for (field, outcome) in temporary_settings_writes {
+            mutation = mutation.with_temporary_settings(field, outcome);
+        }
         let nodes = match (&self.org_memberships, &self.repositories) {
             (Some(memberships_store), Some(repositories)) => {
                 crate::graphql_resolvers::prefetch_node_roots(
@@ -705,6 +730,7 @@ impl GraphqlDeps for SchemaGraphqlDeps {
             .with_nested(nested)
             .with_nodes(nodes)
             .with_namespaces(namespaces)
+            .with_temporary_settings(temporary_settings)
             .with_mutation(mutation);
         if let Some(client_configuration) = client_configuration {
             roots = roots.with_client_configuration(client_configuration);

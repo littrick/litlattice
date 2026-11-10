@@ -74,9 +74,23 @@ pub struct MutationRoot {
     /// `Mutation.logEvent` / `Mutation.logEvents` outcomes
     /// (`crate::log_events::prefetch_log_events`).
     log_events: HashMap<String, Result<(), String>>,
+    /// `Mutation.overwriteTemporarySettings` /
+    /// `editTemporarySettings` outcomes
+    /// (`crate::temporary_settings::prefetch_temporary_settings_mutations`).
+    temporary_settings: HashMap<String, Result<(), String>>,
 }
 
 impl MutationRoot {
+    /// Attach a prefetched temporary-settings write outcome.
+    pub fn with_temporary_settings(
+        mut self,
+        field: impl Into<String>,
+        outcome: Result<(), String>,
+    ) -> Self {
+        self.temporary_settings.insert(field.into(), outcome);
+        self
+    }
+
     /// Attach a prefetched log-event write outcome.
     pub fn with_log_events(
         mut self,
@@ -132,6 +146,18 @@ impl ObjectValue for MutationRoot {
             },
             // `schemaResolver.LogUserEvent` has been a no-op since PR 38826.
             "logUserEvent" => Ok(Some(FieldValue::Null)),
+            // `OverwriteTemporarySettings` / `EditTemporarySettings` return a
+            // non-nil `*EmptyResponse`, so success is an (empty) object; the
+            // baseline reports authentication/database errors on the field.
+            "overwriteTemporarySettings" | "editTemporarySettings" => {
+                match self.temporary_settings.get(field) {
+                    Some(Ok(())) => Ok(Some(FieldValue::Object(Arc::new(
+                        crate::temporary_settings::EmptyResponseObject,
+                    )))),
+                    Some(Err(message)) => Err(ExecError::new(message.clone())),
+                    None => Ok(None),
+                }
+            }
             _ => Ok(None),
         }
     }

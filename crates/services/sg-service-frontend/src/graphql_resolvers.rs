@@ -1992,6 +1992,7 @@ impl FrontendRootResolver {
                 nested: Arc::new(NestedPrefetch::default()),
                 nodes: NodeRoots::default(),
                 namespaces: NamespaceRoots::default(),
+                temporary_settings: None,
                 client_configuration: None,
             },
             mutation: crate::settings_mutation::MutationRoot::default(),
@@ -2007,6 +2008,15 @@ impl FrontendRootResolver {
     /// Attach the request's prefetched `Query.namespace` results.
     pub fn with_namespaces(mut self, namespaces: NamespaceRoots) -> Self {
         self.query.namespaces = namespaces;
+        self
+    }
+
+    /// Attach the request's prefetched `Query.temporarySettings`.
+    pub fn with_temporary_settings(
+        mut self,
+        temporary_settings: Option<Result<String, String>>,
+    ) -> Self {
+        self.query.temporary_settings = temporary_settings;
         self
     }
 
@@ -2064,6 +2074,9 @@ struct QueryRoot {
     /// Prefetched `Query.namespace`/`Query.namespaceByName` results (see
     /// [`prefetch_namespace_roots`]).
     namespaces: NamespaceRoots,
+    /// Prefetched `Query.temporarySettings` contents (see
+    /// [`crate::temporary_settings::prefetch_temporary_settings`]).
+    temporary_settings: Option<Result<String, String>>,
     /// Prefetched `Query.clientConfiguration` (see
     /// [`crate::client_configuration::prefetch_client_configuration`]).
     client_configuration: Option<crate::client_configuration::ClientConfigurationLookup>,
@@ -2330,6 +2343,17 @@ impl ObjectValue for QueryRoot {
                 };
                 namespace_value(self, self.namespaces.by_name.get(name))
             }
+            // `schemaResolver.TemporarySettings` (`temporary_settings.go:18-28`):
+            // the authenticated user's stored jsonb text, `{}` when absent.
+            "temporarySettings" => match &self.temporary_settings {
+                Some(Ok(contents)) => Ok(Some(FieldValue::Object(Arc::new(
+                    crate::temporary_settings::TemporarySettingsObject {
+                        contents: contents.clone(),
+                    },
+                )))),
+                Some(Err(message)) => Err(ExecError::new(message.clone())),
+                None => Ok(None),
+            },
             // `schemaResolver.ClientConfiguration`
             // (`client_configuration.go:36-95`): read-only; the prefetched
             // result carries either the details or the database/config error.
