@@ -12,7 +12,7 @@ use async_trait::async_trait;
 use sqlx::PgPool;
 
 use crate::graphql_resolvers::{
-    maybe_query_is_id, MembersArgs, MembersConnectionData, MembershipData, OrgData,
+    maybe_query_is_id, MembersArgs, MembersConnectionData, MembershipData, NamespaceName, OrgData,
     OrgMembersStore, OrgMembershipsStore, OrganizationStore, OrganizationsArgs,
     OrganizationsConnectionData, OrganizationsConnectionStore, SettingsData, UserData,
     UserOrganizationsStore,
@@ -309,6 +309,24 @@ impl OrgMembershipsStore for PgOrgStore {
         record
             .map(to_user_data)
             .ok_or_else(|| format!("user not found: [{user_id}]"))
+    }
+
+    /// `db.Namespaces().GetByName` (`internal/database/namespaces.go:92-104`):
+    /// `names.name` is `citext`, so the comparison is case-insensitive.
+    async fn namespace_by_name(&self, name: &str) -> Result<Option<NamespaceName>, String> {
+        let row: Option<(String, i32, i32)> = sqlx::query_as(
+            "SELECT name::text, COALESCE(user_id, 0)::int, COALESCE(org_id, 0)::int \
+             FROM names WHERE name = $1::citext",
+        )
+        .bind(name)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|error| error.to_string())?;
+        Ok(row.map(|(name, user_id, org_id)| NamespaceName {
+            name,
+            user_id,
+            org_id,
+        }))
     }
 
     /// `settingsStore.GetLatest` for a user subject

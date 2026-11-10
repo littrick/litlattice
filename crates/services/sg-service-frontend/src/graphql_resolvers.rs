@@ -250,6 +250,15 @@ pub struct OrgData {
     pub viewer_is_member: bool,
 }
 
+/// One `names` row (`internal/database/namespaces.go:17-25`): exactly one of
+/// `user_id`/`org_id` is non-zero for namespaces the GraphQL schema exposes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NamespaceName {
+    pub name: String,
+    pub user_id: i32,
+    pub org_id: i32,
+}
+
 /// The result of prefetching one `Query.organization` root field.
 #[derive(Debug, Clone, PartialEq)]
 pub enum OrganizationLookup {
@@ -402,6 +411,10 @@ pub enum UserByIdLookup {
 pub trait OrgMembershipsStore: Send + Sync {
     async fn memberships_for_user(&self, user_id: i32) -> Result<Vec<MembershipData>, String>;
 
+    /// `db.Namespaces().GetByName` (`internal/database/namespaces.go:92-104`):
+    /// a missing name is `Ok(None)`. `names.name` is `citext`.
+    async fn namespace_by_name(&self, name: &str) -> Result<Option<NamespaceName>, String>;
+
     /// `OrgByIDInt32`: the viewer-relative `viewerCanAdminister`/
     /// `viewerIsMember` flags are computed for the membership's `Org` node.
     async fn org_by_id(
@@ -543,6 +556,137 @@ pub async fn prefetch_node_roots(
         }
     }
     roots
+}
+
+/// Prefetched `Query.namespace` / `Query.namespaceByName` results
+/// (`namespaces.go:24-133`). Namespaces are `User` or `Org` objects.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct NamespaceRoots {
+    /// `namespace(id)` results keyed by the Relay ID string.
+    pub by_id: HashMap<String, NamespaceLookup>,
+    /// `namespaceByName(name)` results keyed by the argument string.
+    pub by_name: HashMap<String, NamespaceLookup>,
+}
+
+/// One prefetched namespace. `NotFound` is only reachable through
+/// `namespaceByName` (the baseline returns `nil`); `UserByID`/`OrgByID` errors
+/// are kept verbatim.
+#[derive(Debug, Clone, PartialEq)]
+pub enum NamespaceLookup {
+    User(UserData),
+    Org(OrgData),
+    NotFound,
+    Error(String),
+}
+
+/// Look up every `Query.namespace` / `Query.namespaceByName` root field in
+/// `fields`.
+///
+/// `namespace(id)` dispatches on the Relay kind; anything but `User`/`Org` is
+/// `InvalidNamespaceIDErr` (`invalid ID "<id>" for namespace`). A missing
+/// user/org is the underlying store error, not `null`. `namespaceByName`
+/// consults the `names` table first: a missing name is `null`, while a row
+/// with neither a user nor an org ID is the baseline's panic (reported as an
+/// error here; see the overview's errata).
+pub async fn prefetch_namespace_roots(
+    store: &dyn OrgMembershipsStore,
+    fields: &[RootField],
+    actor: Actor,
+    viewer_site_admin: bool,
+) -> NamespaceRoots {
+    let mut roots = NamespaceRoots::default();
+    for field in fields {
+        match field.name.as_str() {
+            "namespace" => {
+                let Some(id) = field.arguments.string("id") else {
+                    continue;
+                };
+                if roots.by_id.contains_key(id) {
+                    continue;
+                }
+                let lookup = namespace_by_id(store, id, actor, viewer_site_admin).await;
+                roots.by_id.insert(id.to_owned(), lookup);
+            }
+            "namespaceByName" => {
+                let Some(name) = field.arguments.string("name") else {
+                    continue;
+                };
+                if roots.by_name.contains_key(name) {
+                    continue;
+                }
+                let lookup = namespace_by_name(store, name, actor, viewer_site_admin).await;
+                roots.by_name.insert(name.to_owned(), lookup);
+            }
+            _ => {}
+        }
+    }
+    roots
+}
+
+async fn namespace_by_id(
+    store: &dyn OrgMembershipsStore,
+    id: &str,
+    actor: Actor,
+    viewer_site_admin: bool,
+) -> NamespaceLookup {
+    // `relay.UnmarshalKind` ignores decode errors and yields ""; both that
+    // and an unknown kind fall into `NamespaceByID`'s default branch.
+    let Some(kind) = relay_kind(id) else {
+        return NamespaceLookup::Error(format!("invalid ID {id:?} for namespace"));
+    };
+    match kind.as_str() {
+        "User" => match unmarshal_relay_id(id) {
+            Err(error) => NamespaceLookup::Error(error),
+            Ok(user_id) => match store.user_by_id(user_id).await {
+                Ok(user) => NamespaceLookup::User(user),
+                Err(error) => NamespaceLookup::Error(error),
+            },
+        },
+        "Org" => match unmarshal_relay_id(id) {
+            Err(error) => NamespaceLookup::Error(error),
+            Ok(org_id) => match store
+                .org_by_id(org_id, viewer_uid(actor), viewer_site_admin)
+                .await
+            {
+                Ok(org) => NamespaceLookup::Org(org),
+                Err(error) => NamespaceLookup::Error(error),
+            },
+        },
+        _ => NamespaceLookup::Error(format!("invalid ID {id:?} for namespace")),
+    }
+}
+
+async fn namespace_by_name(
+    store: &dyn OrgMembershipsStore,
+    name: &str,
+    actor: Actor,
+    viewer_site_admin: bool,
+) -> NamespaceLookup {
+    let namespace = match store.namespace_by_name(name).await {
+        Ok(namespace) => namespace,
+        Err(error) => return NamespaceLookup::Error(error),
+    };
+    let Some(namespace) = namespace else {
+        return NamespaceLookup::NotFound;
+    };
+    if namespace.user_id != 0 {
+        return match store.user_by_id(namespace.user_id).await {
+            Ok(user) => NamespaceLookup::User(user),
+            Err(error) => NamespaceLookup::Error(error),
+        };
+    }
+    if namespace.org_id != 0 {
+        return match store
+            .org_by_id(namespace.org_id, viewer_uid(actor), viewer_site_admin)
+            .await
+        {
+            Ok(org) => NamespaceLookup::Org(org),
+            Err(error) => NamespaceLookup::Error(error),
+        };
+    }
+    // The baseline panics here (`invalid namespace (neither user nor
+    // organization)`); a row with neither ID belongs to a team namespace.
+    NamespaceLookup::Error("invalid namespace (neither user nor organization)".to_owned())
 }
 
 /// `membersConnectionStore` arguments from the GraphQL field arguments.
@@ -1847,6 +1991,7 @@ impl FrontendRootResolver {
                 viewer_site_admin,
                 nested: Arc::new(NestedPrefetch::default()),
                 nodes: NodeRoots::default(),
+                namespaces: NamespaceRoots::default(),
                 client_configuration: None,
             },
             mutation: crate::settings_mutation::MutationRoot::default(),
@@ -1856,6 +2001,12 @@ impl FrontendRootResolver {
     /// Attach the request's pre-executed `Mutation` root fields.
     pub fn with_mutation(mut self, mutation: crate::settings_mutation::MutationRoot) -> Self {
         self.mutation = mutation;
+        self
+    }
+
+    /// Attach the request's prefetched `Query.namespace` results.
+    pub fn with_namespaces(mut self, namespaces: NamespaceRoots) -> Self {
+        self.query.namespaces = namespaces;
         self
     }
 
@@ -1910,6 +2061,9 @@ struct QueryRoot {
     nested: Arc<NestedPrefetch>,
     /// Prefetched `Query.node` results (see [`prefetch_node_roots`]).
     nodes: NodeRoots,
+    /// Prefetched `Query.namespace`/`Query.namespaceByName` results (see
+    /// [`prefetch_namespace_roots`]).
+    namespaces: NamespaceRoots,
     /// Prefetched `Query.clientConfiguration` (see
     /// [`crate::client_configuration::prefetch_client_configuration`]).
     client_configuration: Option<crate::client_configuration::ClientConfigurationLookup>,
@@ -1926,6 +2080,27 @@ impl FrontendRootResolver {
     pub fn with_nodes(mut self, nodes: NodeRoots) -> Self {
         self.query.nodes = nodes;
         self
+    }
+}
+
+/// Render a prefetched `NamespaceLookup` as the concrete `User`/`Org` object,
+/// `null` (`namespaceByName` miss) or the lookup error.
+fn namespace_value(
+    root: &QueryRoot,
+    lookup: Option<&NamespaceLookup>,
+) -> Result<Option<FieldValue>, ExecError> {
+    match lookup {
+        Some(NamespaceLookup::User(data)) => Ok(Some(FieldValue::Object(Arc::new(
+            UserObject::from_data_as_viewer(data.clone(), root.viewer_site_admin)
+                .with_nested(root.nested.clone()),
+        )))),
+        Some(NamespaceLookup::Org(data)) => Ok(Some(FieldValue::Object(Arc::new(
+            OrgObject::from_data_as_viewer(data.clone(), root.viewer_site_admin)
+                .with_nested(root.nested.clone()),
+        )))),
+        Some(NamespaceLookup::NotFound) => Ok(Some(FieldValue::Null)),
+        Some(NamespaceLookup::Error(message)) => Err(ExecError::new(message.clone())),
+        None => Ok(None),
     }
 }
 
@@ -2140,6 +2315,21 @@ impl ObjectValue for QueryRoot {
                     Err(message) => Err(ExecError::new(message)),
                 }
             }
+            // `schemaResolver.Namespace` (`namespaces.go:24-29`) and
+            // `NamespaceByName` (`:113-133`): the prefetched lookup carries
+            // the concrete User/Org object, `null`, or the lookup error.
+            "namespace" => {
+                let Some(id) = arguments.string("id") else {
+                    return Ok(None);
+                };
+                namespace_value(self, self.namespaces.by_id.get(id))
+            }
+            "namespaceByName" => {
+                let Some(name) = arguments.string("name") else {
+                    return Ok(None);
+                };
+                namespace_value(self, self.namespaces.by_name.get(name))
+            }
             // `schemaResolver.ClientConfiguration`
             // (`client_configuration.go:36-95`): read-only; the prefetched
             // result carries either the details or the database/config error.
@@ -2257,6 +2447,10 @@ impl ObjectValue for UserObject {
             ))))),
             "databaseID" => Ok(Some(FieldValue::Json(Json::Int(self.data.id as i64)))),
             "username" => Ok(Some(FieldValue::Json(Json::Str(
+                self.data.username.clone(),
+            )))),
+            // `UserResolver.NamespaceName` (`user.go:601`): the raw username.
+            "namespaceName" => Ok(Some(FieldValue::Json(Json::Str(
                 self.data.username.clone(),
             )))),
             // `DisplayName`/`AvatarURL` return nil for the empty string.
@@ -3612,6 +3806,8 @@ mod tests {
                           organization(name: String!): Org \
                           organizations(first: Int, query: String): OrgConnection! \
                           node(id: ID!): Node \
+                          namespace(id: ID!): Namespace \
+                          namespaceByName(name: String!): Namespace \
                           parseSearchQuery(query: String, patternType: SearchPatternType, \
                                            outputPhase: SearchQueryOutputPhase, \
                                            outputFormat: SearchQueryOutputFormat, \
@@ -3623,9 +3819,11 @@ mod tests {
                  parentSourcegraph: ParentSourcegraphDetails! } \
              type ParentSourcegraphDetails { url: String! } \
              interface Node { id: ID! } \
+             interface Namespace { id: ID! namespaceName: String! url: String! } \
              type Repository implements Node { id: ID! name: String! \
                                                uri: String! isPrivate: Boolean! } \
-             type User implements Node { id: ID! databaseID: Int! username: String! \
+             type User implements Node & Namespace { id: ID! databaseID: Int! username: String! \
+                         namespaceName: String! \
                          displayName: String avatarURL: String \
                          url: String! settingsURL: String \
                          createdAt: DateTime! updatedAt: DateTime \
@@ -3641,7 +3839,7 @@ mod tests {
              type UserConnection { nodes: [User!]! totalCount: Int! pageInfo: PageInfo! } \
              type PageInfo { endCursor: String hasNextPage: Boolean! } \
              enum UserActivePeriod { TODAY THIS_WEEK THIS_MONTH ALL_TIME } \
-             type Org implements Node { id: ID! name: String! displayName: String \
+             type Org implements Node & Namespace { id: ID! name: String! displayName: String \
                         createdAt: DateTime! url: String! settingsURL: String \
                         namespaceName: String! viewerCanAdminister: Boolean! \
                         viewerIsMember: Boolean! \
@@ -4494,12 +4692,21 @@ mod tests {
         memberships: HashMap<i32, Vec<MembershipData>>,
         orgs: HashMap<i32, OrgData>,
         users: HashMap<i32, UserData>,
+        namespaces: HashMap<String, NamespaceName>,
     }
 
     #[async_trait]
     impl OrgMembershipsStore for FakeOrgMembershipsStore {
         async fn memberships_for_user(&self, user_id: i32) -> Result<Vec<MembershipData>, String> {
             Ok(self.memberships.get(&user_id).cloned().unwrap_or_default())
+        }
+
+        async fn namespace_by_name(&self, name: &str) -> Result<Option<NamespaceName>, String> {
+            Ok(self
+                .namespaces
+                .iter()
+                .find(|(existing, _)| existing.eq_ignore_ascii_case(name))
+                .map(|(_, namespace)| namespace.clone()))
         }
 
         async fn org_by_id(
@@ -4548,6 +4755,7 @@ mod tests {
             memberships: HashMap::from([(5, vec![membership(7, 5)])]),
             orgs: HashMap::from([(7, org(7, "team", Some("Team")))]),
             users: HashMap::from([(5, bob.clone())]),
+            ..FakeOrgMembershipsStore::default()
         };
         let user_store =
             FakeUserOrganizationsStore(HashMap::from([(9, vec![org(8, "sub", None)])]));
@@ -5297,5 +5505,90 @@ mod tests {
             ),
             r#"{"data":{"node":{"username":"bob","organizations":{"nodes":[{"name":"sub"}]}}}}"#
         );
+    }
+
+    #[tokio::test]
+    async fn namespace_roots_resolve_users_and_orgs() {
+        let schema = schema();
+        let memberships_store = FakeOrgMembershipsStore {
+            users: HashMap::from([(5, member_user(5, "bob"))]),
+            orgs: HashMap::from([(7, org(7, "team", Some("Team")))]),
+            namespaces: HashMap::from([(
+                "team".to_owned(),
+                NamespaceName {
+                    name: "team".to_owned(),
+                    user_id: 0,
+                    org_id: 7,
+                },
+            )]),
+            ..FakeOrgMembershipsStore::default()
+        };
+        let actor = Actor::User { uid: 5 };
+        let user_id = relay_id("User", 5);
+        let query = format!(
+            "{{ namespace(id: \"{user_id}\") {{ __typename id namespaceName url \
+               ... on User {{ username }} }} \
+               namespaceByName(name: \"TEAM\") {{ __typename namespaceName url \
+               ... on Org {{ name }} }} }}"
+        );
+        let variables = Map::new();
+        let request = ExecRequest {
+            query: &query,
+            operation_name: "",
+            variables: &variables,
+            actor,
+        };
+        let fields = sg_graphql::exec::root_fields(&schema, &request);
+        let namespaces = prefetch_namespace_roots(&memberships_store, &fields, actor, false).await;
+        let roots = empty_roots().with_namespaces(namespaces);
+        assert_eq!(
+            run(&schema, &query, actor, &roots),
+            format!(
+                r#"{{"data":{{"namespace":{{"__typename":"User","id":"{user_id}","namespaceName":"bob","url":"/users/bob","username":"bob"}},"namespaceByName":{{"__typename":"Org","namespaceName":"team","url":"/organizations/team","name":"team"}}}}}}"#
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn namespace_roots_report_baseline_errors() {
+        let schema = schema();
+        let memberships_store = FakeOrgMembershipsStore {
+            // A team row has neither a user nor an org ID; the baseline panics.
+            namespaces: HashMap::from([(
+                "team".to_owned(),
+                NamespaceName {
+                    name: "team".to_owned(),
+                    user_id: 0,
+                    org_id: 0,
+                },
+            )]),
+            ..FakeOrgMembershipsStore::default()
+        };
+        let actor = Actor::Anonymous;
+        let unknown = base64::engine::general_purpose::URL_SAFE.encode("Repository:1");
+        let query = format!(
+            "{{ invalid: namespace(id: \"{unknown}\") {{ id }} \
+               missing: namespaceByName(name: \"absent\") {{ id }} \
+               team: namespaceByName(name: \"team\") {{ id }} }}"
+        );
+        let variables = Map::new();
+        let request = ExecRequest {
+            query: &query,
+            operation_name: "",
+            variables: &variables,
+            actor,
+        };
+        let fields = sg_graphql::exec::root_fields(&schema, &request);
+        let namespaces = prefetch_namespace_roots(&memberships_store, &fields, actor, false).await;
+        let roots = empty_roots().with_namespaces(namespaces);
+        let response = run(&schema, &query, actor, &roots);
+        assert!(response.contains(r#""invalid":null"#), "{response}");
+        assert!(response.contains("invalid ID"), "{response}");
+        assert!(response.contains(r#""missing":null"#), "{response}");
+        assert!(
+            response.contains("neither user nor organization"),
+            "{response}"
+        );
+        assert!(response.contains(r#""team":null"#), "{response}");
     }
 }

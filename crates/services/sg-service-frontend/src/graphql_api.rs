@@ -638,6 +638,20 @@ impl GraphqlDeps for SchemaGraphqlDeps {
             }
             _ => crate::graphql_resolvers::NodeRoots::default(),
         };
+        // `Query.namespace`/`Query.namespaceByName` share the user/org store
+        // seam with `Query.node`.
+        let namespaces = match &self.org_memberships {
+            Some(store) => {
+                crate::graphql_resolvers::prefetch_namespace_roots(
+                    store.as_ref(),
+                    &fields,
+                    request.actor,
+                    site_admin,
+                )
+                .await
+            }
+            None => crate::graphql_resolvers::NamespaceRoots::default(),
+        };
         let nested = match (
             &self.user_organizations,
             &self.org_members,
@@ -690,6 +704,7 @@ impl GraphqlDeps for SchemaGraphqlDeps {
             )
             .with_nested(nested)
             .with_nodes(nodes)
+            .with_namespaces(namespaces)
             .with_mutation(mutation);
         if let Some(client_configuration) = client_configuration {
             roots = roots.with_client_configuration(client_configuration);
