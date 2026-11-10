@@ -151,6 +151,20 @@ impl Service for FrontendService {
             ServiceError::new(format!("failed to initialize configuration service: {err}"))
         })?;
 
+        // Baseline `serve_cmd.go:213-219`: `graphqlbackend.NewSchema` assembles
+        // the SDL and returns an error that aborts startup. The OSS schema is
+        // `schema.graphql` + `outbound_webhooks.graphql` + `viewer.graphql`
+        // (enterprise `OptionalResolver`s are nil). Resolvers and execution are
+        // not ported yet, but assembling here keeps the fail-fast contract.
+        let graphql_schema = sg_graphql::schema::assemble_oss()
+            .map_err(|err| ServiceError::new(format!("failed to parse GraphQL schema: {err}")))?;
+        tracing::info!(
+            types = graphql_schema.type_count(),
+            query = graphql_schema.query_type.as_deref().unwrap_or("-"),
+            mutation = graphql_schema.mutation_type.as_deref().unwrap_or("-"),
+            "assembled GraphQL schema"
+        );
+
         let external_addr = config.external_bind_address().to_owned();
         let external = sg_http::listen(&external_addr).await.map_err(|err| {
             ServiceError::with_source(format!("failed to listen on {external_addr}"), err)
@@ -175,8 +189,9 @@ impl Service for FrontendService {
         );
         let search_deps: Arc<dyn crate::search_stream::SearchDeps> =
             Arc::new(crate::search_stream::BackendDeps::new(search_pool));
-        // Schema assembly and resolvers are not ported yet: the transport is
-        // complete, execution answers a GraphQL error (see `graphql_api`).
+        // The schema is assembled above (M9.8ez); resolvers and execution are
+        // not ported yet, so the transport answers a GraphQL error (see
+        // `graphql_api`).
         let graphql_deps: Arc<dyn GraphqlDeps> = Arc::new(UnportedGraphqlDeps);
 
         if let Some((addr, listener)) = internal {

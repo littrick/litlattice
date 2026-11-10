@@ -9,3 +9,6 @@ publish.workspace = true
 [dependencies]
 graphql-parser = "0.4"
 serde_json = { workspace = true }
+
+[dev-dependencies]
+sha2 = { workspace = true }
