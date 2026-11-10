@@ -105,6 +105,10 @@ pub trait ExternalServiceConnectionStore: Send + Sync {
     async fn repo_count(&self, id: i64) -> Result<i32, String>;
 
     async fn last_sync_error(&self, id: i64) -> Result<Option<String>, String>;
+
+    /// `db.ExternalServices().GetByID` (`ExternalService.webhookLogs` and
+    /// `WebhookLog.externalService` need a single live service).
+    async fn get_by_id(&self, id: i64) -> Result<ExternalServiceListRecord, String>;
 }
 
 /// Production adapter over [`sg_db::external_services::ExternalServiceStore`].
@@ -151,6 +155,13 @@ impl ExternalServiceConnectionStore for PgExternalServiceConnectionStore {
     async fn last_sync_error(&self, id: i64) -> Result<Option<String>, String> {
         self.store
             .last_sync_error(id)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn get_by_id(&self, id: i64) -> Result<ExternalServiceListRecord, String> {
+        self.store
+            .get_list_record_by_id(id)
             .await
             .map_err(|error| error.to_string())
     }
@@ -309,6 +320,42 @@ pub async fn external_services(
         total_count,
         has_next_page,
         end_cursor,
+    })
+}
+
+/// `externalServiceByID` (`external_service.go:71-84`) reduced to the node
+/// data the read-only `ExternalService` fields need. The site-admin gate is
+/// the caller's responsibility (`WebhookLog.externalService` resolves only
+/// after the connection's gate).
+pub async fn external_service_by_id(
+    store: &dyn ExternalServiceConnectionStore,
+    users: Option<&dyn UserLookupStore>,
+    key: Option<Arc<dyn Key>>,
+    id: i64,
+) -> Result<ExternalServiceNodeData, String> {
+    let record = store.get_by_id(id).await?;
+    let config = redacted_config(&record, key.as_deref()).await?;
+    let repo_count = store.repo_count(record.id).await?;
+    let last_sync_error = store.last_sync_error(record.id).await?;
+    let mut user_cache: HashMap<i32, Result<Option<UserData>, String>> = HashMap::new();
+    let creator = lookup_user(users, &mut user_cache, record.creator_id).await?;
+    let last_updater = lookup_user(users, &mut user_cache, record.last_updater_id).await?;
+    Ok(ExternalServiceNodeData {
+        id: record.id,
+        supports_repo_exclusion: supports_repo_exclusion(&record.kind),
+        kind: record.kind,
+        display_name: record.display_name,
+        config,
+        created_at: record.created_at,
+        updated_at: record.updated_at,
+        creator,
+        last_updater,
+        warning: None,
+        last_sync_error,
+        repo_count,
+        last_sync_at: record.last_sync_at,
+        next_sync_at: record.next_sync_at,
+        unrestricted: record.unrestricted,
     })
 }
 
@@ -634,6 +681,22 @@ pub struct ExternalServiceObject {
     data: ExternalServiceNodeData,
     viewer_site_admin: bool,
     nested: Arc<crate::graphql_resolvers::NestedPrefetch>,
+}
+
+impl ExternalServiceObject {
+    /// Build the node object from pre-fetched data (used by
+    /// `WebhookLog.externalService`).
+    pub fn from_data(
+        data: ExternalServiceNodeData,
+        viewer_site_admin: bool,
+        nested: Arc<crate::graphql_resolvers::NestedPrefetch>,
+    ) -> Self {
+        Self {
+            data,
+            viewer_site_admin,
+            nested,
+        }
+    }
 }
 
 impl ObjectValue for ExternalServiceObject {

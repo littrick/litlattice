@@ -312,6 +312,15 @@ struct ExternalServicesDeps {
     keyring: Arc<sg_keyring::Keyring>,
 }
 
+/// `Query.webhookLogs`'s dependencies: the `webhook_logs` table, the
+/// `external_services` table for `WebhookLog.externalService`, and the keyring
+/// used to decrypt logs and service configs.
+struct WebhookLogsDeps {
+    logs: Arc<dyn crate::webhook_logs::WebhookLogConnectionStore>,
+    external_services: Arc<dyn crate::external_services::ExternalServiceConnectionStore>,
+    keyring: Arc<sg_keyring::Keyring>,
+}
+
 /// `Query.repository(cloneURL:)` / `Query.repositoryRedirect(cloneURL:)`'s
 /// code-host mapping seam (`internal/cloneurls`), backed by the live site
 /// configuration, `external_services` and the keyring.
@@ -375,6 +384,8 @@ pub struct SchemaGraphqlDeps {
     client_configuration: Option<ClientConfigurationDeps>,
     /// `Query.externalServices`'s seams; `None` in transport-only tests.
     external_services: Option<ExternalServicesDeps>,
+    /// `Query.webhookLogs`'s seams; `None` in transport-only tests.
+    webhook_logs: Option<WebhookLogsDeps>,
     /// `cloneURL` mapping; `None` in transport-only tests.
     clone_urls: Option<CloneUrlDeps>,
     /// `Mutation.logEvent(s)`'s seams; `None` in transport-only tests.
@@ -401,6 +412,7 @@ impl SchemaGraphqlDeps {
             rate_limit: None,
             client_configuration: None,
             external_services: None,
+            webhook_logs: None,
             clone_urls: None,
             log_events: None,
             feature_flags: None,
@@ -436,6 +448,7 @@ impl SchemaGraphqlDeps {
             rate_limit: None,
             client_configuration: None,
             external_services: None,
+            webhook_logs: None,
             clone_urls: None,
             log_events: None,
             feature_flags: Some(Arc::new(
@@ -501,6 +514,23 @@ impl SchemaGraphqlDeps {
         self
     }
 
+    /// Enable `Query.webhookLogs`: the `webhook_logs` table, the
+    /// `external_services` table for `WebhookLog.externalService`, and the
+    /// keyring used to decrypt logs and service configs.
+    pub fn with_webhook_logs(
+        mut self,
+        logs: Arc<dyn crate::webhook_logs::WebhookLogConnectionStore>,
+        external_services: Arc<dyn crate::external_services::ExternalServiceConnectionStore>,
+        keyring: Arc<sg_keyring::Keyring>,
+    ) -> Self {
+        self.webhook_logs = Some(WebhookLogsDeps {
+            logs,
+            external_services,
+            keyring,
+        });
+        self
+    }
+
     /// Enable `cloneURL` resolution for `Query.repository` /
     /// `Query.repositoryRedirect` (`internal/cloneurls`).
     pub fn with_clone_urls(
@@ -552,6 +582,7 @@ impl SchemaGraphqlDeps {
             rate_limit: None,
             client_configuration: None,
             external_services: None,
+            webhook_logs: None,
             clone_urls: None,
             log_events: None,
             feature_flags: None,
@@ -842,6 +873,27 @@ impl GraphqlDeps for SchemaGraphqlDeps {
             }
             None => std::collections::HashMap::new(),
         };
+        // `Query.webhookLogs` is site-admin only; the prefetched lookup
+        // carries the connection, filters or the authorization/argument
+        // error.
+        let webhook_logs = match &self.webhook_logs {
+            Some(deps) => {
+                crate::webhook_logs::prefetch_webhook_logs(
+                    deps.logs.as_ref(),
+                    deps.external_services.as_ref(),
+                    self.users.as_ref().map(|users| {
+                        users.as_ref() as &dyn crate::graphql_resolvers::UserLookupStore
+                    }),
+                    deps.keyring.webhook_log_key(),
+                    deps.keyring.external_service_key(),
+                    &fields,
+                    request.actor,
+                    site_admin,
+                )
+                .await
+            }
+            None => std::collections::HashMap::new(),
+        };
         let mut roots =
             crate::graphql_resolvers::FrontendRootResolver::with_prefetched_organizations(
                 user,
@@ -859,6 +911,7 @@ impl GraphqlDeps for SchemaGraphqlDeps {
             .with_temporary_settings(temporary_settings)
             .with_feature_flags(feature_flags)
             .with_external_services(external_services)
+            .with_webhook_logs(webhook_logs)
             .with_mutation(mutation);
         if let Some(client_configuration) = client_configuration {
             roots = roots.with_client_configuration(client_configuration);

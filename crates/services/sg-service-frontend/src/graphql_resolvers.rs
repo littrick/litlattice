@@ -2148,6 +2148,7 @@ impl FrontendRootResolver {
                 client_configuration: None,
                 feature_flags: FeatureFlagRoots::default(),
                 external_services: HashMap::new(),
+                webhook_logs: HashMap::new(),
             },
             mutation: crate::settings_mutation::MutationRoot::default(),
         }
@@ -2262,6 +2263,12 @@ struct QueryRoot {
         crate::external_services::ExternalServicesArgs,
         crate::external_services::ExternalServicesConnectionLookup,
     >,
+    /// Prefetched `Query.webhookLogs` results (see
+    /// [`crate::webhook_logs::prefetch_webhook_logs`]).
+    webhook_logs: HashMap<
+        crate::webhook_logs::GlobalWebhookLogsArgs,
+        crate::webhook_logs::WebhookLogsConnectionLookup,
+    >,
 }
 
 impl FrontendRootResolver {
@@ -2286,6 +2293,18 @@ impl FrontendRootResolver {
         >,
     ) -> Self {
         self.query.external_services = external_services;
+        self
+    }
+
+    /// Attach the request's `Query.webhookLogs` prefetch data.
+    pub fn with_webhook_logs(
+        mut self,
+        webhook_logs: HashMap<
+            crate::webhook_logs::GlobalWebhookLogsArgs,
+            crate::webhook_logs::WebhookLogsConnectionLookup,
+        >,
+    ) -> Self {
+        self.query.webhook_logs = webhook_logs;
         self
     }
 }
@@ -2633,6 +2652,27 @@ impl ObjectValue for QueryRoot {
                     Some(crate::external_services::ExternalServicesConnectionLookup::Error(
                         message,
                     )) => Err(ExecError::new(message.clone())),
+                    None => Ok(None),
+                }
+            }
+            // `schemaResolver.WebhookLogs` (`webhook_logs.go:133-141`):
+            // site-admin only; the prefetched lookup carries the connection,
+            // its filters or the authorization/argument error.
+            "webhookLogs" => {
+                let args = crate::webhook_logs::global_webhook_logs_args(arguments);
+                match self.webhook_logs.get(&args) {
+                    Some(crate::webhook_logs::WebhookLogsConnectionLookup::Found(data)) => {
+                        Ok(Some(FieldValue::Object(Arc::new(
+                            crate::webhook_logs::WebhookLogConnectionObject::from_data(
+                                data.clone(),
+                                self.viewer_site_admin,
+                                self.nested.clone(),
+                            ),
+                        ))))
+                    }
+                    Some(crate::webhook_logs::WebhookLogsConnectionLookup::Error(message)) => {
+                        Err(ExecError::new(message.clone()))
+                    }
                     None => Ok(None),
                 }
             }
