@@ -290,6 +290,7 @@ impl Service for FrontendService {
             let store = Arc::clone(wiring.store());
             let live = Arc::clone(wiring.live());
             let graphql_deps = Arc::clone(&graphql_deps);
+            let search_deps = Arc::clone(&search_deps);
             background.spawn(async move {
                 // `httpapi.go:397` registers the configuration service on the
                 // internal gRPC server; `serve_cmd.go:397` multiplexes gRPC
@@ -300,7 +301,8 @@ impl Service for FrontendService {
                         crate::configuration_api::ConfigApi::new(store),
                     ),
                 );
-                let handler = middleware::internal_handler(live, Arc::clone(&graphql_deps));
+                let handler =
+                    middleware::internal_handler(live, Arc::clone(&graphql_deps), search_deps);
                 if let Err(err) = sg_http::serve(listener, routes, handler, shutdown).await {
                     tracing::error!(addr, error = %err, "frontend internal server failed");
                 }

@@ -37,6 +37,7 @@ async fn serve() -> (SocketAddr, tokio_util::sync::CancellationToken) {
     let handler = middleware::internal_handler(
         Arc::new(live()),
         Arc::new(sg_service_frontend::graphql_api::UnportedGraphqlDeps),
+        Arc::new(sg_service_frontend::search_stream::UnavailableDeps),
     );
     let token = shutdown.clone();
     tokio::spawn(async move {

@@ -9,7 +9,8 @@
 //! - `path.Clean` canonicalization with a 301, keeping the trailing slash;
 //! - routes matched in registration order on the decoded `URL.Path`
 //!   (`/git/{RepoName:.*}/info/refs`, `/git/{RepoName:.*}/git-upload-pack`,
-//!   `/lsif/upload`, `/scip/upload`, `/compute/stream`, `/ping`);
+//!   `/lsif/upload`, `/scip/upload`, `/search/stream`, `/compute/stream`,
+//!   `/graphql`, `/ping`);
 //! - a path match with the wrong method answers 405 with no body;
 //! - everything else falls through to the custom `no route` 404.
 //!
@@ -35,6 +36,7 @@ use sg_git::addresses::GitserverAddresses;
 
 use crate::graphql_api::{self, GraphqlDeps};
 use crate::mux;
+use crate::search_stream::SearchDeps;
 
 /// `/ping` (`internal.go:61-68`).
 const PING_PATH: &str = "/ping";
@@ -43,6 +45,7 @@ const INFO_REFS: &str = "/info/refs";
 const UPLOAD_PACK: &str = "/git-upload-pack";
 const LSIF_UPLOAD_PATH: &str = "/lsif/upload";
 const SCIP_UPLOAD_PATH: &str = "/scip/upload";
+const SEARCH_STREAM_PATH: &str = "/search/stream";
 const COMPUTE_STREAM_PATH: &str = "/compute/stream";
 const GRAPHQL_PATH: &str = "/graphql";
 
@@ -54,6 +57,7 @@ enum Route {
     UploadPack { repo: String },
     LsifUpload,
     ScipUpload,
+    SearchStream,
     ComputeStream,
     Graphql,
 }
@@ -61,7 +65,7 @@ enum Route {
 impl Route {
     fn allows(&self, method: &Method) -> bool {
         match self {
-            Route::Ping | Route::InfoRefs { .. } => method == Method::GET,
+            Route::Ping | Route::InfoRefs { .. } | Route::SearchStream => method == Method::GET,
             Route::UploadPack { .. } | Route::ComputeStream => {
                 method == Method::GET || method == Method::POST
             }
@@ -80,12 +84,14 @@ pub fn internal_response<B>(req: &Request<B>, live: &LiveConfig) -> Response<Box
 }
 
 /// The dependency-carrying variant used by the internal listener:
-/// `/graphql` (POST) needs the request body and the GraphQL seams; every other
+/// `/graphql` (POST) needs the request body and the GraphQL seams,
+/// `/search/stream` (GET) streams the frontend search events; every other
 /// route is the same synchronous dispatch as [`internal_response`].
 pub async fn internal_response_with_deps<B>(
     req: &mut Request<B>,
     live: &LiveConfig,
     graphql_deps: std::sync::Arc<dyn GraphqlDeps>,
+    search_deps: std::sync::Arc<dyn SearchDeps>,
 ) -> Response<BoxBody>
 where
     B: hyper::body::Body<Data = Bytes> + Unpin + Send,
@@ -94,6 +100,7 @@ where
     match route_request(&*req) {
         Err(response) => response,
         Ok(Route::Graphql) => graphql_api::graphql_response(req, live, true, graphql_deps).await,
+        Ok(Route::SearchStream) => crate::search_stream::search_response(req, search_deps).await,
         Ok(route) => route_response(req, route, live),
     }
 }
@@ -149,8 +156,8 @@ fn route_response<B>(req: &Request<B>, route: Route, live: &LiveConfig) -> Respo
         Route::ScipUpload => enterprise_not_found("code intel upload"),
         Route::ComputeStream => enterprise_not_found("compute streaming endpoint"),
         // Served by `internal_response_with_deps`; the synchronous entry point
-        // never has the GraphQL dependencies.
-        Route::Graphql => empty_response(StatusCode::INTERNAL_SERVER_ERROR),
+        // never has the GraphQL or search dependencies.
+        Route::SearchStream | Route::Graphql => empty_response(StatusCode::INTERNAL_SERVER_ERROR),
     }
 }
 
@@ -241,6 +248,9 @@ fn match_route(path: &str) -> Option<Route> {
     }
     if path == SCIP_UPLOAD_PATH {
         return Some(Route::ScipUpload);
+    }
+    if path == SEARCH_STREAM_PATH {
+        return Some(Route::SearchStream);
     }
     if path == COMPUTE_STREAM_PATH {
         return Some(Route::ComputeStream);
@@ -618,6 +628,61 @@ mod tests {
             get.headers().get(header::CONTENT_TYPE).unwrap(),
             "text/html; charset=utf-8"
         );
+    }
+
+    #[tokio::test]
+    async fn search_stream_is_routed_and_served() {
+        // Method and strict-slash decisions happen before the handler.
+        assert_eq!(
+            internal_response(&request(Method::POST, "/search/stream"), &live()).status(),
+            StatusCode::METHOD_NOT_ALLOWED
+        );
+        let trailing = internal_response(&request(Method::GET, "/search/stream/"), &live());
+        assert_eq!(trailing.status(), StatusCode::MOVED_PERMANENTLY);
+        assert_eq!(
+            trailing.headers().get(header::LOCATION).unwrap(),
+            "/search/stream"
+        );
+        // A method mismatch is decided before the strict-slash branch.
+        assert_eq!(
+            internal_response(&request(Method::POST, "/search/stream/"), &live()).status(),
+            StatusCode::METHOD_NOT_ALLOWED
+        );
+
+        // The sync entry point has no search deps.
+        assert_eq!(
+            internal_response(&request(Method::GET, "/search/stream"), &live()).status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+
+        // The async entry point streams the SSE error event for a missing
+        // query (the deps are not consulted).
+        let mut req = Request::builder()
+            .method(Method::GET)
+            .uri("/search/stream")
+            .body(http_body_util::Full::new(Bytes::new()))
+            .expect("request");
+        let deps: std::sync::Arc<dyn SearchDeps> =
+            std::sync::Arc::new(crate::search_stream::UnavailableDeps);
+        let response = internal_response_with_deps(
+            &mut req,
+            &live(),
+            std::sync::Arc::new(crate::graphql_api::UnportedGraphqlDeps),
+            deps,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "text/event-stream"
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert!(body
+            .windows(b"event: error".len())
+            .any(|window| window == b"event: error"));
+        assert!(body
+            .windows(b"no query found".len())
+            .any(|window| window == b"no query found"));
     }
 
     #[test]

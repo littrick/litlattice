@@ -221,11 +221,11 @@ async fn graphql_http_harness() {
             limited: case.limited.as_ref().map(|limited| limited.retry_after),
         });
         let live = live(case);
+        let search: Arc<dyn SearchDeps> = Arc::new(UnavailableDeps);
         let response = if case.internal {
-            internal_response_with_deps(&mut request, &live, deps).await
+            internal_response_with_deps(&mut request, &live, deps, search).await
         } else {
             let blame: Arc<dyn BlameDeps> = Arc::new(NoBlame);
-            let search: Arc<dyn SearchDeps> = Arc::new(UnavailableDeps);
             api_response_with_deps(&mut request, &live, blame, search, deps).await
         };
 

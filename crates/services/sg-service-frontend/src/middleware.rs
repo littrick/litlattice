@@ -363,12 +363,20 @@ pub fn external_handler_with_live(
 pub fn internal_handler(
     live: Arc<LiveConfig>,
     graphql_deps: Arc<dyn GraphqlDeps>,
+    search_deps: Arc<dyn SearchDeps>,
 ) -> sg_http::HttpHandler {
     std::sync::Arc::new(move |mut req: Request<Incoming>| {
         let live = Arc::clone(&live);
         let graphql_deps = Arc::clone(&graphql_deps);
+        let search_deps = Arc::clone(&search_deps);
         Box::pin(async move {
-            crate::internal_api::internal_response_with_deps(&mut req, &live, graphql_deps).await
+            crate::internal_api::internal_response_with_deps(
+                &mut req,
+                &live,
+                graphql_deps,
+                search_deps,
+            )
+            .await
         })
     })
 }
