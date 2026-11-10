@@ -413,6 +413,113 @@ pub trait OrgMembershipsStore: Send + Sync {
     async fn user_by_id(&self, user_id: i32) -> Result<UserData, String>;
 }
 
+/// Prefetched nodes for `Query.node` (`schemaResolver.Node`,
+/// `node.go:21-39`) and the `node`/`org` root fields' nested objects.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct NodeRoots {
+    /// `UserByID` results keyed by users.id.
+    pub users: HashMap<i32, UserByIdLookup>,
+    /// `OrgByID` results keyed by orgs.id.
+    pub orgs: HashMap<i32, OrgByIdLookup>,
+    /// `repositoryByID` results keyed by repo.id.
+    pub repositories: HashMap<i32, RepoLookup>,
+}
+
+/// `relay.UnmarshalKind`: URL-safe base64 decode and take the prefix before
+/// the first `:`; `None` when decoding fails or there is no `:` (the baseline
+/// then looks up the empty kind and reports `invalid id`).
+pub fn relay_kind(id: &str) -> Option<String> {
+    let decoded = base64::engine::general_purpose::URL_SAFE.decode(id).ok()?;
+    let text = String::from_utf8_lossy(&decoded);
+    let (kind, _) = text.split_once(':')?;
+    Some(kind.to_owned())
+}
+
+/// `relay.UnmarshalSpec` for an int32 ID: decode, skip the kind prefix (the
+/// kind is **not** validated here) and parse the remaining JSON as an int32.
+pub fn unmarshal_relay_id(id: &str) -> Result<i32, String> {
+    let decoded = base64::engine::general_purpose::URL_SAFE
+        .decode(id)
+        .map_err(|error| error.to_string())?;
+    let text = String::from_utf8_lossy(&decoded);
+    let Some((_, spec)) = text.split_once(':') else {
+        return Err("invalid graphql.ID".to_owned());
+    };
+    serde_json::from_str(spec).map_err(|error| error.to_string())
+}
+
+/// Look up every `Query.node` root field in `fields`, dispatching on the Relay
+/// kind. Ported kinds are `User` (`UserByID`), `Org` (`OrgByID`) and
+/// `Repository` (`repositoryByID`); other kinds are left to the resolver,
+/// which reports `invalid id` (errata: the baseline dispatches to resolvers
+/// that are not ported yet).
+pub async fn prefetch_node_roots(
+    memberships_store: &dyn OrgMembershipsStore,
+    repositories: &dyn RepositoryLookup,
+    fields: &[RootField],
+    actor: Actor,
+    viewer_site_admin: bool,
+) -> NodeRoots {
+    let mut roots = NodeRoots::default();
+    for field in fields {
+        if field.name != "node" {
+            continue;
+        }
+        let Some(id) = field.arguments.string("id") else {
+            continue;
+        };
+        let Some(kind) = relay_kind(id) else {
+            continue;
+        };
+        let Ok(node_id) = unmarshal_relay_id(id) else {
+            continue;
+        };
+        match kind.as_str() {
+            "User" => {
+                if roots.users.contains_key(&node_id) {
+                    continue;
+                }
+                let lookup = match memberships_store.user_by_id(node_id).await {
+                    Ok(user) => UserByIdLookup::Found(user),
+                    Err(error) => UserByIdLookup::Error(error),
+                };
+                roots.users.insert(node_id, lookup);
+            }
+            // `OrgByID` does not validate the spec's kind (`UnmarshalOrgID`
+            // is only used by the deprecated `Query.org`, which the schema
+            // does not expose).
+            "Org" => {
+                if roots.orgs.contains_key(&node_id) {
+                    continue;
+                }
+                let lookup = match memberships_store
+                    .org_by_id(node_id, viewer_uid(actor), viewer_site_admin)
+                    .await
+                {
+                    Ok(org) => OrgByIdLookup::Found(org),
+                    Err(error) => OrgByIdLookup::Error(error),
+                };
+                roots.orgs.insert(node_id, lookup);
+            }
+            "Repository" => {
+                if roots.repositories.contains_key(&node_id) {
+                    continue;
+                }
+                let lookup = match repositories
+                    .by_id(node_id, viewer_uid(actor), viewer_site_admin)
+                    .await
+                {
+                    Ok(lookup) => lookup,
+                    Err(error) => RepoLookup::Error(error),
+                };
+                roots.repositories.insert(node_id, lookup);
+            }
+            _ => {}
+        }
+    }
+    roots
+}
+
 /// `membersConnectionStore` arguments from the GraphQL field arguments.
 pub fn members_args(arguments: &Arguments) -> MembersArgs {
     MembersArgs {
@@ -580,6 +687,7 @@ pub async fn prefetch_nested(
     users_connections: &HashMap<UsersArgs, UsersConnectionLookup>,
     organizations: &HashMap<String, OrganizationLookup>,
     organizations_connections: &HashMap<OrganizationsArgs, OrganizationsConnectionLookup>,
+    nodes: &NodeRoots,
     actor: Actor,
     viewer_site_admin: bool,
 ) -> NestedPrefetch {
@@ -659,6 +767,50 @@ pub async fn prefetch_nested(
                             selections: nodes.selections.clone(),
                         });
                     }
+                }
+            }
+            // `Query.node` returns `User`/`Org`/`Repository`; the nested
+            // fields live under the matching `... on <type>` fragment
+            // (`RootField.type_conditions`). `Repository` has no nested
+            // lookups in this framework.
+            "node" => {
+                let Some(id) = field.arguments.string("id") else {
+                    continue;
+                };
+                let Some(kind) = relay_kind(id) else {
+                    continue;
+                };
+                let Ok(node_id) = unmarshal_relay_id(id) else {
+                    continue;
+                };
+                let mut selections = field.selections.clone();
+                for (condition, sub_selections) in &field.type_conditions {
+                    // `Query.node` is declared as the `Node` interface;
+                    // fragments on `Node` apply to every runtime kind,
+                    // fragments on the concrete type only to it
+                    // (`selected.go:150-210`).
+                    if condition.as_str() == kind || condition.as_str() == "Node" {
+                        selections.extend(sub_selections.clone());
+                    }
+                }
+                match kind.as_str() {
+                    "User" => {
+                        if let Some(UserByIdLookup::Found(user)) = nodes.users.get(&node_id) {
+                            user_queue.push(UserJob {
+                                user: user.clone(),
+                                selections,
+                            });
+                        }
+                    }
+                    "Org" => {
+                        if let Some(OrgByIdLookup::Found(org)) = nodes.orgs.get(&node_id) {
+                            org_queue.push(OrgJob {
+                                org: org.clone(),
+                                selections,
+                            });
+                        }
+                    }
+                    _ => {}
                 }
             }
             _ => {}
@@ -903,6 +1055,18 @@ pub trait RepositoryLookup: Send + Sync {
         authenticated_user_id: i32,
         bypass_authz: bool,
     ) -> Result<RepoLookup, String>;
+
+    /// `repoStore.Get` (`internal/database/repos.go:145-166`) for
+    /// `Query.node`'s `Repository` kind: the same `AuthzQueryConds` predicate
+    /// as `GetByName` (site admins bypass unless `authz.enforceForSiteAdmins`
+    /// is enabled), blocked repositories returned as errors, missing/deleted
+    /// → `repo not found`.
+    async fn by_id(
+        &self,
+        repo_id: i32,
+        authenticated_user_id: i32,
+        bypass_authz: bool,
+    ) -> Result<RepoLookup, String>;
 }
 
 /// What `Query.repository` arguments ask for.
@@ -1100,6 +1264,7 @@ impl FrontendRootResolver {
                 organizations_connections,
                 viewer_site_admin,
                 nested: Arc::new(NestedPrefetch::default()),
+                nodes: NodeRoots::default(),
             },
         }
     }
@@ -1142,12 +1307,20 @@ struct QueryRoot {
     /// Nested resolver data prefetched for this request (see
     /// [`prefetch_nested`]); attached to every `User` object the root builds.
     nested: Arc<NestedPrefetch>,
+    /// Prefetched `Query.node` results (see [`prefetch_node_roots`]).
+    nodes: NodeRoots,
 }
 
 impl FrontendRootResolver {
     /// Attach the request's nested prefetch data.
     pub fn with_nested(mut self, nested: Arc<NestedPrefetch>) -> Self {
         self.query.nested = nested;
+        self
+    }
+
+    /// Attach the request's `Query.node` prefetch data.
+    pub fn with_nodes(mut self, nodes: NodeRoots) -> Self {
+        self.query.nodes = nodes;
         self
     }
 }
@@ -1263,6 +1436,55 @@ impl ObjectValue for QueryRoot {
                         Err(ExecError::new(message.clone()))
                     }
                     None => Ok(None),
+                }
+            }
+            // `schemaResolver.Node` (`node.go:21-39`): dispatch on the Relay
+            // kind. Ported kinds: User/Org/Repository; unknown kinds are
+            // `invalid id` (the baseline only knows its registered kinds).
+            "node" => {
+                let Some(id) = arguments.string("id") else {
+                    return Ok(None);
+                };
+                let Some(kind) = relay_kind(id) else {
+                    return Err(ExecError::new("invalid id"));
+                };
+                let node_id = unmarshal_relay_id(id).map_err(ExecError::new)?;
+                match kind.as_str() {
+                    "User" => match self.nodes.users.get(&node_id) {
+                        Some(UserByIdLookup::Found(data)) => {
+                            Ok(Some(FieldValue::Object(Arc::new(
+                                UserObject::from_data_as_viewer(
+                                    data.clone(),
+                                    self.viewer_site_admin,
+                                )
+                                .with_nested(self.nested.clone()),
+                            ))))
+                        }
+                        Some(UserByIdLookup::Error(message)) => {
+                            Err(ExecError::new(message.clone()))
+                        }
+                        None => Ok(None),
+                    },
+                    "Org" => match self.nodes.orgs.get(&node_id) {
+                        Some(OrgByIdLookup::Found(data)) => Ok(Some(FieldValue::Object(Arc::new(
+                            OrgObject::from_data_as_viewer(data.clone(), self.viewer_site_admin)
+                                .with_nested(self.nested.clone()),
+                        )))),
+                        Some(OrgByIdLookup::Error(message)) => Err(ExecError::new(message.clone())),
+                        None => Ok(None),
+                    },
+                    "Repository" => match self.nodes.repositories.get(&node_id) {
+                        Some(RepoLookup::Found(data)) => Ok(Some(FieldValue::Object(Arc::new(
+                            RepositoryObject::from_data(data.clone()),
+                        )))),
+                        Some(RepoLookup::NotFound) => Ok(Some(FieldValue::Null)),
+                        Some(RepoLookup::Blocked { name, reason }) => Err(ExecError::new(format!(
+                            "repository {name} has been blocked. reason: {reason}"
+                        ))),
+                        Some(RepoLookup::Error(message)) => Err(ExecError::new(message.clone())),
+                        None => Ok(None),
+                    },
+                    _ => Err(ExecError::new("invalid id")),
                 }
             }
             _ => Ok(None),
@@ -2228,8 +2450,12 @@ mod tests {
                                 activePeriod: UserActivePeriod, inactiveSince: DateTime): UserConnection! \
                           organization(name: String!): Org \
                           organizations(first: Int, query: String): OrgConnection! \
+                          node(id: ID!): Node \
                           other: String } \
-             type User { id: ID! databaseID: Int! username: String! \
+             interface Node { id: ID! } \
+             type Repository implements Node { id: ID! name: String! \
+                                               uri: String! isPrivate: Boolean! } \
+             type User implements Node { id: ID! databaseID: Int! username: String! \
                          displayName: String avatarURL: String \
                          url: String! settingsURL: String \
                          createdAt: DateTime! updatedAt: DateTime \
@@ -2245,7 +2471,7 @@ mod tests {
              type UserConnection { nodes: [User!]! totalCount: Int! pageInfo: PageInfo! } \
              type PageInfo { endCursor: String hasNextPage: Boolean! } \
              enum UserActivePeriod { TODAY THIS_WEEK THIS_MONTH ALL_TIME } \
-             type Org { id: ID! name: String! displayName: String \
+             type Org implements Node { id: ID! name: String! displayName: String \
                         createdAt: DateTime! url: String! settingsURL: String \
                         namespaceName: String! viewerCanAdminister: Boolean! \
                         viewerIsMember: Boolean! \
@@ -3082,6 +3308,7 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
+            &NodeRoots::default(),
             actor,
             true,
         )
@@ -3136,6 +3363,7 @@ mod tests {
             &HashMap::new(),
             &organizations,
             &HashMap::new(),
+            &NodeRoots::default(),
             actor,
             true,
         )
@@ -3493,6 +3721,15 @@ mod tests {
                 .cloned()
                 .unwrap_or(RepoLookup::NotFound))
         }
+
+        async fn by_id(
+            &self,
+            _repo_id: i32,
+            _authenticated_user_id: i32,
+            _bypass_authz: bool,
+        ) -> Result<RepoLookup, String> {
+            Ok(RepoLookup::NotFound)
+        }
     }
 
     async fn run_repository(query: &str, actor: Actor, lookups: &[(&str, RepoLookup)]) -> String {
@@ -3621,5 +3858,168 @@ mod tests {
             "/a$&+,/:;=@%3Fb%23c%25d%20e"
         );
         assert_eq!(go_url_path("/ä"), "/%C3%A4");
+    }
+
+    fn relay_id(kind: &str, id: i32) -> String {
+        base64::engine::general_purpose::URL_SAFE.encode(format!("{kind}:{id}"))
+    }
+
+    fn empty_roots() -> FrontendRootResolver {
+        FrontendRootResolver::with_prefetched_organizations(
+            None,
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            false,
+        )
+    }
+
+    #[tokio::test]
+    async fn query_node_dispatches_ported_kinds() {
+        let schema = schema();
+        let nodes = NodeRoots {
+            users: HashMap::from([(1, UserByIdLookup::Found(member_user(1, "alice")))]),
+            orgs: HashMap::from([(7, OrgByIdLookup::Found(org(7, "team", Some("Team"))))]),
+            repositories: HashMap::from([(9, RepoLookup::Found(repository_data("a/b")))]),
+        };
+        let user_id = relay_id("User", 1);
+        let org_id = relay_id("Org", 7);
+        let repo_id = relay_id("Repository", 9);
+        let query = format!(
+            "{{ u: node(id: \"{user_id}\") {{ __typename id ... on User {{ username }} }} \
+               o: node(id: \"{org_id}\") {{ __typename ... on Org {{ name displayName }} }} \
+               r: node(id: \"{repo_id}\") {{ __typename ... on Repository {{ name isPrivate }} }} }}"
+        );
+        let roots = empty_roots().with_nodes(nodes);
+        let expected = format!(
+            r#"{{"data":{{"u":{{"__typename":"User","id":"{user_id}","username":"alice"}},"o":{{"__typename":"Org","name":"team","displayName":"Team"}},"r":{{"__typename":"Repository","name":"a/b","isPrivate":true}}}}}}"#
+        );
+        assert_eq!(run(&schema, &query, Actor::Anonymous, &roots), expected);
+    }
+
+    #[tokio::test]
+    async fn query_node_reports_lookup_errors() {
+        let schema = schema();
+        let nodes = NodeRoots {
+            users: HashMap::from([(5, UserByIdLookup::Error("user not found: [5]".to_owned()))]),
+            orgs: HashMap::from([(7, OrgByIdLookup::Error("org not found: id 7".to_owned()))]),
+            repositories: HashMap::from([(
+                9,
+                RepoLookup::Blocked {
+                    name: "a/b".to_owned(),
+                    reason: "dmca".to_owned(),
+                },
+            )]),
+        };
+        let roots = empty_roots().with_nodes(nodes.clone());
+        let query = format!("{{ node(id: \"{}\") {{ id }} }}", relay_id("User", 5));
+        assert_eq!(
+            run(&schema, &query, Actor::Anonymous, &roots),
+            r#"{"errors":[{"message":"user not found: [5]","path":["node"]}],"data":{"node":null}}"#
+        );
+        let query = format!("{{ node(id: \"{}\") {{ id }} }}", relay_id("Org", 7));
+        assert_eq!(
+            run(&schema, &query, Actor::Anonymous, &roots),
+            r#"{"errors":[{"message":"org not found: id 7","path":["node"]}],"data":{"node":null}}"#
+        );
+        let query = format!("{{ node(id: \"{}\") {{ id }} }}", relay_id("Repository", 9));
+        assert_eq!(
+            run(&schema, &query, Actor::Anonymous, &roots),
+            r#"{"errors":[{"message":"repository a/b has been blocked. reason: dmca","path":["node"]}],"data":{"node":null}}"#
+        );
+        // A kind that is not ported (and an unparsable Relay ID) is
+        // `invalid id`, matching the baseline's missing registry entry.
+        let query = format!(
+            "{{ node(id: \"{}\") {{ id }} }}",
+            relay_id("AccessToken", 1)
+        );
+        assert_eq!(
+            run(&schema, &query, Actor::Anonymous, &roots),
+            r#"{"errors":[{"message":"invalid id","path":["node"]}],"data":{"node":null}}"#
+        );
+        assert_eq!(
+            run(
+                &schema,
+                "{ node(id: \"bad\") { id } }",
+                Actor::Anonymous,
+                &roots
+            ),
+            r#"{"errors":[{"message":"invalid id","path":["node"]}],"data":{"node":null}}"#
+        );
+        // Without a prefetch (empty registries) the field is unported.
+        assert_eq!(
+            run(
+                &schema,
+                &format!("{{ node(id: \"{}\") {{ id }} }}", relay_id("User", 1)),
+                Actor::Anonymous,
+                &empty_roots()
+            ),
+            r#"{"errors":[{"message":"GraphQL field \"node\" of \"Query\" has no ported resolver","path":["node"]}],"data":{"node":null}}"#
+        );
+    }
+
+    #[tokio::test]
+    async fn query_node_prefetches_nested_organizations() {
+        let schema = schema();
+        let bob = member_user(5, "bob");
+        let memberships_store = FakeOrgMembershipsStore {
+            users: HashMap::from([(5, bob)]),
+            ..FakeOrgMembershipsStore::default()
+        };
+        let repositories = FakeRepositories(HashMap::new());
+        let actor = Actor::User { uid: 5 };
+        let id = relay_id("User", 5);
+        let variables = Map::new();
+        let request = ExecRequest {
+            query: &format!(
+                "{{ node(id: \"{id}\") {{ ... on User {{ username \
+                   organizations {{ nodes {{ name }} }} }} }} }}"
+            ),
+            operation_name: "",
+            variables: &variables,
+            actor,
+        };
+        let fields = sg_graphql::exec::root_fields(&schema, &request);
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields[0].type_conditions.len(), 1);
+        assert_eq!(fields[0].type_conditions[0].0, "User");
+
+        let nodes =
+            prefetch_node_roots(&memberships_store, &repositories, &fields, actor, false).await;
+        let user_store =
+            FakeUserOrganizationsStore(HashMap::from([(5, vec![org(8, "sub", None)])]));
+        let members_store = FakeOrgMembersStore(HashMap::new());
+        let nested = prefetch_nested(
+            &user_store,
+            &members_store,
+            &memberships_store,
+            &fields,
+            None,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &nodes,
+            actor,
+            false,
+        )
+        .await;
+        let roots = empty_roots()
+            .with_nested(Arc::new(nested))
+            .with_nodes(nodes);
+        assert_eq!(
+            run(
+                &schema,
+                &format!(
+                    "{{ node(id: \"{id}\") {{ ... on User {{ username \
+                       organizations {{ nodes {{ name }} }} }} }} }}"
+                ),
+                actor,
+                &roots
+            ),
+            r#"{"data":{"node":{"username":"bob","organizations":{"nodes":[{"name":"sub"}]}}}}"#
+        );
     }
 }

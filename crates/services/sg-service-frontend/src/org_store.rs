@@ -9,7 +9,6 @@
 use std::collections::HashSet;
 
 use async_trait::async_trait;
-use base64::Engine;
 use sqlx::PgPool;
 
 use crate::graphql_resolvers::{
@@ -176,14 +175,7 @@ impl OrganizationsConnectionStore for PgOrgStore {
 /// `relay.UnmarshalSpec`): base64 decode, skip the `kind:` prefix (the kind is
 /// **not** validated) and decode the remainder as an int32.
 fn unmarshal_user_id(cursor: &str) -> Result<i32, String> {
-    let decoded = base64::engine::general_purpose::URL_SAFE
-        .decode(cursor)
-        .map_err(|error| error.to_string())?;
-    let text = String::from_utf8_lossy(&decoded);
-    let Some((_, spec)) = text.split_once(':') else {
-        return Err("invalid graphql.ID".to_owned());
-    };
-    serde_json::from_str(spec).map_err(|error| error.to_string())
+    crate::graphql_resolvers::unmarshal_relay_id(cursor)
 }
 
 #[async_trait]

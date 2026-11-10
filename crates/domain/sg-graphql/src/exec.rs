@@ -401,6 +401,12 @@ pub struct RootField {
     pub name: String,
     pub arguments: Arguments,
     pub selections: Vec<RootField>,
+    /// Selections under inline fragments / fragment spreads on an
+    /// interface or union-typed field, keyed by the fragment's type
+    /// condition (e.g. `... on User { organizations }` on `Query.node`).
+    /// The executor applies these with the runtime object type; prefetchers
+    /// use them to find nested fields of interface/union results.
+    pub type_conditions: Vec<(String, Vec<RootField>)>,
 }
 
 /// The named type of `parent_type.field` after stripping non-null/list
@@ -442,7 +448,14 @@ fn selected_fields<'a>(
     variables: &BTreeMap<String, RtValue>,
 ) -> Vec<RootField> {
     let mut fields = Vec::new();
-    flatten_fields(parent_type, selections, fragments, variables, &mut fields);
+    flatten_fields(
+        schema,
+        parent_type,
+        selections,
+        fragments,
+        variables,
+        &mut fields,
+    );
     apply_include_filter(&mut fields, variables);
 
     fields
@@ -455,12 +468,26 @@ fn selected_fields<'a>(
         })
         .map(|field| {
             let arguments = collect_arguments(schema, parent_type, &field, variables);
-            let selections = named_field_type(schema, parent_type, &field.name)
+            let child_type = named_field_type(schema, parent_type, &field.name);
+            let selections = child_type
+                .as_deref()
                 .filter(|name| is_composite_type(schema, name))
                 .map(|name| {
                     selected_fields(
                         schema,
-                        &name,
+                        name,
+                        &field.selection_set.items,
+                        fragments,
+                        variables,
+                    )
+                })
+                .unwrap_or_default();
+            let type_conditions = child_type
+                .as_deref()
+                .map(|name| {
+                    type_condition_fields(
+                        schema,
+                        name,
                         &field.selection_set.items,
                         fragments,
                         variables,
@@ -471,9 +498,51 @@ fn selected_fields<'a>(
                 name: field.name,
                 arguments,
                 selections,
+                type_conditions,
             }
         })
         .collect()
+}
+
+/// Interface/union-typed fields (`Query.node`) resolve to one of several
+/// runtime object types; collect each fragment's selections by type condition
+/// so prefetchers can look up nested fields of the concrete type. Empty for
+/// object/scalar-typed fields.
+fn type_condition_fields<'a>(
+    schema: &Schema,
+    parent_type: &str,
+    selections: &[Selection<'a>],
+    fragments: &BTreeMap<String, &Fragment<'a>>,
+    variables: &BTreeMap<String, RtValue>,
+) -> Vec<(String, Vec<RootField>)> {
+    if !matches!(
+        schema.types.get(parent_type).map(|def| def.kind),
+        Some(TypeKind::Interface | TypeKind::Union)
+    ) {
+        return Vec::new();
+    }
+    let mut type_conditions = Vec::new();
+    for selection in selections {
+        let (condition, items) = match selection {
+            Selection::InlineFragment(fragment) => match &fragment.type_condition {
+                Some(q::TypeCondition::On(condition)) => (condition, &fragment.selection_set.items),
+                None => continue,
+            },
+            Selection::FragmentSpread(spread) => match fragments.get(&spread.fragment_name) {
+                Some(&fragment) => {
+                    let q::TypeCondition::On(condition) = &fragment.type_condition;
+                    (condition, &fragment.selection_set.items)
+                }
+                None => continue,
+            },
+            Selection::Field(_) => continue,
+        };
+        type_conditions.push((
+            condition.clone(),
+            selected_fields(schema, condition, items, fragments, variables),
+        ));
+    }
+    type_conditions
 }
 
 /// Parse `request` and return the root fields that [`execute_with`] will
@@ -1043,6 +1112,7 @@ fn directive_bool_argument(
 /// in `exec.go:115-156`): first occurrence fixes the output order, later
 /// occurrences append their sub-selections.
 fn flatten_fields<'a>(
+    schema: &Schema,
     parent_type: &str,
     selections: &[Selection<'a>],
     fragments: &BTreeMap<String, &Fragment<'a>>,
@@ -1070,11 +1140,14 @@ fn flatten_fields<'a>(
             }
             Selection::InlineFragment(fragment) => {
                 let matches = match &fragment.type_condition {
-                    Some(q::TypeCondition::On(condition)) => condition == parent_type,
+                    Some(q::TypeCondition::On(condition)) => {
+                        fragment_condition_matches(schema, parent_type, condition)
+                    }
                     None => true,
                 };
                 if matches {
                     flatten_fields(
+                        schema,
                         parent_type,
                         &fragment.selection_set.items,
                         fragments,
@@ -1088,12 +1161,13 @@ fn flatten_fields<'a>(
                     .get(&spread.fragment_name)
                     .map(|fragment| {
                         let q::TypeCondition::On(condition) = &fragment.type_condition;
-                        condition == parent_type
+                        fragment_condition_matches(schema, parent_type, condition)
                     })
                     .unwrap_or(false);
                 if matches {
                     let fragment = fragments[&spread.fragment_name];
                     flatten_fields(
+                        schema,
                         parent_type,
                         &fragment.selection_set.items,
                         fragments,
@@ -1105,6 +1179,40 @@ fn flatten_fields<'a>(
         }
     }
     out.retain(|field| !skip_by_directive(field, variables));
+}
+
+/// graph-gophers fragment applicability (`internal/exec/selected/selected.go:
+/// 180-215`): a fragment applies when its type condition is the object's
+/// runtime type, an interface the runtime type implements (transitively), or
+/// a union that contains the runtime type. Interface conditions are resolved
+/// through `PossibleTypes` in the baseline, which is the `implements` clause.
+fn fragment_condition_matches(schema: &Schema, runtime_type: &str, condition: &str) -> bool {
+    if condition == runtime_type {
+        return true;
+    }
+    if let Some(def) = schema.types.get(runtime_type) {
+        let mut seen: Vec<&str> = Vec::new();
+        let mut stack: Vec<&str> = def.interfaces.iter().map(String::as_str).collect();
+        while let Some(interface) = stack.pop() {
+            if seen.contains(&interface) {
+                continue;
+            }
+            if interface == condition {
+                return true;
+            }
+            seen.push(interface);
+            if let Some(parent) = schema.types.get(interface) {
+                stack.extend(parent.interfaces.iter().map(String::as_str));
+            }
+        }
+    }
+    schema.types.get(condition).is_some_and(|def| {
+        def.kind == TypeKind::Union
+            && def
+                .union_members
+                .iter()
+                .any(|member| member == runtime_type)
+    })
 }
 
 /// Skip/include is evaluated per field; `retain` above would drop merged
@@ -1164,7 +1272,14 @@ fn execute_object<'s, 'q>(
     errors: &mut Vec<ExecError>,
 ) -> Json {
     let mut fields = Vec::new();
-    flatten_fields(parent_type, selections, fragments, variables, &mut fields);
+    flatten_fields(
+        schema,
+        parent_type,
+        selections,
+        fragments,
+        variables,
+        &mut fields,
+    );
     apply_include_filter(&mut fields, variables);
 
     let mut entries: Vec<(String, Json)> = Vec::with_capacity(fields.len());

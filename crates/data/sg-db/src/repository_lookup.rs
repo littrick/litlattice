@@ -67,24 +67,10 @@ pub async fn find_by_name_or_uri(
 ) -> Result<Option<RepoLookupRecord>, sqlx::Error> {
     // `lower(name::text) COLLATE "C" = ANY(lower(inputs))` in the baseline.
     let lowered = input.to_lowercase();
-    let row = sqlx::query(
+    let row = sqlx::query(&format!(
         r#"
 SELECT
-	r.id,
-	r.name,
-	COALESCE(r.uri, '') AS uri,
-	COALESCE(r.description, '') AS description,
-	r.fork,
-	r.archived,
-	r.private,
-	r.stars,
-	r.created_at,
-	r.updated_at,
-	COALESCE(r.external_id, '') AS external_id,
-	COALESCE(r.external_service_type, '') AS external_service_type,
-	COALESCE(r.external_service_id, '') AS external_service_id,
-	CASE WHEN r.blocked IS NULL THEN NULL
-	     ELSE COALESCE(r.blocked ->> 'reason', '') END AS blocked_reason
+{REPO_COLUMNS}
 FROM repo r
 WHERE r.deleted_at IS NULL
   AND (lower(r.name::text) COLLATE "C" = $1 OR r.uri = $2::citext)
@@ -111,8 +97,8 @@ WHERE r.deleted_at IS NULL
   )
 ORDER BY (lower(r.name::text) COLLATE "C" = $1) DESC, r.id
 LIMIT 1
-"#,
-    )
+"#
+    ))
     .bind(lowered)
     .bind(input)
     .bind(bypass_authz)
@@ -120,10 +106,80 @@ LIMIT 1
     .fetch_optional(pool)
     .await?;
 
-    let Some(row) = row else {
-        return Ok(None);
-    };
-    Ok(Some(RepoLookupRecord {
+    row.map(record_from_row).transpose()
+}
+
+/// `repoStore.Get` (`internal/database/repos.go:145-166`): `listRepos` by ID
+/// with `Limit: 1`, `IncludeBlocked: true` and the same `AuthzQueryConds`
+/// predicate as `GetByName` (`internal/database/repos_perm.go:71-117`).
+/// `bypass_authz` is the actor's site-admin status (unless
+/// `authz.enforceForSiteAdmins` is enabled, which is not read here).
+pub async fn find_by_id(
+    pool: &PgPool,
+    id: i32,
+    authenticated_user_id: i32,
+    bypass_authz: bool,
+) -> Result<Option<RepoLookupRecord>, sqlx::Error> {
+    let row = sqlx::query(&format!(
+        r#"
+SELECT
+{REPO_COLUMNS}
+FROM repo r
+WHERE r.deleted_at IS NULL
+  AND r.id = $1
+  AND (
+	$2
+	OR EXISTS (
+		SELECT FROM user_repo_permissions
+		WHERE repo_id = r.id AND user_id IS NULL
+	)
+	OR NOT r.private
+	OR EXISTS (
+		SELECT FROM external_services es
+		JOIN external_service_repos esr ON (
+			esr.external_service_id = es.id
+			AND esr.repo_id = r.id
+			AND es.unrestricted = TRUE
+			AND es.deleted_at IS NULL
+		)
+	)
+	OR EXISTS (
+		SELECT repo_id FROM user_repo_permissions
+		WHERE repo_id = r.id AND user_id = $3
+	)
+  )
+LIMIT 1
+"#
+    ))
+    .bind(id)
+    .bind(bypass_authz)
+    .bind(authenticated_user_id)
+    .fetch_optional(pool)
+    .await?;
+
+    row.map(record_from_row).transpose()
+}
+
+/// The `repo` columns shared by the by-name/URI and by-ID lookups.
+const REPO_COLUMNS: &str = r#"
+	r.id,
+	r.name,
+	COALESCE(r.uri, '') AS uri,
+	COALESCE(r.description, '') AS description,
+	r.fork,
+	r.archived,
+	r.private,
+	r.stars,
+	r.created_at,
+	r.updated_at,
+	COALESCE(r.external_id, '') AS external_id,
+	COALESCE(r.external_service_type, '') AS external_service_type,
+	COALESCE(r.external_service_id, '') AS external_service_id,
+	CASE WHEN r.blocked IS NULL THEN NULL
+	     ELSE COALESCE(r.blocked ->> 'reason', '') END AS blocked_reason"#;
+
+fn record_from_row(row: sqlx::postgres::PgRow) -> Result<RepoLookupRecord, sqlx::Error> {
+    Ok(RepoLookupRecord {
         id: row.try_get("id")?,
         name: row.try_get("name")?,
         uri: row.try_get("uri")?,
@@ -138,5 +194,5 @@ LIMIT 1
         external_service_type: row.try_get("external_service_type")?,
         external_service_id: row.try_get("external_service_id")?,
         blocked_reason: row.try_get::<Option<String>, _>("blocked_reason")?,
-    }))
+    })
 }

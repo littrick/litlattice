@@ -23,8 +23,8 @@ use sqlx::PgPool;
 use sg_graphql::exec::{execute_with, root_fields, Actor, ExecRequest};
 use sg_graphql::schema::assemble_sdl;
 use sg_service_frontend::graphql_resolvers::{
-    prefetch_nested, prefetch_users, prefetch_users_connections, FrontendRootResolver, UserObject,
-    UserProfiles,
+    prefetch_nested, prefetch_users, prefetch_users_connections, FrontendRootResolver, NodeRoots,
+    UserObject, UserProfiles,
 };
 use sg_service_frontend::org_store::PgOrgStore;
 use sg_service_frontend::session_auth::PgSessionUsers;
@@ -144,6 +144,7 @@ async fn graphql_user_organizations_harness() {
                 &users_connections,
                 &organizations,
                 &organizations_connections,
+                &NodeRoots::default(),
                 actor,
                 admin,
             )

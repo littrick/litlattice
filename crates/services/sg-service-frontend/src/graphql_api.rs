@@ -477,6 +477,19 @@ impl GraphqlDeps for SchemaGraphqlDeps {
             }
             None => std::collections::HashMap::new(),
         };
+        let nodes = match (&self.org_memberships, &self.repositories) {
+            (Some(memberships_store), Some(repositories)) => {
+                crate::graphql_resolvers::prefetch_node_roots(
+                    memberships_store.as_ref(),
+                    repositories.as_ref(),
+                    &fields,
+                    request.actor,
+                    site_admin,
+                )
+                .await
+            }
+            _ => crate::graphql_resolvers::NodeRoots::default(),
+        };
         let nested = match (
             &self.user_organizations,
             &self.org_members,
@@ -493,6 +506,7 @@ impl GraphqlDeps for SchemaGraphqlDeps {
                     &users_connections,
                     &organizations,
                     &organizations_connections,
+                    &nodes,
                     request.actor,
                     site_admin,
                 )
@@ -510,7 +524,8 @@ impl GraphqlDeps for SchemaGraphqlDeps {
             organizations_connections,
             site_admin,
         )
-        .with_nested(nested);
+        .with_nested(nested)
+        .with_nodes(nodes);
         let response = sg_graphql::exec::execute_with(&self.schema, exec_request, Some(&roots));
         GraphqlResponse::from_exec(&response)
     }
