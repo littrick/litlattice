@@ -21,6 +21,7 @@ pub mod filters;
 pub mod json;
 pub mod progress;
 pub mod zoekt_results;
+pub mod zoekt_search;
 
 pub use args::parse_url_query;
 
