@@ -195,11 +195,44 @@ impl Service for FrontendService {
         );
         let search_deps: Arc<dyn crate::search_stream::SearchDeps> =
             Arc::new(crate::search_stream::BackendDeps::new(search_pool));
+        // `serve_cmd.go:143`: `keyring.Init` builds the encryption keys from
+        // the site configuration and fails startup when one cannot be
+        // constructed. The `conf.Watch` equivalent below rebuilds the ring in
+        // place; a rebuild failure terminates the process like the baseline's
+        // `panic`.
+        let keyring = sg_keyring::init(&wiring.live().current().site)
+            .await
+            .map_err(|err| {
+                ServiceError::with_source("initializing keyring", std::io::Error::other(err))
+            })?;
+        {
+            let built_generation = wiring.live().generation();
+            let keyring = Arc::clone(&keyring);
+            let live = Arc::clone(wiring.live());
+            let shutdown = ctx.shutdown.clone();
+            background.spawn(async move {
+                if let Err(err) = sg_keyring::watch(keyring, live, built_generation, shutdown).await
+                {
+                    tracing::error!(error = %err, "creating encryption keyring");
+                    std::process::exit(2);
+                }
+            });
+        }
         // The assembled OSS schema is executed by `sg-graphql` (M9.8fb); the
         // session cookie authenticates external requests and the current-user
-        // row backs `Query.currentUser` (M9.8fe).
+        // row backs `Query.currentUser` (M9.8fe). `Query.clientConfiguration`
+        // reads `external_services` with that same pool.
         let graphql_deps =
-            SchemaGraphqlDeps::with_session(Arc::clone(&graphql_schema), session_pool);
+            SchemaGraphqlDeps::with_session(Arc::clone(&graphql_schema), session_pool.clone())
+                .with_client_configuration(
+                    Arc::new(
+                        crate::client_configuration::PgExternalServiceConfigSource::new(
+                            session_pool,
+                        ),
+                    ),
+                    keyring,
+                    Arc::clone(wiring.live()),
+                );
         // `serve_cmd.go:436-448`: the anonymous GraphQL limiter stores GCRA
         // state in the Redis cache pool (`gql:rl:` prefix). A redigo pool does
         // not dial at construction (failures surface per request); here an

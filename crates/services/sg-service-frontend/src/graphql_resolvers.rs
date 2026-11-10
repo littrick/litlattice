@@ -1847,6 +1847,7 @@ impl FrontendRootResolver {
                 viewer_site_admin,
                 nested: Arc::new(NestedPrefetch::default()),
                 nodes: NodeRoots::default(),
+                client_configuration: None,
             },
             mutation: crate::settings_mutation::MutationRoot::default(),
         }
@@ -1855,6 +1856,15 @@ impl FrontendRootResolver {
     /// Attach the request's pre-executed `Mutation` root fields.
     pub fn with_mutation(mut self, mutation: crate::settings_mutation::MutationRoot) -> Self {
         self.mutation = mutation;
+        self
+    }
+
+    /// Attach the request's prefetched `Query.clientConfiguration`.
+    pub fn with_client_configuration(
+        mut self,
+        client_configuration: crate::client_configuration::ClientConfigurationLookup,
+    ) -> Self {
+        self.query.client_configuration = Some(client_configuration);
         self
     }
 }
@@ -1900,6 +1910,9 @@ struct QueryRoot {
     nested: Arc<NestedPrefetch>,
     /// Prefetched `Query.node` results (see [`prefetch_node_roots`]).
     nodes: NodeRoots,
+    /// Prefetched `Query.clientConfiguration` (see
+    /// [`crate::client_configuration::prefetch_client_configuration`]).
+    client_configuration: Option<crate::client_configuration::ClientConfigurationLookup>,
 }
 
 impl FrontendRootResolver {
@@ -2099,7 +2112,6 @@ impl ObjectValue for QueryRoot {
                     _ => Err(ExecError::new("invalid id")),
                 }
             }
-            // `schemaResolver.ViewerSettings` (`settings_cascade.go:75-93`):
             // `schemaResolver.ParseSearchQuery` (`parse_search_query.go:49-61`):
             // synchronous, no database. `PARSE_TREE` is ported; `JOB_TREE`
             // reports an explicit "not ported" error (see the module docs).
@@ -2128,6 +2140,23 @@ impl ObjectValue for QueryRoot {
                     Err(message) => Err(ExecError::new(message)),
                 }
             }
+            // `schemaResolver.ClientConfiguration`
+            // (`client_configuration.go:36-95`): read-only; the prefetched
+            // result carries either the details or the database/config error.
+            "clientConfiguration" => match &self.client_configuration {
+                Some(crate::client_configuration::ClientConfigurationLookup::Found(details)) => {
+                    Ok(Some(FieldValue::Object(Arc::new(
+                        crate::client_configuration::ClientConfigurationObject::new(
+                            details.clone(),
+                        ),
+                    ))))
+                }
+                Some(crate::client_configuration::ClientConfigurationLookup::Error(message)) => {
+                    Err(ExecError::new(message.clone()))
+                }
+                None => Ok(None),
+            },
+            // `schemaResolver.ViewerSettings` (`settings_cascade.go:75-93`):
             // the current user's cascade, or the site cascade when anonymous
             // (or the row disappeared).
             "viewerSettings" | "viewerConfiguration" => {
@@ -3587,7 +3616,12 @@ mod tests {
                                            outputPhase: SearchQueryOutputPhase, \
                                            outputFormat: SearchQueryOutputFormat, \
                                            outputVerbosity: SearchQueryOutputVerbosity): String! \
+                          clientConfiguration: ClientConfigurationDetails! \
                           other: String } \
+             type ClientConfigurationDetails { \
+                 contentScriptUrls: [String!]! \
+                 parentSourcegraph: ParentSourcegraphDetails! } \
+             type ParentSourcegraphDetails { url: String! } \
              interface Node { id: ID! } \
              type Repository implements Node { id: ID! name: String! \
                                                uri: String! isPrivate: Boolean! } \
@@ -3715,6 +3749,52 @@ mod tests {
                 "unsupported output options for PARSE_TREE, only JSON output with BASIC verbosity is supported"
                     .to_owned()
             )
+        );
+    }
+
+    #[test]
+    fn client_configuration_returns_urls_and_the_parent_instance() {
+        let schema = schema();
+        let roots = FrontendRootResolver::new().with_client_configuration(
+            crate::client_configuration::ClientConfigurationLookup::Found(
+                crate::client_configuration::ClientConfigurationDetails {
+                    content_script_urls: vec![
+                        "https://github.example.com".to_owned(),
+                        "https://gitlab.example.com".to_owned(),
+                    ],
+                    parent_sourcegraph_url: "https://sourcegraph.example.com".to_owned(),
+                },
+            ),
+        );
+        assert_eq!(
+            run(
+                &schema,
+                "{ clientConfiguration { contentScriptUrls parentSourcegraph { url } } }",
+                Actor::Anonymous,
+                &roots,
+            ),
+            r#"{"data":{"clientConfiguration":{"contentScriptUrls":["https://github.example.com","https://gitlab.example.com"],"parentSourcegraph":{"url":"https://sourcegraph.example.com"}}}}"#
+        );
+    }
+
+    #[test]
+    fn client_configuration_errors_are_surfaced() {
+        let schema = schema();
+        let roots = FrontendRootResolver::new().with_client_configuration(
+            crate::client_configuration::ClientConfigurationLookup::Error(
+                "failed to parse JSON: [ValueExpected]".to_owned(),
+            ),
+        );
+        let response = run(
+            &schema,
+            "{ clientConfiguration { contentScriptUrls } }",
+            Actor::Anonymous,
+            &roots,
+        );
+        let value: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(
+            value["errors"][0]["message"],
+            serde_json::Value::String("failed to parse JSON: [ValueExpected]".to_owned())
         );
     }
 

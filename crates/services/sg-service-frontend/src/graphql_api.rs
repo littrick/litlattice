@@ -295,6 +295,15 @@ struct RateLimitDeps {
     live: Arc<LiveConfig>,
 }
 
+/// `Query.clientConfiguration`'s dependencies: the `external_services` table,
+/// the keyring used to decrypt service configs, and the site configuration
+/// that carries `parentSourcegraph`.
+struct ClientConfigurationDeps {
+    source: Arc<dyn crate::client_configuration::ExternalServiceConfigSource>,
+    keyring: Arc<sg_keyring::Keyring>,
+    live: Arc<LiveConfig>,
+}
+
 /// The production session-authentication dependencies.
 struct SessionDeps {
     store: Arc<dyn SessionStore>,
@@ -338,6 +347,8 @@ pub struct SchemaGraphqlDeps {
     /// Anonymous GraphQL rate limiter; `None` in transport-only tests and when
     /// the frontend could not reach Redis at startup.
     rate_limit: Option<RateLimitDeps>,
+    /// `Query.clientConfiguration`'s seams; `None` in transport-only tests.
+    client_configuration: Option<ClientConfigurationDeps>,
 }
 
 impl SchemaGraphqlDeps {
@@ -355,6 +366,7 @@ impl SchemaGraphqlDeps {
             org_memberships: None,
             pool: None,
             rate_limit: None,
+            client_configuration: None,
         }
     }
 
@@ -385,6 +397,7 @@ impl SchemaGraphqlDeps {
             org_memberships: Some(Arc::new(crate::org_store::PgOrgStore::new(pool.clone()))),
             pool: Some(pool),
             rate_limit: None,
+            client_configuration: None,
         }
     }
 
@@ -418,6 +431,22 @@ impl SchemaGraphqlDeps {
         self
     }
 
+    /// `serve_cmd.go:143`'s `keyring.Init` + the `external_services` table:
+    /// enables `Query.clientConfiguration`.
+    pub fn with_client_configuration(
+        mut self,
+        source: Arc<dyn crate::client_configuration::ExternalServiceConfigSource>,
+        keyring: Arc<sg_keyring::Keyring>,
+        live: Arc<LiveConfig>,
+    ) -> Self {
+        self.client_configuration = Some(ClientConfigurationDeps {
+            source,
+            keyring,
+            live,
+        });
+        self
+    }
+
     /// Test hook: inject the store/user lookup without Redis or Postgres.
     #[cfg(test)]
     fn with_session_parts(
@@ -445,6 +474,7 @@ impl SchemaGraphqlDeps {
             org_memberships: None,
             pool: None,
             rate_limit: None,
+            client_configuration: None,
         }
     }
 }
@@ -590,18 +620,37 @@ impl GraphqlDeps for SchemaGraphqlDeps {
             _ => Arc::new(crate::graphql_resolvers::NestedPrefetch::default()),
         };
         let user = current_user.map(crate::graphql_resolvers::UserObject::from_data);
-        let roots = crate::graphql_resolvers::FrontendRootResolver::with_prefetched_organizations(
-            user,
-            repositories,
-            users,
-            users_connections,
-            organizations,
-            organizations_connections,
-            site_admin,
-        )
-        .with_nested(nested)
-        .with_nodes(nodes)
-        .with_mutation(mutation);
+        // `Query.clientConfiguration` reads `external_services` and the
+        // site configuration's `parentSourcegraph`; prefetch only when the
+        // operation selects it (the baseline resolves fields lazily).
+        let client_configuration = match &self.client_configuration {
+            Some(deps) => {
+                crate::client_configuration::prefetch_client_configuration(
+                    deps.source.as_ref(),
+                    deps.keyring.external_service_key(),
+                    crate::client_configuration::parent_sourcegraph_url(&deps.live.current().site),
+                    &fields,
+                )
+                .await
+            }
+            None => None,
+        };
+        let mut roots =
+            crate::graphql_resolvers::FrontendRootResolver::with_prefetched_organizations(
+                user,
+                repositories,
+                users,
+                users_connections,
+                organizations,
+                organizations_connections,
+                site_admin,
+            )
+            .with_nested(nested)
+            .with_nodes(nodes)
+            .with_mutation(mutation);
+        if let Some(client_configuration) = client_configuration {
+            roots = roots.with_client_configuration(client_configuration);
+        }
         let response = sg_graphql::exec::execute_with(&self.schema, exec_request, Some(&roots));
         GraphqlResponse::from_exec(&response)
     }
