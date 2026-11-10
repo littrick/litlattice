@@ -9,9 +9,12 @@
 //! verbatim from the pinned module version
 //! (`v0.0.0-20240808144359-20c496e3680f`).
 
+pub mod cached;
 pub mod client;
 pub mod go_regexp;
 pub mod languages;
+pub mod metered;
 pub mod proto;
 pub mod query;
+pub mod streamer;
 pub mod types;

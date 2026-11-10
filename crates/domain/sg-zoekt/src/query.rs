@@ -712,6 +712,180 @@ fn raw_config_flags(flags: u64) -> Vec<i32> {
     out
 }
 
+// ------------------------------------------------------------- formatting
+//
+// `github.com/sourcegraph/zoekt/query`'s `Q.String()` implementations. Only
+// used by the metered searcher's `queryString` label. Notes:
+//
+// * `Regexp` stores the source pattern, while Go prints
+//   `syntaxutil.RegexpString` (the `regexp/syntax` canonical form). For the
+//   simple patterns in the differential corpus the two agree; exotic patterns
+//   may differ.
+// * `RepoIds`/`BranchesRepos` print a structural approximation because Go
+//   delegates to `roaring.Bitmap.String()`.
+
+impl std::fmt::Display for Query {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Query::RawConfig(flags) => {
+                let mut labels = Vec::new();
+                for (mask, label) in [
+                    (0x01u64, "RcOnlyPublic"),
+                    (0x02, "RcOnlyPrivate"),
+                    (0x04, "RcOnlyForks"),
+                    (0x08, "RcNoForks"),
+                    (0x10, "RcOnlyArchived"),
+                    (0x20, "RcNoArchived"),
+                ] {
+                    if flags & mask != 0 {
+                        labels.push(label);
+                    }
+                }
+                write!(f, "rawConfig:{}", labels.join("|"))
+            }
+            Query::Regexp {
+                regexp,
+                file_name,
+                case_sensitive,
+                ..
+            } => {
+                let mut prefix = String::new();
+                if *file_name {
+                    prefix.push_str("file_");
+                }
+                if *case_sensitive {
+                    prefix.insert_str(0, "case_");
+                }
+                write!(f, "{prefix}regex:{}", go_quote(regexp))
+            }
+            Query::Symbol(child) => write!(f, "sym:{child}"),
+            Query::Language(language) => write!(f, "lang:{language}"),
+            Query::Const(value) => f.write_str(if *value { "TRUE" } else { "FALSE" }),
+            Query::Repo(regexp) => write!(f, "repo:{regexp}"),
+            Query::RepoRegexp(regexp) => write!(f, "reporegex:{}", go_quote(regexp)),
+            Query::BranchesRepos(list) => {
+                f.write_str("(branchesrepos")?;
+                for branch in list {
+                    write!(f, " {}=repo-list", branch.branch)?;
+                }
+                f.write_str(")")
+            }
+            Query::RepoIds(repos) => {
+                let count = roaring::RoaringBitmap::deserialize_from(&repos[..])
+                    .map(|bitmap| bitmap.len())
+                    .unwrap_or(0);
+                write!(f, "(repoids repoid=count:{count})")
+            }
+            Query::RepoSet(set) => {
+                let mut repos: Vec<&str> = set.keys().map(String::as_str).collect();
+                repos.sort_unstable();
+                if repos.len() > 5 {
+                    write!(f, "(reposet size={})", repos.len())
+                } else {
+                    write!(f, "(reposet {})", repos.join(" "))
+                }
+            }
+            Query::FileNameSet(set) => {
+                let mut names: Vec<&str> = set.iter().map(String::as_str).collect();
+                names.sort_unstable();
+                if names.len() > 5 {
+                    write!(f, "(filenameset size={})", names.len())
+                } else {
+                    write!(f, "(filenameset {})", names.join(" "))
+                }
+            }
+            Query::Type { child, kind } => {
+                let kind = match kind {
+                    TypeKind::FileMatch => "filematch",
+                    TypeKind::FileName => "filename",
+                    TypeKind::Repo => "repo",
+                };
+                write!(f, "(type:{kind} {child})")
+            }
+            Query::Substring {
+                pattern,
+                case_sensitive,
+                file_name,
+                content,
+            } => {
+                let mut out = String::new();
+                if *file_name {
+                    out.push_str("file_");
+                } else if *content {
+                    out.push_str("content_");
+                }
+                out.push_str("substr:");
+                out.push_str(&go_quote(pattern));
+                if *case_sensitive {
+                    out.insert_str(0, "case_");
+                }
+                f.write_str(&out)
+            }
+            Query::And(children) => {
+                f.write_str("(and ")?;
+                write_joined(f, children)?;
+                f.write_str(")")
+            }
+            Query::Or(children) => {
+                f.write_str("(or ")?;
+                write_joined(f, children)?;
+                f.write_str(")")
+            }
+            Query::Not(child) => write!(f, "(not {child})"),
+            Query::Branch { pattern, exact } => {
+                if *exact {
+                    write!(f, "branch={}", go_quote(pattern))
+                } else {
+                    write!(f, "branch:{}", go_quote(pattern))
+                }
+            }
+            Query::Boost { child, boost } => write!(f, "(boost {boost:.2} {child})"),
+        }
+    }
+}
+
+fn write_joined(f: &mut std::fmt::Formatter<'_>, children: &[Query]) -> std::fmt::Result {
+    for (index, child) in children.iter().enumerate() {
+        if index > 0 {
+            f.write_str(" ")?;
+        }
+        write!(f, "{child}")?;
+    }
+    Ok(())
+}
+
+/// `strconv.Quote` for the subset `fmt.Sprintf("%q", s)` exercises here.
+fn go_quote(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('"');
+    for ch in value.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\u{07}' => out.push_str("\\a"),
+            '\u{08}' => out.push_str("\\b"),
+            '\u{0c}' => out.push_str("\\f"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{0b}' => out.push_str("\\v"),
+            ch if ch.is_control() => {
+                let code = ch as u32;
+                if code < 0x100 {
+                    out.push_str(&format!("\\x{code:02x}"));
+                } else if code < 0x10000 {
+                    out.push_str(&format!("\\u{code:04x}"));
+                } else {
+                    out.push_str(&format!("\\U{code:08x}"));
+                }
+            }
+            ch => out.push(ch),
+        }
+    }
+    out.push('"');
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
