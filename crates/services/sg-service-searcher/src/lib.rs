@@ -801,6 +801,7 @@ mod tests {
                             column: 7,
                         },
                     }],
+                    symbol_info: Vec::new(),
                     score: 0.0,
                 }],
                 ..FileMatch::default()

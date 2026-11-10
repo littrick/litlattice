@@ -273,6 +273,15 @@ pub struct Range {
     pub end: Location,
 }
 
+/// `zoekt.Symbol`: symbol information associated with a chunk range.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SymbolInfo {
+    pub sym: String,
+    pub kind: String,
+    pub parent: String,
+    pub parent_kind: String,
+}
+
 /// `zoekt.ChunkMatch`.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct ChunkMatch {
@@ -280,6 +289,10 @@ pub struct ChunkMatch {
     pub content_start: Location,
     pub file_name: bool,
     pub ranges: Vec<Range>,
+    /// `zoekt.ChunkMatch.SymbolInfo`. Go models this as `[]*Symbol` (elements
+    /// may be nil); proto `repeated SymbolInfo` cannot express nil elements, so
+    /// `from_proto` always produces `Some`.
+    pub symbol_info: Vec<Option<SymbolInfo>>,
     pub score: f64,
 }
 
@@ -297,15 +310,30 @@ impl ChunkMatch {
                     end: Location::from_proto(range.end),
                 })
                 .collect(),
+            symbol_info: chunk
+                .symbol_info
+                .into_iter()
+                .map(|symbol| {
+                    Some(SymbolInfo {
+                        sym: symbol.sym,
+                        kind: symbol.kind,
+                        parent: symbol.parent,
+                        parent_kind: symbol.parent_kind,
+                    })
+                })
+                .collect(),
             score: chunk.score,
         }
     }
 
     /// `(*zoekt.ChunkMatch).sizeBytes`.
     ///
-    /// `SymbolInfo` (empty) and `DebugScore` (empty) are not carried by the
-    /// port; the baseline accounts for their slice header (`24`) and string
-    /// header (`16`) regardless, so they are added as empty values.
+    /// `SymbolInfo` only contributes its slice header (`24`), matching the
+    /// port's prior behaviour; a non-empty `symbol_info` is therefore
+    /// under-counted relative to Go (which also charges a pointer and the
+    /// strings per element). `DebugScore` (empty) is not carried by the port;
+    /// the baseline accounts for its string header (`16`) regardless, so it is
+    /// added as an empty value.
     pub fn size_bytes(&self) -> u64 {
         // Content.
         let mut sz = 24 + self.content.len() as u64;
@@ -683,7 +711,12 @@ mod tests {
                             column: 7,
                         }),
                     }],
-                    symbol_info: Vec::new(),
+                    symbol_info: vec![proto::SymbolInfo {
+                        sym: "needle".to_owned(),
+                        kind: "variable".to_owned(),
+                        parent: "main".to_owned(),
+                        parent_kind: "function".to_owned(),
+                    }],
                     score: 0.0,
                     debug_score: String::new(),
                 }],
@@ -704,6 +737,12 @@ mod tests {
         assert_eq!(chunk_match.content, b"needle\n");
         assert_eq!(chunk_match.content_start.byte_offset, 10);
         assert_eq!(chunk_match.ranges[0].end.column, 7);
+        assert_eq!(chunk_match.symbol_info.len(), 1);
+        let symbol = chunk_match.symbol_info[0].as_ref().expect("symbol info");
+        assert_eq!(symbol.sym, "needle");
+        assert_eq!(symbol.kind, "variable");
+        assert_eq!(symbol.parent, "main");
+        assert_eq!(symbol.parent_kind, "function");
         assert_eq!(file.language, "Go");
         assert_eq!(file.version, "abc123");
     }

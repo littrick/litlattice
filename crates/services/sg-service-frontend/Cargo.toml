@@ -25,6 +25,7 @@ sg-session = { path = "../../domain/sg-session" }
 sg-service-searcher = { path = "../sg-service-searcher" }
 sg-settings-schema = { path = "../../domain/sg-settings-schema" }
 sg-site-schema = { path = "../../domain/sg-site-schema" }
+sg-zoekt = { path = "../../domain/sg-zoekt" }
 async-trait = { workspace = true }
 base64 = { workspace = true }
 bytes = { workspace = true }
