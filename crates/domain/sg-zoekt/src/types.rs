@@ -300,12 +300,38 @@ impl ChunkMatch {
             score: chunk.score,
         }
     }
+
+    /// `(*zoekt.ChunkMatch).sizeBytes`.
+    ///
+    /// `SymbolInfo` (empty) and `DebugScore` (empty) are not carried by the
+    /// port; the baseline accounts for their slice header (`24`) and string
+    /// header (`16`) regardless, so they are added as empty values.
+    pub fn size_bytes(&self) -> u64 {
+        // Content.
+        let mut sz = 24 + self.content.len() as u64;
+        // ContentStart.
+        sz += 12;
+        // FileName.
+        sz += 1;
+        // Ranges: slice header + 24 per range.
+        sz += 24 + self.ranges.len() as u64 * 24;
+        // SymbolInfo (empty).
+        sz += 24;
+        // Score.
+        sz += 8;
+        // DebugScore (empty).
+        sz += 16;
+        sz
+    }
 }
 
 /// `zoekt.FileMatch`.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct FileMatch {
     pub score: f64,
+    /// `zoekt.FileMatch.Debug` (proto `debug`): the `DebugScore` string. Kept
+    /// so callers can verify that ranking and aggregation never rewrite it.
+    pub debug: String,
     pub file_name: Vec<u8>,
     pub repository: String,
     pub repository_id: u32,
@@ -320,6 +346,7 @@ impl FileMatch {
     fn from_proto(file: proto::FileMatch) -> Self {
         Self {
             score: file.score,
+            debug: file.debug,
             file_name: file.file_name,
             repository: file.repository,
             repository_id: file.repository_id,
@@ -333,6 +360,45 @@ impl FileMatch {
             language: file.language,
             version: file.version,
         }
+    }
+
+    /// `(*zoekt.FileMatch).sizeBytes`.
+    ///
+    /// The port does not carry `SubRepositoryName`, `SubRepositoryPath`,
+    /// `LineMatches` or `Checksum`; the baseline adds a fixed `16 + 0` for each
+    /// of the first two and a fixed slice header (`24`) for the last two, so
+    /// they are accounted for as empty values here.
+    pub fn size_bytes(&self) -> u64 {
+        // Score.
+        let mut sz = 8u64;
+        sz += 16 + self.debug.len() as u64;
+        sz += 16 + self.file_name.len() as u64;
+        sz += 16 + self.repository.len() as u64;
+        sz += 16 + self.language.len() as u64;
+        sz += 16; // SubRepositoryName (empty)
+        sz += 16; // SubRepositoryPath (empty)
+        sz += 16 + self.version.len() as u64;
+        // Branches.
+        sz += 24;
+        for branch in &self.branches {
+            sz += 16 + branch.len() as u64;
+        }
+        // LineMatches (always empty in this port).
+        sz += 24;
+        // ChunkMatches.
+        sz += 24;
+        for chunk in &self.chunk_matches {
+            sz += chunk.size_bytes();
+        }
+        // RepositoryID.
+        sz += 4;
+        // RepositoryPriority.
+        sz += 8;
+        // Content.
+        sz += 24 + self.content.len() as u64;
+        // Checksum (always empty in this port).
+        sz += 24;
+        sz
     }
 }
 
@@ -355,6 +421,152 @@ impl SearchChunk {
                 .collect(),
             crashes: response.stats.map(|stats| stats.crashes).unwrap_or(0),
         }
+    }
+}
+
+/// `zoekt.FlushReason`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash)]
+pub enum FlushReason {
+    /// `FlushReason(0)`: no reason (the baseline stringifies it as `none`).
+    #[default]
+    Unknown,
+    /// `FlushReasonTimerExpired`.
+    TimerExpired,
+    /// `FlushReasonFinalFlush`.
+    FinalFlush,
+    /// `FlushReasonMaxSize`.
+    MaxSize,
+}
+
+impl FlushReason {
+    /// `(zoekt.FlushReason).String`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::TimerExpired => "timer_expired",
+            Self::FinalFlush => "final_flush",
+            Self::MaxSize => "max_size_reached",
+            Self::Unknown => "none",
+        }
+    }
+
+    /// `zoekt.FlushReason` from its proto value.
+    pub fn from_proto(value: i32) -> Self {
+        match value {
+            1 => Self::TimerExpired,
+            2 => Self::FinalFlush,
+            3 => Self::MaxSize,
+            _ => Self::Unknown,
+        }
+    }
+}
+
+/// `zoekt.Progress`.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct Progress {
+    pub priority: f64,
+    pub max_pending_priority: f64,
+}
+
+impl Progress {
+    /// `(*zoekt.Progress).sizeBytes`.
+    pub fn size_bytes(&self) -> u64 {
+        2 * 8
+    }
+}
+
+/// `zoekt.Stats`.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Stats {
+    pub content_bytes_loaded: i64,
+    pub index_bytes_loaded: i64,
+    pub crashes: i64,
+    pub duration: Duration,
+    pub file_count: i64,
+    pub shard_files_considered: i64,
+    pub files_considered: i64,
+    pub files_loaded: i64,
+    pub files_skipped: i64,
+    pub shards_scanned: i64,
+    pub shards_skipped: i64,
+    pub shards_skipped_filter: i64,
+    pub match_count: i64,
+    pub ngram_matches: i64,
+    pub ngram_lookups: i64,
+    pub wait: Duration,
+    pub match_tree_construction: Duration,
+    pub match_tree_search: Duration,
+    pub regexps_considered: i64,
+    pub flush_reason: FlushReason,
+}
+
+impl Stats {
+    /// `(*zoekt.Stats).sizeBytes`: `16*8` plus one byte for `FlushReason`.
+    pub fn size_bytes(&self) -> u64 {
+        16 * 8 + 1
+    }
+
+    /// `(*zoekt.Stats).Add`: field-wise addition. The first non-zero
+    /// `FlushReason` is sticky when aggregating several zoekts.
+    pub fn add(&mut self, other: &Stats) {
+        self.content_bytes_loaded += other.content_bytes_loaded;
+        self.index_bytes_loaded += other.index_bytes_loaded;
+        self.crashes += other.crashes;
+        // `Duration` is deliberately not aggregated (the baseline's `Add`
+        // leaves it untouched).
+        self.file_count += other.file_count;
+        self.shard_files_considered += other.shard_files_considered;
+        self.files_considered += other.files_considered;
+        self.files_loaded += other.files_loaded;
+        self.files_skipped += other.files_skipped;
+        self.shards_scanned += other.shards_scanned;
+        self.shards_skipped += other.shards_skipped;
+        self.shards_skipped_filter += other.shards_skipped_filter;
+        self.match_count += other.match_count;
+        self.ngram_matches += other.ngram_matches;
+        self.ngram_lookups += other.ngram_lookups;
+        self.wait += other.wait;
+        self.match_tree_construction += other.match_tree_construction;
+        self.match_tree_search += other.match_tree_search;
+        self.regexps_considered += other.regexps_considered;
+        if self.flush_reason == FlushReason::Unknown {
+            self.flush_reason = other.flush_reason;
+        }
+    }
+}
+
+/// `zoekt.SearchResult`.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct SearchResult {
+    pub stats: Stats,
+    pub progress: Progress,
+    pub files: Vec<FileMatch>,
+    pub repo_urls: BTreeMap<String, String>,
+    pub line_fragments: BTreeMap<String, String>,
+}
+
+impl SearchResult {
+    /// `(*zoekt.SearchResult).SizeBytes`: a best-effort lower bound on the
+    /// in-memory size, used by the aggregator's `maxSizeBytes` guard.
+    pub fn size_bytes(&self) -> u64 {
+        let mut sz = self.stats.size_bytes() + self.progress.size_bytes();
+        // Files slice header + contents.
+        sz += 24;
+        for file in &self.files {
+            sz += file.size_bytes();
+        }
+        // RepoURLs map header + entries.
+        sz += 48;
+        for (key, value) in &self.repo_urls {
+            sz += 16 + key.len() as u64;
+            sz += 16 + value.len() as u64;
+        }
+        // LineFragments map header + entries.
+        sz += 48;
+        for (key, value) in &self.line_fragments {
+            sz += 16 + key.len() as u64;
+            sz += 16 + value.len() as u64;
+        }
+        sz
     }
 }
 
