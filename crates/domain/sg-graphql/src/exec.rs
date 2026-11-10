@@ -388,6 +388,99 @@ pub fn execute_with(
     }
 }
 
+/// A root field [`execute_with`] will resolve, with the same resolved
+/// [`Arguments`] its resolver will receive.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RootField {
+    pub name: String,
+    pub arguments: Arguments,
+}
+
+/// Parse `request` and return the root fields that [`execute_with`] will
+/// resolve, so an async caller can prefetch their data first. Fragments,
+/// aliases, `@skip`/`@include` and variable/default resolution follow the
+/// executor exactly. Requests the executor would reject yield an empty list
+/// (and no prefetch work); `execute_with` then produces the error response.
+pub fn root_fields(schema: &Schema, request: &ExecRequest<'_>) -> Vec<RootField> {
+    let doc: Doc<'_> = match q::parse_query::<String>(request.query) {
+        Ok(doc) => doc,
+        Err(_) => return Vec::new(),
+    };
+
+    let mut operations: Vec<&Operation<'_>> = Vec::new();
+    let mut fragments: BTreeMap<String, &Fragment<'_>> = BTreeMap::new();
+    for definition in &doc.definitions {
+        match definition {
+            q::Definition::Operation(op) => operations.push(op),
+            q::Definition::Fragment(fragment) => {
+                fragments.insert(fragment.name.clone(), fragment);
+            }
+        }
+    }
+
+    let (kind, _, variable_definitions, selection_set, _) =
+        match select_operation(&operations, request.operation_name) {
+            Ok(selected) => selected,
+            Err(_) => return Vec::new(),
+        };
+
+    let mut errors = Vec::new();
+    validate_selection_set(
+        schema,
+        root_type_name(schema, kind),
+        &selection_set.items,
+        &fragments,
+        &mut BTreeSet::new(),
+        &mut errors,
+    );
+    if !errors.is_empty() {
+        return Vec::new();
+    }
+    if kind == OpKind::Subscription {
+        return Vec::new();
+    }
+    if kind == OpKind::Mutation && schema.mutation_type.is_none() {
+        return Vec::new();
+    }
+
+    let mut variables = BTreeMap::new();
+    for (name, value) in request.variables {
+        variables.insert(name.clone(), runtime_from_json(value));
+    }
+    for definition in variable_definitions {
+        if !variables.contains_key(&definition.name) {
+            if let Some(default) = &definition.default_value {
+                variables.insert(definition.name.clone(), eval_value(default, &variables));
+            }
+        }
+    }
+
+    let root_name = root_type_name(schema, kind).to_owned();
+    let mut fields = Vec::new();
+    flatten_fields(
+        &root_name,
+        &selection_set.items,
+        &fragments,
+        &variables,
+        &mut fields,
+    );
+    apply_include_filter(&mut fields, &variables);
+
+    fields
+        .into_iter()
+        .filter(|field| {
+            !matches!(
+                field.name.as_str(),
+                "__typename" | "__schema" | "__type" | "_service"
+            )
+        })
+        .map(|field| RootField {
+            arguments: collect_arguments(schema, &root_name, &field, &variables),
+            name: field.name,
+        })
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // Operations and fragments
 // ---------------------------------------------------------------------------
@@ -1938,5 +2031,59 @@ mod tests {
             run(&schema, "{ users { id } }"),
             r#"{"errors":[{"message":"GraphQL field \"users\" of \"Query\" has no ported resolver","path":["users"]}],"data":null}"#
         );
+    }
+
+    #[test]
+    fn root_fields_mirror_execution_arguments() {
+        let schema = assemble_sdl(
+            "type Query { repository(name: String, uri: String, first: Int): Repository } \
+             type Repository { id: ID! }",
+        )
+        .unwrap();
+        let variables = serde_json::Map::new();
+        let request = ExecRequest {
+            query: r#"{ repository(name: "github.com/a/b") { id } }"#,
+            operation_name: "",
+            variables: &variables,
+            actor: Actor::Anonymous,
+        };
+        let fields = root_fields(&schema, &request);
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields[0].name, "repository");
+        assert_eq!(fields[0].arguments.string("name"), Some("github.com/a/b"));
+
+        // Fragments, aliases, variables and defaults are resolved like the
+        // executor does; introspection fields are not prefetchable.
+        let query = "query Q($n: String) { r: repository(uri: $n) { ...F } \
+                     __typename } fragment F on Repository { id }";
+        let mut variables = serde_json::Map::new();
+        variables.insert("n".to_owned(), JsonValue::String("m9/uri".to_owned()));
+        let request = ExecRequest {
+            query,
+            operation_name: "Q",
+            variables: &variables,
+            actor: Actor::Anonymous,
+        };
+        let fields = root_fields(&schema, &request);
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields[0].arguments.string("uri"), Some("m9/uri"));
+
+        // @skip removes the field from the prefetch set.
+        let request = ExecRequest {
+            query: r#"{ repository(name: "x") @skip(if: true) { id } }"#,
+            operation_name: "",
+            variables: &variables,
+            actor: Actor::Anonymous,
+        };
+        assert!(root_fields(&schema, &request).is_empty());
+
+        // A query the executor rejects yields no prefetch work.
+        let request = ExecRequest {
+            query: "{ missing }",
+            operation_name: "",
+            variables: &variables,
+            actor: Actor::Anonymous,
+        };
+        assert!(root_fields(&schema, &request).is_empty());
     }
 }

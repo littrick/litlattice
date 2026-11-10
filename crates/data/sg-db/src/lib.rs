@@ -41,6 +41,7 @@ pub mod repo_embeddings;
 pub mod repo_paths;
 pub mod repo_statistics;
 pub mod repos;
+pub mod repository_lookup;
 pub mod reposcheduler;
 pub mod repoupdater_state;
 pub mod sub_repo_perms;

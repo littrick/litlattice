@@ -289,6 +289,8 @@ struct SessionDeps {
 pub struct SchemaGraphqlDeps {
     schema: Arc<sg_graphql::Schema>,
     session: Option<SessionDeps>,
+    /// `Query.repository`'s database seam; `None` in transport-only tests.
+    repositories: Option<Arc<dyn crate::graphql_resolvers::RepositoryLookup>>,
 }
 
 impl SchemaGraphqlDeps {
@@ -296,13 +298,15 @@ impl SchemaGraphqlDeps {
         Self {
             schema,
             session: None,
+            repositories: None,
         }
     }
 
-    /// Wire session authentication and the current-user lookup.
+    /// Wire session authentication, the current-user lookup and the
+    /// repository lookup.
     pub fn with_session(schema: Arc<sg_graphql::Schema>, pool: sqlx::PgPool) -> Self {
         let users = Arc::new(crate::session_auth::PgSessionUsers::new(pool.clone()));
-        let profiles = Arc::new(crate::session_auth::PgSessionUsers::new(pool));
+        let profiles = Arc::new(crate::session_auth::PgSessionUsers::new(pool.clone()));
         Self {
             schema,
             session: Some(SessionDeps {
@@ -311,7 +315,19 @@ impl SchemaGraphqlDeps {
                 profiles,
                 cookie_key: session_cookie_key(),
             }),
+            repositories: Some(Arc::new(crate::repository_store::PgRepositoryStore::new(
+                pool,
+            ))),
         }
+    }
+
+    /// Test hook: use a repository lookup without a real database.
+    pub fn with_repository_store(
+        mut self,
+        repositories: Arc<dyn crate::graphql_resolvers::RepositoryLookup>,
+    ) -> Self {
+        self.repositories = Some(repositories);
+        self
     }
 
     /// Test hook: inject the store/user lookup without Redis or Postgres.
@@ -331,6 +347,7 @@ impl SchemaGraphqlDeps {
                 profiles,
                 cookie_key,
             }),
+            repositories: None,
         }
     }
 }
@@ -342,29 +359,47 @@ impl GraphqlDeps for SchemaGraphqlDeps {
         // the row once per request. A lookup failure is logged and treated as
         // no current user (the baseline would surface a resolver error; no
         // resolver-level error plumbing exists for DB failures yet).
-        let roots = match (request.actor, self.session.as_ref()) {
-            (Actor::User { uid }, Some(session)) => {
-                let user = match session.profiles.profile(uid).await {
-                    Ok(profile) => profile.map(crate::graphql_resolvers::UserObject::from_data),
-                    Err(error) => {
-                        tracing::error!(uid, %error, "failed to look up current user");
-                        None
-                    }
-                };
-                crate::graphql_resolvers::FrontendRootResolver::with_user(user)
-            }
-            _ => crate::graphql_resolvers::FrontendRootResolver::new(),
-        };
-        let response = sg_graphql::exec::execute_with(
-            &self.schema,
-            sg_graphql::exec::ExecRequest {
-                query: request.query,
-                operation_name: request.operation_name,
-                variables: request.variables,
-                actor: request.actor,
+        let mut site_admin = false;
+        let user = match (request.actor, self.session.as_ref()) {
+            (Actor::User { uid }, Some(session)) => match session.profiles.profile(uid).await {
+                Ok(profile) => profile.map(|profile| {
+                    site_admin = profile.site_admin;
+                    crate::graphql_resolvers::UserObject::from_data(profile)
+                }),
+                Err(error) => {
+                    tracing::error!(uid, %error, "failed to look up current user");
+                    None
+                }
             },
-            Some(&roots),
+            _ => None,
+        };
+
+        let exec_request = sg_graphql::exec::ExecRequest {
+            query: request.query,
+            operation_name: request.operation_name,
+            variables: request.variables,
+            actor: request.actor,
+        };
+        // `Query.repository` needs an async database lookup, so prefetch the
+        // root fields identified by the executor before executing.
+        let repositories = match &self.repositories {
+            Some(store) => {
+                let fields = sg_graphql::exec::root_fields(&self.schema, &exec_request);
+                crate::graphql_resolvers::prefetch_repositories(
+                    store.as_ref(),
+                    &fields,
+                    request.actor,
+                    site_admin,
+                )
+                .await
+            }
+            None => std::collections::HashMap::new(),
+        };
+        let roots = crate::graphql_resolvers::FrontendRootResolver::with_user_and_repositories(
+            user,
+            repositories,
         );
+        let response = sg_graphql::exec::execute_with(&self.schema, exec_request, Some(&roots));
         GraphqlResponse::from_exec(&response)
     }
 
