@@ -31,6 +31,10 @@
 //!   services; the others: the OSS empty handler's 200 empty response;
 //! - `/.api/opencodegraph` (POST) -> the `opencodegraph` feature flag is off,
 //!   so `JsonMiddleware`'s error handler answers 500 with an empty body;
+//! - `/.api/repos/{Repo}/-/shield` (GET) -> `serveRepoShield`'s
+//!   `CountGoImporters` error on self-hosted instances, mapped by the same
+//!   `ErrorHandler.Handle` contract to a 500 with an empty body; the route
+//!   reproduces `routevar.Repo`'s gorilla template;
 //! - anything else -> gorilla's default `http.NotFoundHandler`
 //!   (`404 page not found\n`, `nosniff`).
 //!
@@ -38,7 +42,10 @@
 //! routes (`/scim/v2`, `/registry`) are unaffected; matched template routes
 //! redirect a trailing slash away exactly like `http.Redirect`.
 
+use std::sync::OnceLock;
+
 use http::{header, HeaderValue, Method, Request, Response, StatusCode};
+use regex::Regex;
 use tonic::body::BoxBody;
 use uuid::Uuid;
 
@@ -70,6 +77,12 @@ const GITLAB_WEBHOOKS_PATH: &str = "/.api/gitlab-webhooks";
 const BITBUCKET_SERVER_WEBHOOKS_PATH: &str = "/.api/bitbucket-server-webhooks";
 const BITBUCKET_CLOUD_WEBHOOKS_PATH: &str = "/.api/bitbucket-cloud-webhooks";
 const OPENCODEGRAPH_PATH: &str = "/.api/opencodegraph";
+
+/// `routevar.RepoPattern` (`routevar/repo.go:30-35`) after
+/// `namedToNonCapturingGroups`: the gorilla `{Repo:...}` template body. A
+/// component is one or more of `[^@/-]` or a two-or-more character run
+/// without `@`/`/` — i.e. non-empty, no `@`, no `/`, and never exactly `-`.
+const REPO_PATTERN: &str = "(?:(?:[^@/-]|(?:[^/@]{2,}))/)*(?:[^@/-]|(?:[^/@]{2,}))";
 
 /// `srccli.MinimumVersion` (`internal/src-cli/consts.go:9`). The remote
 /// version cache is not ported, so `src_cli_version_handler.Version()`
@@ -115,6 +128,7 @@ enum Route {
     BitbucketServerWebhooks,
     BitbucketCloudWebhooks,
     OpenCodeGraph,
+    RepoShield { repo: String },
 }
 
 impl Route {
@@ -138,6 +152,7 @@ impl Route {
             Route::SrcCli { .. } | Route::ClientConfig | Route::ModelConfig => {
                 method == Method::GET
             }
+            Route::RepoShield { .. } => method == Method::GET,
             Route::WebhookUuid { .. }
             | Route::GitHubWebhooks
             | Route::GitLabWebhooks
@@ -224,7 +239,11 @@ pub fn api_response<B>(req: &Request<B>, _live: &LiveConfig) -> Response<BoxBody
         Route::GitLabWebhooks | Route::BitbucketServerWebhooks | Route::BitbucketCloudWebhooks => {
             empty_response(StatusCode::OK)
         }
-        Route::OpenCodeGraph => json_middleware_error_response(),
+        Route::OpenCodeGraph => error_handler_response(),
+        Route::RepoShield { repo } => {
+            debug_assert!(!repo.is_empty());
+            error_handler_response()
+        }
     }
 }
 
@@ -312,7 +331,29 @@ fn match_route(path: &str) -> Option<Route> {
     if path == MODEL_CONFIG_PATH {
         return Some(Route::ModelConfig);
     }
+    if let Some(caps) = repo_shield_regex().captures(path) {
+        return Some(Route::RepoShield {
+            repo: caps["Repo"].to_owned(),
+        });
+    }
     None
+}
+
+/// `repo.Path("/shield")` under the `/.api/repos/{Repo}/-/` subrouter
+/// (`httpapi.go:317-322`). gorilla concatenates the parent `PathPrefix`
+/// template with the child path and quotes it, so the compiled route is
+/// `^/\.api/repos/(?P<Repo>...)/-/shield$`; `StrictSlash`'s `[/]?` suffix is
+/// equivalent to the caller's strip-and-redirect branch, so it is omitted
+/// here. The Rust `regex` crate has the same leftmost-first semantics as Go's
+/// `regexp`, so `routevar.RepoPattern` is reused verbatim.
+fn repo_shield_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| {
+        Regex::new(&format!(
+            r"^/\.api/repos/(?P<Repo>{REPO_PATTERN})/-/shield$"
+        ))
+        .expect("repo shield route regexp")
+    })
 }
 
 /// gorilla's default variable pattern (`[^/]+`): one non-empty segment.
@@ -440,14 +481,15 @@ fn go_quote(value: &str) -> String {
     quoted
 }
 
-/// `JsonMiddleware` + `ErrorHandler.Handle` (`httpapi.go:405-453`) for a
-/// handler error: the middleware's `application/json` is overridden by
-/// `http.Error` to `text/plain; charset=utf-8`, `nosniff` is added,
-/// `Cache-Control: no-cache, max-age=0` is set, and — with
-/// `WriteErrBody=false` (the default) — only the trailing newline is
-/// written. `/.api/opencodegraph` takes this path with the default feature
-/// flags (`OpenCodeGraph is not enabled ...`, mapped to 500).
-fn json_middleware_error_response() -> Response<BoxBody> {
+/// `ErrorHandler.Handle` (`httpapi.go:405-441`) for a handler error under
+/// `JsonMiddleware` with `WriteErrBody=false` (the default): `http.Error`
+/// overrides the middleware's `application/json` to
+/// `text/plain; charset=utf-8`, adds `nosniff`, `Cache-Control:
+/// no-cache, max-age=0` is set, and only the trailing newline is written.
+/// `/.api/opencodegraph` (feature flag off) and `/.api/repos/{Repo}/-/shield`
+/// (`CountGoImporters` unsupported on self-hosted) both take this path with
+/// an `errcode.HTTP` mapping of 500.
+fn error_handler_response() -> Response<BoxBody> {
     let mut response = text_response(
         StatusCode::INTERNAL_SERVER_ERROR,
         "text/plain; charset=utf-8",
@@ -620,6 +662,78 @@ mod tests {
         assert_eq!(
             trailing.headers().get(header::LOCATION).unwrap(),
             "/.api/opencodegraph"
+        );
+    }
+
+    #[tokio::test]
+    async fn repo_shield_route() {
+        let live = live();
+        let response = api_response(
+            &request(Method::GET, "/.api/repos/github.com/foo/bar/-/shield"),
+            &live,
+        );
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "text/plain; charset=utf-8"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(header::X_CONTENT_TYPE_OPTIONS)
+                .unwrap(),
+            "nosniff"
+        );
+        assert_eq!(
+            response.headers().get(header::CACHE_CONTROL).unwrap(),
+            "no-cache, max-age=0"
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body[..], b"\n");
+
+        // `routevar.RepoPattern`: components are non-empty and free of `@`
+        // and `/`; a component that is exactly `-` is rejected while longer
+        // dashed components are accepted.
+        assert_eq!(
+            match_route("/.api/repos/foo/-/shield"),
+            Some(Route::RepoShield {
+                repo: "foo".to_owned(),
+            })
+        );
+        assert_eq!(
+            match_route("/.api/repos/foo-bar/-/shield"),
+            Some(Route::RepoShield {
+                repo: "foo-bar".to_owned(),
+            })
+        );
+        assert_eq!(
+            match_route("/.api/repos/foo/--/bar/-/shield"),
+            Some(Route::RepoShield {
+                repo: "foo/--/bar".to_owned(),
+            })
+        );
+        assert_eq!(match_route("/.api/repos/-/-/shield"), None);
+        assert_eq!(match_route("/.api/repos/foo@bar/-/shield"), None);
+        assert_eq!(match_route("/.api/repos/foo/-/shield/extra"), None);
+
+        assert_eq!(
+            api_response(&request(Method::POST, "/.api/repos/foo/-/shield"), &live).status(),
+            StatusCode::METHOD_NOT_ALLOWED
+        );
+        let trailing = api_response(&request(Method::GET, "/.api/repos/foo/-/shield/"), &live);
+        assert_eq!(trailing.status(), StatusCode::MOVED_PERMANENTLY);
+        assert_eq!(
+            trailing.headers().get(header::LOCATION).unwrap(),
+            "/.api/repos/foo/-/shield"
+        );
+
+        // gorilla `Router.ServeHTTP` cleans the path first: a doubled slash
+        // is redirected before route matching.
+        let cleaned = api_response(&request(Method::GET, "/.api/repos//-/shield"), &live);
+        assert_eq!(cleaned.status(), StatusCode::MOVED_PERMANENTLY);
+        assert_eq!(
+            cleaned.headers().get(header::LOCATION).unwrap(),
+            "/.api/repos/-/shield"
         );
     }
 
