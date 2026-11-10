@@ -1791,6 +1791,17 @@ pub trait RepositoryLookup: Send + Sync {
         authenticated_user_id: i32,
         bypass_authz: bool,
     ) -> Result<RepoLookup, String>;
+
+    /// `repoStore.GetByHashedName` (`internal/database/repos.go:242-263`) for
+    /// `Query.repositoryRedirect(hashedName:)`. Unlike by-name lookups a
+    /// missing repository is an error (`RepoNotFoundErr`), not `null`; the
+    /// same authz predicate and blocked-repository handling apply.
+    async fn by_hashed_name(
+        &self,
+        hashed_name: &str,
+        authenticated_user_id: i32,
+        bypass_authz: bool,
+    ) -> Result<RepoLookup, String>;
 }
 
 /// What `Query.repository` arguments ask for.
@@ -1850,6 +1861,81 @@ pub async fn prefetch_repositories(
         repositories.insert(key, lookup);
     }
     repositories
+}
+
+/// `Query.repositoryRedirect`'s lookup key. `hashedName` is checked first
+/// (`graphqlbackend.go:961-975`); `name` uses the same `GetByName` lookup as
+/// `Query.repository`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum RepositoryRedirectKey {
+    Name(String),
+    Hashed(String),
+}
+
+/// What `Query.repositoryRedirect` arguments ask for.
+pub enum RepositoryRedirectArg {
+    Key(RepositoryRedirectKey),
+    /// `cloneURL` needs `internal/cloneurls` (code-host configuration), not
+    /// ported yet; reported as an unported resolver, like `Query.repository`.
+    CloneUrl,
+    /// Neither `name` nor `cloneURL` (nor `hashedName`): the baseline errors.
+    Missing,
+}
+
+/// `schemaResolver.RepositoryRedirect` argument precedence
+/// (`graphqlbackend.go:961-1001`): `hashedName`, then `name`, then
+/// `cloneURL`.
+pub fn repository_redirect_arg(arguments: &Arguments) -> RepositoryRedirectArg {
+    if let Some(hashed_name) = arguments.string("hashedName") {
+        return RepositoryRedirectArg::Key(RepositoryRedirectKey::Hashed(
+            hashed_name.to_owned(),
+        ));
+    }
+    if let Some(name) = arguments.string("name") {
+        return RepositoryRedirectArg::Key(RepositoryRedirectKey::Name(name.to_owned()));
+    }
+    if arguments.string("cloneURL").is_some() {
+        return RepositoryRedirectArg::CloneUrl;
+    }
+    RepositoryRedirectArg::Missing
+}
+
+/// Look up every `Query.repositoryRedirect` root field in `fields`.
+/// `hashedName` misses are `RepoLookup::Error` (the baseline's
+/// `RepoNotFoundErr`), while `name` misses stay `RepoLookup::NotFound`
+/// (`errcode.IsNotFound` → GraphQL `null`).
+pub async fn prefetch_repository_redirects(
+    store: &dyn RepositoryLookup,
+    fields: &[RootField],
+    actor: Actor,
+    actor_site_admin: bool,
+) -> HashMap<RepositoryRedirectKey, RepoLookup> {
+    let authenticated_user_id = actor.uid().unwrap_or(0);
+    let bypass_authz = actor.is_authenticated() && actor_site_admin;
+    let mut redirects = HashMap::new();
+    for field in fields {
+        if field.name != "repositoryRedirect" {
+            continue;
+        }
+        let RepositoryRedirectArg::Key(key) = repository_redirect_arg(&field.arguments) else {
+            continue;
+        };
+        if redirects.contains_key(&key) {
+            continue;
+        }
+        let lookup = match &key {
+            RepositoryRedirectKey::Hashed(hashed_name) => store
+                .by_hashed_name(hashed_name, authenticated_user_id, bypass_authz)
+                .await,
+            RepositoryRedirectKey::Name(name) => {
+                store
+                    .lookup(name, authenticated_user_id, bypass_authz)
+                    .await
+            }
+        };
+        redirects.insert(key, lookup.unwrap_or_else(RepoLookup::Error));
+    }
+    redirects
 }
 
 /// Root objects for the assembled OSS schema.
@@ -1992,6 +2078,7 @@ impl FrontendRootResolver {
                 nested: Arc::new(NestedPrefetch::default()),
                 nodes: NodeRoots::default(),
                 namespaces: NamespaceRoots::default(),
+                repository_redirects: HashMap::new(),
                 temporary_settings: None,
                 client_configuration: None,
             },
@@ -2002,6 +2089,15 @@ impl FrontendRootResolver {
     /// Attach the request's pre-executed `Mutation` root fields.
     pub fn with_mutation(mut self, mutation: crate::settings_mutation::MutationRoot) -> Self {
         self.mutation = mutation;
+        self
+    }
+
+    /// Attach the request's prefetched `Query.repositoryRedirect` results.
+    pub fn with_repository_redirects(
+        mut self,
+        redirects: HashMap<RepositoryRedirectKey, RepoLookup>,
+    ) -> Self {
+        self.query.repository_redirects = redirects;
         self
     }
 
@@ -2074,6 +2170,9 @@ struct QueryRoot {
     /// Prefetched `Query.namespace`/`Query.namespaceByName` results (see
     /// [`prefetch_namespace_roots`]).
     namespaces: NamespaceRoots,
+    /// Prefetched `Query.repositoryRedirect` results (see
+    /// [`prefetch_repository_redirects`]).
+    repository_redirects: HashMap<RepositoryRedirectKey, RepoLookup>,
     /// Prefetched `Query.temporarySettings` contents (see
     /// [`crate::temporary_settings::prefetch_temporary_settings`]).
     temporary_settings: Option<Result<String, String>>,
@@ -2180,6 +2279,30 @@ impl ObjectValue for QueryRoot {
                 },
                 RepositoryArg::CloneUrl => Ok(None),
                 RepositoryArg::Missing => Err(ExecError::new("neither name nor cloneURL given")),
+            },
+            // `schemaResolver.RepositoryRedirect`
+            // (`graphqlbackend.go:961-1001`): `hashedName` misses are errors,
+            // `name` misses are `null`; the `Redirect` union member is
+            // unreachable in this snapshot (`ErrRepoSeeOther` is never
+            // constructed).
+            "repositoryRedirect" => match repository_redirect_arg(arguments) {
+                RepositoryRedirectArg::Key(key) => match self.repository_redirects.get(&key) {
+                    Some(RepoLookup::Found(data)) => Ok(Some(FieldValue::Object(Arc::new(
+                        RepositoryObject::from_data(data.clone()),
+                    )))),
+                    Some(RepoLookup::NotFound) => Ok(Some(FieldValue::Null)),
+                    Some(RepoLookup::Blocked { name, reason }) => Err(ExecError::new(format!(
+                        "repository {name} has been blocked. reason: {reason}"
+                    ))),
+                    Some(RepoLookup::Error(message)) => Err(ExecError::new(message.clone())),
+                    // No prefetch was performed for this request.
+                    None => Ok(None),
+                },
+                // `cloneURL` needs `internal/cloneurls`, not ported yet.
+                RepositoryRedirectArg::CloneUrl => Ok(None),
+                RepositoryRedirectArg::Missing => {
+                    Err(ExecError::new("neither name nor cloneURL given"))
+                }
             },
             // `schemaResolver.User` (`user.go:30-73`): username, then
             // databaseID, then verified email; not-found is `null`.
@@ -5238,6 +5361,118 @@ mod tests {
         ) -> Result<RepoLookup, String> {
             Ok(RepoLookup::NotFound)
         }
+
+        async fn by_hashed_name(
+            &self,
+            hashed_name: &str,
+            _authenticated_user_id: i32,
+            _bypass_authz: bool,
+        ) -> Result<RepoLookup, String> {
+            Ok(self
+                .0
+                .get(hashed_name)
+                .cloned()
+                .unwrap_or_else(|| RepoLookup::Error("repo not found".to_owned())))
+        }
+    }
+
+    fn redirect_schema() -> sg_graphql::Schema {
+        assemble_sdl(
+            "type Query { \
+                 repositoryRedirect(name: String, cloneURL: String, hashedName: String): RepositoryRedirect \
+             } \
+             union RepositoryRedirect = Repository | Redirect \
+             type Repository { id: ID! name: String! url: String! } \
+             type Redirect { url: String! }",
+        )
+        .expect("schema")
+    }
+
+    async fn run_repository_redirect(
+        query: &str,
+        lookups: &[(&str, RepoLookup)],
+    ) -> String {
+        let schema = redirect_schema();
+        let variables = Map::new();
+        let request = ExecRequest {
+            query,
+            operation_name: "",
+            variables: &variables,
+            actor: Actor::Anonymous,
+        };
+        let fields = sg_graphql::exec::root_fields(&schema, &request);
+        let store = FakeRepositories(
+            lookups
+                .iter()
+                .map(|(key, value)| ((*key).to_owned(), value.clone()))
+                .collect(),
+        );
+        let redirects =
+            prefetch_repository_redirects(&store, &fields, Actor::Anonymous, false).await;
+        let roots = FrontendRootResolver::new().with_repository_redirects(redirects);
+        execute_with(&schema, request, Some(&roots)).to_json()
+    }
+
+    #[tokio::test]
+    async fn repository_redirect_name_hit_and_miss() {
+        let body = "{ repositoryRedirect(name: \"github.com/a/b\") { \
+                      __typename ... on Repository { name url } ... on Redirect { url } } }";
+        assert_eq!(
+            run_repository_redirect(
+                body,
+                &[(
+                    "github.com/a/b",
+                    RepoLookup::Found(repository_data("github.com/a/b")),
+                )]
+            )
+            .await,
+            r#"{"data":{"repositoryRedirect":{"__typename":"Repository","name":"github.com/a/b","url":"/github.com/a/b"}}}"#
+        );
+        assert_eq!(
+            run_repository_redirect(body, &[]).await,
+            r#"{"data":{"repositoryRedirect":null}}"#
+        );
+    }
+
+    #[tokio::test]
+    async fn repository_redirect_hashed_name_errors_when_missing() {
+        let body =
+            "{ repositoryRedirect(hashedName: \"abc\") { ... on Repository { name } } }";
+        assert_eq!(
+            run_repository_redirect(body, &[]).await,
+            r#"{"errors":[{"message":"repo not found","path":["repositoryRedirect"]}],"data":{"repositoryRedirect":null}}"#
+        );
+        // `hashedName` wins over `name` (`graphqlbackend.go:961-975`).
+        assert_eq!(
+            run_repository_redirect(
+                "{ repositoryRedirect(name: \"ignored\", hashedName: \"abc\") { \
+                   ... on Repository { name } } }",
+                &[
+                    ("ignored", RepoLookup::Found(repository_data("ignored"))),
+                    ("abc", RepoLookup::Found(repository_data("github.com/h"))),
+                ]
+            )
+            .await,
+            r#"{"data":{"repositoryRedirect":{"name":"github.com/h"}}}"#
+        );
+    }
+
+    #[tokio::test]
+    async fn repository_redirect_argument_errors_and_clone_url_gap() {
+        assert_eq!(
+            run_repository_redirect("{ repositoryRedirect { ... on Repository { name } } }", &[])
+                .await,
+            r#"{"errors":[{"message":"neither name nor cloneURL given","path":["repositoryRedirect"]}],"data":{"repositoryRedirect":null}}"#
+        );
+        assert_eq!(
+            run_repository_redirect(
+                "{ repositoryRedirect(cloneURL: \"https://example.com/r.git\") { \
+                   ... on Repository { name } } }",
+                &[]
+            )
+            .await,
+            r#"{"errors":[{"message":"GraphQL field \"repositoryRedirect\" of \"Query\" has no ported resolver","path":["repositoryRedirect"]}],"data":{"repositoryRedirect":null}}"#
+        );
     }
 
     async fn run_repository(query: &str, actor: Actor, lookups: &[(&str, RepoLookup)]) -> String {

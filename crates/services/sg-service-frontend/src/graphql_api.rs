@@ -558,6 +558,20 @@ impl GraphqlDeps for SchemaGraphqlDeps {
             }
             None => std::collections::HashMap::new(),
         };
+        // `Query.repositoryRedirect` shares the repository store and authz
+        // predicate with `Query.repository`.
+        let repository_redirects = match &self.repositories {
+            Some(store) => {
+                crate::graphql_resolvers::prefetch_repository_redirects(
+                    store.as_ref(),
+                    &fields,
+                    request.actor,
+                    site_admin,
+                )
+                .await
+            }
+            None => std::collections::HashMap::new(),
+        };
         let users = match &self.users {
             Some(store) => crate::graphql_resolvers::prefetch_users(store.as_ref(), &fields).await,
             None => std::collections::HashMap::new(),
@@ -730,6 +744,7 @@ impl GraphqlDeps for SchemaGraphqlDeps {
             .with_nested(nested)
             .with_nodes(nodes)
             .with_namespaces(namespaces)
+            .with_repository_redirects(repository_redirects)
             .with_temporary_settings(temporary_settings)
             .with_mutation(mutation);
         if let Some(client_configuration) = client_configuration {

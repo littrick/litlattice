@@ -93,4 +93,33 @@ impl RepositoryLookup for PgRepositoryStore {
         }
         Ok(RepoLookup::Found(to_repo_data(record)))
     }
+
+    /// `repoStore.GetByHashedName`: a missing repository is the
+    /// `RepoNotFoundErr` resolver error (`repo not found`), and a blocked
+    /// repository surfaces `BlockedRepoError`.
+    async fn by_hashed_name(
+        &self,
+        hashed_name: &str,
+        authenticated_user_id: i32,
+        bypass_authz: bool,
+    ) -> Result<RepoLookup, String> {
+        let record = sg_db::repository_lookup::find_by_hashed_name(
+            &self.pool,
+            hashed_name,
+            authenticated_user_id,
+            bypass_authz,
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+        let Some(record) = record else {
+            return Ok(RepoLookup::Error("repo not found".to_owned()));
+        };
+        if let Some(reason) = record.blocked_reason {
+            return Ok(RepoLookup::Blocked {
+                name: record.name,
+                reason,
+            });
+        }
+        Ok(RepoLookup::Found(to_repo_data(record)))
+    }
 }

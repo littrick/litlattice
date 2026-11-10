@@ -160,7 +160,59 @@ LIMIT 1
     row.map(record_from_row).transpose()
 }
 
-/// The `repo` columns shared by the by-name/URI and by-ID lookups.
+/// `repoStore.GetByHashedName` (`internal/database/repos.go:242-263`): the
+/// target is the SHA-256 of the lowercased repository name, computed in SQL so
+/// the `repo_hashed_name_idx` partial index applies. Same authz predicate and
+/// `deleted_at IS NULL` filter as [`find_by_id`]; blocked repositories are
+/// returned with their reason.
+pub async fn find_by_hashed_name(
+    pool: &PgPool,
+    hashed_name: &str,
+    authenticated_user_id: i32,
+    bypass_authz: bool,
+) -> Result<Option<RepoLookupRecord>, sqlx::Error> {
+    let row = sqlx::query(&format!(
+        r#"
+SELECT
+{REPO_COLUMNS}
+FROM repo r
+WHERE r.deleted_at IS NULL
+  AND sha256(lower(r.name)::bytea) = decode($1, 'hex')
+  AND (
+	$2
+	OR EXISTS (
+		SELECT FROM user_repo_permissions
+		WHERE repo_id = r.id AND user_id IS NULL
+	)
+	OR NOT r.private
+	OR EXISTS (
+		SELECT FROM external_services es
+		JOIN external_service_repos esr ON (
+			esr.external_service_id = es.id
+			AND esr.repo_id = r.id
+			AND es.unrestricted = TRUE
+			AND es.deleted_at IS NULL
+		)
+	)
+	OR EXISTS (
+		SELECT repo_id FROM user_repo_permissions
+		WHERE repo_id = r.id AND user_id = $3
+	)
+  )
+LIMIT 1
+"#
+    ))
+    .bind(hashed_name)
+    .bind(bypass_authz)
+    .bind(authenticated_user_id)
+    .fetch_optional(pool)
+    .await?;
+
+    row.map(record_from_row).transpose()
+}
+
+/// The `repo` columns shared by the by-name/URI, by-ID and by-hashed-name
+/// lookups.
 const REPO_COLUMNS: &str = r#"
 	r.id,
 	r.name,
