@@ -156,6 +156,17 @@ impl Service for FrontendService {
             .clone()
             .ok_or_else(|| ServiceError::new("frontend configuration was not loaded"))?;
 
+        // `internal/tracer.Init` (`serve_cmd.go`): apply the initial trace
+        // policy and install the tracer runtime. The exporter is an injectable
+        // seam here; passing `None` means no spans leave the process. The
+        // baseline's `conf.Watch` update is the per-generation
+        // `trace_policy::apply_tracing_config` hook in `middleware`.
+        let trace_startup = crate::trace_policy::plan_otel_startup(
+            crate::trace_policy::tracing_config_from_site(&self.site_config).as_ref(),
+            crate::trace_policy::get_trace_policy(),
+        );
+        let _tracer = crate::trace_policy::init_tracer(&trace_startup, None);
+
         // Baseline `serve_cmd.go:134-139`: apply the `SITE_CONFIG_FILE`
         // override first, then start the configuration service. Like the
         // baseline (whose `InitDB` fails before this point), the process needs
@@ -414,6 +425,22 @@ impl Service for FrontendService {
                 .with_clone_urls(clone_url_resolver)
                 .with_log_events(log_events_store, Arc::clone(wiring.live()))
                 .with_site_configuration(Arc::clone(wiring.store()), Arc::clone(wiring.server()));
+        // M9.8jf: `Query.slowRequests` reads the FIFO list whose capacity is
+        // `observability.captureSlowGraphQLRequestsLimit` (`conf.Get()` per
+        // request in the baseline; here from the current configuration
+        // snapshot). The GraphQL capture point is not ported yet, so the
+        // in-memory store starts empty.
+        let slow_requests_limit =
+            crate::trace_policy::capture_slow_graphql_requests_limit(&wiring.live().current().site);
+        let slow_requests_store: Arc<dyn crate::slow_requests_tracer::SlowRequestStore> = Arc::new(
+            crate::slow_requests_tracer::InMemorySlowRequestStore::new(slow_requests_limit),
+        );
+        let graphql_deps = graphql_deps.with_slow_requests(Arc::new(
+            crate::slow_requests_tracer::SlowRequestsSurface::new(
+                slow_requests_store,
+                slow_requests_limit,
+            ),
+        ));
         // M9.8ii: `internal/searchcontexts/init.go` installs the resolver only
         // when search contexts are enabled; the Pg store is registered through
         // the same optional seam.

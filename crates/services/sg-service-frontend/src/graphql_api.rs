@@ -432,6 +432,9 @@ pub struct SchemaGraphqlDeps {
     /// `None` makes `symbols`/`symbol` report `symbols: no endpoints
     /// configured`.
     symbols: Option<Arc<dyn crate::search_searcher_client::SymbolsClient + Send + Sync>>,
+    /// `Query.slowRequests`'s capture-list seam (M9.8jf). `None` keeps the
+    /// field unported (the pre-wiring frontend).
+    slow_requests: Option<Arc<crate::slow_requests_tracer::SlowRequestsSurface>>,
 }
 
 impl SchemaGraphqlDeps {
@@ -463,6 +466,7 @@ impl SchemaGraphqlDeps {
             search_executor: None,
             git_objects: None,
             symbols: None,
+            slow_requests: None,
         }
     }
 
@@ -511,6 +515,7 @@ impl SchemaGraphqlDeps {
             search_executor: None,
             git_objects: None,
             symbols: None,
+            slow_requests: None,
         }
     }
 
@@ -747,6 +752,18 @@ impl SchemaGraphqlDeps {
         self
     }
 
+    /// Wire the `Query.slowRequests` capture-list seam (M9.8jf).
+    ///
+    /// The surface carries the FIFO store and the configured capture limit;
+    /// when never called the field keeps its pre-wiring (unported) behavior.
+    pub fn with_slow_requests(
+        mut self,
+        surface: Arc<crate::slow_requests_tracer::SlowRequestsSurface>,
+    ) -> Self {
+        self.slow_requests = Some(surface);
+        self
+    }
+
     /// Assemble the M9.8ii production surfaces in one testable step.
     ///
     /// This is the same chain `service.rs` uses: search contexts are gated by
@@ -815,6 +832,7 @@ impl SchemaGraphqlDeps {
             search_executor: None,
             git_objects: None,
             symbols: None,
+            slow_requests: None,
         }
     }
 }
@@ -1297,6 +1315,9 @@ impl GraphqlDeps for SchemaGraphqlDeps {
             .with_ranking_roots(ranking_roots)
             .with_search_roots(search_root)
             .with_git(git);
+        if let Some(surface) = &self.slow_requests {
+            roots = roots.with_slow_requests(Arc::clone(surface));
+        }
         if let Some(client_configuration) = client_configuration {
             roots = roots.with_client_configuration(client_configuration);
         }

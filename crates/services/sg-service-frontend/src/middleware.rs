@@ -35,6 +35,7 @@ use crate::mux::{self, SecurityConfig};
 use crate::search_stream::SearchDeps;
 use crate::tenant;
 use crate::trace_headers;
+use crate::trace_policy;
 
 /// `middleware.isBlackhole`.
 pub fn is_blackhole<B>(req: &Request<B>) -> bool {
@@ -130,6 +131,13 @@ pub fn external_response_with_ipallowlist<B>(
     if let Err(response) = tenant::external_tenant_from_hostname(req, tenant::fixed_tenant_one) {
         return response;
     }
+    // `instrumentation.HTTPMiddleware` decides the per-request shouldTrace
+    // value before starting the span; keep it on the request for inner layers
+    // (GraphQL/slow-request capture). The trace response headers below are
+    // unaffected.
+    let should_trace = trace_policy::request_should_trace(req.headers(), req.uri().query());
+    req.extensions_mut()
+        .insert(trace_policy::ShouldTrace(should_trace));
     let trace = trace_headers::TraceIds::generate();
     let mut response = (|| {
         if forbid_all {
@@ -178,6 +186,9 @@ where
     if let Err(response) = tenant::external_tenant_from_hostname(req, tenant::fixed_tenant_one) {
         return response;
     }
+    let should_trace = trace_policy::request_should_trace(req.headers(), req.uri().query());
+    req.extensions_mut()
+        .insert(trace_policy::ShouldTrace(should_trace));
     let trace = trace_headers::TraceIds::generate();
     let mut response = if forbid_all {
         auth::forbidden_response()
@@ -289,6 +300,9 @@ impl DerivedConfig {
         app_deps: Arc<AppDeps>,
         sign_out_factory: Option<&SignOutFactory>,
     ) -> Self {
+        // `conf.Watch` equivalent (`internal/tracer.newConfWatcher`): refresh
+        // the process-global trace policy for each configuration generation.
+        crate::trace_policy::apply_tracing_config(site);
         let security = SecurityConfig::from_site_config(site);
         let app_deps = match sign_out_factory {
             Some(factory) => {
