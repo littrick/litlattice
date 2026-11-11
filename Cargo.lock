@@ -4240,6 +4240,8 @@ name = "sg-search-query"
 version = "0.1.0"
 dependencies = [
  "regex-syntax",
+ "serde",
+ "serde_json",
  "sg-jsonx",
 ]
 
