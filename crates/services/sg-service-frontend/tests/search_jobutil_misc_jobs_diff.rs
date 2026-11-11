@@ -878,6 +878,7 @@ fn run_job(job: &mut dyn SearchJob) -> (Vec<SearchEvent>, Option<JobError>) {
         max_repos: None,
         searcher: None,
         commit: None,
+        repo_pager: None,
     };
     let ctx = JobContext::default();
     let mut events = Vec::new();

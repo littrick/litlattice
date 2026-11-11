@@ -7,11 +7,15 @@
 //! `ToFeatures`, `getBoolPtr`, `QueryError` and the parts of `search.Inputs`
 //! this slice produces.
 //!
-//! Not ported: `Execute`/the job tree, and `sanitizeSearchPatterns`'s
-//! site-config/actor/DB walk — its final value is injected through
-//! [`PlanDeps::sanitize_search_patterns`]. Search-context resolution, user
-//! settings and feature flags are likewise injected so no real database is
-//! needed.
+//! `sanitizeSearchPatterns` is ported as [`sanitize_search_patterns`] over
+//! the injected [`SanitizeDeps`] (site config, actor, user and org stores);
+//! [`sanitize_patterns_loader`] adapts it to the
+//! [`PlanDeps::sanitize_search_patterns`] call site. The production
+//! configuration/DB wiring is a parent-layer concern. Search-context
+//! resolution, user settings and feature flags are likewise injected so no
+//! real database is needed.
+//!
+//! Not ported: `Execute`/the job tree.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -25,6 +29,8 @@ use sg_search_query::node::{
 use sg_search_query::parser::{parse, SearchType};
 use sg_search_query::pipeline::{init, pipeline, substitute_search_contexts, with_step};
 use sg_search_query::transformer::lowercase_field_names;
+
+use crate::actor_middleware::Actor;
 
 /// `search.Mode` (`internal/search/types.go:65-70`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -142,6 +148,98 @@ pub type FeatureFlagLoader = Box<dyn Fn() -> BTreeMap<String, bool> + Send + Syn
 pub type SearchContextResolver = Arc<dyn Fn(&str) -> Result<String, String> + Send + Sync>;
 pub type SanitizePatternsLoader = Box<dyn Fn() -> Vec<String> + Send + Sync>;
 
+/// `schema.SettingsExperimentalFeatures.SearchSanitization`
+/// (`client.go:183-216`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SearchSanitization {
+    pub org_name: String,
+    pub sanitize_patterns: Vec<String>,
+}
+
+/// The `database.User` fields `sanitizeSearchPatterns` reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SanitizeUser {
+    pub id: i32,
+    pub site_admin: bool,
+}
+
+/// `db.Orgs().GetByUserID` failure; `sanitizeSearchPatterns` swallows it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OrgLookupError;
+
+/// Injected collaborators of [`sanitize_search_patterns`]: `conf.Get()`,
+/// `actor.FromContext`, `db.Users()` and `db.Orgs()`.
+pub trait SanitizeDeps: Send + Sync {
+    /// `conf.Get().ExperimentalFeatures.SearchSanitization`.
+    fn search_sanitization(&self) -> Option<SearchSanitization>;
+    /// `actor.FromContext(ctx)`.
+    fn actor(&self) -> Actor;
+    /// `actr.User(ctx, db.Users())`: `None` models the error path.
+    fn user(&self, id: i32) -> Option<SanitizeUser>;
+    /// `db.Orgs().GetByUserID` names; `Err` models a DB error.
+    fn user_org_names(&self, user_id: i32) -> Result<Vec<String>, OrgLookupError>;
+    /// `log.Warn(message)`.
+    fn warn(&self, message: &str);
+}
+
+/// `sanitizeSearchPatterns` (`internal/search/client/client.go:183-216`).
+///
+/// Returns the source text of the configured patterns that compile, unless
+/// sanitization is disabled, the actor is internal, the user is a site admin
+/// or belongs to the exempt org. The baseline returns `[]*regexp.Regexp`;
+/// [`crate::search_jobutil_tree::TreeInputs::sanitize_search_patterns`] stores
+/// the pattern strings, so only the sources are kept.
+pub fn sanitize_search_patterns(deps: &dyn SanitizeDeps) -> Vec<String> {
+    let mut sanitize_patterns: Vec<String> = Vec::new();
+
+    let Some(sanitization) = deps.search_sanitization() else {
+        return sanitize_patterns;
+    };
+
+    let actr = deps.actor();
+    if actr.is_internal() {
+        return Vec::new();
+    }
+
+    for pattern in &sanitization.sanitize_patterns {
+        if regex::Regex::new(pattern).is_err() {
+            deps.warn("invalid regex pattern provided, ignoring");
+        } else {
+            sanitize_patterns.push(pattern.clone());
+        }
+    }
+
+    let Some(user) = deps.user(actr.uid) else {
+        deps.warn("search being run as invalid user");
+        return sanitize_patterns;
+    };
+
+    if user.site_admin {
+        return Vec::new();
+    }
+
+    if !sanitization.org_name.is_empty() {
+        match deps.user_org_names(user.id) {
+            // DB error: keep the compiled patterns (the baseline swallows it).
+            Err(OrgLookupError) => return sanitize_patterns,
+            Ok(org_names) => {
+                if org_names.iter().any(|name| name == &sanitization.org_name) {
+                    return Vec::new();
+                }
+            }
+        }
+    }
+
+    sanitize_patterns
+}
+
+/// Adapts [`SanitizeDeps`] to the [`PlanDeps::sanitize_search_patterns`]
+/// injection point; the production configuration/DB wiring is a parent-layer
+/// concern.
+pub fn sanitize_patterns_loader(deps: Arc<dyn SanitizeDeps>) -> SanitizePatternsLoader {
+    Box::new(move || sanitize_search_patterns(deps.as_ref()))
+}
+
 /// Injected dependencies of [`SearchClient::plan`].
 ///
 /// The baseline reaches these through `settings.Service`, `featureflag` and
@@ -154,7 +252,7 @@ pub struct PlanDeps {
     pub feature_flags: FeatureFlagLoader,
     /// `searchcontexts.ResolveSearchContextSpec` -> `sc.Query`.
     pub resolve_search_context: SearchContextResolver,
-    /// `sanitizeSearchPatterns` (not ported in this slice).
+    /// `sanitizeSearchPatterns`; wire [`sanitize_patterns_loader`] here.
     pub sanitize_search_patterns: SanitizePatternsLoader,
     /// `searchClient.sourcegraphDotComMode`.
     pub on_sourcegraph_dot_com: bool,

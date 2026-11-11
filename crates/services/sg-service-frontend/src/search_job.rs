@@ -149,6 +149,19 @@ pub trait PrivateRepoLister {
     fn list_minimal_repos(&self, options: &ReposListOptions) -> Result<Vec<MinimalRepo>, JobError>;
 }
 
+/// `repos.Resolver.Iterator` + `zoekt.Streamer.List` collaborators the
+/// `RepoPagerJob` tree node needs (`repo_pager_job.go:19-27,95-136`).
+pub struct RepoPagerClients<'a> {
+    pub pages: &'a dyn crate::search_jobutil_repos::RepoPageSource,
+    pub zoekt: &'a dyn crate::search_jobutil_repos::ZoektRepoLister,
+}
+
+impl std::fmt::Debug for RepoPagerClients<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RepoPagerClients").finish_non_exhaustive()
+    }
+}
+
 /// `job.RuntimeClients`, reduced to what these jobs read.
 pub struct RuntimeClients<'a> {
     /// `clients.DB` (only `Repos().ListMinimalRepos` is used).
@@ -173,6 +186,12 @@ pub struct RuntimeClients<'a> {
     ///
     /// Additive: the jobs in this module never read it.
     pub commit: Option<&'a crate::search_commit_job::CommitRuntimeClients<'a>>,
+    /// Injected repository-pager collaborators (`repos.Resolver.Iterator` and
+    /// `zoekt.Streamer.List`). `None` keeps the explicit
+    /// `RepoPagerJob execution is not ported (M9.8hw)` error for tree nodes.
+    ///
+    /// Additive: no job in this module reads it.
+    pub repo_pager: Option<&'a RepoPagerClients<'a>>,
 }
 
 impl RuntimeClients<'_> {
@@ -560,6 +579,7 @@ mod tests {
             max_repos: None,
             searcher: None,
             commit: None,
+            repo_pager: None,
         }
     }
 

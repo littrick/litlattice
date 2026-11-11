@@ -1004,6 +1004,7 @@ fn run_alert(case: &Case) -> Value {
         max_repos: None,
         searcher: None,
         commit: None,
+        repo_pager: None,
     };
     let (events, alert, error) = run_node(&mut node, case, &clients);
 
@@ -1029,6 +1030,7 @@ fn run_select(case: &Case) -> Value {
         max_repos: None,
         searcher: None,
         commit: None,
+        repo_pager: None,
     };
     let (events, alert, error) = run_node(&mut node, case, &clients);
 
@@ -1089,6 +1091,7 @@ fn run_commit(case: &Case) -> Value {
         max_repos: None,
         searcher: None,
         commit: Some(&commit_clients),
+        repo_pager: None,
     };
 
     let mut node = JobNode::commit(query, repos, case.diff, case.limit);
@@ -1153,6 +1156,7 @@ fn commit_leaf_without_clients_reports_not_ported() {
         max_repos: None,
         searcher: None,
         commit: None,
+        repo_pager: None,
     };
     let ctx = JobContext::default();
     let (alert, error) = node.run_with_alert(&ctx, &clients, &mut |_| {});

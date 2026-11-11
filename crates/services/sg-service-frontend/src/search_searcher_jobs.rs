@@ -779,6 +779,7 @@ mod tests {
             max_repos: None,
             searcher: None,
             commit: None,
+            repo_pager: None,
         };
         let mut text = TextSearchJob {
             pattern_info: TextPatternInfo::default(),

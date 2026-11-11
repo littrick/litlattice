@@ -38,10 +38,11 @@ use sg_search_query::parser::SearchType;
 use sg_search_query::predicate::parse_as_predicate;
 use sg_search_query::validate::YesNoOnly;
 use sg_zoekt::global_query::{default_global_query_scope, GlobalZoektQuery};
-use sg_zoekt::indexed_repo_revs::{IndexedRepoRevs, RepositoryRevisions};
+use sg_zoekt::indexed_repo_revs::{partition_repos, IndexedRepoRevs, RepositoryRevisions};
 use sg_zoekt::languages::lang_to_file_regexp;
 use sg_zoekt::query::{self as zoekt_query, IndexedRequestType};
 
+use crate::codycontext::{self, CodyContextJobParts, CodyContextOptions, CodyFileMatcher};
 use crate::search_client::{Features, Protocol, SearchMode};
 use crate::search_contexts::{parse_repository_revisions, ParsedRepoFilter, RepoVisibility};
 use crate::search_job::{
@@ -55,6 +56,7 @@ use crate::search_jobutil_filters::{
     patterns_in_tree, ContainsPatternError, ContainsPatternStage, PatternNode as FilterPatternNode,
 };
 use crate::search_jobutil_job_builders as jb;
+use crate::search_jobutil_repos::ResolvedRepos;
 use crate::search_stream::convert::Match;
 use crate::search_stream::progress::{RepoStatusMap, SearchEvent, Stats};
 use crate::search_stream::zoekt_search::{SelectPath, ZoektParameters};
@@ -81,6 +83,10 @@ pub struct TreeInputs {
     pub sub_repo_enabled: bool,
     /// `codycontext.NewSearchJob`; `None` means "not ported".
     pub cody_context_hook: Option<Box<CodyContextHook>>,
+    /// `Inputs.Features` fields `codycontext` reads
+    /// (`CodyContextCodeCount`, `CodyContextTextCount`, `CodyFileMatcher`).
+    /// `None` models `Inputs.Features == nil`.
+    pub cody_context: Option<CodyContextOptions>,
 }
 
 impl TreeInputs {
@@ -386,6 +392,10 @@ pub struct JobNode {
 #[derive(Debug, Clone, PartialEq)]
 enum NodeKind {
     Noop,
+    /// `codycontext.noopJob` (`codycontext/job.go:269-279`): a *different*
+    /// Go type from `jobutil.NoopJob`, so `NewAlertJob` still wraps it in an
+    /// `AlertJob`.
+    CodyNoop,
     Or,
     And,
     Parallel,
@@ -477,9 +487,23 @@ enum NodeKind {
     SelectOwners,
     Sanitize,
     SubRepoPerms,
+    /// `codycontext.searchJob` (`codycontext/job.go:234-265`). The baseline's
+    /// `Children()` is nil, so the three sub-jobs are stored out-of-line.
+    CodyContext {
+        symbol_job: Option<Box<JobNode>>,
+        code_job: Box<JobNode>,
+        text_job: Box<JobNode>,
+        patterns: Vec<String>,
+        code_count: i32,
+        text_count: i32,
+        file_matcher: CodyFileMatcher,
+    },
     RepoPager {
         repo_opts: TreeRepoOptions,
         contains_ref_globs: bool,
+        /// `repoPagerJob.skipPartitioning` (`repo_pager_job.go:25-27`);
+        /// commit/diff pagers set it, text/symbol pagers leave it false.
+        skip_partitioning: bool,
     },
     ReposPartial,
     RepoSearch {
@@ -537,7 +561,7 @@ impl JobNode {
 
     fn name_str(&self) -> &'static str {
         match &self.kind {
-            NodeKind::Noop => "NoopJob",
+            NodeKind::Noop | NodeKind::CodyNoop => "NoopJob",
             NodeKind::Or => "OrJob",
             NodeKind::And => "AndJob",
             NodeKind::Parallel => "ParallelJob",
@@ -568,6 +592,7 @@ impl JobNode {
             NodeKind::SelectOwners => "SelectOwnersSearchJob",
             NodeKind::Sanitize => "SanitizeJob",
             NodeKind::SubRepoPerms => "SubRepoPermsFilterJob",
+            NodeKind::CodyContext { .. } => "CodyContextSearchJob",
             NodeKind::RepoPager { .. } => "RepoPagerJob",
             NodeKind::ReposPartial => "PartialReposJob",
             NodeKind::RepoSearch { .. } => "RepoSearchJob",
@@ -578,6 +603,7 @@ impl JobNode {
     fn basic_attributes(&self) -> Vec<(String, String)> {
         match &self.kind {
             NodeKind::Noop
+            | NodeKind::CodyNoop
             | NodeKind::Or
             | NodeKind::And
             | NodeKind::Parallel
@@ -698,6 +724,19 @@ impl JobNode {
                 "select".to_owned(),
                 string_slice(select.iter().map(String::as_str)),
             )],
+            NodeKind::CodyContext {
+                patterns,
+                code_count,
+                text_count,
+                ..
+            } => vec![
+                (
+                    "patterns".to_owned(),
+                    string_slice(patterns.iter().map(String::as_str)),
+                ),
+                ("codeCount".to_owned(), code_count.to_string()),
+                ("textCount".to_owned(), text_count.to_string()),
+            ],
             NodeKind::RepoPager { repo_opts, .. } => repo_opts.scoped_attributes(),
             NodeKind::RepoSearch {
                 repo_opts,
@@ -714,7 +753,50 @@ impl JobNode {
     }
 }
 
+/// Read access to a [`NodeKind::CodyContext`] node's out-of-line sub-jobs
+/// (the baseline hides them behind `Children() == nil`).
+pub struct CodyContextView<'a> {
+    pub symbol_job: Option<&'a JobNode>,
+    pub code_job: &'a JobNode,
+    pub text_job: &'a JobNode,
+    pub patterns: &'a [String],
+    pub code_count: i32,
+    pub text_count: i32,
+    pub file_matcher: &'a CodyFileMatcher,
+}
+
 impl JobNode {
+    /// The codycontext sub-jobs, when this is a `CodyContextSearchJob`.
+    pub fn cody_context_view(&self) -> Option<CodyContextView<'_>> {
+        let NodeKind::CodyContext {
+            symbol_job,
+            code_job,
+            text_job,
+            patterns,
+            code_count,
+            text_count,
+            file_matcher,
+        } = &self.kind
+        else {
+            return None;
+        };
+        Some(CodyContextView {
+            symbol_job: symbol_job.as_deref(),
+            code_job,
+            text_job,
+            patterns,
+            code_count: *code_count,
+            text_count: *text_count,
+            file_matcher,
+        })
+    }
+
+    /// `fileMatcher(repoID, path)`; `None` for non-codycontext nodes.
+    pub fn file_matcher_accepts(&self, repo_id: i32, path: &str) -> Option<bool> {
+        self.cody_context_view()
+            .map(|view| view.file_matcher.accepts(repo_id, path))
+    }
+
     /// Runs the tree and exposes the baseline `(alert, error)` pair.
     ///
     /// [`SearchJob::run`] cannot carry an alert (the ported interface returns
@@ -846,6 +928,135 @@ impl comb::CombinatorJob for TreeLeafJob {
     }
 }
 
+/// `repoPagerJob` (`repo_pager_job.go:19-136`) wired to a [`JobNode`] child.
+///
+/// Per page: `MaybeSendStats` → `PartitionRepos(..., TextRequest, ...)` (all
+/// unindexed when `skipPartitioning`) → `setRepos` on the partial child →
+/// run it, aggregating alerts and stopping at the first child error; finally
+/// returns the page iterator's error.
+struct TreeRepoPagerJob {
+    repo_opts: TreeRepoOptions,
+    contains_ref_globs: bool,
+    skip_partitioning: bool,
+    /// `reposPartialJob.inner`; unresolved until a page arrives.
+    inner: JobNode,
+}
+
+impl comb::CombinatorJob for TreeRepoPagerJob {
+    fn run(
+        &mut self,
+        ctx: &comb::RunContext,
+        clients: &RuntimeClients<'_>,
+        stream: comb::Sender<'_>,
+    ) -> (Option<comb::Alert>, Option<comb::JobFailure>) {
+        let Some(repo_pager) = clients.repo_pager else {
+            return (
+                None,
+                Some(comb::JobFailure::Message(
+                    "RepoPagerJob execution is not ported (M9.8hw)".to_owned(),
+                )),
+            );
+        };
+
+        let max_alerter = comb::MaxAlerter::new();
+        let pages = repo_pager.pages.pages();
+        for page in &pages {
+            page.maybe_send_stats(stream);
+
+            let resolved = if self.skip_partitioning {
+                ResolvedRepos::new(None, page.repo_revs.clone())
+            } else {
+                // The baseline always passes `search.TextRequest`, including
+                // for symbol pagers (`repo_pager_job.go:105-113`).
+                match partition_repos(
+                    &page.repo_revs,
+                    IndexedRequestType::Text,
+                    self.repo_opts.use_index,
+                    self.contains_ref_globs,
+                    || repo_pager.zoekt.list(),
+                ) {
+                    Ok((indexed, unindexed)) => ResolvedRepos::new(Some(indexed), unindexed),
+                    Err(err) => {
+                        return (
+                            max_alerter.alert(),
+                            Some(comb::JobFailure::Message(err.to_string())),
+                        )
+                    }
+                }
+            };
+
+            let resolved_tree = set_tree_repos(&self.inner, &resolved);
+            let mut job = match resolved_tree.to_combinator() {
+                Ok(job) => job,
+                Err(err) => return (max_alerter.alert(), Some(comb::JobFailure::Message(err.0))),
+            };
+            let (alert, err) = job.run(ctx, clients, stream);
+            max_alerter.add(alert);
+            if let Some(err) = err {
+                return (max_alerter.alert(), Some(err));
+            }
+        }
+
+        match repo_pager.pages.error() {
+            Some(err) => (max_alerter.alert(), Some(comb::JobFailure::Message(err.0))),
+            None => (max_alerter.alert(), None),
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        "RepoPagerJob"
+    }
+}
+
+/// `setRepos` (`repo_pager_job.go:59-93`) over the modeled [`JobNode`]
+/// leaves: zoekt jobs receive the indexed set, commit jobs the unindexed
+/// list. Searcher/structural repo fields are not modeled yet; containers are
+/// rewritten bottom-up, as `job.Map` does.
+fn set_tree_repos(node: &JobNode, resolved: &ResolvedRepos) -> JobNode {
+    let kind = match &node.kind {
+        NodeKind::ZoektRepoSubsetText {
+            query,
+            zoekt_query_regexps,
+            zoekt_params,
+            ..
+        } => NodeKind::ZoektRepoSubsetText {
+            repos: resolved.indexed.clone(),
+            query: query.clone(),
+            zoekt_query_regexps: zoekt_query_regexps.clone(),
+            zoekt_params: zoekt_params.clone(),
+        },
+        NodeKind::ZoektSymbol {
+            query,
+            zoekt_params,
+            ..
+        } => NodeKind::ZoektSymbol {
+            repos: resolved.indexed.clone(),
+            query: query.clone(),
+            zoekt_params: zoekt_params.clone(),
+        },
+        NodeKind::Commit {
+            query,
+            git_query,
+            diff,
+            limit,
+            ..
+        } => NodeKind::Commit {
+            query: query.clone(),
+            git_query: git_query.clone(),
+            repos: resolved.unindexed.clone(),
+            diff: *diff,
+            limit: *limit,
+        },
+        other => other.clone(),
+    };
+    let children = node
+        .children
+        .iter()
+        .map(|child| set_tree_repos(child, resolved))
+        .collect();
+    JobNode { kind, children }
+}
+
 /// `searchalert.Observer` subset reachable from the tree (`observer.go:28-45,
 /// 177-219`): context errors are ignored, errors that `errorToAlert` cannot
 /// convert are accumulated, `Done` adds the structural-search hint and drops
@@ -968,13 +1179,35 @@ impl comb::CombinatorJob for CommitLeafJob {
 impl JobNode {
     /// Converts this tree into the executable combinator representation.
     fn to_combinator(&self) -> Result<Box<dyn comb::CombinatorJob>, JobError> {
+        // A pager resolves its partial child per page, so it cannot be
+        // converted bottom-up like the other nodes (`repo_pager_job.go:95-136`).
+        if let NodeKind::RepoPager {
+            repo_opts,
+            contains_ref_globs,
+            skip_partitioning,
+        } = &self.kind
+        {
+            let inner = self
+                .children
+                .first()
+                .and_then(|partial| partial.children.first())
+                .cloned()
+                .unwrap_or_else(new_noop_job);
+            return Ok(Box::new(TreeRepoPagerJob {
+                repo_opts: repo_opts.clone(),
+                contains_ref_globs: *contains_ref_globs,
+                skip_partitioning: *skip_partitioning,
+                inner,
+            }));
+        }
+
         let mut children = Vec::with_capacity(self.children.len());
         for child in &self.children {
             children.push(child.to_combinator()?);
         }
 
         Ok(match &self.kind {
-            NodeKind::Noop => comb::new_noop_job(),
+            NodeKind::Noop | NodeKind::CodyNoop => comb::new_noop_job(),
             // `LogJob.Run` only writes event logs when authenticated; events
             // and errors pass through unchanged.
             NodeKind::Log => only_child(children),
@@ -1110,6 +1343,13 @@ impl JobNode {
                     swallow_error_when_canceled: true,
                 })
             }
+            // The blocking collector (`searchJob.Run`) needs the unported
+            // result layer; the construction side is ported (M9.8ju).
+            NodeKind::CodyContext { .. } => {
+                return Err(JobError(
+                    "CodyContextSearchJob execution is not ported (M9.8ju)".to_owned(),
+                ));
+            }
             NodeKind::SearcherText
             | NodeKind::SearcherSymbol { .. }
             | NodeKind::Structural { .. }
@@ -1120,13 +1360,18 @@ impl JobNode {
             | NodeKind::SelectOwners
             | NodeKind::Sanitize
             | NodeKind::SubRepoPerms
-            | NodeKind::RepoPager { .. }
             | NodeKind::ReposPartial
             | NodeKind::RepoSearch { .. } => {
                 return Err(JobError(format!(
                     "{} execution is not ported (M9.8hw)",
                     self.name_str()
                 )));
+            }
+            // Handled by the early return above; kept for exhaustiveness.
+            NodeKind::RepoPager { .. } => {
+                return Err(JobError(
+                    "RepoPagerJob execution is not ported (M9.8hw)".to_owned(),
+                ));
             }
         })
     }
@@ -1431,10 +1676,20 @@ fn new_log_job(child: JobNode) -> JobNode {
 }
 
 fn repo_pager(child: JobNode, repo_opts: TreeRepoOptions, contains_ref_globs: bool) -> JobNode {
+    repo_pager_with_partitioning(child, repo_opts, contains_ref_globs, false)
+}
+
+fn repo_pager_with_partitioning(
+    child: JobNode,
+    repo_opts: TreeRepoOptions,
+    contains_ref_globs: bool,
+    skip_partitioning: bool,
+) -> JobNode {
     JobNode::new(
         NodeKind::RepoPager {
             repo_opts,
             contains_ref_globs,
+            skip_partitioning,
         },
         vec![JobNode::new(NodeKind::ReposPartial, vec![child])],
     )
@@ -1456,16 +1711,57 @@ pub fn new_plan_job(inputs: &TreeInputs, plan: &Plan) -> Result<JobNode, JobErro
     if inputs.pattern_type == SearchType::CodyContext {
         match &inputs.cody_context_hook {
             Some(hook) => job_tree = hook(plan, inputs)?,
-            None => {
-                return Err(JobError(
-                    "codycontext.NewSearchJob is not ported (M9.8ho)".to_owned(),
-                ))
-            }
+            None => job_tree = new_cody_context_job(inputs, plan)?,
         }
     }
 
     let alert_job = new_alert_job(inputs, plan, job_tree);
     Ok(new_log_job(alert_job))
+}
+
+/// `codycontext.NewSearchJob` (`job.go:34-89`) with
+/// `newJob = NewBasicJob(inputs, ...)`.
+///
+/// The baseline constructs the symbol sub-job first (only when `symbols` is
+/// non-empty), then code, then text, propagating the first constructor error.
+fn new_cody_context_job(inputs: &TreeInputs, plan: &[Basic]) -> Result<JobNode, JobError> {
+    let parts = codycontext::new_search_job(plan, inputs.cody_context.as_ref())?;
+    let CodyContextJobParts::Jobs {
+        symbol_query,
+        code_query,
+        text_query,
+        patterns,
+        code_count,
+        text_count,
+        file_matcher,
+    } = parts
+    else {
+        // `codycontext.newNoopJob()`: a distinct Go type from
+        // `jobutil.NoopJob`, so `NewAlertJob` does not unwrap it.
+        return Ok(JobNode::leaf(NodeKind::CodyNoop));
+    };
+
+    let symbol_job = match &symbol_query {
+        Some(symbol_query) => Some(Box::new(new_basic_job(inputs, symbol_query)?)),
+        // `symbolJob` defaults to `newNoopJob()`; invisible because
+        // `searchJob.Children()` is nil.
+        None => None,
+    };
+    let code_job = Box::new(new_basic_job(inputs, &code_query)?);
+    let text_job = Box::new(new_basic_job(inputs, &text_query)?);
+
+    Ok(JobNode::new(
+        NodeKind::CodyContext {
+            symbol_job,
+            code_job,
+            text_job,
+            patterns,
+            code_count,
+            text_count,
+            file_matcher,
+        },
+        Vec::new(),
+    ))
 }
 
 /// `NewBasicJob` (`job.go:65-281`).
@@ -1597,10 +1893,11 @@ pub fn new_basic_job(inputs: &TreeInputs, basic: &Basic) -> Result<JobNode, JobE
             diff,
             limit: i64::from(file_match_limit),
         });
-        children.push(repo_pager(
+        children.push(repo_pager_with_partitioning(
             commit_job,
             commit_repo_options,
             contains_ref_globs,
+            true,
         ));
     }
 
@@ -2816,5 +3113,252 @@ impl JobNode {
             self.basic_attributes(),
             self.children.iter().collect(),
         )
+    }
+}
+
+#[cfg(test)]
+mod pager_tests {
+    use std::cell::Cell;
+
+    use super::*;
+    use crate::search_job::{JobStreamer, PrivateRepoLister, RepoPagerClients, ReposListOptions};
+    use crate::search_jobutil_repos::{RepoPage, RepoPageSource, ZoektRepoLister};
+    use sg_zoekt::indexed_repo_revs::{MinimalRepo, RepositoryRevisions, RepositoryRevisionsRepo};
+    use sg_zoekt::types::{ListResponse, SearchOptions, SearchResult};
+
+    struct NoDb;
+    impl PrivateRepoLister for NoDb {
+        fn list_minimal_repos(
+            &self,
+            _options: &ReposListOptions,
+        ) -> Result<Vec<MinimalRepo>, JobError> {
+            Ok(Vec::new())
+        }
+    }
+
+    struct NoStreamer;
+    impl JobStreamer for NoStreamer {
+        fn stream_search(
+            &self,
+            _query: &zoekt_query::Query,
+            _options: &SearchOptions,
+            _sender: &mut dyn FnMut(SearchResult),
+        ) -> Result<(), JobError> {
+            Ok(())
+        }
+    }
+
+    struct Pages {
+        pages: Vec<RepoPage>,
+        error: Option<JobError>,
+    }
+    impl RepoPageSource for Pages {
+        fn pages(&self) -> Vec<RepoPage> {
+            self.pages.clone()
+        }
+        fn error(&self) -> Option<JobError> {
+            self.error.clone()
+        }
+    }
+
+    struct Lister {
+        calls: Cell<usize>,
+    }
+    impl ZoektRepoLister for Lister {
+        fn list(&self) -> Result<ListResponse, JobError> {
+            self.calls.set(self.calls.get() + 1);
+            Ok(ListResponse {
+                repos: Vec::new(),
+                repos_map: std::collections::BTreeMap::new(),
+                crashes: 0,
+            })
+        }
+    }
+
+    fn revision(id: u32, name: &str) -> RepositoryRevisions {
+        RepositoryRevisions {
+            repo: RepositoryRevisionsRepo {
+                id,
+                name: name.to_owned(),
+            },
+            revs: vec!["HEAD".to_owned()],
+        }
+    }
+
+    fn page(repo_id: u32, backends_missing: i64) -> RepoPage {
+        RepoPage {
+            repo_revs: vec![revision(repo_id, "repo")],
+            backends_missing,
+        }
+    }
+
+    fn static_inner() -> JobNode {
+        JobNode::static_events(
+            vec![StaticEvent {
+                results: Vec::new(),
+                is_limit_hit: false,
+                status: vec![(7, 1)],
+            }],
+            None,
+        )
+    }
+
+    fn run_pager(
+        pages: &Pages,
+        lister: &Lister,
+        skip_partitioning: bool,
+        contains_ref_globs: bool,
+        with_clients: bool,
+    ) -> (Vec<SearchEvent>, Option<comb::JobFailure>) {
+        let mut job = TreeRepoPagerJob {
+            repo_opts: TreeRepoOptions::default(),
+            contains_ref_globs,
+            skip_partitioning,
+            inner: static_inner(),
+        };
+        let pager = RepoPagerClients {
+            pages,
+            zoekt: lister,
+        };
+        let db = NoDb;
+        let streamer = NoStreamer;
+        let clients = RuntimeClients {
+            db: &db,
+            zoekt: &streamer,
+            max_repos: None,
+            searcher: None,
+            commit: None,
+            repo_pager: if with_clients { Some(&pager) } else { None },
+        };
+        let ctx = comb::RunContext::default();
+        let mut events = Vec::new();
+        let mut sink = |event: SearchEvent| events.push(event);
+        let (_alert, failure) = comb::CombinatorJob::run(&mut job, &ctx, &clients, &mut sink);
+        (events, failure)
+    }
+
+    #[test]
+    fn runs_inner_once_per_page_and_forwards_page_stats() {
+        let pages = Pages {
+            pages: vec![page(1, 2), page(2, 0)],
+            error: None,
+        };
+        let lister = Lister {
+            calls: Cell::new(0),
+        };
+        let (events, failure) = run_pager(&pages, &lister, true, false, true);
+        assert!(failure.is_none());
+        // `skipPartitioning` never consults the zoekt list.
+        assert_eq!(lister.calls.get(), 0);
+        // `MaybeSendStats` for page 1, then one inner event per page.
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0].stats.backends_missing, 2);
+        assert!(events[0].stats.status.entries().is_empty());
+        assert_eq!(events[1].stats.status.entries(), vec![(7, 1)]);
+        assert_eq!(events[2].stats.status.entries(), vec![(7, 1)]);
+    }
+
+    #[test]
+    fn partitions_each_page_against_the_zoekt_list() {
+        let pages = Pages {
+            pages: vec![page(1, 0), page(2, 0)],
+            error: None,
+        };
+        let lister = Lister {
+            calls: Cell::new(0),
+        };
+        let (events, failure) = run_pager(&pages, &lister, false, false, true);
+        assert!(failure.is_none());
+        assert_eq!(lister.calls.get(), 2);
+        assert_eq!(events.len(), 2);
+
+        // Ref-globs force the unindexed fallback without a list call.
+        let lister = Lister {
+            calls: Cell::new(0),
+        };
+        let (events, failure) = run_pager(&pages, &lister, false, true, true);
+        assert!(failure.is_none());
+        assert_eq!(lister.calls.get(), 0);
+        assert_eq!(events.len(), 2);
+    }
+
+    #[test]
+    fn propagates_terminal_page_error() {
+        let pages = Pages {
+            pages: Vec::new(),
+            error: Some(JobError("page failed".to_owned())),
+        };
+        let lister = Lister {
+            calls: Cell::new(0),
+        };
+        let (_events, failure) = run_pager(&pages, &lister, true, false, true);
+        assert_eq!(
+            failure,
+            Some(comb::JobFailure::Message("page failed".to_owned()))
+        );
+    }
+
+    #[test]
+    fn without_clients_keeps_the_explicit_error() {
+        let pages = Pages {
+            pages: vec![page(1, 0)],
+            error: None,
+        };
+        let lister = Lister {
+            calls: Cell::new(0),
+        };
+        let (events, failure) = run_pager(&pages, &lister, true, false, false);
+        assert!(events.is_empty());
+        assert_eq!(
+            failure,
+            Some(comb::JobFailure::Message(
+                "RepoPagerJob execution is not ported (M9.8hw)".to_owned()
+            ))
+        );
+    }
+
+    #[test]
+    fn set_tree_repos_assigns_indexed_and_unindexed_sets() {
+        let tree = JobNode::new(
+            NodeKind::Parallel,
+            vec![
+                JobNode::zoekt_repo_subset_text(
+                    Some(IndexedRepoRevs::default()),
+                    zoekt_query::Query::Const(true),
+                    Vec::new(),
+                    ZoektParameters::default(),
+                ),
+                JobNode::zoekt_symbol(
+                    Some(IndexedRepoRevs::default()),
+                    zoekt_query::Query::Const(true),
+                    ZoektParameters::default(),
+                ),
+                JobNode::commit(pb::QueryNode::default(), vec![revision(9, "old")], false, 1),
+            ],
+        );
+        let mut indexed = IndexedRepoRevs::default();
+        indexed.repo_revs.insert(1, revision(1, "indexed"));
+        let resolved = ResolvedRepos::new(Some(indexed), vec![revision(2, "unindexed")]);
+        let rewritten = set_tree_repos(&tree, &resolved);
+
+        match &rewritten.children[0].kind {
+            NodeKind::ZoektRepoSubsetText { repos, .. } => {
+                let repos = repos.as_ref().expect("indexed set");
+                assert_eq!(repos.repo_revs.len(), 1);
+                assert!(repos.repo_revs.contains_key(&1));
+            }
+            other => panic!("unexpected text node: {other:?}"),
+        }
+        match &rewritten.children[1].kind {
+            NodeKind::ZoektSymbol { repos, .. } => {
+                let repos = repos.as_ref().expect("indexed set");
+                assert_eq!(repos.repo_revs.len(), 1);
+            }
+            other => panic!("unexpected symbol node: {other:?}"),
+        }
+        match &rewritten.children[2].kind {
+            NodeKind::Commit { repos, .. } => assert_eq!(repos, &vec![revision(2, "unindexed")]),
+            other => panic!("unexpected commit node: {other:?}"),
+        }
     }
 }
