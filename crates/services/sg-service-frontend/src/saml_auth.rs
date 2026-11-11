@@ -485,6 +485,28 @@ impl SamlProvider {
             (None, Some(service_provider)) => Ok(service_provider.clone()),
         }
     }
+
+    /// `Config()` (`provider.go:52-55`). `schema.AuthProviders.MarshalJSON`
+    /// emits the SAML config itself, which is exactly the defaulted config's
+    /// canonical JSON.
+    pub fn config_json(&self) -> &str {
+        &self.config.canonical_json
+    }
+
+    /// `Type()` (`provider.go:57-59`).
+    pub fn provider_type(&self) -> &'static str {
+        PROVIDER_TYPE
+    }
+
+    /// `ExternalAccountInfo` (`provider.go:68-70`): delegates to
+    /// `GetPublicExternalAccountData` over the account's `Data` blob.
+    pub async fn external_account_info(
+        &self,
+        account_data: &SamlAccountData,
+        key: Option<&dyn sg_encryption::Key>,
+    ) -> Result<Option<SamlPublicAccountData>, String> {
+        get_public_external_account_data(account_data, key).await
+    }
 }
 
 /// The registered SAML provider set.
@@ -534,6 +556,285 @@ impl SamlProviderSet {
         }
         None
     }
+}
+
+// ---------------------------------------------------------------------------
+// user.go:250-321 — external account public data
+// ---------------------------------------------------------------------------
+
+/// `SAMLValue` (`user.go:246-248`). The struct has no JSON tag; Go's
+/// `encoding/json` matches the `value` key case-insensitively.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SamlValue {
+    pub value: String,
+}
+
+/// `SAMLAttribute` (`user.go:242-244`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SamlAttribute {
+    pub values: Vec<SamlValue>,
+}
+
+/// `SAMLValues` (`user.go:238-240`). A `None` map is Go's nil map.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SamlValues {
+    pub values: Option<BTreeMap<String, SamlAttribute>>,
+}
+
+/// The subset of `extsvc.PublicAccountData` SAML ever populates
+/// (`internal/extsvc/types.go:54-59`). `Login`/`URL` stay empty, which the
+/// GraphQL resolver renders as null.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SamlPublicAccountData {
+    pub display_name: String,
+}
+
+/// `extsvc.EncryptableData` (`internal/extsvc/types.go:46-64`): either a
+/// plaintext value (`NewUnencryptedData`) or ciphertext plus the
+/// `user_external_accounts.encryption_key_id`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SamlEncryptableData {
+    Unencrypted(Vec<u8>),
+    Encrypted { cipher: Vec<u8>, key_id: String },
+}
+
+/// `extsvc.AccountData`. SAML reads only [`SamlAccountData::data`] (the
+/// `account_data` column); `auth_data` is carried so callers can prove it is
+/// ignored.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SamlAccountData {
+    pub auth_data: Option<SamlEncryptableData>,
+    pub data: Option<SamlEncryptableData>,
+}
+
+/// Case-insensitive object key lookup, matching Go's `encoding/json` field
+/// matching (`"values"` and `"VALUES"` both select struct field `Values`).
+fn find_case_insensitive<'a>(obj: &'a Map<String, Value>, key: &str) -> Option<&'a Value> {
+    if let Some(value) = obj.get(key) {
+        return Some(value);
+    }
+    obj.iter()
+        .find(|(candidate, _)| candidate.eq_ignore_ascii_case(key))
+        .map(|(_, value)| value)
+}
+
+/// Go `encoding/json` type-kind word used in `UnmarshalTypeError` texts.
+fn go_json_kind(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "bool",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
+}
+
+/// Go's `strconv.Quote`-style rendering of the offending byte in
+/// `encoding/json` syntax errors (only the bytes reachable from JSON text).
+fn go_json_char(byte: u8) -> String {
+    match byte {
+        b'\'' => "'\\''".to_owned(),
+        b'\\' => "'\\\\'".to_owned(),
+        b'\n' => "'\\n'".to_owned(),
+        b'\r' => "'\\r'".to_owned(),
+        b'\t' => "'\\t'".to_owned(),
+        _ => format!("'{}'", byte as char),
+    }
+}
+
+/// Byte offset serde reported, falling back to the last byte.
+fn serde_error_offset(bytes: &[u8], error: &serde_json::Error) -> usize {
+    let column = error.column().saturating_sub(1);
+    if error.line() <= 1 {
+        return column.min(bytes.len().saturating_sub(1));
+    }
+    let mut offset = 0usize;
+    let mut line = 1usize;
+    while line < error.line() {
+        match bytes[offset..].iter().position(|byte| *byte == b'\n') {
+            Some(position) => {
+                offset += position + 1;
+                line += 1;
+            }
+            None => return bytes.len().saturating_sub(1),
+        }
+    }
+    (offset + column).min(bytes.len().saturating_sub(1))
+}
+
+/// Map a `serde_json` syntax error onto the `encoding/json` text for the
+/// corpus shapes (invalid first value, object key/value, trailing data).
+/// Truncated input always reports `unexpected end of JSON input`.
+fn go_json_unmarshal_error(bytes: &[u8], error: &serde_json::Error) -> String {
+    let text = String::from_utf8_lossy(bytes);
+    if text.trim().is_empty() || error.is_eof() {
+        return "unexpected end of JSON input".to_owned();
+    }
+    let message = error.to_string();
+    let offset = serde_error_offset(bytes, error);
+    let byte = bytes
+        .get(offset)
+        .copied()
+        .unwrap_or_else(|| text.as_bytes().last().copied().unwrap_or(b' '));
+    let character = go_json_char(byte);
+    if message.contains("key must be a string") {
+        return format!("invalid character {character} looking for beginning of object key string");
+    }
+    if message.contains("expected value") {
+        return format!("invalid character {character} looking for beginning of value");
+    }
+    if message.contains("trailing characters") {
+        return format!("invalid character {character} after top-level value");
+    }
+    if message.contains("expected `,` or `}`") {
+        return format!("invalid character {character} after object key:value pair");
+    }
+    if message.contains("expected `,` or `]`") {
+        return format!("invalid character {character} after array element");
+    }
+    if message.contains("expected `:`") {
+        return format!("invalid character {character} after object key");
+    }
+    // Remaining serde diagnostics (strings/escapes/numbers) are outside the
+    // differential corpus; report the first offending value byte like Go.
+    format!("invalid character {character} looking for beginning of value")
+}
+
+/// `json.Unmarshal([]byte(...), &SAMLValues{})` with Go's field matching and
+/// type-error texts.
+fn parse_saml_values(bytes: &[u8]) -> Result<SamlValues, String> {
+    let value: Value =
+        serde_json::from_slice(bytes).map_err(|error| go_json_unmarshal_error(bytes, &error))?;
+    let object = match value {
+        Value::Null => return Ok(SamlValues::default()),
+        Value::Object(object) => object,
+        other => {
+            return Err(format!(
+                "json: cannot unmarshal {} into Go value of type saml.SAMLValues",
+                go_json_kind(&other)
+            ))
+        }
+    };
+    let Some(values) = find_case_insensitive(&object, "Values") else {
+        return Ok(SamlValues::default());
+    };
+    if values.is_null() {
+        return Ok(SamlValues::default());
+    }
+    let Some(attributes) = values.as_object() else {
+        return Err(format!(
+            "json: cannot unmarshal {} into Go struct field SAMLValues.Values of type map[string]saml.SAMLAttribute",
+            go_json_kind(values)
+        ));
+    };
+    let mut parsed = BTreeMap::new();
+    for (name, attribute) in attributes {
+        let Some(attribute) = attribute.as_object() else {
+            return Err(format!(
+                "json: cannot unmarshal {} into Go value of type saml.SAMLAttribute",
+                go_json_kind(attribute)
+            ));
+        };
+        let mut values = Vec::new();
+        if let Some(items) = find_case_insensitive(attribute, "Values") {
+            if !items.is_null() {
+                let Some(items) = items.as_array() else {
+                    return Err(format!(
+                        "json: cannot unmarshal {} into Go struct field SAMLAttribute.Values of type []saml.SAMLValue",
+                        go_json_kind(items)
+                    ));
+                };
+                for item in items {
+                    let Some(item) = item.as_object() else {
+                        return Err(format!(
+                            "json: cannot unmarshal {} into Go value of type saml.SAMLValue",
+                            go_json_kind(item)
+                        ));
+                    };
+                    let mut value = SamlValue::default();
+                    if let Some(raw) = find_case_insensitive(item, "Value") {
+                        if !raw.is_null() {
+                            let Some(raw) = raw.as_str() else {
+                                return Err(format!(
+                                    "json: cannot unmarshal {} into Go struct field SAMLValue.Values.Value of type string",
+                                    go_json_kind(raw)
+                                ));
+                            };
+                            value.value = raw.to_owned();
+                        }
+                    }
+                    values.push(value);
+                }
+            }
+        }
+        parsed.insert(name.clone(), SamlAttribute { values });
+    }
+    Ok(SamlValues {
+        values: Some(parsed),
+    })
+}
+
+/// `GetExternalAccountData` (`user.go:250-263`).
+pub async fn get_external_account_data(
+    account_data: &SamlAccountData,
+    key: Option<&dyn sg_encryption::Key>,
+) -> Result<SamlValues, String> {
+    let Some(data) = &account_data.data else {
+        return Err("could not find data for the external account".to_owned());
+    };
+    let plaintext = match data {
+        SamlEncryptableData::Unencrypted(bytes) => String::from_utf8_lossy(bytes).into_owned(),
+        SamlEncryptableData::Encrypted { cipher, key_id } => {
+            let cipher = String::from_utf8_lossy(cipher);
+            sg_encryption::maybe_decrypt(key, &cipher, key_id)
+                .await
+                .map_err(|error| error.to_string())?
+        }
+    };
+    parse_saml_values(plaintext.as_bytes())
+}
+
+/// `GetPublicExternalAccountData` (`user.go:265-309`). Returns `Ok(None)` when
+/// no candidate attribute carries a non-empty first value.
+pub async fn get_public_external_account_data(
+    account_data: &SamlAccountData,
+    key: Option<&dyn sg_encryption::Key>,
+) -> Result<Option<SamlPublicAccountData>, String> {
+    let data = get_external_account_data(account_data, key).await?;
+    let Some(values) = &data.values else {
+        return Err("could not find data values for external account".to_owned());
+    };
+
+    // `strings.ToLower` over the keys, then the fixed candidate order.
+    let mut lower_case_values: BTreeMap<String, &SamlAttribute> = BTreeMap::new();
+    for (key, value) in values {
+        lower_case_values.insert(key.to_lowercase(), value);
+    }
+    const CANDIDATES: &[&str] = &[
+        "nickname",
+        "login",
+        "username",
+        "name",
+        "http://schemas.xmlsoap.org/claims/name",
+        "http://schemas.xmlsoap.org/ws/2005/05/identity/claims/name",
+        "email",
+        "emailaddress",
+        "http://schemas.xmlsoap.org/claims/emailaddress",
+        "http://schemas.xmlsoap.org/ws/2005/05/identity/claims/emailaddress",
+    ];
+    for candidate in CANDIDATES {
+        if let Some(attribute) = lower_case_values.get(*candidate) {
+            if let Some(first) = attribute.values.first() {
+                if !first.value.is_empty() {
+                    return Ok(Some(SamlPublicAccountData {
+                        display_name: first.value.clone(),
+                    }));
+                }
+            }
+        }
+    }
+    Ok(None)
 }
 
 struct ProviderFileConfig {
