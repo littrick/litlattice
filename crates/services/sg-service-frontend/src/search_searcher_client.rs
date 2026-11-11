@@ -23,7 +23,7 @@
 
 use std::fmt;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use sg_proto::searcher as pb;
 use tonic::transport::Channel;
@@ -145,6 +145,13 @@ pub struct SymbolsParameters {
     pub exclude_langs: Vec<String>,
     /// `First`: the symbol job passes `limit + 1`.
     pub first: i32,
+    /// `Timeout`: maximum time the symbols service should spend. The Go zero
+    /// value is `0` (the searcher job does not set it); the zoekt symbol path
+    /// passes 5s.
+    pub timeout: Duration,
+    /// Local deadline modelling the caller's context. `None` means no
+    /// deadline (the Go searcher job has no per-call timeout here).
+    pub deadline: Option<Instant>,
 }
 
 /// `search.SymbolsResponse` reduced to the fields the job consumes.
@@ -300,7 +307,7 @@ impl RetryConfig {
         }
     }
 
-    fn backoff(&self, attempt: u32) -> Duration {
+    pub(crate) fn backoff(&self, attempt: u32) -> Duration {
         if attempt <= 1 {
             return self.backoff_base;
         }

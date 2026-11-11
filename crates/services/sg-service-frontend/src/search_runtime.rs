@@ -49,6 +49,7 @@ use crate::search_searcher_client::{
     NOT_PORTED_MESSAGE,
 };
 use crate::search_stream::TreeRuntimeClients;
+use crate::symbols_client::default_symbols_client;
 
 /// Failure to assemble the production runtime. The only mandatory endpoint is
 /// zoekt; the caller falls back to `TreeJobRunner::unconfigured()`.
@@ -157,9 +158,12 @@ pub fn assemble(
             gitserver: Arc::new(GitSearcherGitserver {
                 client: Arc::clone(&gitserver),
             }),
-            // The symbols gRPC client is not ported in this slice; the ported
-            // job tree's symbol leaf fails before reaching it.
-            symbols: Arc::new(NotPortedSymbols),
+            // Production symbols gRPC client when endpoints are configured;
+            // otherwise the explicit not-ported error is unchanged.
+            symbols: match default_symbols_client(connections.symbols.clone()) {
+                Some(client) => Arc::from(client),
+                None => Arc::new(NotPortedSymbols),
+            },
         }))
     };
 
@@ -472,8 +476,8 @@ impl SearcherLimiter for NoopSearcherLimiter {
     }
 }
 
-/// The symbols gRPC client is not ported in this slice; every call reports the
-/// existing explicit not-ported error.
+/// Fallback used when no symbols endpoints are configured; every call reports
+/// the existing explicit not-ported error.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct NotPortedSymbols;
 

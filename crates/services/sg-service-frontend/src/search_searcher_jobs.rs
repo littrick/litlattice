@@ -419,6 +419,9 @@ impl SymbolSearchJob {
             exclude_langs: self.request.exclude_langs.clone(),
             // Ask for limit + 1 so the service can report limit hits.
             first: self.limit.saturating_add(1),
+            // Go leaves `Timeout` unset on the searcher symbol job.
+            timeout: Duration::ZERO,
+            deadline: None,
         };
 
         let response = searcher.symbols.search(&params)?;
