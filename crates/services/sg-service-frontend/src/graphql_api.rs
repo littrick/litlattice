@@ -40,7 +40,7 @@ use sg_graphql::exec::{Actor, ExecError, ExecResponse, PathSegment};
 use sg_graphql::json::Json;
 use sg_graphql::{estimate_query_cost, QueryCost};
 use sg_session::auth::{self, SessionAuthOutcome, SessionStore, SessionUserLookup};
-use sg_session::{AnonymousReason, COOKIE_NAME};
+use sg_session::AnonymousReason;
 
 /// `HTTAPI_GZIP_FILE_SIZE_LIMIT` default (`graphql.go:35`): 500 MiB of
 /// decompressed request body.
@@ -1654,14 +1654,8 @@ fn get_uid(headers: &HeaderMap, actor: Actor) -> (String, bool, bool) {
 /// `isTrustedOrigin` plus the `X-Requested-With` presence check from
 /// `CookieMiddlewareWithCSRFSafety` (`session.go:332-344`).
 fn is_trusted_request(headers: &HeaderMap, live: &LiveConfig) -> bool {
-    if headers.contains_key("x-requested-with") {
-        return true;
-    }
-    let origin = headers
-        .get(header::ORIGIN)
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or("");
-    crate::mux::SecurityConfig::from_site_config(&live.current().site).is_trusted_origin(origin)
+    let security = crate::mux::SecurityConfig::from_site_config(&live.current().site);
+    crate::actor_middleware::is_trusted_request(headers, &security)
 }
 
 /// The `sgs` request cookie (`r.Cookie(cookieName)`). Untrusted requests never
@@ -1686,31 +1680,7 @@ async fn session_actor(
 
 /// `r.Cookie("sgs")`: the first matching `Cookie` header value, unquoted.
 fn session_cookie(headers: &HeaderMap) -> Option<String> {
-    for value in headers.get_all(header::COOKIE) {
-        let Ok(cookies) = value.to_str() else {
-            continue;
-        };
-        for cookie in cookies.split(';') {
-            let cookie = cookie.trim();
-            let Some((name, value)) = cookie.split_once('=') else {
-                continue;
-            };
-            if name.trim() == COOKIE_NAME {
-                return Some(unquote_cookie_value(value.trim()));
-            }
-        }
-    }
-    None
-}
-
-/// `net/http` strips one pair of surrounding double quotes from request cookie
-/// values.
-fn unquote_cookie_value(value: &str) -> String {
-    value
-        .strip_prefix('"')
-        .and_then(|value| value.strip_suffix('"'))
-        .unwrap_or(value)
-        .to_owned()
+    crate::actor_middleware::session_cookie(headers)
 }
 
 /// The baseline's Redis-error response: `w.WriteHeader(500)` then the message
@@ -1728,26 +1698,7 @@ fn session_store_error() -> Response<BoxBody> {
 /// `cookie.AnonymousUID` (`internal/cookie/cookie.go:9-30`): the first
 /// `sourcegraphAnonymousUid` cookie in the request's `Cookie` headers.
 fn anonymous_uid(headers: &HeaderMap) -> Option<String> {
-    for value in headers.get_all(header::COOKIE) {
-        let Ok(cookies) = value.to_str() else {
-            continue;
-        };
-        for cookie in cookies.split(';') {
-            let cookie = cookie.trim();
-            let Some((name, value)) = cookie.split_once('=') else {
-                continue;
-            };
-            if name.trim() == "sourcegraphAnonymousUid" {
-                let value = value.trim();
-                let value = value
-                    .strip_prefix('"')
-                    .and_then(|value| value.strip_suffix('"'))
-                    .unwrap_or(value);
-                return Some(value.to_owned());
-            }
-        }
-    }
-    None
+    crate::actor_middleware::cookie_anonymous_uid(headers)
 }
 
 /// `AnonymousUIDMiddleware` (`internal/actor/http.go:180-205`): the cookie is
@@ -1755,13 +1706,7 @@ fn anonymous_uid(headers: &HeaderMap) -> Option<String> {
 /// header is consulted only when there is no cookie. Used for the audit
 /// actor's ID; `getUID` deliberately keeps its own cookie-only lookup.
 fn actor_anonymous_uid(headers: &HeaderMap) -> String {
-    if let Some(uid) = anonymous_uid(headers) {
-        return uid;
-    }
-    headers
-        .get("x-sourcegraph-actor-anonymous-uid")
-        .map(|value| String::from_utf8_lossy(value.as_bytes()).into_owned())
-        .unwrap_or_default()
+    crate::actor_middleware::actor_anonymous_uid(headers)
 }
 
 // ---------------------------------------------------------------------------
@@ -2839,7 +2784,7 @@ mod tests {
         }
         .encode_redis();
         let cookie = sg_session::securecookie::encode_session_id(
-            COOKIE_NAME,
+            sg_session::COOKIE_NAME,
             b"",
             now.unix_timestamp(),
             "ID",
