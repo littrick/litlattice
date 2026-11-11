@@ -23,6 +23,8 @@ use tonic::body::BoxBody;
 
 use sg_config::LiveConfig;
 
+use crate::app_handlers::{AppConfig, AppDeps, AppEnv};
+use crate::app_router;
 use crate::auth;
 use crate::blame::BlameDeps;
 use crate::goimportpath;
@@ -210,21 +212,58 @@ pub fn external_handler(
     trace_url_template: Option<String>,
     security: SecurityConfig,
 ) -> sg_http::HttpHandler {
+    let app_env = Arc::new(AppEnv::from_env());
+    let app_config = AppConfig {
+        external_url: security.external_url.clone(),
+        branding_favicon: String::new(),
+    };
+    let app_deps = Arc::new(AppDeps::production());
     Arc::new(move |mut req: Request<Incoming>| {
         let version = version.clone();
         let allowlist = allowlist.clone();
         let trace_url_template = trace_url_template.clone();
         let security = security.clone();
+        let app_env = Arc::clone(&app_env);
+        let app_config = app_config.clone();
+        let app_deps = Arc::clone(&app_deps);
         Box::pin(async move {
-            external_response_with_ipallowlist(
+            external_response_with_ipallowlist_async(
                 &mut req,
                 &version,
                 allowlist.as_deref(),
                 forbid_all,
                 trace_url_template.as_deref(),
                 &security.external_url,
-                |req| mux::route(req, &security, mux::not_found_dispatch),
+                |req| {
+                    let security = security.clone();
+                    let app_env = Arc::clone(&app_env);
+                    let app_config = app_config.clone();
+                    let app_deps = Arc::clone(&app_deps);
+                    Box::pin(async move {
+                        mux::route_async(req, &security, |route, request| {
+                            let app_env = Arc::clone(&app_env);
+                            let app_config = app_config.clone();
+                            let app_deps = Arc::clone(&app_deps);
+                            Box::pin(async move {
+                                match route {
+                                    mux::Route::App => {
+                                        app_router::dispatch_async(
+                                            request,
+                                            &app_env,
+                                            &app_config,
+                                            &app_deps,
+                                        )
+                                        .await
+                                    }
+                                    other => mux::not_found_dispatch(other),
+                                }
+                            })
+                        })
+                        .await
+                    })
+                },
             )
+            .await
         })
     })
 }
@@ -236,15 +275,26 @@ struct DerivedConfig {
     forbid_all: bool,
     trace_url_template: Option<String>,
     security: SecurityConfig,
+    app_env: Arc<AppEnv>,
+    app_config: AppConfig,
+    app_deps: Arc<AppDeps>,
 }
 
 impl DerivedConfig {
-    fn from_site(site: &sg_config::SiteConfiguration, env: &AllowlistEnv) -> Self {
+    fn from_site(
+        site: &sg_config::SiteConfiguration,
+        env: &AllowlistEnv,
+        app_env: Arc<AppEnv>,
+        app_deps: Arc<AppDeps>,
+    ) -> Self {
         Self {
             allowlist: ipallowlist::compile(site, env).map(Arc::new),
             forbid_all: auth::forbidden(site),
             trace_url_template: trace_headers::url_template(site),
             security: SecurityConfig::from_site_config(site),
+            app_env,
+            app_config: AppConfig::from_site_config(site),
+            app_deps,
         }
     }
 }
@@ -256,14 +306,23 @@ impl DerivedConfig {
 pub struct LiveMiddleware {
     live: Arc<LiveConfig>,
     allowlist_env: AllowlistEnv,
+    app_env: Arc<AppEnv>,
+    app_deps: Arc<AppDeps>,
     cache: std::sync::Mutex<Option<(u64, Arc<DerivedConfig>)>>,
 }
 
 impl LiveMiddleware {
-    pub fn new(live: Arc<LiveConfig>, allowlist_env: AllowlistEnv) -> Self {
+    pub fn new(
+        live: Arc<LiveConfig>,
+        allowlist_env: AllowlistEnv,
+        app_env: Arc<AppEnv>,
+        app_deps: Arc<AppDeps>,
+    ) -> Self {
         Self {
             live,
             allowlist_env,
+            app_env,
+            app_deps,
             cache: std::sync::Mutex::new(None),
         }
     }
@@ -283,6 +342,8 @@ impl LiveMiddleware {
         let derived = Arc::new(DerivedConfig::from_site(
             &self.live.current().site,
             &self.allowlist_env,
+            Arc::clone(&self.app_env),
+            Arc::clone(&self.app_deps),
         ));
         if let Ok(mut cache) = self.cache.lock() {
             *cache = Some((generation, Arc::clone(&derived)));
@@ -303,7 +364,9 @@ pub fn external_handler_with_live(
     graphql_deps: Arc<dyn GraphqlDeps>,
 ) -> sg_http::HttpHandler {
     let api_live = Arc::clone(&live);
-    let middleware = Arc::new(LiveMiddleware::new(live, allowlist_env));
+    let app_env = Arc::new(AppEnv::from_env());
+    let app_deps = Arc::new(AppDeps::production());
+    let middleware = Arc::new(LiveMiddleware::new(live, allowlist_env, app_env, app_deps));
     Arc::new(move |mut req: Request<Incoming>| {
         let middleware = Arc::clone(&middleware);
         let api_live = Arc::clone(&api_live);
@@ -322,12 +385,18 @@ pub fn external_handler_with_live(
                 &derived.security.external_url,
                 |req| {
                     let security = derived.security.clone();
+                    let app_env = Arc::clone(&derived.app_env);
+                    let app_config = derived.app_config.clone();
+                    let app_deps = Arc::clone(&derived.app_deps);
                     let api_live = Arc::clone(&api_live);
                     let blame_deps = Arc::clone(&blame_deps);
                     let search_deps = Arc::clone(&search_deps);
                     let graphql_deps = Arc::clone(&graphql_deps);
                     Box::pin(async move {
                         mux::route_async(req, &security, |route, request| {
+                            let app_env = Arc::clone(&app_env);
+                            let app_config = app_config.clone();
+                            let app_deps = Arc::clone(&app_deps);
                             let api_live = Arc::clone(&api_live);
                             let blame_deps = Arc::clone(&blame_deps);
                             let search_deps = Arc::clone(&search_deps);
@@ -341,6 +410,15 @@ pub fn external_handler_with_live(
                                             blame_deps,
                                             search_deps,
                                             graphql_deps,
+                                        )
+                                        .await
+                                    }
+                                    mux::Route::App => {
+                                        app_router::dispatch_async(
+                                            request,
+                                            &app_env,
+                                            &app_config,
+                                            &app_deps,
                                         )
                                         .await
                                     }
@@ -694,7 +772,12 @@ mod tests {
             r#"{"auth.providers":[{"type":"builtin","allowSignup":true}],
                 "auth.allowedIpAddress":{"enabled":true,"userIpAddress":[]}}"#,
         );
-        let middleware = LiveMiddleware::new(Arc::clone(&live), AllowlistEnv::default());
+        let middleware = LiveMiddleware::new(
+            Arc::clone(&live),
+            AllowlistEnv::default(),
+            Arc::new(AppEnv::default()),
+            Arc::new(AppDeps::default()),
+        );
 
         let derived = middleware.current();
         assert!(!derived.forbid_all);

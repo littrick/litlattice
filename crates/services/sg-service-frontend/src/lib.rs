@@ -10,6 +10,8 @@
 //! records what each missing layer is supposed to do.
 
 pub mod audit;
+pub mod app_handlers;
+pub mod app_router;
 pub mod auth;
 pub mod blame;
 pub mod client_configuration;
