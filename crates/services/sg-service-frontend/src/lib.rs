@@ -78,6 +78,8 @@ pub mod site_config_file;
 pub mod site_configuration_mutation;
 pub mod site_configuration_query;
 pub mod site_configuration_secrets;
+pub mod symbol_search;
+pub mod symbols_client;
 pub mod temporary_settings;
 pub mod tenant;
 pub mod trace_headers;
