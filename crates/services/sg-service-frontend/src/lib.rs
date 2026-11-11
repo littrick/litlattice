@@ -48,6 +48,7 @@ pub mod search_client;
 pub mod search_contexts;
 pub mod search_contexts_graphql;
 pub mod search_job;
+pub mod search_job_printer;
 pub mod search_jobutil_combinators;
 pub mod search_jobutil_exhaustive;
 pub mod search_jobutil_expression;
