@@ -3917,10 +3917,27 @@ dependencies = [
 [[package]]
 name = "sg-bin-server"
 version = "0.1.0"
+dependencies = [
+ "sg-core",
+ "sg-entry",
+ "sg-log",
+ "tokio",
+]
 
 [[package]]
 name = "sg-bin-sourcegraph"
 version = "0.1.0"
+dependencies = [
+ "sg-core",
+ "sg-entry",
+ "sg-log",
+ "sg-service-frontend",
+ "sg-service-gitserver",
+ "sg-service-repo-updater",
+ "sg-service-searcher",
+ "sg-service-worker",
+ "tokio",
+]
 
 [[package]]
 name = "sg-bin-symbols"
@@ -4047,6 +4064,16 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 1.0.69",
+ "tokio",
+]
+
+[[package]]
+name = "sg-entry"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
  "tokio",
 ]
 
