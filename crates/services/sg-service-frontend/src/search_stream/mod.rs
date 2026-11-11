@@ -153,6 +153,73 @@ impl JobRunner for UnportedJobRunner {
     }
 }
 
+/// Injected runtime clients for [`TreeJobRunner`] (`job.RuntimeClients`).
+pub struct TreeRuntimeClients {
+    pub db: Arc<dyn crate::search_job::PrivateRepoLister + Send + Sync>,
+    pub zoekt: Arc<dyn crate::search_job::JobStreamer + Send + Sync>,
+    pub max_repos: Option<i64>,
+}
+
+/// Runs the constructed job tree with injected clients.
+///
+/// An unconfigured runner keeps the pre-execution [`UnportedJobRunner`] error,
+/// so the default HTTP path is byte-for-byte unchanged. `JobRunner` does not
+/// model a request deadline yet, so the tree runs with no deadline (see the
+/// M9.8hw overview).
+pub struct TreeJobRunner {
+    runtime: Option<TreeRuntimeClients>,
+}
+
+impl TreeJobRunner {
+    pub fn unconfigured() -> Self {
+        Self { runtime: None }
+    }
+
+    pub fn new(
+        db: Arc<dyn crate::search_job::PrivateRepoLister + Send + Sync>,
+        zoekt: Arc<dyn crate::search_job::JobStreamer + Send + Sync>,
+        max_repos: Option<i64>,
+    ) -> Self {
+        Self {
+            runtime: Some(TreeRuntimeClients {
+                db,
+                zoekt,
+                max_repos,
+            }),
+        }
+    }
+}
+
+impl JobRunner for TreeJobRunner {
+    fn run(&self, job: &mut JobNode, sender: &mut dyn FnMut(SearchEvent)) -> JobRunOutput {
+        let Some(runtime) = self.runtime.as_ref() else {
+            return JobRunOutput {
+                alert: None,
+                error: Some(ExecuteError {
+                    message: "search execution is not ported yet".to_owned(),
+                    unsupported: false,
+                }),
+            };
+        };
+        let clients = crate::search_job::RuntimeClients {
+            db: runtime.db.as_ref(),
+            zoekt: runtime.zoekt.as_ref(),
+            max_repos: runtime.max_repos,
+        };
+        let ctx = crate::search_job::JobContext { deadline: None };
+        match crate::search_job::SearchJob::run(job, &ctx, &clients, sender) {
+            Ok(()) => JobRunOutput::default(),
+            Err(err) => JobRunOutput {
+                alert: None,
+                error: Some(ExecuteError {
+                    message: err.0,
+                    unsupported: false,
+                }),
+            },
+        }
+    }
+}
+
 /// The seams the handler needs from the rest of the system.
 #[async_trait]
 pub trait SearchDeps: Send + Sync {
@@ -194,7 +261,11 @@ pub struct BackendDeps {
 
 impl BackendDeps {
     pub fn new(pool: sqlx::PgPool) -> Self {
-        Self::with_deps(pool, default_plan_deps(), Arc::new(UnportedJobRunner))
+        Self::with_deps(
+            pool,
+            default_plan_deps(),
+            Arc::new(TreeJobRunner::unconfigured()),
+        )
     }
 
     /// Test/differential seam: inject the `Plan` loaders and the runner.
