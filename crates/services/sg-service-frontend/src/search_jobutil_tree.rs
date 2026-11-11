@@ -1,0 +1,2158 @@
+#![forbid(unsafe_code)]
+
+//! `internal/search/job/jobutil/job.go` job tree construction.
+//!
+//! This ports the construction entry points of the baseline:
+//!
+//! * [`new_plan_job`] (`NewPlanJob`), [`new_basic_job`] (`NewBasicJob`),
+//!   [`new_text_search_job`] (`NewTextSearchJob`), [`new_flat_job`]
+//!   (`NewFlatJob`);
+//! * the `jobBuilder` zoekt constructors (`newZoektGlobalSearch` /
+//!   `newZoektSearch`);
+//! * [`to_and_job`], [`to_or_job`], [`to_pattern_expression_job`],
+//!   [`to_flat_jobs`];
+//! * the structural `orderRacingJobs` rewriting.
+//!
+//! The result is an enumerable [`JobNode`] tree implementing [`SearchJob`]
+//! (Name/Children/Attributes). Job *execution* is not ported: [`SearchJob::run`]
+//! returns an error. No GraphQL/HTTP/gRPC/DB is touched.
+//!
+//! See `docs/overviews/m9_8ho_jobutil_tree_overview.md`.
+
+use std::collections::BTreeMap;
+use std::time::Duration;
+
+use regex::Regex;
+
+use sg_search_query::basic::{plan_to_q, q_string, q_string_value, Basic, Plan};
+use sg_search_query::fields::{FIELD_FILE, FIELD_REPO, FIELD_SELECT};
+use sg_search_query::labels::Labels;
+use sg_search_query::node::{visit_field, visit_parameter, Node, Operator, OperatorKind, Pattern};
+use sg_search_query::parser::SearchType;
+use sg_search_query::predicate::parse_as_predicate;
+use sg_search_query::validate::YesNoOnly;
+use sg_zoekt::global_query::{default_global_query_scope, GlobalZoektQuery};
+use sg_zoekt::languages::lang_to_file_regexp;
+use sg_zoekt::query::{self as zoekt_query, IndexedRequestType};
+
+use crate::search_client::{Features, Protocol};
+use crate::search_contexts::{parse_repository_revisions, ParsedRepoFilter, RepoVisibility};
+use crate::search_job::{JobContext, JobError, RuntimeClients, SearchJob, Verbosity};
+use crate::search_jobutil_combinators::format_go_duration;
+use crate::search_jobutil_filters::{
+    patterns_in_tree, ContainsPatternError, ContainsPatternStage, PatternNode as FilterPatternNode,
+};
+use crate::search_jobutil_job_builders as jb;
+
+// ---------------------------------------------------------------------------
+// Inputs
+// ---------------------------------------------------------------------------
+
+/// Injection point for `codycontext.NewSearchJob`.
+pub type CodyContextHook = dyn Fn(&[Basic], &TreeInputs) -> Result<JobNode, JobError>;
+
+/// The `search.Inputs` subset the construction entry points read.
+pub struct TreeInputs {
+    pub protocol: Protocol,
+    pub pattern_type: SearchType,
+    pub user_settings: jb::UserSettings,
+    pub features: Features,
+    pub context_lines: i32,
+    pub sanitize_search_patterns: Vec<String>,
+    pub on_sourcegraph_dot_com: bool,
+    /// `Inputs.Query` rendered by `AlertJob` attributes.
+    pub original_query: String,
+    /// `authz.SubRepoEnabled(authz.DefaultSubRepoPermsChecker)`.
+    pub sub_repo_enabled: bool,
+    /// `codycontext.NewSearchJob`; `None` means "not ported".
+    pub cody_context_hook: Option<Box<CodyContextHook>>,
+}
+
+impl TreeInputs {
+    fn default_limit(&self) -> i64 {
+        default_limit(self.protocol)
+    }
+}
+
+/// `Inputs.DefaultLimit` (`internal/search/types.go:50-63`).
+pub fn default_limit(protocol: Protocol) -> i64 {
+    match protocol {
+        Protocol::Streaming => 10_000,
+        Protocol::Batch => jb::DEFAULT_MAX_SEARCH_RESULTS,
+        Protocol::Exhaustive => 1_000_000,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Full `search.RepoOptions` model
+// ---------------------------------------------------------------------------
+
+/// `search.RepoOptions` as read by the construction code and its attributes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TreeRepoOptions {
+    pub repo_filters: Vec<ParsedRepoFilter>,
+    pub minus_repo_filters: Vec<String>,
+    pub description_patterns: Vec<String>,
+    pub case_sensitive_repo_filters: bool,
+    pub search_context_spec: String,
+    pub commit_after: Option<jb::RepoHasCommitAfterArgs>,
+    pub visibility: RepoVisibility,
+    pub limit: i64,
+    pub cursors: usize,
+    pub use_index: YesNoOnly,
+    pub has_file_content: Vec<sg_search_query::basic::RepoHasFileContentArgs>,
+    pub has_kvps: Vec<jb::RepoKvpFilter>,
+    pub has_topics: Vec<jb::RepoHasTopic>,
+    pub fork_set: bool,
+    pub no_forks: bool,
+    pub only_forks: bool,
+    pub only_cloned: bool,
+    pub archived_set: bool,
+    pub no_archived: bool,
+    pub only_archived: bool,
+}
+
+impl Default for TreeRepoOptions {
+    fn default() -> Self {
+        // Mirrors `search.RepoOptions{}` for the fields `addPatternAsRepoFilter`
+        // returns on rejection; the rejected options are never turned into a
+        // job, so this value is not observable in attributes.
+        TreeRepoOptions {
+            repo_filters: Vec::new(),
+            minus_repo_filters: Vec::new(),
+            description_patterns: Vec::new(),
+            case_sensitive_repo_filters: false,
+            search_context_spec: String::new(),
+            commit_after: None,
+            visibility: RepoVisibility::Any,
+            limit: 0,
+            cursors: 0,
+            use_index: YesNoOnly::Yes,
+            has_file_content: Vec::new(),
+            has_kvps: Vec::new(),
+            has_topics: Vec::new(),
+            fork_set: false,
+            no_forks: false,
+            only_forks: false,
+            only_cloned: false,
+            archived_set: false,
+            no_archived: false,
+            only_archived: false,
+        }
+    }
+}
+
+impl TreeRepoOptions {
+    /// Fill from the `toRepoOptions` result. `case_sensitive_repo_filters`,
+    /// `limit` and `only_cloned` stay at their zero values, as in the baseline.
+    pub fn from_job_builders(options: &jb::RepoOptions) -> Self {
+        TreeRepoOptions {
+            repo_filters: options.repo_filters.clone(),
+            minus_repo_filters: options.minus_repo_filters.clone(),
+            description_patterns: options.description_patterns.clone(),
+            case_sensitive_repo_filters: false,
+            search_context_spec: options.search_context_spec.clone(),
+            commit_after: options.commit_after.clone(),
+            visibility: options.visibility,
+            limit: 0,
+            cursors: 0,
+            use_index: options.use_index,
+            has_file_content: options.has_file_content.clone(),
+            has_kvps: options.has_kvps.clone(),
+            has_topics: options.has_topics.clone(),
+            fork_set: options.fork_set,
+            no_forks: options.no_forks,
+            only_forks: options.only_forks,
+            only_cloned: false,
+            archived_set: options.archived_set,
+            no_archived: options.no_archived,
+            only_archived: options.only_archived,
+        }
+    }
+
+    /// `RepoOptions.Attributes` (`internal/search/types.go:461-560`).
+    pub fn attributes(&self) -> Vec<(String, String)> {
+        let mut res = Vec::new();
+        if !self.repo_filters.is_empty() {
+            res.push((
+                "repoFilters".to_owned(),
+                parsed_repo_filters_string(&self.repo_filters),
+            ));
+        }
+        if !self.minus_repo_filters.is_empty() {
+            res.push((
+                "minusRepoFilters".to_owned(),
+                string_slice(self.minus_repo_filters.iter().map(String::as_str)),
+            ));
+        }
+        if !self.description_patterns.is_empty() {
+            res.push((
+                "descriptionPatterns".to_owned(),
+                string_slice(self.description_patterns.iter().map(String::as_str)),
+            ));
+        }
+        if self.case_sensitive_repo_filters {
+            res.push(("caseSensitiveRepoFilters".to_owned(), "true".to_owned()));
+        }
+        if !self.search_context_spec.is_empty() {
+            res.push((
+                "searchContextSpec".to_owned(),
+                self.search_context_spec.clone(),
+            ));
+        }
+        if let Some(commit_after) = &self.commit_after {
+            res.push(("commitAfter.time".to_owned(), commit_after.time_ref.clone()));
+            res.push((
+                "commitAfter.negated".to_owned(),
+                commit_after.negated.to_string(),
+            ));
+        }
+        if self.visibility != RepoVisibility::Any {
+            res.push((
+                "visibility".to_owned(),
+                visibility_str(self.visibility).to_owned(),
+            ));
+        }
+        if self.limit > 0 {
+            res.push(("limit".to_owned(), self.limit.to_string()));
+        }
+        // `Cursors` is never set by `toRepoOptions`; the zero value is omitted.
+        if self.use_index != YesNoOnly::Yes {
+            res.push((
+                "useIndex".to_owned(),
+                yes_no_only_str(self.use_index).to_owned(),
+            ));
+        }
+        for (index, arg) in self.has_file_content.iter().enumerate() {
+            let mut nondefault = Vec::new();
+            if !arg.path.is_empty() {
+                nondefault.push(("path".to_owned(), arg.path.clone()));
+            }
+            if !arg.content.is_empty() {
+                nondefault.push(("content".to_owned(), arg.content.clone()));
+            }
+            if arg.negated {
+                nondefault.push(("negated".to_owned(), "true".to_owned()));
+            }
+            push_scoped(&mut res, &format!("hasFileContent[{index}]"), nondefault);
+        }
+        for (index, arg) in self.has_kvps.iter().enumerate() {
+            let mut nondefault = Vec::new();
+            if !arg.key.is_empty() {
+                nondefault.push(("key".to_owned(), arg.key.clone()));
+            }
+            if let Some(value) = &arg.value {
+                nondefault.push(("value".to_owned(), value.clone()));
+            }
+            if arg.negated {
+                nondefault.push(("negated".to_owned(), "true".to_owned()));
+            }
+            push_scoped(&mut res, &format!("hasKVPs[{index}]"), nondefault);
+        }
+        for (index, arg) in self.has_topics.iter().enumerate() {
+            let mut nondefault = Vec::new();
+            if !arg.topic.is_empty() {
+                nondefault.push(("topic".to_owned(), arg.topic.clone()));
+            }
+            if arg.negated {
+                nondefault.push(("negated".to_owned(), "true".to_owned()));
+            }
+            push_scoped(&mut res, &format!("hasTopics[{index}]"), nondefault);
+        }
+        if self.fork_set {
+            res.push(("forkSet".to_owned(), "true".to_owned()));
+        }
+        if !self.no_forks {
+            res.push(("noForks".to_owned(), self.no_forks.to_string()));
+        }
+        if self.only_forks {
+            res.push(("onlyForks".to_owned(), "true".to_owned()));
+        }
+        if self.only_cloned {
+            res.push(("onlyCloned".to_owned(), "true".to_owned()));
+        }
+        if self.archived_set {
+            res.push(("archivedSet".to_owned(), "true".to_owned()));
+        }
+        if !self.no_archived {
+            res.push(("noArchived".to_owned(), self.no_archived.to_string()));
+        }
+        if self.only_archived {
+            res.push(("onlyArchived".to_owned(), "true".to_owned()));
+        }
+        res
+    }
+
+    fn scoped_attributes(&self) -> Vec<(String, String)> {
+        let mut res = Vec::new();
+        push_scoped(&mut res, "repoOpts", self.attributes());
+        res
+    }
+}
+
+fn push_scoped(res: &mut Vec<(String, String)>, scope: &str, kvs: Vec<(String, String)>) {
+    for (key, value) in kvs {
+        res.push((format!("{scope}.{key}"), value));
+    }
+}
+
+fn visibility_str(value: RepoVisibility) -> &'static str {
+    // `query.RepoVisibility` is a string type whose values are capitalized.
+    match value {
+        RepoVisibility::Any => "Any",
+        RepoVisibility::Private => "Private",
+        RepoVisibility::Public => "Public",
+    }
+}
+
+fn yes_no_only_str(value: YesNoOnly) -> &'static str {
+    match value {
+        YesNoOnly::Yes => "yes",
+        YesNoOnly::No => "no",
+        YesNoOnly::Only => "only",
+        YesNoOnly::Invalid => "invalid",
+    }
+}
+
+fn string_slice<'a>(values: impl Iterator<Item = &'a str>) -> String {
+    // OTel's `attribute.Value.Emit` renders STRINGSLICE as `json.Marshal` of
+    // the slice (`["a","b"]`), which is what the baseline job attributes use.
+    let values: Vec<&str> = values.collect();
+    serde_json::to_string(&values).expect("string slice is serializable")
+}
+
+fn parsed_repo_filters_string(filters: &[ParsedRepoFilter]) -> String {
+    let mut out = String::from("[");
+    for (index, filter) in filters.iter().enumerate() {
+        if index > 0 {
+            out.push(' ');
+        }
+        out.push_str(&filter.repo);
+        if !filter.revs.is_empty() {
+            out.push('@');
+            for (rev_index, rev) in filter.revs.iter().enumerate() {
+                if rev_index > 0 {
+                    out.push(':');
+                }
+                out.push_str(&revision_specifier_string(rev));
+            }
+        }
+    }
+    out.push(']');
+    out
+}
+
+fn revision_specifier_string(rev: &crate::search_contexts::RevisionSpecifier) -> String {
+    if !rev.exclude_ref_glob.is_empty() {
+        format!("*!{}", rev.exclude_ref_glob)
+    } else if !rev.ref_glob.is_empty() {
+        format!("*{}", rev.ref_glob)
+    } else if rev.rev_at_time {
+        // `RevAtTime.String()` is a base64 JSON blob; not exercised by the
+        // corpus (date parsing is outside this construction slice).
+        "rat=?".to_owned()
+    } else {
+        rev.rev_spec.clone()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Enumerable job tree
+// ---------------------------------------------------------------------------
+
+/// One constructed job. `children` mirrors `Job.Children`; `kind` carries the
+/// attributes and name.
+#[derive(Debug, Clone, PartialEq)]
+pub struct JobNode {
+    kind: NodeKind,
+    children: Vec<JobNode>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum NodeKind {
+    Noop,
+    Or,
+    And,
+    Parallel,
+    Sequential {
+        ensure_unique: bool,
+    },
+    Timeout {
+        nanos: i64,
+    },
+    Limit {
+        limit: i64,
+    },
+    Log,
+    Alert {
+        query: String,
+        original_query: String,
+        pattern_type: &'static str,
+    },
+    SearcherText,
+    SearcherSymbol {
+        request: jb::SymbolSearchRequest,
+        limit: i64,
+    },
+    Commit {
+        query: String,
+        diff: bool,
+        limit: i64,
+    },
+    Structural {
+        pattern_info: jb::TextPatternInfo,
+    },
+    ZoektRepoSubsetText {
+        query: String,
+        typ: &'static str,
+    },
+    ZoektSymbol {
+        query: String,
+    },
+    ZoektGlobalText {
+        query: String,
+        typ: &'static str,
+        repo_opts: TreeRepoOptions,
+    },
+    ZoektGlobalSymbol {
+        query: String,
+        typ: &'static str,
+        repo_opts: TreeRepoOptions,
+    },
+    ComputeExcluded {
+        repo_opts: TreeRepoOptions,
+    },
+    FileContains {
+        original_patterns: Vec<String>,
+        filter_patterns: Vec<String>,
+    },
+    FileHasOwners {
+        include: Vec<String>,
+        exclude: Vec<String>,
+    },
+    FileHasContributors {
+        include: Vec<String>,
+        exclude: Vec<String>,
+    },
+    Select {
+        select: Vec<String>,
+    },
+    SelectOwners,
+    Sanitize,
+    SubRepoPerms,
+    RepoPager {
+        repo_opts: TreeRepoOptions,
+        contains_ref_globs: bool,
+    },
+    ReposPartial,
+    RepoSearch {
+        repo_opts: TreeRepoOptions,
+        repo_name_patterns: Vec<String>,
+    },
+}
+
+impl JobNode {
+    fn leaf(kind: NodeKind) -> JobNode {
+        JobNode {
+            kind,
+            children: Vec::new(),
+        }
+    }
+
+    fn new(kind: NodeKind, children: Vec<JobNode>) -> JobNode {
+        JobNode { kind, children }
+    }
+
+    fn is_noop(&self) -> bool {
+        matches!(self.kind, NodeKind::Noop)
+    }
+
+    fn name_str(&self) -> &'static str {
+        match &self.kind {
+            NodeKind::Noop => "NoopJob",
+            NodeKind::Or => "OrJob",
+            NodeKind::And => "AndJob",
+            NodeKind::Parallel => "ParallelJob",
+            NodeKind::Sequential { .. } => "SequentialJob",
+            NodeKind::Timeout { .. } => "TimeoutJob",
+            NodeKind::Limit { .. } => "LimitJob",
+            NodeKind::Log => "LogJob",
+            NodeKind::Alert { .. } => "AlertJob",
+            NodeKind::SearcherText => "SearcherTextSearchJob",
+            NodeKind::SearcherSymbol { .. } => "SearcherSymbolSearchJob",
+            NodeKind::Commit { diff, .. } => {
+                if *diff {
+                    "DiffSearchJob"
+                } else {
+                    "CommitSearchJob"
+                }
+            }
+            NodeKind::Structural { .. } => "StructuralSearchJob",
+            NodeKind::ZoektRepoSubsetText { .. } => "ZoektRepoSubsetTextSearchJob",
+            NodeKind::ZoektSymbol { .. } => "ZoektSymbolSearchJob",
+            NodeKind::ZoektGlobalText { .. } => "ZoektGlobalTextSearchJob",
+            NodeKind::ZoektGlobalSymbol { .. } => "ZoektGlobalSymbolSearchJob",
+            NodeKind::ComputeExcluded { .. } => "ReposComputeExcludedJob",
+            NodeKind::FileContains { .. } => "FileContainsFilterJob",
+            NodeKind::FileHasOwners { .. } => "FileHasOwnersFilterJob",
+            NodeKind::FileHasContributors { .. } => "FileHasContributorsFilterJob",
+            NodeKind::Select { .. } => "SelectJob",
+            NodeKind::SelectOwners => "SelectOwnersSearchJob",
+            NodeKind::Sanitize => "SanitizeJob",
+            NodeKind::SubRepoPerms => "SubRepoPermsFilterJob",
+            NodeKind::RepoPager { .. } => "RepoPagerJob",
+            NodeKind::ReposPartial => "PartialReposJob",
+            NodeKind::RepoSearch { .. } => "RepoSearchJob",
+        }
+    }
+
+    fn basic_attributes(&self) -> Vec<(String, String)> {
+        match &self.kind {
+            NodeKind::Noop
+            | NodeKind::Or
+            | NodeKind::And
+            | NodeKind::Parallel
+            | NodeKind::Log
+            | NodeKind::SelectOwners
+            | NodeKind::Sanitize
+            | NodeKind::SubRepoPerms
+            | NodeKind::ReposPartial => Vec::new(),
+            NodeKind::Sequential { ensure_unique } => {
+                vec![("ensureUnique".to_owned(), ensure_unique.to_string())]
+            }
+            NodeKind::Timeout { nanos } => vec![("timeout".to_owned(), go_duration(*nanos))],
+            NodeKind::Limit { limit } => vec![("limit".to_owned(), limit.to_string())],
+            NodeKind::Alert {
+                query,
+                original_query,
+                pattern_type,
+            } => vec![
+                ("query".to_owned(), query.clone()),
+                ("originalQuery".to_owned(), original_query.clone()),
+                ("patternType".to_owned(), (*pattern_type).to_owned()),
+            ],
+            NodeKind::SearcherText => vec![("indexed".to_owned(), "false".to_owned())],
+            NodeKind::SearcherSymbol { request, limit } => {
+                let mut res = Vec::new();
+                push_scoped(&mut res, "request", symbol_request_attributes(request));
+                res.push(("numRepos".to_owned(), "0".to_owned()));
+                res.push(("limit".to_owned(), limit.to_string()));
+                res
+            }
+            NodeKind::Commit { query, diff, limit } => vec![
+                ("query".to_owned(), query.clone()),
+                ("diff".to_owned(), diff.to_string()),
+                ("limit".to_owned(), limit.to_string()),
+            ],
+            NodeKind::Structural { pattern_info } => {
+                let mut res = Vec::new();
+                push_scoped(
+                    &mut res,
+                    "patternInfo",
+                    text_pattern_info_attributes(pattern_info),
+                );
+                res
+            }
+            NodeKind::ZoektRepoSubsetText { query, typ } => vec![
+                ("query".to_owned(), query.clone()),
+                ("type".to_owned(), (*typ).to_owned()),
+            ],
+            NodeKind::ZoektSymbol { query } => vec![("query".to_owned(), query.clone())],
+            NodeKind::ZoektGlobalText {
+                query,
+                typ,
+                repo_opts,
+            }
+            | NodeKind::ZoektGlobalSymbol {
+                query,
+                typ,
+                repo_opts,
+            } => {
+                let mut res = vec![
+                    ("query".to_owned(), query.clone()),
+                    ("type".to_owned(), (*typ).to_owned()),
+                ];
+                res.extend(repo_opts.scoped_attributes());
+                res
+            }
+            NodeKind::ComputeExcluded { repo_opts } => repo_opts.scoped_attributes(),
+            NodeKind::FileContains {
+                original_patterns,
+                filter_patterns,
+            } => vec![
+                (
+                    "originalPatterns".to_owned(),
+                    string_slice(original_patterns.iter().map(String::as_str)),
+                ),
+                (
+                    "filterPatterns".to_owned(),
+                    string_slice(filter_patterns.iter().map(String::as_str)),
+                ),
+            ],
+            NodeKind::FileHasOwners { include, exclude } => vec![
+                (
+                    "includeOwners".to_owned(),
+                    string_slice(include.iter().map(String::as_str)),
+                ),
+                (
+                    "excludeOwners".to_owned(),
+                    string_slice(exclude.iter().map(String::as_str)),
+                ),
+            ],
+            NodeKind::FileHasContributors { include, exclude } => vec![
+                (
+                    "includeContributors".to_owned(),
+                    string_slice(include.iter().map(String::as_str)),
+                ),
+                (
+                    "excludeContributors".to_owned(),
+                    string_slice(exclude.iter().map(String::as_str)),
+                ),
+            ],
+            NodeKind::Select { select } => vec![(
+                "select".to_owned(),
+                string_slice(select.iter().map(String::as_str)),
+            )],
+            NodeKind::RepoPager { repo_opts, .. } => repo_opts.scoped_attributes(),
+            NodeKind::RepoSearch {
+                repo_opts,
+                repo_name_patterns,
+            } => {
+                let mut res = repo_opts.scoped_attributes();
+                res.push((
+                    "repoNamePatterns".to_owned(),
+                    string_slice(repo_name_patterns.iter().map(String::as_str)),
+                ));
+                res
+            }
+        }
+    }
+}
+
+impl SearchJob for JobNode {
+    fn run(
+        &mut self,
+        _ctx: &JobContext,
+        _clients: &RuntimeClients<'_>,
+        _stream: &mut dyn FnMut(crate::search_stream::progress::SearchEvent),
+    ) -> Result<(), JobError> {
+        Err(JobError(
+            "job execution is not ported (M9.8ho construction-only)".to_owned(),
+        ))
+    }
+
+    fn name(&self) -> &'static str {
+        self.name_str()
+    }
+
+    fn children(&self) -> Vec<&dyn SearchJob> {
+        self.children
+            .iter()
+            .map(|child| child as &dyn SearchJob)
+            .collect()
+    }
+
+    fn attributes(&self, verbosity: Verbosity) -> Vec<(String, String)> {
+        match verbosity {
+            Verbosity::None => Vec::new(),
+            Verbosity::Basic | Verbosity::Max => self.basic_attributes(),
+        }
+    }
+}
+
+fn symbol_request_attributes(request: &jb::SymbolSearchRequest) -> Vec<(String, String)> {
+    let mut res = vec![("pattern".to_owned(), request.regexp_pattern.clone())];
+    if request.is_case_sensitive {
+        res.push(("isCaseSensitive".to_owned(), "true".to_owned()));
+    }
+    if !request.include_patterns.is_empty() {
+        res.push((
+            "includePatterns".to_owned(),
+            string_slice(request.include_patterns.iter().map(String::as_str)),
+        ));
+    }
+    if !request.exclude_pattern.is_empty() {
+        res.push(("excludePattern".to_owned(), request.exclude_pattern.clone()));
+    }
+    if !request.include_langs.is_empty() {
+        res.push((
+            "includeLangs".to_owned(),
+            string_slice(request.include_langs.iter().map(String::as_str)),
+        ));
+    }
+    if !request.exclude_langs.is_empty() {
+        res.push((
+            "excludeLangs".to_owned(),
+            string_slice(request.exclude_langs.iter().map(String::as_str)),
+        ));
+    }
+    res
+}
+
+fn text_pattern_info_attributes(info: &jb::TextPatternInfo) -> Vec<(String, String)> {
+    let mut res = vec![("query".to_owned(), info.query.to_string())];
+    if info.is_structural_pat {
+        res.push(("isStructural".to_owned(), "true".to_owned()));
+    }
+    if !info.comby_rule.is_empty() {
+        res.push(("combyRule".to_owned(), info.comby_rule.clone()));
+    }
+    if info.is_case_sensitive {
+        res.push(("isCaseSensitive".to_owned(), "true".to_owned()));
+    }
+    res.push((
+        "fileMatchLimit".to_owned(),
+        info.file_match_limit.to_string(),
+    ));
+    if info.index != YesNoOnly::Yes {
+        res.push(("index".to_owned(), yes_no_only_str(info.index).to_owned()));
+    }
+    if !info.select.is_empty() {
+        res.push((
+            "select".to_owned(),
+            string_slice(info.select.iter().map(String::as_str)),
+        ));
+    }
+    if !info.include_paths.is_empty() {
+        res.push((
+            "includePatterns".to_owned(),
+            string_slice(info.include_paths.iter().map(String::as_str)),
+        ));
+    }
+    if !info.exclude_paths.is_empty() {
+        res.push(("excludePattern".to_owned(), info.exclude_paths.clone()));
+    }
+    if info.path_patterns_are_case_sensitive {
+        res.push(("pathPatternsAreCaseSensitive".to_owned(), "true".to_owned()));
+    }
+    if info.pattern_matches_path {
+        res.push(("patternMatchesPath".to_owned(), "true".to_owned()));
+    }
+    if !info.languages.is_empty() {
+        res.push((
+            "languages".to_owned(),
+            string_slice(info.languages.iter().map(String::as_str)),
+        ));
+    }
+    res
+}
+
+fn go_duration(nanos: i64) -> String {
+    if nanos < 0 {
+        format!(
+            "-{}",
+            format_go_duration(Duration::from_nanos(nanos.unsigned_abs()))
+        )
+    } else {
+        format_go_duration(Duration::from_nanos(nanos as u64))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Combinator constructors (baseline collapse rules)
+// ---------------------------------------------------------------------------
+
+fn new_noop_job() -> JobNode {
+    JobNode::leaf(NodeKind::Noop)
+}
+
+fn new_or_job(mut children: Vec<JobNode>) -> JobNode {
+    match children.len() {
+        0 => new_noop_job(),
+        1 => children.remove(0),
+        _ => JobNode::new(NodeKind::Or, children),
+    }
+}
+
+fn new_and_job(mut children: Vec<JobNode>) -> JobNode {
+    match children.len() {
+        0 => new_noop_job(),
+        1 => children.remove(0),
+        _ => JobNode::new(NodeKind::And, children),
+    }
+}
+
+fn new_parallel_job(mut children: Vec<JobNode>) -> JobNode {
+    match children.len() {
+        0 => new_noop_job(),
+        1 => children.remove(0),
+        _ => JobNode::new(NodeKind::Parallel, children),
+    }
+}
+
+fn new_sequential_job(ensure_unique: bool, mut children: Vec<JobNode>) -> JobNode {
+    match children.len() {
+        0 => new_noop_job(),
+        1 => children.remove(0),
+        _ => JobNode::new(NodeKind::Sequential { ensure_unique }, children),
+    }
+}
+
+fn new_timeout_job(nanos: i64, child: JobNode) -> JobNode {
+    if child.is_noop() {
+        return child;
+    }
+    JobNode::new(NodeKind::Timeout { nanos }, vec![child])
+}
+
+fn new_limit_job(limit: i64, child: JobNode) -> JobNode {
+    if child.is_noop() {
+        return child;
+    }
+    JobNode::new(NodeKind::Limit { limit }, vec![child])
+}
+
+fn new_alert_job(inputs: &TreeInputs, plan: &Plan, child: JobNode) -> JobNode {
+    if child.is_noop() {
+        return child;
+    }
+    let query = q_string(&plan_to_q(plan));
+    JobNode::new(
+        NodeKind::Alert {
+            query,
+            original_query: inputs.original_query.clone(),
+            pattern_type: crate::search_jobutil_combinators::pattern_type_str(inputs.pattern_type),
+        },
+        vec![child],
+    )
+}
+
+fn new_log_job(child: JobNode) -> JobNode {
+    JobNode::new(NodeKind::Log, vec![child])
+}
+
+fn repo_pager(child: JobNode, repo_opts: TreeRepoOptions, contains_ref_globs: bool) -> JobNode {
+    JobNode::new(
+        NodeKind::RepoPager {
+            repo_opts,
+            contains_ref_globs,
+        },
+        vec![JobNode::new(NodeKind::ReposPartial, vec![child])],
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Entry points
+// ---------------------------------------------------------------------------
+
+/// `NewPlanJob` (`job.go:35-63`).
+pub fn new_plan_job(inputs: &TreeInputs, plan: &Plan) -> Result<JobNode, JobError> {
+    let mut children = Vec::with_capacity(plan.len());
+    for basic in plan {
+        children.push(new_basic_job(inputs, basic)?);
+    }
+
+    let mut job_tree = new_or_job(children);
+
+    if inputs.pattern_type == SearchType::CodyContext {
+        match &inputs.cody_context_hook {
+            Some(hook) => job_tree = hook(plan, inputs)?,
+            None => {
+                return Err(JobError(
+                    "codycontext.NewSearchJob is not ported (M9.8ho)".to_owned(),
+                ))
+            }
+        }
+    }
+
+    let alert_job = new_alert_job(inputs, plan, job_tree);
+    Ok(new_log_job(alert_job))
+}
+
+/// `NewBasicJob` (`job.go:65-281`).
+pub fn new_basic_job(inputs: &TreeInputs, basic: &Basic) -> Result<JobNode, JobError> {
+    let mut children = Vec::new();
+
+    // `file:contains.content()` rewrite. The original query feeds the
+    // post-filter and the git query.
+    let file_contains_patterns = file_contains_content(basic);
+    let original_query = basic.clone();
+    let mut b = basic.clone();
+    if !file_contains_patterns.is_empty() {
+        let mut new_nodes = Vec::with_capacity(file_contains_patterns.len() + 1);
+        for pattern in &file_contains_patterns {
+            let mut node = Pattern {
+                value: pattern.clone(),
+                negated: false,
+                annotation: Default::default(),
+            };
+            node.annotation.labels.set(Labels::REGEXP);
+            new_nodes.push(Node::Pattern(node));
+        }
+        if let Some(pattern) = &b.pattern {
+            new_nodes.push(pattern.clone());
+        }
+        b.pattern = Some(Node::Operator(Operator {
+            kind: OperatorKind::And,
+            operands: new_nodes,
+            annotation: Default::default(),
+        }));
+    }
+
+    let default_limit = inputs.default_limit();
+    let result_types = jb::compute_result_types(&b, inputs.pattern_type, jb::DEFAULT_RESULT_TYPES);
+    let file_match_limit = jb::compute_file_match_limit(&b, default_limit) as i32;
+    let job_repo_options = jb::to_repo_options(&b, &inputs.user_settings);
+    let (repo_universe_search, skip_repo_subset_search, run_zoekt_over_repos) = jb::job_mode(
+        &b,
+        &job_repo_options,
+        result_types,
+        &jb::SearchInputs {
+            protocol: inputs.protocol,
+            pattern_type: inputs.pattern_type,
+            on_sourcegraph_dot_com: inputs.on_sourcegraph_dot_com,
+        },
+    );
+    let repo_options = TreeRepoOptions::from_job_builders(&job_repo_options);
+    let contains_ref_globs = contains_ref_globs(&b);
+
+    let builder = JobBuilder {
+        result_types,
+        features: inputs.features,
+    };
+
+    if result_types.has(jb::ResultTypes::FILE | jb::ResultTypes::PATH) {
+        if repo_universe_search {
+            children.push(new_zoekt_global_search(
+                &builder,
+                &b,
+                &repo_options,
+                IndexedRequestType::Text,
+            )?);
+        }
+
+        if !skip_repo_subset_search {
+            if run_zoekt_over_repos {
+                let search_job = new_zoekt_search(&builder, &b, IndexedRequestType::Text)?;
+                children.push(repo_pager(
+                    search_job,
+                    repo_options.clone(),
+                    contains_ref_globs,
+                ));
+            }
+
+            children.push(new_text_search_job(
+                inputs,
+                &b,
+                result_types,
+                repo_options.clone(),
+            )?);
+        }
+    }
+
+    if result_types.has(jb::ResultTypes::SYMBOL) {
+        if repo_universe_search {
+            children.push(new_zoekt_global_search(
+                &builder,
+                &b,
+                &repo_options,
+                IndexedRequestType::Symbol,
+            )?);
+        }
+
+        if !skip_repo_subset_search && run_zoekt_over_repos {
+            let search_job = new_zoekt_search(&builder, &b, IndexedRequestType::Symbol)?;
+            children.push(repo_pager(
+                search_job,
+                repo_options.clone(),
+                contains_ref_globs,
+            ));
+        }
+    }
+
+    if result_types.has(jb::ResultTypes::COMMIT) || result_types.has(jb::ResultTypes::DIFF) {
+        let own = jb::is_ownership_search(&b).2;
+        let diff = result_types.has(jb::ResultTypes::DIFF);
+        let commit_repo_options = TreeRepoOptions {
+            only_cloned: true,
+            ..repo_options.clone()
+        };
+        // `IncludeModifiedFiles` is Max-only and therefore not part of this
+        // construction tree. `own` only feeds it in the baseline.
+        let _ = own;
+        let commit_job = JobNode::leaf(NodeKind::Commit {
+            query: query_to_git_query(&original_query, diff).to_string(),
+            diff,
+            limit: i64::from(file_match_limit),
+        });
+        children.push(repo_pager(
+            commit_job,
+            commit_repo_options,
+            contains_ref_globs,
+        ));
+    }
+
+    children.push(JobNode::leaf(NodeKind::ComputeExcluded {
+        repo_opts: repo_options.clone(),
+    }));
+
+    children.push(to_flat_jobs(inputs, &b)?);
+
+    let mut basic_job = new_parallel_job(children);
+
+    if !file_contains_patterns.is_empty() {
+        basic_job = new_file_contains_filter(
+            file_contains_patterns,
+            original_query.pattern.as_ref(),
+            b.is_case_sensitive(),
+            basic_job,
+        )?;
+    }
+
+    let (include_owners, exclude_owners, ownership) = jb::is_ownership_search(&b);
+    if ownership {
+        basic_job = JobNode::new(
+            NodeKind::FileHasOwners {
+                include: include_owners,
+                exclude: exclude_owners,
+            },
+            vec![basic_job],
+        );
+    }
+
+    let (include_contributors, exclude_contributors, contributors) = jb::is_contributor_search(&b);
+    if contributors {
+        let include = jb::contributors_as_regexp(&include_contributors, b.is_case_sensitive())
+            .iter()
+            .map(|re| re.as_str().to_owned())
+            .collect();
+        let exclude = jb::contributors_as_regexp(&exclude_contributors, b.is_case_sensitive())
+            .iter()
+            .map(|re| re.as_str().to_owned())
+            .collect();
+        basic_job = JobNode::new(
+            NodeKind::FileHasContributors { include, exclude },
+            vec![basic_job],
+        );
+    }
+
+    if inputs.sub_repo_enabled {
+        basic_job = JobNode::new(NodeKind::SubRepoPerms, vec![basic_job]);
+    }
+
+    let select_value = q_string_value(&b.to_parse_tree(), FIELD_SELECT);
+    if !select_value.is_empty() {
+        let select_path = jb::select_path_from_string(&select_value).unwrap_or_default();
+        if jb::is_select_owners_search(&select_path) {
+            basic_job = JobNode::new(NodeKind::SelectOwners, vec![basic_job]);
+        } else {
+            basic_job = JobNode::new(
+                NodeKind::Select {
+                    select: select_path,
+                },
+                vec![basic_job],
+            );
+        }
+    }
+
+    if !inputs.sanitize_search_patterns.is_empty() {
+        basic_job = JobNode::new(NodeKind::Sanitize, vec![basic_job]);
+    }
+
+    let max_results = jb::parameters_max_results(&b.parameters, default_limit);
+    basic_job = new_limit_job(max_results, basic_job);
+
+    let timeout = jb::timeout_duration(inputs.protocol, &b, jb::DEFAULT_MAX_TIMEOUT_SECONDS);
+    basic_job = new_timeout_job(timeout, basic_job);
+
+    if inputs.on_sourcegraph_dot_com && matches!(b.pattern, Some(Node::Pattern(_))) {
+        basic_job = order_racing_jobs(basic_job);
+    }
+
+    Ok(basic_job)
+}
+
+/// `NewTextSearchJob` (`job.go:282-304`).
+pub fn new_text_search_job(
+    inputs: &TreeInputs,
+    basic: &Basic,
+    result_types: jb::ResultTypes,
+    repo_options: TreeRepoOptions,
+) -> Result<JobNode, JobError> {
+    // `useFullDeadline`, `features`, `pathRegexps` and `numContextLines` are
+    // Max-only attributes; `toTextPatternInfo` is still evaluated because its
+    // validation error is observable.
+    let _info = jb::to_text_pattern_info(
+        basic,
+        result_types,
+        &inputs.features,
+        inputs.default_limit(),
+    )
+    .map_err(JobError)?;
+
+    let searcher_job = JobNode::leaf(NodeKind::SearcherText);
+    Ok(repo_pager(
+        searcher_job,
+        repo_options,
+        contains_ref_globs(basic),
+    ))
+}
+
+struct JobBuilder {
+    result_types: jb::ResultTypes,
+    features: Features,
+}
+
+impl JobBuilder {
+    fn zoekt_result_types(&self) -> zoekt_query::ResultTypes {
+        let mut types = zoekt_query::ResultTypes::default();
+        for (from, to) in [
+            (jb::ResultTypes::REPO, zoekt_query::ResultTypes::REPO),
+            (jb::ResultTypes::SYMBOL, zoekt_query::ResultTypes::SYMBOL),
+            (jb::ResultTypes::FILE, zoekt_query::ResultTypes::FILE),
+            (jb::ResultTypes::PATH, zoekt_query::ResultTypes::PATH),
+            (jb::ResultTypes::DIFF, zoekt_query::ResultTypes::DIFF),
+            (jb::ResultTypes::COMMIT, zoekt_query::ResultTypes::COMMIT),
+            (
+                jb::ResultTypes::STRUCTURAL,
+                zoekt_query::ResultTypes::STRUCTURAL,
+            ),
+        ] {
+            if self.result_types.has(from) {
+                types = types.with(to);
+            }
+        }
+        types
+    }
+
+    fn zoekt_features(&self) -> zoekt_query::Features {
+        zoekt_query::Features {
+            content_based_lang_filters: self.features.content_based_lang_filters,
+        }
+    }
+}
+
+fn zoekt_repo_options(options: &TreeRepoOptions) -> sg_zoekt::global_query::RepoOptions {
+    sg_zoekt::global_query::RepoOptions {
+        visibility: match options.visibility {
+            RepoVisibility::Any => sg_zoekt::global_query::RepoVisibility::Any,
+            RepoVisibility::Private => sg_zoekt::global_query::RepoVisibility::Private,
+            RepoVisibility::Public => sg_zoekt::global_query::RepoVisibility::Public,
+        },
+        minus_repo_filters: options.minus_repo_filters.clone(),
+        only_archived: options.only_archived,
+        no_archived: options.no_archived,
+        only_forks: options.only_forks,
+        no_forks: options.no_forks,
+    }
+}
+
+/// `jobBuilder.newZoektGlobalSearch` (`job.go:858-909`).
+fn new_zoekt_global_search(
+    builder: &JobBuilder,
+    basic: &Basic,
+    repo_options: &TreeRepoOptions,
+    typ: IndexedRequestType,
+) -> Result<JobNode, JobError> {
+    let zoekt_query = zoekt_query::from_basic(
+        basic,
+        builder.zoekt_result_types(),
+        &builder.zoekt_features(),
+        typ,
+    )
+    .map_err(|error| JobError(error.to_string()))?;
+
+    let default_scope = default_global_query_scope(&zoekt_repo_options(repo_options))
+        .map_err(|error| JobError(error.to_string()))?;
+
+    let include_private = matches!(
+        repo_options.visibility,
+        RepoVisibility::Private | RepoVisibility::Any
+    );
+    let global = GlobalZoektQuery::new(zoekt_query, default_scope, include_private);
+    let query = global.query.to_string();
+
+    Ok(match typ {
+        IndexedRequestType::Symbol => JobNode::leaf(NodeKind::ZoektGlobalSymbol {
+            query,
+            typ: "symbol",
+            repo_opts: repo_options.clone(),
+        }),
+        IndexedRequestType::Text => JobNode::leaf(NodeKind::ZoektGlobalText {
+            query,
+            typ: "text",
+            repo_opts: repo_options.clone(),
+        }),
+    })
+}
+
+/// `jobBuilder.newZoektSearch` (`job.go:911-936`).
+fn new_zoekt_search(
+    builder: &JobBuilder,
+    basic: &Basic,
+    typ: IndexedRequestType,
+) -> Result<JobNode, JobError> {
+    let zoekt_query = zoekt_query::from_basic(
+        basic,
+        builder.zoekt_result_types(),
+        &builder.zoekt_features(),
+        typ,
+    )
+    .map_err(|error| JobError(error.to_string()))?;
+
+    Ok(match typ {
+        IndexedRequestType::Symbol => JobNode::leaf(NodeKind::ZoektSymbol {
+            query: zoekt_query.to_string(),
+        }),
+        IndexedRequestType::Text => JobNode::leaf(NodeKind::ZoektRepoSubsetText {
+            query: zoekt_query.to_string(),
+            typ: "text",
+        }),
+    })
+}
+
+/// `NewFlatJob` (`job.go:361-520`).
+pub fn new_flat_job(inputs: &TreeInputs, basic: &Basic) -> Result<JobNode, JobError> {
+    let default_limit = inputs.default_limit();
+    let max_results = jb::parameters_max_results(&basic.parameters, default_limit);
+    let result_types =
+        jb::compute_result_types(basic, inputs.pattern_type, jb::DEFAULT_RESULT_TYPES);
+    let job_repo_options = jb::to_repo_options(basic, &inputs.user_settings);
+    let (_, skip_repo_subset_search, _) = jb::job_mode(
+        basic,
+        &job_repo_options,
+        result_types,
+        &jb::SearchInputs {
+            protocol: inputs.protocol,
+            pattern_type: inputs.pattern_type,
+            on_sourcegraph_dot_com: inputs.on_sourcegraph_dot_com,
+        },
+    );
+    let mut repo_options = TreeRepoOptions::from_job_builders(&job_repo_options);
+    let contains_ref_globs = contains_ref_globs(basic);
+
+    let mut all_jobs = Vec::new();
+
+    if result_types.has(jb::ResultTypes::SYMBOL) && !skip_repo_subset_search {
+        let request = jb::to_symbol_search_request(basic, &inputs.features).map_err(JobError)?;
+        let symbol_job = JobNode::leaf(NodeKind::SearcherSymbol {
+            request,
+            limit: max_results,
+        });
+        all_jobs.push(repo_pager(
+            symbol_job,
+            repo_options.clone(),
+            contains_ref_globs,
+        ));
+    }
+
+    if result_types.has(jb::ResultTypes::STRUCTURAL) {
+        let pattern_info =
+            jb::to_text_pattern_info(basic, result_types, &inputs.features, default_limit)
+                .map_err(JobError)?;
+        let structural_job = JobNode::leaf(NodeKind::Structural { pattern_info });
+        all_jobs.push(repo_pager(
+            structural_job,
+            repo_options.clone(),
+            contains_ref_globs,
+        ));
+    }
+
+    if result_types.has(jb::ResultTypes::REPO) && repo_search_valid(basic) {
+        let (updated, ok) = add_pattern_as_repo_filter(
+            &basic.pattern_string(),
+            repo_options.clone(),
+            basic.is_case_sensitive(),
+        );
+        if ok {
+            repo_options = updated;
+            let repo_name_patterns = repo_options
+                .repo_filters
+                .iter()
+                .map(|filter| format!("(?i){}", filter.repo))
+                .collect();
+            all_jobs.push(JobNode::leaf(NodeKind::RepoSearch {
+                repo_opts: repo_options.clone(),
+                repo_name_patterns,
+            }));
+        }
+    }
+
+    Ok(new_parallel_job(all_jobs))
+}
+
+/// `NewFlatJob`'s repo field allowlist.
+fn repo_search_valid(basic: &Basic) -> bool {
+    const ALLOWLIST: &[&str] = &[
+        "repo",
+        "context",
+        "type",
+        "",
+        "index",
+        "count",
+        "timeout",
+        "fork",
+        "archived",
+        "visibility",
+        "case",
+        "repohasfile",
+        "repohascommitafter",
+        "patterntype",
+        "select",
+    ];
+    let mut valid = true;
+    visit_parameter(&basic.to_parse_tree(), &mut |field, _, _, _| {
+        if !ALLOWLIST.contains(&field) {
+            valid = false;
+        }
+    });
+    valid
+}
+
+/// `NewFlatJob`'s `addPatternAsRepoFilter`.
+fn add_pattern_as_repo_filter(
+    pattern: &str,
+    mut options: TreeRepoOptions,
+    case_sensitive: bool,
+) -> (TreeRepoOptions, bool) {
+    if pattern.is_empty() {
+        return (options, true);
+    }
+
+    options.repo_filters = options.repo_filters.clone();
+    options.case_sensitive_repo_filters = case_sensitive;
+
+    let mut split = pattern.splitn(2, '@');
+    let prefix = split.next().unwrap_or_default();
+    let has_suffix = split.next().is_some();
+    if !has_suffix || !prefix.is_empty() {
+        match parse_repository_revisions(prefix) {
+            Ok(filter) => {
+                options.repo_filters.push(filter);
+                (options, true)
+            }
+            Err(_) => (TreeRepoOptions::default(), false),
+        }
+    } else {
+        // Pattern starts with `@`: cannot be used as a repo filter.
+        (TreeRepoOptions::default(), false)
+    }
+}
+
+/// `toAndJob` (`job.go:1006-1029`).
+fn to_and_job(inputs: &TreeInputs, basic: &Basic) -> Result<JobNode, JobError> {
+    let Node::Operator(operator) = basic.pattern.as_ref().expect("And requires operator") else {
+        unreachable!("toAndJob requires an Operator pattern");
+    };
+    let operands = operator.operands.clone();
+    let mut jobs = Vec::with_capacity(operands.len());
+    for operand in operands {
+        let mapped = basic.map_pattern(operand);
+        let child = to_pattern_expression_job(inputs, &mapped)?;
+        jobs.push(new_limit_job(40000, child));
+    }
+    Ok(new_and_job(jobs))
+}
+
+/// `toOrJob` (`job.go:1031-1043`).
+fn to_or_job(inputs: &TreeInputs, basic: &Basic) -> Result<JobNode, JobError> {
+    let Node::Operator(operator) = basic.pattern.as_ref().expect("Or requires operator") else {
+        unreachable!("toOrJob requires an Operator pattern");
+    };
+    let operands = operator.operands.clone();
+    let mut jobs = Vec::with_capacity(operands.len());
+    for operand in operands {
+        jobs.push(to_pattern_expression_job(
+            inputs,
+            &basic.map_pattern(operand),
+        )?);
+    }
+    Ok(new_or_job(jobs))
+}
+
+/// `toPatternExpressionJob` (`job.go:1045-1070`).
+fn to_pattern_expression_job(inputs: &TreeInputs, basic: &Basic) -> Result<JobNode, JobError> {
+    match &basic.pattern {
+        Some(Node::Operator(operator)) => {
+            if operator.operands.is_empty() {
+                return Ok(new_noop_job());
+            }
+            match operator.kind {
+                OperatorKind::And => to_and_job(inputs, basic),
+                OperatorKind::Or => to_or_job(inputs, basic),
+                OperatorKind::Concat => Err(JobError(
+                    "unrecognized type query.Operator in evaluatePatternExpression".to_owned(),
+                )),
+            }
+        }
+        Some(Node::Pattern(_)) => new_flat_job(inputs, basic),
+        Some(Node::Parameter(_)) => Ok(new_noop_job()),
+        None => Err(JobError(
+            "unrecognized type <nil> in evaluatePatternExpression".to_owned(),
+        )),
+    }
+}
+
+/// `toFlatJobs` (`job.go:1074-1081`).
+fn to_flat_jobs(inputs: &TreeInputs, basic: &Basic) -> Result<JobNode, JobError> {
+    if basic.pattern.is_none() {
+        new_flat_job(inputs, basic)
+    } else {
+        to_pattern_expression_job(inputs, basic)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// file:contains.content()
+// ---------------------------------------------------------------------------
+
+/// `Parameters.FileContainsContent` for the `file:contains.content()` predicate.
+fn file_contains_content(basic: &Basic) -> Vec<String> {
+    let mut include = Vec::new();
+    let nodes = basic.parameters.to_nodes();
+    visit_field(&nodes, FIELD_FILE, &mut |value, _negated, annotation| {
+        if !annotation.labels.is_set(Labels::IS_PREDICATE) {
+            return;
+        }
+        let Some((name, args)) = parse_as_predicate(value) else {
+            return;
+        };
+        let canonical = match name.as_str() {
+            "contains.content" | "has.content" => "contains.content",
+            _ => return,
+        };
+        if canonical == "contains.content" {
+            include.push(args);
+        }
+    });
+    include
+}
+
+/// `NewFileContainsFilterJob` (`filter_file_contains.go:39-72`).
+fn new_file_contains_filter(
+    include_patterns: Vec<String>,
+    original_pattern: Option<&Node>,
+    case_sensitive: bool,
+    child: JobNode,
+) -> Result<JobNode, JobError> {
+    let include_matchers = compile_contains_patterns(
+        &include_patterns,
+        case_sensitive,
+        ContainsPatternStage::Include,
+    )?;
+    let pattern_node = original_pattern.map(node_to_filter_pattern);
+    let original_patterns = pattern_node
+        .as_ref()
+        .map(patterns_in_tree)
+        .unwrap_or_default();
+    let original_matchers = compile_contains_patterns(
+        &original_patterns,
+        case_sensitive,
+        ContainsPatternStage::Original,
+    )?;
+
+    Ok(JobNode::new(
+        NodeKind::FileContains {
+            original_patterns: original_matchers,
+            filter_patterns: include_matchers,
+        },
+        vec![child],
+    ))
+}
+
+fn node_to_filter_pattern(node: &Node) -> FilterPatternNode {
+    match node {
+        Node::Pattern(pattern) => FilterPatternNode::Pattern(pattern.value.clone()),
+        Node::Operator(operator) => FilterPatternNode::Operator(
+            operator
+                .operands
+                .iter()
+                .map(node_to_filter_pattern)
+                .collect(),
+        ),
+        Node::Parameter(_) => {
+            panic!("unknown pattern node type query.Parameter")
+        }
+    }
+}
+
+fn compile_contains_patterns(
+    patterns: &[String],
+    case_sensitive: bool,
+    stage: ContainsPatternStage,
+) -> Result<Vec<String>, JobError> {
+    let mut matchers = Vec::with_capacity(patterns.len());
+    for pattern in patterns {
+        let pattern = if case_sensitive {
+            pattern.clone()
+        } else {
+            format!("(?i:{pattern})")
+        };
+        match Regex::new(&pattern) {
+            Ok(regex) => matchers.push(regex.as_str().to_owned()),
+            Err(error) => {
+                return Err(JobError(
+                    ContainsPatternError {
+                        stage,
+                        pattern,
+                        message: error.to_string(),
+                    }
+                    .to_string(),
+                ))
+            }
+        }
+    }
+    Ok(matchers)
+}
+
+// ---------------------------------------------------------------------------
+// query.ContainsRefGlobs
+// ---------------------------------------------------------------------------
+
+fn contains_ref_globs(basic: &Basic) -> bool {
+    let (filters, _) = repositories(basic);
+    filters
+        .iter()
+        .any(|filter| filter.revs.iter().any(|rev| rev.has_ref_glob()))
+}
+
+fn repositories(basic: &Basic) -> (Vec<ParsedRepoFilter>, Vec<String>) {
+    let mut repos = Vec::new();
+    let mut negated = Vec::new();
+    let nodes = basic.parameters.to_nodes();
+    visit_field(&nodes, FIELD_REPO, &mut |value, is_negated, annotation| {
+        if annotation.labels.is_set(Labels::IS_PREDICATE) {
+            return;
+        }
+        if is_negated {
+            negated.push(value.to_owned());
+        } else {
+            match parse_repository_revisions(value) {
+                Ok(filter) => repos.push(filter),
+                Err(error) => panic!("repo field {value:?} is an invalid regex: {error}"),
+            }
+        }
+    });
+    (repos, negated)
+}
+
+// ---------------------------------------------------------------------------
+// orderRacingJobs
+// ---------------------------------------------------------------------------
+
+fn has_descendant(node: &JobNode, predicate: &dyn Fn(&NodeKind) -> bool) -> bool {
+    if predicate(&node.kind) {
+        return true;
+    }
+    node.children
+        .iter()
+        .any(|child| has_descendant(child, predicate))
+}
+
+fn map_tree(node: JobNode, map: &mut dyn FnMut(JobNode) -> JobNode) -> JobNode {
+    let mapped_children = node
+        .children
+        .into_iter()
+        .map(|child| map_tree(child, map))
+        .collect();
+    let mapped = JobNode {
+        kind: node.kind,
+        children: mapped_children,
+    };
+    map(mapped)
+}
+
+/// `orderRacingJobs` (`job.go:306-358`).
+fn order_racing_jobs(root: JobNode) -> JobNode {
+    let mut collection = Vec::new();
+
+    let mut first = map_tree(root.clone(), &mut |node| {
+        if matches!(node.kind, NodeKind::RepoPager { .. })
+            && has_descendant(&node, &|kind| matches!(kind, NodeKind::SearcherText))
+        {
+            collection.push(node);
+            new_noop_job()
+        } else {
+            node
+        }
+    });
+
+    first = map_tree(first, &mut |node| {
+        if matches!(node.kind, NodeKind::RepoSearch { .. }) {
+            collection.push(node);
+            new_noop_job()
+        } else {
+            node
+        }
+    });
+
+    if collection.is_empty() {
+        return root;
+    }
+
+    let mut seen_zoekt_repo_search = false;
+    let mut second = map_tree(first, &mut |node| {
+        if matches!(node.kind, NodeKind::RepoPager { .. })
+            && has_descendant(&node, &|kind| {
+                matches!(kind, NodeKind::ZoektRepoSubsetText { .. })
+            })
+        {
+            seen_zoekt_repo_search = true;
+            let mut children = vec![node];
+            children.extend(collection.clone());
+            new_sequential_job(false, children)
+        } else {
+            node
+        }
+    });
+
+    let mut seen_zoekt_global_search = false;
+    second = map_tree(second, &mut |node| {
+        if matches!(node.kind, NodeKind::ZoektGlobalText { .. }) && !seen_zoekt_global_search {
+            seen_zoekt_global_search = true;
+            let mut children = vec![node];
+            children.extend(collection.clone());
+            new_sequential_job(false, children)
+        } else {
+            node
+        }
+    });
+
+    if !seen_zoekt_repo_search && !seen_zoekt_global_search {
+        return root;
+    }
+
+    second
+}
+
+// ---------------------------------------------------------------------------
+// commit.QueryToGitQuery + gitprotocol reduction
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq)]
+enum GitNode {
+    Boolean(bool),
+    AuthorMatches {
+        expr: String,
+        ignore_case: bool,
+    },
+    CommitterMatches {
+        expr: String,
+        ignore_case: bool,
+    },
+    CommitBefore {
+        time: String,
+    },
+    CommitAfter {
+        time: String,
+    },
+    MessageMatches {
+        expr: String,
+        ignore_case: bool,
+    },
+    DiffMatches {
+        expr: String,
+        ignore_case: bool,
+    },
+    DiffModifiesFile {
+        expr: String,
+        ignore_case: bool,
+    },
+    Operator {
+        kind: GitOperatorKind,
+        operands: Vec<GitNode>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum GitOperatorKind {
+    And,
+    Or,
+    Not,
+}
+
+impl GitNode {
+    fn cost(&self) -> f64 {
+        match self {
+            GitNode::Boolean(_) => 0.0,
+            GitNode::CommitBefore { .. } | GitNode::CommitAfter { .. } => 1.0,
+            GitNode::AuthorMatches { .. } | GitNode::CommitterMatches { .. } => 5.0,
+            GitNode::MessageMatches { .. } => 10.0,
+            GitNode::DiffModifiesFile { .. } => 1000.0,
+            GitNode::DiffMatches { .. } => 10000.0,
+            GitNode::Operator { operands, .. } => operands.iter().map(GitNode::cost).sum(),
+        }
+    }
+}
+
+impl std::fmt::Display for GitNode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            GitNode::Boolean(value) => write!(f, "*protocol.Boolean({value})"),
+            GitNode::AuthorMatches { expr, .. } => {
+                write!(f, "*protocol.AuthorMatches({expr})")
+            }
+            GitNode::CommitterMatches { expr, .. } => {
+                write!(f, "*protocol.CommitterMatches({expr})")
+            }
+            GitNode::CommitBefore { time } => write!(f, "*protocol.CommitBefore({time})"),
+            GitNode::CommitAfter { time } => write!(f, "*protocol.CommitAfter({time})"),
+            GitNode::MessageMatches { expr, .. } => {
+                write!(f, "*protocol.MessageMatches({expr})")
+            }
+            GitNode::DiffMatches { expr, .. } => write!(f, "*protocol.DiffMatches({expr})"),
+            GitNode::DiffModifiesFile { expr, .. } => {
+                write!(f, "*protocol.DiffModifiesFile({expr})")
+            }
+            GitNode::Operator { kind, operands } => {
+                let (separator, prefix) = match kind {
+                    GitOperatorKind::And => (" AND ", ""),
+                    GitOperatorKind::Or => (" OR ", ""),
+                    GitOperatorKind::Not => (" AND NOT ", "NOT "),
+                };
+                let rendered: Vec<String> = operands
+                    .iter()
+                    .map(std::string::ToString::to_string)
+                    .collect();
+                write!(f, "({prefix}{})", rendered.join(separator))
+            }
+        }
+    }
+}
+
+fn git_new_operator(kind: GitOperatorKind, operands: Vec<GitNode>) -> GitNode {
+    GitNode::Operator { kind, operands }
+}
+
+fn git_new_and(operands: Vec<GitNode>) -> GitNode {
+    match operands.len() {
+        0 => GitNode::Boolean(true),
+        1 => operands.into_iter().next().expect("one operand"),
+        _ => {
+            let mut flattened = Vec::with_capacity(operands.len());
+            for operand in operands {
+                match operand {
+                    GitNode::Operator {
+                        kind: GitOperatorKind::And,
+                        operands,
+                    } => flattened.extend(operands),
+                    other => flattened.push(other),
+                }
+            }
+            git_new_operator(GitOperatorKind::And, flattened)
+        }
+    }
+}
+
+fn git_new_or(operands: Vec<GitNode>) -> GitNode {
+    match operands.len() {
+        0 => GitNode::Boolean(false),
+        1 => operands.into_iter().next().expect("one operand"),
+        _ => {
+            let mut flattened = Vec::with_capacity(operands.len());
+            for operand in operands {
+                match operand {
+                    GitNode::Operator {
+                        kind: GitOperatorKind::Or,
+                        operands,
+                    } => flattened.extend(operands),
+                    other => flattened.push(other),
+                }
+            }
+            git_new_operator(GitOperatorKind::Or, flattened)
+        }
+    }
+}
+
+fn git_new_not(operand: GitNode) -> GitNode {
+    match operand {
+        GitNode::Operator {
+            kind: GitOperatorKind::Not,
+            operands,
+        } => operands.into_iter().next().expect("one operand"),
+        other => git_new_operator(GitOperatorKind::Not, vec![other]),
+    }
+}
+
+/// `QueryToGitQuery` (`internal/search/commit/commit.go:213-236`).
+fn query_to_git_query(basic: &Basic, diff: bool) -> GitNode {
+    let case_sensitive = basic.is_case_sensitive();
+    let mut res = Vec::with_capacity(basic.parameters.0.len() + 2);
+
+    for parameter in &basic.parameters.0 {
+        if parameter.annotation.labels.is_set(Labels::IS_PREDICATE) {
+            continue;
+        }
+        if let Some(predicate) = query_parameter_to_predicate(parameter, case_sensitive, diff) {
+            res.push(predicate);
+        }
+    }
+
+    if let Some(predicate) = basic
+        .pattern
+        .as_ref()
+        .and_then(|pattern| query_pattern_to_predicate(pattern, case_sensitive, diff))
+    {
+        res.push(predicate);
+    }
+
+    reduce(git_new_and(res))
+}
+
+fn query_pattern_to_predicate(node: &Node, case_sensitive: bool, diff: bool) -> Option<GitNode> {
+    match node {
+        Node::Operator(operator) => {
+            let operands: Vec<GitNode> = operator
+                .operands
+                .iter()
+                .filter_map(|operand| query_pattern_to_predicate(operand, case_sensitive, diff))
+                .collect();
+            Some(match operator.kind {
+                OperatorKind::And => git_new_and(operands),
+                OperatorKind::Or => git_new_or(operands),
+                OperatorKind::Concat => return None,
+            })
+        }
+        Node::Pattern(pattern) => {
+            let expr = pattern.regexp_pattern();
+            let predicate = if diff {
+                GitNode::DiffMatches {
+                    expr,
+                    ignore_case: !case_sensitive,
+                }
+            } else {
+                GitNode::MessageMatches {
+                    expr,
+                    ignore_case: !case_sensitive,
+                }
+            };
+            Some(if pattern.negated {
+                git_new_not(predicate)
+            } else {
+                predicate
+            })
+        }
+        Node::Parameter(_) => None,
+    }
+}
+
+fn query_parameter_to_predicate(
+    parameter: &sg_search_query::node::Parameter,
+    case_sensitive: bool,
+    diff: bool,
+) -> Option<GitNode> {
+    let predicate = match parameter.field.as_str() {
+        "author" => GitNode::AuthorMatches {
+            expr: parameter.value.clone(),
+            ignore_case: !case_sensitive,
+        },
+        "committer" => GitNode::CommitterMatches {
+            expr: parameter.value.clone(),
+            ignore_case: !case_sensitive,
+        },
+        "before" => GitNode::CommitBefore {
+            time: parameter.value.clone(),
+        },
+        "after" => GitNode::CommitAfter {
+            time: parameter.value.clone(),
+        },
+        "message" => GitNode::MessageMatches {
+            expr: parameter.value.clone(),
+            ignore_case: !case_sensitive,
+        },
+        "content" => {
+            if diff {
+                GitNode::DiffMatches {
+                    expr: parameter.value.clone(),
+                    ignore_case: !case_sensitive,
+                }
+            } else {
+                GitNode::MessageMatches {
+                    expr: parameter.value.clone(),
+                    ignore_case: !case_sensitive,
+                }
+            }
+        }
+        "file" => GitNode::DiffModifiesFile {
+            expr: parameter.value.clone(),
+            ignore_case: !case_sensitive,
+        },
+        "lang" => GitNode::DiffModifiesFile {
+            expr: lang_to_file_regexp(&parameter.value),
+            ignore_case: true,
+        },
+        _ => return None,
+    };
+
+    Some(if parameter.negated {
+        git_new_not(predicate)
+    } else {
+        predicate
+    })
+}
+
+fn reduce(node: GitNode) -> GitNode {
+    let node = match node {
+        GitNode::Operator { kind, operands } => GitNode::Operator {
+            kind,
+            operands: operands.into_iter().map(reduce).collect(),
+        },
+        other => other,
+    };
+
+    let node = propagate_boolean(node);
+    let node = rewrite_conjunctive(node);
+    let node = flatten(node);
+    let node = merge_or_regexp(node);
+    sort_and_by_cost(node)
+}
+
+fn propagate_boolean(node: GitNode) -> GitNode {
+    let GitNode::Operator { kind, operands } = node else {
+        return node;
+    };
+    match kind {
+        GitOperatorKind::Not => {
+            if let Some(GitNode::Boolean(value)) = operands.first() {
+                GitNode::Boolean(!value)
+            } else {
+                GitNode::Operator { kind, operands }
+            }
+        }
+        GitOperatorKind::And => {
+            let mut filtered = Vec::with_capacity(operands.len());
+            for operand in operands {
+                match operand {
+                    GitNode::Boolean(false) => return GitNode::Boolean(false),
+                    GitNode::Boolean(true) => {}
+                    other => filtered.push(other),
+                }
+            }
+            git_new_operator(GitOperatorKind::And, filtered)
+        }
+        GitOperatorKind::Or => {
+            let mut filtered = Vec::with_capacity(operands.len());
+            for operand in operands {
+                match operand {
+                    GitNode::Boolean(true) => return GitNode::Boolean(true),
+                    GitNode::Boolean(false) => {}
+                    other => filtered.push(other),
+                }
+            }
+            git_new_operator(GitOperatorKind::Or, filtered)
+        }
+    }
+}
+
+fn rewrite_conjunctive(node: GitNode) -> GitNode {
+    let GitNode::Operator {
+        kind: GitOperatorKind::Or,
+        operands,
+    } = node
+    else {
+        return node;
+    };
+
+    let mut and_operands: Vec<Vec<GitNode>> = Vec::new();
+    let mut siblings = Vec::new();
+    for operand in operands {
+        match operand {
+            GitNode::Operator {
+                kind: GitOperatorKind::And,
+                operands,
+            } => and_operands.push(operands),
+            other => siblings.push(other),
+        }
+    }
+
+    if and_operands.is_empty() {
+        return GitNode::Operator {
+            kind: GitOperatorKind::Or,
+            operands: siblings,
+        };
+    }
+
+    let distributed = distribute(&and_operands, siblings);
+    let new_and_operands = distributed
+        .into_iter()
+        .map(|row| git_new_operator(GitOperatorKind::Or, row))
+        .collect();
+    git_new_operator(GitOperatorKind::And, new_and_operands)
+}
+
+fn distribute(prefixes: &[Vec<GitNode>], nodes: Vec<GitNode>) -> Vec<Vec<GitNode>> {
+    if prefixes.is_empty() {
+        return vec![nodes];
+    }
+
+    let distributed = distribute(&prefixes[1..], nodes);
+    let mut res = Vec::with_capacity(distributed.len() * prefixes[0].len());
+    for prefix in &prefixes[0] {
+        for row in &distributed {
+            let mut new_row = row.clone();
+            new_row.push(prefix.clone());
+            res.push(new_row);
+        }
+    }
+    res
+}
+
+fn flatten(node: GitNode) -> GitNode {
+    let GitNode::Operator { kind, operands } = node else {
+        return node;
+    };
+    if kind == GitOperatorKind::Not {
+        return GitNode::Operator { kind, operands };
+    }
+
+    let mut flattened = Vec::with_capacity(operands.len());
+    for operand in operands {
+        match operand {
+            GitNode::Operator {
+                kind: nested_kind,
+                operands,
+            } if nested_kind == kind => flattened.extend(operands),
+            other => flattened.push(other),
+        }
+    }
+    git_new_operator(kind, flattened)
+}
+
+fn merge_or_regexp(node: GitNode) -> GitNode {
+    let GitNode::Operator {
+        kind: GitOperatorKind::Or,
+        operands,
+    } = node
+    else {
+        return node;
+    };
+
+    fn union(left: &str, right: &str) -> String {
+        format!("(?:{left})|(?:{right})")
+    }
+
+    #[derive(PartialEq, Eq, PartialOrd, Ord)]
+    enum Key {
+        Author(bool),
+        Committer(bool),
+        Message(bool),
+        Diff(bool),
+        DiffModifiesFile(bool),
+    }
+
+    let mut unmergeable = Vec::new();
+    let mut mergeable: BTreeMap<(u8, bool), GitNode> = BTreeMap::new();
+    for operand in operands {
+        let (kind_rank, ignore_case, key) = match &operand {
+            GitNode::AuthorMatches { ignore_case, .. } => {
+                (0, *ignore_case, Key::Author(*ignore_case))
+            }
+            GitNode::CommitterMatches { ignore_case, .. } => {
+                (1, *ignore_case, Key::Committer(*ignore_case))
+            }
+            GitNode::MessageMatches { ignore_case, .. } => {
+                (2, *ignore_case, Key::Message(*ignore_case))
+            }
+            GitNode::DiffMatches { ignore_case, .. } => (3, *ignore_case, Key::Diff(*ignore_case)),
+            GitNode::DiffModifiesFile { ignore_case, .. } => {
+                (4, *ignore_case, Key::DiffModifiesFile(*ignore_case))
+            }
+            _ => {
+                unmergeable.push(operand);
+                continue;
+            }
+        };
+        let _ = key;
+        let map_key = (kind_rank, ignore_case);
+        match (mergeable.remove(&map_key), operand) {
+            (
+                Some(GitNode::AuthorMatches { expr: prev, .. }),
+                GitNode::AuthorMatches { expr, .. },
+            ) => {
+                mergeable.insert(
+                    map_key,
+                    GitNode::AuthorMatches {
+                        expr: union(&prev, &expr),
+                        ignore_case,
+                    },
+                );
+            }
+            (
+                Some(GitNode::CommitterMatches { expr: prev, .. }),
+                GitNode::CommitterMatches { expr, .. },
+            ) => {
+                mergeable.insert(
+                    map_key,
+                    GitNode::CommitterMatches {
+                        expr: union(&prev, &expr),
+                        ignore_case,
+                    },
+                );
+            }
+            (
+                Some(GitNode::MessageMatches { expr: prev, .. }),
+                GitNode::MessageMatches { expr, .. },
+            ) => {
+                mergeable.insert(
+                    map_key,
+                    GitNode::MessageMatches {
+                        expr: union(&prev, &expr),
+                        ignore_case,
+                    },
+                );
+            }
+            (Some(GitNode::DiffMatches { expr: prev, .. }), GitNode::DiffMatches { expr, .. }) => {
+                mergeable.insert(
+                    map_key,
+                    GitNode::DiffMatches {
+                        expr: union(&prev, &expr),
+                        ignore_case,
+                    },
+                );
+            }
+            (
+                Some(GitNode::DiffModifiesFile { expr: prev, .. }),
+                GitNode::DiffModifiesFile { expr, .. },
+            ) => {
+                mergeable.insert(
+                    map_key,
+                    GitNode::DiffModifiesFile {
+                        expr: union(&prev, &expr),
+                        ignore_case,
+                    },
+                );
+            }
+            (None, operand) => {
+                mergeable.insert(map_key, operand);
+            }
+            (Some(previous), _) => {
+                mergeable.insert(map_key, previous);
+            }
+        }
+    }
+
+    let mut res = unmergeable;
+    res.extend(mergeable.into_values());
+    git_new_operator(GitOperatorKind::Or, res)
+}
+
+fn sort_and_by_cost(mut node: GitNode) -> GitNode {
+    if let GitNode::Operator {
+        kind: GitOperatorKind::And,
+        operands,
+    } = &mut node
+    {
+        operands.sort_by(|left, right| {
+            left.cost()
+                .partial_cmp(&right.cost())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+    }
+    node
+}
+
+// ---------------------------------------------------------------------------
+// Debug helper for the harness/overview
+// ---------------------------------------------------------------------------
+
+impl JobNode {
+    /// Recursive `(name, attributes, children)` view used by the differential
+    /// harness.
+    pub fn describe(&self) -> (&'static str, Vec<(String, String)>, Vec<&JobNode>) {
+        (
+            self.name_str(),
+            self.basic_attributes(),
+            self.children.iter().collect(),
+        )
+    }
+}
