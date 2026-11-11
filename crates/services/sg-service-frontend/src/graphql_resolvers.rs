@@ -2341,6 +2341,7 @@ impl FrontendRootResolver {
                 git: None,
                 slow_requests: None,
                 site: None,
+                settings_subject_site: None,
             },
             mutation: MutationRoot::default(),
         }
@@ -2395,6 +2396,16 @@ impl FrontendRootResolver {
     /// Attach the request's prefetched read-only `Query.site` data (M9.8je).
     pub fn with_site(mut self, site: Option<crate::config_graphql::SiteRoot>) -> Self {
         self.query.site = site.map(Arc::new);
+        self
+    }
+
+    /// Attach the request's prefetched
+    /// `Query.settingsSubject(id: <Site>).configuration` data (M9.8jh).
+    pub fn with_settings_subject_site_configuration(
+        mut self,
+        site: Option<crate::config_graphql::SiteRoot>,
+    ) -> Self {
+        self.query.settings_subject_site = site.map(Arc::new);
         self
     }
 
@@ -2531,6 +2542,10 @@ struct QueryRoot {
     /// Prefetched read-only `Query.site.configuration` data (M9.8je); `None`
     /// when the configuration surface was not injected or not selected.
     site: Option<Arc<crate::config_graphql::SiteRoot>>,
+    /// Prefetched `Query.settingsSubject(id: <Site>).configuration` data
+    /// (M9.8jh). This is a separate prefetch from [`Self::site`] because the
+    /// baseline runs the admin check and security-event audit per resolver.
+    settings_subject_site: Option<Arc<crate::config_graphql::SiteRoot>>,
 }
 
 /// `Mutation` root: `settingsMutation`/log events/temporary settings/feature
@@ -2730,13 +2745,23 @@ impl ObjectValue for QueryRoot {
                     return Ok(None);
                 };
                 match self.nested.settings_subjects.get(id) {
-                    Some(SettingsSubjectLookup::Found(data)) => Ok(Some(FieldValue::Object(
-                        Arc::new(SettingsSubjectObject::from_data(
-                            data.clone(),
-                            self.viewer_site_admin,
-                            self.nested.clone(),
-                        )),
-                    ))),
+                    Some(SettingsSubjectLookup::Found(data)) => {
+                        let object = match data {
+                            // The site subject's `configuration` is prefetched
+                            // separately from `Query.site` (M9.8jh).
+                            SettingsSubjectData::Site => SettingsSubjectObject::Site(SiteObject {
+                                viewer_site_admin: self.viewer_site_admin,
+                                nested: self.nested.clone(),
+                                site: self.settings_subject_site.clone(),
+                            }),
+                            other => SettingsSubjectObject::from_data(
+                                other.clone(),
+                                self.viewer_site_admin,
+                                self.nested.clone(),
+                            ),
+                        };
+                        Ok(Some(FieldValue::Object(Arc::new(object))))
+                    }
                     Some(SettingsSubjectLookup::Error(message)) => {
                         Err(ExecError::new(message.clone()))
                     }
@@ -3614,8 +3639,8 @@ impl ObjectValue for SettingsSubjectObject {
 pub struct SiteObject {
     viewer_site_admin: bool,
     nested: Arc<NestedPrefetch>,
-    /// Prefetched `Query.site.configuration` data (M9.8je). `None` for the
-    /// `settingsSubject(site)` path, where `configuration` stays unported.
+    /// Prefetched `configuration` data: `Query.site` (M9.8je) or
+    /// `Query.settingsSubject(id: <Site>)` (M9.8jh, a separate prefetch).
     site: Option<Arc<crate::config_graphql::SiteRoot>>,
 }
 

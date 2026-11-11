@@ -14,10 +14,10 @@
 //! (`UpdateSiteConfiguration`) lives in
 //! [`crate::site_configuration_mutation`] and is untouched.
 //!
-//! As with the other resolver cores in this crate, the module is not wired
-//! into [`crate::graphql_resolvers::QueryRoot`]; it exposes plain async
-//! functions over injected seams so the parent slice can attach it to the
-//! resolver tree.
+//! As with the other resolver cores in this crate, the module exposes plain
+//! async prefetch functions over injected seams; `graphql_api` injects the
+//! results into [`crate::graphql_resolvers::QueryRoot`] (M9.8je for
+//! `Query.site`, M9.8jh for `settingsSubject(id: <Site>)`).
 
 use std::sync::Arc;
 
@@ -36,8 +36,8 @@ use sqlx::types::time::OffsetDateTime;
 use sqlx::PgPool;
 
 use crate::graphql_resolvers::{
-    check_current_user_is_site_admin, ConnectionPageInfoObject, UserData, UserKey, UserLookupStore,
-    UserObject,
+    check_current_user_is_site_admin, relay_kind, unmarshal_relay_spec_string,
+    ConnectionPageInfoObject, UserData, UserKey, UserLookupStore, UserObject,
 };
 use crate::license_config::{LicenseConfig, PgProductLicenseStore, ProductLicenseStore};
 use crate::site_config_change::{
@@ -144,16 +144,228 @@ impl SiteConfigValidator for ConfigStoreSiteConfigValidator {
 }
 
 /// The synchronous core of `conf.ValidateSite`:
-/// `UnredactSecrets(contents, conf.Raw())` then the JSON Schema validation.
+/// `UnredactSecrets(contents, conf.Raw())`, then `conf.Validate`'s JSON Schema
+/// problems and the offline subset of `validateCustomRaw`
+/// (`internal/conf/validate_custom.go` plus
+/// `cmd/frontend/internal/conf/validation/auth.go`).
 ///
-/// `validateCustomRaw` is not ported (M9.8gp errata).
+/// The typed `json.Unmarshal` error of `validateCustomRaw` is only reproduced at
+/// the top level (see the M9.8jh overview §4.2).
 pub fn validate_site_against_raw(contents: &str, raw_site: &str) -> Result<Vec<String>, String> {
     let raw = RawUnified {
         site: raw_site.to_owned(),
         ..RawUnified::default()
     };
     let unredacted = crate::site_configuration_secrets::unredact_secrets(contents, &raw)?;
-    sg_site_schema::validate_site(&unredacted).map_err(|err| err.to_string())
+    let mut messages = sg_site_schema::validate_site(&unredacted).map_err(|err| err.to_string())?;
+
+    // `conf.Validate` parses the JSONC document before `validateCustomRaw`; a
+    // parse error would already have surfaced above. `null` is a valid document
+    // for `json.Unmarshal` and leaves the typed struct zero-valued.
+    let parsed = sg_config::SiteConfiguration::parse(&unredacted).map_err(|err| err.to_string())?;
+    messages.extend(validate_custom(parsed.raw())?);
+    Ok(messages)
+}
+
+/// `validateCustom`'s core rules (email, externalURL, gitUpdateInterval),
+/// followed by the two offline auth contributed validators.
+fn validate_custom(site: &Value) -> Result<Vec<String>, String> {
+    if !site.is_null() && !site.is_object() {
+        // `json.Unmarshal` into `schema.SiteConfiguration` rejects non-objects.
+        return Err(format!(
+            "json: cannot unmarshal {} into Go value of type schema.SiteConfiguration",
+            go_json_type(site)
+        ));
+    }
+
+    let mut problems = Vec::new();
+
+    let email_address = site
+        .get("email.address")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let smtp = site.get("email.smtp").filter(|value| !value.is_null());
+    let has_smtp = smtp.is_some();
+    let has_smtp_auth = smtp
+        .and_then(|value| value.get("authentication"))
+        .and_then(Value::as_str)
+        .is_some_and(|authentication| authentication != "none");
+    if has_smtp && email_address.is_empty() {
+        problems.push("should set email.address because email.smtp is set".to_owned());
+    }
+    if has_smtp_auth {
+        let username = smtp
+            .and_then(|value| value.get("username"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let password = smtp
+            .and_then(|value| value.get("password"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if username.is_empty() && password.is_empty() {
+            problems.push(
+                "must set email.smtp username and password for email.smtp authentication"
+                    .to_owned(),
+            );
+        }
+    }
+
+    let external_url = site
+        .get("externalURL")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if !external_url.is_empty() {
+        match go_url_path(external_url) {
+            Err(()) => problems.push("externalURL must be a valid URL".to_owned()),
+            Ok(path) if path != "/" && !path.is_empty() => {
+                problems.push("externalURL must not be a non-root URL".to_owned());
+            }
+            Ok(_) => {}
+        }
+    }
+
+    if let Some(Value::Array(rules)) = site.get("gitUpdateInterval") {
+        for rule in rules {
+            if let Some(pattern) = rule.get("pattern").and_then(Value::as_str) {
+                if regex::Regex::new(pattern).is_err() {
+                    problems.push(format!(
+                        "GitUpdateIntervalRule pattern is not valid regex: {}",
+                        go_quote(pattern)
+                    ));
+                }
+            }
+        }
+    }
+
+    // Contributed validators registered by
+    // `cmd/frontend/internal/conf/validation/auth.go`.
+    let empty = Vec::new();
+    let providers: &[Value] = match site.get("auth.providers") {
+        Some(Value::Array(providers)) => providers,
+        _ => &empty,
+    };
+    if providers.is_empty() {
+        problems.push("no auth providers set (all access will be forbidden)".to_owned());
+    }
+    let has_external_provider = providers
+        .iter()
+        .any(|provider| provider.get("type").and_then(Value::as_str) != Some("builtin"));
+    let enable_username_changes = site
+        .get("auth.enableUsernameChanges")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if has_external_provider && enable_username_changes {
+        problems.push(
+            "`auth.enableUsernameChanges` must not be true if external auth providers are set in `auth.providers`"
+                .to_owned(),
+        );
+    }
+    let builtin_providers = providers
+        .iter()
+        .filter(|provider| provider.get("type").and_then(Value::as_str) == Some("builtin"))
+        .count();
+    if builtin_providers >= 2 {
+        problems.push("at most 1 builtin auth provider may be used".to_owned());
+    }
+
+    Ok(problems)
+}
+
+fn go_json_type(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "bool",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
+}
+
+/// `url.Parse(raw).Path`, approximately. Go accepts relative references; only
+/// absolute URLs go through the `url` crate. Validation of percent escapes and
+/// control characters matches Go's parser (see overview §4.2 for the remaining
+/// divergence).
+fn go_url_path(raw: &str) -> Result<String, ()> {
+    if raw
+        .chars()
+        .any(|character| (character as u32) < 0x20 || character as u32 == 0x7f)
+    {
+        return Err(());
+    }
+    if !valid_percent_escapes(raw) {
+        return Err(());
+    }
+    if raw.contains("://") || raw.starts_with("//") {
+        return url::Url::parse(raw)
+            .map(|url| url.path().to_owned())
+            .map_err(|_| ());
+    }
+    // A leading scheme makes the reference opaque in Go, whose `Path` is empty.
+    if let Some(colon) = raw.find(':') {
+        if is_url_scheme(&raw[..colon]) {
+            return Ok(String::new());
+        }
+    }
+    Ok(raw.split(['?', '#']).next().unwrap_or_default().to_owned())
+}
+
+fn valid_percent_escapes(raw: &str) -> bool {
+    let bytes = raw.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            if index + 2 >= bytes.len()
+                || !bytes[index + 1].is_ascii_hexdigit()
+                || !bytes[index + 2].is_ascii_hexdigit()
+            {
+                return false;
+            }
+            index += 3;
+        } else {
+            index += 1;
+        }
+    }
+    true
+}
+
+fn is_url_scheme(scheme: &str) -> bool {
+    let mut characters = scheme.chars();
+    match characters.next() {
+        Some(character) if character.is_ascii_alphabetic() => {}
+        _ => return false,
+    }
+    characters.all(|character| {
+        character.is_ascii_alphanumeric()
+            || character == '+'
+            || character == '-'
+            || character == '.'
+    })
+}
+
+/// Go `fmt.Sprintf("%q", s)` for the ASCII patterns corpus uses.
+fn go_quote(value: &str) -> String {
+    let mut quoted = String::with_capacity(value.len() + 2);
+    quoted.push('"');
+    for character in value.chars() {
+        match character {
+            '"' => quoted.push_str("\\\""),
+            '\\' => quoted.push_str("\\\\"),
+            '\u{7}' => quoted.push_str("\\a"),
+            '\u{8}' => quoted.push_str("\\b"),
+            '\u{c}' => quoted.push_str("\\f"),
+            '\n' => quoted.push_str("\\n"),
+            '\r' => quoted.push_str("\\r"),
+            '\t' => quoted.push_str("\\t"),
+            '\u{b}' => quoted.push_str("\\v"),
+            character if (character as u32) < 0x20 || character as u32 == 0x7f => {
+                quoted.push_str(&format!("\\x{:02x}", character as u32));
+            }
+            character => quoted.push(character),
+        }
+    }
+    quoted.push('"');
+    quoted
 }
 
 /// `siteConfigurationResolver`'s `Database`-backed dependencies
@@ -416,85 +628,177 @@ pub async fn prefetch_site(
         return Some(SiteRoot::default());
     };
 
+    let configuration = prefetch_site_configuration(
+        backend,
+        licenses,
+        validator,
+        history_store,
+        users,
+        configuration_field,
+        actor,
+    )
+    .await;
+
+    Some(SiteRoot {
+        configuration: Some(configuration),
+    })
+}
+
+/// Prefetch every selected field of one `SiteConfiguration` resolver.
+///
+/// Shared by `Query.site.configuration` and
+/// `Query.settingsSubject(id: <Site>).configuration`; the baseline resolves both
+/// through the same `siteResolver.Configuration` method, including the admin
+/// check and security-event audit.
+pub async fn prefetch_site_configuration(
+    backend: &dyn SiteConfigurationBackend,
+    licenses: &dyn LicenseInfoProvider,
+    validator: &dyn SiteConfigValidator,
+    history_store: &dyn SiteConfigHistoryStore,
+    users: Option<&dyn UserLookupStore>,
+    configuration_field: &RootField,
+    actor: Actor,
+) -> Result<SiteConfigurationRoot, String> {
     let return_safe_configs_only = configuration_field
         .arguments
         .bool("returnSafeConfigsOnly")
         .unwrap_or(false);
-    let configuration = match configuration(
+    let resolver = match configuration(
         backend,
         actor,
         configuration_field.arguments.bool("returnSafeConfigsOnly"),
     )
     .await
     {
-        Err(message) => Err(message),
-        Ok(resolver) => {
-            let selections = &configuration_field.selections;
-            let want_id = selected(selections, "id").is_some();
-            let want_effective = selected(selections, "effectiveContents").is_some();
-            let want_validation = selected(selections, "validationMessages").is_some();
-            let want_license = selected(selections, "licenseInfo").is_some();
-            let want_history = selected(selections, "history").is_some();
-
-            // `ValidationMessages` calls `EffectiveContents` internally; share
-            // the lookup when both fields are selected.
-            let effective = if want_effective || want_validation {
-                Some(effective_contents(backend, actor, &resolver).await)
-            } else {
-                None
-            };
-
-            let id = if want_id {
-                Some(site_configuration_id(backend, actor, &resolver).await)
-            } else {
-                None
-            };
-
-            let validation_messages = if want_validation {
-                match &effective {
-                    Some(Ok(contents)) => Some(validator.validate_site(contents).await),
-                    Some(Err(message)) => Some(Err(message.clone())),
-                    None => None,
-                }
-            } else {
-                None
-            };
-
-            let license_info = if want_license {
-                Some(license_info(backend, licenses, actor).await)
-            } else {
-                None
-            };
-
-            let history = if want_history {
-                Some(
-                    prefetch_history(
-                        backend,
-                        history_store,
-                        users,
-                        actor,
-                        selected(selections, "history").expect("history selected"),
-                    )
-                    .await,
-                )
-            } else {
-                None
-            };
-
-            Ok(SiteConfigurationRoot {
-                return_safe_configs_only,
-                id,
-                effective_contents: effective,
-                validation_messages,
-                license_info,
-                history,
-            })
-        }
+        Err(message) => return Err(message),
+        Ok(resolver) => resolver,
     };
 
-    Some(SiteRoot {
-        configuration: Some(configuration),
+    let selections = &configuration_field.selections;
+    let want_id = selected(selections, "id").is_some();
+    let want_effective = selected(selections, "effectiveContents").is_some();
+    let want_validation = selected(selections, "validationMessages").is_some();
+    let want_license = selected(selections, "licenseInfo").is_some();
+    let want_history = selected(selections, "history").is_some();
+
+    // `ValidationMessages` calls `EffectiveContents` internally; share the
+    // lookup when both fields are selected.
+    let effective = if want_effective || want_validation {
+        Some(effective_contents(backend, actor, &resolver).await)
+    } else {
+        None
+    };
+
+    let id = if want_id {
+        Some(site_configuration_id(backend, actor, &resolver).await)
+    } else {
+        None
+    };
+
+    let validation_messages = if want_validation {
+        match &effective {
+            Some(Ok(contents)) => Some(validator.validate_site(contents).await),
+            Some(Err(message)) => Some(Err(message.clone())),
+            None => None,
+        }
+    } else {
+        None
+    };
+
+    let license_info = if want_license {
+        Some(license_info(backend, licenses, actor).await)
+    } else {
+        None
+    };
+
+    let history = if want_history {
+        Some(
+            prefetch_history(
+                backend,
+                history_store,
+                users,
+                actor,
+                selected(selections, "history").expect("history selected"),
+            )
+            .await,
+        )
+    } else {
+        None
+    };
+
+    Ok(SiteConfigurationRoot {
+        return_safe_configs_only,
+        id,
+        effective_contents: effective,
+        validation_messages,
+        license_info,
+        history,
     })
+}
+
+/// The `configuration` selection of `settingsSubject(id: <Site>)`, if any.
+///
+/// Only the canonical site subject (`relay.MarshalID("Site", "site")`) is
+/// recognized; any other subject kind keeps the unported `configuration`
+/// field.
+pub fn settings_subject_site_configuration_field(fields: &[RootField]) -> Option<&RootField> {
+    for field in fields {
+        if field.name != "settingsSubject" {
+            continue;
+        }
+        let Some(id) = field.arguments.string("id") else {
+            continue;
+        };
+        if relay_kind(id).as_deref() != Some("Site") {
+            continue;
+        }
+        if unmarshal_relay_spec_string(id).as_deref() != Ok("site") {
+            continue;
+        }
+        if let Some(configuration) = selected(&field.selections, "configuration") {
+            return Some(configuration);
+        }
+        // `configuration` is only declared on the `Site` object, so a query
+        // against the `SettingsSubject` interface selects it inside an inline
+        // fragment.
+        for (type_condition, selections) in &field.type_conditions {
+            if type_condition == "Site" {
+                if let Some(configuration) = selected(selections, "configuration") {
+                    return Some(configuration);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Prefetch `Query.settingsSubject(id: <Site>).configuration`.
+///
+/// `None` means the operation did not select that field. Each root field is its
+/// own prefetch (and therefore its own admin check/audit), matching the
+/// baseline's per-resolver `siteResolver.Configuration` call.
+pub async fn prefetch_settings_subject_site_configuration(
+    backend: &dyn SiteConfigurationBackend,
+    licenses: &dyn LicenseInfoProvider,
+    validator: &dyn SiteConfigValidator,
+    history_store: &dyn SiteConfigHistoryStore,
+    users: Option<&dyn UserLookupStore>,
+    fields: &[RootField],
+    actor: Actor,
+) -> Option<Result<SiteConfigurationRoot, String>> {
+    let configuration_field = settings_subject_site_configuration_field(fields)?;
+    Some(
+        prefetch_site_configuration(
+            backend,
+            licenses,
+            validator,
+            history_store,
+            users,
+            configuration_field,
+            actor,
+        )
+        .await,
+    )
 }
 
 async fn prefetch_history(
@@ -974,5 +1278,117 @@ mod tests {
         .expect("history");
         assert_eq!(connection.total_count().await.expect("count"), 1);
         assert_eq!(connection.nodes().await.expect("nodes").len(), 1);
+    }
+
+    fn custom(raw: &str) -> Vec<String> {
+        validate_site_against_raw(raw, raw).expect("valid")
+    }
+
+    #[test]
+    fn custom_validation_covers_email_rules() {
+        const BUILTIN: &str = r#""auth.providers":[{"allowSignup":true,"type":"builtin"}]"#;
+        assert_eq!(
+            custom(&format!(
+                r#"{{"email.smtp":{{"authentication":"none","host":"h","port":25}},{BUILTIN}}}"#
+            )),
+            vec!["should set email.address because email.smtp is set".to_owned()]
+        );
+        assert_eq!(
+            custom(&format!(
+                r#"{{"email.address":"a@b.c","email.smtp":{{"authentication":"PLAIN","host":"h","port":25}},{BUILTIN}}}"#
+            )),
+            vec![
+                "must set email.smtp username and password for email.smtp authentication"
+                    .to_owned()
+            ]
+        );
+        assert_eq!(
+            custom(&format!(
+                r#"{{"email.address":"a@b.c","email.smtp":{{"authentication":"PLAIN","host":"h","password":"p","port":25,"username":"u"}},{BUILTIN}}}"#
+            )),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn custom_validation_covers_external_url_and_git_regex() {
+        const BUILTIN: &str = r#""auth.providers":[{"allowSignup":true,"type":"builtin"}]"#;
+        assert_eq!(
+            custom(&format!(
+                r#"{{"externalURL":"http://example.com/sub",{BUILTIN}}}"#
+            )),
+            vec!["externalURL must not be a non-root URL".to_owned()]
+        );
+        assert_eq!(
+            custom(&format!(
+                r#"{{"externalURL":"http://example.com/%zz",{BUILTIN}}}"#
+            )),
+            vec!["externalURL must be a valid URL".to_owned()]
+        );
+        assert_eq!(
+            custom(&format!(
+                r#"{{"externalURL":"https://example.com",{BUILTIN}}}"#
+            )),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            custom(&format!(
+                r#"{{"gitUpdateInterval":[{{"interval":1,"pattern":"["}}],{BUILTIN}}}"#
+            )),
+            vec![r#"GitUpdateIntervalRule pattern is not valid regex: "[""#.to_owned()]
+        );
+        assert_eq!(
+            custom(&format!(
+                r#"{{"gitUpdateInterval":[{{"interval":1,"pattern":"^github\\.com/"}}],{BUILTIN}}}"#
+            )),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn custom_validation_covers_contributed_auth_rules() {
+        // `UnredactSecrets` materializes a nil `auth.providers` as `null`, so
+        // the schema reports the type mismatch before the custom validator.
+        assert_eq!(
+            custom("{}"),
+            vec![
+                "auth.providers: Invalid type. Expected: array, given: null".to_owned(),
+                "no auth providers set (all access will be forbidden)".to_owned(),
+            ]
+        );
+        assert_eq!(
+            custom(
+                r#"{"auth.enableUsernameChanges":true,"auth.providers":[{"clientID":"cid","clientSecret":"secret","type":"github"}]}"#
+            ),
+            vec![
+                "`auth.enableUsernameChanges` must not be true if external auth providers are set in `auth.providers`".to_owned()
+            ]
+        );
+        assert_eq!(
+            custom(
+                r#"{"auth.providers":[{"allowSignup":true,"type":"builtin"},{"type":"builtin"}]}"#
+            ),
+            vec!["at most 1 builtin auth provider may be used".to_owned()]
+        );
+    }
+
+    #[test]
+    fn custom_validation_runs_after_schema_messages() {
+        let messages = custom(
+            r#"{"auth.providers":[{"allowSignup":true,"type":"builtin"}],"externalURL":"http://example.com/sub","update.channel":"bogus"}"#,
+        );
+        assert!(messages.len() >= 2, "{messages:?}");
+        assert!(messages[0].starts_with("update.channel:"), "{messages:?}");
+        assert_eq!(
+            messages.last().map(String::as_str),
+            Some("externalURL must not be a non-root URL")
+        );
+    }
+
+    #[test]
+    fn go_quote_matches_the_ascii_cases() {
+        assert_eq!(go_quote("["), "\"[\"");
+        assert_eq!(go_quote("a\"b\\c"), "\"a\\\"b\\\\c\"");
+        assert_eq!(go_quote("\n"), "\"\\n\"");
     }
 }
