@@ -1449,6 +1449,7 @@ mod tests {
                     email: "a@example.com".to_owned(),
                     date: OffsetDateTime::UNIX_EPOCH,
                 },
+                parents: Vec::new(),
             },
             repo: MinimalRepo {
                 id: 1,
@@ -1459,6 +1460,10 @@ mod tests {
                 content: content.to_owned(),
                 matched_ranges: ranges,
             }),
+            refs: Vec::new(),
+            source_refs: Vec::new(),
+            diff: Vec::new(),
+            modified_files: Vec::new(),
         })
     }
 

@@ -3,6 +3,7 @@
 
 use time::OffsetDateTime;
 
+use super::convert::{CommitMatch, Signature};
 use super::json;
 
 /// `result.Location`; JSON is `{offset,line,column}` in the event API.
@@ -534,4 +535,153 @@ pub fn encode_alert(alert: &EventAlert) -> String {
     }
     out.push('}');
     out
+}
+
+// ---------------------------------------------------------------------------
+// `protocol.CommitMatch` JSON
+// ---------------------------------------------------------------------------
+
+/// `encoding/json` of `protocol.CommitMatch`
+/// (`internal/gitserver/protocol/gitserver.go:93-103`).
+///
+/// This is the wire form of the richer commit result model
+/// ([`CommitMatch`](super::convert::CommitMatch)); it is deliberately separate
+/// from [`encode_commit_match`], which encodes the streaming `http.EventCommitMatch`
+/// shape (`events.go:151-171`) and must stay byte-identical to the baseline.
+/// Field names, declaration order, `omitempty` behaviour and string escaping
+/// match Go's `encoding/json`.
+pub fn encode_protocol_commit_match(commit: &CommitMatch) -> String {
+    let mut out = String::from("{");
+    protocol_field_str(&mut out, "Oid", &commit.commit.id);
+    json::separator_public(&mut out);
+    json::push_key(&mut out, "Author");
+    encode_protocol_signature(&mut out, &commit.commit.author);
+    json::separator_public(&mut out);
+    json::push_key(&mut out, "Committer");
+    encode_protocol_signature(&mut out, &commit.commit.committer);
+    protocol_opt_strings(&mut out, "Parents", &commit.commit.parents);
+    protocol_opt_strings(&mut out, "Refs", &commit.refs);
+    protocol_opt_strings(&mut out, "SourceRefs", &commit.source_refs);
+    json::separator_public(&mut out);
+    json::push_key(&mut out, "Message");
+    let message_ranges = commit
+        .message_preview
+        .as_ref()
+        .map(|preview| preview.matched_ranges.as_slice())
+        .unwrap_or(&[]);
+    encode_protocol_matched_string(&mut out, &commit.commit.message, message_ranges);
+    json::separator_public(&mut out);
+    json::push_key(&mut out, "Diff");
+    let (diff_content, diff_ranges) = match &commit.diff_preview {
+        Some(preview) => (preview.content.as_str(), preview.matched_ranges.as_slice()),
+        None => ("", &[][..]),
+    };
+    encode_protocol_matched_string(&mut out, diff_content, diff_ranges);
+    protocol_opt_strings(&mut out, "ModifiedFiles", &commit.modified_files);
+    out.push('}');
+    out
+}
+
+/// `encoding/json` string escaping. It differs from [`json::push_quoted`] only
+/// for backspace/form feed, which Go 1.22 emits as the short escapes `\b`/`\f`
+/// (`encoding/json/encode.go:appendString`).
+fn push_protocol_quoted(out: &mut String, value: &str) {
+    out.push('"');
+    for ch in value.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\u{8}' => out.push_str("\\b"),
+            '\u{c}' => out.push_str("\\f"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '<' => out.push_str("\\u003c"),
+            '>' => out.push_str("\\u003e"),
+            '&' => out.push_str("\\u0026"),
+            '\u{2028}' => out.push_str("\\u2028"),
+            '\u{2029}' => out.push_str("\\u2029"),
+            c if (c as u32) < 0x20 => {
+                out.push_str(&format!("\\u{:04x}", c as u32));
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+}
+
+fn protocol_field_str(out: &mut String, key: &str, value: &str) {
+    if !out.ends_with('{') {
+        out.push(',');
+    }
+    json::push_key(out, key);
+    push_protocol_quoted(out, value);
+}
+
+fn protocol_opt_str(out: &mut String, key: &str, value: &str) {
+    if !value.is_empty() {
+        protocol_field_str(out, key, value);
+    }
+}
+
+fn protocol_opt_strings(out: &mut String, key: &str, values: &[String]) {
+    if values.is_empty() {
+        return;
+    }
+    if !out.ends_with('{') {
+        out.push(',');
+    }
+    json::push_key(out, key);
+    out.push('[');
+    for (i, value) in values.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        push_protocol_quoted(out, value);
+    }
+    out.push(']');
+}
+
+fn encode_protocol_signature(out: &mut String, signature: &Signature) {
+    out.push('{');
+    protocol_opt_str(out, "Name", &signature.name);
+    protocol_opt_str(out, "Email", &signature.email);
+    json::separator_public(out);
+    json::push_key(out, "Date");
+    json::push_time(out, signature.date);
+    out.push('}');
+}
+
+fn encode_protocol_matched_string(out: &mut String, content: &str, ranges: &[Range]) {
+    out.push('{');
+    protocol_field_str(out, "content", content);
+    json::separator_public(out);
+    json::push_key(out, "matchedRanges");
+    out.push('[');
+    for (i, range) in ranges.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push('{');
+        json::separator_public(out);
+        json::push_key(out, "start");
+        encode_protocol_location(out, &range.start);
+        json::separator_public(out);
+        json::push_key(out, "end");
+        encode_protocol_location(out, &range.end);
+        out.push('}');
+    }
+    out.push(']');
+    out.push('}');
+}
+
+/// `result.Location.MarshalJSON`: `[offset,line,column]`.
+fn encode_protocol_location(out: &mut String, location: &Location) {
+    out.push('[');
+    out.push_str(&location.offset.to_string());
+    out.push(',');
+    out.push_str(&location.line.to_string());
+    out.push(',');
+    out.push_str(&location.column.to_string());
+    out.push(']');
 }

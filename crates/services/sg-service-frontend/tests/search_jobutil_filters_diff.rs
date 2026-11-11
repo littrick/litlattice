@@ -454,10 +454,15 @@ fn result_match(spec: &ResultSpec) -> Match {
                     message: commit.message.clone(),
                     author: signature(&commit.author),
                     committer: signature(&commit.committer),
+                    parents: Vec::new(),
                 },
                 repo: minimal_repo(spec.repo.as_ref().expect("repo spec")),
                 message_preview: matched_string(&spec.message_preview),
                 diff_preview: matched_string(&spec.diff_preview),
+                refs: Vec::new(),
+                source_refs: Vec::new(),
+                diff: Vec::new(),
+                modified_files: Vec::new(),
             })
         }
         other => panic!("unknown result kind {other}"),
@@ -802,6 +807,7 @@ fn run_diff_remove(case: &Case) -> Value {
                 email: "a@example.com".to_owned(),
                 date: epoch,
             },
+            parents: Vec::new(),
         },
         repo: MinimalRepo {
             id: 1,
@@ -812,6 +818,10 @@ fn run_diff_remove(case: &Case) -> Value {
             content: case.content.clone(),
             matched_ranges: ranges(&case.matched_ranges),
         }),
+        refs: Vec::new(),
+        source_refs: Vec::new(),
+        diff: Vec::new(),
+        modified_files: Vec::new(),
     };
     let matched = job.filter_unmatched_file_diffs(&mut cm, &case.matched_file_counts);
     let result = if matched.is_some() {

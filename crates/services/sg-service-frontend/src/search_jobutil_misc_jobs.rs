@@ -1070,6 +1070,7 @@ mod tests {
                 message: "msg".to_owned(),
                 author: signature.clone(),
                 committer: signature,
+                parents: Vec::new(),
             },
             repo: MinimalRepo {
                 id: 1,
@@ -1080,6 +1081,10 @@ mod tests {
                 content: content.to_owned(),
                 matched_ranges: vec![range(0, 1)],
             }),
+            refs: Vec::new(),
+            source_refs: Vec::new(),
+            diff: Vec::new(),
+            modified_files: Vec::new(),
         })
     }
 
