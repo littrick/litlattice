@@ -33,10 +33,9 @@
 //! Only the store boundary is seamed: `CommitGraphStore`,
 //! `CommitGraphGitserver`, `CommitGraphLocker` and `CommitGraphConfigSource`
 //! are traits so the differential harness can drive the exact control flow
-//! with fakes. Production gitserver (sg-git) and locker (PostgreSQL advisory
-//! locks) are wired; the store's `update_uploads_visible_to_commits` is not
-//! ported yet and returns an explicit error (see the module's README note in
-//! `dev/rs/docs/overviews/m9_8in_commitgraph_updater_overview.md` §4).
+//! with fakes. Production gitserver (sg-git), the store write-back
+//! (`sg-db::codeintel_commitgraph`) and the locker (PostgreSQL advisory locks)
+//! are wired.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -654,8 +653,8 @@ impl CommitGraphGitserver for GitserverAdapter {
     }
 }
 
-/// Production store adapter. The read paths are ported; the graph write path
-/// (`UpdateUploadsVisibleToCommits`) is not (see §4 of the slice overview).
+/// Production store adapter: the read paths and the graph write-back
+/// (`UpdateUploadsVisibleToCommits`).
 struct PgStore {
     frontend: PgPool,
 }
@@ -740,16 +739,64 @@ impl CommitGraphStore for PgStore {
 
     async fn update_uploads_visible_to_commits(
         &self,
-        _repository_id: i64,
-        _commit_graph: &CommitGraph,
-        _refs: &RefsByCommit,
-        _max_age_for_non_stale_branches: Duration,
-        _max_age_for_non_stale_tags: Duration,
-        _dirty_token: i64,
-        _now: Option<Timestamp>,
+        repository_id: i64,
+        commit_graph: &CommitGraph,
+        refs: &RefsByCommit,
+        max_age_for_non_stale_branches: Duration,
+        max_age_for_non_stale_tags: Duration,
+        dirty_token: i64,
+        now: Option<Timestamp>,
     ) -> Result<(), String> {
-        Err("store.UpdateUploadsVisibleToCommits is not ported to the Rust worker yet".to_owned())
+        let refs = refs_for_store(refs);
+        let now = now
+            .map(|timestamp| {
+                timestamp_to_offset_datetime(timestamp)
+                    .ok_or_else(|| format!("invalid commit graph update time: {timestamp:?}"))
+            })
+            .transpose()?;
+
+        sg_db::codeintel_commitgraph::update_uploads_visible_to_commits(
+            &self.frontend,
+            repository_id,
+            commit_graph,
+            &refs,
+            max_age_for_non_stale_branches,
+            max_age_for_non_stale_tags,
+            dirty_token,
+            now,
+        )
+        .await
+        .map_err(|err| err.to_string())
     }
+}
+
+/// `map[string][]gitdomain.Ref` -> `sg-db`'s ref projection.
+fn refs_for_store(refs: &RefsByCommit) -> sg_db::codeintel_commitgraph::RefsByCommit {
+    refs.iter()
+        .map(|(commit, commit_refs)| {
+            let refs = commit_refs
+                .iter()
+                .map(|git_ref| sg_db::codeintel_commitgraph::CommitGraphRef {
+                    short_name: git_ref.short_name.clone(),
+                    ref_type: match git_ref.ref_type {
+                        sg_git::RefType::Branch => sg_db::codeintel_commitgraph::RefType::Branch,
+                        sg_git::RefType::Tag => sg_db::codeintel_commitgraph::RefType::Tag,
+                        sg_git::RefType::Unknown => sg_db::codeintel_commitgraph::RefType::Unknown,
+                    },
+                    created_at: git_ref.created_at.and_then(timestamp_to_offset_datetime),
+                    is_head: git_ref.is_head,
+                })
+                .collect();
+            (commit.clone(), refs)
+        })
+        .collect()
+}
+
+/// `time.Unix(ts.Seconds, ts.Nanos)`; `None` when the value is out of range.
+fn timestamp_to_offset_datetime(timestamp: Timestamp) -> Option<time::OffsetDateTime> {
+    time::OffsetDateTime::from_unix_timestamp(timestamp.seconds)
+        .ok()?
+        .checked_add(time::Duration::nanoseconds(i64::from(timestamp.nanos)))
 }
 
 /// `locker.StringKey("codeintel")`: FNV-1 32-bit modulo `math.MaxInt32`.
