@@ -447,6 +447,36 @@ impl OAuthToken {
             .map(|(_, v)| v.clone())
             .unwrap_or_default()
     }
+
+    /// Builds a token from a parsed JSON token-endpoint body exactly as
+    /// `parse_token_response` does for an `application/json` response. This is
+    /// the seam provider resolvers (and their differential harnesses) use to
+    /// construct an [`OAuthToken`] without going through the flow. It does not
+    /// change any flow semantics.
+    pub fn from_json_value(json: Value) -> Option<Self> {
+        if !json.is_object() {
+            return None;
+        }
+        let expires_in = match json.get("expires_in") {
+            None | Some(Value::Null) => None,
+            Some(Value::Number(number)) => number.as_i64().filter(|value| *value != 0),
+            Some(_) => None,
+        };
+        let field = |key: &str| {
+            json.get(key)
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned()
+        };
+        Some(Self {
+            access_token: field("access_token"),
+            token_type: field("token_type"),
+            refresh_token: field("refresh_token"),
+            expires_in,
+            json: Some(json),
+            form: Vec::new(),
+        })
+    }
 }
 
 /// The provider's `SessionIssuerHelper.GetOrCreateUser` outcome.
