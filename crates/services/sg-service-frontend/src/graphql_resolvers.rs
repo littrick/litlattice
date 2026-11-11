@@ -2334,9 +2334,19 @@ impl FrontendRootResolver {
                 git: None,
                 slow_requests: None,
                 site: None,
+                auth_providers: None,
             },
             mutation: MutationRoot::default(),
         }
+    }
+
+    /// Attach the request's `Site.authProviders` directory (M9.8jg).
+    pub fn with_auth_providers(
+        mut self,
+        providers: Option<Arc<crate::auth_providers_graphql::AuthProvidersRoot>>,
+    ) -> Self {
+        self.query.auth_providers = providers;
+        self
     }
 
     /// Attach the request's prefetched `Query.search` result (M9.8ie).
@@ -2524,6 +2534,9 @@ struct QueryRoot {
     /// Prefetched read-only `Query.site.configuration` data (M9.8je); `None`
     /// when the configuration surface was not injected or not selected.
     site: Option<Arc<crate::config_graphql::SiteRoot>>,
+    /// `Site.authProviders` derived from the live `auth.providers`
+    /// configuration (M9.8jg); `None` when the directory was not injected.
+    auth_providers: Option<Arc<crate::auth_providers_graphql::AuthProvidersRoot>>,
 }
 
 /// `Mutation` root: `settingsMutation`/log events/temporary settings/feature
@@ -2714,6 +2727,7 @@ impl ObjectValue for QueryRoot {
                 viewer_site_admin: self.viewer_site_admin,
                 nested: self.nested.clone(),
                 site: self.site.clone(),
+                auth_providers: self.auth_providers.clone(),
             })))),
             // `schemaResolver.SettingsSubject` (`settings_subject.go:16-23`):
             // `nodeByID` dispatch + `settingsSubjectForNodeAndCheckAccess`;
@@ -3568,6 +3582,10 @@ impl SettingsSubjectObject {
                 viewer_site_admin,
                 nested,
                 site: None,
+                // `settingsSubject(site)` has no live configuration snapshot in
+                // this port; `Site.authProviders` stays unported on that path
+                // (overview §4).
+                auth_providers: None,
             }),
         }
     }
@@ -3608,6 +3626,10 @@ pub struct SiteObject {
     /// Prefetched `Query.site.configuration` data (M9.8je). `None` for the
     /// `settingsSubject(site)` path, where `configuration` stays unported.
     site: Option<Arc<crate::config_graphql::SiteRoot>>,
+    /// `Site.authProviders` derived from the live `auth.providers` site
+    /// configuration (M9.8jg). `None` when the provider directory was not
+    /// injected (transport-only tests), leaving the field unported.
+    auth_providers: Option<Arc<crate::auth_providers_graphql::AuthProvidersRoot>>,
 }
 
 impl SiteObject {
@@ -3672,6 +3694,15 @@ impl ObjectValue for SiteObject {
                     )))),
                 },
             },
+            // `siteResolver.AuthProviders` (`auth_providers.go:10-16`): no
+            // access check, no request-header dependency.
+            "authProviders" => Ok(self.auth_providers.as_ref().map(|root| {
+                FieldValue::Object(Arc::new(
+                    crate::auth_providers_graphql::AuthProviderConnectionObject::new(
+                        root.providers.clone(),
+                    ),
+                ))
+            })),
             _ => Ok(None),
         }
     }
