@@ -89,6 +89,7 @@ pub mod executors_metrics;
 pub mod executors_multiqueue_metrics;
 pub mod exhaustive_search_janitor;
 pub mod exhaustive_search_job;
+pub mod exhaustive_search_searcher;
 pub mod exhaustive_search_workers;
 pub mod github_apps_installation;
 pub mod gitserver;
