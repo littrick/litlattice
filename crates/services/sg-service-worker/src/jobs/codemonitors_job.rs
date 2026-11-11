@@ -21,10 +21,12 @@
 //!
 //! The database is `JobDeps.frontend` (the Rust equivalent of
 //! `workerdb.InitDB`; the pool already exists at startup). Trigger search
-//! execution (`codemonitors.Search`) is **not** ported: the production
-//! [`TriggerSearcher`] is [`NotPortedTriggerSearcher`], which reports that
-//! explicitly, while the trigger job's DB steps, error wrapping and
-//! `latestResultTime` are ported and differentially tested.
+//! execution (`codemonitors.Search`) runs through
+//! [`sg_service_frontend::codemonitors_search::search`]; the production
+//! [`TriggerSearcher`] is [`FrontendTriggerSearcher`], backed by the
+//! commit-only search runtime assembled from the live configuration. The
+//! trigger job's DB steps, error wrapping, `latestResultTime` and the
+//! non-retryable classification are unchanged (M9.8ip + M9.9f).
 //!
 //! Seams (all injectable so the differential harness runs without a
 //! database):
@@ -45,8 +47,9 @@
 //! `url::Url` requires an absolute URL); and the `Transact` wrappers around
 //! the action handlers (the reads are already single consistent statements).
 
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -61,6 +64,11 @@ use sg_db::code_monitors::{
     self, ActionJob, ActionJobMetadata, EmailAction, Monitor, QueryTrigger, Recipient,
     SlackWebhookAction, TriggerJob, WebhookAction,
 };
+use sg_service_frontend::codemonitors_search::{
+    self, TriggerSearchFailure, TriggerSearchStore,
+};
+use sg_service_frontend::search_stream::convert::CommitMatch as SearchCommitMatch;
+use sg_service_frontend::search_stream::TreeRuntimeClients;
 
 use super::code_monitor_action_runner::{commit_matches_from_json, EmailSender};
 use super::code_monitor_actions::{
@@ -428,7 +436,41 @@ impl TriggerSearchOutcome {
     }
 }
 
-/// `codemonitors.Search` (`internal/codemonitors/search.go`), not ported.
+/// A `codemonitors.Search` failure plus `errcode.MakeNonRetryable`'s
+/// classification. `Display` is exactly the Go error text.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TriggerSearchError {
+    pub message: String,
+    pub non_retryable: bool,
+}
+
+impl From<String> for TriggerSearchError {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            non_retryable: false,
+        }
+    }
+}
+
+impl std::fmt::Display for TriggerSearchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for TriggerSearchError {}
+
+impl From<TriggerSearchFailure> for TriggerSearchError {
+    fn from(failure: TriggerSearchFailure) -> Self {
+        Self {
+            message: failure.message,
+            non_retryable: failure.non_retryable,
+        }
+    }
+}
+
+/// `codemonitors.Search` (`internal/codemonitors/search.go`).
 #[async_trait]
 pub trait TriggerSearcher: Send + Sync + 'static {
     async fn search(
@@ -436,10 +478,11 @@ pub trait TriggerSearcher: Send + Sync + 'static {
         query: &str,
         monitor_id: i64,
         trigger_job_id: i32,
-    ) -> Result<TriggerSearchOutcome, String>;
+    ) -> Result<TriggerSearchOutcome, TriggerSearchError>;
 }
 
-/// The production [`TriggerSearcher`] until the search execution is ported.
+/// Kept for tests that exercise the explicit not-ported marker; production
+/// assembly uses [`FrontendTriggerSearcher`].
 pub struct NotPortedTriggerSearcher;
 
 #[async_trait]
@@ -449,8 +492,131 @@ impl TriggerSearcher for NotPortedTriggerSearcher {
         _query: &str,
         _monitor_id: i64,
         _trigger_job_id: i32,
-    ) -> Result<TriggerSearchOutcome, String> {
-        Err("codemonitors.Search is not ported to the Rust worker (M9.8ip)".to_owned())
+    ) -> Result<TriggerSearchOutcome, TriggerSearchError> {
+        Err("codemonitors.Search is not ported to the Rust worker (M9.8ip)".to_owned().into())
+    }
+}
+
+/// Production [`TriggerSearcher`]: runs [`codemonitors_search::search`] with
+/// the runtime assembled from the live configuration.
+pub struct FrontendTriggerSearcher {
+    runtime: TreeRuntimeClients,
+    store: Arc<dyn TriggerSearchStore + Send + Sync>,
+}
+
+impl FrontendTriggerSearcher {
+    pub fn new(runtime: TreeRuntimeClients, store: Arc<dyn TriggerSearchStore + Send + Sync>) -> Self {
+        Self { runtime, store }
+    }
+}
+
+#[async_trait]
+impl TriggerSearcher for FrontendTriggerSearcher {
+    async fn search(
+        &self,
+        query: &str,
+        monitor_id: i64,
+        trigger_job_id: i32,
+    ) -> Result<TriggerSearchOutcome, TriggerSearchError> {
+        let results: Vec<SearchCommitMatch> = codemonitors_search::search(
+            &self.runtime,
+            Arc::clone(&self.store),
+            query,
+            monitor_id,
+            trigger_job_id,
+        )?;
+        let first_committer_date = results
+            .first()
+            .map(|result| result.commit.committer.date);
+        let stored_results = codemonitors_search::commit_matches_json(&results);
+        Ok(TriggerSearchOutcome::new(
+            stored_results,
+            results.len(),
+            first_committer_date,
+        ))
+    }
+}
+
+/// Production [`TriggerSearchStore`]: the three `codeMonitorStore` calls the
+/// hook makes, bridging the sync hook to the async `sg-db` adapter.
+pub struct PgTriggerSearchStore {
+    pool: PgPool,
+}
+
+impl PgTriggerSearchStore {
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
+}
+
+impl TriggerSearchStore for PgTriggerSearchStore {
+    fn get_last_searched(
+        &self,
+        monitor_id: i64,
+        repo_id: i32,
+    ) -> Result<Option<Vec<String>>, sg_service_frontend::search_job::JobError> {
+        block_on(code_monitors::get_last_searched(
+            &self.pool,
+            monitor_id,
+            repo_id,
+        ))
+        .map_err(|error| sg_service_frontend::search_job::JobError(error.to_string()))
+    }
+
+    fn upsert_last_searched(
+        &self,
+        monitor_id: i64,
+        repo_id: i32,
+        commit_oids: &[String],
+    ) -> Result<(), sg_service_frontend::search_job::JobError> {
+        block_on(code_monitors::upsert_last_searched(
+            &self.pool,
+            monitor_id,
+            repo_id,
+            commit_oids,
+        ))
+        .map_err(|error| sg_service_frontend::search_job::JobError(error.to_string()))
+    }
+
+    fn update_trigger_job_with_logs(
+        &self,
+        trigger_id: i32,
+        message: &str,
+    ) -> Result<(), sg_service_frontend::search_job::JobError> {
+        let entry = serde_json::json!({ "message": message });
+        block_on(code_monitors::update_trigger_job_with_logs(
+            &self.pool,
+            trigger_id,
+            &entry,
+        ))
+        .map_err(|error| sg_service_frontend::search_job::JobError(error.to_string()))
+    }
+}
+
+/// Bridge a future to the synchronous `TriggerSearchStore` trait. The worker
+/// runs on the multi-thread runtime (`block_in_place`); tests may use a
+/// current-thread runtime, hence the scoped-thread fallback.
+fn block_on<F>(future: F) -> F::Output
+where
+    F: std::future::Future + Send,
+    F::Output: Send,
+{
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(|| handle.block_on(future))
+        }
+        _ => std::thread::scope(|scope| {
+            scope
+                .spawn(move || {
+                    tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .expect("building the trigger store blocking runtime cannot fail")
+                        .block_on(future)
+                })
+                .join()
+                .unwrap_or_else(|payload| std::panic::resume_unwind(payload))
+        }),
     }
 }
 
@@ -521,6 +687,32 @@ pub fn latest_result_time(
         .unwrap_or(now)
 }
 
+/// A `run_query_trigger` failure with the searcher's non-retryable
+/// classification (`errcode.IsNonRetryable`). `Display` is the exact message
+/// stored on the record.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TriggerRunError {
+    pub message: String,
+    pub non_retryable: bool,
+}
+
+impl From<String> for TriggerRunError {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            non_retryable: false,
+        }
+    }
+}
+
+impl std::fmt::Display for TriggerRunError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for TriggerRunError {}
+
 /// `(*queryRunner).Handle`.
 ///
 /// `now` stands in for the baseline's `time.Now()`/store clock, so the
@@ -532,8 +724,28 @@ pub async fn run_query_trigger(
     poll_interval: Duration,
     now: OffsetDateTime,
 ) -> Result<(), String> {
-    let query_trigger = store.get_query_trigger_for_job(trigger_job_id).await?;
-    let monitor = store.get_monitor(query_trigger.monitor).await?;
+    run_query_trigger_classified(store, searcher, trigger_job_id, poll_interval, now)
+        .await
+        .map_err(|error| error.message)
+}
+
+/// [`run_query_trigger`] retaining the searcher's non-retryable bit so the
+/// dbworker handler can mark the record failed instead of errored.
+pub async fn run_query_trigger_classified(
+    store: &dyn TriggerStore,
+    searcher: &dyn TriggerSearcher,
+    trigger_job_id: i32,
+    poll_interval: Duration,
+    now: OffsetDateTime,
+) -> Result<(), TriggerRunError> {
+    let query_trigger = store
+        .get_query_trigger_for_job(trigger_job_id)
+        .await
+        .map_err(TriggerRunError::from)?;
+    let monitor = store
+        .get_monitor(query_trigger.monitor)
+        .await
+        .map_err(TriggerRunError::from)?;
 
     let searched = searcher
         .search(&query_trigger.query_string, monitor.id, trigger_job_id)
@@ -547,11 +759,17 @@ pub async fn run_query_trigger(
     );
     store
         .set_query_trigger_next_run(query_trigger.id, now + poll_interval, new_latest_result)
-        .await?;
+        .await
+        .map_err(TriggerRunError::from)?;
 
     let outcome = match searched {
         Ok(outcome) => outcome,
-        Err(err) => return Err(format!("execute search: {err}")),
+        Err(err) => {
+            return Err(TriggerRunError {
+                message: format!("execute search: {err}"),
+                non_retryable: err.non_retryable,
+            })
+        }
     };
 
     store
@@ -561,13 +779,15 @@ pub async fn run_query_trigger(
             &outcome.stored_results,
         )
         .await
-        .map_err(|err| format!("UpdateTriggerJobWithResults: {err}"))?;
+        .map_err(|err| TriggerRunError::from(format!("UpdateTriggerJobWithResults: {err}")))?;
 
     if outcome.count > 0 {
         store
             .enqueue_action_jobs_for_monitor(monitor.id, trigger_job_id)
             .await
-            .map_err(|err| format!("store.EnqueueActionJobsForQuery: {err}"))?;
+            .map_err(|err| {
+                TriggerRunError::from(format!("store.EnqueueActionJobsForQuery: {err}"))
+            })?;
     }
 
     Ok(())
@@ -578,6 +798,11 @@ pub struct QueryTriggerHandler {
     store: Arc<dyn TriggerStore>,
     searcher: Arc<dyn TriggerSearcher>,
     poll_interval: Duration,
+    /// Failures whose searcher error was `errcode.MakeNonRetryable`. The
+    /// dbworker interface only passes the failure message to
+    /// `non_retryable`, so the handler records the exact message produced by
+    /// `handle` and consumes it there.
+    non_retryable_messages: Mutex<HashSet<String>>,
 }
 
 impl QueryTriggerHandler {
@@ -590,6 +815,7 @@ impl QueryTriggerHandler {
             store,
             searcher,
             poll_interval,
+            non_retryable_messages: Mutex::new(HashSet::new()),
         }
     }
 }
@@ -597,14 +823,32 @@ impl QueryTriggerHandler {
 #[async_trait]
 impl DbWorkerHandler<TriggerJobStore> for QueryTriggerHandler {
     async fn handle(&self, _ctx: CancellationToken, record: &TriggerJob) -> Result<(), String> {
-        run_query_trigger(
+        let result = run_query_trigger_classified(
             self.store.as_ref(),
             self.searcher.as_ref(),
             record.id,
             self.poll_interval,
             OffsetDateTime::now_utc(),
         )
-        .await
+        .await;
+        if let Err(error) = &result {
+            if error.non_retryable {
+                self.non_retryable_messages
+                    .lock()
+                    .expect("non-retryable message set poisoned")
+                    .insert(error.message.clone());
+            }
+        }
+        result.map_err(|error| error.message)
+    }
+
+    /// `errcode.IsNonRetryable`: the Plan/NewPlanJob/addCodeMonitorHook errors
+    /// of `codemonitors.Search` are marked failed instead of errored.
+    fn non_retryable(&self, failure_message: &str) -> bool {
+        self.non_retryable_messages
+            .lock()
+            .expect("non-retryable message set poisoned")
+            .remove(failure_message)
     }
 }
 
@@ -882,9 +1126,19 @@ pub fn assemble_code_monitor_job(
 
     // 3. `newTriggerQueryRunner`.
     let trigger_store = Arc::new(TriggerJobStore::new(pool.clone()));
+    let config = live_config.current();
+    let search_runtime = sg_service_frontend::search_runtime::assemble_commit_search(
+        &pool,
+        &config.service_connections,
+        site,
+    );
+    let searcher = Arc::new(FrontendTriggerSearcher::new(
+        search_runtime,
+        Arc::new(PgTriggerSearchStore::new(pool.clone())),
+    ));
     let trigger_handler = Arc::new(QueryTriggerHandler::new(
         Arc::new(PgTriggerStore::new(pool.clone())),
-        Arc::new(NotPortedTriggerSearcher),
+        searcher,
         poll_interval,
     ));
     let trigger_worker: WorkerRoutine<TriggerJobStore, QueryTriggerHandler> =
@@ -1191,7 +1445,7 @@ mod tests {
     }
 
     struct FakeSearcher {
-        outcome: Result<TriggerSearchOutcome, String>,
+        outcome: Result<TriggerSearchOutcome, TriggerSearchError>,
     }
 
     #[async_trait]
@@ -1201,7 +1455,7 @@ mod tests {
             _query: &str,
             _monitor_id: i64,
             _trigger_job_id: i32,
-        ) -> Result<TriggerSearchOutcome, String> {
+        ) -> Result<TriggerSearchOutcome, TriggerSearchError> {
             self.outcome.clone()
         }
     }
@@ -1225,7 +1479,7 @@ mod tests {
         let err = run_query_trigger(
             &store,
             &FakeSearcher {
-                outcome: Err("boom".to_owned()),
+                outcome: Err("boom".to_owned().into()),
             },
             1,
             Duration::from_secs(300),

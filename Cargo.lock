@@ -4514,6 +4514,7 @@ dependencies = [
  "sg-rcache",
  "sg-redis",
  "sg-scip",
+ "sg-service-frontend",
  "sg-txemail",
  "sg-zoekt",
  "sha2 0.10.9",

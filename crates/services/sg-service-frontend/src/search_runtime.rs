@@ -41,7 +41,7 @@ use sg_zoekt::indexed_repo_revs::MinimalRepo;
 
 use crate::search_commit_job::{searcher_error_from_git, CommitUserDB, CommitUserEmail};
 use crate::search_env::{IndexedError, IndexedJobStreamer, SearcherGrpcConnectionCache};
-use crate::search_job::{JobError, PrivateRepoLister, ReposListOptions};
+use crate::search_job::{JobError, JobStreamer, PrivateRepoLister, ReposListOptions};
 use crate::search_searcher_client::{
     default_searcher_client, grpc_client_from_endpoints, run_to_completion, SearcherClient,
     SearcherClients, SearcherError, SearcherGitserver, SearcherLimiter, SymbolsClient,
@@ -224,6 +224,60 @@ pub fn assemble_with_repo_pager(
         // this bundle. `None` keeps the exact RepoPagerJob not-ported error.
         repo_pager,
     })
+}
+
+/// Zoekt streamer placeholder for commit-only job trees. Code-monitor
+/// searches only construct commit/diff leaves, so the streamer is never
+/// invoked; an explicit error keeps the "not configured" behavior observable
+/// instead of panicking.
+struct UnconfiguredJobStreamer;
+
+impl JobStreamer for UnconfiguredJobStreamer {
+    fn stream_search(
+        &self,
+        _query: &sg_zoekt::query::Query,
+        _options: &sg_zoekt::types::SearchOptions,
+        _sender: &mut dyn FnMut(sg_zoekt::types::SearchResult),
+    ) -> Result<(), JobError> {
+        Err(JobError(
+            "zoekt is not configured for this search".to_owned(),
+        ))
+    }
+}
+
+/// Minimal production runtime for commit-only job trees
+/// (`internal/codemonitors.search.go`). Unlike [`assemble`], it does not
+/// require zoekt endpoints: the code-monitor query plan only builds
+/// commit/diff leaves plus the repo pager, so `zoekt` is a placeholder and
+/// `searcher` is `None`. The repo pager stays `None` until the resolver is
+/// ported (M9.8hw); injecting it via [`TreeRuntimeClients::with_repo_pager`]
+/// makes the same runtime executable end-to-end.
+pub fn assemble_commit_search(
+    pool: &PgPool,
+    connections: &ServiceConnections,
+    site: &SiteConfiguration,
+) -> TreeRuntimeClients {
+    let db = Arc::new(PgPrivateRepoLister::new(pool.clone()));
+    let gitserver = Arc::new(GitClient::new(connections.git_servers.clone()));
+    let commit = if connections.git_servers.is_empty() {
+        None
+    } else {
+        Some(Arc::new(CommitRuntimeClientsOwned {
+            db: Arc::new(PgCommitUserDB::new(pool.clone())),
+            gitserver: Arc::new(GitCommitGitserver {
+                client: Arc::clone(&gitserver),
+            }),
+        }))
+    };
+
+    TreeRuntimeClients {
+        db,
+        zoekt: Arc::new(UnconfiguredJobStreamer),
+        max_repos: max_repos_from_site(site),
+        searcher: None,
+        commit,
+        repo_pager: None,
+    }
 }
 
 /// `db.Repos().ListMinimalRepos` for `privateReposForActor`.
@@ -421,6 +475,24 @@ impl crate::search_commit_job::GitserverClient for GitCommitGitserver {
             on_matches(batch);
         }
         outcome
+    }
+
+    /// `gitserver.Client.ResolveRevision(repo, rev, EnsureRevision)`.
+    fn resolve_revision(
+        &self,
+        repo: &str,
+        rev: &str,
+        ensure_revision: bool,
+    ) -> Result<String, SearcherError> {
+        let client = Arc::clone(&self.client);
+        let repo = repo.to_owned();
+        let rev = rev.to_owned();
+        run_to_completion(async move {
+            client
+                .resolve_revision(&repo, &rev, ensure_revision)
+                .await
+                .map_err(searcher_error_from_git)
+        })
     }
 }
 
