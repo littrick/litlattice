@@ -370,9 +370,14 @@ mod tests {
         assert!(matches("[a-z]*", "release"));
         assert!(matches("[!a-z]*", "Release"));
         assert!(!matches("[!a-z]*", "release"));
-        assert!(matches("[]]", "]"));
-        assert!(matches("[a-]", "a"));
-        assert!(matches("[a-]", "-"));
+        // gobwas rejects these: the first `]` of `[]]` closes an empty set
+        // ("could not parse range"), and `[a-]` wants a hi character before
+        // the closing bracket ("unexpected end of input").
+        assert_eq!(Glob::compile("[]]").unwrap_err(), "could not parse range");
+        assert_eq!(
+            Glob::compile("[a-]").unwrap_err(),
+            "unexpected end of input"
+        );
     }
 
     #[test]
