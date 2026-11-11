@@ -8,7 +8,8 @@
 //! selected by `SRC_LOG_LEVEL`; see the overview for the sink-shape note.
 
 use http::HeaderMap;
-use serde_json::{Map, Value};
+use serde_json::{json, Map, Value};
+use time::{OffsetDateTime, UtcOffset};
 use uuid::Uuid;
 
 use sg_config::SiteConfiguration;
@@ -241,23 +242,41 @@ pub fn log_level_from_env() -> String {
         .unwrap_or_else(|_| DEFAULT_LOG_LEVEL.to_owned())
 }
 
-/// `recordAuditLog` + `audit.Log` gating, with a caller-provided audit ID
-/// (the baseline's test-only `auditIDGenerator`).
-pub fn build_graphql_record(
+/// `audit.Log`'s two filters (`internal/audit/audit.go:27-40`) and nothing
+/// else. Callers with a setting-specific gate (GraphQL) apply it first.
+pub fn log_filtered(
     site: &SiteConfiguration,
-    context: &GraphqlAuditContext,
+    actor: &AuditActor,
+    client: Option<&ClientInfo>,
+) -> bool {
+    let internal_traffic = is_enabled(site, AuditLogSetting::InternalTraffic);
+    // Internal actors generate a large volume of noise.
+    if actor.internal && !internal_traffic {
+        return false;
+    }
+    // Unknown actor and unknown client IP: likewise not useful.
+    !(actor.id() == UNKNOWN && client_ip(client) == UNKNOWN && !internal_traffic)
+}
+
+/// Generic `audit.Log` record builder: filters, the audit object and the
+/// caller's fields. `entity`/`action` are the baseline `Record` values.
+pub fn build_record(
+    site: &SiteConfiguration,
+    actor: &AuditActor,
+    client: Option<&ClientInfo>,
+    entity: &str,
+    action: &str,
+    extra_fields: Map<String, Value>,
     audit_id: &str,
 ) -> Option<AuditRecord> {
-    if !should_log(site, &context.actor, context.client.as_ref()) {
+    if !log_filtered(site, actor, client) {
         return None;
     }
 
-    let actor = &context.actor;
-    let client = context.client.as_ref();
-    let audit = serde_json::json!({
+    let audit = json!({
         "auditId": audit_id,
-        "action": "request",
-        "entity": "GraphQL",
+        "action": action,
+        "entity": entity,
         "actor": {
             "actorUID": actor.id(),
             "ip": client_ip(client),
@@ -268,24 +287,50 @@ pub fn build_graphql_record(
             "X-Forwarded-For": client.map(|c| c.forwarded_for.as_str()).unwrap_or(UNKNOWN),
         },
     });
-    let request = serde_json::json!({
+    let mut fields = extra_fields;
+    fields.insert("audit".to_owned(), audit);
+
+    Some(AuditRecord {
+        audit_id: audit_id.to_owned(),
+        message: format!("{action} (sampling immunity token: {audit_id})"),
+        fields: Value::Object(fields),
+    })
+}
+
+/// `recordAuditLog` + `audit.Log` gating, with a caller-provided audit ID
+/// (the baseline's test-only `auditIDGenerator`).
+pub fn build_graphql_record(
+    site: &SiteConfiguration,
+    context: &GraphqlAuditContext,
+    audit_id: &str,
+) -> Option<AuditRecord> {
+    if !is_enabled(site, AuditLogSetting::GraphQL) {
+        return None;
+    }
+
+    let request = json!({
         "name": context.request_name,
         "source": context.request_source,
         "variables": context.variables_json,
         "query": context.query,
     });
-    let fields = serde_json::json!({
-        "audit": audit,
-        "request": request,
-        "mutation": context.query.contains("mutation"),
-        "successful": context.successful,
-    });
+    let mut fields = Map::new();
+    fields.insert("request".to_owned(), request);
+    fields.insert(
+        "mutation".to_owned(),
+        Value::Bool(context.query.contains("mutation")),
+    );
+    fields.insert("successful".to_owned(), Value::Bool(context.successful));
 
-    Some(AuditRecord {
-        audit_id: audit_id.to_owned(),
-        message: format!("request (sampling immunity token: {audit_id})"),
+    build_record(
+        site,
+        &context.actor,
+        context.client.as_ref(),
+        "GraphQL",
+        "request",
         fields,
-    })
+        audit_id,
+    )
 }
 
 /// `build_graphql_record` with a fresh UUID v4, as `audit.Log` generates.
@@ -296,6 +341,126 @@ pub fn graphql_record(
     build_graphql_record(site, context, &Uuid::new_v4().to_string())
 }
 
+/// `authAuditEntity` (`cmd/frontend/internal/httpapi/auth.go:27`).
+pub const HTTP_API_AUTH_ENTITY: &str = "httpapi/auth";
+
+/// `internal/database/security_event_logs.go:222-234`: the `event` object the
+/// security-event audit log attaches to its `audit.Log` record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SecurityEventAuditFields {
+    pub url: String,
+    pub user_id: i32,
+    pub anonymous_user_id: String,
+    pub source: String,
+    pub argument: String,
+    pub version: String,
+    pub timestamp: OffsetDateTime,
+}
+
+impl SecurityEventAuditFields {
+    fn to_json(&self) -> Value {
+        json!({
+            "URL": self.url,
+            "UserID": self.user_id,
+            "AnonymousUserID": self.anonymous_user_id,
+            "source": self.source,
+            "argument": self.argument,
+            "version": self.version,
+            "timestamp": format_go_time(self.timestamp),
+        })
+    }
+}
+
+/// `securityEventLogsStore.InsertList`'s `audit.Log` call
+/// (`internal/database/security_event_logs.go:222-234`):
+/// `Entity = "security events"`, `Action = event name`, one `event` object.
+pub fn build_security_event_record(
+    site: &SiteConfiguration,
+    actor: &AuditActor,
+    client: Option<&ClientInfo>,
+    action: &str,
+    fields: &SecurityEventAuditFields,
+    audit_id: &str,
+) -> Option<AuditRecord> {
+    let mut extra = Map::new();
+    extra.insert("event".to_owned(), fields.to_json());
+    build_record(
+        site,
+        actor,
+        client,
+        "security events",
+        action,
+        extra,
+        audit_id,
+    )
+}
+
+/// Generic `audit.Log` record for an HTTP call site (`httpapi/auth`):
+/// `check_authorization_header` / `check_sudo_access`.
+pub fn build_http_record(
+    site: &SiteConfiguration,
+    actor: &AuditActor,
+    client: Option<&ClientInfo>,
+    action: &str,
+    mut fields: Map<String, Value>,
+    audit_id: &str,
+) -> Option<AuditRecord> {
+    build_record(
+        site,
+        actor,
+        client,
+        HTTP_API_AUTH_ENTITY,
+        action,
+        std::mem::take(&mut fields),
+        audit_id,
+    )
+}
+
+/// Go `time.Time.String()` for a UTC timestamp
+/// (`2006-01-02 15:04:05.999999999 -0700 MST`; UTC renders as
+/// `+0000 UTC`, trailing fractional zeros are dropped).
+pub fn format_go_time(timestamp: OffsetDateTime) -> String {
+    let utc = timestamp.to_offset(UtcOffset::UTC);
+    let mut out = format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+        utc.year(),
+        u8::from(utc.month()),
+        utc.day(),
+        utc.hour(),
+        utc.minute(),
+        utc.second()
+    );
+    push_fraction(&mut out, utc.nanosecond());
+    out.push_str(" +0000 UTC");
+    out
+}
+
+/// Go `time.RFC3339Nano` for the normalized database argument.
+pub fn format_rfc3339_nano(timestamp: OffsetDateTime) -> String {
+    let utc = timestamp.to_offset(UtcOffset::UTC);
+    let mut out = format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}",
+        utc.year(),
+        u8::from(utc.month()),
+        utc.day(),
+        utc.hour(),
+        utc.minute(),
+        utc.second()
+    );
+    push_fraction(&mut out, utc.nanosecond());
+    out.push('Z');
+    out
+}
+
+fn push_fraction(out: &mut String, nanos: u32) {
+    if nanos == 0 {
+        return;
+    }
+    out.push('.');
+    let digits = format!("{nanos:09}");
+    out.push_str(digits.trim_end_matches('0'));
+}
+
 /// `recordAuditLog`'s `audit.IsEnabled(..., GraphQL)` check followed by
 /// `audit.Log`'s two filters (`audit.go:21-39`).
 pub fn should_log(
@@ -303,19 +468,7 @@ pub fn should_log(
     actor: &AuditActor,
     client: Option<&ClientInfo>,
 ) -> bool {
-    if !is_enabled(site, AuditLogSetting::GraphQL) {
-        return false;
-    }
-    let internal_traffic = is_enabled(site, AuditLogSetting::InternalTraffic);
-    // Internal actors generate a large volume of noise.
-    if actor.internal && !internal_traffic {
-        return false;
-    }
-    // Unknown actor and unknown client IP: likewise not useful.
-    if actor.id() == UNKNOWN && client_ip(client) == UNKNOWN && !internal_traffic {
-        return false;
-    }
-    true
+    is_enabled(site, AuditLogSetting::GraphQL) && log_filtered(site, actor, client)
 }
 
 impl AuditRecord {
@@ -540,6 +693,47 @@ mod tests {
             .message
             .ends_with(&format!("(sampling immunity token: {})", record.audit_id)));
         assert_eq!(record.fields["audit"]["auditId"], record.audit_id);
+    }
+
+    #[test]
+    fn builds_http_auth_records() {
+        let mut fields = Map::new();
+        fields.insert(
+            "problem".to_owned(),
+            Value::String("invalid username used with sudo access token".to_owned()),
+        );
+        fields.insert("sudoUser".to_owned(), Value::String("nobody".to_owned()));
+        let record = build_http_record(
+            &site("{}"),
+            &AuditActor::new(Some(7), ""),
+            context().client.as_ref(),
+            "check_sudo_access",
+            fields,
+            "id",
+        )
+        .expect("record");
+        assert_eq!(
+            record.message,
+            "check_sudo_access (sampling immunity token: id)"
+        );
+        assert_eq!(record.fields["audit"]["entity"], HTTP_API_AUTH_ENTITY);
+        assert_eq!(record.fields["audit"]["action"], "check_sudo_access");
+        assert_eq!(
+            record.fields["problem"],
+            "invalid username used with sudo access token"
+        );
+        assert_eq!(record.fields["sudoUser"], "nobody");
+
+        // `audit.Log` still drops an unknown actor with a nil client.
+        assert!(build_http_record(
+            &site("{}"),
+            &AuditActor::new(None, ""),
+            None,
+            "check_authorization_header",
+            Map::new(),
+            "id",
+        )
+        .is_none());
     }
 
     #[test]

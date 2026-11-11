@@ -39,6 +39,7 @@ use tonic::body::BoxBody;
 use sg_session::auth::{SessionAuthOutcome, SessionStore, SessionUserLookup};
 use sg_session::COOKIE_NAME;
 
+use crate::audit::{AuditActor, ClientInfo};
 use crate::authz::{http_error, parse_authorization_header, SCOPE_SITE_ADMIN_SUDO, SCOPE_USER_ALL};
 use crate::mux::SecurityConfig;
 
@@ -383,6 +384,21 @@ pub struct AccessTokenSecurityEvent<'a> {
     pub sudo_user: &'a str,
     pub token_subject_user_id: i32,
     pub token_subject_user_name: &'a str,
+    /// `actor.SourcegraphOperator` for the event's audit context: false for
+    /// the two pre-lookup failures, the looked-up value for
+    /// `AccessTokenImpersonated` (`auth.go:245-249,281-287`).
+    pub sourcegraph_operator: bool,
+}
+
+/// The pre-token request actor and request client used for the
+/// `security_event_logs` downstream sinks. The baseline resolves
+/// `actor.FromContext` inside `AccessTokenAuthMiddleware`, which runs outside
+/// `session.CookieMiddleware`/`AnonymousUIDMiddleware`; the actor is therefore
+/// the zero actor, and only `AccessTokenImpersonated` overrides the UID.
+#[derive(Debug, Clone, Copy)]
+pub struct AccessTokenAuditContext<'a> {
+    pub actor: &'a AuditActor,
+    pub client: Option<&'a ClientInfo>,
 }
 
 /// The database seams `AccessTokenAuthMiddleware` reads. The production
@@ -417,6 +433,7 @@ pub trait AccessTokenAuth: Send + Sync {
         &'a self,
         _url: &'a str,
         _anonymous_uid: Option<&'a str>,
+        _audit: Option<AccessTokenAuditContext<'a>>,
     ) -> Option<Box<dyn AccessTokenAuth + 'a>> {
         None
     }
@@ -619,6 +636,7 @@ pub async fn apply_access_token(
                     sudo_user: "",
                     token_subject_user_id: 0,
                     token_subject_user_name: "",
+                    sourcegraph_operator: false,
                 })
                 .await;
                 return token_reject(StatusCode::UNAUTHORIZED, "Invalid access token.");
@@ -649,6 +667,7 @@ pub async fn apply_access_token(
                     sudo_user: "",
                     token_subject_user_id: 0,
                     token_subject_user_name: "",
+                    sourcegraph_operator: false,
                 })
                 .await;
                 return token_reject(
@@ -672,6 +691,7 @@ pub async fn apply_access_token(
                         sudo_user: &user.username,
                         token_subject_user_id: subject_user_id,
                         token_subject_user_name: &token_subject_user_name,
+                        sourcegraph_operator,
                     })
                     .await;
                     user.uid

@@ -1,15 +1,23 @@
 #![forbid(unsafe_code)]
 
 //! `internal/database/security_event_logs.go`: the write path used by the
-//! `auditlog-expansion` feature. Only the database location is ported (see
-//! `docs/overviews/m9_8gn_update_site_configuration_overview.md` §4.9): the
-//! baseline writes rows when `log.securityEventLog.location` is `database` or
-//! `all`, and that decision stays with the caller (it needs the parsed site
-//! configuration, which `sg-db` does not depend on).
+//! `auditlog-expansion` feature. Only the persistence itself lives here; the
+//! location decision is exposed as [`security_event_location`] so callers
+//! with the parsed site configuration (which `sg-db` does not depend on) can
+//! gate the database and audit-log sinks exactly like the baseline.
 
 use serde_json::Value;
 use sqlx::types::time::OffsetDateTime;
-use sqlx::PgPool;
+use sqlx::{PgPool, QueryBuilder};
+
+/// `audit.SecurityEventsLocation` (`internal/audit/security_events.go:5-12`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SecurityEventLocation {
+    None,
+    AuditLog,
+    Database,
+    All,
+}
 
 /// `database.SecurityEventNameSiteConfigUpdated`.
 pub const SECURITY_EVENT_NAME_SITE_CONFIG_UPDATED: &str = "SiteConfigUpdated";
@@ -29,42 +37,70 @@ pub struct SecurityEvent<'a> {
     pub timestamp: OffsetDateTime,
 }
 
-/// `SecurityEventLogs().LogSecurityEvent`'s INSERT
-/// (`internal/database/security_event_logs.go:242-272`).
+/// `securityEventLogsStore.InsertList`'s single multi-row INSERT
+/// (`internal/database/security_event_logs.go:226-232`): the baseline joins
+/// one `(name,url,...)` tuple per event with commas.
+pub async fn insert_security_events(
+    pool: &PgPool,
+    events: &[SecurityEvent<'_>],
+) -> Result<(), sqlx::Error> {
+    if events.is_empty() {
+        return Ok(());
+    }
+    let mut builder: QueryBuilder<'_, sqlx::Postgres> = QueryBuilder::new(
+        "INSERT INTO security_event_logs(name, url, user_id, anonymous_user_id, \
+         source, argument, version, timestamp) ",
+    );
+    builder.push_values(events, |mut builder, event| {
+        builder
+            .push_bind(event.name)
+            .push_bind(event.url)
+            .push_bind(event.user_id)
+            .push_bind(event.anonymous_user_id)
+            .push_bind(event.source)
+            .push_bind(event.argument.clone())
+            .push_bind(event.version)
+            .push_bind(event.timestamp);
+    });
+    builder.build().execute(pool).await.map(|_| ())
+}
+
+/// `SecurityEventLogs().LogSecurityEvent`'s INSERT (a one-event
+/// [`insert_security_events`]).
 pub async fn insert_security_event(
     pool: &PgPool,
     event: &SecurityEvent<'_>,
 ) -> Result<(), sqlx::Error> {
-    sqlx::query(
-        "INSERT INTO security_event_logs(name, url, user_id, anonymous_user_id, \
-         source, argument, version, timestamp) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
-    )
-    .bind(event.name)
-    .bind(event.url)
-    .bind(event.user_id)
-    .bind(event.anonymous_user_id)
-    .bind(event.source)
-    .bind(event.argument.clone())
-    .bind(event.version)
-    .bind(event.timestamp)
-    .execute(pool)
-    .await
-    .map(|_| ())
+    insert_security_events(pool, std::slice::from_ref(event)).await
 }
 
-/// `audit.SecurityEventLocation(conf.SiteConfig()) == database || all`
-/// (`internal/audit/security_events.go:14-36`, default `auditlog`). The
-/// caller passes the parsed site config's raw JSON value.
+/// `audit.SecurityEventLocation(conf.SiteConfig())`
+/// (`internal/audit/security_events.go:14-29`): `land`/`log` nil-safe, known
+/// values mapped, everything else (including a missing `location`) defaults
+/// to `auditlog`.
+pub fn security_event_location(site: &Value) -> SecurityEventLocation {
+    let Some(security_event_log) = site
+        .get("log")
+        .and_then(|log| log.get("securityEventLog"))
+        .filter(|value| !value.is_null())
+    else {
+        return SecurityEventLocation::AuditLog;
+    };
+    match security_event_log.get("location").and_then(Value::as_str) {
+        Some("none") => SecurityEventLocation::None,
+        Some("auditlog") => SecurityEventLocation::AuditLog,
+        Some("database") => SecurityEventLocation::Database,
+        Some("all") => SecurityEventLocation::All,
+        _ => SecurityEventLocation::AuditLog,
+    }
+}
+
+/// `audit.SecurityEventLocation(...) == database || all`. The caller passes
+/// the parsed site config's raw JSON value.
 pub fn security_event_logs_in_database(site: &Value) -> bool {
-    let Some(log) = site.get("log") else {
-        return false;
-    };
-    let Some(security_event_log) = log.get("securityEventLog") else {
-        return false;
-    };
     matches!(
-        security_event_log.get("location").and_then(Value::as_str),
-        Some("database" | "all")
+        security_event_location(site),
+        SecurityEventLocation::Database | SecurityEventLocation::All
     )
 }
 
@@ -94,5 +130,45 @@ mod tests {
         assert!(security_event_logs_in_database(
             &json!({"log": {"securityEventLog": {"location": "all"}}})
         ));
+    }
+
+    #[test]
+    fn location_enum_defaults_to_auditlog() {
+        assert_eq!(
+            security_event_location(&json!({})),
+            SecurityEventLocation::AuditLog
+        );
+        assert_eq!(
+            security_event_location(&json!({"log": {"securityEventLog": null}})),
+            SecurityEventLocation::AuditLog
+        );
+        assert_eq!(
+            security_event_location(&json!({"log": {"securityEventLog": {}}})),
+            SecurityEventLocation::AuditLog
+        );
+        assert_eq!(
+            security_event_location(&json!({"log": {"securityEventLog": {"location": "bogus"}}})),
+            SecurityEventLocation::AuditLog
+        );
+        assert_eq!(
+            security_event_location(&json!({"log": {"securityEventLog": {"location": "none"}}})),
+            SecurityEventLocation::None
+        );
+        assert_eq!(
+            security_event_location(
+                &json!({"log": {"securityEventLog": {"location": "auditlog"}}})
+            ),
+            SecurityEventLocation::AuditLog
+        );
+        assert_eq!(
+            security_event_location(
+                &json!({"log": {"securityEventLog": {"location": "database"}}})
+            ),
+            SecurityEventLocation::Database
+        );
+        assert_eq!(
+            security_event_location(&json!({"log": {"securityEventLog": {"location": "all"}}})),
+            SecurityEventLocation::All
+        );
     }
 }

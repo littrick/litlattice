@@ -24,11 +24,16 @@ use sg_db::users::SOURCEGRAPH_OPERATOR_PROVIDER_TYPE;
 
 use crate::actor_chain::{LicenseReader, SiteAdminChecker};
 use crate::actor_middleware::{
-    AccessTokenAuth, AccessTokenLookupError, AccessTokenSecurityEvent, AccessTokenUser,
-    AccessTokenUserLookup, Actor, SECURITY_EVENT_ACCESS_TOKEN_IMPERSONATED,
+    AccessTokenAuditContext, AccessTokenAuth, AccessTokenLookupError, AccessTokenSecurityEvent,
+    AccessTokenUser, AccessTokenUserLookup, Actor, SECURITY_EVENT_ACCESS_TOKEN_IMPERSONATED,
     SECURITY_EVENT_ACCESS_TOKEN_INVALID, SECURITY_EVENT_ACCESS_TOKEN_SUBJECT_NOT_SITE_ADMIN,
 };
+use crate::audit::{format_go_time, log_level_from_env, AuditActor};
 use crate::authz::{LicenseState, SiteAdminCheck};
+use crate::security_event_logs::{
+    prepare_security_events, write_prepared_security_events, SecurityEventInput,
+    SecurityEventPolicy,
+};
 
 /// `database.MaxAccessTokenLastUsedAtAge`.
 const MAX_ACCESS_TOKEN_LAST_USED_AT_AGE: Duration = Duration::minutes(5);
@@ -90,11 +95,13 @@ impl PgAccessTokenAuth {
         &'a self,
         url: &'a str,
         anonymous_uid: Option<&'a str>,
+        audit: Option<AccessTokenAuditContext<'a>>,
     ) -> RequestAccessTokenAuth<'a> {
         RequestAccessTokenAuth {
             db: self,
             url,
             anonymous_uid,
+            audit,
             version: version_string(),
         }
     }
@@ -179,8 +186,9 @@ impl AccessTokenAuth for PgAccessTokenAuth {
         &'a self,
         url: &'a str,
         anonymous_uid: Option<&'a str>,
+        audit: Option<AccessTokenAuditContext<'a>>,
     ) -> Option<Box<dyn AccessTokenAuth + 'a>> {
-        Some(Box::new(self.request(url, anonymous_uid)))
+        Some(Box::new(self.request(url, anonymous_uid, audit)))
     }
 }
 
@@ -190,6 +198,7 @@ pub struct RequestAccessTokenAuth<'a> {
     db: &'a PgAccessTokenAuth,
     url: &'a str,
     anonymous_uid: Option<&'a str>,
+    audit: Option<AccessTokenAuditContext<'a>>,
     version: &'a str,
 }
 
@@ -229,56 +238,99 @@ impl AccessTokenAuth for RequestAccessTokenAuth<'_> {
             sudo_user: "",
             token_subject_user_id: 0,
             token_subject_user_name: "",
+            sourcegraph_operator: false,
         };
         self.security_event(event).await;
     }
 
-    /// `SecurityEventLogs().LogSecurityEvent` with the baseline's arguments.
+    /// `SecurityEventLogs().LogSecurityEvent` with the baseline's arguments
+    /// and both downstream sinks (`database`/`all` and `auditlog`/`all`).
     async fn security_event(&self, event: AccessTokenSecurityEvent<'_>) {
         let snapshot = self.db.live.current();
-        if !sg_db::security_event_logs::security_event_logs_in_database(snapshot.site.raw()) {
-            // `auditlog` (the default) is not this slice's sink.
-            return;
-        }
+        let policy = SecurityEventPolicy::from_site(&snapshot.site);
+
+        let timestamp = OffsetDateTime::now_utc();
         let anonymous_user_id = if event.name == SECURITY_EVENT_ACCESS_TOKEN_INVALID {
             self.anonymous_uid
                 .map(ToOwned::to_owned)
-                .unwrap_or_else(|| format!("unknown user @ {}", OffsetDateTime::now_utc()))
+                .unwrap_or_else(|| {
+                    // The baseline has no reliable identifier at this point.
+                    format!("unknown user @ {}", format_go_time(timestamp))
+                })
         } else {
             String::new()
         };
-        let argument = security_event_argument(&event);
-        let row = sg_db::security_event_logs::SecurityEvent {
-            name: event.name,
-            url: self.url,
+        let input = SecurityEventInput {
+            name: event.name.to_owned(),
+            url: self.url.to_owned(),
             user_id: event.user_id,
-            anonymous_user_id: &anonymous_user_id,
-            source: "BACKEND",
-            argument,
-            version: self.version,
-            timestamp: OffsetDateTime::now_utc(),
+            anonymous_user_id,
+            source: "BACKEND".to_owned(),
+            argument: security_event_argument(&event),
+            timestamp,
         };
-        if let Err(error) =
-            sg_db::security_event_logs::insert_security_event(&self.db.pool, &row).await
-        {
+
+        // `AccessTokenImpersonated` logs on a context whose actor is the
+        // token subject (and carries `SourcegraphOperator`); the earlier
+        // failures log on the pre-token, zero actor.
+        let (actor, sourcegraph_operator) =
+            if event.name == SECURITY_EVENT_ACCESS_TOKEN_IMPERSONATED {
+                (
+                    AuditActor {
+                        uid: (event.subject_user_id > 0).then_some(event.subject_user_id),
+                        anonymous_uid: String::new(),
+                        internal: false,
+                    },
+                    event.sourcegraph_operator,
+                )
+            } else {
+                (
+                    self.audit
+                        .map(|audit| audit.actor.clone())
+                        .unwrap_or_default(),
+                    false,
+                )
+            };
+        let client = self.audit.and_then(|audit| audit.client);
+
+        let prepared = match prepare_security_events(
+            &snapshot.site,
+            policy,
+            &actor,
+            sourcegraph_operator,
+            client,
+            &[input],
+            self.version,
+            || uuid::Uuid::new_v4().to_string(),
+        ) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                // `LogEvent` logs the error and does not return it.
+                tracing::error!(error = %error, "failed to write access-token security event");
+                return;
+            }
+        };
+
+        if let Err(error) = write_prepared_security_events(&self.db.pool, &prepared).await {
             tracing::error!(error = %error, "failed to write access-token security event");
         }
+        prepared.emit_audits(&log_level_from_env());
     }
 }
 
-fn security_event_argument(event: &AccessTokenSecurityEvent<'_>) -> serde_json::Value {
+fn security_event_argument(event: &AccessTokenSecurityEvent<'_>) -> Option<serde_json::Value> {
     match event.name {
         SECURITY_EVENT_ACCESS_TOKEN_SUBJECT_NOT_SITE_ADMIN => {
-            json!({ "subject_user_id": event.subject_user_id })
+            Some(json!({ "subject_user_id": event.subject_user_id }))
         }
-        SECURITY_EVENT_ACCESS_TOKEN_IMPERSONATED => json!({
+        SECURITY_EVENT_ACCESS_TOKEN_IMPERSONATED => Some(json!({
             "sudo_user": event.sudo_user,
             "sudo_user_id": event.sudo_user_id,
             "token_subject_user_id": event.token_subject_user_id,
             "token_subject_user_name": event.token_subject_user_name,
-        }),
+        })),
         // `AccessTokenInvalid` passes nil arguments (`{}` after marshalling).
-        _ => json!({}),
+        _ => None,
     }
 }
 

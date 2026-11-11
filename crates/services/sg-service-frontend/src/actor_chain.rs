@@ -28,10 +28,11 @@ use sg_session::auth::{SessionStore, SessionUserLookup};
 
 use crate::actor_middleware::{
     apply_access_token, apply_anonymous_uid_middleware, basic_auth_username, cookie_anonymous_uid,
-    is_trusted_request, resolve_session_actor, AccessTokenAuth, AccessTokenConfig,
-    AccessTokenDecision, AccessTokenInput, AccessTokensAllow, Actor, LicenseForToken,
-    SessionActorOutcome,
+    is_trusted_request, resolve_session_actor, AccessTokenAuditContext, AccessTokenAuth,
+    AccessTokenConfig, AccessTokenDecision, AccessTokenInput, AccessTokensAllow, Actor,
+    LicenseForToken, SessionActorOutcome,
 };
+use crate::audit::{client_info, AuditActor};
 use crate::authz::{
     authorization_header_value, http_error, post_auth_middleware, post_auth_response, LicenseState,
     PostAuthDecision, SiteAdminCheck,
@@ -200,9 +201,29 @@ pub async fn run_external_chain_at<B>(
         .map(|path_and_query| path_and_query.as_str())
         .unwrap_or(path);
     let anonymous_uid = cookie_anonymous_uid(headers);
-    let scoped_auth = deps
-        .access_token
-        .request_auth(request_uri, anonymous_uid.as_deref());
+    let initial_actor = Actor::default();
+    // `AccessTokenAuthMiddleware` runs outside the session/anonymous-UID
+    // middlewares, so the audit actor is the zero actor (impersonated events
+    // override the UID inside the adapter).
+    let audit_actor = AuditActor {
+        uid: (initial_actor.uid > 0).then_some(initial_actor.uid),
+        anonymous_uid: initial_actor.anonymous_uid.clone(),
+        internal: initial_actor.internal,
+    };
+    let client = client_info(
+        headers,
+        req.extensions()
+            .get::<sg_http::RemoteAddr>()
+            .map(|remote| remote.0.as_str()),
+    );
+    let scoped_auth = deps.access_token.request_auth(
+        request_uri,
+        anonymous_uid.as_deref(),
+        Some(AccessTokenAuditContext {
+            actor: &audit_actor,
+            client: client.as_ref(),
+        }),
+    );
     let token_auth: &dyn AccessTokenAuth = match scoped_auth.as_deref() {
         Some(auth) => auth,
         None => deps.access_token.as_ref(),
@@ -216,7 +237,7 @@ pub async fn run_external_chain_at<B>(
         },
         config.access_token,
         license_for_token,
-        Actor::default(),
+        initial_actor,
         token_auth,
     )
     .await
