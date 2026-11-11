@@ -1,10 +1,14 @@
 #![forbid(unsafe_code)]
 
-//! `sg-objectstorage`: S3/blobstore client used by the code-intel upload
-//! processor.
+//! `sg-objectstorage`: S3/blobstore and GCS client used by the code-intel
+//! upload processor.
 //!
 //! Mirrors `internal/object` from the Go baseline:
 //!
+//! - [`ObjectStore::new`] is `object.create`: the normalized backend selects
+//!   the S3 (`s3`/`blobstore`) or GCS (`gcs`) implementation, and every
+//!   storage operation dispatches to it ([`ObjectStore`] mirrors
+//!   `object.Storage`).
 //! - [`StorageConfig::normalize`] is `object.normalizeConfig`: the backend name
 //!   is lowercased, and `blobstore` implies `IsBlobstore`, `ManageBucket` and
 //!   `UsePathStyle`.
@@ -89,6 +93,11 @@ pub enum Error {
     ListObjects(String),
     /// `failed to delete objects: ...`
     DeleteObjects(String),
+    /// A GCS backend error. The GCS store already applies the baseline wrap
+    /// prefixes (`failed to get object: ...`), so it is rendered as-is.
+    Gcs(String),
+    /// `object.create`: an unregistered backend name.
+    UnknownBackend(String),
 }
 
 impl fmt::Display for Error {
@@ -100,43 +109,61 @@ impl fmt::Display for Error {
             Self::DeleteObject(message) => write!(f, "failed to delete object: {message}"),
             Self::ListObjects(message) => write!(f, "failed to list objects: {message}"),
             Self::DeleteObjects(message) => write!(f, "failed to delete objects: {message}"),
+            Self::Gcs(message) => f.write_str(message),
+            Self::UnknownBackend(backend) => {
+                write!(f, "unknown upload store backend '{backend}'")
+            }
         }
     }
 }
 
 impl std::error::Error for Error {}
 
-/// The response of `s3Store.Get`. `into_async_read` is the `io.ReadCloser`
-/// equivalent.
-pub struct ObjectBody {
-    body: ByteStream,
-    content_length: Option<i64>,
+/// The response of `object.Storage.Get`. `into_async_read` is the
+/// `io.ReadCloser` equivalent.
+pub enum ObjectBody {
+    /// S3: the body streamed by the SDK and `GetObjectOutput.ContentLength`.
+    S3 {
+        body: ByteStream,
+        content_length: Option<i64>,
+    },
+    /// GCS: the baseline hands back a reader; this port materialises the body.
+    Gcs(Vec<u8>),
 }
 
 impl ObjectBody {
     /// `GetObjectOutput.ContentLength`; absent when the server omits it.
     pub fn content_length(&self) -> Option<i64> {
-        self.content_length
+        match self {
+            Self::S3 { content_length, .. } => *content_length,
+            Self::Gcs(data) => Some(data.len() as i64),
+        }
     }
 
     pub fn into_byte_stream(self) -> ByteStream {
-        self.body
+        match self {
+            Self::S3 { body, .. } => body,
+            Self::Gcs(data) => ByteStream::from(data),
+        }
     }
 
     /// Convert into a [`tokio::io::AsyncRead`].
-    pub fn into_async_read(self) -> impl tokio::io::AsyncRead + Send {
-        self.body.into_async_read()
+    pub fn into_async_read(self) -> std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send>> {
+        match self {
+            Self::S3 { body, .. } => Box::pin(body.into_async_read()),
+            Self::Gcs(data) => Box::pin(std::io::Cursor::new(data)),
+        }
     }
 }
 
 /// An S3-compatible store (`object.s3Store`).
-pub struct ObjectStore {
+pub struct S3Store {
     client: Client,
     bucket: String,
     manage_bucket: bool,
 }
 
-impl ObjectStore {
+impl S3Store {
     /// `newS3FromConfig`.
     pub async fn new(config: StorageConfig) -> Result<Self, Error> {
         let config = config.normalize();
@@ -191,7 +218,7 @@ impl ObjectStore {
             .send()
             .await
             .map_err(|err| Error::GetObject(err.to_string()))?;
-        Ok(ObjectBody {
+        Ok(ObjectBody::S3 {
             body: output.body,
             content_length: output.content_length,
         })
@@ -342,6 +369,132 @@ impl ObjectStore {
             Err(err) => {
                 tracing::error!(error = %err, bucket = %self.bucket, "Failed to delete objects in S3 bucket");
             }
+        }
+    }
+}
+
+/// `object.Storage`: dispatches to the S3/blobstore or GCS backend. The
+/// baseline's `CreateLazyStorage` picks the implementation from
+/// `StorageConfig.Backend`; the same names and method surface are exposed
+/// here so consumers (precise-code-intel-worker, the upload-store expirer and
+/// the exhaustive-search services) do not branch on the backend themselves.
+pub enum ObjectStore {
+    S3(S3Store),
+    Gcs(GcsStore),
+}
+
+impl ObjectStore {
+    /// `newS3FromConfig` / `newGCSFromConfig` dispatch (`object.create`).
+    pub async fn new(config: StorageConfig) -> Result<Self, Error> {
+        let config = config.normalize();
+        match config.backend.as_str() {
+            "gcs" => {
+                let store = GcsStore::new(config).map_err(|err| Error::Gcs(err.to_string()))?;
+                Ok(Self::Gcs(store))
+            }
+            "s3" | "blobstore" => Ok(Self::S3(S3Store::new(config).await?)),
+            other => Err(Error::UnknownBackend(other.to_owned())),
+        }
+    }
+
+    /// Build an S3 store from an already configured SDK client.
+    pub fn with_client(client: Client, bucket: impl Into<String>, manage_bucket: bool) -> Self {
+        Self::S3(S3Store::with_client(client, bucket, manage_bucket))
+    }
+
+    /// Build from an already configured GCS store (tests inject a transport).
+    pub fn from_gcs(store: GcsStore) -> Self {
+        Self::Gcs(store)
+    }
+
+    pub fn bucket(&self) -> &str {
+        match self {
+            Self::S3(store) => store.bucket(),
+            Self::Gcs(store) => store.bucket(),
+        }
+    }
+
+    /// `object.Storage.Init`.
+    pub async fn init(&self) -> Result<(), Error> {
+        match self {
+            Self::S3(store) => store.init().await,
+            Self::Gcs(store) => store
+                .init()
+                .await
+                .map_err(|err| Error::Gcs(err.to_string())),
+        }
+    }
+
+    /// `object.Storage.Get`.
+    pub async fn get(&self, key: &str) -> Result<ObjectBody, Error> {
+        match self {
+            Self::S3(store) => store.get(key).await,
+            Self::Gcs(store) => store
+                .get(key)
+                .await
+                .map(ObjectBody::Gcs)
+                .map_err(|err| Error::Gcs(err.to_string())),
+        }
+    }
+
+    /// `object.Storage.Upload`; returns the number of bytes uploaded. The GCS
+    /// backend takes bytes, so the S3-style stream is drained first.
+    pub async fn upload(&self, key: &str, body: ByteStream) -> Result<i64, Error> {
+        match self {
+            Self::S3(store) => store.upload(key, body).await,
+            Self::Gcs(store) => {
+                let data = body
+                    .collect()
+                    .await
+                    .map_err(|err| Error::Gcs(format!("failed to upload object: {err}")))?
+                    .into_bytes();
+                store
+                    .upload(key, &data)
+                    .await
+                    .map_err(|err| Error::Gcs(err.to_string()))
+            }
+        }
+    }
+
+    /// `object.Storage.Delete`.
+    pub async fn delete(&self, key: &str) -> Result<(), Error> {
+        match self {
+            Self::S3(store) => store.delete(key).await,
+            Self::Gcs(store) => store
+                .delete(key)
+                .await
+                .map_err(|err| Error::Gcs(err.to_string())),
+        }
+    }
+
+    /// `object.Storage.List`: every key with the prefix. GCS listings do not
+    /// expose `LastModified` here; the expirer uses `timeCreated` internally.
+    pub async fn list_objects(&self, prefix: &str) -> Result<Vec<ObjectInfo>, Error> {
+        match self {
+            Self::S3(store) => store.list_objects(prefix).await,
+            Self::Gcs(store) => store
+                .list_objects(prefix)
+                .await
+                .map(|keys| {
+                    keys.into_iter()
+                        .map(|key| ObjectInfo {
+                            key,
+                            last_modified_secs: None,
+                        })
+                        .collect()
+                })
+                .map_err(|err| Error::Gcs(err.to_string())),
+        }
+    }
+
+    /// `object.Storage.ExpireObjects`.
+    pub async fn expire_objects(&self, prefix: &str, max_age: Duration) -> Result<(), Error> {
+        match self {
+            Self::S3(store) => store.expire_objects(prefix, max_age).await,
+            Self::Gcs(store) => store
+                .expire_objects(prefix, max_age)
+                .await
+                .map_err(|err| Error::Gcs(err.to_string())),
         }
     }
 }

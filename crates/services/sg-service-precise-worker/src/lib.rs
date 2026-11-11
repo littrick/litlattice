@@ -156,7 +156,7 @@ impl Service for PreciseWorkerService {
         // `ready()`: migrations are done and the process accepts traffic.
         ctx.ready.mark_ready();
 
-        // `lsifuploadstore.New` + `initializeUploadStore` (S3/blobstore).
+        // `lsifuploadstore.New` + `initializeUploadStore` (S3/blobstore/GCS).
         let upload_store = Arc::new(
             initialize_upload_store(&config.upload_store)
                 .await
@@ -259,17 +259,16 @@ async fn resetter_loop(store: Arc<queue::UploadQueueStore>, shutdown: Cancellati
     }
 }
 
-/// `lsifuploadstore.New` for the S3-compatible backends. GCS is not
-/// implemented by the Rust worker yet; the baseline would accept it, so this
-/// is a documented difference (see docs/modules/07 §16). The implementation is
-/// shared with the worker's `codeintel-uploadstore-expirer` job.
+/// `lsifuploadstore.New` for the S3/blobstore and GCS backends. The
+/// implementation is shared with the worker's `codeintel-uploadstore-expirer`
+/// job.
 pub fn upload_storage_config(
     config: &config::UploadStoreConfig,
 ) -> Result<sg_objectstorage::StorageConfig, String> {
     sg_codeintel::lsifuploadstore::storage_config(config)
 }
 
-/// `initializeUploadStore`: `object.Storage.Init` (S3 only for now).
+/// `initializeUploadStore`: `object.Storage.Init` for every supported backend.
 pub async fn initialize_upload_store(
     config: &config::UploadStoreConfig,
 ) -> Result<sg_objectstorage::ObjectStore, String> {

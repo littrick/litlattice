@@ -162,8 +162,9 @@ impl Config {
     }
 }
 
-/// `lsifuploadstore.New`'s storage config. GCS is not implemented by the Rust
-/// worker yet; the baseline would accept it.
+/// `lsifuploadstore.New`'s storage config (`object.StorageConfig` + the
+/// `object.create` backend validation). S3/blobstore and GCS are supported;
+/// the unknown-backend text matches the baseline's `object.create`.
 pub fn storage_config(config: &Config) -> Result<sg_objectstorage::StorageConfig, String> {
     match config.backend.as_str() {
         "s3" | "blobstore" => Ok(sg_objectstorage::StorageConfig {
@@ -182,14 +183,26 @@ pub fn storage_config(config: &Config) -> Result<sg_objectstorage::StorageConfig
             gcs: sg_objectstorage::GcsConfig::default(),
         }
         .normalize()),
-        "gcs" => Err("GCS upload storage is not implemented by the Rust worker".to_owned()),
-        other => Err(format!("unsupported upload backend {other:?}")),
+        "gcs" => Ok(sg_objectstorage::StorageConfig {
+            backend: config.backend.clone(),
+            manage_bucket: config.manage_bucket,
+            bucket: config.bucket.clone(),
+            s3: sg_objectstorage::S3Config::default(),
+            gcs: sg_objectstorage::GcsConfig {
+                project_id: config.gcs_project_id.clone(),
+                credentials_file: config.gcs_credentials_file.clone(),
+                credentials_file_contents: config.gcs_credentials_file_contents.clone(),
+            },
+        }
+        .normalize()),
+        other => Err(format!("unknown upload store backend '{other}'")),
     }
 }
 
 /// `lsifuploadstore.New` plus `object.Storage.Init`. The baseline returns a
 /// lazy store that initializes on first use; callers that need the eager form
-/// use this helper.
+/// use this helper. `ObjectStore::new` dispatches on the backend (S3/blobstore
+/// or GCS), mirroring `object.create`.
 pub async fn initialize_store(config: &Config) -> Result<sg_objectstorage::ObjectStore, String> {
     let storage_config = storage_config(config)?;
     let store = sg_objectstorage::ObjectStore::new(storage_config)
@@ -197,6 +210,33 @@ pub async fn initialize_store(config: &Config) -> Result<sg_objectstorage::Objec
         .map_err(|err| err.to_string())?;
     store.init().await.map_err(|err| err.to_string())?;
     Ok(store)
+}
+
+/// The GCS variant of [`initialize_store`] with an injected transport and
+/// endpoint (tests; no credentials or network). It runs the same config
+/// mapping and eager `Init` as the production path, then wraps the store in
+/// the backend-dispatching [`sg_objectstorage::ObjectStore`].
+pub async fn initialize_store_with_transport(
+    config: &Config,
+    endpoint: &str,
+    transport: std::sync::Arc<dyn sg_objectstorage::GcsTransport>,
+) -> Result<sg_objectstorage::ObjectStore, String> {
+    let storage_config = storage_config(config)?;
+    if storage_config.backend != "gcs" {
+        return Err(format!(
+            "injected transport requires the GCS backend, got {:?}",
+            storage_config.backend
+        ));
+    }
+    let store = sg_objectstorage::GcsStore::with_transport(
+        storage_config.bucket,
+        storage_config.manage_bucket,
+        storage_config.gcs.project_id,
+        endpoint,
+        transport,
+    );
+    store.init().await.map_err(|err| err.to_string())?;
+    Ok(sg_objectstorage::ObjectStore::from_gcs(store))
 }
 
 /// `deploy.BlobstoreDefaultEndpoint`: the single-container deployment listens
@@ -357,5 +397,51 @@ mod tests {
             ]
         );
         clear_env();
+    }
+
+    fn base_config(backend: &str) -> Config {
+        Config {
+            backend: backend.to_owned(),
+            manage_bucket: false,
+            bucket: "lsif-uploads".to_owned(),
+            ttl: Duration::from_secs(168 * 3600),
+            s3_region: String::new(),
+            s3_endpoint: String::new(),
+            s3_use_path_style: false,
+            s3_access_key_id: String::new(),
+            s3_secret_access_key: String::new(),
+            s3_session_token: String::new(),
+            gcs_project_id: String::new(),
+            gcs_credentials_file: String::new(),
+            gcs_credentials_file_contents: String::new(),
+        }
+    }
+
+    #[test]
+    fn gcs_storage_config_carries_the_baseline_fields() {
+        let mut config = base_config("gcs");
+        config.manage_bucket = true;
+        config.bucket = "uploads".to_owned();
+        config.gcs_project_id = "project-1".to_owned();
+        config.gcs_credentials_file = "/tmp/key.json".to_owned();
+        config.gcs_credentials_file_contents = "{\"type\":\"service_account\"}".to_owned();
+
+        let storage = storage_config(&config).expect("gcs storage config");
+        assert_eq!(storage.backend, "gcs");
+        assert!(storage.manage_bucket);
+        assert_eq!(storage.bucket, "uploads");
+        assert_eq!(storage.gcs.project_id, "project-1");
+        assert_eq!(storage.gcs.credentials_file, "/tmp/key.json");
+        assert_eq!(
+            storage.gcs.credentials_file_contents,
+            "{\"type\":\"service_account\"}"
+        );
+        assert_eq!(storage.s3, sg_objectstorage::S3Config::default());
+    }
+
+    #[test]
+    fn unknown_storage_backend_matches_the_baseline_text() {
+        let error = storage_config(&base_config("swift")).expect_err("unknown backend");
+        assert_eq!(error, "unknown upload store backend 'swift'");
     }
 }
