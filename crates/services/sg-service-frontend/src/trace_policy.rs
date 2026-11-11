@@ -412,6 +412,16 @@ pub fn capture_slow_graphql_requests_limit(site: &SiteConfiguration) -> i64 {
         .unwrap_or(0)
 }
 
+/// `observability.logSlowGraphQLRequests`: the slow-request threshold in
+/// milliseconds (`graphqlbackend.go:137`). Missing/non-integer is `0`
+/// (capture disabled).
+pub fn log_slow_graphql_requests(site: &SiteConfiguration) -> i64 {
+    site.raw()
+        .get("observability.logSlowGraphQLRequests")
+        .and_then(Value::as_i64)
+        .unwrap_or(0)
+}
+
 /// The outcome of one `newConfWatcher` invocation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OtelStartup {
@@ -534,6 +544,195 @@ pub fn init_tracer(
     TracerRuntime::init(startup.clone(), exporter)
 }
 
+// ---------------------------------------------------------------------------
+// OTLP exporter adapter (`internal/tracer/oteldefaults/exporters/otlp.go`,
+// `internal/otlpenv/otlpenv.go`)
+// ---------------------------------------------------------------------------
+
+/// `defaultGRPCCollectorEndpoint` (`internal/otlpenv/otlpenv.go:24`).
+pub const DEFAULT_OTLP_ENDPOINT: &str = "http://127.0.0.1:4317";
+
+/// `otlpenv.Protocol`: only the values `NewOTLPTraceExporter` accepts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OtlpProtocol {
+    /// `grpc`
+    Grpc,
+    /// `http/json`
+    HttpJson,
+}
+
+impl OtlpProtocol {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Grpc => "grpc",
+            Self::HttpJson => "http/json",
+        }
+    }
+
+    /// `NewOTLPTraceExporter`'s protocol switch: `http/proto` (and anything
+    /// else) is unsupported and surfaces as `unexpected protocol %q`.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "grpc" => Some(Self::Grpc),
+            "http/json" => Some(Self::HttpJson),
+            _ => None,
+        }
+    }
+}
+
+/// The resolved OTLP exporter settings (`internal/otlpenv`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OtlpExporterConfig {
+    /// The endpoint with any `http(s)://` scheme stripped.
+    pub endpoint: String,
+    pub protocol: OtlpProtocol,
+    /// `otlpenv.IsInsecure`: the endpoint used `http://`.
+    pub insecure: bool,
+}
+
+/// `otlpenv.GetEndpoint`: the first set env wins; unset uses the default.
+pub fn otlp_endpoint(env: impl Fn(&str) -> Option<String>) -> String {
+    env("OTEL_EXPORTER_OTLP_ENDPOINT").unwrap_or_else(|| DEFAULT_OTLP_ENDPOINT.to_owned())
+}
+
+/// `otlpenv.GetProtocol`: the first set env wins; unset uses `grpc`.
+pub fn otlp_protocol(env: impl Fn(&str) -> Option<String>) -> String {
+    env("OTEL_EXPORTER_OTLP_PROTOCOL").unwrap_or_else(|| "grpc".to_owned())
+}
+
+/// `trimSchema` (`exporters/otlp.go:70`): case-insensitive `http://`/`https://`.
+pub fn trim_schema(endpoint: &str) -> String {
+    let lower = endpoint.to_ascii_lowercase();
+    for scheme in ["http://", "https://"] {
+        if lower.starts_with(scheme) {
+            return endpoint[scheme.len()..].to_owned();
+        }
+    }
+    endpoint.to_owned()
+}
+
+/// `otlpenv.IsInsecure`: only a literal `http://` prefix counts.
+pub fn otlp_is_insecure(endpoint: &str) -> bool {
+    endpoint.to_ascii_lowercase().starts_with("http://")
+}
+
+/// Resolve the OTLP exporter settings, reproducing the two startup errors of
+/// `NewOTLPTraceExporter` (`exporters/otlp.go:26-70`).
+pub fn otlp_exporter_config_from_env(
+    env: impl Fn(&str) -> Option<String>,
+) -> Result<OtlpExporterConfig, String> {
+    let endpoint = otlp_endpoint(&env);
+    if endpoint.is_empty() {
+        return Err(
+            "please configure an exporter endpoint with OTEL_EXPORTER_OTLP_ENDPOINT".to_owned(),
+        );
+    }
+    let raw_protocol = otlp_protocol(&env);
+    let protocol = OtlpProtocol::parse(&raw_protocol)
+        .ok_or_else(|| format!("unexpected protocol \"{raw_protocol}\""))?;
+    Ok(OtlpExporterConfig {
+        endpoint: trim_schema(&endpoint),
+        protocol,
+        insecure: otlp_is_insecure(&endpoint),
+    })
+}
+
+/// The batch seam standing in for the OTLP/Jaeger clients. Tests inject a
+/// recording transport; production uses [`NoopSpanTransport`], so an injected
+/// exporter never performs I/O.
+pub trait SpanTransport: Send + Sync {
+    fn send(&self, spans: &[SpanData]) -> Result<(), String>;
+    fn shutdown(&self) {}
+}
+
+/// The production transport: accepts and discards every batch.
+pub struct NoopSpanTransport;
+
+impl SpanTransport for NoopSpanTransport {
+    fn send(&self, _spans: &[SpanData]) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+/// `otlptrace.Exporter`: hands finished spans to the injected transport. The
+/// wire encoding itself (protobuf/gRPC or HTTP/JSON) stays behind the
+/// transport seam.
+pub struct OtlpSpanExporter {
+    config: OtlpExporterConfig,
+    transport: Arc<dyn SpanTransport>,
+}
+
+impl OtlpSpanExporter {
+    pub fn new(config: OtlpExporterConfig, transport: Arc<dyn SpanTransport>) -> Self {
+        Self { config, transport }
+    }
+
+    pub fn config(&self) -> &OtlpExporterConfig {
+        &self.config
+    }
+}
+
+impl SpanExporter for OtlpSpanExporter {
+    fn export(&self, span: &SpanData) {
+        let _ = self.transport.send(std::slice::from_ref(span));
+    }
+
+    fn shutdown(&self) {
+        self.transport.shutdown();
+    }
+}
+
+/// The Jaeger exporter seam: the baseline builds a Jaeger client from `jaeger`
+/// env config; here the transport stands in for it.
+pub struct JaegerSpanExporter {
+    transport: Arc<dyn SpanTransport>,
+}
+
+impl JaegerSpanExporter {
+    pub fn new(transport: Arc<dyn SpanTransport>) -> Self {
+        Self { transport }
+    }
+}
+
+impl SpanExporter for JaegerSpanExporter {
+    fn export(&self, span: &SpanData) {
+        let _ = self.transport.send(std::slice::from_ref(span));
+    }
+
+    fn shutdown(&self) {
+        self.transport.shutdown();
+    }
+}
+
+/// `newOtelSpanProcessor` (`internal/tracer/otel.go:43`): pick the exporter for
+/// the configured tracer type. `none` keeps the no-op path.
+pub fn build_span_exporter(
+    tracer_type: TracerType,
+    transport: Arc<dyn SpanTransport>,
+    env: impl Fn(&str) -> Option<String>,
+) -> Result<Option<Arc<dyn SpanExporter>>, String> {
+    match tracer_type {
+        TracerType::None => Ok(None),
+        TracerType::OpenTelemetry => {
+            let config = otlp_exporter_config_from_env(env)?;
+            Ok(Some(Arc::new(OtlpSpanExporter::new(config, transport))))
+        }
+        TracerType::Jaeger => Ok(Some(Arc::new(JaegerSpanExporter::new(transport)))),
+    }
+}
+
+/// `tracer.Init`'s exporter installation: set the policy, and build the
+/// exporter from the environment. On error the caller keeps running without an
+/// exporter (the baseline's `newConfWatcher` warns and continues).
+pub fn init_tracer_from_env(
+    startup: &OtelStartup,
+    transport: Arc<dyn SpanTransport>,
+    env: impl Fn(&str) -> Option<String>,
+) -> Result<TracerRuntime, String> {
+    let exporter = build_span_exporter(startup.tracer_type, transport, env)?;
+    Ok(init_tracer(startup, exporter))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -620,5 +819,77 @@ mod tests {
         let plan = plan_otel_startup(None, TracePolicy::All);
         assert_eq!(plan.policy, TracePolicy::All);
         assert_eq!(plan.tracer_type, TracerType::None);
+    }
+
+    #[test]
+    fn otlp_env_mirrors_otlpenv_and_exporter_errors() {
+        let empty = |_: &str| None;
+        let config = otlp_exporter_config_from_env(empty).unwrap();
+        assert_eq!(config.endpoint, "127.0.0.1:4317");
+        assert_eq!(config.protocol, OtlpProtocol::Grpc);
+        assert!(config.insecure);
+
+        let env = |key: &str| match key {
+            "OTEL_EXPORTER_OTLP_ENDPOINT" => Some("https://collector:4318".to_owned()),
+            "OTEL_EXPORTER_OTLP_PROTOCOL" => Some("http/json".to_owned()),
+            _ => None,
+        };
+        let config = otlp_exporter_config_from_env(env).unwrap();
+        assert_eq!(config.endpoint, "collector:4318");
+        assert_eq!(config.protocol, OtlpProtocol::HttpJson);
+        assert!(!config.insecure);
+
+        // An explicitly empty endpoint disables the exporter.
+        let env = |key: &str| (key == "OTEL_EXPORTER_OTLP_ENDPOINT").then(String::new);
+        assert_eq!(
+            otlp_exporter_config_from_env(env).unwrap_err(),
+            "please configure an exporter endpoint with OTEL_EXPORTER_OTLP_ENDPOINT"
+        );
+        // `http/proto` is not supported by the baseline switch.
+        let env =
+            |key: &str| (key == "OTEL_EXPORTER_OTLP_PROTOCOL").then(|| "http/proto".to_owned());
+        assert_eq!(
+            otlp_exporter_config_from_env(env).unwrap_err(),
+            "unexpected protocol \"http/proto\""
+        );
+        assert_eq!(trim_schema("HTTP://host:1"), "host:1");
+    }
+
+    #[test]
+    fn exporter_is_selected_by_tracer_type_and_defaults_to_noop() {
+        let startup = OtelStartup {
+            policy: TracePolicy::Selective,
+            tracer_type: TracerType::OpenTelemetry,
+            debug: false,
+        };
+        let error = init_tracer_from_env(&startup, Arc::new(NoopSpanTransport), |key: &str| {
+            (key == "OTEL_EXPORTER_OTLP_ENDPOINT").then(|| "".to_owned())
+        })
+        .err()
+        .unwrap();
+        assert_eq!(
+            error,
+            "please configure an exporter endpoint with OTEL_EXPORTER_OTLP_ENDPOINT"
+        );
+
+        let runtime =
+            init_tracer_from_env(&startup, Arc::new(NoopSpanTransport), |_: &str| None).unwrap();
+        assert!(runtime.enabled());
+        let span = SpanData {
+            name: "GraphQL".to_owned(),
+            trace_id: "t".to_owned(),
+            span_id: "s".to_owned(),
+            attributes: vec![sampling_retain(true).unwrap()],
+        };
+        assert!(runtime.export(&span));
+
+        let disabled = OtelStartup {
+            tracer_type: TracerType::None,
+            ..startup
+        };
+        let runtime =
+            init_tracer_from_env(&disabled, Arc::new(NoopSpanTransport), |_: &str| None).unwrap();
+        assert!(!runtime.enabled());
+        assert!(!runtime.export(&span));
     }
 }

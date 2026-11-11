@@ -170,6 +170,18 @@ fn query_error_from_exec(error: &ExecError) -> QueryError {
     }
 }
 
+/// `(*errors.QueryError).Error()` (`graphql-go/errors/errors.go:41`), used by
+/// the slow-request capture (`graphqlbackend.go:170`).
+fn query_error_string(error: &QueryError) -> String {
+    let locations = error
+        .locations
+        .iter()
+        .flatten()
+        .map(|location| (location.line, location.column))
+        .collect::<Vec<_>>();
+    crate::slow_requests_tracer::query_error_string(&error.message, &locations)
+}
+
 fn query_error_json(error: &QueryError) -> Result<Json, String> {
     let mut entries: Vec<(&str, Json)> = vec![("message", Json::Str(error.message.clone()))];
     if let Some(locations) = error.locations.as_ref().filter(|list| !list.is_empty()) {
@@ -283,6 +295,16 @@ pub trait GraphqlDeps: Send + Sync {
     /// as unauthenticated.
     async fn authenticate(&self, _cookie: Option<&str>) -> SessionAuthOutcome {
         SessionAuthOutcome::Anonymous(AnonymousReason::NoCookie)
+    }
+
+    /// `requestTracer.TraceQuery`'s `captureSlowRequest` hook
+    /// (`graphqlbackend.go:176`). The default (transport tests, unported deps)
+    /// does nothing; production inserts into the slow-request store when the
+    /// request exceeds `observability.logSlowGraphQLRequests`.
+    async fn capture_slow_request(
+        &self,
+        _capture: crate::slow_requests_tracer::SlowRequestCapture,
+    ) {
     }
 }
 
@@ -1351,6 +1373,27 @@ impl GraphqlDeps for SchemaGraphqlDeps {
             }
             None => None,
         };
+        // `Query.slowRequests` (`slow_requests_tracer.go:63`): the `after`
+        // cursor and the nodes' `user`/`repository` rows are async, so resolve
+        // whole connections before the sync executor replays the fields.
+        let slow_requests_prefetch = match &self.slow_requests {
+            Some(surface) => {
+                crate::slow_requests_tracer::prefetch_slow_requests(
+                    surface.as_ref(),
+                    self.users.as_ref().map(|users| {
+                        users.as_ref() as &dyn crate::graphql_resolvers::UserLookupStore
+                    }),
+                    self.repositories.as_ref().map(|store| {
+                        store.as_ref() as &dyn crate::graphql_resolvers::RepositoryLookup
+                    }),
+                    &fields,
+                    request.actor,
+                    site_admin,
+                )
+                .await
+            }
+            None => std::collections::HashMap::new(),
+        };
         let mut roots =
             crate::graphql_resolvers::FrontendRootResolver::with_prefetched_organizations(
                 user,
@@ -1379,11 +1422,23 @@ impl GraphqlDeps for SchemaGraphqlDeps {
         if let Some(surface) = &self.slow_requests {
             roots = roots.with_slow_requests(Arc::clone(surface));
         }
+        roots = roots.with_slow_requests_prefetch(slow_requests_prefetch);
         if let Some(client_configuration) = client_configuration {
             roots = roots.with_client_configuration(client_configuration);
         }
         let response = sg_graphql::exec::execute_with(&self.schema, exec_request, Some(&roots));
         GraphqlResponse::from_exec(&response)
+    }
+
+    async fn capture_slow_request(&self, capture: crate::slow_requests_tracer::SlowRequestCapture) {
+        let Some(surface) = self.slow_requests.as_ref() else {
+            return;
+        };
+        // The baseline logs marshal/insert failures and continues
+        // (`captureSlowRequest`).
+        if let Err(error) = surface.capture(&capture) {
+            tracing::warn!(%error, "failed to capture slow GraphQL request");
+        }
     }
 
     async fn authenticate(&self, cookie: Option<&str>) -> SessionAuthOutcome {
@@ -1604,6 +1659,8 @@ where
         successful: true,
     };
     let site = live.current().site.clone();
+    // `conf.Get().ObservabilityLogSlowGraphQLRequests`, read at request time.
+    let slow_threshold_ms = crate::trace_policy::log_slow_graphql_requests(&site);
     let mut timer = RequestTimer::new(&params.query, &request_name, site, audit_context);
 
     // Calculating the cost is cheaper than validating the schema
@@ -1660,6 +1717,10 @@ where
     // `graphql.go:220`: the duration histogram measures execution only; the
     // timer's earlier phase was used for the pre-execution return paths.
     timer.exec_started();
+    // `requestTracer.TraceQuery`: `start := time.Now()` (before schema.Exec)
+    // then `time.Since(start)` in the finish callback.
+    let slow_start = time::OffsetDateTime::now_utc();
+    let slow_exec_started = Instant::now();
     let response = deps
         .exec(GraphqlExecRequest {
             query: &params.query,
@@ -1668,7 +1729,21 @@ where
             actor,
         })
         .await;
+    let slow_duration_ns =
+        i64::try_from(slow_exec_started.elapsed().as_nanos()).unwrap_or(i64::MAX);
     timer.finish(response.errors.is_empty());
+    deps.capture_slow_request(crate::slow_requests_tracer::SlowRequestCapture {
+        start: crate::slow_requests_tracer::rfc3339_nanos(slow_start),
+        duration_ns: slow_duration_ns,
+        threshold_ms: slow_threshold_ms,
+        user_id: actor.uid().unwrap_or(0),
+        name: request_name,
+        source: request_source,
+        variables: params.variables.clone(),
+        errors: response.errors.iter().map(query_error_string).collect(),
+        query: params.query.clone(),
+    })
+    .await;
     let body = match response.to_json() {
         Ok(body) => body.into_bytes(),
         Err(error) => {

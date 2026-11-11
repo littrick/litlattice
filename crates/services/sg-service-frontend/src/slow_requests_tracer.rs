@@ -17,20 +17,27 @@
 //!   `strconv.Atoi` error with the (successful) list read and treats the
 //!   cursor as 0 (`slow_requests_tracer.go:107-121`).
 //!
-//! `SlowRequest.user`/`repository` perform database lookups in the baseline;
-//! the GraphQL objects below return `null` and leave that as a seam.
+//! `SlowRequest.user`/`repository` perform database lookups in the baseline.
+//! The GraphQL objects below accept the already-resolved rows (the async
+//! lookups happen in [`SlowRequestsSurface::resolve_prefetch`] using the
+//! existing `UserLookupStore`/`RepositoryLookup` adapters); an unresolved
+//! object (transport tests) keeps `null` for both fields.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use time::{format_description::well_known::Rfc3339, OffsetDateTime, UtcOffset};
 
-use sg_graphql::exec::{Actor, Arguments, ExecError, FieldValue, ObjectValue};
+use sg_graphql::exec::{Actor, Arguments, ExecError, FieldValue, ObjectValue, RootField};
 use sg_graphql::json::Json;
 
-use crate::graphql_resolvers::PageInfoObject;
+use crate::graphql_resolvers::{
+    PageInfoObject, RepoLookup, RepositoryData, RepositoryLookup, RepositoryObject, UserData,
+    UserKey, UserLookupStore, UserObject,
+};
 
 /// `slowRequestRedisFIFOListPerPage` (`slow_requests_tracer.go:24`).
 pub const SLOW_REQUEST_REDIS_FIFO_LIST_PER_PAGE: usize = 50;
@@ -248,6 +255,105 @@ pub fn capture_slow_request(
     store.insert(request.clone())
 }
 
+/// A request the tracer decided may be slow (`graphqlbackend.go:159-177`).
+///
+/// The caller supplies the start timestamp (RFC3339Nano, as Go's
+/// `time.Time.MarshalJSON` writes it), the measured duration and the current
+/// `observability.logSlowGraphQLRequests` threshold.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SlowRequestCapture {
+    pub start: String,
+    pub duration_ns: i64,
+    pub threshold_ms: i64,
+    pub user_id: i32,
+    pub name: String,
+    pub source: String,
+    pub variables: serde_json::Map<String, Value>,
+    pub errors: Vec<String>,
+    pub query: String,
+}
+
+impl SlowRequestCapture {
+    /// `conf.Get().ObservabilityLogSlowGraphQLRequests != 0 && d.Milliseconds()
+    /// > int64(v)` (`graphqlbackend.go:137`).
+    pub fn should_capture(&self) -> bool {
+        should_capture_slow_request(self.threshold_ms, self.duration_ns)
+    }
+
+    /// The `types.SlowRequest` row `captureSlowRequest` marshals.
+    pub fn to_slow_request(&self) -> SlowRequest {
+        SlowRequest {
+            index: String::new(),
+            start: self.start.clone(),
+            duration: self.duration_ns,
+            user_id: self.user_id,
+            name: self.name.clone(),
+            source: self.source.clone(),
+            variables: self.variables.clone(),
+            errors: self.errors.clone(),
+            query: self.query.clone(),
+            filepath: String::new(),
+        }
+    }
+}
+
+/// `threshold != 0 && duration.Milliseconds() > threshold`.
+///
+/// `time.Duration.Milliseconds()` truncates toward zero, like Rust's integer
+/// division for positive and negative durations.
+pub fn should_capture_slow_request(threshold_ms: i64, duration_ns: i64) -> bool {
+    threshold_ms != 0 && duration_ns / 1_000_000 > threshold_ms
+}
+
+/// `captureSlowRequest` behind the threshold check: returns whether the request
+/// was inserted.
+pub fn maybe_capture_slow_request(
+    store: &dyn SlowRequestStore,
+    capture: &SlowRequestCapture,
+) -> Result<bool, String> {
+    if !capture.should_capture() {
+        return Ok(false);
+    }
+    capture_slow_request(store, &capture.to_slow_request())?;
+    Ok(true)
+}
+
+/// `time.Time.MarshalJSON` (`time.Time.appendStrictRFC3339` with RFC3339Nano):
+/// UTC, fractional seconds only when non-zero, trailing zeros trimmed.
+pub fn rfc3339_nanos(t: OffsetDateTime) -> String {
+    let t = t.to_offset(UtcOffset::UTC);
+    let mut out = format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}",
+        t.year(),
+        t.month() as u8,
+        t.day(),
+        t.hour(),
+        t.minute(),
+        t.second()
+    );
+    let nanos = t.nanosecond();
+    if nanos != 0 {
+        let mut fraction = format!("{nanos:09}");
+        while fraction.ends_with('0') {
+            fraction.pop();
+        }
+        out.push('.');
+        out.push_str(&fraction);
+    }
+    out.push('Z');
+    out
+}
+
+/// `(*errors.QueryError).Error()` from graph-gophers/graphql-go:
+/// `graphql: <message>` followed by one ` (line L, column C)` per location.
+pub fn query_error_string(message: &str, locations: &[(i64, i64)]) -> String {
+    let mut out = format!("graphql: {message}");
+    for (line, column) in locations {
+        out.push_str(&format!(" (line {line}, column {column})"));
+    }
+    out
+}
+
 /// `getSlowRequestsAfter` (`slow_requests_tracer.go:44`): fetch the inclusive
 /// slice and assign `index = i + after`.
 pub fn get_slow_requests_after(
@@ -338,14 +444,50 @@ pub fn load_connection(
     }
 }
 
+/// `slowRequestResolver.Start` (`slow_requests_tracer.go:169`): the stored
+/// `time.Time` re-marshaled by `gqlutil.DateTime` (UTC, seconds precision).
+fn start_datetime(value: &str) -> String {
+    OffsetDateTime::parse(value, &Rfc3339)
+        .map(crate::graphql_resolvers::datetime_rfc3339)
+        .unwrap_or_else(|_| value.to_owned())
+}
+
 /// `slowRequestResolver` as a GraphQL `SlowRequest` object.
+///
+/// `user`/`repository` carry the already-resolved rows (see
+/// [`SlowRequestsSurface::resolve_prefetch`]). `None` means the baseline would
+/// return `nil` (`UserID == 0`, no guessed repo name) or no database seam was
+/// injected (transport tests).
+#[derive(Debug, Clone)]
 pub struct SlowRequestObject {
     request: SlowRequest,
+    user: Option<Result<UserData, String>>,
+    repository: Option<Result<RepositoryData, String>>,
+    viewer_site_admin: bool,
 }
 
 impl SlowRequestObject {
     pub fn new(request: SlowRequest) -> Self {
-        Self { request }
+        Self {
+            request,
+            user: None,
+            repository: None,
+            viewer_site_admin: false,
+        }
+    }
+
+    pub fn with_resolved(
+        request: SlowRequest,
+        user: Option<Result<UserData, String>>,
+        repository: Option<Result<RepositoryData, String>>,
+        viewer_site_admin: bool,
+    ) -> Self {
+        Self {
+            request,
+            user,
+            repository,
+            viewer_site_admin,
+        }
     }
 
     pub fn request(&self) -> &SlowRequest {
@@ -367,17 +509,32 @@ impl ObjectValue for SlowRequestObject {
         let request = &self.request;
         match field {
             "index" => Ok(Some(FieldValue::Json(Json::Str(request.index.clone())))),
-            "start" => Ok(Some(FieldValue::Json(Json::Str(request.start.clone())))),
+            // `gqlutil.DateTime.MarshalJSON`: UTC RFC3339, seconds precision.
+            "start" => Ok(Some(FieldValue::Json(Json::Str(start_datetime(
+                &request.start,
+            ))))),
             "duration" => Ok(Some(FieldValue::Json(Json::Float(
                 request.duration_seconds(),
             )))),
-            // `UserByID` is a database seam.
-            "user" => Ok(Some(FieldValue::Null)),
+            // `UserByID`: the lookup happened in `resolve_prefetch`; a missing
+            // user is an error (not `null`).
+            "user" => match &self.user {
+                None => Ok(Some(FieldValue::Null)),
+                Some(Ok(data)) => Ok(Some(FieldValue::Object(Arc::new(
+                    UserObject::from_data_as_viewer(data.clone(), self.viewer_site_admin),
+                )))),
+                Some(Err(error)) => Err(ExecError::new(error.clone())),
+            },
             "name" => Ok(Some(FieldValue::Json(Json::Str(request.name.clone())))),
             "source" => Ok(Some(FieldValue::Json(Json::Str(request.source.clone())))),
-            // `db.Repos().GetByName` is a database seam; `guess_repo_name`
-            // implements the name guess used by the baseline.
-            "repository" => Ok(Some(FieldValue::Null)),
+            // `db.Repos().GetByName`: missing/blocked repositories are errors.
+            "repository" => match &self.repository {
+                None => Ok(Some(FieldValue::Null)),
+                Some(Ok(data)) => Ok(Some(FieldValue::Object(Arc::new(
+                    RepositoryObject::from_data(data.clone()),
+                )))),
+                Some(Err(error)) => Err(ExecError::new(error.clone())),
+            },
             "variables" => Ok(Some(FieldValue::Json(Json::Str(request.variables_json())))),
             "errors" => Ok(Some(FieldValue::Json(Json::Arr(
                 request
@@ -400,11 +557,24 @@ impl ObjectValue for SlowRequestObject {
 #[derive(Debug)]
 pub struct SlowRequestConnectionObject {
     connection: SlowRequestConnection,
+    /// Nodes with their `user`/`repository` rows resolved; `None` rebuilds
+    /// plain nodes for transport-only callers.
+    nodes: Option<Vec<SlowRequestObject>>,
 }
 
 impl SlowRequestConnectionObject {
     pub fn new(connection: SlowRequestConnection) -> Self {
-        Self { connection }
+        Self {
+            connection,
+            nodes: None,
+        }
+    }
+
+    pub fn with_nodes(connection: SlowRequestConnection, nodes: Vec<SlowRequestObject>) -> Self {
+        Self {
+            connection,
+            nodes: Some(nodes),
+        }
     }
 
     pub fn connection(&self) -> &SlowRequestConnection {
@@ -427,17 +597,27 @@ impl ObjectValue for SlowRequestConnectionObject {
         match field {
             "nodes" => match &connection.nodes_error {
                 Some(error) => Err(ExecError::new(error.clone())),
-                None => Ok(Some(FieldValue::List {
-                    items: connection
-                        .nodes
-                        .iter()
-                        .cloned()
-                        .map(|request| {
-                            FieldValue::Object(Arc::new(SlowRequestObject::new(request)))
-                        })
-                        .collect(),
-                    element_type: Some("SlowRequest"),
-                })),
+                None => {
+                    let items = match &self.nodes {
+                        Some(nodes) => nodes
+                            .iter()
+                            .cloned()
+                            .map(|node| FieldValue::Object(Arc::new(node)))
+                            .collect(),
+                        None => connection
+                            .nodes
+                            .iter()
+                            .cloned()
+                            .map(|request| {
+                                FieldValue::Object(Arc::new(SlowRequestObject::new(request)))
+                            })
+                            .collect(),
+                    };
+                    Ok(Some(FieldValue::List {
+                        items,
+                        element_type: Some("SlowRequest"),
+                    }))
+                }
             },
             "totalCount" => match &connection.total_count_error {
                 Some(error) => Err(ExecError::new(error.clone())),
@@ -459,45 +639,62 @@ impl ObjectValue for SlowRequestConnectionObject {
 
 /// The injected `Query.slowRequests` surface: the FIFO store plus the
 /// configured capture limit.
+///
+/// The limit is atomic because the baseline reads
+/// `observability.captureSlowGraphQLRequestsLimit` dynamically on each
+/// `SlowRequests`/insert call (`conf.Get()`); production updates it through
+/// [`SlowRequestsSurface::set_limit`].
 pub struct SlowRequestsSurface {
     store: Arc<dyn SlowRequestStore>,
-    limit: i64,
+    limit: AtomicI64,
 }
 
 impl SlowRequestsSurface {
     pub fn new(store: Arc<dyn SlowRequestStore>, limit: i64) -> Self {
-        Self { store, limit }
+        Self {
+            store,
+            limit: AtomicI64::new(limit),
+        }
     }
 
     pub fn store(&self) -> &Arc<dyn SlowRequestStore> {
         &self.store
     }
 
-    pub fn limit(&self) -> i64 {
-        self.limit
+    pub fn set_limit(&self, limit: i64) {
+        self.limit.store(limit, Ordering::SeqCst);
     }
 
-    /// `schemaResolver.SlowRequests` (`slow_requests_tracer.go:63`).
+    pub fn limit(&self) -> i64 {
+        self.limit.load(Ordering::SeqCst)
+    }
+
+    /// `ObservabilityCaptureSlowGraphQLRequestsLimit == 0` then
+    /// `auth.CheckCurrentUserIsSiteAdmin` (`slow_requests_tracer.go:63-71`).
     ///
-    /// The baseline's internal actor bypass cannot be represented by
+    /// The baseline's internal-actor bypass cannot be represented by
     /// `sg_graphql::exec::Actor`; the anonymous/non-admin branches match
-    /// `auth.CheckCurrentUserIsSiteAdmin`.
+    /// `auth.CheckCurrentUserIsSiteAdmin` for the external chain.
+    pub fn authorize(&self, actor: Actor, viewer_site_admin: bool) -> Result<(), String> {
+        if self.limit() == 0 {
+            return Err("slow graphql requests capture is not enabled".to_owned());
+        }
+        match actor {
+            Actor::Anonymous => Err("not authenticated".to_owned()),
+            Actor::User { .. } if !viewer_site_admin => Err("must be site admin".to_owned()),
+            Actor::User { .. } => Ok(()),
+        }
+    }
+
+    /// `schemaResolver.SlowRequests` without database resolution (transport
+    /// tests): `user`/`repository` stay `null`.
     pub fn resolve(
         &self,
         actor: Actor,
         viewer_site_admin: bool,
         after: Option<&str>,
     ) -> Result<SlowRequestConnectionObject, String> {
-        if self.limit == 0 {
-            return Err("slow graphql requests capture is not enabled".to_owned());
-        }
-        match actor {
-            Actor::Anonymous => return Err("not authenticated".to_owned()),
-            Actor::User { .. } if !viewer_site_admin => {
-                return Err("must be site admin".to_owned());
-            }
-            Actor::User { .. } => {}
-        }
+        self.authorize(actor, viewer_site_admin)?;
         let after = after.unwrap_or("0");
         Ok(SlowRequestConnectionObject::new(load_connection(
             self.store.as_ref(),
@@ -505,15 +702,123 @@ impl SlowRequestsSurface {
             SLOW_REQUEST_REDIS_FIFO_LIST_PER_PAGE,
         )))
     }
+
+    /// `schemaResolver.SlowRequests` plus the async `user`/`repository`
+    /// lookups (the baseline resolvers call `db.Users().GetByID` and
+    /// `db.Repos().GetByName` lazily; the sync executor replays these
+    /// prefetched rows).
+    pub async fn resolve_prefetch(
+        &self,
+        users: Option<&dyn UserLookupStore>,
+        repositories: Option<&dyn RepositoryLookup>,
+        actor: Actor,
+        viewer_site_admin: bool,
+        after: Option<&str>,
+    ) -> Result<SlowRequestConnectionObject, String> {
+        self.authorize(actor, viewer_site_admin)?;
+        let after = after.unwrap_or("0");
+        let connection = load_connection(
+            self.store.as_ref(),
+            after,
+            SLOW_REQUEST_REDIS_FIFO_LIST_PER_PAGE,
+        );
+        let mut nodes = Vec::with_capacity(connection.nodes.len());
+        for request in &connection.nodes {
+            let user = resolve_user(users, request.user_id).await;
+            let repository = resolve_repository(repositories, &request.variables).await;
+            nodes.push(SlowRequestObject::with_resolved(
+                request.clone(),
+                user,
+                repository,
+                viewer_site_admin,
+            ));
+        }
+        Ok(SlowRequestConnectionObject::with_nodes(connection, nodes))
+    }
+
+    /// `captureSlowRequest` (`graphqlbackend.go:176`): insert when the request
+    /// exceeds the threshold. The store error is a warn in the baseline; the
+    /// caller decides how to log it.
+    pub fn capture(&self, capture: &SlowRequestCapture) -> Result<bool, String> {
+        maybe_capture_slow_request(self.store.as_ref(), capture)
+    }
 }
 
 impl std::fmt::Debug for SlowRequestsSurface {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("SlowRequestsSurface")
-            .field("limit", &self.limit)
+            .field("limit", &self.limit())
             .finish_non_exhaustive()
     }
+}
+
+/// `slowRequestResolver.User` (`slow_requests_tracer.go:182`): `UserID == 0` →
+/// `nil`; otherwise `UserByID`, whose not-found result is an error.
+async fn resolve_user(
+    users: Option<&dyn UserLookupStore>,
+    user_id: i32,
+) -> Option<Result<UserData, String>> {
+    if user_id == 0 {
+        return None;
+    }
+    let store = users?;
+    match store.lookup(&UserKey::DatabaseId(user_id)).await {
+        Ok(Some(data)) => Some(Ok(data)),
+        Ok(None) => Some(Err(format!("user not found: [{user_id}]"))),
+        Err(error) => Some(Err(error)),
+    }
+}
+
+/// `slowRequestResolver.getRepo` (`slow_requests_tracer.go:205`): no guessed
+/// name → `nil`; otherwise `db.Repos().GetByName`, where not-found and blocked
+/// repositories are errors.
+async fn resolve_repository(
+    repositories: Option<&dyn RepositoryLookup>,
+    variables: &serde_json::Map<String, Value>,
+) -> Option<Result<RepositoryData, String>> {
+    let name = guess_repo_name(variables)?;
+    let store = repositories?;
+    match store.lookup(&name, 0, true).await {
+        Ok(RepoLookup::Found(data)) => Some(Ok(data)),
+        Ok(RepoLookup::NotFound) => Some(Err(format!(
+            "repo not found: name={}",
+            crate::search_stream::json::go_quote(&name)
+        ))),
+        Ok(RepoLookup::Blocked { name, reason }) => Some(Err(format!(
+            "repository {name} has been blocked. reason: {reason}"
+        ))),
+        Ok(RepoLookup::Error(error)) => Some(Err(error)),
+        Err(error) => Some(Err(error)),
+    }
+}
+
+/// Prefetch every selected `Query.slowRequests` connection (including its
+/// nodes' `user`/`repository` rows), keyed by the `after` cursor.
+pub async fn prefetch_slow_requests(
+    surface: &SlowRequestsSurface,
+    users: Option<&dyn UserLookupStore>,
+    repositories: Option<&dyn RepositoryLookup>,
+    fields: &[RootField],
+    actor: Actor,
+    viewer_site_admin: bool,
+) -> HashMap<String, Result<Arc<SlowRequestConnectionObject>, String>> {
+    let mut prefetched = HashMap::new();
+    for field in fields {
+        if field.name != "slowRequests" {
+            continue;
+        }
+        let after = field.arguments.string("after").unwrap_or("0").to_owned();
+        if prefetched.contains_key(&after) {
+            continue;
+        }
+        let result = surface
+            .resolve_prefetch(users, repositories, actor, viewer_site_admin, Some(&after))
+            .await
+            .map(Arc::new);
+        prefetched.insert(after, result);
+    }
+    prefetched
 }
 
 #[cfg(test)]
