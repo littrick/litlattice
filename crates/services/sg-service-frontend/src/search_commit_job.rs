@@ -41,6 +41,7 @@ use sg_search_query::basic::Basic;
 use sg_zoekt::indexed_repo_revs::{RepositoryRevisions, RepositoryRevisionsRepo};
 
 use crate::search_job::{JobContext, JobError, Verbosity};
+use crate::search_jobutil_filters::parse_diff_string;
 use crate::search_jobutil_tree::{
     query_to_git_query as tree_query_to_git_query, GitNode, GitOperatorKind,
 };
@@ -459,9 +460,10 @@ pub fn query_node_string(node: &pb::QueryNode) -> String {
 
 /// `protocolMatchToCommitMatch` (`commit.go:322-354`).
 ///
-/// [`convert::CommitMatch`] only models the fields the streaming result model
-/// consumes, so `Parents`, the parsed structured diff, `ModifiedFiles` and
-/// `Refs` are not represented (see the module docs).
+/// The full `result.CommitMatch` shape is modelled: `Parents`, `Refs`,
+/// `SourceRefs`, the parsed structured [`Diff`](convert::CommitMatch::diff) and
+/// `ModifiedFiles` are populated from the protocol match; the streaming event
+/// conversion ignores them, so existing event payloads are unchanged.
 pub fn protocol_match_to_commit_match(
     repo: &MinimalRepo,
     diff: bool,
@@ -473,12 +475,15 @@ pub fn protocol_match_to_commit_match(
         message: message.content.clone(),
         author: signature(protocol_match.author.as_ref()),
         committer: signature(protocol_match.committer.as_ref()),
+        parents: protocol_match.parents.clone(),
     };
 
-    let (message_preview, diff_preview) = if diff {
-        (None, Some(matched_string(protocol_match.diff.as_ref())))
+    let (message_preview, diff_preview, structured_diff) = if diff {
+        let diff_preview = matched_string(protocol_match.diff.as_ref());
+        let structured_diff = parse_diff_string(&diff_preview.content).unwrap_or_default();
+        (None, Some(diff_preview), structured_diff)
     } else {
-        (Some(message), None)
+        (Some(message), None, Vec::new())
     };
 
     CommitMatch {
@@ -486,6 +491,10 @@ pub fn protocol_match_to_commit_match(
         repo: repo.clone(),
         message_preview,
         diff_preview,
+        refs: protocol_match.refs.clone(),
+        source_refs: protocol_match.source_refs.clone(),
+        diff: structured_diff,
+        modified_files: protocol_match.modified_files.clone(),
     }
 }
 

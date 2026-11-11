@@ -306,6 +306,8 @@ pub struct GitCommit {
     pub message: String,
     pub author: Signature,
     pub committer: Signature,
+    /// `gitdomain.Commit.Parents` (`protocol.CommitMatch.Parents`).
+    pub parents: Vec<String>,
 }
 
 /// `result.MatchedString`.
@@ -322,6 +324,14 @@ pub struct CommitMatch {
     pub repo: MinimalRepo,
     pub message_preview: Option<MatchedString>,
     pub diff_preview: Option<MatchedString>,
+    /// `result.CommitMatch.Refs` (`protocol.CommitMatch.Refs`).
+    pub refs: Vec<String>,
+    /// `result.CommitMatch.SourceRefs` (`protocol.CommitMatch.SourceRefs`).
+    pub source_refs: Vec<String>,
+    /// `result.CommitMatch.Diff`: `ParseDiffString(DiffPreview.Content)`.
+    pub diff: Vec<crate::search_jobutil_filters::DiffFile>,
+    /// `result.CommitMatch.ModifiedFiles`.
+    pub modified_files: Vec<String>,
 }
 
 impl CommitMatch {

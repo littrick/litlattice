@@ -199,6 +199,7 @@ fn build(spec: &MatchSpec) -> Match {
                 message: String::new(),
                 author: signature(spec.author_nanos),
                 committer: signature(spec.author_nanos),
+                parents: Vec::new(),
             };
             let message_preview = spec.message_ranges.as_ref().map(|matched| MatchedString {
                 content: String::new(),
@@ -216,6 +217,10 @@ fn build(spec: &MatchSpec) -> Match {
                 },
                 message_preview,
                 diff_preview,
+                refs: Vec::new(),
+                source_refs: Vec::new(),
+                diff: Vec::new(),
+                modified_files: Vec::new(),
             })
         }
         "owner" => {

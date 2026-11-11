@@ -335,6 +335,7 @@ fn commit_matches() -> Vec<CommitMatch> {
             message: "fix: handle <stuff>\n\nBody line\n".to_owned(),
             author: author.clone(),
             committer: committer.clone(),
+            parents: Vec::new(),
         },
         repo: repo(1),
         message_preview: Some(MatchedString {
@@ -342,6 +343,10 @@ fn commit_matches() -> Vec<CommitMatch> {
             matched_ranges: vec![range(5, 1, 5, 6), range(25, 3, 0, 4)],
         }),
         diff_preview: None,
+        refs: Vec::new(),
+        source_refs: Vec::new(),
+        diff: Vec::new(),
+        modified_files: Vec::new(),
     };
     let diff = CommitMatch {
         commit: GitCommit {
@@ -349,6 +354,7 @@ fn commit_matches() -> Vec<CommitMatch> {
             message: "subject only".to_owned(),
             author,
             committer,
+            parents: Vec::new(),
         },
         repo: repo(3),
         message_preview: None,
@@ -356,6 +362,10 @@ fn commit_matches() -> Vec<CommitMatch> {
             content: "@@ -1 +1 @@\n-old\n+new\n".to_owned(),
             matched_ranges: vec![range(12, 2, 0, 3)],
         }),
+        refs: Vec::new(),
+        source_refs: Vec::new(),
+        diff: Vec::new(),
+        modified_files: Vec::new(),
     };
     vec![message, diff]
 }
