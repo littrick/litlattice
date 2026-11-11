@@ -98,6 +98,7 @@ impl GitlabOAuthProvider {
             scopes: self.scopes.clone(),
             redirect_url: self.redirect_url.clone(),
             config_id: self.config_id(),
+            sso_url: self.sso_url.clone(),
         }
     }
 }
@@ -368,11 +369,15 @@ pub struct GitlabGroup {
 pub struct ExternalIdentity {
     pub service_type: String,
     pub service_id: String,
+    /// `extsvc.AccountSpec.ClientID` (`sessionIssuerHelper.clientID`).
+    pub client_id: String,
     pub account_id: String,
     pub login: String,
     pub email: String,
     pub email_verified: bool,
     pub display_name: Option<String>,
+    /// `UserProps.AvatarURL` (`gUser.AvatarURL`).
+    pub avatar_url: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -403,6 +408,8 @@ pub trait Provisioner: Send + Sync {
 
 pub struct GitlabUserResolver {
     service_id: String,
+    /// `sessionIssuerHelper.clientID` (`p.ClientID`).
+    client_id: String,
     allow_signup: Option<bool>,
     allow_groups: Vec<String>,
     /// Host root, from `gitlabClientFromAuthURL` (path cleared).
@@ -424,6 +431,7 @@ impl GitlabUserResolver {
     ) -> Self {
         Self {
             service_id: provider.service_id.clone(),
+            client_id: provider.client_id.clone(),
             allow_signup: provider.allow_signup,
             allow_groups: provider.allow_groups.clone(),
             base_url: provider.base_url(),
@@ -570,11 +578,13 @@ impl OAuthUserResolver for GitlabUserResolver {
         let identity = ExternalIdentity {
             service_type: GITLAB_SERVICE_TYPE.to_owned(),
             service_id: self.service_id.clone(),
+            client_id: self.client_id.clone(),
             account_id: user.id.to_string(),
             login,
             email: user.email.clone(),
             email_verified: !user.email.is_empty(),
             display_name: Some(user.name.clone()),
+            avatar_url: user.avatar_url.clone(),
         };
         let create_if_not_exist = self.allow_signup.unwrap_or(true);
         match self
@@ -602,9 +612,8 @@ impl OAuthUserResolver for GitlabUserResolver {
 // `userpasswd.NormalizeUsername`).
 // ---------------------------------------------------------------------------
 
-/// Ports `NormalizeUsername`. `suspiciousnames` only applies on Sourcegraph.com
-/// and is left to the production wiring; the differential harness runs with
-/// `sourcegraph_dotcom == false`.
+/// Ports `NormalizeUsername`. On Sourcegraph.com the normalized name is also
+/// checked against `suspiciousnames` (`user_provisioning::is_suspicious_name`).
 pub fn normalize_username(name: &str, sourcegraph_dotcom: bool) -> Result<String, String> {
     let orig = name;
     let mut name = name.to_owned();
@@ -658,6 +667,9 @@ pub fn normalize_username(name: &str, sourcegraph_dotcom: bool) -> Result<String
             "username {} could not be normalized to acceptable format",
             go_quote(orig)
         ));
+    }
+    if sourcegraph_dotcom && crate::user_provisioning::is_suspicious_name(&trimmed) {
+        return Err(format!("rejected suspicious name {}", go_quote(&trimmed)));
     }
     Ok(trimmed)
 }

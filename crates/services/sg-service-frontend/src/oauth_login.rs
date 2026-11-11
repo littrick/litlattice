@@ -58,6 +58,10 @@ pub struct OAuthProviderConfig {
     /// `providers.ConfigID.ID` (usually `ServiceID::ClientID`; OIDC may use an
     /// explicit/hashed config ID).
     pub config_id: String,
+    /// `gitlaboauth`'s `ssoURL`; empty for every other service type. When set,
+    /// the provider's login handler rewrites the redirect to the SSO URL
+    /// (`SSOLoginHandler`).
+    pub sso_url: String,
 }
 
 impl OAuthProviderConfig {
@@ -179,6 +183,7 @@ impl OAuthProviders {
                         // `oauth2.Config.RedirectURL` (unlike GitLab), so
                         // `AuthCodeURL` has no `redirect_uri` parameter.
                         redirect_url: String::new(),
+                        sso_url: String::new(),
                     });
                 }
                 "gitlab" => {
@@ -211,6 +216,7 @@ impl OAuthProviders {
                         token_url: format!("{base}/oauth/token"),
                         scopes,
                         redirect_url: oauth_callback_url(external_url, service_type),
+                        sso_url: string_field(obj, "ssoURL"),
                     });
                 }
                 "openidconnect" => {
@@ -238,6 +244,7 @@ impl OAuthProviders {
                             "email".to_owned(),
                         ],
                         redirect_url: oauth_callback_url(external_url, service_type),
+                        sso_url: String::new(),
                     });
                 }
                 _ => {}
@@ -666,26 +673,54 @@ pub fn could_not_initiate_session_message() -> &'static str {
     ERR_GET_USER
 }
 
-/// `newOAuthFlowHandler`'s `/login` branch + the provider's `stateHandler` +
-/// `gologin.LoginHandler`.
-pub async fn handle_login(
-    deps: &OAuthFlowDeps<'_>,
+/// The provider-selection step shared by [`handle_login`] and the GitLab SSO
+/// branch in [`crate::oauth_routes`].
+pub enum LoginProviderSelection<'a> {
+    /// A configured provider matched and the post-login redirect was resolved.
+    Matched {
+        provider: &'a OAuthProviderConfig,
+        redirect: String,
+    },
+    /// The baseline response to return as-is (`/sign-in?returnTo=…` or the
+    /// `Referer` parse error).
+    Response(OAuthFlowResponse),
+}
+
+/// `newOAuthFlowHandler`'s `/login` provider lookup (`pc`) and the provider
+/// `stateHandler`'s [`get_redirect`]; no state/cookie is written here.
+pub fn select_login_provider<'a>(
+    deps: &'a OAuthFlowDeps<'_>,
     request: &OAuthLoginRequest<'_>,
-) -> OAuthFlowResponse {
+) -> LoginProviderSelection<'a> {
     let id = query_get(request.query, "pc");
     let Some(provider) = deps.providers.find(request.service_type, &id) else {
         let mut redirect = query_get(request.query, "redirect");
         if redirect.is_empty() {
             redirect = query_get(request.query, "returnTo");
         }
-        return redirect_response(&format!("/sign-in?returnTo={redirect}"));
+        return LoginProviderSelection::Response(redirect_response(&format!(
+            "/sign-in?returnTo={redirect}"
+        )));
+    };
+    let redirect = match get_redirect(request, deps.external_url) {
+        Ok(redirect) => redirect,
+        Err(()) => return LoginProviderSelection::Response(error_response(500, ERR_REFERER)),
+    };
+    LoginProviderSelection::Matched { provider, redirect }
+}
+
+/// `newOAuthFlowHandler`'s `/login` branch + the provider's `stateHandler` +
+/// `gologin.LoginHandler`.
+pub async fn handle_login(
+    deps: &OAuthFlowDeps<'_>,
+    request: &OAuthLoginRequest<'_>,
+) -> OAuthFlowResponse {
+    let (provider, redirect) = match select_login_provider(deps, request) {
+        LoginProviderSelection::Matched { provider, redirect } => (provider, redirect),
+        LoginProviderSelection::Response(response) => return response,
     };
 
     let csrf = deps.state_source.generate();
-    let redirect = match get_redirect(request, deps.external_url) {
-        Ok(redirect) => redirect,
-        Err(()) => return error_response(500, ERR_REFERER),
-    };
     let state = LoginState {
         redirect,
         provider_id: provider.config_id(),
@@ -1484,6 +1519,7 @@ mod tests {
             ],
             redirect_url: "https://sourcegraph.example/.auth/fakeoauth/callback".to_owned(),
             config_id: "https://idp.example/::cid-123".to_owned(),
+            sso_url: String::new(),
         };
         assert_eq!(
             provider.auth_code_url("abc"),
