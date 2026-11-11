@@ -40,12 +40,12 @@ use sg_proto::gitserver as pb;
 use sg_zoekt::indexed_repo_revs::MinimalRepo;
 
 use crate::search_commit_job::{searcher_error_from_git, CommitUserDB, CommitUserEmail};
-use crate::search_env::{IndexedError, IndexedJobStreamer};
+use crate::search_env::{IndexedError, IndexedJobStreamer, SearcherGrpcConnectionCache};
 use crate::search_job::{JobError, PrivateRepoLister, ReposListOptions};
 use crate::search_searcher_client::{
-    default_searcher_client, run_to_completion, SearcherClient, SearcherClients, SearcherError,
-    SearcherGitserver, SearcherLimiter, SymbolsClient, SymbolsParameters, SymbolsResponse,
-    NOT_PORTED_MESSAGE,
+    default_searcher_client, grpc_client_from_endpoints, run_to_completion, SearcherClient,
+    SearcherClients, SearcherError, SearcherGitserver, SearcherLimiter, SymbolsClient,
+    SymbolsParameters, SymbolsResponse, NOT_PORTED_MESSAGE,
 };
 use crate::search_stream::TreeRuntimeClients;
 use crate::symbols_client::default_symbols_client;
@@ -78,6 +78,11 @@ pub struct SearcherRuntimeClients {
     pub limiter: Arc<dyn SearcherLimiter + Send + Sync>,
     pub gitserver: Arc<dyn SearcherGitserver + Send + Sync>,
     pub symbols: Arc<dyn SymbolsClient + Send + Sync>,
+    /// `job.RuntimeClients.SearcherGRPCConnectionCache`: the process-wide
+    /// searcher connection cache shared by the searcher client (and, in the
+    /// baseline, the repos resolver/alert/filter paths). The symbols client
+    /// owns a separate `symbolsConnectionCache` instance.
+    pub searcher_connection_cache: Arc<SearcherGrpcConnectionCache>,
 }
 
 impl SearcherRuntimeClients {
@@ -156,18 +161,32 @@ pub fn assemble(
     let searcher = if connections.searchers.is_empty() {
         None
     } else {
+        // The process-wide cache (`search.SearcherGRPCConnectionCache()`);
+        // stored on the bundle so later job-tree paths (repos resolver, alert
+        // observer, filter-file-contains) can share it like the baseline
+        // `job.RuntimeClients`.
+        let searcher_connection_cache = Arc::new(SearcherGrpcConnectionCache::new());
+        let searcher_client: Arc<dyn SearcherClient + Send + Sync> =
+            match grpc_client_from_endpoints(connections.searchers.clone()) {
+                Some(client) => {
+                    Arc::new(client.with_connection_cache(Arc::clone(&searcher_connection_cache)))
+                }
+                None => Arc::from(default_searcher_client(Vec::new())),
+            };
         Some(Arc::new(SearcherRuntimeClients {
-            client: Arc::from(default_searcher_client(connections.searchers.clone())),
+            client: searcher_client,
             limiter: Arc::new(NoopSearcherLimiter),
             gitserver: Arc::new(GitSearcherGitserver {
                 client: Arc::clone(&gitserver),
             }),
             // Production symbols gRPC client when endpoints are configured;
-            // otherwise the explicit not-ported error is unchanged.
+            // otherwise the explicit not-ported error is unchanged. The client
+            // creates its own cache instance (`symbolsConnectionCache`).
             symbols: match default_symbols_client(connections.symbols.clone()) {
                 Some(client) => Arc::from(client),
                 None => Arc::new(NotPortedSymbols),
             },
+            searcher_connection_cache,
         }))
     };
 
@@ -605,6 +624,7 @@ mod tests {
                     client: Arc::new(GitClient::new(Vec::new())),
                 }),
                 symbols: Arc::new(NotPortedSymbols),
+                searcher_connection_cache: Arc::new(SearcherGrpcConnectionCache::new()),
             })),
             commit: None,
         };

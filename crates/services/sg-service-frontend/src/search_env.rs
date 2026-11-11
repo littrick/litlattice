@@ -8,7 +8,8 @@
 //! * [`SearcherUrls`] — `SearcherURLs()`, a conf-based consistent-hash endpoint
 //!   map over `ServiceConnections.Searchers`;
 //! * [`SearcherGrpcConnectionCache`] — `SearcherGRPCConnectionCache()`, a
-//!   TTL-cached set of lazy gRPC clients;
+//!   TTL-cached set of lazy tonic channels keyed by endpoint (the baseline
+//!   caches `grpc.ClientConn`), with an adapter for the pre-M9.8iw zoekt use;
 //! * [`compose_indexed`] / [`IndexedJobStreamer`]: `Indexed()`,
 //!   `cachedSearcher(ttl) → meteredSearcher("") → HorizontalSearcher` over the
 //!   conf-based zoekt endpoints with a cached per-endpoint dialer
@@ -34,6 +35,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -50,9 +52,10 @@ use sg_zoekt::types::{
     ListOptions, ListResponse, MinimalRepoListEntry, RepoListField, SearchChunk, SearchOptions,
     SearchResult,
 };
+use tonic::transport::Channel;
 
 use crate::search_job::{JobError, JobStreamer};
-use crate::search_searcher_client::{rendezvous_order, run_to_completion};
+use crate::search_searcher_client::{rendezvous_order, run_to_completion, SearcherError};
 
 /// `grpc.DefaultConnectionCache`'s TTL (10 minutes of inactivity).
 pub const GRPC_CONNECTION_CACHE_TTL: Duration = Duration::from_secs(10 * 60);
@@ -205,68 +208,116 @@ impl SearcherUrls {
 
 // ------------------------------------------------------- searcher connection cache
 
-/// One cached connection: the lazy client (or its dial error) and the last
-/// access instant (the baseline `ttlcache` expires on inactivity).
+/// One cached connection: the lazy tonic channel (or its parse error) and the
+/// last access instant (the baseline `ttlcache` expires on inactivity).
 struct CachedConnection {
-    client: Result<ZoektClient, ZoektError>,
+    channel: Result<Channel, SearcherError>,
     last_used: Instant,
 }
 
-/// `grpc.DefaultConnectionCache`, reduced to the zoekt client this crate uses.
+/// `grpc.DefaultConnectionCache` (`internal/grpc/defaults/cache.go`).
 ///
-/// The baseline caches `grpc.ClientConn`; the Rust searcher client is built
-/// from `SearcherConnector` instead, so this cache stores lazy zoekt clients
-/// parsed from the same addresses. Parsing/dial errors are cached alongside the
-/// client, matching `connAndError`.
-pub struct SearcherGrpcConnectionCache<C: Clock = SystemClock> {
+/// The baseline caches a lazy `grpc.ClientConn` per address and also caches
+/// address-parsing/dial errors (`connAndError`). The Rust port caches a lazy
+/// tonic [`Channel`] plus its `SearcherError` using the same semantics: hits
+/// refresh the inactivity deadline and are shared by every caller of the same
+/// cache instance.
+///
+/// Baseline caveat: Go expires entries from a background reaper (every minute,
+/// 10 minute TTL), so an already-expired but not-yet-reaped entry is still
+/// returned by `Get` and refreshes its deadline. This port has no background
+/// reaper and expires lazily on access (`now - last_used >= ttl`), which makes
+/// the TTL testable with an injected clock; the only observable difference is
+/// a connection idle for `[10m, 11m)` may be re-dialed instead of reused.
+pub struct GrpcConnectionCache<C: Clock = SystemClock> {
     ttl: Duration,
     clock: C,
+    created: AtomicUsize,
     connections: Mutex<HashMap<String, CachedConnection>>,
 }
 
-impl SearcherGrpcConnectionCache<SystemClock> {
+/// The baseline singleton name used by the searcher path
+/// (`search.SearcherGRPCConnectionCache()`).
+pub type SearcherGrpcConnectionCache<C = SystemClock> = GrpcConnectionCache<C>;
+
+impl GrpcConnectionCache<SystemClock> {
     /// `NewConnectionCache`: 10 minute inactivity TTL.
     pub fn new() -> Self {
         Self::with_clock_and_ttl(GRPC_CONNECTION_CACHE_TTL, SystemClock)
     }
 }
 
-impl Default for SearcherGrpcConnectionCache<SystemClock> {
+impl Default for GrpcConnectionCache<SystemClock> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<C: Clock> SearcherGrpcConnectionCache<C> {
+impl<C: Clock> GrpcConnectionCache<C> {
     pub fn with_clock_and_ttl(ttl: Duration, clock: C) -> Self {
         Self {
             ttl,
             clock,
+            created: AtomicUsize::new(0),
             connections: Mutex::new(HashMap::new()),
         }
     }
 
-    /// `ConnectionCache.GetConnection`: dial (lazily) on a miss and cache the
-    /// result. A hit refreshes the inactivity deadline.
-    pub fn client(&self, endpoint: &str) -> Result<ZoektClient, ZoektError> {
+    /// `ConnectionCache.GetConnection`: build (lazily) on a miss and cache the
+    /// result. A hit refreshes the inactivity deadline. Parse/dial errors are
+    /// cached exactly like successful channels.
+    pub fn channel(&self, endpoint: &str) -> Result<Channel, SearcherError> {
+        self.channel_with_creation(endpoint).0
+    }
+
+    /// [`Self::channel`] plus whether this call constructed a new channel
+    /// (a cache miss that parsed). Hits and cached errors return `false`.
+    /// Differential harnesses use this to attribute creations per endpoint
+    /// without racing on the aggregate counter.
+    pub fn channel_with_creation(&self, endpoint: &str) -> (Result<Channel, SearcherError>, bool) {
         let now = self.clock.now();
         let mut connections = lock(&self.connections);
         if let Some(connection) = connections.get_mut(endpoint) {
             if now.saturating_duration_since(connection.last_used) < self.ttl {
                 connection.last_used = now;
-                return connection.client.clone();
+                return (connection.channel.clone(), false);
             }
         }
 
-        let client = ZoektClient::connect_lazy(endpoint);
+        let channel = build_channel(endpoint);
+        let created = channel.is_ok();
+        if created {
+            self.created.fetch_add(1, Ordering::SeqCst);
+        }
         connections.insert(
             endpoint.to_owned(),
             CachedConnection {
-                client: client.clone(),
+                channel: channel.clone(),
                 last_used: now,
             },
         );
-        client
+        (channel, created)
+    }
+
+    /// Adapter preserving the pre-M9.8iw zoekt use: the same channel cache
+    /// wrapped in a lazy zoekt client (`ZoektClient::new`).
+    pub fn zoekt_client(&self, endpoint: &str) -> Result<ZoektClient, ZoektError> {
+        match self.channel(endpoint) {
+            Ok(channel) => Ok(ZoektClient::new(channel)),
+            Err(error) => Err(ZoektError::InvalidEndpoint(error.message)),
+        }
+    }
+
+    /// Backwards-compatible zoekt accessor (`zoekt_client`).
+    pub fn client(&self, endpoint: &str) -> Result<ZoektClient, ZoektError> {
+        self.zoekt_client(endpoint)
+    }
+
+    /// Number of successful channel constructions (cache misses that parsed).
+    /// Observation aid for differential tests; the baseline analogue is the
+    /// number of distinct `grpc.ClientConn`s dialed.
+    pub fn channel_creations(&self) -> usize {
+        self.created.load(Ordering::SeqCst)
     }
 
     /// Number of cached addresses (observation aid).
@@ -276,6 +327,33 @@ impl<C: Clock> SearcherGrpcConnectionCache<C> {
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+}
+
+/// Build a lazily-connected cleartext channel. The baseline parses the address
+/// and dials `u.Host` with `insecure.NewCredentials()` (`defaults.Dial`), so a
+/// bare `host:port` gets an `http://` scheme and an explicit `https://` scheme
+/// is still transported in cleartext.
+fn build_channel(endpoint: &str) -> Result<Channel, SearcherError> {
+    let uri = if endpoint.contains("://") {
+        endpoint.to_owned()
+    } else {
+        format!("http://{endpoint}")
+    };
+    Channel::from_shared(uri)
+        .map(|endpoint| endpoint.connect_lazy())
+        .map_err(|error| SearcherError::other(format!("failed to parse URL: {error}")))
+}
+
+/// A cache-like source of tonic channels. Connectors depend on this trait so
+/// tests can inject a counting source without changing the transport wiring.
+pub trait GrpcChannelSource: Send + Sync {
+    fn channel(&self, endpoint: &str) -> Result<Channel, SearcherError>;
+}
+
+impl<C: Clock> GrpcChannelSource for GrpcConnectionCache<C> {
+    fn channel(&self, endpoint: &str) -> Result<Channel, SearcherError> {
+        GrpcConnectionCache::channel(self, endpoint)
     }
 }
 
@@ -767,7 +845,19 @@ mod tests {
         assert_eq!(urls.get("repo@rev").unwrap(), "http://a:1");
     }
 
-    struct TestClock(Mutex<Instant>);
+    #[derive(Clone)]
+    struct TestClock(std::sync::Arc<Mutex<Instant>>);
+
+    impl TestClock {
+        fn new(now: Instant) -> Self {
+            Self(std::sync::Arc::new(Mutex::new(now)))
+        }
+
+        fn advance(&self, duration: Duration) {
+            let mut now = self.0.lock().unwrap();
+            *now += duration;
+        }
+    }
 
     impl Clock for TestClock {
         fn now(&self) -> Instant {
@@ -776,15 +866,59 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn connection_cache_reuses_and_expires_entries() {
-        let clock = TestClock(Mutex::new(Instant::now()));
+    async fn connection_cache_reuses_entries_and_caches_errors() {
+        let clock = TestClock::new(Instant::now());
         let cache = SearcherGrpcConnectionCache::with_clock_and_ttl(Duration::from_secs(10), clock);
-        assert!(cache.client("127.0.0.1:1").is_ok());
+        assert!(cache.channel("127.0.0.1:1").is_ok());
+        assert_eq!(cache.channel_creations(), 1);
         assert_eq!(cache.len(), 1);
-        assert!(cache.client("127.0.0.1:1").is_ok());
+        assert!(cache.channel("127.0.0.1:1").is_ok());
+        assert_eq!(cache.channel_creations(), 1);
         assert_eq!(cache.len(), 1);
-        assert!(cache.client("bad endpoint").is_err());
+        // Parse errors are cached alongside channels but never dial.
+        assert!(cache.channel("bad endpoint").is_err());
+        assert!(cache.channel("bad endpoint").is_err());
+        assert_eq!(cache.channel_creations(), 1);
         assert_eq!(cache.len(), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn connection_cache_expires_after_the_idle_ttl() {
+        let start = Instant::now();
+        let clock = TestClock::new(start);
+        let cache =
+            SearcherGrpcConnectionCache::with_clock_and_ttl(Duration::from_secs(10), clock.clone());
+        assert!(cache.channel("127.0.0.1:1").is_ok());
+        assert_eq!(cache.channel_creations(), 1);
+
+        clock.advance(Duration::from_secs(9));
+        assert!(cache.channel("127.0.0.1:1").is_ok());
+        assert_eq!(
+            cache.channel_creations(),
+            1,
+            "an access refreshes the deadline"
+        );
+
+        clock.advance(Duration::from_secs(10));
+        assert!(cache.channel("127.0.0.1:1").is_ok());
+        assert_eq!(
+            cache.channel_creations(),
+            2,
+            "idle for the whole TTL re-dials"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn zoekt_adapter_reuses_the_channel_cache() {
+        let cache = SearcherGrpcConnectionCache::new();
+        assert!(cache.client("127.0.0.1:1").is_ok());
+        assert!(cache.client("127.0.0.1:1").is_ok());
+        assert_eq!(cache.channel_creations(), 1);
+        assert!(cache
+            .client("bad endpoint")
+            .unwrap_err()
+            .to_string()
+            .starts_with("failed to parse URL"));
     }
 
     #[test]

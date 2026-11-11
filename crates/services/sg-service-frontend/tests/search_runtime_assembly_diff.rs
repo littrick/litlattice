@@ -1292,6 +1292,9 @@ fn run_case(case: &Case) -> Value {
             limiter: Arc::new(FakeSearcher),
             gitserver: Arc::new(FakeSearcher),
             symbols: Arc::new(FakeSearcher),
+            searcher_connection_cache: Arc::new(
+                sg_service_frontend::search_env::SearcherGrpcConnectionCache::new(),
+            ),
         })),
         commit: Some(Arc::new(CommitRuntimeClientsOwned {
             db: db.clone(),

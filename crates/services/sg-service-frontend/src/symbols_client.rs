@@ -23,8 +23,10 @@ use std::time::{Duration, Instant};
 
 use prost_types::Duration as ProtoDuration;
 use sg_proto::symbols as pb;
+use sg_zoekt::cached::Clock;
 use tonic::transport::Channel;
 
+use crate::search_env::{GrpcChannelSource, GrpcConnectionCache, SearcherGrpcConnectionCache};
 use crate::search_searcher_client::{
     classify_status, rendezvous_order, run_to_completion, RetryConfig, SearcherError,
     SearcherErrorKind, SymbolsClient, SymbolsParameters, SymbolsResponse,
@@ -97,6 +99,35 @@ impl SymbolsConnector for ChannelConnector {
     }
 }
 
+/// Production symbols connector: fetch the lazy channel from the symbols
+/// client's own [`GrpcConnectionCache`] instance.
+///
+/// Unlike the searcher (keyed by `url.Host`), the baseline symbols client keys
+/// the cache by the full `Endpoints.Get(repo)` address string, so this passes
+/// `endpoint` through unchanged. The symbols cache is a separate instance from
+/// the searcher's (`symbolsConnectionCache` vs `searcherGRPCConnectionCache`).
+pub struct CachedSymbolsConnector {
+    source: Arc<dyn GrpcChannelSource>,
+}
+
+impl CachedSymbolsConnector {
+    pub fn new(source: Arc<dyn GrpcChannelSource>) -> Self {
+        Self { source }
+    }
+}
+
+impl SymbolsConnector for CachedSymbolsConnector {
+    fn connect(
+        &self,
+        endpoint: &str,
+    ) -> Result<pb::symbols_service_client::SymbolsServiceClient<Channel>, SearcherError> {
+        let channel = self.source.channel(endpoint)?;
+        Ok(pb::symbols_service_client::SymbolsServiceClient::new(
+            channel,
+        ))
+    }
+}
+
 /// Real gRPC transport for [`SymbolsClient`] (`internal/symbols/client.go`).
 pub struct GrpcSymbolsClient {
     endpoints: Vec<String>,
@@ -116,12 +147,22 @@ impl std::fmt::Debug for GrpcSymbolsClient {
 
 impl GrpcSymbolsClient {
     pub fn new(endpoints: Vec<String>) -> Self {
+        // `symbols.LoadConfig` creates its own `symbolsConnectionCache`
+        // instance; it is intentionally not shared with the searcher cache.
+        let cache = Arc::new(SearcherGrpcConnectionCache::new());
         Self {
             endpoints,
-            connector: Arc::new(ChannelConnector),
+            connector: Arc::new(CachedSymbolsConnector::new(cache)),
             retry: RetryConfig::from_env(),
             sub_repo_perms: Arc::new(NoSubRepoPerms),
         }
+    }
+
+    /// Inject the symbols connection cache (a distinct instance from the
+    /// searcher's; useful for tests and for wiring an externally owned cache).
+    pub fn with_connection_cache<C: Clock>(mut self, cache: Arc<GrpcConnectionCache<C>>) -> Self {
+        self.connector = Arc::new(CachedSymbolsConnector::new(cache));
+        self
     }
 
     /// Inject a test connector (in-process fake gRPC servers).
