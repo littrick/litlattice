@@ -240,3 +240,172 @@ fn into_http_response(response: SamlHttpResponse) -> Response<BoxBody> {
             fallback
         })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use async_trait::async_trait;
+
+    use crate::saml_auth::{
+        SamlHttpClient, SamlMetadataResponse, SamlNewUser, SamlUser,
+    };
+    use crate::user_provisioning::{OsUsernameSuffix, ProvisionError, ProvisionOutcome};
+
+    struct NoStore;
+
+    #[async_trait]
+    impl SessionStore for NoStore {
+        async fn load(&self, _id: &str) -> Result<Option<Vec<u8>>, sg_session::SessionStoreError> {
+            Ok(None)
+        }
+    }
+
+    struct NoLicense;
+
+    #[async_trait]
+    impl LicenseReader for NoLicense {
+        async fn product_license(&self) -> LicenseState {
+            LicenseState::Valid
+        }
+    }
+
+    struct NoProvisioner;
+
+    #[async_trait]
+    impl SamlProvisioner for NoProvisioner {
+        async fn get_or_create_user(
+            &self,
+            _user: &SamlNewUser<'_>,
+        ) -> Result<ProvisionOutcome, ProvisionError> {
+            panic!("the wiring tests never provision users");
+        }
+    }
+
+    struct NoUsers;
+
+    #[async_trait]
+    impl SamlUserStore for NoUsers {
+        async fn get_by_id(&self, _id: i32) -> Result<Option<SamlUser>, String> {
+            Ok(None)
+        }
+    }
+
+    struct NoHttp;
+
+    #[async_trait]
+    impl SamlHttpClient for NoHttp {
+        async fn fetch(&self, _url: &str) -> Result<SamlMetadataResponse, String> {
+            Err("the wiring tests never fetch IdP metadata".to_owned())
+        }
+    }
+
+    fn deps(site: &str) -> SamlRouteDeps {
+        let unified = sg_config::Unified::parse(&sg_config::RawUnified {
+            site: site.to_owned(),
+            ..sg_config::RawUnified::default()
+        })
+        .expect("site configuration");
+        let site = &unified.site;
+        let deps = SamlRouteDeps {
+            providers: SamlProviderSet::from_site(site, Arc::new(NoHttp)),
+            sign_in_without_soap: crate::saml_auth::sign_in_providers_from_site(site, true),
+            sign_in_with_soap: crate::saml_auth::sign_in_providers_from_site(site, false),
+            auth_public: false,
+            external_url: "https://sourcegraph.example.com".to_owned(),
+            store: Arc::new(NoStore),
+            ids: Arc::new(sg_session::OsSessionIdSource),
+            cookie_key: Vec::new(),
+            secure: true,
+            configured_expiry: None,
+            license: Arc::new(NoLicense),
+            provisioner: Arc::new(NoProvisioner),
+            users: Arc::new(NoUsers),
+            suffix: Arc::new(OsUsernameSuffix),
+            sourcegraph_dotcom: false,
+        };
+        deps
+    }
+
+    fn get(uri: &str) -> Request<Full<Bytes>> {
+        Request::get(uri)
+            .body(Full::new(Bytes::new()))
+            .expect("request")
+    }
+
+    async fn body_text(response: Response<BoxBody>) -> (StatusCode, String) {
+        let status = response.status();
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
+        (status, String::from_utf8_lossy(&body).into_owned())
+    }
+
+    #[tokio::test]
+    async fn endpoints_are_served_without_providers() {
+        let deps = deps("{}");
+        let mut req = get("/.auth/saml/metadata");
+        let response = saml_route_response(&deps, &mut req, false, false)
+            .await
+            .expect("the endpoint is handled");
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "text/plain; charset=utf-8"
+        );
+        // `http.Error` sets nosniff.
+        assert_eq!(
+            response.headers().get("x-content-type-options").unwrap(),
+            "nosniff"
+        );
+        let (status, body) = body_text(response).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body, "Misconfigured SAML auth provider\n");
+    }
+
+    #[tokio::test]
+    async fn endpoints_ignore_the_actor() {
+        let deps = deps("{}");
+        let mut req = get("/.auth/saml/metadata");
+        let response = saml_route_response(&deps, &mut req, true, false)
+            .await
+            .expect("endpoints run before the actor is consulted");
+        assert_eq!(body_text(response).await.0, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
+    async fn acs_consumes_the_form_body() {
+        let deps = deps("{}");
+        let mut req = Request::post("/.auth/saml/acs")
+            .header(
+                header::CONTENT_TYPE,
+                "application/x-www-form-urlencoded",
+            )
+            .body(Full::new(Bytes::from("RelayState=x&SAMLResponse=y")))
+            .expect("request");
+        let response = saml_route_response(&deps, &mut req, false, false)
+            .await
+            .expect("the ACS endpoint is handled");
+        assert_eq!(body_text(response).await.0, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
+    async fn non_endpoint_requests_are_left_to_the_chain() {
+        let deps = deps("{}");
+        let mut req = get("/");
+        assert!(saml_route_response(&deps, &mut req, false, false)
+            .await
+            .is_none());
+        // Unauthenticated, but the single sign-in provider is `builtin`, not
+        // SAML: no redirect.
+        assert!(saml_route_response(&deps, &mut req, false, true)
+            .await
+            .is_none());
+        // Authenticated requests short-circuit before the license read.
+        assert!(saml_route_response(&deps, &mut req, true, true)
+            .await
+            .is_none());
+    }
+}
