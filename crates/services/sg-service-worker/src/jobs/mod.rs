@@ -37,6 +37,7 @@ use crate::registry;
 
 pub mod adminanalytics;
 pub mod auth_sourcegraph_operator_cleaner;
+pub mod autoindex_config;
 pub mod authz_azuredevops;
 pub mod authz_azuredevops_client;
 pub mod authz_bitbucketcloud;
@@ -49,7 +50,6 @@ pub mod authz_github_user;
 pub mod authz_gitlab;
 pub mod authz_gitlab_client;
 pub mod authz_providers;
-pub mod autoindex_config;
 pub mod batches;
 pub mod batches_scheduler;
 pub mod bitbucket_project_permissions;
@@ -71,6 +71,8 @@ pub mod codeintel_autoindexing_package_inference;
 pub mod codeintel_autoindexing_path_patterns;
 pub mod codeintel_autoindexing_scheduler;
 pub mod codeintel_dependency_jobs;
+pub mod codeintel_autoindexing_summary_builder;
+pub mod codeintel_commitgraph_updater;
 pub mod codeintel_metrics_reporter;
 pub mod codeintel_package_filter_applicator;
 pub mod codeintel_policies_repository_matcher;
@@ -245,6 +247,18 @@ pub fn all_jobs() -> Vec<(&'static str, Arc<dyn Job>)> {
                 "codehost-version-syncing" => {
                     Arc::new(codehost_version_syncing::CodehostVersionSyncing::new())
                 }
+                "codeintel-autoindexing-dependency-scheduler" => Arc::new(
+                    codeintel_autoindexing_dependency_scheduler::AutoindexingDependencyScheduler::new(),
+                ),
+                "codeintel-autoindexing-scheduler" => {
+                    Arc::new(codeintel_autoindexing_scheduler::AutoindexingScheduler::new())
+                }
+                "codeintel-autoindexing-summary-builder" => Arc::new(
+                    codeintel_autoindexing_summary_builder::AutoIndexingSummaryBuilder::new(),
+                ),
+                "codeintel-commitgraph-updater" => {
+                    Arc::new(codeintel_commitgraph_updater::CommitGraphUpdater::new())
+                }
                 "codeintel-metrics-reporter" => {
                     Arc::new(codeintel_metrics_reporter::CodeIntelMetricsReporter::new())
                 }
@@ -254,12 +268,6 @@ pub fn all_jobs() -> Vec<(&'static str, Arc<dyn Job>)> {
                 "codeintel-policies-repository-matcher" => Arc::new(
                     codeintel_policies_repository_matcher::PoliciesRepositoryMatcher::new(),
                 ),
-                "codeintel-autoindexing-dependency-scheduler" => Arc::new(
-                    codeintel_autoindexing_dependency_scheduler::AutoindexingDependencyScheduler::new(),
-                ),
-                "codeintel-autoindexing-scheduler" => {
-                    Arc::new(codeintel_autoindexing_scheduler::AutoindexingScheduler::new())
-                }
                 "codeintel-ranking-file-reference-counter" => Arc::new(
                     codeintel_ranking_file_reference_counter::RankingFileReferenceCounter::new(),
                 ),
@@ -304,10 +312,10 @@ pub fn all_jobs() -> Vec<(&'static str, Arc<dyn Job>)> {
                     Arc::new(perforce_changelist_mapper::PerforceChangelistMappingJob::new())
                 }
                 "permission-sync-job-cleaner" => Arc::new(permissions::PermissionSyncJobCleaner),
-                "repo-perms-syncer" => Arc::new(perms_syncer_job::PermsSyncerJob::new()),
                 "permission-sync-job-scheduler" => {
                     Arc::new(permissions::PermissionSyncJobScheduler)
                 }
+                "repo-perms-syncer" => Arc::new(perms_syncer_job::PermsSyncerJob::new()),
                 "rate-limit-config" => Arc::new(ratelimit::RateLimitConfigJob::new()),
                 "refresh-analytics-cache" => Arc::new(adminanalytics::RefreshAnalyticsCacheJob),
                 "repo-embedding-janitor" => {

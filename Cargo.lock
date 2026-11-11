@@ -3826,7 +3826,10 @@ version = "0.1.0"
 name = "sg-bin-frontend"
 version = "0.1.0"
 dependencies = [
+ "sg-core",
+ "sg-log",
  "sg-service-frontend",
+ "tokio",
 ]
 
 [[package]]
@@ -3908,6 +3911,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "sg-codeintel-ranking"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "sg-config",
+ "sg-cronexpr",
+ "sg-db",
+ "sqlx",
+ "time",
+ "tokio",
+]
+
+[[package]]
 name = "sg-config"
 version = "0.1.0"
 dependencies = [
@@ -3936,12 +3952,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "sg-cronexpr"
+version = "0.1.0"
+dependencies = [
+ "regex",
+ "serde",
+ "serde_json",
+ "time",
+]
+
+[[package]]
 name = "sg-db"
 version = "0.1.0"
 dependencies = [
  "async-trait",
  "serde",
  "serde_json",
+ "sg-codeintel",
  "sqlx",
  "thiserror 1.0.69",
  "time",
@@ -4152,8 +4179,10 @@ dependencies = [
 name = "sg-scip"
 version = "0.1.0"
 dependencies = [
+ "md5",
  "prost 0.13.5",
  "prost-build",
+ "serde_json",
 ]
 
 [[package]]
@@ -4164,7 +4193,27 @@ version = "0.1.0"
 name = "sg-service-frontend"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
+ "bytes",
+ "http 1.5.0",
+ "http-body-util",
+ "hyper 1.12.0",
+ "prost-types 0.13.5",
+ "regex",
+ "serde_json",
+ "sg-config",
  "sg-core",
+ "sg-db",
+ "sg-git",
+ "sg-http",
+ "sg-metrics",
+ "sg-proto",
+ "sqlx",
+ "tokio",
+ "tokio-util",
+ "tonic 0.12.3",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -4348,13 +4397,16 @@ dependencies = [
  "hyper 1.12.0",
  "prost 0.13.5",
  "prost-types 0.13.5",
+ "regex",
  "reqwest",
  "rsa",
  "serde",
  "serde_json",
  "sg-codeintel",
+ "sg-codeintel-ranking",
  "sg-config",
  "sg-core",
+ "sg-cronexpr",
  "sg-db",
  "sg-encryption",
  "sg-extsvc",
@@ -4370,6 +4422,7 @@ dependencies = [
  "sg-proto",
  "sg-rcache",
  "sg-redis",
+ "sg-scip",
  "sg-txemail",
  "sg-zoekt",
  "sha2 0.10.9",
