@@ -428,6 +428,10 @@ pub struct SchemaGraphqlDeps {
     /// (M9.8ix). `None` reproduces the pre-wiring frontend: those fields
     /// resolve as unported (`null`/error).
     git_objects: Option<Arc<dyn crate::git_graphql::GitObjectSource>>,
+    /// `symbol.DefaultZoektSymbolsClient()`'s symbols-service seam (M9.8iy).
+    /// `None` makes `symbols`/`symbol` report `symbols: no endpoints
+    /// configured`.
+    symbols: Option<Arc<dyn crate::search_searcher_client::SymbolsClient + Send + Sync>>,
 }
 
 impl SchemaGraphqlDeps {
@@ -458,6 +462,7 @@ impl SchemaGraphqlDeps {
             ranking_service: None,
             search_executor: None,
             git_objects: None,
+            symbols: None,
         }
     }
 
@@ -505,6 +510,7 @@ impl SchemaGraphqlDeps {
             ranking_service: None,
             search_executor: None,
             git_objects: None,
+            symbols: None,
         }
     }
 
@@ -596,6 +602,16 @@ impl SchemaGraphqlDeps {
         resolver: Arc<dyn crate::graphql_resolvers::CloneUrlResolver>,
     ) -> Self {
         self.clone_urls = Some(CloneUrlDeps { resolver });
+        self
+    }
+
+    /// Enable the symbols service calls behind `TreeEntry.symbols` /
+    /// `TreeEntry.symbol` / `GitCommit.symbols` (M9.8iy).
+    pub fn with_symbols(
+        mut self,
+        client: Arc<dyn crate::search_searcher_client::SymbolsClient + Send + Sync>,
+    ) -> Self {
+        self.symbols = Some(client);
         self
     }
 
@@ -798,6 +814,7 @@ impl SchemaGraphqlDeps {
             ranking_service: None,
             search_executor: None,
             git_objects: None,
+            symbols: None,
         }
     }
 }
@@ -1088,13 +1105,17 @@ impl GraphqlDeps for SchemaGraphqlDeps {
         // `search_root` are still owned here (they move into the roots below).
         let git = match &self.git_objects {
             Some(source) => Some(Arc::new(
-                crate::git_graphql::prefetch_git(
+                crate::git_graphql::prefetch_git_with(
                     source.as_ref(),
                     &repositories,
                     &repository_redirects,
                     &nodes,
                     search_root.as_ref(),
                     &fields,
+                    self.symbols.clone(),
+                    self.clone_urls.as_ref().map(|deps| {
+                        deps.resolver.as_ref() as &dyn crate::graphql_resolvers::CloneUrlResolver
+                    }),
                 )
                 .await,
             )),

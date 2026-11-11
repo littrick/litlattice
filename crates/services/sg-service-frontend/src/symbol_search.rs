@@ -582,6 +582,7 @@ mod tests {
                     parent_kind: String::new(),
                 }],
                 limit_hit: true,
+                file_limited: vec![false],
             }),
             seen: Mutex::new(None),
         });

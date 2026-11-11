@@ -447,6 +447,18 @@ impl Service for FrontendService {
         let graphql_deps = graphql_deps.with_git_objects(Arc::new(
             crate::git_graphql::GitserverGitObjects::new(Arc::clone(wiring.live())),
         ));
+        // M9.8iy: `TreeEntry.symbols`/`TreeEntry.symbol`/`GitCommit.symbols`
+        // use the same symbols endpoints as the search runtime (M9.8im); no
+        // endpoints leaves the fields reporting the symbols error.
+        let graphql_deps = match crate::service_connections::service_connections() {
+            Ok(connections) => {
+                match crate::symbols_client::default_symbols_client(connections.symbols) {
+                    Some(client) => graphql_deps.with_symbols(Arc::from(client)),
+                    None => graphql_deps,
+                }
+            }
+            Err(_) => graphql_deps,
+        };
         let graphql_deps = graphql_deps
             .with_production_surfaces(
                 Some(search_contexts),

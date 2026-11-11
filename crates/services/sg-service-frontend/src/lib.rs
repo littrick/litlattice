@@ -30,6 +30,7 @@ pub mod extsvc_config_file;
 pub mod feature_flag_mutations;
 pub mod feature_flag_store;
 pub mod git_graphql;
+pub mod git_tree_entry_graphql;
 pub mod goimportpath;
 pub mod graphql_api;
 pub mod graphql_metrics;

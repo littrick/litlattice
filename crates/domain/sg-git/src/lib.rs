@@ -151,6 +151,84 @@ pub struct DirEntry {
 /// `os.ModeDir`: the bit gitserver sets in `FileInfo.mode` for tree entries.
 const MODE_DIR: u32 = 1 << 31;
 
+/// `os.ModeSymlink`.
+const MODE_SYMLINK: u32 = 1 << 27;
+
+/// `os.ModeType`: the `FileMode` bits that make a file non-regular.
+///
+/// `ModeDir | ModeSymlink | ModeNamedPipe | ModeSocket | ModeDevice |
+/// ModeCharDevice | ModeIrregular`.
+const MODE_TYPE: u32 =
+    MODE_DIR | MODE_SYMLINK | (1 << 25) | (1 << 24) | (1 << 26) | (1 << 21) | (1 << 19);
+
+/// `gitdomain.Submodule` (`common.go:47-59`), the `fs.FileInfo.Sys` value for
+/// submodule entries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Submodule {
+    pub url: String,
+    pub path: String,
+    pub commit_sha: String,
+}
+
+/// The full `fs.FileInfo` projection of a gitserver `FileInfo`
+/// (`gitdomain.ProtoFileInfoToFS`, `common.go:609-628`): the `stat` RPC and the
+/// rich `ReadDir` entries need more than [`DirEntry`]'s name/size/is_dir.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileStat {
+    pub name: String,
+    pub size: i64,
+    /// `fi.Mode()`: git mode bits plus the Go `FileMode` type bits gitserver
+    /// adds (`MODE_DIR`, `MODE_SYMLINK`, `gitdomain.ModeSubmodule`).
+    pub mode: u32,
+    pub blob_oid: String,
+    pub submodule: Option<Submodule>,
+}
+
+impl FileStat {
+    /// `fs.FileMode.IsDir`.
+    pub fn is_dir(&self) -> bool {
+        self.mode & MODE_DIR != 0
+    }
+
+    /// `fs.FileMode.IsRegular`: `m&ModeType == 0`.
+    pub fn is_regular(&self) -> bool {
+        self.mode & MODE_TYPE == 0
+    }
+
+    /// `fs.FileMode.Type()&fs.ModeSymlink != 0`.
+    pub fn is_symlink(&self) -> bool {
+        self.mode & MODE_SYMLINK != 0
+    }
+
+    /// A synthetic `fs.FileInfo` that never came from a gitserver `Stat`:
+    /// `rootTreeFileInfo` / `CreateFileInfo(path, isDir)`
+    /// (`git_tree_entry.go:309-322,473-475`). `name` is the full path.
+    pub fn synthetic(name: &str, is_dir: bool) -> Self {
+        Self {
+            name: name.to_owned(),
+            size: 0,
+            mode: if is_dir { MODE_DIR } else { 0 },
+            blob_oid: String::new(),
+            submodule: None,
+        }
+    }
+}
+
+/// `gitdomain.ProtoFileInfoToFS`.
+fn file_stat(file_info: &pb::FileInfo) -> FileStat {
+    FileStat {
+        name: String::from_utf8_lossy(&file_info.name).into_owned(),
+        size: file_info.size,
+        mode: file_info.mode,
+        blob_oid: file_info.blob_oid.clone(),
+        submodule: file_info.submodule.as_ref().map(|submodule| Submodule {
+            url: submodule.url.clone(),
+            path: String::from_utf8_lossy(&submodule.path).into_owned(),
+            commit_sha: submodule.commit_sha.clone(),
+        }),
+    }
+}
+
 /// `gitdomain.ProtoFileInfoToFS`'s directory flag (`fs.FileInfo.IsDir` is
 /// `Mode().IsDir()`, i.e. `mode & os.ModeDir != 0`).
 fn dir_entry(file_info: &pb::FileInfo) -> DirEntry {
@@ -420,7 +498,22 @@ impl GitserverClient {
 
     /// Read one file at `repo@commit:path`.
     pub async fn read_file(&self, repo: &str, commit: &str, path: &str) -> Result<Vec<u8>, Error> {
-        let mut client = self.client_for(repo).await?;
+        let addr = self
+            .addr_for(repo)
+            .ok_or_else(|| Error::Message("no gitserver address configured".to_owned()))?
+            .to_owned();
+        self.read_file_at(&addr, repo, commit, path).await
+    }
+
+    /// `gitserver.Client.ReadFile` against an explicitly resolved shard.
+    pub async fn read_file_at(
+        &self,
+        addr: &str,
+        repo: &str,
+        commit: &str,
+        path: &str,
+    ) -> Result<Vec<u8>, Error> {
+        let mut client = self.client(addr).await?;
 
         let request = pb::ReadFileRequest {
             repo_name: repo.to_owned(),
@@ -634,6 +727,39 @@ impl GitserverClient {
         Ok(refs)
     }
 
+    /// `gitserver.Client.Stat`: the full `fs.FileInfo` projection. A missing
+    /// path is a `FileNotFoundPayload` → [`Error::NotFound`]; a missing
+    /// revision stays [`Error::RevisionNotFound`].
+    pub async fn stat(&self, repo: &str, commit: &str, path: &str) -> Result<FileStat, Error> {
+        let addr = self
+            .addr_for(repo)
+            .ok_or_else(|| Error::Message("no gitserver address configured".to_owned()))?
+            .to_owned();
+        self.stat_at(&addr, repo, commit, path).await
+    }
+
+    /// `gitserver.Client.Stat` against an explicitly resolved shard.
+    pub async fn stat_at(
+        &self,
+        addr: &str,
+        repo: &str,
+        commit: &str,
+        path: &str,
+    ) -> Result<FileStat, Error> {
+        let mut client = self.client(addr).await?;
+        let context = format!("stat {repo}@{commit}:{path}");
+        let response = client
+            .stat(pb::StatRequest {
+                repo_name: repo.to_owned(),
+                commit_sha: commit.to_owned(),
+                path: path.as_bytes().to_vec(),
+            })
+            .await
+            .map_err(|status| translate_status(status, &context))?
+            .into_inner();
+        Ok(file_stat(&response.file_info.unwrap_or_default()))
+    }
+
     /// `gitserver.Client.ReadDir`: the non-recursive first chunk. A missing
     /// directory is reported as `FileNotFoundPayload` and maps to
     /// [`Error::NotFound`] (the handler treats it like `os.IsNotExist`).
@@ -661,7 +787,24 @@ impl GitserverClient {
         path: &str,
         recursive: bool,
     ) -> Result<Vec<DirEntry>, Error> {
-        let mut client = self.client_for(repo).await?;
+        let addr = self
+            .addr_for(repo)
+            .ok_or_else(|| Error::Message("no gitserver address configured".to_owned()))?
+            .to_owned();
+        self.read_dir_entries_at(&addr, repo, commit, path, recursive)
+            .await
+    }
+
+    /// `gitserver.Client.ReadDir` against an explicitly resolved shard.
+    pub async fn read_dir_entries_at(
+        &self,
+        addr: &str,
+        repo: &str,
+        commit: &str,
+        path: &str,
+        recursive: bool,
+    ) -> Result<Vec<DirEntry>, Error> {
+        let mut client = self.client(addr).await?;
         let context = format!("read dir {repo}@{commit}:{path}");
         let mut stream = client
             .read_dir(pb::ReadDirRequest {

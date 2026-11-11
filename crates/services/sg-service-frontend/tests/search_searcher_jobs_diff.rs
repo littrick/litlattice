@@ -512,6 +512,7 @@ impl SymbolsClient for FakeSymbols {
             Ok((symbols, limit_hit)) => Ok(SymbolsResponse {
                 symbols: symbols.clone(),
                 limit_hit: *limit_hit,
+                file_limited: vec![false; symbols.len()],
             }),
             Err(error) => Err(error.clone()),
         }

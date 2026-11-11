@@ -1758,8 +1758,8 @@ fn line_spec_from_position(line: i32, character: i32, force_include_character: b
 }
 
 /// `Symbol.Kind`: empty when the kind is unknown, else the LSP kind name
-/// uppercased.
-fn symbol_kind(kind: &str) -> String {
+/// uppercased. Shared with the M9.8iy tree-entry `symbol` resolver.
+pub(crate) fn symbol_kind(kind: &str) -> String {
     match lsp_kind(kind) {
         None => "UNKNOWN".to_owned(),
         Some(kind) => lsp_kind_name(kind).to_ascii_uppercase(),
