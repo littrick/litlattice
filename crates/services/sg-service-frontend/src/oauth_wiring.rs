@@ -372,34 +372,23 @@ fn gitlab_providers(site: &SiteConfiguration) -> Vec<GitlabOAuthProvider> {
     providers
 }
 
-fn oidc_configs(site: &SiteConfiguration) -> Vec<OpenIdConnectAuthProvider> {
-    let entries = site
-        .raw()
-        .get("auth.providers")
-        .and_then(serde_json::Value::as_array)
-        .map(Vec::as_slice)
-        .unwrap_or_default();
-    let mut configs = Vec::new();
-    for entry in entries {
-        let Some(obj) = entry.as_object() else {
-            continue;
-        };
-        if obj.get("type").and_then(serde_json::Value::as_str) != Some("openidconnect") {
-            continue;
-        }
-        let Ok(mut config) =
-            serde_json::from_value::<OpenIdConnectAuthProvider>(serde_json::Value::Object(
-                obj.clone(),
-            ))
-        else {
-            continue;
-        };
-        if config.provider_type.is_empty() {
-            config.provider_type = "openidconnect".to_owned();
-        }
-        configs.push(config);
+/// The M9.8js `OidcProvisionerFactory` implementation over
+/// `user_provisioning`: `CreateIfNotExist = allowSignup == nil || *allowSignup`
+/// (`openidconnect/user.go:92`).
+struct WiringOidcProvisionerFactory {
+    pool: PgPool,
+    dotcom: bool,
+}
+
+impl crate::oidc_middleware::OidcProvisionerFactory for WiringOidcProvisionerFactory {
+    fn for_config(&self, config: &OpenIdConnectAuthProvider) -> Arc<dyn OidcProvisioner> {
+        Arc::new(OidcProvisionerAdapter {
+            pool: self.pool.clone(),
+            dotcom: self.dotcom,
+            client_id: config.client_id.clone(),
+            create_if_not_exist: config.allow_signup.unwrap_or(true),
+        })
     }
-    configs
 }
 
 /// `state.ProviderID` from a generic OAuth state (`oauth.LoginState`).
@@ -521,6 +510,28 @@ impl OAuthResolverWiring {
         }
     }
 
+    /// The discovery/JWKS/userinfo transport, shared with the OIDC middleware
+    /// (M9.8js).
+    pub fn oidc_http(&self) -> Arc<dyn OidcHttpClient> {
+        Arc::clone(&self.oidc_http)
+    }
+
+    /// The M9.8jp-backed provisioner factory the OIDC middleware uses for its
+    /// `getOrCreateUser` call.
+    pub fn oidc_provisioner_factory(
+        &self,
+    ) -> Arc<dyn crate::oidc_middleware::OidcProvisionerFactory> {
+        Arc::new(WiringOidcProvisionerFactory {
+            pool: self.pool.clone(),
+            dotcom: self.dotcom,
+        })
+    }
+
+    /// `dotcom.SourcegraphDotComMode()` captured at construction.
+    pub fn dotcom(&self) -> bool {
+        self.dotcom
+    }
+
     /// Registers the GitHub/GitLab/OIDC resolvers for one site configuration
     /// snapshot. Each registration is a factory keyed on the callback's `state`
     /// so multi-provider setups pick the provider the state names, and so OIDC
@@ -593,7 +604,7 @@ impl OAuthResolverWiring {
     }
 
     fn register_oidc(&self, registry: &OAuthUserResolverRegistry, site: &SiteConfiguration) {
-        let configs = oidc_configs(site);
+        let configs = crate::oidc_middleware::oidc_configs(site);
         if configs.is_empty() {
             return;
         }

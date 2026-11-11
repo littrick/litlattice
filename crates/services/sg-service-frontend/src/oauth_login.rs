@@ -435,19 +435,27 @@ pub struct OAuthToken {
 }
 
 impl OAuthToken {
-    /// `Token.Extra(key)`'s useful case: a JSON string field (id_token).
-    pub fn extra_str(&self, key: &str) -> String {
+    /// `Token.Extra(key)` as a JSON value (JSON token responses keep the raw
+    /// field, form responses keep strings). The OIDC middleware needs the raw
+    /// value to distinguish a missing `id_token` from a non-string one, exactly
+    /// like the baseline's type assertion.
+    pub fn extra(&self, key: &str) -> Option<Value> {
         if let Some(json) = &self.json {
-            return json
-                .get(key)
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_owned();
+            return json.get(key).cloned();
         }
         self.form
             .iter()
             .find(|(k, _)| k == key)
-            .map(|(_, v)| v.clone())
+            .map(|(_, v)| Value::String(v.clone()))
+    }
+
+    /// `Token.Extra(key)`'s useful case: a JSON string field (id_token).
+    pub fn extra_str(&self, key: &str) -> String {
+        self.extra(key)
+            .and_then(|value| match value {
+                Value::String(value) => Some(value),
+                _ => None,
+            })
             .unwrap_or_default()
     }
 
@@ -929,7 +937,7 @@ async fn retry_in_params(
 }
 
 /// `internal.doTokenRoundTrip` + `RetrieveError.Error`.
-fn parse_token_response(response: &OAuthHttpResponse) -> Result<OAuthToken, String> {
+pub(crate) fn parse_token_response(response: &OAuthHttpResponse) -> Result<OAuthToken, String> {
     let failure_status = !(200..=299).contains(&response.status);
     let media_type = response
         .content_type
@@ -1385,7 +1393,7 @@ pub fn html_escape(input: &str) -> String {
         .replace('\'', "&#39;")
 }
 
-fn redirect_response(location: &str) -> OAuthFlowResponse {
+pub(crate) fn redirect_response(location: &str) -> OAuthFlowResponse {
     OAuthFlowResponse {
         status: 302,
         location: location.to_owned(),
@@ -1395,7 +1403,7 @@ fn redirect_response(location: &str) -> OAuthFlowResponse {
     }
 }
 
-fn error_response(status: u16, message: &str) -> OAuthFlowResponse {
+pub(crate) fn error_response(status: u16, message: &str) -> OAuthFlowResponse {
     OAuthFlowResponse {
         status,
         location: String::new(),

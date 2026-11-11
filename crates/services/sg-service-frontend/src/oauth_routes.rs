@@ -225,6 +225,8 @@ pub struct OAuthRouteConfig {
     /// `conf.AuthPublic()`, i.e. `dotcom.SourcegraphDotComMode()`.
     pub dotcom: bool,
     pub access_requests_enabled: bool,
+    /// `auth.providers` entries with `openidconnect` set (M9.8js).
+    pub oidc_configs: Vec<crate::oidc_login::OpenIdConnectAuthProvider>,
     sign_in_without_soap: Vec<String>,
     sign_in_with_soap: Vec<String>,
 }
@@ -252,6 +254,7 @@ impl OAuthRouteConfig {
             secure,
             dotcom,
             access_requests_enabled: access_requests_enabled(raw),
+            oidc_configs: crate::oidc_middleware::oidc_configs(site),
             sign_in_without_soap: sign_in_provider_types(site, true),
             sign_in_with_soap: sign_in_provider_types(site, false),
         }
@@ -305,6 +308,11 @@ pub struct OAuthRouteDeps {
     pub users: Arc<dyn OAuthUserLookup>,
     pub events: Arc<dyn OAuthSecurityEventSink>,
     pub resolvers: Arc<OAuthUserResolverRegistry>,
+    /// When set, `/.auth/openidconnect/{login,callback}` and the legacy
+    /// `/.auth/callback` alias are served by [`crate::oidc_middleware`]
+    /// instead of the generic OAuth flow (M9.8js). `None` preserves the old
+    /// dispatch, which the M9.8jo 46-case differential pins.
+    pub oidc: Option<Arc<crate::oidc_middleware::OidcMiddlewareRuntime>>,
 }
 
 /// Builds [`OAuthRouteDeps`] for one site configuration generation.
@@ -486,7 +494,7 @@ impl OAuthHttpClient for ReqwestOAuthHttpClient {
 /// The `net/http` response for a flow result. `http.Redirect` only writes a
 /// body for GET (and a Content-Type for GET/HEAD); `http.Error` adds
 /// `X-Content-Type-Options: nosniff`.
-fn flow_response(mut flow: OAuthFlowResponse, method: &Method) -> Response<BoxBody> {
+pub(crate) fn flow_response(mut flow: OAuthFlowResponse, method: &Method) -> Response<BoxBody> {
     let is_redirect = flow.status == StatusCode::FOUND.as_u16() && !flow.location.is_empty();
     let mut response = Response::new(tonic::body::boxed(Full::new(Bytes::new())));
     *response.status_mut() =
@@ -622,11 +630,29 @@ pub async fn auth_prefix_response_at<B>(
     deps: &OAuthRouteDeps,
     now: OffsetDateTime,
 ) -> Option<Response<BoxBody>> {
+    let method = req.method().clone();
+    // M9.8js: the OpenID Connect provider has its own middleware in the
+    // baseline (including the `/.auth/callback` alias) and takes over its whole
+    // prefix before the generic flow mux. When the parent wires the runtime,
+    // hand those paths to it; otherwise keep the M9.8jo dispatch.
+    if let Some(oidc) = &deps.oidc {
+        let oidc_config = crate::oidc_middleware::OidcMiddlewareConfig {
+            configs: config.oidc_configs.clone(),
+            external_url: config.external_url.clone(),
+            secure: config.secure,
+            configured_expiry: config.configured_expiry.clone(),
+            dotcom: config.dotcom,
+        };
+        if let Some(flow) =
+            crate::oidc_middleware::handle_oidc_auth(req, &oidc_config, oidc, now).await
+        {
+            return Some(with_outer_vary(flow_response(flow, &method)));
+        }
+    }
     let AuthFlowPath {
         service_type,
         subpath,
     } = match_auth_prefix(req.uri().path())?;
-    let method = req.method().clone();
     let flow = match subpath {
         "/login" => {
             let query = query_pairs(req);

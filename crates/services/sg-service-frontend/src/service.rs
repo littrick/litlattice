@@ -623,6 +623,22 @@ impl Service for FrontendService {
                 ));
                 let users: Arc<dyn crate::oauth_login::OAuthUserLookup> = backend.clone();
                 let events: Arc<dyn crate::oauth_login::OAuthSecurityEventSink> = backend;
+                // M9.8js: the OpenID Connect middleware (including the
+                // `/.auth/callback` alias) has its own handler; it reuses the
+                // same session store, transports, provisioning factory and
+                // user/event/license seams as the generic flow.
+                let oidc = Arc::new(crate::oidc_middleware::OidcMiddlewareRuntime {
+                    discovery_http: resolver_wiring.oidc_http(),
+                    token_http: Arc::clone(&http),
+                    store: Arc::clone(&oauth_store),
+                    ids: Arc::new(sg_session::OsSessionIdSource),
+                    cookie_key: oauth_cookie_key.clone(),
+                    state_source: Arc::new(crate::oidc_middleware::OsAuthnStateSource),
+                    provisioners: resolver_wiring.oidc_provisioner_factory(),
+                    users: Arc::clone(&users),
+                    events: Arc::clone(&events),
+                    license: Arc::clone(&oauth_license),
+                });
                 Arc::new(crate::oauth_routes::OAuthRouteDeps {
                     store: Arc::clone(&oauth_store),
                     ids: Arc::new(sg_session::OsSessionIdSource),
@@ -633,6 +649,7 @@ impl Service for FrontendService {
                     users,
                     events,
                     resolvers,
+                    oidc: Some(oidc),
                 })
             })
         };
