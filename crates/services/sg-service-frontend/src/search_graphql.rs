@@ -10,13 +10,13 @@
 //!
 //! See `docs/overviews/m9_8ie_search_graphql_executor_overview.md`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 
 use async_trait::async_trait;
 use time::format_description::well_known::Rfc3339;
-use time::OffsetDateTime;
+use time::{Duration, OffsetDateTime};
 use tokio_stream::StreamExt;
 
 use sg_graphql::exec::{Actor, Arguments, ExecError, FieldValue, ObjectValue, RootField};
@@ -405,9 +405,13 @@ impl ObjectValue for SearchResultsObject {
                 self.approximate_result_count(),
             )))),
             "limitHit" => Ok(Some(FieldValue::Json(Json::Bool(self.stats.is_limit_hit)))),
-            // The baseline blames file matches through gitserver; no blame
-            // backend is ported, so the sparkline is empty.
-            "sparkline" => Ok(Some(FieldValue::Json(Json::Arr(Vec::new())))),
+            // File matches are blamed through gitserver in the baseline; no
+            // blame backend is ported, so they contribute nothing (the same
+            // zero-value the Go blame failure path produces).
+            "sparkline" => Ok(Some(sparkline_json(
+                &self.matches,
+                OffsetDateTime::now_utc(),
+            ))),
             "repositories" => Ok(Some(FieldValue::List {
                 items: self
                     .match_repos()
@@ -520,11 +524,21 @@ impl ObjectValue for SearchResultsStatsObject {
                     results.approximate_result_count(),
                 ))))
             }
-            "sparkline" => Ok(Some(FieldValue::Json(Json::Arr(Vec::new())))),
-            "languages" => Ok(Some(FieldValue::List {
-                items: Vec::new(),
-                element_type: Some("LanguageStatistics"),
-            })),
+            "sparkline" => Ok(Some(sparkline_json(
+                &self.matches,
+                OffsetDateTime::now_utc(),
+            ))),
+            "languages" => {
+                let languages = search_results_stat_languages(&self.matches)
+                    .map_err(|message| ExecError::new(message.as_str()))?;
+                Ok(Some(FieldValue::List {
+                    items: languages
+                        .into_iter()
+                        .map(|lang| FieldValue::Object(Arc::new(LanguageStatisticsObject { lang })))
+                        .collect(),
+                    element_type: Some("LanguageStatistics"),
+                }))
+            }
             _ => Ok(None),
         }
     }
@@ -969,12 +983,11 @@ impl ObjectValue for CommitSearchResultObject {
                 commit: Some(self.match_.commit.clone()),
                 input_rev: None,
             })))),
-            // `CommitMatch.Refs`/`SourceRefs` are not modelled by the ported
-            // result model (M9.8ih adds them for the streaming encoder).
-            "refs" | "sourceRefs" => Ok(Some(FieldValue::List {
-                items: Vec::new(),
-                element_type: Some("GitRef"),
-            })),
+            "refs" => Ok(Some(git_ref_list(&self.match_.repo, &self.match_.refs))),
+            "sourceRefs" => Ok(Some(git_ref_list(
+                &self.match_.repo,
+                &self.match_.source_refs,
+            ))),
             "messagePreview" => match &self.match_.message_preview {
                 Some(preview) => Ok(Some(FieldValue::Object(Arc::new(
                     HighlightedStringObject::from_matched_string(preview),
@@ -1185,8 +1198,9 @@ impl ObjectValue for MarkdownObject {
     ) -> Result<Option<FieldValue>, ExecError> {
         match field {
             "text" => Ok(Some(FieldValue::Json(Json::Str(self.text.clone())))),
-            // Markdown HTML rendering (goldmark) is not ported.
-            "html" => Ok(Some(FieldValue::Json(Json::Str(String::new())))),
+            "html" => Ok(Some(FieldValue::Json(Json::Str(
+                markdown_html(&self.text).map_err(|message| ExecError::new(message.as_str()))?,
+            )))),
             _ => Ok(None),
         }
     }
@@ -1818,5 +1832,729 @@ fn commit_body_message(message: &str) -> Option<String> {
         None
     } else {
         Some(body.to_owned())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// M9.8ij: sparkline, language statistics, GitRef and Markdown HTML
+// ---------------------------------------------------------------------------
+
+/// `SearchResultsResolver.Sparkline` (`search_results.go:266-334`).
+///
+/// File matches are blamed through gitserver in the baseline; without a blame
+/// backend they contribute nothing (the zero time is outside the window, just
+/// like the baseline's blame-error path).
+pub fn sparkline(matches: &[Match], now: OffsetDateTime) -> Vec<i32> {
+    let mut points = vec![0i32; 30];
+    for match_ in matches {
+        if let Match::Commit(commit) = match_ {
+            add_sparkline_point(&mut points, commit.commit.author.date, now);
+        }
+    }
+    points
+}
+
+fn sparkline_json(matches: &[Match], now: OffsetDateTime) -> FieldValue {
+    FieldValue::Json(Json::Arr(
+        sparkline(matches, now)
+            .into_iter()
+            .map(|point| Json::Int(i64::from(point)))
+            .collect(),
+    ))
+}
+
+fn add_sparkline_point(sparkline: &mut [i32], t: OffsetDateTime, now: OffsetDateTime) {
+    if t < now - Duration::days(30) {
+        // Outside the range of the sparkline.
+        return;
+    }
+    for (n, point) in sparkline.iter_mut().enumerate() {
+        let n = n as i64;
+        let d1 = now - Duration::days(n);
+        let d2 = now - Duration::days(n - 1);
+        if t > d1 && t < d2 {
+            *point += 1;
+        }
+    }
+}
+
+/// One entry of `SearchResultsStats.languages`
+/// (`internal/inventory.Lang`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LanguageStat {
+    pub name: String,
+    pub total_bytes: u64,
+    pub total_lines: i64,
+}
+
+/// `searchResultsStatsLanguages` (`search_results_stats_languages.go:66-190`)
+/// without a gitserver inventory backend.
+///
+/// The language of each file comes from the same detection the file resolver
+/// uses. Line counts are the number of matched ranges; bytes are always 0
+/// because the baseline reads the file through gitserver. Files without chunk
+/// matches still contribute their language with 0 lines (the baseline
+/// inventories them, but an empty reader yields 0 bytes/lines).
+pub fn search_results_stat_languages(matches: &[Match]) -> Result<Vec<LanguageStat>, String> {
+    let mut by_language: BTreeMap<String, LanguageStat> = BTreeMap::new();
+    for match_ in matches {
+        match match_ {
+            Match::Commit(_) => {
+                return Err("language statistics do not support diff searches".to_owned());
+            }
+            Match::File(file) => {
+                let matched_lines: i64 = file
+                    .chunk_matches
+                    .iter()
+                    .map(|chunk| chunk.ranges.len() as i64)
+                    .sum();
+                if let Some(name) = file_languages(&file.file).into_iter().next() {
+                    if !name.is_empty() {
+                        let stat =
+                            by_language
+                                .entry(name.clone())
+                                .or_insert_with(|| LanguageStat {
+                                    name,
+                                    total_bytes: 0,
+                                    total_lines: 0,
+                                });
+                        stat.total_lines += matched_lines;
+                    }
+                }
+            }
+            // Repo matches are only inventoried when every match is a repo
+            // match, which needs the gitserver inventory backend (unported).
+            Match::Repo(_) => {}
+            // `OwnerMatch` is ignored by the baseline as well.
+            Match::Owner(_) => {}
+        }
+    }
+
+    let mut languages: Vec<LanguageStat> = by_language.into_values().collect();
+    // `inventory.Sum`: lines descending, bytes descending, name ascending.
+    languages.sort_by(|a, b| {
+        b.total_lines
+            .cmp(&a.total_lines)
+            .then_with(|| b.total_bytes.cmp(&a.total_bytes))
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    Ok(languages)
+}
+
+struct LanguageStatisticsObject {
+    lang: LanguageStat,
+}
+
+impl ObjectValue for LanguageStatisticsObject {
+    fn type_name(&self) -> &'static str {
+        "LanguageStatistics"
+    }
+
+    fn field(
+        &self,
+        field: &str,
+        _arguments: &Arguments,
+        _actor: Actor,
+    ) -> Result<Option<FieldValue>, ExecError> {
+        match field {
+            "name" => Ok(Some(FieldValue::Json(Json::Str(self.lang.name.clone())))),
+            "totalBytes" => Ok(Some(FieldValue::Json(Json::Float(
+                self.lang.total_bytes as f64,
+            )))),
+            "totalLines" => Ok(Some(FieldValue::Json(Json::Int(self.lang.total_lines)))),
+            _ => Ok(None),
+        }
+    }
+}
+
+/// `GitRefResolver` (`git_ref.go:72-133`), minus `target`.
+struct GitRefObject {
+    repo: MinimalRepo,
+    name: String,
+}
+
+impl GitRefObject {
+    fn abbrev_name(&self) -> &str {
+        let prefix = git_ref_prefix(&self.name);
+        self.name.strip_prefix(prefix).unwrap_or(&self.name)
+    }
+
+    fn url(&self) -> String {
+        go_url_path(&format!("/{}@{}", self.repo.name, self.abbrev_name()))
+    }
+}
+
+impl ObjectValue for GitRefObject {
+    fn type_name(&self) -> &'static str {
+        "GitRef"
+    }
+
+    fn field(
+        &self,
+        field: &str,
+        _arguments: &Arguments,
+        _actor: Actor,
+    ) -> Result<Option<FieldValue>, ExecError> {
+        match field {
+            "id" => Ok(Some(FieldValue::Json(Json::Str(git_ref_relay_id(
+                &self.repo, &self.name,
+            ))))),
+            "name" => Ok(Some(FieldValue::Json(Json::Str(self.name.clone())))),
+            "abbrevName" => Ok(Some(FieldValue::Json(Json::Str(
+                self.abbrev_name().to_owned(),
+            )))),
+            "displayName" => Ok(Some(FieldValue::Json(Json::Str(git_ref_display_name(
+                &self.name,
+            ))))),
+            "prefix" => Ok(Some(FieldValue::Json(Json::Str(
+                git_ref_prefix(&self.name).to_owned(),
+            )))),
+            "type" => Ok(Some(FieldValue::Json(Json::Str(
+                git_ref_type(&self.name).to_owned(),
+            )))),
+            // The baseline lazily resolves the target through gitserver
+            // (`gitObjectResolver`); no gitserver client is ported here.
+            "target" => Err(ExecError::new(
+                "GitRef.target requires a gitserver object resolver, which is not ported",
+            )),
+            "repository" => Ok(Some(FieldValue::Object(Arc::new(repository_object(
+                &self.repo,
+            ))))),
+            "url" => Ok(Some(FieldValue::Json(Json::Str(self.url())))),
+            _ => Ok(None),
+        }
+    }
+}
+
+fn git_ref_list(repo: &MinimalRepo, refs: &[String]) -> FieldValue {
+    FieldValue::List {
+        items: refs
+            .iter()
+            .map(|name| {
+                FieldValue::Object(Arc::new(GitRefObject {
+                    repo: repo.clone(),
+                    name: name.clone(),
+                }))
+            })
+            .collect(),
+        element_type: Some("GitRef"),
+    }
+}
+
+fn git_ref_prefix(name: &str) -> &'static str {
+    if name.starts_with("refs/heads/") {
+        "refs/heads/"
+    } else if name.starts_with("refs/tags/") {
+        "refs/tags/"
+    } else if name.starts_with("refs/pull/") {
+        "refs/pull/"
+    } else if name.starts_with("refs/") {
+        "refs/"
+    } else {
+        ""
+    }
+}
+
+fn git_ref_type(name: &str) -> &'static str {
+    if name.starts_with("refs/heads/") {
+        "GIT_BRANCH"
+    } else if name.starts_with("refs/tags/") {
+        "GIT_TAG"
+    } else {
+        "GIT_REF_OTHER"
+    }
+}
+
+fn git_ref_display_name(name: &str) -> String {
+    let prefix = git_ref_prefix(name);
+    if prefix == "refs/pull/" && (name.ends_with("/head") || name.ends_with("/merge")) {
+        let rest = &name[prefix.len()..];
+        if let Some(slash) = rest.find('/') {
+            if let Ok(number) = rest[..slash].parse::<i64>() {
+                return format!("#{number}");
+            }
+        }
+    }
+    name.strip_prefix(prefix).unwrap_or(name).to_owned()
+}
+
+fn git_ref_relay_id(repo: &MinimalRepo, name: &str) -> String {
+    use base64::Engine as _;
+    let repo_relay = RepositoryObject::relay_id(repo.id);
+    let rev = serde_json::to_string(name).unwrap_or_else(|_| "\"\"".to_owned());
+    base64::engine::general_purpose::URL_SAFE
+        .encode(format!("GitRef:{{\"r\":\"{repo_relay}\",\"v\":{rev}}}"))
+}
+
+/// Deterministic subset of `internal/markdown.Render` (goldmark + GFM +
+/// chroma, sanitized by `htmlutil.SanitizeReader`).
+///
+/// Supported: paragraphs and two-space hard breaks, ATX headings with
+/// goldmark-style auto IDs, unordered/ordered lists (one nesting level),
+/// blockquotes, thematic breaks, fenced code (plain or `COMMIT_EDITMSG`;
+/// highlighted languages fail explicitly), inline code, `*em*`/`**strong**`
+/// and links with the sanitizer's `rel`/`target` policy.
+pub fn markdown_html(content: &str) -> Result<String, String> {
+    let lines: Vec<&str> = content.split('\n').collect();
+    let mut ids = HashSet::new();
+    render_markdown_blocks(&lines, &mut ids)
+}
+
+fn render_markdown_blocks(lines: &[&str], ids: &mut HashSet<String>) -> Result<String, String> {
+    let mut out = String::new();
+    let mut i = 0;
+    while i < lines.len() {
+        if lines[i].trim().is_empty() {
+            i += 1;
+            continue;
+        }
+        if let Some((html, next)) = render_fence(lines, i)? {
+            out.push_str(&html);
+            i = next;
+            continue;
+        }
+        if let Some((html, next)) = render_heading(lines, i, ids)? {
+            out.push_str(&html);
+            i = next;
+            continue;
+        }
+        if is_thematic_break(lines[i]) {
+            out.push_str("<hr>\n");
+            i += 1;
+            continue;
+        }
+        if lines[i].trim_start().starts_with('>') {
+            let (html, next) = render_blockquote(lines, i, ids)?;
+            out.push_str(&html);
+            i = next;
+            continue;
+        }
+        if list_marker(lines[i]).is_some() {
+            let (html, next) = render_list(lines, i)?;
+            out.push_str(&html);
+            i = next;
+            continue;
+        }
+        let (html, next) = render_paragraph(lines, i)?;
+        out.push_str(&html);
+        i = next;
+    }
+    Ok(out)
+}
+
+fn render_paragraph(lines: &[&str], start: usize) -> Result<(String, usize), String> {
+    let mut end = start;
+    while end < lines.len() && !lines[end].trim().is_empty() && !starts_markdown_block(lines[end]) {
+        end += 1;
+    }
+    let paragraph = &lines[start..end];
+    let mut out = String::from("<p>");
+    for (n, line) in paragraph.iter().enumerate() {
+        if n > 0 {
+            out.push('\n');
+        }
+        if n + 1 < paragraph.len() && line.ends_with("  ") {
+            out.push_str(&render_inline(line.trim_end())?);
+            out.push_str("<br>");
+        } else {
+            out.push_str(&render_inline(line)?);
+        }
+    }
+    out.push_str("</p>\n");
+    Ok((out, end))
+}
+
+fn render_heading(
+    lines: &[&str],
+    i: usize,
+    ids: &mut HashSet<String>,
+) -> Result<Option<(String, usize)>, String> {
+    let trimmed = lines[i].trim_start();
+    let Some(hashes) = heading_start(trimmed) else {
+        return Ok(None);
+    };
+    let mut text = trimmed[hashes..].trim();
+    let without_closing = text.trim_end_matches('#');
+    if without_closing.len() != text.len()
+        && (without_closing.is_empty() || without_closing.ends_with(' '))
+    {
+        text = without_closing.trim_end();
+    }
+    let id = heading_id(text, ids);
+    let inner = render_inline(text)?;
+    Ok(Some((
+        format!(
+            "<h{hashes} id=\"{id}\"><a href=\"#{id}\" class=\"anchor\" rel=\"nofollow\" aria-hidden=\"true\" name=\"{id}\"></a>{inner}</h{hashes}>\n"
+        ),
+        i + 1,
+    )))
+}
+
+fn heading_start(trimmed: &str) -> Option<usize> {
+    let hashes = trimmed.chars().take_while(|ch| *ch == '#').count();
+    if hashes == 0 || hashes > 6 {
+        return None;
+    }
+    let rest = &trimmed[hashes..];
+    if rest.is_empty() || rest.starts_with(' ') {
+        Some(hashes)
+    } else {
+        None
+    }
+}
+
+fn heading_id(text: &str, ids: &mut HashSet<String>) -> String {
+    let mut base = String::new();
+    for ch in text.chars() {
+        if ch.is_ascii_alphanumeric() {
+            base.push(ch.to_ascii_lowercase());
+        } else if ch.is_whitespace() || ch == '-' || ch == '_' {
+            base.push('-');
+        }
+    }
+    if base.is_empty() {
+        base.push_str("heading");
+    }
+    let mut candidate = base.clone();
+    let mut n = 1;
+    while !ids.insert(candidate.clone()) {
+        candidate = format!("{base}-{n}");
+        n += 1;
+    }
+    candidate
+}
+
+fn render_fence(lines: &[&str], start: usize) -> Result<Option<(String, usize)>, String> {
+    let trimmed = lines[start].trim_start();
+    let ticks = trimmed.chars().take_while(|ch| *ch == '`').count();
+    if ticks < 3 {
+        return Ok(None);
+    }
+    let info = trimmed[ticks..].trim();
+    let language = info.split_whitespace().next().unwrap_or("");
+
+    let mut content = String::new();
+    let mut i = start + 1;
+    let mut closed = false;
+    while i < lines.len() {
+        let line = lines[i].trim_start();
+        let line_ticks = line.chars().take_while(|ch| *ch == '`').count();
+        if line_ticks >= ticks && line[line_ticks..].trim().is_empty() {
+            closed = true;
+            i += 1;
+            break;
+        }
+        content.push_str(lines[i]);
+        content.push('\n');
+        i += 1;
+    }
+    if !closed && !content.is_empty() {
+        // EOF without a trailing newline: goldmark keeps the last line as-is.
+        content.pop();
+    }
+    let escaped = escape_html(&content);
+    if language.is_empty() || language == "COMMIT_EDITMSG" {
+        return Ok(Some((format!("<pre><code>{escaped}</code></pre>\n"), i)));
+    }
+    if is_highlighted_language(language) {
+        return Err(format!(
+            "markdown: chroma-highlighted code fence `{language}` is not ported"
+        ));
+    }
+    Ok(Some((
+        format!(
+            "<pre><code class=\"language-{}\">{escaped}</code></pre>\n",
+            escape_html(language)
+        ),
+        i,
+    )))
+}
+
+/// Languages the baseline renders through chroma (and therefore cannot match
+/// byte-for-byte without a port of the highlighter).
+fn is_highlighted_language(language: &str) -> bool {
+    matches!(
+        language.to_ascii_lowercase().as_str(),
+        "diff"
+            | "go"
+            | "golang"
+            | "text"
+            | "plaintext"
+            | "rust"
+            | "python"
+            | "javascript"
+            | "js"
+            | "typescript"
+            | "ts"
+            | "java"
+            | "c"
+            | "cpp"
+            | "shell"
+            | "bash"
+            | "sh"
+            | "json"
+            | "yaml"
+            | "yml"
+            | "markdown"
+            | "html"
+            | "css"
+            | "sql"
+            | "toml"
+            | "ruby"
+            | "php"
+            | "csharp"
+    )
+}
+
+fn render_blockquote(
+    lines: &[&str],
+    start: usize,
+    ids: &mut HashSet<String>,
+) -> Result<(String, usize), String> {
+    let mut inner = Vec::new();
+    let mut i = start;
+    while i < lines.len() {
+        let trimmed = lines[i].trim_start();
+        let Some(rest) = trimmed.strip_prefix('>') else {
+            break;
+        };
+        inner.push(rest.strip_prefix(' ').unwrap_or(rest));
+        i += 1;
+    }
+    let rendered = render_markdown_blocks(&inner, ids)?;
+    Ok((format!("<blockquote>\n{rendered}</blockquote>\n"), i))
+}
+
+/// `(indent, ordered, content)` of a list item line.
+fn list_marker(line: &str) -> Option<(usize, bool, String)> {
+    let indent = line.len() - line.trim_start_matches(' ').len();
+    let trimmed = &line[indent..];
+    for marker in ["- ", "* ", "+ "] {
+        if let Some(rest) = trimmed.strip_prefix(marker) {
+            return Some((indent, false, rest.to_owned()));
+        }
+    }
+    let digits = trimmed.chars().take_while(|ch| ch.is_ascii_digit()).count();
+    if digits > 0 {
+        let rest = &trimmed[digits..];
+        if rest.starts_with(". ") || rest.starts_with(") ") {
+            return Some((indent, true, rest[2..].to_owned()));
+        }
+    }
+    None
+}
+
+fn render_list(lines: &[&str], start: usize) -> Result<(String, usize), String> {
+    let (indent, ordered, _) = list_marker(lines[start]).expect("list marker");
+    let tag = if ordered { "ol" } else { "ul" };
+    let mut out = format!("<{tag}>\n");
+    let mut i = start;
+    while i < lines.len() {
+        let Some((item_indent, item_ordered, content)) = list_marker(lines[i]) else {
+            break;
+        };
+        if item_indent != indent || item_ordered != ordered {
+            break;
+        }
+        let mut item = render_inline(&content)?;
+        let mut next = i + 1;
+        if next < lines.len() {
+            if let Some((nested_indent, _, _)) = list_marker(lines[next]) {
+                if nested_indent > indent {
+                    let (nested, after) = render_list(lines, next)?;
+                    item.push('\n');
+                    item.push_str(&nested);
+                    next = after;
+                }
+            }
+        }
+        out.push_str(&format!("<li>{item}</li>\n"));
+        i = next;
+    }
+    out.push_str(&format!("</{tag}>\n"));
+    Ok((out, i))
+}
+
+fn starts_markdown_block(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    trimmed.starts_with("```")
+        || is_thematic_break(line)
+        || trimmed.starts_with('>')
+        || list_marker(line).is_some()
+        || heading_start(trimmed).is_some()
+}
+
+fn is_thematic_break(line: &str) -> bool {
+    let mut marker: Option<char> = None;
+    let mut count = 0;
+    for ch in line.chars() {
+        if ch == ' ' || ch == '\t' {
+            continue;
+        }
+        if !matches!(ch, '-' | '*' | '_') {
+            return false;
+        }
+        match marker {
+            None => marker = Some(ch),
+            Some(previous) if previous == ch => {}
+            Some(_) => return false,
+        }
+        count += 1;
+    }
+    count >= 3
+}
+
+fn render_inline(text: &str) -> Result<String, String> {
+    let bytes = text.as_bytes();
+    let mut out = String::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => {
+                if i + 1 < bytes.len() {
+                    let ch = text[i + 1..].chars().next().expect("char");
+                    out.push_str(&escape_char(ch));
+                    i += 1 + ch.len_utf8();
+                } else {
+                    out.push('\\');
+                    i += 1;
+                }
+            }
+            b'`' => {
+                let run = run_len(bytes, i, b'`');
+                if let Some(end) = find_run(bytes, i + run, run, b'`') {
+                    out.push_str("<code>");
+                    out.push_str(&escape_html(&text[i + run..end]));
+                    out.push_str("</code>");
+                    i = end + run;
+                } else {
+                    out.push_str(&escape_html(&text[i..i + run]));
+                    i += run;
+                }
+            }
+            delimiter @ (b'*' | b'_') => {
+                let run = run_len(bytes, i, delimiter);
+                let width = run.min(2);
+                if let Some(end) = find_run(bytes, i + width, width, delimiter) {
+                    let inner = render_inline(&text[i + width..end])?;
+                    let tag = if width == 2 { "strong" } else { "em" };
+                    out.push_str(&format!("<{tag}>{inner}</{tag}>"));
+                    i = end + width;
+                } else {
+                    out.push_str(&escape_html(&text[i..i + width]));
+                    i += width;
+                }
+            }
+            b'[' => match render_link(text, i)? {
+                Some((html, next)) => {
+                    out.push_str(&html);
+                    i = next;
+                }
+                None => {
+                    out.push('[');
+                    i += 1;
+                }
+            },
+            _ => {
+                let ch = text[i..].chars().next().expect("char");
+                out.push_str(&escape_char(ch));
+                i += ch.len_utf8();
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn run_len(bytes: &[u8], from: usize, byte: u8) -> usize {
+    bytes[from..]
+        .iter()
+        .take_while(|value| **value == byte)
+        .count()
+}
+
+fn find_run(bytes: &[u8], from: usize, width: usize, byte: u8) -> Option<usize> {
+    let mut i = from;
+    while i + width <= bytes.len() {
+        if bytes[i..i + width].iter().all(|value| *value == byte)
+            && (i == 0 || bytes[i - 1] != byte)
+        {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+fn render_link(text: &str, start: usize) -> Result<Option<(String, usize)>, String> {
+    let bytes = text.as_bytes();
+    let Some(label_end) = find_byte(bytes, start + 1, b']') else {
+        return Ok(None);
+    };
+    if label_end + 1 >= bytes.len() || bytes[label_end + 1] != b'(' {
+        return Ok(None);
+    }
+    let Some(destination_end) = find_byte(bytes, label_end + 2, b')') else {
+        return Ok(None);
+    };
+    let (destination, title) = parse_link_target(&text[label_end + 2..destination_end]);
+    let label = render_inline(&text[start + 1..label_end])?;
+    let mut html = format!("<a href=\"{}\"", escape_html(destination));
+    if let Some(title) = title {
+        html.push_str(&format!(" title=\"{}\"", escape_html(title)));
+    }
+    if is_fully_qualified_url(destination) {
+        html.push_str(" rel=\"nofollow noopener\" target=\"_blank\"");
+    } else {
+        html.push_str(" rel=\"nofollow\"");
+    }
+    html.push('>');
+    html.push_str(&label);
+    html.push_str("</a>");
+    Ok(Some((html, destination_end + 1)))
+}
+
+fn find_byte(bytes: &[u8], from: usize, byte: u8) -> Option<usize> {
+    bytes
+        .iter()
+        .enumerate()
+        .skip(from)
+        .find(|(_, value)| **value == byte)
+        .map(|(index, _)| index)
+}
+
+fn parse_link_target(inner: &str) -> (&str, Option<&str>) {
+    let inner = inner.trim();
+    let mut parts = inner.splitn(2, char::is_whitespace);
+    let destination = parts.next().unwrap_or("");
+    if let Some(rest) = parts.next() {
+        let rest = rest.trim();
+        if rest.len() >= 2 && rest.starts_with('"') && rest.ends_with('"') {
+            return (destination, Some(&rest[1..rest.len() - 1]));
+        }
+    }
+    (inner, None)
+}
+
+/// `htmlutil` adds `target="_blank"` plus `noopener` to fully-qualified links.
+fn is_fully_qualified_url(destination: &str) -> bool {
+    destination.starts_with("http://") || destination.starts_with("https://")
+}
+
+fn escape_html(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
+        out.push_str(&escape_char(ch));
+    }
+    out
+}
+
+fn escape_char(ch: char) -> String {
+    match ch {
+        '&' => "&amp;".to_owned(),
+        '<' => "&lt;".to_owned(),
+        '>' => "&gt;".to_owned(),
+        '"' => "&#34;".to_owned(),
+        '\'' => "&#39;".to_owned(),
+        _ => ch.to_string(),
     }
 }
