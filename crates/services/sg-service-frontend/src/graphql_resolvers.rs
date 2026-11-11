@@ -2787,6 +2787,7 @@ impl ObjectValue for QueryRoot {
                                 viewer_site_admin: self.viewer_site_admin,
                                 nested: self.nested.clone(),
                                 site: self.settings_subject_site.clone(),
+                                auth_providers: self.auth_providers.clone(),
                             }),
                             other => SettingsSubjectObject::from_data(
                                 other.clone(),
