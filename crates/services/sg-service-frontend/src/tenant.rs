@@ -81,6 +81,44 @@ pub fn external_tenant_from_hostname<B>(
     Ok(())
 }
 
+/// `headerKeyTenantID` (`internal/tenant/http.go`).
+pub const HEADER_TENANT_ID: &str = "x-sourcegraph-tenant-id";
+/// `headerValueNoTenant`.
+pub const TENANT_NONE: &str = "none";
+
+/// `tenant.InternalHTTPMiddleware`: only the internal listener trusts
+/// `X-Sourcegraph-Tenant-ID`. Empty/`none` leaves the request without a tenant;
+/// a non-numeric value is a 403 written without a `Content-Type` (the baseline
+/// calls `WriteHeader` then `Write`); a valid value stores the tenant.
+#[allow(clippy::result_large_err)] // The error is the short-circuit response.
+pub fn internal_tenant_from_header<B>(req: &mut Request<B>) -> Result<(), Response<BoxBody>> {
+    let Some(value) = req
+        .headers()
+        .get(HEADER_TENANT_ID)
+        .map(|value| String::from_utf8_lossy(value.as_bytes()).into_owned())
+    else {
+        return Ok(());
+    };
+    match value.as_str() {
+        "" | TENANT_NONE => Ok(()),
+        other => match other.parse::<i64>() {
+            Ok(tenant_id) => {
+                req.extensions_mut().insert(TenantId(tenant_id));
+                Ok(())
+            }
+            Err(_) => {
+                // Go formats the error with its display name (canonical casing).
+                let body =
+                    "X-Sourcegraph-Tenant-ID was provided for tenant, but the value was invalid"
+                        .to_owned();
+                let mut response = Response::new(tonic::body::boxed(Full::new(Bytes::from(body))));
+                *response.status_mut() = StatusCode::FORBIDDEN;
+                Err(response)
+            }
+        },
+    }
+}
+
 /// `net/http.Error`: content type, `nosniff`, status, message + newline.
 pub fn http_error(status: StatusCode, message: impl Into<String>) -> Response<BoxBody> {
     let body = format!("{}\n", message.into());

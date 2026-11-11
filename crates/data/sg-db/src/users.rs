@@ -420,6 +420,46 @@ LIMIT 1
     }))
 }
 
+/// `users.site_admin` for a live user (`database.Users().GetByID` narrowed to
+/// the site-admin check used by `internal/auth/site_admin.go`). `Ok(None)` is
+/// the baseline's not-found error (the caller decides whether that is
+/// "not authenticated" or a 500).
+pub async fn get_site_admin(pool: &PgPool, id: i32) -> Result<Option<bool>, sqlx::Error> {
+    let row =
+        sqlx::query("SELECT site_admin FROM users WHERE id = $1 AND deleted_at IS NULL LIMIT 1")
+            .bind(id)
+            .fetch_optional(pool)
+            .await?;
+    Ok(row.map(|row| row.get("site_admin")))
+}
+
+/// The token subject's username for the `AccessTokenImpersonated` audit
+/// argument (`database.Users().GetByID`; the baseline ignores lookup errors
+/// and leaves the name empty).
+pub async fn get_username_by_id(pool: &PgPool, id: i32) -> Result<Option<String>, sqlx::Error> {
+    let row =
+        sqlx::query("SELECT username FROM users WHERE id = $1 AND deleted_at IS NULL LIMIT 1")
+            .bind(id)
+            .fetch_optional(pool)
+            .await?;
+    Ok(row.map(|row| row.get("username")))
+}
+
+/// `database.Users().GetByUsername` reduced to the two fields sudo needs.
+/// `Ok(None)` is the baseline's not-found error (`errcode.IsNotFound`).
+pub async fn lookup_by_username(
+    pool: &PgPool,
+    username: &str,
+) -> Result<Option<(i32, String)>, sqlx::Error> {
+    let row = sqlx::query(
+        "SELECT id, username FROM users WHERE username = $1 AND deleted_at IS NULL LIMIT 1",
+    )
+    .bind(username)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|row| (row.get("id"), row.get("username"))))
+}
+
 /// The `users` fields session authentication and the DB-backed `User`
 /// resolvers read (`internal/database/users.go:1330-1360`).
 /// `display_name`/`avatar_url` are nullable columns; the baseline's

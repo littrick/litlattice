@@ -16,13 +16,14 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
-use http::{header, Request, Response, StatusCode};
+use http::{header, HeaderValue, Request, Response, StatusCode};
 use http_body_util::Full;
 use hyper::body::Incoming;
 use tonic::body::BoxBody;
 
 use sg_config::LiveConfig;
 
+use crate::actor_chain::{ChainActor, ChainConfig, ChainDeps, ChainOutcome, ExternalMode};
 use crate::app_handlers::{AppConfig, AppDeps, AppEnv, SignOutFactory};
 use crate::app_router;
 use crate::auth;
@@ -276,6 +277,9 @@ struct DerivedConfig {
     forbid_all: bool,
     trace_url_template: Option<String>,
     security: SecurityConfig,
+    /// The actor/authz chain's per-snapshot configuration (`conf.Get()` per
+    /// request in the baseline).
+    chain_config: ChainConfig,
     app_env: Arc<AppEnv>,
     app_config: AppConfig,
     app_deps: Arc<AppDeps>,
@@ -290,6 +294,7 @@ impl DerivedConfig {
         sign_out_factory: Option<&SignOutFactory>,
     ) -> Self {
         let security = SecurityConfig::from_site_config(site);
+        let chain_config = ChainConfig::from_site(site, app_env.dotcom);
         let app_deps = match sign_out_factory {
             Some(factory) => {
                 let wiring = factory(site, &security.external_url);
@@ -302,6 +307,7 @@ impl DerivedConfig {
             forbid_all: auth::forbidden(site),
             trace_url_template: trace_headers::url_template(site),
             security,
+            chain_config,
             app_env,
             app_config: AppConfig::from_site_config(site),
             app_deps,
@@ -371,6 +377,7 @@ impl LiveMiddleware {
 /// The hyper entry point for the external listener, reading the middleware
 /// configuration from the live configuration snapshot (`conf.Get()` per
 /// request, cached by generation).
+#[allow(clippy::too_many_arguments)] // Dependency-injection seam; one argument per subsystem.
 pub fn external_handler_with_live(
     live: Arc<LiveConfig>,
     allowlist_env: AllowlistEnv,
@@ -379,6 +386,7 @@ pub fn external_handler_with_live(
     blame_deps: Arc<dyn BlameDeps>,
     search_deps: Arc<dyn SearchDeps>,
     graphql_deps: Arc<dyn GraphqlDeps>,
+    chain_deps: Arc<ChainDeps>,
 ) -> sg_http::HttpHandler {
     let api_live = Arc::clone(&live);
     let app_env = Arc::new(AppEnv::from_env());
@@ -396,6 +404,7 @@ pub fn external_handler_with_live(
         let blame_deps = Arc::clone(&blame_deps);
         let search_deps = Arc::clone(&search_deps);
         let graphql_deps = Arc::clone(&graphql_deps);
+        let chain_deps = Arc::clone(&chain_deps);
         let version = version.clone();
         Box::pin(async move {
             let derived = middleware.current();
@@ -408,6 +417,7 @@ pub fn external_handler_with_live(
                 &derived.security.external_url,
                 |req| {
                     let security = derived.security.clone();
+                    let chain_config = derived.chain_config.clone();
                     let app_env = Arc::clone(&derived.app_env);
                     let app_config = derived.app_config.clone();
                     let app_deps = Arc::clone(&derived.app_deps);
@@ -415,6 +425,7 @@ pub fn external_handler_with_live(
                     let blame_deps = Arc::clone(&blame_deps);
                     let search_deps = Arc::clone(&search_deps);
                     let graphql_deps = Arc::clone(&graphql_deps);
+                    let chain_deps = Arc::clone(&chain_deps);
                     Box::pin(async move {
                         mux::route_async(req, &security, |route, request| {
                             let app_env = Arc::clone(&app_env);
@@ -424,28 +435,61 @@ pub fn external_handler_with_live(
                             let blame_deps = Arc::clone(&blame_deps);
                             let search_deps = Arc::clone(&search_deps);
                             let graphql_deps = Arc::clone(&graphql_deps);
+                            let chain_config = chain_config.clone();
+                            let chain_deps = Arc::clone(&chain_deps);
                             Box::pin(async move {
-                                match route {
-                                    mux::Route::Api => {
-                                        crate::external_api::api_response_with_deps(
+                                match &route {
+                                    // `/.api/` and `/` are the baseline's only
+                                    // mounts wrapped in the actor chain; the
+                                    // executor proxy implements its own auth.
+                                    mux::Route::Api | mux::Route::App => {
+                                        let mode = match &route {
+                                            mux::Route::Api => ExternalMode::Api,
+                                            _ => ExternalMode::App,
+                                        };
+                                        match crate::actor_chain::run_external_chain(
                                             request,
-                                            &api_live,
-                                            blame_deps,
-                                            search_deps,
-                                            graphql_deps,
+                                            mode,
+                                            &chain_config,
+                                            &chain_deps,
                                         )
                                         .await
+                                        {
+                                            ChainOutcome::Reject(response) => response,
+                                            ChainOutcome::Proceed { actor, vary } => {
+                                                request.extensions_mut().insert(ChainActor(actor));
+                                                let mut response = match &route {
+                                                    mux::Route::Api => {
+                                                        crate::external_api::api_response_with_deps(
+                                                            request,
+                                                            &api_live,
+                                                            blame_deps,
+                                                            search_deps,
+                                                            graphql_deps,
+                                                        )
+                                                        .await
+                                                    }
+                                                    _ => {
+                                                        app_router::dispatch_async_with_body(
+                                                            request,
+                                                            &app_env,
+                                                            &app_config,
+                                                            &app_deps,
+                                                        )
+                                                        .await
+                                                    }
+                                                };
+                                                for value in vary {
+                                                    response.headers_mut().append(
+                                                        header::VARY,
+                                                        HeaderValue::from_static(value),
+                                                    );
+                                                }
+                                                response
+                                            }
+                                        }
                                     }
-                                    mux::Route::App => {
-                                        app_router::dispatch_async_with_body(
-                                            request,
-                                            &app_env,
-                                            &app_config,
-                                            &app_deps,
-                                        )
-                                        .await
-                                    }
-                                    other => mux::not_found_dispatch(other),
+                                    other => mux::not_found_dispatch(other.clone()),
                                 }
                             })
                         })
@@ -471,23 +515,32 @@ pub fn internal_handler(
         let graphql_deps = Arc::clone(&graphql_deps);
         let search_deps = Arc::clone(&search_deps);
         Box::pin(async move {
-            // `actor.HTTPMiddleware` is the only place the internal listener
-            // trusts `X-Sourcegraph-Actor-UID`. The resolved actor is not
-            // threaded through `internal_api` yet (the internal GraphQL route
-            // still forces an anonymous actor); the header's validation and
-            // rejection are wired here.
-            if let crate::actor_middleware::ActorHeaderDecision::Reject { status, body } =
-                crate::actor_middleware::apply_actor_header(req.headers())
-            {
-                return crate::actor_middleware::actor_header_reject_response(status, body);
+            // `tenant.InternalHTTPMiddleware` is the outermost internal layer;
+            // `actor.HTTPMiddleware` follows it. The resolved actor reaches
+            // `graphql_api` through the `ChainActor` extension.
+            if let Err(response) = tenant::internal_tenant_from_header(&mut req) {
+                return response;
             }
-            crate::internal_api::internal_response_with_deps(
+            let actor = match crate::actor_middleware::apply_actor_header(req.headers()) {
+                crate::actor_middleware::ActorHeaderDecision::Proceed(actor) => actor,
+                crate::actor_middleware::ActorHeaderDecision::Reject { status, body } => {
+                    return crate::actor_middleware::actor_header_reject_response(status, body);
+                }
+            };
+            req.extensions_mut().insert(ChainActor(actor));
+            // `featureflag.Middleware` sits inside `actor.HTTPMiddleware` on the
+            // internal mux and only contributes this header.
+            let mut response = crate::internal_api::internal_response_with_deps(
                 &mut req,
                 &live,
                 graphql_deps,
                 search_deps,
             )
-            .await
+            .await;
+            response
+                .headers_mut()
+                .append(header::VARY, HeaderValue::from_static("Cookie"));
+            response
         })
     })
 }

@@ -1365,7 +1365,15 @@ where
     // The session middleware adds `Vary` before doing anything else, so it is
     // present on error responses too. The internal listener has no session
     // middleware.
-    if !internal {
+    // The external actor chain already appended the session middleware's
+    // `Vary` values before dispatching (and resolved the session actor); only
+    // direct callers without the chain need the fallback.
+    if !internal
+        && req
+            .extensions()
+            .get::<crate::actor_chain::ChainActor>()
+            .is_none()
+    {
         response
             .headers_mut()
             .append(header::VARY, HeaderValue::from_static(SESSION_VARY));
@@ -1390,10 +1398,23 @@ where
         return handler_error("method must be POST", write_err_body);
     }
 
-    // `session.CookieMiddlewareWithCSRFSafety`: only trusted external requests
-    // authenticate from the cookie; the internal listener uses the actor
-    // header middleware instead (not ported), so it stays anonymous.
-    let actor = if internal {
+    // The external chain (`session.CookieMiddlewareWithCSRFSafety`) and the
+    // internal actor middleware both insert the resolved actor. Direct callers
+    // (tests) fall back to the session lookup / anonymous actor.
+    let actor = if let Some(crate::actor_chain::ChainActor(chain_actor)) =
+        req.extensions().get::<crate::actor_chain::ChainActor>()
+    {
+        // `sg_graphql::exec::Actor` has no internal variant; Go's
+        // `IsAuthenticated` is `UID != 0`, so internal/anonymous both reduce to
+        // `Anonymous`.
+        if chain_actor.is_authenticated() {
+            Actor::User {
+                uid: chain_actor.uid,
+            }
+        } else {
+            Actor::Anonymous
+        }
+    } else if internal {
         Actor::Anonymous
     } else {
         match session_actor(req.headers(), live, deps.as_ref()).await {

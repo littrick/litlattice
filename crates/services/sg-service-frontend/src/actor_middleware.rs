@@ -364,6 +364,23 @@ pub enum AccessTokenUserLookup {
     Error(String),
 }
 
+/// The details of a security event emitted by `AccessTokenAuthMiddleware`.
+/// The production adapter adds the request URI/anonymous UID it captured when
+/// the per-request wrapper was built; the default trait implementation only
+/// forwards the event name (the M9.8ja seam).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AccessTokenSecurityEvent<'a> {
+    pub name: &'a str,
+    /// `SecurityEvent.UserID`.
+    pub user_id: i32,
+    /// The token's subject user (`0` when the token was not found).
+    pub subject_user_id: i32,
+    pub sudo_user_id: i32,
+    pub sudo_user: &'a str,
+    pub token_subject_user_id: i32,
+    pub token_subject_user_name: &'a str,
+}
+
 /// The database seams `AccessTokenAuthMiddleware` reads. The production
 /// adapter is `db.AccessTokens`/`db.Users`/`db.UserExternalAccounts`/
 /// `db.SecurityEventLogs`.
@@ -388,6 +405,29 @@ pub trait AccessTokenAuth: Send + Sync {
 
     /// `SecurityEventLogs().LogSecurityEvent` (errors are logged, not returned).
     async fn log_security_event(&self, name: &str);
+
+    /// A per-request view that adds the request URI and anonymous UID to
+    /// security events (the production adapter overrides this; the default
+    /// keeps the decision-level seam unchanged).
+    fn request_auth<'a>(
+        &'a self,
+        _url: &'a str,
+        _anonymous_uid: Option<&'a str>,
+    ) -> Option<Box<dyn AccessTokenAuth + 'a>> {
+        None
+    }
+
+    /// `db.Users().GetByID(subjectUID)`'s username, used only for the
+    /// `AccessTokenImpersonated` argument (the baseline ignores errors).
+    async fn get_user_by_id(&self, _uid: i32) -> Option<String> {
+        None
+    }
+
+    /// The full event. Default implementations (including the M9.8ja
+    /// differential double) only need [`Self::log_security_event`].
+    async fn security_event(&self, event: AccessTokenSecurityEvent<'_>) {
+        self.log_security_event(event.name).await;
+    }
 }
 
 /// `schema.AuthAccessTokens.Allow`:
@@ -567,8 +607,16 @@ pub async fn apply_access_token(
         let subject_user_id = match auth.lookup(&token, required_scope, only_admin).await {
             Ok(uid) => uid,
             Err(AccessTokenLookupError::NotFound | AccessTokenLookupError::Invalid) => {
-                auth.log_security_event(SECURITY_EVENT_ACCESS_TOKEN_INVALID)
-                    .await;
+                auth.security_event(AccessTokenSecurityEvent {
+                    name: SECURITY_EVENT_ACCESS_TOKEN_INVALID,
+                    user_id: initial.uid,
+                    subject_user_id: 0,
+                    sudo_user_id: 0,
+                    sudo_user: "",
+                    token_subject_user_id: 0,
+                    token_subject_user_name: "",
+                })
+                .await;
                 return token_reject(StatusCode::UNAUTHORIZED, "Invalid access token.");
             }
             Err(AccessTokenLookupError::Other(message)) => {
@@ -589,8 +637,16 @@ pub async fn apply_access_token(
             // 🚨 SECURITY: the sudo token's subject must still be a site
             // admin (a demoted user must not retain sudo privileges).
             if !matches!(auth.is_subject_site_admin(subject_user_id).await, Ok(true)) {
-                auth.log_security_event(SECURITY_EVENT_ACCESS_TOKEN_SUBJECT_NOT_SITE_ADMIN)
-                    .await;
+                auth.security_event(AccessTokenSecurityEvent {
+                    name: SECURITY_EVENT_ACCESS_TOKEN_SUBJECT_NOT_SITE_ADMIN,
+                    user_id: subject_user_id,
+                    subject_user_id,
+                    sudo_user_id: 0,
+                    sudo_user: "",
+                    token_subject_user_id: 0,
+                    token_subject_user_name: "",
+                })
+                .await;
                 return token_reject(
                     StatusCode::FORBIDDEN,
                     "The subject user of a sudo access token must be a site admin.",
@@ -598,8 +654,22 @@ pub async fn apply_access_token(
             }
             match auth.get_user_by_username(&sudo_user).await {
                 AccessTokenUserLookup::Found(user) => {
-                    auth.log_security_event(SECURITY_EVENT_ACCESS_TOKEN_IMPERSONATED)
-                        .await;
+                    // The baseline reads the subject's username for the audit
+                    // argument and ignores a lookup failure.
+                    let token_subject_user_name = auth
+                        .get_user_by_id(subject_user_id)
+                        .await
+                        .unwrap_or_default();
+                    auth.security_event(AccessTokenSecurityEvent {
+                        name: SECURITY_EVENT_ACCESS_TOKEN_IMPERSONATED,
+                        user_id: subject_user_id,
+                        subject_user_id,
+                        sudo_user_id: user.uid,
+                        sudo_user: &user.username,
+                        token_subject_user_id: subject_user_id,
+                        token_subject_user_name: &token_subject_user_name,
+                    })
+                    .await;
                     user.uid
                 }
                 AccessTokenUserLookup::NotFound => {

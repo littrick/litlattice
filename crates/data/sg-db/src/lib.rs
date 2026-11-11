@@ -7,6 +7,7 @@
 
 use sqlx::postgres::{PgPool, PgPoolOptions};
 
+pub mod access_tokens;
 pub mod batches;
 pub mod batches_janitor;
 pub mod code_monitors;
