@@ -38,6 +38,18 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use sg_db::exhaustive_search::{self as ex};
+use sg_insights_query::sg_search_query::{
+    self as sgq,
+    basic::map_plan,
+    fields::{FIELD_PATTERN_TYPE, FIELD_TYPE as QUERY_FIELD_TYPE},
+    labels::Labels as QueryLabels,
+    node::{
+        go_quote, visit_field, Annotation as QueryAnnotation, Node as QueryNode,
+        Operator as QueryOperator, OperatorKind as QueryOperatorKind, Pattern as QueryPattern,
+    },
+    parser::SearchType as QuerySearchType,
+    transformer::lowercase_field_names,
+};
 use sg_zoekt::indexed_repo_revs::{MinimalRepo, RepositoryRevisions, RepositoryRevisionsRepo};
 use sg_zoekt::languages::{get_language_by_name_or_alias, lang_to_file_regexp};
 
@@ -767,6 +779,10 @@ pub struct JobClients {
 }
 
 impl JobClients {
+    pub fn new(resolver: Arc<dyn RepoResolver>, runner: Arc<dyn JobRunner>) -> JobClients {
+        JobClients { resolver, runner }
+    }
+
     /// Clients that fail every operation with an explicit not-ported error.
     pub fn not_ported() -> JobClients {
         JobClients {
@@ -861,6 +877,257 @@ impl SearchClient for NotPortedSearchClient {
     }
 }
 
+/// Production [`SearchClient`]: `client.Plan`'s query-parsing stage over the
+/// injected job clients.
+///
+/// The baseline reaches user settings and feature flags through services.
+/// This port keeps the exhaustive-search defaults (`context:` substitution
+/// disabled, features false, no search-context-line override) and exposes the
+/// remaining fields for the parent that assembles the worker.
+pub struct PlanSearchClient {
+    clients: JobClients,
+    user_settings: UserSettings,
+    features: Features,
+    default_context_lines: i32,
+}
+
+impl PlanSearchClient {
+    pub fn new(clients: JobClients) -> PlanSearchClient {
+        PlanSearchClient {
+            clients,
+            user_settings: UserSettings::default(),
+            features: Features::default(),
+            default_context_lines: 1,
+        }
+    }
+
+    pub fn with_settings(
+        mut self,
+        user_settings: UserSettings,
+        features: Features,
+        default_context_lines: i32,
+    ) -> PlanSearchClient {
+        self.user_settings = user_settings;
+        self.features = features;
+        self.default_context_lines = default_context_lines;
+        self
+    }
+}
+
+impl SearchClient for PlanSearchClient {
+    fn plan(
+        &self,
+        version: &str,
+        pattern_type: Option<&str>,
+        query: &str,
+        _search_mode: SearchMode,
+        protocol: Protocol,
+        context_lines: Option<i32>,
+    ) -> Result<Inputs, String> {
+        // `searchClient.Plan` (`client.go:83-161`) without the services this
+        // crate cannot reach.
+        let search_type = detect_search_type(version, pattern_type)?;
+        let search_type = override_search_type(query, search_type);
+
+        let plan = sgq::pipeline_query(query, search_type)
+            .map_err(|err| format!("invalid query {}: {err}", go_quote(query)))?;
+
+        let plan = if search_type == QuerySearchType::Keyword {
+            map_plan(plan, &mut |basic| experimental_phrase_boost(query, basic))
+        } else {
+            plan
+        };
+
+        Ok(Inputs {
+            plan: convert_plan(&plan),
+            pattern_type: convert_search_type(search_type),
+            user_settings: self.user_settings,
+            protocol,
+            features: self.features,
+            context_lines: context_lines.unwrap_or(self.default_context_lines),
+            sub_repo_enabled: false,
+        })
+    }
+
+    fn job_clients(&self) -> JobClients {
+        self.clients.clone()
+    }
+}
+
+/// `SearchTypeFromString` (`client.go:236-256`).
+fn query_search_type_from_string(pattern_type: &str) -> Result<QuerySearchType, String> {
+    match pattern_type {
+        "standard" => Ok(QuerySearchType::Standard),
+        "literal" => Ok(QuerySearchType::Literal),
+        "regexp" => Ok(QuerySearchType::Regex),
+        "structural" => Ok(QuerySearchType::Structural),
+        "codycontext" => Ok(QuerySearchType::CodyContext),
+        "keyword" => Ok(QuerySearchType::Keyword),
+        "lucky" => Ok(QuerySearchType::Standard),
+        other => Err(format!("unrecognized patternType {}", go_quote(other))),
+    }
+}
+
+/// `detectSearchType` (`client.go:262-279`).
+fn detect_search_type(
+    version: &str,
+    pattern_type: Option<&str>,
+) -> Result<QuerySearchType, String> {
+    if let Some(pattern_type) = pattern_type {
+        return query_search_type_from_string(pattern_type);
+    }
+    match version {
+        "V1" => Ok(QuerySearchType::Regex),
+        "V2" => Ok(QuerySearchType::Literal),
+        "V3" => Ok(QuerySearchType::Standard),
+        other => Err(format!(
+            "unrecognized version: want \"V1\", \"V2\", or \"V3\", got {}",
+            go_quote(other)
+        )),
+    }
+}
+
+/// `overrideSearchType` (`client.go:281-309`): the last non-empty
+/// `patterntype:` filter wins; unknown values are ignored.
+fn override_search_type(input: &str, search_type: QuerySearchType) -> QuerySearchType {
+    let Ok(query) = sgq::parse(input, QuerySearchType::Literal) else {
+        return search_type;
+    };
+    let query = lowercase_field_names(&query);
+    let mut search_type = search_type;
+    visit_field(
+        &query,
+        FIELD_PATTERN_TYPE,
+        &mut |value, _negated, _annotation| {
+            search_type = match value {
+                "standard" => QuerySearchType::Standard,
+                "regex" | "regexp" => QuerySearchType::Regex,
+                "literal" => QuerySearchType::Literal,
+                "structural" => QuerySearchType::Structural,
+                "codycontext" => QuerySearchType::CodyContext,
+                "keyword" => QuerySearchType::Keyword,
+                "lucky" => QuerySearchType::Standard,
+                _ => search_type,
+            };
+        },
+    );
+    search_type
+}
+
+/// `ExperimentalPhraseBoost` (`transformer.go:685-744`). Duplicated from
+/// `sg-service-frontend::search_client` because the worker cannot depend on
+/// the frontend crate.
+fn experimental_phrase_boost(original_query: &str, basic: sgq::Basic) -> sgq::Basic {
+    let Some(pattern) = basic.pattern.as_ref() else {
+        return basic;
+    };
+
+    for parameter in &basic.parameters.0 {
+        if parameter.field == QUERY_FIELD_TYPE
+            && !(parameter.value == "file" || parameter.value == "path")
+        {
+            return basic;
+        }
+    }
+
+    match pattern {
+        QueryNode::Pattern(pattern) => {
+            if !pattern.annotation.labels.is_set(QueryLabels::QUOTED)
+                || pattern.negated
+                || pattern.annotation.labels.is_set(QueryLabels::REGEXP)
+            {
+                return basic;
+            }
+        }
+        QueryNode::Operator(operator) => {
+            if operator.kind != QueryOperatorKind::And {
+                return basic;
+            }
+            for child in &operator.operands {
+                match child {
+                    QueryNode::Pattern(child) => {
+                        if child.negated || child.annotation.labels.is_set(QueryLabels::REGEXP) {
+                            return basic;
+                        }
+                    }
+                    _ => return basic,
+                }
+            }
+        }
+        QueryNode::Parameter(_) => return basic,
+    }
+
+    let terms: Vec<&str> = original_query
+        .split_whitespace()
+        .filter(|term| !term.contains(':'))
+        .collect();
+    let phrase = terms.join(" ");
+
+    let boosted = QueryNode::Operator(QueryOperator {
+        kind: QueryOperatorKind::Or,
+        operands: vec![
+            QueryNode::Pattern(QueryPattern {
+                value: phrase,
+                negated: false,
+                annotation: QueryAnnotation {
+                    labels: QueryLabels::BOOST | QueryLabels::LITERAL | QueryLabels::STANDARD,
+                    range: Default::default(),
+                },
+            }),
+            pattern.clone(),
+        ],
+        annotation: QueryAnnotation::default(),
+    });
+
+    sgq::Basic::new(basic.parameters, Some(boosted))
+}
+
+fn convert_search_type(search_type: QuerySearchType) -> SearchType {
+    match search_type {
+        QuerySearchType::Regex => SearchType::Regex,
+        QuerySearchType::Literal => SearchType::Literal,
+        QuerySearchType::Structural => SearchType::Structural,
+        QuerySearchType::Standard => SearchType::Standard,
+        QuerySearchType::CodyContext => SearchType::CodyContext,
+        QuerySearchType::Keyword => SearchType::Keyword,
+    }
+}
+
+/// `Plan` -> this module's reduced model. The reduced model was already
+/// diff-verified against the baseline by M9.8hv; this keeps the same shape.
+fn convert_plan(plan: &sgq::Plan) -> Plan {
+    plan.iter()
+        .map(|basic| Basic {
+            parameters: basic
+                .parameters
+                .0
+                .iter()
+                .map(|parameter| Parameter {
+                    field: parameter.field.clone(),
+                    value: parameter.value.clone(),
+                    negated: parameter.negated,
+                    predicate: sgq::parser::scan_predicate(
+                        &parameter.field,
+                        parameter.value.as_bytes(),
+                    )
+                    .map(|(predicate, _)| predicate),
+                    is_predicate: parameter
+                        .annotation
+                        .labels
+                        .is_set(QueryLabels::IS_PREDICATE),
+                })
+                .collect(),
+            pattern: basic.pattern.as_ref().map(|node| match node {
+                QueryNode::Pattern(pattern) => PatternNode::Pattern {
+                    value: pattern.value.clone(),
+                    content: pattern.annotation.labels.is_set(QueryLabels::IS_CONTENT),
+                },
+                _ => PatternNode::Other,
+            }),
+        })
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // User context (`actor.FromContext`)
 // ---------------------------------------------------------------------------
@@ -895,10 +1162,29 @@ pub fn is_same_user(user_context: &dyn UserContext, user_id: i32) -> Result<(), 
 // FromSearchClient / searchQuery
 // ---------------------------------------------------------------------------
 
+/// `UserContext` for worker handlers. The baseline handlers set
+/// `actor.WithActor(ctx, actor.FromUser(userID))` with the record's initiator
+/// before calling `NewSearch(ctx, userID, ...)`, so the request user is always
+/// the actor.
+pub struct RequestUserContext {
+    uid: i32,
+}
+
+impl UserContext for RequestUserContext {
+    fn actor_uid(&self) -> Option<i32> {
+        Some(self.uid)
+    }
+}
+
+enum UserContextSource {
+    Fixed(Arc<dyn UserContext>),
+    RequestUser,
+}
+
 /// `service.FromSearchClient` (`searcher.go:25-63`).
 pub struct FromSearchClient {
     client: Arc<dyn SearchClient>,
-    user_context: Arc<dyn UserContext>,
+    user_context: UserContextSource,
 }
 
 impl FromSearchClient {
@@ -908,15 +1194,31 @@ impl FromSearchClient {
     ) -> FromSearchClient {
         FromSearchClient {
             client,
-            user_context,
+            user_context: UserContextSource::Fixed(user_context),
         }
     }
 
-    /// The default production wiring: no real client yet.
+    /// Production wiring: real `client.Plan` over `clients`, with the actor
+    /// taken from the request (see [`RequestUserContext`]).
+    pub fn production(clients: JobClients) -> FromSearchClient {
+        FromSearchClient {
+            client: Arc::new(PlanSearchClient::new(clients)),
+            user_context: UserContextSource::RequestUser,
+        }
+    }
+
+    /// An explicit not-ported client (tests/seams).
     pub fn not_ported() -> FromSearchClient {
         FromSearchClient {
             client: Arc::new(NotPortedSearchClient),
-            user_context: Arc::new(NoActor),
+            user_context: UserContextSource::Fixed(Arc::new(NoActor)),
+        }
+    }
+
+    fn user_context(&self, user_id: i32) -> Arc<dyn UserContext> {
+        match &self.user_context {
+            UserContextSource::Fixed(user_context) => Arc::clone(user_context),
+            UserContextSource::RequestUser => Arc::new(RequestUserContext { uid: user_id }),
         }
     }
 }
@@ -924,7 +1226,8 @@ impl FromSearchClient {
 #[async_trait]
 impl NewSearcher for FromSearchClient {
     async fn new_search(&self, user_id: i32, query: &str) -> Result<Box<dyn SearchQuery>, String> {
-        is_same_user(self.user_context.as_ref(), user_id)?;
+        let user_context = self.user_context(user_id);
+        is_same_user(user_context.as_ref(), user_id)?;
 
         // We run queries on searcher only which makes it easier to control
         // limits. Low latency is not a priority of Search Jobs.
@@ -949,7 +1252,7 @@ impl NewSearcher for FromSearchClient {
             user_id,
             exhaustive,
             clients: self.client.job_clients(),
-            user_context: Arc::clone(&self.user_context),
+            user_context,
         }))
     }
 }
