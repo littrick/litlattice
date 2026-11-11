@@ -469,6 +469,17 @@ async fn prefetch_comparison(
     if let Some(file_diffs_field) = selected(&field.selections, "fileDiffs") {
         let paths = string_list(&file_diffs_field.arguments, "paths");
         let result = compute_file_diffs(extra, repo, &data, paths).await;
+        if let Ok(files) = &result {
+            crate::git_comparison_graphql::prefetch_file_diff_extras(
+                source,
+                prefetch,
+                repo,
+                &data,
+                files,
+                &file_diffs_field.selections,
+            )
+            .await;
+        }
         if let Some(Ok(comparison)) = prefetch.extra.comparisons.get_mut(&key) {
             comparison.file_diffs = Some(result);
         }
@@ -558,7 +569,7 @@ async fn compute_comparison(
     })
 }
 
-async fn compute_file_diffs(
+pub(crate) async fn compute_file_diffs(
     extra: &dyn GitCommitExtraSource,
     repo: &MinimalRepo,
     data: &ComparisonData,
@@ -589,7 +600,7 @@ async fn compute_file_diffs(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn compute_comparison_commits(
+pub(crate) async fn compute_comparison_commits(
     extra: &dyn GitCommitExtraSource,
     source: &dyn GitObjectSource,
     prefetch: &mut GitPrefetch,
@@ -1176,6 +1187,10 @@ impl ObjectValue for RepositoryComparisonObject {
                         .unwrap_or_else(|| Err("fileDiffs are not prefetched".to_owned())),
                     first: int_arg(arguments, "first"),
                     after: arguments.string("after").map(str::to_owned),
+                    base_oid: self.data.base_oid.clone(),
+                    head_oid: self.data.head_oid.clone(),
+                    new_file: crate::git_comparison_graphql::NewFileSource::Tree,
+                    git: self.git.clone(),
                 },
             )))),
             _ => Ok(None),
@@ -1336,6 +1351,13 @@ pub struct FileDiffConnectionObject {
     pub file_diffs: Result<Vec<FileDiff>, String>,
     pub first: Option<i32>,
     pub after: Option<String>,
+    /// `Base` commit OID (`oldFile`), absent for a `DevNullSHA` base.
+    pub base_oid: Option<String>,
+    /// `Head` commit OID (`newFile`).
+    pub head_oid: String,
+    /// Head-commit tree entry or preview virtual file.
+    pub new_file: crate::git_comparison_graphql::NewFileSource,
+    pub git: Option<Arc<GitPrefetch>>,
 }
 
 impl ObjectValue for FileDiffConnectionObject {
@@ -1368,6 +1390,10 @@ impl ObjectValue for FileDiffConnectionObject {
                             FieldValue::Object(Arc::new(FileDiffObject {
                                 file: file.clone(),
                                 repo: self.repo.clone(),
+                                base_oid: self.base_oid.clone(),
+                                head_oid: self.head_oid.clone(),
+                                new_file: self.new_file.clone(),
+                                git: self.git.clone(),
                             }))
                         })
                         .collect(),
@@ -1418,6 +1444,56 @@ impl ObjectValue for FileDiffConnectionObject {
 pub struct FileDiffObject {
     pub file: FileDiff,
     pub repo: MinimalRepo,
+    pub base_oid: Option<String>,
+    pub head_oid: String,
+    pub new_file: crate::git_comparison_graphql::NewFileSource,
+    pub git: Option<Arc<GitPrefetch>>,
+}
+
+impl FileDiffObject {
+    fn old_path(&self) -> Option<String> {
+        crate::git_comparison_graphql::diff_path(&self.file.orig_name)
+    }
+
+    fn new_path(&self) -> Option<String> {
+        crate::git_comparison_graphql::diff_path(&self.file.new_name)
+    }
+
+    fn old_file_value(&self) -> FieldValue {
+        match self.old_path() {
+            None => FieldValue::Null,
+            Some(path) => {
+                FieldValue::Object(Arc::new(crate::git_comparison_graphql::tree_file_object(
+                    &self.repo,
+                    self.base_oid.as_deref(),
+                    &path,
+                    self.git.clone(),
+                )))
+            }
+        }
+    }
+
+    fn new_file_value(&self) -> FieldValue {
+        match self.new_path() {
+            None => FieldValue::Null,
+            Some(path) => crate::git_comparison_graphql::new_file_value(
+                &self.repo,
+                &self.new_file,
+                &path,
+                &self.head_oid,
+                self.git.clone(),
+            ),
+        }
+    }
+
+    fn preview(&self) -> Option<&crate::git_comparison_graphql::PreviewData> {
+        match &self.new_file {
+            crate::git_comparison_graphql::NewFileSource::Preview(preview) => {
+                Some(preview.as_ref())
+            }
+            crate::git_comparison_graphql::NewFileSource::Tree => None,
+        }
+    }
 }
 
 impl ObjectValue for FileDiffObject {
@@ -1433,16 +1509,42 @@ impl ObjectValue for FileDiffObject {
     ) -> Result<Option<FieldValue>, ExecError> {
         match field {
             "oldPath" => Ok(Some(path_value(&self.file.orig_name))),
+            "oldFile" => Ok(Some(self.old_file_value())),
             "newPath" => Ok(Some(path_value(&self.file.new_name))),
-            "hunks" => Ok(Some(FieldValue::List {
-                items: self
-                    .file
-                    .hunks
-                    .iter()
-                    .map(|hunk| FieldValue::Object(Arc::new(DiffHunkObject { hunk: hunk.clone() })))
-                    .collect(),
-                element_type: Some("FileDiffHunk"),
-            })),
+            "newFile" => Ok(Some(self.new_file_value())),
+            "mostRelevantFile" => {
+                let value = self.new_file_value();
+                if matches!(value, FieldValue::Null) {
+                    Ok(Some(self.old_file_value()))
+                } else {
+                    Ok(Some(value))
+                }
+            }
+            "hunks" => {
+                let old_path = self.old_path();
+                let new_path = self.new_path();
+                let preview = self.preview();
+                Ok(Some(FieldValue::List {
+                    items: self
+                        .file
+                        .hunks
+                        .iter()
+                        .map(|hunk| {
+                            FieldValue::Object(Arc::new(DiffHunkObject {
+                                hunk: hunk.clone(),
+                                repo: self.repo.clone(),
+                                old_path: old_path.clone(),
+                                new_path: new_path.clone(),
+                                base_oid: self.base_oid.clone(),
+                                head_oid: self.head_oid.clone(),
+                                preview: preview.cloned().map(Arc::new),
+                                git: self.git.clone(),
+                            }))
+                        })
+                        .collect(),
+                    element_type: Some("FileDiffHunk"),
+                }))
+            }
             "stat" => {
                 let (added, deleted) = file_diff_stat(&self.file);
                 Ok(Some(FieldValue::Object(Arc::new(DiffStatObject {
@@ -1467,11 +1569,6 @@ impl ObjectValue for FileDiffObject {
                         .to_owned(),
                 ))))
             }
-            // The `File2` values are M9.8iy's tree/blob/file surface.
-            "oldFile" | "newFile" => Ok(Some(FieldValue::Null)),
-            "mostRelevantFile" => Err(ExecError::new(
-                "FileDiff.mostRelevantFile requires the tree entry resolver (M9.8iy)",
-            )),
             _ => Ok(None),
         }
     }
@@ -1487,6 +1584,13 @@ fn path_value(path: &[u8]) -> FieldValue {
 
 pub struct DiffHunkObject {
     pub hunk: Hunk,
+    pub repo: MinimalRepo,
+    pub old_path: Option<String>,
+    pub new_path: Option<String>,
+    pub base_oid: Option<String>,
+    pub head_oid: String,
+    pub preview: Option<Arc<crate::git_comparison_graphql::PreviewData>>,
+    pub git: Option<Arc<GitPrefetch>>,
 }
 
 impl ObjectValue for DiffHunkObject {
@@ -1524,7 +1628,19 @@ impl ObjectValue for DiffHunkObject {
             "body" => Ok(Some(FieldValue::Json(Json::Str(
                 String::from_utf8_lossy(&self.hunk.body).into_owned(),
             )))),
-            "highlight" => Err(ExecError::new("FileDiffHunk.highlight is not ported")),
+            "highlight" => Ok(Some(FieldValue::Object(Arc::new(
+                crate::git_comparison_graphql::hunk_highlight_body(
+                    &self.repo,
+                    &self.hunk,
+                    self.old_path.as_deref(),
+                    self.new_path.as_deref(),
+                    self.base_oid.as_deref(),
+                    Some(&self.head_oid),
+                    self.preview.as_deref(),
+                    self.git.as_ref(),
+                    _arguments,
+                )?,
+            )))),
             _ => Ok(None),
         }
     }

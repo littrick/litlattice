@@ -159,6 +159,13 @@ pub trait GitObjectSource: Send + Sync {
         None
     }
 
+    /// The syntax highlighter backing `FileDiffHunk.highlight` (M9.8jd).
+    /// Production has no gosyntect client, so the default (offline
+    /// `HTML_PLAINTEXT` only) applies.
+    fn highlighter(&self) -> Option<&dyn crate::git_comparison_graphql::HighlightSource> {
+        None
+    }
+
     /// `gitserver.Client.Stat` (M9.8iy).
     ///
     /// Defaulted so the existing M9.8ix fakes keep compiling; the production
@@ -390,6 +397,8 @@ pub struct GitPrefetch {
     pub commits: HashMap<(i32, String), CommitLookup>,
     /// M9.8iz: the remaining `GitCommit` fields.
     pub extra: crate::git_commit_extra::CommitExtraPrefetch,
+    /// M9.8jd: `Repository.comparison` and file-diff content/highlight.
+    pub comparison: crate::git_comparison_graphql::ComparisonPrefetch,
     pub tree_entries: HashMap<(i32, String, String), TreeEntryLookup>,
     pub contents: HashMap<(i32, String, String), ContentLookup>,
     pub dirs: HashMap<(i32, String, String), DirLookup>,
@@ -412,6 +421,7 @@ impl Clone for GitPrefetch {
             objects: self.objects.clone(),
             commits: self.commits.clone(),
             extra: self.extra.clone(),
+            comparison: self.comparison.clone(),
             tree_entries: self.tree_entries.clone(),
             contents: self.contents.clone(),
             dirs: self.dirs.clone(),
@@ -429,6 +439,7 @@ impl std::fmt::Debug for GitPrefetch {
             .field("objects", &self.objects)
             .field("commits", &self.commits)
             .field("extra", &self.extra)
+            .field("comparison", &self.comparison)
             .field("tree_entries", &self.tree_entries)
             .field("contents", &self.contents)
             .field("dirs", &self.dirs)
@@ -669,10 +680,8 @@ async fn prefetch_parent(
 ) {
     // The extra commit fields only need the OID, so prefetch them even when no
     // core data field is selected.
-    crate::git_commit_extra::prefetch_commit_extra(
-        source, prefetch, repo, oid, selections, depth,
-    )
-    .await;
+    crate::git_commit_extra::prefetch_commit_extra(source, prefetch, repo, oid, selections, depth)
+        .await;
     prefetch_commit_fields(source, prefetch, repo, oid, selections, depth).await;
 }
 
@@ -688,10 +697,8 @@ pub(crate) async fn prefetch_commit_data(
 ) {
     // The extra commit fields only need the OID, so prefetch them even when no
     // core data field is selected.
-    crate::git_commit_extra::prefetch_commit_extra(
-        source, prefetch, repo, oid, selections, depth,
-    )
-    .await;
+    crate::git_commit_extra::prefetch_commit_extra(source, prefetch, repo, oid, selections, depth)
+        .await;
     prefetch_commit_fields(source, prefetch, repo, oid, selections, depth).await;
 }
 
@@ -761,11 +768,14 @@ async fn prefetch_repository_selections(
     repo: &MinimalRepo,
     selections: &[RootField],
 ) {
-    let Some(commit) = find_field(selections, "commit") else {
-        return;
-    };
-    let rev = commit.arguments.string("rev").unwrap_or_default();
-    prefetch_commit_rev(source, prefetch, repo, rev, &commit.selections).await;
+    if let Some(commit) = find_field(selections, "commit") {
+        let rev = commit.arguments.string("rev").unwrap_or_default();
+        prefetch_commit_rev(source, prefetch, repo, rev, &commit.selections).await;
+    }
+    crate::git_comparison_graphql::prefetch_repository_comparison(
+        source, prefetch, repo, selections,
+    )
+    .await;
 }
 
 /// The `GitObject` selection under `GitRef.target`: prefetch its `commit`

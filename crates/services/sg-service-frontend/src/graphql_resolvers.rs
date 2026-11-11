@@ -4618,6 +4618,30 @@ impl ObjectValue for RepositoryObject {
                     None => Ok(None),
                 }
             }
+            // `RepositoryResolver.Comparison` (`repository_comparison.go:132`):
+            // `NewRepositoryComparison` is resolved eagerly during prefetch.
+            "comparison" => {
+                let Some(git) = &self.git else {
+                    return Ok(None);
+                };
+                let base = arguments.string("base").unwrap_or("HEAD").to_owned();
+                let head = arguments.string("head").unwrap_or("HEAD").to_owned();
+                match git
+                    .comparison
+                    .repository_comparisons
+                    .get(&(self.data.id, base, head))
+                {
+                    Some(Ok(data)) => Ok(Some(FieldValue::Object(Arc::new(
+                        crate::git_commit_extra::RepositoryComparisonObject {
+                            repo: self.minimal_repo(),
+                            data: data.clone(),
+                            git: self.git.clone(),
+                        },
+                    )))),
+                    Some(Err(message)) => Err(ExecError::new(message.clone())),
+                    None => Err(ExecError::new("comparison is not prefetched")),
+                }
+            }
             "id" => Ok(Some(FieldValue::Json(Json::Str(Self::relay_id(
                 self.data.id,
             ))))),
