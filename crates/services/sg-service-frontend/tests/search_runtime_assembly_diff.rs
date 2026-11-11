@@ -1300,6 +1300,7 @@ fn run_case(case: &Case) -> Value {
             db: db.clone(),
             gitserver: gitserver.clone(),
         })),
+        repo_pager: None,
     };
     let runner = TreeJobRunner::with_clients(runtime);
     let mut tree = build_tree(case);

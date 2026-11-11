@@ -207,6 +207,9 @@ pub fn assemble(
         max_repos,
         searcher,
         commit,
+        // `repos.Resolver` is not ported; a caller that can supply pages sets
+        // this bundle. `None` keeps the exact RepoPagerJob not-ported error.
+        repo_pager: None,
     })
 }
 
@@ -627,6 +630,7 @@ mod tests {
                 searcher_connection_cache: Arc::new(SearcherGrpcConnectionCache::new()),
             })),
             commit: None,
+            repo_pager: None,
         };
         let runner = TreeJobRunner::with_clients(runtime);
         let mut tree = crate::search_jobutil_tree::JobNode::zoekt_global_text(

@@ -417,10 +417,22 @@ enum NodeKind {
         /// `new_plan_job` (construction does not model the runtime mode).
         search_mode: SearchMode,
     },
-    SearcherText,
+    /// `searcher.TextSearchJob` (`internal/search/searcher/search.go:33-55`).
+    SearcherText {
+        pattern_info: crate::search_searcher_jobs::TextPatternInfo,
+        /// `PathRegexps`, stored as sources to keep `JobNode` `PartialEq`.
+        path_regexps: Vec<String>,
+        indexed: bool,
+        num_context_lines: i32,
+        use_full_deadline: bool,
+        /// `Repos`; filled by [`set_tree_repos`].
+        repos: Vec<RepositoryRevisions>,
+    },
     SearcherSymbol {
         request: jb::SymbolSearchRequest,
         limit: i64,
+        /// `Repos`; filled by [`set_tree_repos`].
+        repos: Vec<RepositoryRevisions>,
     },
     Commit {
         /// `gitprotocol.Node.String()`, rendered in `Attributes`.
@@ -570,7 +582,7 @@ impl JobNode {
             NodeKind::Limit { .. } => "LimitJob",
             NodeKind::Log => "LogJob",
             NodeKind::Alert { .. } => "AlertJob",
-            NodeKind::SearcherText => "SearcherTextSearchJob",
+            NodeKind::SearcherText { .. } => "SearcherTextSearchJob",
             NodeKind::SearcherSymbol { .. } => "SearcherSymbolSearchJob",
             NodeKind::Commit { diff, .. } => {
                 if *diff {
@@ -628,11 +640,17 @@ impl JobNode {
                 ("originalQuery".to_owned(), original_query.clone()),
                 ("patternType".to_owned(), (*pattern_type).to_owned()),
             ],
-            NodeKind::SearcherText => vec![("indexed".to_owned(), "false".to_owned())],
-            NodeKind::SearcherSymbol { request, limit } => {
+            NodeKind::SearcherText { indexed, .. } => {
+                vec![("indexed".to_owned(), indexed.to_string())]
+            }
+            NodeKind::SearcherSymbol {
+                request,
+                limit,
+                repos,
+            } => {
                 let mut res = Vec::new();
                 push_scoped(&mut res, "request", symbol_request_attributes(request));
-                res.push(("numRepos".to_owned(), "0".to_owned()));
+                res.push(("numRepos".to_owned(), repos.len().to_string()));
                 res.push(("limit".to_owned(), limit.to_string()));
                 res
             }
@@ -1009,9 +1027,8 @@ impl comb::CombinatorJob for TreeRepoPagerJob {
 }
 
 /// `setRepos` (`repo_pager_job.go:59-93`) over the modeled [`JobNode`]
-/// leaves: zoekt jobs receive the indexed set, commit jobs the unindexed
-/// list. Searcher/structural repo fields are not modeled yet; containers are
-/// rewritten bottom-up, as `job.Map` does.
+/// leaves: zoekt jobs receive the indexed set; searcher and commit jobs the
+/// unindexed list. Containers are rewritten bottom-up, as `job.Map` does.
 fn set_tree_repos(node: &JobNode, resolved: &ResolvedRepos) -> JobNode {
     let kind = match &node.kind {
         NodeKind::ZoektRepoSubsetText {
@@ -1033,6 +1050,26 @@ fn set_tree_repos(node: &JobNode, resolved: &ResolvedRepos) -> JobNode {
             repos: resolved.indexed.clone(),
             query: query.clone(),
             zoekt_params: zoekt_params.clone(),
+        },
+        NodeKind::SearcherText {
+            pattern_info,
+            path_regexps,
+            indexed,
+            num_context_lines,
+            use_full_deadline,
+            ..
+        } => NodeKind::SearcherText {
+            pattern_info: pattern_info.clone(),
+            path_regexps: path_regexps.clone(),
+            indexed: *indexed,
+            num_context_lines: *num_context_lines,
+            use_full_deadline: *use_full_deadline,
+            repos: resolved.unindexed.clone(),
+        },
+        NodeKind::SearcherSymbol { request, limit, .. } => NodeKind::SearcherSymbol {
+            request: request.clone(),
+            limit: *limit,
+            repos: resolved.unindexed.clone(),
         },
         NodeKind::Commit {
             query,
@@ -1369,9 +1406,46 @@ impl JobNode {
                     file_matcher.clone(),
                 ))
             }
-            NodeKind::SearcherText
-            | NodeKind::SearcherSymbol { .. }
-            | NodeKind::Structural { .. }
+            NodeKind::SearcherText {
+                pattern_info,
+                path_regexps,
+                indexed,
+                num_context_lines,
+                use_full_deadline,
+                repos,
+            } => {
+                let job = crate::search_searcher_jobs::TextSearchJob {
+                    pattern_info: pattern_info.clone(),
+                    repos: to_searcher_repos(repos),
+                    path_regexps: compile_regexps(path_regexps)?,
+                    indexed: *indexed,
+                    num_context_lines: *num_context_lines,
+                    use_full_deadline: *use_full_deadline,
+                };
+                Box::new(TreeLeafJob {
+                    name: self.name_str(),
+                    job: Box::new(job),
+                    swallow_error_when_canceled: false,
+                })
+            }
+            NodeKind::SearcherSymbol {
+                request,
+                limit,
+                repos,
+            } => {
+                let job = crate::search_searcher_jobs::SymbolSearchJob {
+                    request: to_searcher_symbol_request(request),
+                    repos: to_searcher_repos(repos),
+                    limit: i32::try_from(*limit).unwrap_or(i32::MAX),
+                };
+                // `SymbolSearchJob.Run` stops once the context is done.
+                Box::new(TreeLeafJob {
+                    name: self.name_str(),
+                    job: Box::new(job),
+                    swallow_error_when_canceled: true,
+                })
+            }
+            NodeKind::Structural { .. }
             | NodeKind::ComputeExcluded { .. }
             | NodeKind::FileContains { .. }
             | NodeKind::FileHasOwners { .. }
@@ -2007,23 +2081,87 @@ pub fn new_text_search_job(
     result_types: jb::ResultTypes,
     repo_options: TreeRepoOptions,
 ) -> Result<JobNode, JobError> {
-    // `useFullDeadline`, `features`, `pathRegexps` and `numContextLines` are
-    // Max-only attributes; `toTextPatternInfo` is still evaluated because its
-    // validation error is observable.
-    let _info = jb::to_text_pattern_info(
+    let info = jb::to_text_pattern_info(
         basic,
         result_types,
         &inputs.features,
         inputs.default_limit(),
     )
     .map_err(JobError)?;
+    // `useFullDeadline = b.GetTimeout() != nil || b.Count() != nil ||
+    // inputs.Protocol != search.Batch` (`job.go:283-284`).
+    let use_full_deadline = jb::parameters_timeout_nanos(&basic.parameters).is_some()
+        || jb::parameters_count(&basic.parameters).is_some()
+        || inputs.protocol != Protocol::Batch;
+    let path_regexps = regexp_patterns(jb::get_path_regexps(basic, &info));
 
-    let searcher_job = JobNode::leaf(NodeKind::SearcherText);
+    let searcher_job = JobNode::leaf(NodeKind::SearcherText {
+        pattern_info: to_searcher_pattern_info(&info),
+        path_regexps,
+        indexed: false,
+        num_context_lines: inputs.context_lines,
+        use_full_deadline,
+        repos: Vec::new(),
+    });
     Ok(repo_pager(
         searcher_job,
         repo_options,
         contains_ref_globs(basic),
     ))
+}
+
+/// Convert the job-builder `search.TextPatternInfo` into the searcher job's
+/// view (`search_searcher_jobs::TextPatternInfo`).
+fn to_searcher_pattern_info(
+    info: &jb::TextPatternInfo,
+) -> crate::search_searcher_jobs::TextPatternInfo {
+    crate::search_searcher_jobs::TextPatternInfo {
+        // `protocol.FromJobNode(nil)` yields an empty regex pattern node.
+        query: Some(info.query.clone()),
+        is_structural_pat: info.is_structural_pat,
+        comby_rule: info.comby_rule.clone(),
+        is_case_sensitive: info.is_case_sensitive,
+        file_match_limit: info.file_match_limit,
+        select: info.select.clone(),
+        include_paths: info.include_paths.clone(),
+        exclude_paths: info.exclude_paths.clone(),
+        include_langs: info.include_langs.clone(),
+        exclude_langs: info.exclude_langs.clone(),
+        path_patterns_are_case_sensitive: info.path_patterns_are_case_sensitive,
+        pattern_matches_content: info.pattern_matches_content,
+        pattern_matches_path: info.pattern_matches_path,
+        languages: info.languages.clone(),
+    }
+}
+
+/// Convert the pager's `search.RepositoryRevisions` into the searcher job's
+/// `MinimalRepo`-based view (both models carry only id/name).
+fn to_searcher_repos(
+    repos: &[RepositoryRevisions],
+) -> Vec<crate::search_searcher_jobs::RepositoryRevisions> {
+    repos
+        .iter()
+        .map(|repo| crate::search_searcher_jobs::RepositoryRevisions {
+            repo: crate::search_stream::convert::MinimalRepo {
+                id: repo.repo.id as i32,
+                name: repo.repo.name.clone(),
+            },
+            revs: repo.revs.clone(),
+        })
+        .collect()
+}
+
+fn to_searcher_symbol_request(
+    request: &jb::SymbolSearchRequest,
+) -> crate::search_searcher_jobs::SymbolSearchRequest {
+    crate::search_searcher_jobs::SymbolSearchRequest {
+        regexp_pattern: request.regexp_pattern.clone(),
+        is_case_sensitive: request.is_case_sensitive,
+        include_patterns: request.include_patterns.clone(),
+        exclude_pattern: request.exclude_pattern.clone(),
+        include_langs: request.include_langs.clone(),
+        exclude_langs: request.exclude_langs.clone(),
+    }
 }
 
 struct JobBuilder {
@@ -2203,6 +2341,7 @@ pub fn new_flat_job(inputs: &TreeInputs, basic: &Basic) -> Result<JobNode, JobEr
         let symbol_job = JobNode::leaf(NodeKind::SearcherSymbol {
             request,
             limit: max_results,
+            repos: Vec::new(),
         });
         all_jobs.push(repo_pager(
             symbol_job,
@@ -2533,7 +2672,7 @@ fn order_racing_jobs(root: JobNode) -> JobNode {
 
     let mut first = map_tree(root.clone(), &mut |node| {
         if matches!(node.kind, NodeKind::RepoPager { .. })
-            && has_descendant(&node, &|kind| matches!(kind, NodeKind::SearcherText))
+            && has_descendant(&node, &|kind| matches!(kind, NodeKind::SearcherText { .. }))
         {
             collection.push(node);
             new_noop_job()

@@ -82,6 +82,12 @@ pub struct SearchInputs {
     pub sanitize_search_patterns: Vec<String>,
     /// `Inputs.OnSourcegraphDotCom`.
     pub on_sourcegraph_dot_com: bool,
+    /// `Inputs.Features` cody fields (`CodyContextCodeCount`,
+    /// `CodyContextTextCount`, `CodyFileMatcher`). `Plan` never produces them;
+    /// the caller writes them afterwards via `addLimitsAndFilter`
+    /// (`cmd/frontend/internal/codycontext/context.go:407-414`). `None` keeps
+    /// `NewSearchJob`'s defaults (12/3) and the accept-all filter.
+    pub cody_context: Option<crate::codycontext::CodyContextOptions>,
 }
 
 /// A planned search error (`*client.QueryError` or any other error).
@@ -153,9 +159,29 @@ impl JobRunner for UnportedJobRunner {
     }
 }
 
+/// Owned repository-pager collaborators (`repos.Resolver.Iterator` and
+/// `zoekt.Streamer.List`), borrowed for the duration of one `run`.
+///
+/// The resolver itself is not ported: a caller that can supply pages owns this
+/// bundle. `None` on [`TreeRuntimeClients`] keeps the baseline's
+/// `RepoPagerJob` node non-executable.
+pub struct RepoPagerRuntimeClients {
+    pub pages: Arc<dyn crate::search_jobutil_repos::RepoPageSource + Send + Sync>,
+    pub zoekt: Arc<dyn crate::search_jobutil_repos::ZoektRepoLister + Send + Sync>,
+}
+
+impl RepoPagerRuntimeClients {
+    fn as_clients(&self) -> crate::search_job::RepoPagerClients<'_> {
+        crate::search_job::RepoPagerClients {
+            pages: self.pages.as_ref(),
+            zoekt: self.zoekt.as_ref(),
+        }
+    }
+}
+
 /// Injected runtime clients for [`TreeJobRunner`] (`job.RuntimeClients`).
 ///
-/// `searcher`/`commit` are the owned bundles assembled by
+/// `searcher`/`commit`/`repo_pager` are the owned bundles assembled by
 /// [`crate::search_runtime`]; they are borrowed for the duration of one
 /// `run` and stay `None` when the corresponding endpoints are not configured
 /// (the tree then keeps the existing per-kind not-ported errors).
@@ -165,6 +191,31 @@ pub struct TreeRuntimeClients {
     pub max_repos: Option<i64>,
     pub searcher: Option<Arc<crate::search_runtime::SearcherRuntimeClients>>,
     pub commit: Option<Arc<crate::search_runtime::CommitRuntimeClientsOwned>>,
+    /// Injected `RepoPagerJob` collaborators. `None` keeps the exact
+    /// `"RepoPagerJob execution is not ported (M9.8hw)"` fallback.
+    pub repo_pager: Option<Arc<RepoPagerRuntimeClients>>,
+}
+
+impl TreeRuntimeClients {
+    /// Borrow the owned bundles into one `job.RuntimeClients` view for a
+    /// single tree run (the borrowed child structs cannot outlive this call).
+    pub fn with_clients<R>(
+        &self,
+        f: impl FnOnce(&crate::search_job::RuntimeClients<'_>) -> R,
+    ) -> R {
+        let searcher = self.searcher.as_ref().map(|clients| clients.as_clients());
+        let commit = self.commit.as_ref().map(|clients| clients.as_clients());
+        let repo_pager = self.repo_pager.as_ref().map(|clients| clients.as_clients());
+        let clients = crate::search_job::RuntimeClients {
+            db: self.db.as_ref(),
+            zoekt: self.zoekt.as_ref(),
+            max_repos: self.max_repos,
+            searcher: searcher.as_ref(),
+            commit: commit.as_ref(),
+            repo_pager: repo_pager.as_ref(),
+        };
+        f(&clients)
+    }
 }
 
 /// Runs the constructed job tree with injected clients.
@@ -194,6 +245,7 @@ impl TreeJobRunner {
                 max_repos,
                 searcher: None,
                 commit: None,
+                repo_pager: None,
             }),
         }
     }
@@ -218,30 +270,19 @@ impl JobRunner for TreeJobRunner {
                 }),
             };
         };
-        let searcher = runtime
-            .searcher
-            .as_ref()
-            .map(|clients| clients.as_clients());
-        let commit = runtime.commit.as_ref().map(|clients| clients.as_clients());
-        let clients = crate::search_job::RuntimeClients {
-            db: runtime.db.as_ref(),
-            zoekt: runtime.zoekt.as_ref(),
-            max_repos: runtime.max_repos,
-            searcher: searcher.as_ref(),
-            commit: commit.as_ref(),
-            repo_pager: None,
-        };
         let ctx = crate::search_job::JobContext { deadline: None };
-        match crate::search_job::SearchJob::run(job, &ctx, &clients, sender) {
-            Ok(()) => JobRunOutput::default(),
-            Err(err) => JobRunOutput {
-                alert: None,
-                error: Some(ExecuteError {
-                    message: err.0,
-                    unsupported: false,
-                }),
-            },
-        }
+        runtime.with_clients(|clients| {
+            match crate::search_job::SearchJob::run(job, &ctx, clients, sender) {
+                Ok(()) => JobRunOutput::default(),
+                Err(err) => JobRunOutput {
+                    alert: None,
+                    error: Some(ExecuteError {
+                        message: err.0,
+                        unsupported: false,
+                    }),
+                },
+            }
+        })
     }
 }
 
@@ -368,7 +409,10 @@ fn plan_max_results(plan: &Plan, default_limit: i64) -> i64 {
 }
 
 /// `search.Inputs` fields the job tree reads.
-fn tree_inputs(inputs: &SearchInputs) -> TreeInputs {
+///
+/// Public so the codycontext injection differential can drive the production
+/// `SearchInputs` -> `TreeInputs` propagation (M9.8kb).
+pub fn tree_inputs(inputs: &SearchInputs) -> TreeInputs {
     TreeInputs {
         protocol: inputs.protocol,
         pattern_type: inputs.pattern_type,
@@ -382,9 +426,12 @@ fn tree_inputs(inputs: &SearchInputs) -> TreeInputs {
         original_query: inputs.original_query.clone(),
         // `authz.SubRepoEnabled` is not ported.
         sub_repo_enabled: false,
-        // `codycontext.NewSearchJob` is not ported.
+        // `codycontext.NewSearchJob` is ported; the hook stays `None` so the
+        // tree builder calls it directly.
         cody_context_hook: None,
-        cody_context: None,
+        // `addLimitsAndFilter` writes these after `Plan`; the caller owns the
+        // mutation (the codycontext client is not ported yet).
+        cody_context: inputs.cody_context.clone(),
     }
 }
 
@@ -429,6 +476,9 @@ impl SearchDeps for BackendDeps {
             context_lines: inputs.context_lines,
             sanitize_search_patterns: inputs.sanitize_search_patterns,
             on_sourcegraph_dot_com: inputs.on_sourcegraph_dot_com,
+            // `Plan` never sets cody fields; the codycontext client (not
+            // ported) fills them after planning.
+            cody_context: None,
         })
     }
 
