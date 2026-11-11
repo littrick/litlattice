@@ -17,7 +17,7 @@
 //! `User.id` is the Relay ID: `relay.MarshalID("User", id)` =
 //! `base64.URLEncoding(kind + ":" + json.Marshal(id))` (`relay/relay.go:14-19`).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -25,12 +25,28 @@ use base64::Engine;
 use sg_db::feature_flags::{FeatureFlag, FeatureFlagKind, FeatureFlagOverride};
 use sg_encryption::Key;
 use sg_graphql::exec::{
-    Actor, Arguments, ExecError, FieldValue, ObjectValue, RootField, RootResolver,
+    Actor, Arguments, ExecError, FieldValue, InputValue, ObjectValue, RootField, RootResolver,
 };
 use sg_graphql::json::Json;
 use time::{OffsetDateTime, UtcOffset};
 
+use crate::search_contexts::RequestContext;
+use crate::search_contexts_graphql::{
+    NamespaceResolver, PageInfo, RepositoryResolver, SearchContextEditInputArgs,
+    SearchContextInputArgs, SearchContextRepositoryRevisionsInputArgs,
+    SearchContextRepositoryRevisionsResolver, SearchContextResolver, SearchContextsGraphqlDatabase,
+    SearchContextsOrderBy,
+};
+use crate::search_contexts_schema::{
+    SearchContextsFieldArgs, SearchContextsFieldValue, SearchContextsOperation,
+    SearchContextsResolverDispatch,
+};
 use crate::settings_merge::{final_settings, DEFAULT_SETTINGS_CONTENTS};
+
+/// A search contexts GraphQL database handle. The extra auto-trait bounds keep
+/// the handle usable from [`ObjectValue`] (whose implementors are `Send +
+/// Sync`) without changing the M9.8hq trait itself.
+pub type SearchContextsDatabaseHandle = Arc<dyn SearchContextsGraphqlDatabase + Send + Sync>;
 
 /// The `users` row fields the DB-backed `User` resolvers read, plus the
 /// primary `user_emails.email` (`userEmailsStore.GetPrimaryEmail`).
@@ -2073,8 +2089,9 @@ pub async fn prefetch_repository_redirects(
 /// Root objects for the assembled OSS schema.
 pub struct FrontendRootResolver {
     query: QueryRoot,
-    /// `Mutation` root fields (`Mutation.settingsMutation`).
-    mutation: crate::settings_mutation::MutationRoot,
+    /// `Mutation` root fields (`Mutation.settingsMutation` plus the optional
+    /// search contexts surface).
+    mutation: MutationRoot,
 }
 
 impl FrontendRootResolver {
@@ -2217,14 +2234,27 @@ impl FrontendRootResolver {
                 external_services: HashMap::new(),
                 webhook_logs: HashMap::new(),
                 repositories_connections: HashMap::new(),
+                search_contexts: None,
             },
-            mutation: crate::settings_mutation::MutationRoot::default(),
+            mutation: MutationRoot::default(),
         }
     }
 
     /// Attach the request's pre-executed `Mutation` root fields.
     pub fn with_mutation(mut self, mutation: crate::settings_mutation::MutationRoot) -> Self {
-        self.mutation = mutation;
+        self.mutation.settings = mutation;
+        self
+    }
+
+    /// Attach the optional search contexts database (M9.8hz). `None` keeps the
+    /// search contexts surface absent, matching a nil
+    /// `OptionalResolver.SearchContextsResolver`.
+    pub fn with_search_contexts(
+        mut self,
+        search_contexts: Option<SearchContextsDatabaseHandle>,
+    ) -> Self {
+        self.query.search_contexts = search_contexts.clone();
+        self.mutation.search_contexts = search_contexts;
         self
     }
 
@@ -2343,6 +2373,48 @@ struct QueryRoot {
         crate::repositories::RepositoriesArgs,
         crate::repositories::RepositoriesConnectionLookup,
     >,
+    /// Optional search contexts database (M9.8hz). `None` means the SDL was
+    /// not appended and the root fields are absent.
+    search_contexts: Option<SearchContextsDatabaseHandle>,
+}
+
+/// `Mutation` root: `settingsMutation`/log events/temporary settings/feature
+/// flags/site configuration from [`crate::settings_mutation::MutationRoot`],
+/// plus the optional search contexts mutations (M9.8hz).
+#[derive(Default)]
+pub struct MutationRoot {
+    settings: crate::settings_mutation::MutationRoot,
+    search_contexts: Option<SearchContextsDatabaseHandle>,
+}
+
+impl ObjectValue for MutationRoot {
+    fn type_name(&self) -> &'static str {
+        "Mutation"
+    }
+
+    fn field(
+        &self,
+        field: &str,
+        arguments: &Arguments,
+        actor: Actor,
+    ) -> Result<Option<FieldValue>, ExecError> {
+        if self.search_contexts.is_some()
+            && crate::search_contexts_schema::field_handler(
+                SearchContextsOperation::Mutation,
+                field,
+            )
+            .is_some()
+        {
+            return dispatch_search_context_field(
+                self.search_contexts.as_ref(),
+                SearchContextsOperation::Mutation,
+                field,
+                arguments,
+                actor,
+            );
+        }
+        self.settings.field(field, arguments, actor)
+    }
 }
 
 impl FrontendRootResolver {
@@ -2681,6 +2753,24 @@ impl ObjectValue for QueryRoot {
                 // int32 kinds are parsed per branch: `UnmarshalExternalServiceID`
                 // validates the Relay kind while the others do not.
                 match kind.as_str() {
+                    // `NodeResolvers()["SearchContext"]` is only registered
+                    // when the optional resolver is present; otherwise the
+                    // kind is unknown and `Node` reports `invalid id`.
+                    "SearchContext" if self.search_contexts.is_some() => {
+                        let db = self
+                            .search_contexts
+                            .as_ref()
+                            .expect("checked search contexts database");
+                        let ctx = search_contexts_request_context(actor);
+                        let dispatch = SearchContextsResolverDispatch::new(db.as_ref());
+                        match dispatch.node_by_id(&ctx, "SearchContext", id) {
+                            Ok(Some(resolver)) => Ok(Some(FieldValue::Object(
+                                search_context_snapshot(&ctx, &resolver),
+                            ))),
+                            Ok(None) => Ok(None),
+                            Err(error) => Err(ExecError::new(error.to_string())),
+                        }
+                    }
                     "ExternalService" => match self.nodes.external_services.get(id) {
                         Some(Ok(data)) => Ok(Some(FieldValue::Object(Arc::new(
                             crate::external_services::ExternalServiceObject::from_data(
@@ -2875,6 +2965,18 @@ impl ObjectValue for QueryRoot {
                     None => Ok(None),
                 }
             }
+            // `SearchContextsResolver` root fields (`search_contexts.go:20-39`):
+            // dispatched through the M9.8hu registration layer (M9.8hz).
+            "searchContexts"
+            | "searchContextBySpec"
+            | "isSearchContextAvailable"
+            | "defaultSearchContext" => dispatch_search_context_field(
+                self.search_contexts.as_ref(),
+                SearchContextsOperation::Query,
+                field,
+                arguments,
+                actor,
+            ),
             _ => Ok(None),
         }
     }
@@ -4695,6 +4797,436 @@ impl ObjectValue for FeatureFlagOverrideObject {
                 })))),
                 None => Err(ExecError::new("sql: no rows in result set")),
             },
+            _ => Ok(None),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Search contexts GraphQL executor wiring (M9.8hz)
+// ---------------------------------------------------------------------------
+
+/// `actor.FromContext` + `dotcom.SourcegraphDotComMode()` as the
+/// [`RequestContext`] the M9.8hq resolver expects.
+fn search_contexts_request_context(actor: Actor) -> RequestContext {
+    let getenv = |key: &str| std::env::var(key).ok();
+    RequestContext {
+        actor_uid: actor.uid().unwrap_or(0),
+        internal: false,
+        sourcegraph_dot_com_mode: crate::service_connections::sourcegraph_dotcom_mode(&getenv),
+    }
+}
+
+fn input_string(value: &InputValue) -> Option<String> {
+    value.as_str().map(str::to_owned)
+}
+
+fn required_input_string(
+    map: &BTreeMap<String, InputValue>,
+    name: &str,
+) -> Result<String, ExecError> {
+    match map.get(name).and_then(InputValue::as_str) {
+        Some(value) => Ok(value.to_owned()),
+        None => Err(ExecError::new(format!("missing required argument: {name}"))),
+    }
+}
+
+fn required_input_bool(map: &BTreeMap<String, InputValue>, name: &str) -> Result<bool, ExecError> {
+    match map.get(name).and_then(InputValue::as_bool) {
+        Some(value) => Ok(value),
+        None => Err(ExecError::new(format!("missing required argument: {name}"))),
+    }
+}
+
+fn input_string_list(value: Option<&InputValue>) -> Result<Vec<String>, ExecError> {
+    match value {
+        None | Some(InputValue::Null) => Ok(Vec::new()),
+        Some(InputValue::List(items)) => items
+            .iter()
+            .map(|item| input_string(item).ok_or_else(|| ExecError::new("invalid list argument")))
+            .collect(),
+        Some(_) => Err(ExecError::new("invalid list argument")),
+    }
+}
+
+fn input_optional_string_list(
+    value: Option<&InputValue>,
+) -> Result<Vec<Option<String>>, ExecError> {
+    match value {
+        None | Some(InputValue::Null) => Ok(Vec::new()),
+        Some(InputValue::List(items)) => items
+            .iter()
+            .map(|item| match item {
+                InputValue::Null => Ok(None),
+                other => input_string(other)
+                    .map(Some)
+                    .ok_or_else(|| ExecError::new("invalid namespaces argument")),
+            })
+            .collect(),
+        Some(_) => Err(ExecError::new("invalid namespaces argument")),
+    }
+}
+
+fn input_order_by(value: Option<&InputValue>) -> Option<SearchContextsOrderBy> {
+    match value.and_then(InputValue::as_str) {
+        Some("SEARCH_CONTEXT_SPEC") => Some(SearchContextsOrderBy::Spec),
+        Some("SEARCH_CONTEXT_UPDATED_AT") => Some(SearchContextsOrderBy::UpdatedAt),
+        _ => None,
+    }
+}
+
+fn search_context_create_input(
+    map: &BTreeMap<String, InputValue>,
+) -> Result<SearchContextInputArgs, ExecError> {
+    Ok(SearchContextInputArgs {
+        name: required_input_string(map, "name")?,
+        description: required_input_string(map, "description")?,
+        public: required_input_bool(map, "public")?,
+        namespace: map
+            .get("namespace")
+            .and_then(InputValue::as_str)
+            .map(str::to_owned),
+        query: required_input_string(map, "query")?,
+    })
+}
+
+fn search_context_edit_input(
+    map: &BTreeMap<String, InputValue>,
+) -> Result<SearchContextEditInputArgs, ExecError> {
+    Ok(SearchContextEditInputArgs {
+        name: required_input_string(map, "name")?,
+        description: required_input_string(map, "description")?,
+        public: required_input_bool(map, "public")?,
+        query: required_input_string(map, "query")?,
+    })
+}
+
+fn search_context_repositories_input(
+    value: Option<&InputValue>,
+) -> Result<Vec<SearchContextRepositoryRevisionsInputArgs>, ExecError> {
+    let items = match value {
+        None | Some(InputValue::Null) => return Ok(Vec::new()),
+        Some(InputValue::List(items)) => items,
+        Some(_) => return Err(ExecError::new("invalid repositories argument")),
+    };
+    items
+        .iter()
+        .map(|item| {
+            let InputValue::Object(map) = item else {
+                return Err(ExecError::new("invalid repositories argument"));
+            };
+            Ok(SearchContextRepositoryRevisionsInputArgs {
+                repository_id: required_input_string(map, "repositoryID")?,
+                revisions: input_string_list(map.get("revisions"))?,
+            })
+        })
+        .collect()
+}
+
+/// Map the executor's resolved [`Arguments`] (schema defaults already applied)
+/// onto the M9.8hu dispatch struct.
+fn search_contexts_field_args(arguments: &Arguments) -> Result<SearchContextsFieldArgs, ExecError> {
+    let mut args = SearchContextsFieldArgs {
+        id: arguments.string("id").map(str::to_owned),
+        spec: arguments.string("spec").map(str::to_owned),
+        first: arguments.i64("first").map(|first| first as i32),
+        after: arguments.string("after").map(str::to_owned),
+        query: arguments.string("query").map(str::to_owned),
+        namespaces: input_optional_string_list(arguments.get("namespaces"))?,
+        order_by: input_order_by(arguments.get("orderBy")),
+        descending: arguments.bool("descending"),
+        search_context: None,
+        search_context_edit: None,
+        repositories: search_context_repositories_input(arguments.get("repositories"))?,
+        search_context_id: arguments.string("searchContextID").map(str::to_owned),
+        user_id: arguments.string("userID").map(str::to_owned),
+    };
+    if let Some(InputValue::Object(map)) = arguments.get("searchContext") {
+        // Create and update share the argument name but use different input
+        // types; populate both and let the dispatch pick the right one.
+        args.search_context = Some(search_context_create_input(map)?);
+        args.search_context_edit = Some(search_context_edit_input(map)?);
+    }
+    Ok(args)
+}
+
+/// Dispatch one search-contexts root field through the M9.8hu registration
+/// layer and convert the borrowed resolver values into owned snapshots.
+fn dispatch_search_context_field(
+    db: Option<&SearchContextsDatabaseHandle>,
+    operation: SearchContextsOperation,
+    field: &str,
+    arguments: &Arguments,
+    actor: Actor,
+) -> Result<Option<FieldValue>, ExecError> {
+    let Some(db) = db else {
+        return Ok(None);
+    };
+    let ctx = search_contexts_request_context(actor);
+    let args = search_contexts_field_args(arguments)?;
+    let dispatch = SearchContextsResolverDispatch::new(db.as_ref());
+    match dispatch.field(operation, field, &args, &ctx) {
+        Ok(Some(value)) => Ok(Some(search_contexts_field_value(&ctx, value))),
+        Ok(None) => Ok(None),
+        Err(error) => Err(ExecError::new(error.to_string())),
+    }
+}
+
+fn search_contexts_field_value(
+    ctx: &RequestContext,
+    value: SearchContextsFieldValue<'_>,
+) -> FieldValue {
+    match value {
+        SearchContextsFieldValue::SearchContext(resolver) => {
+            FieldValue::Object(search_context_snapshot(ctx, &resolver))
+        }
+        SearchContextsFieldValue::Connection(connection) => {
+            FieldValue::Object(Arc::new(SearchContextConnectionObject {
+                nodes: connection
+                    .nodes()
+                    .iter()
+                    .map(|resolver| search_context_snapshot(ctx, resolver))
+                    .collect(),
+                total_count: connection.total_count(),
+                page_info: connection.page_info(),
+            }))
+        }
+        SearchContextsFieldValue::Bool(value) => FieldValue::Json(Json::Bool(value)),
+        SearchContextsFieldValue::EmptyResponse => {
+            FieldValue::Object(Arc::new(crate::temporary_settings::EmptyResponseObject))
+        }
+    }
+}
+
+/// Owned snapshot of `searchContextResolver`. The M9.8hq resolver borrows the
+/// database and cannot be stored in `Arc<dyn ObjectValue>`; namespace and
+/// repository lookup errors are captured here and surface only when those
+/// fields are selected.
+fn search_context_snapshot(
+    ctx: &RequestContext,
+    resolver: &SearchContextResolver<'_>,
+) -> Arc<SearchContextObject> {
+    Arc::new(SearchContextObject {
+        id: resolver.id(),
+        name: resolver.name().to_owned(),
+        description: resolver.description().to_owned(),
+        spec: resolver.spec(),
+        auto_defined: resolver.auto_defined(),
+        query: resolver.query().to_owned(),
+        public: resolver.public(),
+        updated_at: crate::search_contexts_graphql::format_gqlutil_datetime(resolver.updated_at()),
+        viewer_can_manage: resolver.viewer_can_manage(ctx),
+        viewer_has_as_default: resolver.viewer_has_as_default(),
+        viewer_has_starred: resolver.viewer_has_starred(),
+        namespace: resolver.namespace(ctx).map_err(|error| error.to_string()),
+        repositories: resolver.repositories().map_err(|error| error.to_string()),
+    })
+}
+
+struct SearchContextObject {
+    id: String,
+    name: String,
+    description: String,
+    spec: String,
+    auto_defined: bool,
+    query: String,
+    public: bool,
+    updated_at: String,
+    viewer_can_manage: bool,
+    viewer_has_as_default: bool,
+    viewer_has_starred: bool,
+    namespace: Result<Option<NamespaceResolver>, String>,
+    repositories: Result<Vec<SearchContextRepositoryRevisionsResolver>, String>,
+}
+
+impl ObjectValue for SearchContextObject {
+    fn type_name(&self) -> &'static str {
+        "SearchContext"
+    }
+
+    fn field(
+        &self,
+        field: &str,
+        _arguments: &Arguments,
+        _actor: Actor,
+    ) -> Result<Option<FieldValue>, ExecError> {
+        match field {
+            "id" => Ok(Some(FieldValue::Json(Json::Str(self.id.clone())))),
+            "name" => Ok(Some(FieldValue::Json(Json::Str(self.name.clone())))),
+            "namespace" => match &self.namespace {
+                Ok(None) => Ok(Some(FieldValue::Null)),
+                Ok(Some(namespace)) => Ok(Some(FieldValue::Object(Arc::new(NamespaceObject {
+                    namespace: namespace.clone(),
+                })))),
+                Err(message) => Err(ExecError::new(message.clone())),
+            },
+            "description" => Ok(Some(FieldValue::Json(Json::Str(self.description.clone())))),
+            "spec" => Ok(Some(FieldValue::Json(Json::Str(self.spec.clone())))),
+            "autoDefined" => Ok(Some(FieldValue::Json(Json::Bool(self.auto_defined)))),
+            "query" => Ok(Some(FieldValue::Json(Json::Str(self.query.clone())))),
+            "repositories" => match &self.repositories {
+                Ok(repositories) => Ok(Some(FieldValue::List {
+                    items: repositories
+                        .iter()
+                        .map(|revisions| {
+                            FieldValue::Object(Arc::new(SearchContextRepositoryRevisionsObject {
+                                repository: revisions.repository().clone(),
+                                revisions: revisions.revisions().to_vec(),
+                            }))
+                        })
+                        .collect(),
+                    element_type: Some("SearchContextRepositoryRevisions"),
+                })),
+                Err(message) => Err(ExecError::new(message.clone())),
+            },
+            "public" => Ok(Some(FieldValue::Json(Json::Bool(self.public)))),
+            "updatedAt" => Ok(Some(FieldValue::Json(Json::Str(self.updated_at.clone())))),
+            "viewerCanManage" => Ok(Some(FieldValue::Json(Json::Bool(self.viewer_can_manage)))),
+            "viewerHasAsDefault" => Ok(Some(FieldValue::Json(Json::Bool(
+                self.viewer_has_as_default,
+            )))),
+            "viewerHasStarred" => Ok(Some(FieldValue::Json(Json::Bool(self.viewer_has_starred)))),
+            _ => Ok(None),
+        }
+    }
+}
+
+/// `Namespace` interface value. The M9.8hq database seam exposes only the
+/// `id`/`username` (user) or `id`/`name` (org) columns, so fields beyond the
+/// interface contract are not ported here.
+struct NamespaceObject {
+    namespace: NamespaceResolver,
+}
+
+impl ObjectValue for NamespaceObject {
+    fn type_name(&self) -> &'static str {
+        match self.namespace {
+            NamespaceResolver::User(_) => "User",
+            NamespaceResolver::Org(_) => "Org",
+        }
+    }
+
+    fn field(
+        &self,
+        field: &str,
+        _arguments: &Arguments,
+        _actor: Actor,
+    ) -> Result<Option<FieldValue>, ExecError> {
+        match field {
+            "id" => Ok(Some(FieldValue::Json(Json::Str(self.namespace.id())))),
+            "namespaceName" => Ok(Some(FieldValue::Json(Json::Str(
+                self.namespace.namespace_name().to_owned(),
+            )))),
+            "url" => Ok(Some(FieldValue::Json(Json::Str(self.namespace.url())))),
+            "username" => Ok(self
+                .namespace
+                .as_user()
+                .map(|user| FieldValue::Json(Json::Str(user.username.clone())))),
+            "name" => Ok(self
+                .namespace
+                .as_org()
+                .map(|org| FieldValue::Json(Json::Str(org.name.clone())))),
+            _ => Ok(None),
+        }
+    }
+}
+
+struct SearchContextConnectionObject {
+    nodes: Vec<Arc<SearchContextObject>>,
+    total_count: i32,
+    page_info: PageInfo,
+}
+
+impl ObjectValue for SearchContextConnectionObject {
+    fn type_name(&self) -> &'static str {
+        "SearchContextConnection"
+    }
+
+    fn field(
+        &self,
+        field: &str,
+        _arguments: &Arguments,
+        _actor: Actor,
+    ) -> Result<Option<FieldValue>, ExecError> {
+        match field {
+            "nodes" => Ok(Some(FieldValue::List {
+                items: self
+                    .nodes
+                    .iter()
+                    .map(|node| FieldValue::Object(node.clone()))
+                    .collect(),
+                element_type: Some("SearchContext"),
+            })),
+            "totalCount" => Ok(Some(FieldValue::Json(Json::Int(i64::from(
+                self.total_count,
+            ))))),
+            "pageInfo" => Ok(Some(FieldValue::Object(Arc::new(PageInfoObject::new(
+                self.page_info.has_next_page,
+                self.page_info.end_cursor.clone(),
+            ))))),
+            _ => Ok(None),
+        }
+    }
+}
+
+struct SearchContextRepositoryRevisionsObject {
+    repository: RepositoryResolver,
+    revisions: Vec<String>,
+}
+
+impl ObjectValue for SearchContextRepositoryRevisionsObject {
+    fn type_name(&self) -> &'static str {
+        "SearchContextRepositoryRevisions"
+    }
+
+    fn field(
+        &self,
+        field: &str,
+        _arguments: &Arguments,
+        _actor: Actor,
+    ) -> Result<Option<FieldValue>, ExecError> {
+        match field {
+            "repository" => Ok(Some(FieldValue::Object(Arc::new(
+                RepositorySummaryObject {
+                    repository: self.repository.clone(),
+                },
+            )))),
+            "revisions" => Ok(Some(FieldValue::List {
+                items: self
+                    .revisions
+                    .iter()
+                    .map(|revision| FieldValue::Json(Json::Str(revision.clone())))
+                    .collect(),
+                element_type: Some("String"),
+            })),
+            _ => Ok(None),
+        }
+    }
+}
+
+/// `MinimalRepositoryResolver`-backed `Repository` value (the M9.8hq seam only
+/// carries `id` and `name`).
+struct RepositorySummaryObject {
+    repository: RepositoryResolver,
+}
+
+impl ObjectValue for RepositorySummaryObject {
+    fn type_name(&self) -> &'static str {
+        "Repository"
+    }
+
+    fn field(
+        &self,
+        field: &str,
+        _arguments: &Arguments,
+        _actor: Actor,
+    ) -> Result<Option<FieldValue>, ExecError> {
+        match field {
+            "id" => Ok(Some(FieldValue::Json(Json::Str(self.repository.id())))),
+            "name" => Ok(Some(FieldValue::Json(Json::Str(
+                self.repository.name().to_owned(),
+            )))),
+            "url" => Ok(Some(FieldValue::Json(Json::Str(self.repository.url())))),
             _ => Ok(None),
         }
     }

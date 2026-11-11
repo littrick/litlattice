@@ -402,6 +402,9 @@ pub struct SchemaGraphqlDeps {
     site_configuration: Option<crate::site_configuration_mutation::SiteConfigurationDeps>,
     /// `Query.repositories`'s database seam; `None` in transport-only tests.
     repositories_connections: Option<Arc<dyn crate::repositories::RepositoriesConnectionStore>>,
+    /// `SearchContextsResolver`'s database seam (M9.8hz); `None` reproduces an
+    /// absent optional resolver (SDL not appended, root fields/types absent).
+    search_contexts: Option<crate::graphql_resolvers::SearchContextsDatabaseHandle>,
 }
 
 impl SchemaGraphqlDeps {
@@ -427,6 +430,7 @@ impl SchemaGraphqlDeps {
             feature_flags: None,
             site_configuration: None,
             repositories_connections: None,
+            search_contexts: None,
         }
     }
 
@@ -469,6 +473,7 @@ impl SchemaGraphqlDeps {
             repositories_connections: Some(Arc::new(
                 crate::repositories::PgRepositoriesConnectionStore::new(pool),
             )),
+            search_contexts: None,
         }
     }
 
@@ -587,6 +592,46 @@ impl SchemaGraphqlDeps {
         self
     }
 
+    /// Enable the search contexts GraphQL surface (M9.8hz): append the
+    /// `searchContexts.graphql` SDL to the assembled schema and hand the
+    /// database seam to the executor's root objects.
+    ///
+    /// This mirrors `NewSchema`'s
+    /// `schemaResolver.SearchContextsResolver != nil` branch: the optional
+    /// resolver is present, so the root fields and Node kind are registered.
+    pub fn with_search_contexts(
+        mut self,
+        db: crate::graphql_resolvers::SearchContextsDatabaseHandle,
+    ) -> Result<Self, sg_graphql::schema::SchemaError> {
+        let registered = crate::search_contexts_schema::register_search_contexts_schema(
+            &self.schema,
+            Some(db.as_ref()),
+        )?;
+        self.schema = Arc::new(registered.schema);
+        self.search_contexts = Some(db);
+        Ok(self)
+    }
+
+    /// `internal/searchcontexts/init.go:26`'s switch: register the surface
+    /// only when `enabled` **and** `searchcontexts.IsEnabled()`. When either is
+    /// false the base schema stays untouched, reproducing the optional
+    /// resolver's absence.
+    pub fn with_search_contexts_switch(
+        mut self,
+        db: crate::graphql_resolvers::SearchContextsDatabaseHandle,
+        enabled: bool,
+    ) -> Result<Self, sg_graphql::schema::SchemaError> {
+        let registered = crate::search_contexts_schema::register_with_switch(
+            &self.schema,
+            db.as_ref(),
+            enabled,
+        )?;
+        let enabled = registered.is_enabled();
+        self.schema = Arc::new(registered.schema);
+        self.search_contexts = enabled.then_some(db);
+        Ok(self)
+    }
+
     /// Test hook: inject the store/user lookup without Redis or Postgres.
     #[cfg(test)]
     fn with_session_parts(
@@ -622,6 +667,7 @@ impl SchemaGraphqlDeps {
             feature_flags: None,
             site_configuration: None,
             repositories_connections: None,
+            search_contexts: None,
         }
     }
 }
@@ -1039,7 +1085,8 @@ impl GraphqlDeps for SchemaGraphqlDeps {
             .with_external_services(external_services)
             .with_webhook_logs(webhook_logs)
             .with_repositories_connections(repositories_connections)
-            .with_mutation(mutation);
+            .with_mutation(mutation)
+            .with_search_contexts(self.search_contexts.clone());
         if let Some(client_configuration) = client_configuration {
             roots = roots.with_client_configuration(client_configuration);
         }
