@@ -3,16 +3,14 @@
 //! Production adapters for [`sg_session::auth`]: the Redis session store and
 //! the `users` lookup.
 //!
-//! * [`RedisSessionStore`] is `redistore.load`: `GET session_<id>`, with a
-//!   lazily established `sg_redis::KeyValue`. The baseline's redigo pool is
-//!   also lazy and reconnects on demand; a failed connect makes this request
-//!   fail with [`sg_session::SessionStoreError`] (the HTTP layer answers the
-//!   baseline's 500 `failed to read session actor` and keeps the cookie).
+//! * [`RedisSessionStore`] is `redistore.load`/`save`/`delete`: `GET`,
+//!   `SETEX` and `DEL` on `session_<id>`, with a lazily established
+//!   `sg_redis::KeyValue`. The baseline's redigo pool is also lazy and
+//!   reconnects on demand; a failed connect makes this request fail with
+//!   [`sg_session::SessionStoreError`] (the HTTP layer answers the baseline's
+//!   500 `failed to read session actor` and keeps the cookie).
 //! * [`PgSessionUsers`] is `db.Users().GetByID` restricted to the columns the
 //!   session check and `User` resolvers read.
-//!
-//! Session writes (`SetData`, `deleteSession`, renewal) are not ported yet;
-//! the read path only needs `load`.
 
 use async_trait::async_trait;
 use sqlx::PgPool;
@@ -67,6 +65,27 @@ impl SessionStore for RedisSessionStore {
     async fn load(&self, id: &str) -> Result<Option<Vec<u8>>, SessionStoreError> {
         let kv = self.kv().await?;
         kv.get(&Self::key(id))
+            .await
+            .map_err(|error| SessionStoreError(error.to_string()))
+    }
+
+    /// `redistore.save`: `SETEX session_<id> <MaxAge|1200> <gob>`.
+    async fn save(
+        &self,
+        id: &str,
+        payload: Vec<u8>,
+        ttl_seconds: i64,
+    ) -> Result<(), SessionStoreError> {
+        let kv = self.kv().await?;
+        kv.set_ex(&Self::key(id), ttl_seconds, payload)
+            .await
+            .map_err(|error| SessionStoreError(error.to_string()))
+    }
+
+    /// `redistore.delete`: `DEL session_<id>`.
+    async fn delete(&self, id: &str) -> Result<(), SessionStoreError> {
+        let kv = self.kv().await?;
+        kv.del(&Self::key(id))
             .await
             .map_err(|error| SessionStoreError(error.to_string()))
     }

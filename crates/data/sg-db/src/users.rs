@@ -484,6 +484,51 @@ LIMIT 1
     Ok(row.as_ref().map(scan_user_session_row))
 }
 
+/// `userStore.InvalidateSessionsByIDs` (`internal/database/users.go:1026-1060`):
+/// one transaction, `updated_at` and `invalidated_sessions_at` both bumped by
+/// the database clock. Fewer affected rows than requested is the baseline's
+/// `userNotFoundErr` (`errcode.IsNotFound`); the transaction is rolled back.
+pub async fn invalidate_sessions_by_ids(pool: &PgPool, ids: &[i32]) -> Result<(), DbError> {
+    // The baseline would render `IN ()` (a SQL error) for an empty list; no
+    // caller does that (`InvalidateSessionCurrentUser` always passes one ID).
+    if ids.is_empty() {
+        return Ok(());
+    }
+
+    let mut tx = pool.begin().await.map_err(DbError::database)?;
+    let mut builder: QueryBuilder<'_, sqlx::Postgres> = QueryBuilder::new(
+        "UPDATE users SET updated_at=now(), invalidated_sessions_at=now() WHERE id IN (",
+    );
+    {
+        let mut separated = builder.separated(", ");
+        for id in ids {
+            separated.push_bind(*id);
+        }
+        separated.push_unseparated(")");
+    }
+    let result = builder
+        .build()
+        .execute(&mut *tx)
+        .await
+        .map_err(DbError::database)?;
+
+    let invalidated = result.rows_affected();
+    if invalidated != ids.len() as u64 {
+        let _ = tx.rollback().await;
+        return Err(DbError {
+            message: format!(
+                "user not found: [Some users were not found. Expected to invalidate sessions of {} users, but invalidated sessions only {}]",
+                ids.len(),
+                invalidated
+            ),
+            not_found: true,
+        });
+    }
+
+    tx.commit().await.map_err(DbError::database)?;
+    Ok(())
+}
+
 /// `userStore.GetByUsername` (`internal/database/users.go:996-998`):
 /// `username` is citext, so the comparison is case-insensitive.
 pub async fn find_user_by_username(
