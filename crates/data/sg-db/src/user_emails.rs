@@ -9,7 +9,48 @@
 //! lookup failure is replaced with the baseline's fixed message.
 
 use sqlx::postgres::PgPool;
+use sqlx::types::time::OffsetDateTime;
 use sqlx::Row;
+
+/// `database.UserEmail`, reduced to the fields commit-search username expansion
+/// reads (`internal/database/user_emails.go:17-25`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserEmail {
+    pub user_id: i32,
+    pub email: String,
+    /// `VerifiedAt`; only verified addresses are expanded to commit-author
+    /// regexes (`internal/search/commit/commit.go:190-193`).
+    pub verified_at: Option<OffsetDateTime>,
+}
+
+/// `userEmailsStore.ListByUser` (`internal/database/user_emails.go:338-356`):
+/// the user's addresses ordered by `created_at ASC, email ASC`, optionally
+/// restricted to verified ones.
+pub async fn list_by_user(
+    pool: &PgPool,
+    user_id: i32,
+    only_verified: bool,
+) -> Result<Vec<UserEmail>, sqlx::Error> {
+    let rows = sqlx::query(
+        "SELECT user_id, email, verified_at FROM user_emails \
+         WHERE user_id=$1 AND (NOT $2 OR verified_at IS NOT NULL) \
+         ORDER BY created_at ASC, email ASC",
+    )
+    .bind(user_id)
+    .bind(only_verified)
+    .fetch_all(pool)
+    .await?;
+
+    rows.into_iter()
+        .map(|row| {
+            Ok(UserEmail {
+                user_id: row.try_get("user_id")?,
+                email: row.try_get("email")?,
+                verified_at: row.try_get("verified_at")?,
+            })
+        })
+        .collect()
+}
 
 /// `userEmailsStore.GetInitialSiteAdminInfo`.
 ///
