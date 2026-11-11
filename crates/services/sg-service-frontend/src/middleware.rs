@@ -470,6 +470,16 @@ pub fn internal_handler(
         let graphql_deps = Arc::clone(&graphql_deps);
         let search_deps = Arc::clone(&search_deps);
         Box::pin(async move {
+            // `actor.HTTPMiddleware` is the only place the internal listener
+            // trusts `X-Sourcegraph-Actor-UID`. The resolved actor is not
+            // threaded through `internal_api` yet (the internal GraphQL route
+            // still forces an anonymous actor); the header's validation and
+            // rejection are wired here.
+            if let crate::actor_middleware::ActorHeaderDecision::Reject { status, body } =
+                crate::actor_middleware::apply_actor_header(req.headers())
+            {
+                return crate::actor_middleware::actor_header_reject_response(status, body);
+            }
             crate::internal_api::internal_response_with_deps(
                 &mut req,
                 &live,
