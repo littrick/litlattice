@@ -352,6 +352,7 @@ async fn run_case(case: &Case) -> Output {
         users: Arc::new(FakeUsers),
         events: Arc::new(FakeEvents),
         resolvers: Arc::new(OAuthUserResolverRegistry::new()),
+        oidc: None,
     };
     let request = build_request(case, &pc);
     let now = OffsetDateTime::from_unix_timestamp(NOW_UNIX).expect("timestamp");

@@ -299,6 +299,9 @@ async fn run_case(case: &Case) -> Output {
         users: Arc::new(FakeUsers),
         events: Arc::new(FakeEvents),
         resolvers: Arc::new(OAuthUserResolverRegistry::new()),
+        // M9.8jo pins the pre-M9.8js dispatch; the OIDC middleware has its own
+        // differential (`run_oidc_middleware_diff.sh`).
+        oidc: None,
     };
     let mut request = build_request(case);
     if let Some(state) = state_param(case) {

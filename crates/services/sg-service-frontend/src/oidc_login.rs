@@ -898,10 +898,29 @@ impl OidcLoginResolver {
                 return result;
             }
         };
-        result.provider = Some(provider.clone());
+        self.authorize_with_provider(&provider, access_token, token_type, raw_id_token)
+            .await
+    }
+
+    /// The part of [`Self::authorize`] after discovery. The OIDC middleware has
+    /// already created the provider (one discovery request for the whole
+    /// callback, like `GetProviderAndClient` + `Verifier` + `UserInfo` in the
+    /// baseline), so it calls this directly. Validation order and messages are
+    /// identical to [`Self::authorize`].
+    pub async fn authorize_with_provider(
+        &self,
+        provider: &OidcProvider,
+        access_token: &str,
+        token_type: &str,
+        raw_id_token: &str,
+    ) -> OidcAuthResult {
+        let mut result = OidcAuthResult {
+            provider: Some(provider.clone()),
+            ..Default::default()
+        };
 
         let id_token = match verify_id_token(
-            &provider,
+            provider,
             &*self.http,
             raw_id_token,
             &self.config.client_id,
