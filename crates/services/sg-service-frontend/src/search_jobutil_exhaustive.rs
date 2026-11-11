@@ -32,8 +32,8 @@
 
 use sg_search_query::basic::{q_string_value, Basic, Plan};
 use sg_search_query::fields::{
-    FIELD_AUTHOR, FIELD_COMMITTER, FIELD_CONTENT, FIELD_FILE, FIELD_LANG, FIELD_MESSAGE,
-    FIELD_SELECT,
+    FIELD_AFTER, FIELD_AUTHOR, FIELD_BEFORE, FIELD_COMMITTER, FIELD_CONTENT, FIELD_FILE,
+    FIELD_LANG, FIELD_MESSAGE, FIELD_SELECT,
 };
 use sg_search_query::labels::Labels;
 use sg_search_query::node::{go_quote, visit_field, Node, OperatorKind, Parameter, Pattern};
@@ -100,24 +100,38 @@ pub enum GitOperatorKind {
     Not,
 }
 
-/// Minimal `gitprotocol.Node`. `IgnoreCase`/`RevAtTime` do not affect the
-/// rendered `String`, so they are not stored.
+/// Minimal `gitprotocol.Node`. `RevAtTime` does not affect the rendered
+/// `String`; `IgnoreCase` is kept because `mergeOrRegexp` keys on it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GitQueryNode {
     AuthorMatches {
         expr: String,
+        ignore_case: bool,
     },
     CommitterMatches {
         expr: String,
+        ignore_case: bool,
     },
     MessageMatches {
         expr: String,
+        ignore_case: bool,
     },
     DiffMatches {
         expr: String,
+        ignore_case: bool,
     },
     DiffModifiesFile {
         expr: String,
+        ignore_case: bool,
+    },
+    /// `*gitprotocol.CommitBefore`; the rendered time is stored because
+    /// `Time.String()` is the only observable form.
+    CommitBefore {
+        time: String,
+    },
+    /// `*gitprotocol.CommitAfter`.
+    CommitAfter {
+        time: String,
     },
     Boolean(bool),
     Operator {
@@ -138,6 +152,7 @@ impl GitQueryNode {
                 operands.iter().map(GitQueryNode::estimated_cost).sum()
             }
             GitQueryNode::Boolean(_) => 0.0,
+            GitQueryNode::CommitBefore { .. } | GitQueryNode::CommitAfter { .. } => 1.0,
             GitQueryNode::AuthorMatches { .. } | GitQueryNode::CommitterMatches { .. } => 5.0,
             GitQueryNode::MessageMatches { .. } => 10.0,
             GitQueryNode::DiffModifiesFile { .. } => 1000.0,
@@ -150,19 +165,23 @@ impl std::fmt::Display for GitQueryNode {
     /// `gitprotocol.Node.String`.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            GitQueryNode::AuthorMatches { expr } => {
+            GitQueryNode::AuthorMatches { expr, .. } => {
                 write!(f, "*protocol.AuthorMatches({expr})")
             }
-            GitQueryNode::CommitterMatches { expr } => {
+            GitQueryNode::CommitterMatches { expr, .. } => {
                 write!(f, "*protocol.CommitterMatches({expr})")
             }
-            GitQueryNode::MessageMatches { expr } => {
+            GitQueryNode::MessageMatches { expr, .. } => {
                 write!(f, "*protocol.MessageMatches({expr})")
             }
-            GitQueryNode::DiffMatches { expr } => write!(f, "*protocol.DiffMatches({expr})"),
-            GitQueryNode::DiffModifiesFile { expr } => {
+            GitQueryNode::DiffMatches { expr, .. } => write!(f, "*protocol.DiffMatches({expr})"),
+            GitQueryNode::DiffModifiesFile { expr, .. } => {
                 write!(f, "*protocol.DiffModifiesFile({expr})")
             }
+            GitQueryNode::CommitBefore { time } => {
+                write!(f, "*protocol.CommitBefore({time})")
+            }
+            GitQueryNode::CommitAfter { time } => write!(f, "*protocol.CommitAfter({time})"),
             GitQueryNode::Boolean(value) => write!(f, "*protocol.Boolean({value})"),
             GitQueryNode::Operator { kind, operands } => {
                 let (sep, prefix) = match kind {
@@ -308,9 +327,141 @@ fn sort_and_by_cost(node: GitQueryNode) -> GitQueryNode {
     GitQueryNode::operator(GitOperatorKind::And, operands)
 }
 
-/// `Reduce` with the deterministic default passes. `rewriteConjunctive` and
-/// `mergeOrRegexp` are not ported (the latter iterates a Go map); the corpus
-/// avoids OR patterns so they are unobservable.
+/// `rewriteConjunctive` (`search_reduce.go:90-119`).
+fn rewrite_conjunctive(node: GitQueryNode) -> GitQueryNode {
+    let GitQueryNode::Operator {
+        kind: GitOperatorKind::Or,
+        operands,
+    } = node
+    else {
+        return node;
+    };
+
+    let mut and_operands: Vec<Vec<GitQueryNode>> = Vec::new();
+    let mut siblings: Vec<GitQueryNode> = Vec::new();
+    for operand in operands {
+        match operand {
+            GitQueryNode::Operator {
+                kind: GitOperatorKind::And,
+                operands,
+            } => and_operands.push(operands),
+            other => siblings.push(other),
+        }
+    }
+
+    if and_operands.is_empty() {
+        // No nested and operands, so don't modify the node.
+        return GitQueryNode::operator(GitOperatorKind::Or, siblings);
+    }
+
+    let distributed = distribute(&and_operands, &siblings);
+    let new_and_operands = distributed
+        .into_iter()
+        .map(|row| GitQueryNode::operator(GitOperatorKind::Or, row))
+        .collect();
+    GitQueryNode::operator(GitOperatorKind::And, new_and_operands)
+}
+
+/// `distribute` (`search_reduce.go:121-135`): expand prefixes into every
+/// choice of one node from each prefix, appending each to `nodes`.
+fn distribute(prefixes: &[Vec<GitQueryNode>], nodes: &[GitQueryNode]) -> Vec<Vec<GitQueryNode>> {
+    if prefixes.is_empty() {
+        return vec![nodes.to_vec()];
+    }
+
+    let distributed = distribute(&prefixes[1..], nodes);
+    let mut result = Vec::with_capacity(distributed.len() * prefixes[0].len());
+    for prefix in &prefixes[0] {
+        for row in &distributed {
+            let mut new_row = row.clone();
+            new_row.push(prefix.clone());
+            result.push(new_row);
+        }
+    }
+    result
+}
+
+/// `mergeOrRegexp` (`search_reduce.go:159-235`). The baseline iterates a Go
+/// map, whose order is unspecified; this port uses a `BTreeMap` keyed by node
+/// kind (and `IgnoreCase`) so a single mergeable key (the corpus case) is
+/// byte-identical and multiple keys are deterministic rather than random.
+fn merge_or_regexp(node: GitQueryNode) -> GitQueryNode {
+    let GitQueryNode::Operator {
+        kind: GitOperatorKind::Or,
+        operands,
+    } = node
+    else {
+        return node;
+    };
+
+    fn union(left: &str, right: &str) -> String {
+        format!("(?:{left})|(?:{right})")
+    }
+
+    #[derive(PartialEq, Eq, PartialOrd, Ord)]
+    enum Key {
+        Author(bool),
+        Committer(bool),
+        Message(bool),
+        Diff(bool),
+        DiffModifiesFile(bool),
+    }
+
+    let mut unmergeable: Vec<GitQueryNode> = Vec::new();
+    let mut mergeable: std::collections::BTreeMap<Key, GitQueryNode> =
+        std::collections::BTreeMap::new();
+    for operand in operands {
+        match operand {
+            GitQueryNode::AuthorMatches { expr, ignore_case } => {
+                let key = Key::Author(ignore_case);
+                let expr = match mergeable.remove(&key) {
+                    Some(GitQueryNode::AuthorMatches { expr: prev, .. }) => union(&prev, &expr),
+                    _ => expr,
+                };
+                mergeable.insert(key, GitQueryNode::AuthorMatches { expr, ignore_case });
+            }
+            GitQueryNode::CommitterMatches { expr, ignore_case } => {
+                let key = Key::Committer(ignore_case);
+                let expr = match mergeable.remove(&key) {
+                    Some(GitQueryNode::CommitterMatches { expr: prev, .. }) => union(&prev, &expr),
+                    _ => expr,
+                };
+                mergeable.insert(key, GitQueryNode::CommitterMatches { expr, ignore_case });
+            }
+            GitQueryNode::MessageMatches { expr, ignore_case } => {
+                let key = Key::Message(ignore_case);
+                let expr = match mergeable.remove(&key) {
+                    Some(GitQueryNode::MessageMatches { expr: prev, .. }) => union(&prev, &expr),
+                    _ => expr,
+                };
+                mergeable.insert(key, GitQueryNode::MessageMatches { expr, ignore_case });
+            }
+            GitQueryNode::DiffMatches { expr, ignore_case } => {
+                let key = Key::Diff(ignore_case);
+                let expr = match mergeable.remove(&key) {
+                    Some(GitQueryNode::DiffMatches { expr: prev, .. }) => union(&prev, &expr),
+                    _ => expr,
+                };
+                mergeable.insert(key, GitQueryNode::DiffMatches { expr, ignore_case });
+            }
+            GitQueryNode::DiffModifiesFile { expr, ignore_case } => {
+                let key = Key::DiffModifiesFile(ignore_case);
+                let expr = match mergeable.remove(&key) {
+                    Some(GitQueryNode::DiffModifiesFile { expr: prev, .. }) => union(&prev, &expr),
+                    _ => expr,
+                };
+                mergeable.insert(key, GitQueryNode::DiffModifiesFile { expr, ignore_case });
+            }
+            other => unmergeable.push(other),
+        }
+    }
+
+    let mut result = unmergeable;
+    result.extend(mergeable.into_values());
+    GitQueryNode::operator(GitOperatorKind::Or, result)
+}
+
+/// `Reduce` with the baseline's default passes (`search_reduce.go:7-37`).
 fn reduce(node: GitQueryNode) -> GitQueryNode {
     let mut node = match node {
         GitQueryNode::Operator { kind, operands } => {
@@ -319,20 +470,28 @@ fn reduce(node: GitQueryNode) -> GitQueryNode {
         other => other,
     };
     node = propagate_boolean(node);
+    node = rewrite_conjunctive(node);
     node = flatten(node);
+    node = merge_or_regexp(node);
     node = sort_and_by_cost(node);
     node
 }
 
-/// `queryPatternToPredicate` (`commit.go:247-257`).
-fn query_pattern_to_predicate(node: Option<&Node>, diff: bool) -> Option<GitQueryNode> {
+/// `queryPatternToPredicate` (`commit.go:238-270`).
+fn query_pattern_to_predicate(
+    node: Option<&Node>,
+    case_sensitive: bool,
+    diff: bool,
+) -> Option<GitQueryNode> {
     let node = node?;
     match node {
         Node::Operator(operator) => {
             let operands = operator
                 .operands
                 .iter()
-                .filter_map(|operand| query_pattern_to_predicate(Some(operand), diff))
+                .filter_map(|operand| {
+                    query_pattern_to_predicate(Some(operand), case_sensitive, diff)
+                })
                 .collect::<Vec<_>>();
             match operator.kind {
                 OperatorKind::And => Some(new_and(operands)),
@@ -340,18 +499,19 @@ fn query_pattern_to_predicate(node: Option<&Node>, diff: bool) -> Option<GitQuer
                 OperatorKind::Concat => None,
             }
         }
-        Node::Pattern(pattern) => Some(pattern_atom_to_predicate(pattern, diff)),
+        Node::Pattern(pattern) => Some(pattern_atom_to_predicate(pattern, case_sensitive, diff)),
         Node::Parameter(_) => None,
     }
 }
 
-/// `patternAtomToPredicate` (`commit.go:275-290`).
-fn pattern_atom_to_predicate(pattern: &Pattern, diff: bool) -> GitQueryNode {
+/// `patternAtomToPredicate` (`commit.go:272-286`).
+fn pattern_atom_to_predicate(pattern: &Pattern, case_sensitive: bool, diff: bool) -> GitQueryNode {
     let expr = pattern.regexp_pattern();
+    let ignore_case = !case_sensitive;
     let atom = if diff {
-        GitQueryNode::DiffMatches { expr }
+        GitQueryNode::DiffMatches { expr, ignore_case }
     } else {
-        GitQueryNode::MessageMatches { expr }
+        GitQueryNode::MessageMatches { expr, ignore_case }
     };
     if pattern.negated {
         new_not(atom)
@@ -360,23 +520,52 @@ fn pattern_atom_to_predicate(pattern: &Pattern, diff: bool) -> GitQueryNode {
     }
 }
 
-/// `queryParameterToPredicate` (`commit.go:292-325`).
-fn query_parameter_to_predicate(parameter: &Parameter, diff: bool) -> Option<GitQueryNode> {
+/// `queryParameterToPredicate` (`commit.go:288-325`).
+fn query_parameter_to_predicate(
+    parameter: &Parameter,
+    case_sensitive: bool,
+    diff: bool,
+) -> Option<GitQueryNode> {
     let value = parameter.value.clone();
+    let ignore_case = !case_sensitive;
     let predicate = match parameter.field.as_str() {
-        FIELD_AUTHOR => Some(GitQueryNode::AuthorMatches { expr: value }),
-        FIELD_COMMITTER => Some(GitQueryNode::CommitterMatches { expr: value }),
-        FIELD_MESSAGE => Some(GitQueryNode::MessageMatches { expr: value }),
-        FIELD_CONTENT => Some(if diff {
-            GitQueryNode::DiffMatches { expr: value }
-        } else {
-            GitQueryNode::MessageMatches { expr: value }
+        FIELD_AUTHOR => Some(GitQueryNode::AuthorMatches {
+            expr: value,
+            ignore_case,
         }),
-        FIELD_FILE => Some(GitQueryNode::DiffModifiesFile { expr: value }),
+        FIELD_COMMITTER => Some(GitQueryNode::CommitterMatches {
+            expr: value,
+            ignore_case,
+        }),
+        FIELD_BEFORE => Some(GitQueryNode::CommitBefore {
+            time: parse_git_date(&value)?,
+        }),
+        FIELD_AFTER => Some(GitQueryNode::CommitAfter {
+            time: parse_git_date(&value)?,
+        }),
+        FIELD_MESSAGE => Some(GitQueryNode::MessageMatches {
+            expr: value,
+            ignore_case,
+        }),
+        FIELD_CONTENT => Some(if diff {
+            GitQueryNode::DiffMatches {
+                expr: value,
+                ignore_case,
+            }
+        } else {
+            GitQueryNode::MessageMatches {
+                expr: value,
+                ignore_case,
+            }
+        }),
+        FIELD_FILE => Some(GitQueryNode::DiffModifiesFile {
+            expr: value,
+            ignore_case,
+        }),
         FIELD_LANG => Some(GitQueryNode::DiffModifiesFile {
             expr: lang_to_file_regexp(&value),
+            ignore_case: true,
         }),
-        // `before:`/`after:` (`CommitBefore`/`CommitAfter`) are not modelled.
         _ => None,
     };
     match (parameter.negated, predicate) {
@@ -385,22 +574,212 @@ fn query_parameter_to_predicate(parameter: &Parameter, diff: bool) -> Option<Git
     }
 }
 
-/// `commit.QueryToGitQuery` (`commit.go:213-240`). `caseSensitive` only
-/// affects the (unrendered) `IgnoreCase` flag, so it is not threaded through.
+/// `commit.QueryToGitQuery` (`commit.go:213-236`).
 fn query_to_git_query(basic: &Basic, diff: bool) -> GitQueryNode {
+    let case_sensitive = basic.parameters.is_case_sensitive();
     let mut nodes = Vec::with_capacity(basic.parameters.len() + 2);
     for parameter in basic.parameters.iter() {
         if parameter.annotation.labels.is_set(Labels::IS_PREDICATE) {
             continue;
         }
-        if let Some(predicate) = query_parameter_to_predicate(parameter, diff) {
+        if let Some(predicate) = query_parameter_to_predicate(parameter, case_sensitive, diff) {
             nodes.push(predicate);
         }
     }
-    if let Some(predicate) = query_pattern_to_predicate(basic.pattern.as_ref(), diff) {
+    if let Some(predicate) =
+        query_pattern_to_predicate(basic.pattern.as_ref(), case_sensitive, diff)
+    {
         nodes.push(predicate);
     }
     reduce(new_and(nodes))
+}
+
+/// `gitdomain.ParseGitDate` (`date.go:17-90`), returning the rendered
+/// `time.Time.String()` that `CommitBefore`/`CommitAfter` emit.
+///
+/// The deterministic layouts are ported; the `go-naturaldate` fallback is
+/// not (see the slice overview §4).
+fn parse_git_date(value: &str) -> Option<String> {
+    use time::format_description::well_known::Rfc3339;
+    use time::{Date, OffsetDateTime, PrimitiveDateTime, Time, UtcOffset};
+
+    fn render(datetime: OffsetDateTime, location: &str) -> String {
+        let offset = datetime.offset();
+        let offset_str = if offset.is_utc() {
+            "+0000".to_owned()
+        } else {
+            let seconds = offset.whole_seconds();
+            let sign = if seconds < 0 { '-' } else { '+' };
+            let seconds = seconds.abs();
+            format!("{sign}{:02}{:02}", seconds / 3600, (seconds % 3600) / 60)
+        };
+        format!(
+            "{:04}-{:02}-{:02} {:02}:{:02}:{:02} {offset_str} {location}",
+            datetime.year(),
+            datetime.month() as u8,
+            datetime.day(),
+            datetime.hour(),
+            datetime.minute(),
+            datetime.second(),
+        )
+    }
+
+    fn numeric_location(offset: UtcOffset) -> String {
+        if offset.is_utc() {
+            "+0000".to_owned()
+        } else {
+            let seconds = offset.whole_seconds();
+            let sign = if seconds < 0 { '-' } else { '+' };
+            let seconds = seconds.abs();
+            format!("{sign}{:02}{:02}", seconds / 3600, (seconds % 3600) / 60)
+        }
+    }
+
+    // Git internal format: epoch seconds plus an optional ±HHMM offset.
+    if let Some((epoch, zone)) = parse_git_internal(value) {
+        let datetime = OffsetDateTime::from_unix_timestamp(epoch).ok()?;
+        let offset = match zone {
+            Some((sign, hours, minutes)) => {
+                let seconds = ((hours * 3600 + minutes * 60) * sign) as i32;
+                UtcOffset::from_whole_seconds(seconds).ok()?
+            }
+            None => UtcOffset::UTC,
+        };
+        let datetime = datetime.to_offset(offset);
+        return Some(render(datetime, &numeric_location(offset)));
+    }
+
+    // Deterministic fixed layouts (in the baseline's order).
+    const DATE: &[time::format_description::FormatItem<'static>] =
+        time::macros::format_description!("[year]-[month]-[day]");
+    const DATE_TIME: &[time::format_description::FormatItem<'static>] =
+        time::macros::format_description!("[year]-[month]-[day]T[hour]:[minute]:[second]");
+    const DATE_TIME_SPACE: &[time::format_description::FormatItem<'static>] =
+        time::macros::format_description!("[year]-[month]-[day] [hour]:[minute]:[second]");
+    const DATE_TIME_SPACE_ZONE: &[time::format_description::FormatItem<'static>] = time::macros::format_description!(
+        "[year]-[month]-[day] [hour]:[minute]:[second][offset_hour sign:mandatory]:[offset_minute]"
+    );
+    const RFC2822: &[time::format_description::FormatItem<'static>] =
+        time::macros::format_description!(
+            "[weekday repr:short], [day] [month repr:short] [year] [hour]:[minute]:[second] [offset_hour sign:mandatory][offset_minute]"
+        );
+    const DOTTED_YMD: &[time::format_description::FormatItem<'static>] =
+        time::macros::format_description!("[year].[month].[day]");
+    const SLASH_MDY: &[time::format_description::FormatItem<'static>] =
+        time::macros::format_description!("[month]/[day]/[year]");
+    const DOTTED_DMY: &[time::format_description::FormatItem<'static>] =
+        time::macros::format_description!("[day].[month].[year]");
+
+    if let Ok(date) = Date::parse(value, DATE) {
+        return Some(render(date.with_time(Time::MIDNIGHT).assume_utc(), "UTC"));
+    }
+    if let Ok(datetime) = OffsetDateTime::parse(value, &Rfc3339) {
+        let name = if datetime.offset().is_utc() {
+            "UTC".to_owned()
+        } else {
+            numeric_location(datetime.offset())
+        };
+        return Some(render(datetime, &name));
+    }
+    if let Ok(datetime) = PrimitiveDateTime::parse(value, DATE_TIME) {
+        return Some(render(datetime.assume_utc(), "UTC"));
+    }
+    if let Ok(datetime) = OffsetDateTime::parse(value, DATE_TIME_SPACE_ZONE) {
+        let name = if datetime.offset().is_utc() {
+            "UTC".to_owned()
+        } else {
+            numeric_location(datetime.offset())
+        };
+        return Some(render(datetime, &name));
+    }
+    if let Ok(datetime) = PrimitiveDateTime::parse(value, DATE_TIME_SPACE) {
+        return Some(render(datetime.assume_utc(), "UTC"));
+    }
+    if let Ok(datetime) = OffsetDateTime::parse(value, RFC2822) {
+        return Some(render(datetime, &numeric_location(datetime.offset())));
+    }
+    if let Ok(date) = Date::parse(value, DOTTED_YMD) {
+        return Some(render(date.with_time(Time::MIDNIGHT).assume_utc(), "UTC"));
+    }
+    if let Ok(date) = Date::parse(value, SLASH_MDY) {
+        return Some(render(date.with_time(Time::MIDNIGHT).assume_utc(), "UTC"));
+    }
+    if let Ok(date) = Date::parse(value, DOTTED_DMY) {
+        return Some(render(date.with_time(Time::MIDNIGHT).assume_utc(), "UTC"));
+    }
+    if let Some(date) = parse_simple_date(value) {
+        return Some(render(date.with_time(Time::MIDNIGHT).assume_utc(), "UTC"));
+    }
+    // `go-naturaldate` is not ported.
+    None
+}
+
+/// `parseGitInternalFormat` (`date.go:93-131`).
+type GitInternalDate = (i64, Option<(i64, i64, i64)>);
+
+fn parse_git_internal(value: &str) -> Option<GitInternalDate> {
+    let mut parts = value.split(' ');
+    let epoch_str = parts.next()?;
+    if epoch_str.len() < 5 || !epoch_str.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let epoch: i64 = epoch_str.parse().ok()?;
+    match parts.next() {
+        None => Some((epoch, None)),
+        Some(zone) if parts.next().is_none() => {
+            let bytes = zone.as_bytes();
+            if bytes.len() != 5
+                || !matches!(bytes[0], b'+' | b'-')
+                || !bytes[1..].iter().all(|byte| byte.is_ascii_digit())
+            {
+                return None;
+            }
+            let hours: i64 = zone[1..3].parse().ok()?;
+            let minutes: i64 = zone[3..5].parse().ok()?;
+            let sign = if bytes[0] == b'-' { -1 } else { 1 };
+            Some((epoch, Some((sign, hours, minutes))))
+        }
+        Some(_) => None,
+    }
+}
+
+/// `parseSimpleDate` (`date.go:135-190`): `Month D, YYYY` / `D Month YYYY`.
+fn parse_simple_date(value: &str) -> Option<time::Date> {
+    fn month(name: &str) -> Option<time::Month> {
+        match name.to_lowercase().as_str() {
+            "january" | "jan" => Some(time::Month::January),
+            "february" | "feb" => Some(time::Month::February),
+            "march" | "mar" => Some(time::Month::March),
+            "april" | "apr" => Some(time::Month::April),
+            "may" => Some(time::Month::May),
+            "june" | "jun" => Some(time::Month::June),
+            "july" | "jul" => Some(time::Month::July),
+            "august" | "aug" => Some(time::Month::August),
+            "september" | "sep" | "sept" => Some(time::Month::September),
+            "october" | "oct" => Some(time::Month::October),
+            "november" | "nov" => Some(time::Month::November),
+            "december" | "dec" => Some(time::Month::December),
+            _ => None,
+        }
+    }
+
+    let tokens: Vec<&str> = value
+        .split(|c: char| c.is_whitespace() || c == ',')
+        .filter(|token| !token.is_empty())
+        .collect();
+    let (month_token, day_token, year_token) = match tokens.as_slice() {
+        [month, day, year] if month.chars().next().is_some_and(|c| c.is_alphabetic()) => {
+            (month, day, year)
+        }
+        [day, month, year] if month.chars().next().is_some_and(|c| c.is_alphabetic()) => {
+            (month, day, year)
+        }
+        _ => return None,
+    };
+    let month = month(month_token)?;
+    let day: u8 = day_token.parse().ok()?;
+    let year: i32 = year_token.parse().ok()?;
+    time::Date::from_calendar_date(year, month, day).ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -1005,5 +1384,83 @@ mod tests {
             resolver.seen.borrow()[1].repo_filters[0].repo,
             "repo1".to_owned()
         );
+    }
+
+    #[test]
+    fn rewrite_conjunctive_distributes_and_over_or() {
+        let node = GitQueryNode::operator(
+            GitOperatorKind::Or,
+            vec![
+                GitQueryNode::operator(
+                    GitOperatorKind::And,
+                    vec![
+                        GitQueryNode::MessageMatches {
+                            expr: "foo".to_owned(),
+                            ignore_case: false,
+                        },
+                        GitQueryNode::MessageMatches {
+                            expr: "bar".to_owned(),
+                            ignore_case: false,
+                        },
+                    ],
+                ),
+                GitQueryNode::MessageMatches {
+                    expr: "baz".to_owned(),
+                    ignore_case: false,
+                },
+            ],
+        );
+        assert_eq!(
+            rewrite_conjunctive(node).to_string(),
+            "((*protocol.MessageMatches(baz) OR *protocol.MessageMatches(foo)) AND \
+             (*protocol.MessageMatches(baz) OR *protocol.MessageMatches(bar)))"
+        );
+    }
+
+    #[test]
+    fn merge_or_regexp_merges_same_kind_and_keeps_unmergeable() {
+        let node = GitQueryNode::operator(
+            GitOperatorKind::Or,
+            vec![
+                GitQueryNode::MessageMatches {
+                    expr: "a".to_owned(),
+                    ignore_case: false,
+                },
+                GitQueryNode::Boolean(true),
+                GitQueryNode::MessageMatches {
+                    expr: "b".to_owned(),
+                    ignore_case: false,
+                },
+            ],
+        );
+        assert_eq!(
+            merge_or_regexp(node).to_string(),
+            "(*protocol.Boolean(true) OR *protocol.MessageMatches((?:a)|(?:b)))"
+        );
+    }
+
+    #[test]
+    fn parses_git_dates_like_time_string() {
+        assert_eq!(
+            parse_git_date("2020-01-02").as_deref(),
+            Some("2020-01-02 00:00:00 +0000 UTC")
+        );
+        assert_eq!(
+            parse_git_date("2020-01-02T03:04:05Z").as_deref(),
+            Some("2020-01-02 03:04:05 +0000 UTC")
+        );
+        assert_eq!(
+            parse_git_date("1700000000").as_deref(),
+            Some("2023-11-14 22:13:20 +0000 +0000")
+        );
+        assert_eq!(
+            parse_git_date("Jan 2, 2020").as_deref(),
+            Some("2020-01-02 00:00:00 +0000 UTC")
+        );
+        assert_eq!(
+            parse_git_date("2 January 2020").as_deref(),
+            Some("2020-01-02 00:00:00 +0000 UTC")
+        );
+        assert_eq!(parse_git_date("not a date"), None);
     }
 }

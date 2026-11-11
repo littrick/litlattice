@@ -21,6 +21,11 @@ pub mod parser;
 pub mod regexp;
 pub mod repo;
 
+/// Re-exported so worker services that already depend on this crate can build
+/// search queries without adding a direct `sg-search-query` dependency
+/// (used by the exhaustive-search searcher's `Plan` port).
+pub use sg_search_query;
+
 pub use builder::{
     add_author_filter, add_file_filter, add_filter, add_repo_filter, add_repo_metadata_filter,
     aggregation_query, build_filter_text, code_insights_query_defaults,

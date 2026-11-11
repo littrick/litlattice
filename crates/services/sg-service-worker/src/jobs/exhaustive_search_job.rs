@@ -21,8 +21,10 @@
 //! `newSearcherFactory`). [`SearchJob`] is registered under
 //! `exhaustive-search-job` in `all_jobs()` and assembles the baseline's seven
 //! routines. Its production searcher factory is
-//! [`FromSearchClient::not_ported`], so handlers dequeue records but fail at
-//! `new_search` until a real `SearchClient` is wired.
+//! [`FromSearchClient::production`] with the plan implemented by
+//! [`crate::jobs::exhaustive_search_searcher::PlanSearchClient`]. Repository
+//! resolution and job execution remain explicit not-ported seams until
+//! `repos.Resolver` and the exhaustive job runner are ported.
 //!
 //! The janitor (`search_jobs_janitor`) lives in
 //! [`crate::jobs::exhaustive_search_janitor`] and is assembled by
@@ -51,7 +53,7 @@ use crate::jobs::exhaustive_search_janitor::{
     new_search_jobs_janitor_routine, storage_config, JobLogsBlobStore, PgJanitorService,
     SearchJobsObjectStorageConfig,
 };
-use crate::jobs::exhaustive_search_searcher::FromSearchClient;
+use crate::jobs::exhaustive_search_searcher::{FromSearchClient, JobClients};
 use crate::jobs::exhaustive_search_service::{
     new_object_storage, ObjectStorageBackend, ObjectStorageLogBlobStore,
     ObjectStorageMatchWriterFactory, ObjectStorageUploadStore, UploadStore,
@@ -550,9 +552,10 @@ pub type NewSearcherFactory = Arc<dyn Fn() -> Arc<dyn NewSearcher> + Send + Sync
 /// `routines` mirrors `searchJob.Routines`: disabled when
 /// [`is_enabled`] is false, otherwise it builds the same lazy object storage
 /// as the M9.8id janitor and assembles the seven routines. The production
-/// searcher factory is [`FromSearchClient::not_ported`] because the real
-/// `SearchClient::plan`/job execution is not ported (M9.8hv); tests and the
-/// differential harness inject a fake through [`WithSearcherFactory`].
+/// searcher factory is [`FromSearchClient::production`]: `client.Plan` is
+/// real, while repository resolution and job execution are explicit
+/// not-ported seams. Tests and the differential harness inject a fake through
+/// [`SearchJob::with_searcher_factory`].
 pub struct SearchJob {
     config: Arc<SearchJobsObjectStorageConfig>,
     new_searcher_factory: NewSearcherFactory,
@@ -560,7 +563,9 @@ pub struct SearchJob {
 
 impl SearchJob {
     pub fn new() -> Self {
-        Self::with_searcher_factory(Arc::new(|| Arc::new(FromSearchClient::not_ported())))
+        Self::with_searcher_factory(Arc::new(|| {
+            Arc::new(FromSearchClient::production(JobClients::not_ported()))
+        }))
     }
 
     /// The baseline's `newSearcherFactory` seam. Production uses
