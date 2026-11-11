@@ -80,6 +80,7 @@ pub mod codeintel_upload_backfiller;
 pub mod codeintel_upload_expirer;
 pub mod codeintel_upload_janitor;
 pub mod codeintel_uploadstore_expirer;
+pub mod codemonitors_job;
 pub mod codygateway;
 pub mod completions;
 pub mod encryption;
@@ -237,6 +238,7 @@ pub fn all_jobs() -> Vec<(&'static str, Arc<dyn Job>)> {
                 "bitbucket-project-permissions" => {
                     Arc::new(bitbucket_project_permissions::BitbucketProjectPermissionsJob::new())
                 }
+                "codemonitors-job" => Arc::new(codemonitors_job::CodeMonitorJob::new()),
                 "cody-gateway-usage-check" => Arc::new(codygateway::CodyGatewayUsageCheck),
                 "cody-llm-token-counter" => Arc::new(completions::CodyLlmTokenCounter),
                 "event-logs-janitor" => Arc::new(eventlogs::EventLogsJanitor),

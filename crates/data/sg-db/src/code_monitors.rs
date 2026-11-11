@@ -405,6 +405,100 @@ pub async fn list_recipients(pool: &PgPool, email_id: i64) -> Result<Vec<Recipie
         .collect()
 }
 
+/// `database.QueryTrigger` subset read by `queryRunner.Handle`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct QueryTrigger {
+    pub id: i64,
+    pub monitor: i64,
+    pub query_string: String,
+    pub latest_result: Option<OffsetDateTime>,
+}
+
+/// `queryColumns` narrowed to the fields the trigger handler reads.
+pub const GET_QUERY_TRIGGER_FOR_JOB_SQL: &str = "SELECT cm_queries.id, cm_queries.monitor, \
+     cm_queries.query, cm_queries.latest_result FROM cm_queries \
+     INNER JOIN cm_trigger_jobs j ON cm_queries.id = j.query WHERE j.id = $1";
+
+/// `codeMonitorStore.GetQueryTriggerForJob`.
+pub async fn get_query_trigger_for_job(
+    pool: &PgPool,
+    trigger_job: i32,
+) -> Result<QueryTrigger, sqlx::Error> {
+    let row = sqlx::query(GET_QUERY_TRIGGER_FOR_JOB_SQL)
+        .bind(trigger_job)
+        .fetch_one(pool)
+        .await?;
+    Ok(QueryTrigger {
+        id: row.try_get("id")?,
+        monitor: row.try_get("monitor")?,
+        query_string: row.try_get("query")?,
+        latest_result: row.try_get("latest_result")?,
+    })
+}
+
+/// `database.Monitor` subset needed by `queryRunner.Handle` (`GetMonitor`
+/// returns the full row; only the id is used afterwards).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Monitor {
+    pub id: i64,
+}
+
+/// `monitorByIDFmtStr` narrowed to the id.
+pub const GET_MONITOR_SQL: &str =
+    "SELECT cm_monitors.id FROM cm_monitors WHERE cm_monitors.id = $1";
+
+/// `codeMonitorStore.GetMonitor`.
+pub async fn get_monitor(pool: &PgPool, monitor_id: i64) -> Result<Monitor, sqlx::Error> {
+    let row = sqlx::query(GET_MONITOR_SQL)
+        .bind(monitor_id)
+        .fetch_one(pool)
+        .await?;
+    Ok(Monitor {
+        id: row.try_get("id")?,
+    })
+}
+
+/// `setTriggerQueryNextRunFmtStr`.
+pub const SET_QUERY_TRIGGER_NEXT_RUN_SQL: &str =
+    "UPDATE cm_queries SET next_run = $1, latest_result = $2 WHERE id = $3";
+
+/// `codeMonitorStore.SetQueryTriggerNextRun`.
+pub async fn set_query_trigger_next_run(
+    pool: &PgPool,
+    trigger_query_id: i64,
+    next: OffsetDateTime,
+    latest_result: OffsetDateTime,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(SET_QUERY_TRIGGER_NEXT_RUN_SQL)
+        .bind(next)
+        .bind(latest_result)
+        .bind(trigger_query_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// `logSearchFmtStr`.
+pub const UPDATE_TRIGGER_JOB_WITH_RESULTS_SQL: &str =
+    "UPDATE cm_trigger_jobs SET query_string = $1, search_results = $2::jsonb WHERE id = $3";
+
+/// `codeMonitorStore.UpdateTriggerJobWithResults`. The baseline marshals a
+/// nil slice as `[]`; callers therefore pass a JSON array.
+pub async fn update_trigger_job_with_results(
+    pool: &PgPool,
+    trigger_job_id: i32,
+    query_string: &str,
+    results: &serde_json::Value,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(UPDATE_TRIGGER_JOB_WITH_RESULTS_SQL)
+        .bind(query_string)
+        .bind(results)
+        .bind(trigger_job_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -14,12 +14,11 @@
 //! (webhook JSON, Slack blocks, e-mail template data) and the webhook/Slack
 //! HTTP delivery, ported 1:1 and differentially verified.
 //!
-//! Still **not** ported: the trigger/action workers and their resetters, the
-//! trigger search execution and the e-mail transport/templates. The job is
-//! therefore intentionally absent from the registry ([`crate::jobs::all_jobs`]
-//! keeps returning the `UnportedJob` error for `codemonitors-job`).
-//! Registering it while `Routines` returns a subset would silently drop
-//! trigger execution.
+//! The remaining routines (trigger/action workers and resetters), the metrics
+//! wiring and the job registration live in [`super::codemonitors_job`]
+//! (M9.8ip). This two-routine [`CodeMonitorJob`] is kept as the M9.8bo
+//! assembly and is not itself registered; `codemonitors-job` now maps to
+//! [`super::codemonitors_job::CodeMonitorJob`].
 //!
 //! Baseline facts reproduced here:
 //!
@@ -103,10 +102,10 @@ impl Handler for TriggerJobsLogDeleterHandler {
     }
 }
 
-/// `cmd/worker/internal/codemonitors.codeMonitorJob`.
+/// The M9.8bo subset of `cmd/worker/internal/codemonitors.codeMonitorJob`.
 ///
-/// Not registered until the trigger/action workers and action senders are
-/// ported; see the module docs.
+/// Not registered; see [`super::codemonitors_job::CodeMonitorJob`] for the
+/// full six-routine assembly.
 pub struct CodeMonitorJob;
 
 impl CodeMonitorJob {
