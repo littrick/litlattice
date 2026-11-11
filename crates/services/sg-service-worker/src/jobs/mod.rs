@@ -52,6 +52,7 @@ pub mod authz_gitlab_client;
 pub mod authz_providers;
 pub mod batches;
 pub mod batches_scheduler;
+pub mod batches_workspace_resolver;
 pub mod bitbucket_project_permissions;
 pub mod bitbucket_server_client;
 pub mod code_monitor_action_runner;
@@ -238,6 +239,9 @@ pub fn all_jobs() -> Vec<(&'static str, Arc<dyn Job>)> {
                 }
                 "batches-janitor" => Arc::new(batches::BatchesJanitor::new()),
                 "batches-scheduler" => Arc::new(batches_scheduler::BatchesScheduler::new()),
+                "batches-workspace-resolver" => Arc::new(
+                    batches_workspace_resolver::BatchesWorkspaceResolver::new(),
+                ),
                 "bitbucket-project-permissions" => {
                     Arc::new(bitbucket_project_permissions::BitbucketProjectPermissionsJob::new())
                 }
