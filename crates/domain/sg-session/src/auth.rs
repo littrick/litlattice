@@ -30,12 +30,35 @@ use time::OffsetDateTime;
 use crate::securecookie;
 use crate::session::{GoTime, COOKIE_NAME};
 
-/// The session's Redis store (`redistore.RediStore.load`). Only the read path
-/// is needed by authentication.
+/// The session's Redis store (`redistore.RediStore.load`/`save`/`delete`).
+///
+/// The read path used by authentication needs [`SessionStore::load`]; the
+/// write path in [`crate::write`] additionally uses [`SessionStore::save`]
+/// (`SETEX`) and [`SessionStore::delete`] (`DEL`). The default implementations
+/// fail loudly so a read-only test double cannot silently accept a write.
 #[async_trait]
 pub trait SessionStore: Send + Sync {
     /// `GET session_<id>`: `Ok(None)` when the key does not exist.
     async fn load(&self, id: &str) -> Result<Option<Vec<u8>>, SessionStoreError>;
+
+    /// `SETEX session_<id> <ttl> <payload>`.
+    async fn save(
+        &self,
+        _id: &str,
+        _payload: Vec<u8>,
+        _ttl_seconds: i64,
+    ) -> Result<(), SessionStoreError> {
+        Err(SessionStoreError(
+            "session store does not support writes".to_owned(),
+        ))
+    }
+
+    /// `DEL session_<id>`.
+    async fn delete(&self, _id: &str) -> Result<(), SessionStoreError> {
+        Err(SessionStoreError(
+            "session store does not support writes".to_owned(),
+        ))
+    }
 }
 
 /// A Redis failure. The baseline distinguishes `*net.OpError` (connection
