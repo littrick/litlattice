@@ -341,6 +341,14 @@ struct LogEventsDeps {
     live: Arc<LiveConfig>,
 }
 
+/// Production ranking wiring (M9.8ii): the Pg-backed `RankingService` plus the
+/// configured root graph key. The site-admin checker is built per request
+/// because the baseline reads the actor from `context.Context`.
+pub struct RankingServiceDeps {
+    service: Arc<dyn crate::ranking_graphql::RankingService>,
+    raw_graph_key_root: String,
+}
+
 /// The production session-authentication dependencies.
 struct SessionDeps {
     store: Arc<dyn SessionStore>,
@@ -408,6 +416,10 @@ pub struct SchemaGraphqlDeps {
     /// `RankingServiceResolver`'s root resolver (M9.8ic); `None` reproduces an
     /// absent ranking surface (SDL not appended, root fields/types absent).
     ranking: Option<crate::graphql_resolvers::RankingResolverHandle>,
+    /// Production ranking seam (M9.8ii): a `RankingService` whose per-request
+    /// site-admin checker is derived from the executor's actor/`site_admin`.
+    /// Mutually exclusive with `ranking` in practice; `ranking` wins.
+    ranking_service: Option<RankingServiceDeps>,
     /// `schemaResolver.Search`'s execution seam (M9.8ie). `None` reproduces
     /// the pre-wiring frontend: the `search` root field has no prefetched
     /// value and resolves as unported (`null`).
@@ -439,6 +451,7 @@ impl SchemaGraphqlDeps {
             repositories_connections: None,
             search_contexts: None,
             ranking: None,
+            ranking_service: None,
             search_executor: None,
         }
     }
@@ -484,6 +497,7 @@ impl SchemaGraphqlDeps {
             )),
             search_contexts: None,
             ranking: None,
+            ranking_service: None,
             search_executor: None,
         }
     }
@@ -661,6 +675,27 @@ impl SchemaGraphqlDeps {
         Ok(self)
     }
 
+    /// Production ranking wiring (M9.8ii): append the ranking SDL and drive the
+    /// three root operations through `service` after a per-request site-admin
+    /// check, mirroring `serve_cmd.go`'s
+    /// `rankinggraphql.NewRootResolver(..., RankingService, siteAdminChecker)`.
+    ///
+    /// The caller decides whether the surface is available (e.g. the ranking
+    /// tables exist); when never called the base schema and every response stay
+    /// byte-identical.
+    pub fn with_ranking_service(
+        mut self,
+        service: Arc<dyn crate::ranking_graphql::RankingService>,
+        raw_graph_key_root: impl Into<String>,
+    ) -> Result<Self, sg_graphql::schema::SchemaError> {
+        self.schema = Arc::new(crate::ranking_graphql::append_ranking_schema(&self.schema)?);
+        self.ranking_service = Some(RankingServiceDeps {
+            service,
+            raw_graph_key_root: raw_graph_key_root.into(),
+        });
+        Ok(self)
+    }
+
     /// Inject the `Query.search` execution seam (M9.8ie).
     ///
     /// The baseline `schemaResolver.Search` plans and executes through the
@@ -674,6 +709,33 @@ impl SchemaGraphqlDeps {
     ) -> Self {
         self.search_executor = Some(executor);
         self
+    }
+
+    /// Assemble the M9.8ii production surfaces in one testable step.
+    ///
+    /// This is the same chain `service.rs` uses: search contexts are gated by
+    /// [`search_contexts_enabled`](crate::service::search_contexts_enabled), the
+    /// ranking surface is only installed when its tables exist, and
+    /// `Query.search` reuses the `SearchDeps` behind `/.api/search/stream`.
+    /// `None` for any surface leaves the schema untouched, so the existing
+    /// Unported/absent paths stay byte-identical.
+    pub fn with_production_surfaces(
+        mut self,
+        search_contexts: Option<crate::graphql_resolvers::SearchContextsDatabaseHandle>,
+        search_contexts_enabled: bool,
+        ranking: Option<(Arc<dyn crate::ranking_graphql::RankingService>, String)>,
+        search_executor: Option<Arc<dyn crate::search_graphql::SearchExecutor>>,
+    ) -> Result<Self, sg_graphql::schema::SchemaError> {
+        if let Some(db) = search_contexts {
+            self = self.with_search_contexts_switch(db, search_contexts_enabled)?;
+        }
+        if let Some((service, raw_graph_key_root)) = ranking {
+            self = self.with_ranking_service(service, raw_graph_key_root)?;
+        }
+        if let Some(executor) = search_executor {
+            self = self.with_search_executor(executor);
+        }
+        Ok(self)
     }
 
     /// Test hook: inject the store/user lookup without Redis or Postgres.
@@ -713,6 +775,7 @@ impl SchemaGraphqlDeps {
             repositories_connections: None,
             search_contexts: None,
             ranking: None,
+            ranking_service: None,
             search_executor: None,
         }
     }
@@ -841,8 +904,8 @@ impl GraphqlDeps for SchemaGraphqlDeps {
         // `CodeIntelResolver.RankingSummary` / `BumpDerivativeGraphKey` /
         // `DeleteRankingProgress` (M9.8ic): the resolver is async, so run the
         // selected root operations before the synchronous executor.
-        let ranking_roots = match &self.ranking {
-            Some(resolver) => {
+        let ranking_roots = match (&self.ranking, &self.ranking_service) {
+            (Some(resolver), _) => {
                 crate::graphql_resolvers::prefetch_ranking_roots(
                     resolver.as_ref(),
                     &fields,
@@ -850,7 +913,23 @@ impl GraphqlDeps for SchemaGraphqlDeps {
                 )
                 .await
             }
-            None => crate::graphql_resolvers::RankingRoots::default(),
+            (None, Some(deps)) => {
+                // `auth.CheckCurrentUserIsSiteAdmin(ctx, db)` reads the actor
+                // from the request context; build the equivalent checker from
+                // the authenticated request and run the same prefetch path.
+                let checker: Arc<dyn crate::ranking_graphql::SiteAdminChecker> = Arc::new(
+                    crate::ranking_graphql::ViewerSiteAdminChecker::new(request.actor, site_admin),
+                );
+                let resolver = crate::ranking_graphql::RootResolver::new(
+                    Arc::clone(&deps.service),
+                    checker,
+                    Arc::new(crate::ranking_graphql::NoopObserver),
+                    deps.raw_graph_key_root.clone(),
+                );
+                crate::graphql_resolvers::prefetch_ranking_roots(&resolver, &fields, is_mutation)
+                    .await
+            }
+            (None, None) => crate::graphql_resolvers::RankingRoots::default(),
         };
         // `schemaResolver.Search` (M9.8ie): plan + execute through the
         // injected seam before the synchronous executor replays the snapshot.

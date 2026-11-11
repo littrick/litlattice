@@ -33,6 +33,30 @@ pub fn service_name() -> &'static str {
     SERVICE_NAME
 }
 
+/// `searchcontexts.IsEnabled` (`internal/search/searchcontexts/conf.go`):
+/// `DISABLE_SEARCH_CONTEXTS` is parsed with Go's `strconv.ParseBool`; an
+/// unparsable value leaves the feature enabled.
+fn search_contexts_enabled() -> bool {
+    match std::env::var("DISABLE_SEARCH_CONTEXTS") {
+        Ok(value) => !matches!(value.as_str(), "1" | "t" | "T" | "TRUE" | "true" | "True"),
+        Err(_) => true,
+    }
+}
+
+/// The ranking GraphQL surface is only useful when its store tables exist
+/// (they are created by the code intel migrations). Probing avoids a startup
+/// failure on a frontend that has never run the code intel workers; when the
+/// relation is absent the base schema stays untouched.
+async fn ranking_tables_available(pool: &sqlx::PgPool) -> bool {
+    sqlx::query_scalar::<_, Option<String>>(
+        "SELECT to_regclass('codeintel_ranking_graph_keys')::text",
+    )
+    .fetch_one(pool)
+    .await
+    .map(|relation| relation.is_some())
+    .unwrap_or(false)
+}
+
 /// The frontend service. Only the transport skeleton is implemented; the
 /// GraphQL API, UI and enterprise setup land in later waves.
 pub struct FrontendService {
@@ -226,6 +250,11 @@ impl Service for FrontendService {
         let blame_deps: Arc<dyn crate::blame::BlameDeps> = Arc::new(
             crate::blame::BackendDeps::new(blame_pool, Arc::clone(wiring.live())),
         );
+        // M9.8ii: `Query.search` and the internal `/.api/search/stream` handler
+        // must share one `SearchDeps` instance; the search contexts and ranking
+        // GraphQL stores read the same primary pool.
+        let search_contexts_pool = search_pool.clone();
+        let ranking_pool = search_pool.clone();
         let search_deps: Arc<dyn crate::search_stream::SearchDeps> =
             Arc::new(crate::search_stream::BackendDeps::new(search_pool));
         // `serve_cmd.go:143`: `keyring.Init` builds the encryption keys from
@@ -337,6 +366,46 @@ impl Service for FrontendService {
                 .with_clone_urls(clone_url_resolver)
                 .with_log_events(log_events_store, Arc::clone(wiring.live()))
                 .with_site_configuration(Arc::clone(wiring.store()), Arc::clone(wiring.server()));
+        // M9.8ii: `internal/searchcontexts/init.go` installs the resolver only
+        // when search contexts are enabled; the Pg store is registered through
+        // the same optional seam.
+        let search_contexts: crate::graphql_resolvers::SearchContextsDatabaseHandle = Arc::new(
+            crate::search_contexts_store::PgSearchContextsStore::new(search_contexts_pool),
+        );
+        // The ranking surface is installed by the enterprise code intel hook;
+        // probe for its tables so a frontend without migrations keeps the base
+        // schema (and therefore byte-identical responses).
+        let ranking = if ranking_tables_available(&ranking_pool).await {
+            let live = Arc::clone(wiring.live());
+            let raw_graph_key_root =
+                sg_codeintel_ranking::document_reference_counts_graph_key(&live.current().site);
+            Some((
+                Arc::new(crate::ranking_store::PgRankingService::new(
+                    ranking_pool,
+                    live,
+                )) as Arc<dyn crate::ranking_graphql::RankingService>,
+                raw_graph_key_root,
+            ))
+        } else {
+            None
+        };
+        // `serve_cmd.go:213`: `Query.search` plans and executes through the
+        // same client deps as `/.api/search/stream`.
+        let search_executor: Arc<dyn crate::search_graphql::SearchExecutor> = Arc::new(
+            crate::search_graphql::BackendSearchExecutor::new(Arc::clone(&search_deps)),
+        );
+        let graphql_deps = graphql_deps
+            .with_production_surfaces(
+                Some(search_contexts),
+                search_contexts_enabled(),
+                ranking,
+                Some(search_executor),
+            )
+            .map_err(|err| {
+                ServiceError::new(format!(
+                    "failed to register production GraphQL surfaces: {err}"
+                ))
+            })?;
         // `serve_cmd.go:436-448`: the anonymous GraphQL limiter stores GCRA
         // state in the Redis cache pool (`gql:rl:` prefix). A redigo pool does
         // not dial at construction (failures surface per request); here an
