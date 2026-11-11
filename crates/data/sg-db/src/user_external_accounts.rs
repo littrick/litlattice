@@ -417,3 +417,111 @@ pub async fn touch_last_valid(pool: &PgPool, id: i32) -> Result<(), sqlx::Error>
     .await
     .map(|_| ())
 }
+
+/// `extsvc.AccountSpec` reduced to the fields the OAuth provisioning path
+/// matches on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AuthAccountSpec<'a> {
+    pub service_type: &'a str,
+    pub service_id: &'a str,
+    pub client_id: &'a str,
+    pub account_id: &'a str,
+}
+
+/// `userExternalAccountsStore.Update` for the OAuth login path: returns the
+/// associated user ID when a live account matches the spec.
+///
+/// `Ok(None)` is the baseline's `userExternalAccountNotFoundError`. As in the
+/// baseline the matching row has its `updated_at` bumped and `expired_at`
+/// cleared.
+pub async fn touch_for_auth(
+    pool: &PgPool,
+    spec: &AuthAccountSpec<'_>,
+) -> Result<Option<i32>, sqlx::Error> {
+    let row = sqlx::query(
+        r#"
+UPDATE user_external_accounts
+SET updated_at = now(), expired_at = NULL
+WHERE service_type = $1
+  AND service_id = $2
+  AND client_id = $3
+  AND account_id = $4
+  AND deleted_at IS NULL
+RETURNING user_id
+"#,
+    )
+    .bind(spec.service_type)
+    .bind(spec.service_id)
+    .bind(spec.client_id)
+    .bind(spec.account_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|row| row.get("user_id")))
+}
+
+/// `userExternalAccountsStore.Upsert` for the OAuth login path: associates the
+/// external account with `user_id`, inserting it if missing.
+///
+/// A spec already linked to a different user returns the baseline's
+/// `unable to change association of external account ...` error.
+pub async fn upsert_for_auth(
+    pool: &PgPool,
+    user_id: i32,
+    spec: &AuthAccountSpec<'_>,
+) -> Result<(), DbError> {
+    let existing = sqlx::query(
+        r#"
+SELECT id, user_id
+FROM user_external_accounts
+WHERE service_type = $1
+  AND service_id = $2
+  AND client_id = $3
+  AND account_id = $4
+  AND deleted_at IS NULL
+"#,
+    )
+    .bind(spec.service_type)
+    .bind(spec.service_id)
+    .bind(spec.client_id)
+    .bind(spec.account_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(DbError::from_sqlx)?;
+
+    let Some(row) = existing else {
+        sqlx::query(
+            r#"
+INSERT INTO user_external_accounts (user_id, service_type, service_id, client_id, account_id, encryption_key_id)
+VALUES ($1, $2, $3, $4, $5, '')
+"#,
+        )
+        .bind(user_id)
+        .bind(spec.service_type)
+        .bind(spec.service_id)
+        .bind(spec.client_id)
+        .bind(spec.account_id)
+        .execute(pool)
+        .await
+        .map_err(DbError::from_sqlx)?;
+        return Ok(());
+    };
+
+    let associated_user_id: i32 = row.get("user_id");
+    if associated_user_id != user_id {
+        return Err(DbError {
+            message: format!(
+                "unable to change association of external account from user {associated_user_id} to user {user_id} (delete the external account and then try again)"
+            ),
+            not_found: false,
+        });
+    }
+
+    sqlx::query(
+        "UPDATE user_external_accounts SET updated_at = now(), expired_at = NULL WHERE id = $1",
+    )
+    .bind(row.get::<i32, _>("id"))
+    .execute(pool)
+    .await
+    .map_err(DbError::from_sqlx)?;
+    Ok(())
+}

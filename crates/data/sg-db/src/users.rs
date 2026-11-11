@@ -47,6 +47,11 @@ pub struct DbError {
 
 impl DbError {
     fn database(err: sqlx::Error) -> Self {
+        Self::from_sqlx(err)
+    }
+
+    /// Wrap a driver error with no not-found classification.
+    pub fn from_sqlx(err: sqlx::Error) -> Self {
         Self {
             message: err.to_string(),
             not_found: false,
@@ -892,4 +897,216 @@ LIMIT 1
         display_name: row.get("display_name"),
         avatar_url: row.get("avatar_url"),
     }))
+}
+
+/// `database.NewUser` reduced to the fields the OAuth provisioning path sets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NewAuthUser<'a> {
+    pub username: &'a str,
+    pub display_name: &'a str,
+    pub avatar_url: &'a str,
+    pub email: &'a str,
+    pub email_is_verified: bool,
+}
+
+/// `database.ErrCannotCreateUser`, split into the two codes
+/// `auth.GetAndSaveUser` branches on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateUserError {
+    pub message: String,
+    pub username_exists: bool,
+    pub email_exists: bool,
+}
+
+impl CreateUserError {
+    fn other(err: sqlx::Error) -> Self {
+        Self {
+            message: err.to_string(),
+            username_exists: false,
+            email_exists: false,
+        }
+    }
+
+    fn username_exists() -> Self {
+        Self {
+            message: "cannot create user: err_username_exists".to_owned(),
+            username_exists: true,
+            email_exists: false,
+        }
+    }
+
+    fn email_exists() -> Self {
+        Self {
+            message: "cannot create user: err_email_exists".to_owned(),
+            username_exists: false,
+            email_exists: true,
+        }
+    }
+}
+
+/// `userStore.CreateWithExternalAccount` for the OAuth login path: inside one
+/// transaction it inserts the `users`, `names`, `user_emails` and
+/// `user_external_accounts` rows.
+///
+/// The initial-site-admin calculation from `CreateInTransaction` is not
+/// reproduced (OAuth signups never create the initial site admin); the
+/// baseline's unverified-email verification-code requirement is likewise
+/// unreachable here because every provider passes a verified email.
+pub async fn create_with_external_account_for_auth(
+    pool: &PgPool,
+    new_user: &NewAuthUser<'_>,
+    spec: &crate::user_external_accounts::AuthAccountSpec<'_>,
+) -> Result<i32, CreateUserError> {
+    let mut tx = pool.begin().await.map_err(CreateUserError::other)?;
+
+    let display_name = (!new_user.display_name.is_empty()).then_some(new_user.display_name);
+    let avatar_url = (!new_user.avatar_url.is_empty()).then_some(new_user.avatar_url);
+    let row = sqlx::query(
+        r#"
+INSERT INTO users (username, display_name, avatar_url, created_at, updated_at, invalidated_sessions_at, tos_accepted, site_admin)
+VALUES ($1, $2, $3, now(), now(), now(), false, false)
+RETURNING id
+"#,
+    )
+    .bind(new_user.username)
+    .bind(display_name)
+    .bind(avatar_url)
+    .fetch_one(&mut *tx)
+    .await;
+    let id: i32 = match row {
+        Ok(row) => row.get("id"),
+        Err(err) => {
+            let username_exists = err
+                .as_database_error()
+                .and_then(|db| db.constraint())
+                .is_some_and(|constraint| {
+                    matches!(
+                        constraint,
+                        "users_username"
+                            | "users_username_max_length"
+                            | "users_username_valid_chars"
+                            | "users_display_name_max_length"
+                    )
+                });
+            return Err(if username_exists {
+                CreateUserError::username_exists()
+            } else {
+                CreateUserError::other(err)
+            });
+        }
+    };
+
+    // Reserve the username in the shared users+orgs namespace.
+    if sqlx::query("INSERT INTO names(name, user_id) VALUES($1, $2)")
+        .bind(new_user.username)
+        .bind(id)
+        .execute(&mut *tx)
+        .await
+        .is_err()
+    {
+        return Err(CreateUserError::username_exists());
+    }
+
+    if !new_user.email.is_empty() {
+        let exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM user_emails WHERE email = $1::citext AND verified_at IS NOT NULL)",
+        )
+        .bind(new_user.email)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(CreateUserError::other)?;
+        if exists {
+            return Err(CreateUserError::email_exists());
+        }
+
+        let email_result = if new_user.email_is_verified {
+            sqlx::query(
+                "INSERT INTO user_emails(user_id, email, verified_at, is_primary) VALUES ($1, $2, now(), true)",
+            )
+            .bind(id)
+            .bind(new_user.email)
+            .execute(&mut *tx)
+            .await
+        } else {
+            sqlx::query(
+                "INSERT INTO user_emails(user_id, email, verification_code, is_primary) VALUES ($1, $2, '', true)",
+            )
+            .bind(id)
+            .bind(new_user.email)
+            .execute(&mut *tx)
+            .await
+        };
+        if let Err(err) = email_result {
+            let email_exists = err.as_database_error().and_then(|db| db.constraint())
+                == Some("user_emails_unique_verified_email");
+            return Err(if email_exists {
+                CreateUserError::email_exists()
+            } else {
+                CreateUserError::other(err)
+            });
+        }
+    }
+
+    sqlx::query(
+        r#"
+INSERT INTO user_external_accounts (user_id, service_type, service_id, client_id, account_id, encryption_key_id)
+VALUES ($1, $2, $3, $4, $5, '')
+"#,
+    )
+    .bind(id)
+    .bind(spec.service_type)
+    .bind(spec.service_id)
+    .bind(spec.client_id)
+    .bind(spec.account_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(CreateUserError::other)?;
+
+    tx.commit().await.map_err(CreateUserError::other)?;
+    Ok(id)
+}
+
+/// `userStore.GetByID` narrowed to the profile fields `GetAndSaveUser` reads.
+/// `None` is the baseline's not-found error (`deleted_at IS NULL` only).
+pub async fn get_profile_by_id(
+    pool: &PgPool,
+    id: i32,
+) -> Result<Option<(i32, String, String)>, sqlx::Error> {
+    let row = sqlx::query(
+        "SELECT id, COALESCE(display_name, '') AS display_name, COALESCE(avatar_url, '') AS avatar_url \
+         FROM users WHERE id = $1 AND deleted_at IS NULL LIMIT 1",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|row| {
+        (
+            row.get("id"),
+            row.get("display_name"),
+            row.get("avatar_url"),
+        )
+    }))
+}
+
+/// `userStore.Update` restricted to the profile fields: `updated_at` always
+/// moves, and only the provided fields are written (`None` leaves the column
+/// untouched).
+pub async fn update_user_profile(
+    pool: &PgPool,
+    id: i32,
+    display_name: Option<&str>,
+    avatar_url: Option<&str>,
+) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query(
+        "UPDATE users SET updated_at = now(), \
+         display_name = COALESCE($2, display_name), \
+         avatar_url = COALESCE($3, avatar_url) \
+         WHERE id = $1",
+    )
+    .bind(id)
+    .bind(display_name)
+    .bind(avatar_url)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() > 0)
 }
