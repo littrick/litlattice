@@ -540,6 +540,9 @@ pub struct NodeRoots {
         HashMap<String, Result<crate::external_services::ExternalServiceNodeData, String>>,
     /// `webhookLogByID` results keyed by the raw Relay ID.
     pub webhook_logs: HashMap<String, Result<crate::webhook_logs::WebhookLogNodeData, String>>,
+    /// `externalAccountByID` results keyed by the raw id (M9.8ka).
+    pub external_accounts:
+        HashMap<i32, crate::external_accounts_graphql::ExternalAccountNodeLookup>,
 }
 
 /// `relay.UnmarshalKind`: URL-safe base64 decode and take the prefix before
@@ -1002,6 +1005,13 @@ pub struct NestedPrefetch {
     /// Live `auth.providers` snapshot for the Site subject reached through a
     /// settings cascade (M9.8jl); `Site.authProviders`.
     pub auth_providers: Option<Arc<crate::auth_providers_graphql::AuthProvidersRoot>>,
+    /// `User.externalAccounts` connections keyed by user id and the `first`
+    /// argument (M9.8ka).
+    pub user_external_accounts:
+        HashMap<(i32, Option<i32>), crate::external_accounts_graphql::ExternalAccountsLookup>,
+    /// `CodySubscription` inputs for `ExternalAccount` nodes (M9.8ka).
+    pub external_account_cody:
+        Option<Arc<crate::external_accounts_graphql::CodySubscriptionConfig>>,
 }
 
 /// The database seam for `User.organizations` (`db.Orgs().GetByUserID` plus
@@ -2032,6 +2042,132 @@ pub(crate) fn repository_arg(arguments: &Arguments) -> RepositoryArg {
         return RepositoryArg::CloneUrl(clone_url.to_owned());
     }
     RepositoryArg::Missing
+}
+
+/// Prefetch every `User.externalAccounts` selection (M9.8ka).
+///
+/// `User` objects are reached through `currentUser`, `user`, `users.nodes` and
+/// `node(... on User)` — the same entry points [`prefetch_nested`] collects.
+/// The baseline checks permission before listing, so unauthorized viewers get
+/// no lookup and [`UserObject::field`] returns the folded authorization error.
+#[allow(clippy::too_many_arguments)]
+pub async fn prefetch_user_external_accounts(
+    store: &dyn crate::external_accounts_graphql::ExternalAccountsStore,
+    registry: &crate::external_accounts_graphql::ExternalAccountProviderRegistry,
+    key: Option<Arc<dyn Key>>,
+    fields: &[RootField],
+    current_user: Option<&UserData>,
+    users: &HashMap<UserKey, UserLookup>,
+    users_connections: &HashMap<UsersArgs, UsersConnectionLookup>,
+    nodes: &NodeRoots,
+    actor: Actor,
+    viewer_site_admin: bool,
+) -> HashMap<(i32, Option<i32>), crate::external_accounts_graphql::ExternalAccountsLookup> {
+    fn push_selections(
+        selections_by_user: &mut HashMap<i32, Vec<RootField>>,
+        user_id: i32,
+        selections: &[RootField],
+    ) {
+        for selection in selections
+            .iter()
+            .filter(|selection| selection.name == "externalAccounts")
+        {
+            selections_by_user
+                .entry(user_id)
+                .or_default()
+                .push(selection.clone());
+        }
+    }
+
+    let mut selections_by_user: HashMap<i32, Vec<RootField>> = HashMap::new();
+    for field in fields {
+        match field.name.as_str() {
+            "currentUser" => {
+                if let Some(user) = current_user {
+                    push_selections(&mut selections_by_user, user.id, &field.selections);
+                }
+            }
+            "user" => {
+                let UserArg::Key(key) = user_arg(&field.arguments) else {
+                    continue;
+                };
+                if let Some(UserLookup::Found(user)) = users.get(&key) {
+                    push_selections(&mut selections_by_user, user.id, &field.selections);
+                }
+            }
+            "users" => {
+                let args = users_args(&field.arguments);
+                let Some(UsersConnectionLookup::Found(data)) = users_connections.get(&args) else {
+                    continue;
+                };
+                for nodes_selection in field
+                    .selections
+                    .iter()
+                    .filter(|selection| selection.name == "nodes")
+                {
+                    for user in &data.users {
+                        push_selections(
+                            &mut selections_by_user,
+                            user.id,
+                            &nodes_selection.selections,
+                        );
+                    }
+                }
+            }
+            "node" => {
+                let Some(id) = field.arguments.string("id") else {
+                    continue;
+                };
+                let Some(kind) = relay_kind(id) else {
+                    continue;
+                };
+                if kind != "User" {
+                    continue;
+                }
+                let Ok(node_id) = unmarshal_relay_id(id) else {
+                    continue;
+                };
+                let Some(UserByIdLookup::Found(user)) = nodes.users.get(&node_id) else {
+                    continue;
+                };
+                let mut selections = field.selections.clone();
+                for (condition, sub_selections) in &field.type_conditions {
+                    if condition.as_str() == "User" || condition.as_str() == "Node" {
+                        selections.extend(sub_selections.clone());
+                    }
+                }
+                push_selections(&mut selections_by_user, user.id, &selections);
+            }
+            _ => {}
+        }
+    }
+
+    let mut results = HashMap::new();
+    for (user_id, selections) in selections_by_user {
+        if !crate::external_accounts_graphql::can_view_external_account(
+            actor,
+            viewer_site_admin,
+            user_id,
+        ) {
+            continue;
+        }
+        for selection in selections {
+            let first = crate::external_accounts_graphql::first_argument(&selection.arguments);
+            if results.contains_key(&(user_id, first)) {
+                continue;
+            }
+            let lookup = crate::external_accounts_graphql::external_accounts_connection(
+                store,
+                registry,
+                key.clone(),
+                user_id,
+                first,
+            )
+            .await;
+            results.insert((user_id, first), lookup);
+        }
+    }
+    results
 }
 
 /// Look up every `Query.repository` root field in `fields`, deduplicated by
@@ -3148,6 +3284,33 @@ impl ObjectValue for QueryRoot {
                             None => Ok(None),
                         }
                     }
+                    // `NodeResolvers()["ExternalAccount"]` →
+                    // `externalAccountByID` (M9.8ka): the Relay kind is not
+                    // validated, the row is fetched before the permission
+                    // check.
+                    "ExternalAccount" => {
+                        let node_id = unmarshal_relay_id(id).map_err(ExecError::new)?;
+                        match self.nodes.external_accounts.get(&node_id) {
+                            Some(
+                                crate::external_accounts_graphql::ExternalAccountNodeLookup::Found(
+                                    data,
+                                ),
+                            ) => Ok(Some(FieldValue::Object(Arc::new(
+                                crate::external_accounts_graphql::ExternalAccountObject::from_data(
+                                    data.clone(),
+                                    None,
+                                    self.viewer_site_admin,
+                                    self.nested.clone(),
+                                ),
+                            )))),
+                            Some(
+                                crate::external_accounts_graphql::ExternalAccountNodeLookup::Error(
+                                    message,
+                                ),
+                            ) => Err(ExecError::new(message.clone())),
+                            None => Ok(None),
+                        }
+                    }
                     _ => self.node_int32(kind.as_str(), id),
                 }
             }
@@ -3421,7 +3584,7 @@ impl ObjectValue for UserObject {
     fn field(
         &self,
         field: &str,
-        _arguments: &Arguments,
+        arguments: &Arguments,
         actor: Actor,
     ) -> Result<Option<FieldValue>, ExecError> {
         match field {
@@ -3527,6 +3690,31 @@ impl ObjectValue for UserObject {
                         ))))
                     }
                     Some(UserMembershipsLookup::Error(message)) => {
+                        Err(ExecError::new(message.clone()))
+                    }
+                    None => Ok(None),
+                }
+            }
+            // `UserResolver.ExternalAccounts` (`external_accounts.go:55-73`):
+            // the same folded authorization error, then the id-ascending
+            // connection (M9.8ka).
+            "externalAccounts" => {
+                if !self.can_administer(actor) {
+                    return Err(ExecError::new(MUST_BE_SITE_ADMIN_OR_SAME_USER));
+                }
+                let first = crate::external_accounts_graphql::first_argument(arguments);
+                match self.nested.user_external_accounts.get(&(self.data.id, first)) {
+                    Some(crate::external_accounts_graphql::ExternalAccountsLookup::Found(data)) => {
+                        Ok(Some(FieldValue::Object(Arc::new(
+                            crate::external_accounts_graphql::ExternalAccountsConnectionObject::from_data(
+                                data.clone(),
+                                Some(self.data.clone()),
+                                self.viewer_site_admin,
+                                self.nested.clone(),
+                            ),
+                        ))))
+                    }
+                    Some(crate::external_accounts_graphql::ExternalAccountsLookup::Error(message)) => {
                         Err(ExecError::new(message.clone()))
                     }
                     None => Ok(None),

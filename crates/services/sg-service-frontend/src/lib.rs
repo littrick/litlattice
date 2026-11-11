@@ -32,6 +32,7 @@ pub mod configuration_startup;
 pub mod configuration_watch;
 pub mod debug;
 pub mod deploy_defaults;
+pub mod external_accounts_graphql;
 pub mod external_api;
 pub mod external_services;
 pub mod extsvc_config_file;
