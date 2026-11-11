@@ -370,6 +370,9 @@ impl ViewerSiteAdminChecker {
 impl SiteAdminChecker for ViewerSiteAdminChecker {
     async fn check_current_user_is_site_admin(&self) -> Result<(), RankingError> {
         match self.actor {
+            // `auth.CheckCurrentUserIsSiteAdmin` returns nil for internal
+            // actors (`internal/auth/site_admin.go:19-21`).
+            Actor::Internal => Ok(()),
             // `auth.CurrentUser` returns nil for an anonymous request:
             // `auth.ErrNotAuthenticated`.
             Actor::Anonymous => Err(RankingError::Service("not authenticated".to_owned())),

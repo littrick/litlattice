@@ -392,9 +392,12 @@ pub async fn repositories(
         ascending: !args.descending,
     };
     let authenticated_user_id = actor.uid().unwrap_or(0);
-    // `AuthzQueryConds` bypasses for site admins (authz.enforceForSiteAdmins
-    // defaults to false); anonymous actors never bypass.
-    let is_site_admin = actor.is_authenticated() && viewer_site_admin;
+    // `AuthzQueryConds` bypasses for internal actors
+    // (`internal/database/repos_perm.go:42-45`) and for site admins
+    // (authz.enforceForSiteAdmins defaults to false); anonymous actors never
+    // bypass. `ComputeTotal` uses the same `CheckCurrentUserIsSiteAdmin`
+    // predicate, which internal actors pass.
+    let is_site_admin = actor.is_internal() || (actor.is_authenticated() && viewer_site_admin);
 
     // `ComputeTotal`: only site admins see the unrestricted count; everyone
     // else gets 0 (even when the row filters would match).

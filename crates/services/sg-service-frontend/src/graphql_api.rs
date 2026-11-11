@@ -896,6 +896,14 @@ impl GraphqlDeps for SchemaGraphqlDeps {
             },
             _ => None,
         };
+        // Internal actors are treated as site admins by every
+        // `internal/auth` gate (`CheckCurrentUserIsSiteAdmin`,
+        // `CheckSiteAdminOrSameUserFromActor`, `CheckOrgAccessOrSiteAdmin`
+        // all return nil for `IsInternal`). They still have no current user
+        // (`UID == 0` → `GetByCurrentAuthUser` misses).
+        if request.actor.is_internal() {
+            site_admin = true;
+        }
 
         // `conf.ExternalURL()` for the `ExternalService.webhookURL` fields.
         let external_url = self
@@ -1486,16 +1494,10 @@ where
     let actor = if let Some(crate::actor_chain::ChainActor(chain_actor)) =
         req.extensions().get::<crate::actor_chain::ChainActor>()
     {
-        // `sg_graphql::exec::Actor` has no internal variant; Go's
-        // `IsAuthenticated` is `UID != 0`, so internal/anonymous both reduce to
-        // `Anonymous`.
-        if chain_actor.is_authenticated() {
-            Actor::User {
-                uid: chain_actor.uid,
-            }
-        } else {
-            Actor::Anonymous
-        }
+        // An internal actor keeps its distinct executor shape; Go's
+        // `IsAuthenticated` is `UID != 0`, so an internal actor (UID 0) would
+        // otherwise be indistinguishable from anonymous.
+        chain_actor.to_graphql()
     } else if internal {
         Actor::Anonymous
     } else {
@@ -1578,13 +1580,19 @@ where
     // from here on every return path observes the duration and (when enabled)
     // writes the audit log.
     let audit_context = crate::audit::GraphqlAuditContext {
-        actor: crate::audit::AuditActor::new(
-            actor.uid(),
-            match actor {
-                Actor::User { .. } => String::new(),
-                Actor::Anonymous => actor_anonymous_uid(req.headers()),
-            },
-        ),
+        actor: {
+            let mut audit_actor = crate::audit::AuditActor::new(
+                actor.uid(),
+                match actor {
+                    Actor::User { .. } => String::new(),
+                    Actor::Anonymous | Actor::Internal => actor_anonymous_uid(req.headers()),
+                },
+            );
+            // `audit.Log` drops internal actors unless `internalTraffic`
+            // auditing is enabled (`internal/audit/audit.go:29-33`).
+            audit_actor.internal = actor.is_internal();
+            audit_actor
+        },
         client: crate::audit::client_info(
             req.headers(),
             req.extensions()
@@ -1614,7 +1622,7 @@ where
         crate::graphql_metrics::observe_cost(
             &crate::graphql_metrics::actor_type_label(
                 internal,
-                matches!(actor, Actor::Anonymous),
+                !actor.is_authenticated(),
                 &request_source,
             ),
             cost.field_count,

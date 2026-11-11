@@ -341,6 +341,7 @@ mod tests {
     impl SiteConfigurationBackend for FakeBackend {
         async fn check_current_user_is_site_admin(&self, actor: Actor) -> Result<(), String> {
             match actor {
+                Actor::Internal => Ok(()),
                 Actor::Anonymous => Err("not authenticated".to_owned()),
                 Actor::User { .. } if !self.viewer_site_admin => {
                     Err("must be site admin".to_owned())

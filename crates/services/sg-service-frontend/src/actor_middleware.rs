@@ -101,9 +101,13 @@ impl Actor {
         self.uid.to_string()
     }
 
-    /// The `sg-graphql` executor's actor (`Authenticated` iff `uid != 0`).
+    /// The `sg-graphql` executor's actor. Precedence mirrors Go's
+    /// `IsInternal`/`IsAuthenticated`: internal wins, then `uid != 0`, then
+    /// anonymous.
     pub fn to_graphql(&self) -> sg_graphql::exec::Actor {
-        if self.is_authenticated() {
+        if self.is_internal() {
+            sg_graphql::exec::Actor::Internal
+        } else if self.is_authenticated() {
             sg_graphql::exec::Actor::User { uid: self.uid }
         } else {
             sg_graphql::exec::Actor::Anonymous

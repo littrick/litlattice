@@ -479,9 +479,9 @@ impl SlowRequestsSurface {
 
     /// `schemaResolver.SlowRequests` (`slow_requests_tracer.go:63`).
     ///
-    /// The baseline's internal actor bypass cannot be represented by
-    /// `sg_graphql::exec::Actor`; the anonymous/non-admin branches match
-    /// `auth.CheckCurrentUserIsSiteAdmin`.
+    /// The anonymous/non-admin branches match
+    /// `auth.CheckCurrentUserIsSiteAdmin`, which also returns nil for internal
+    /// actors (`internal/auth/site_admin.go:19-21`).
     pub fn resolve(
         &self,
         actor: Actor,
@@ -492,6 +492,7 @@ impl SlowRequestsSurface {
             return Err("slow graphql requests capture is not enabled".to_owned());
         }
         match actor {
+            Actor::Internal => {}
             Actor::Anonymous => return Err("not authenticated".to_owned()),
             Actor::User { .. } if !viewer_site_admin => {
                 return Err("must be site admin".to_owned());

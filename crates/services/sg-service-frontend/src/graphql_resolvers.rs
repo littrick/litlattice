@@ -1028,6 +1028,10 @@ fn viewer_uid(actor: Actor) -> i32 {
 /// (`internal/auth/orgs.go:12,43`).
 pub(crate) fn org_access_error(actor: Actor) -> &'static str {
     match actor {
+        // Unreachable for internal actors: `CheckOrgAccessOrSiteAdmin`
+        // returns nil (`internal/auth/orgs.go:27-29`) before this error is
+        // built.
+        Actor::Internal => "current user is not an org member",
         Actor::Anonymous => "not authenticated",
         Actor::User { .. } => "current user is not an org member",
     }
@@ -2027,7 +2031,9 @@ pub async fn prefetch_repositories(
     actor_site_admin: bool,
 ) -> HashMap<RepoKey, RepoLookup> {
     let authenticated_user_id = actor.uid().unwrap_or(0);
-    let bypass_authz = actor.is_authenticated() && actor_site_admin;
+    // `GetAuthzQueryParameters` bypasses authz for internal actors
+    // (`internal/database/repos_perm.go:42-45`) and for site admins.
+    let bypass_authz = actor.is_internal() || (actor.is_authenticated() && actor_site_admin);
     let mut repositories = HashMap::new();
     for field in fields {
         if field.name != "repository" {
@@ -2132,7 +2138,8 @@ pub async fn prefetch_repository_redirects(
     actor_site_admin: bool,
 ) -> HashMap<RepositoryRedirectKey, RepoLookup> {
     let authenticated_user_id = actor.uid().unwrap_or(0);
-    let bypass_authz = actor.is_authenticated() && actor_site_admin;
+    // Internal actors bypass authz (`internal/database/repos_perm.go:42-45`).
+    let bypass_authz = actor.is_internal() || (actor.is_authenticated() && actor_site_admin);
     let mut redirects = HashMap::new();
     for field in fields {
         if field.name != "repositoryRedirect" {
@@ -2749,7 +2756,9 @@ impl ObjectValue for QueryRoot {
             // actors get `nil`; an authenticated actor gets the prefetched row
             // (or `nil` if it disappeared between authentication and here).
             "currentUser" => match actor {
-                Actor::Anonymous => Ok(Some(FieldValue::Null)),
+                // Internal actors have `UID == 0`, so
+                // `GetByCurrentAuthUser` finds no user.
+                Actor::Anonymous | Actor::Internal => Ok(Some(FieldValue::Null)),
                 Actor::User { .. } => match &self.user {
                     Some(user) => Ok(Some(FieldValue::Object(Arc::new(
                         user.clone().with_nested(self.nested.clone()),
@@ -4539,6 +4548,7 @@ impl OrgConnectionObject {
     /// an authenticated non-admin is `must be site admin`.
     fn check_site_admin(&self, actor: Actor) -> Result<(), ExecError> {
         match actor {
+            Actor::Internal => Ok(()),
             Actor::Anonymous => Err(ExecError::new(NOT_AUTHENTICATED)),
             Actor::User { .. } if !self.viewer_site_admin => {
                 Err(ExecError::new(MUST_BE_SITE_ADMIN))
@@ -4883,6 +4893,9 @@ pub(crate) fn check_current_user_is_site_admin(
     viewer_site_admin: bool,
 ) -> Result<(), String> {
     match actor {
+        // `CheckCurrentUserIsSiteAdmin` returns nil for internal actors
+        // (`internal/auth/site_admin.go:19-21`).
+        Actor::Internal => Ok(()),
         Actor::Anonymous => Err(NOT_AUTHENTICATED.to_owned()),
         Actor::User { .. } if !viewer_site_admin => Err(MUST_BE_SITE_ADMIN.to_owned()),
         Actor::User { .. } => Ok(()),

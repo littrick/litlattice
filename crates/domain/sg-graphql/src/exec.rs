@@ -81,25 +81,38 @@ impl ExecError {
     }
 }
 
-/// `actor.Actor` as seen by resolvers. The frontend has no session
-/// middleware yet, so production requests are always [`Actor::Anonymous`].
+/// `actor.Actor` as seen by resolvers. Mirrors Go's three shapes
+/// (`internal/actor/actor.go:26-58`): an anonymous actor, an authenticated
+/// user (`UID != 0`), or an internal Sourcegraph service actor (`Internal`,
+/// `UID == 0`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Actor {
     #[default]
     Anonymous,
+    /// `actor.Internal()`: an internal service actor. Not authenticated
+    /// (`UID == 0`) but treated as a site admin by the `internal/auth` checks
+    /// and as bypassing repository authz.
+    Internal,
     User {
         uid: i32,
     },
 }
 
 impl Actor {
+    /// `(*actor.Actor).IsAuthenticated`: `UID != 0`.
     pub fn is_authenticated(self) -> bool {
         matches!(self, Actor::User { .. })
     }
 
+    /// `(*actor.Actor).IsInternal`.
+    pub fn is_internal(self) -> bool {
+        matches!(self, Actor::Internal)
+    }
+
+    /// The `UID` (0/absent for anonymous and internal actors).
     pub fn uid(self) -> Option<i32> {
         match self {
-            Actor::Anonymous => None,
+            Actor::Anonymous | Actor::Internal => None,
             Actor::User { uid } => Some(uid),
         }
     }
@@ -2073,7 +2086,7 @@ mod tests {
                     arguments.string("value").unwrap_or_default().to_owned(),
                 )),
                 "currentUser" => match actor {
-                    Actor::Anonymous => FieldValue::Null,
+                    Actor::Anonymous | Actor::Internal => FieldValue::Null,
                     Actor::User { uid } => {
                         FieldValue::Object(std::sync::Arc::new(UserObject { uid }))
                     }

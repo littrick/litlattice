@@ -234,8 +234,9 @@ pub async fn external_services(
     actor: Actor,
     current_user: Option<&UserData>,
 ) -> ExternalServicesConnectionLookup {
-    // `auth.CheckCurrentUserIsSiteAdmin`.
+    // `auth.CheckCurrentUserIsSiteAdmin` passes for internal actors.
     match actor {
+        Actor::Internal => {}
         Actor::Anonymous => {
             return ExternalServicesConnectionLookup::Error("not authenticated".to_owned())
         }

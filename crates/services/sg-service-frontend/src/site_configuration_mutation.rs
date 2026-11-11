@@ -209,7 +209,9 @@ async fn auditlog_expansion(pool: &PgPool, actor: Actor) -> bool {
             Ok(flags) => flags.get("auditlog-expansion").copied().unwrap_or(false),
             Err(_) => global_auditlog_expansion(pool).await,
         },
-        Actor::Anonymous => global_auditlog_expansion(pool).await,
+        // Internal actors have `UID == 0`; see `config_graphql` for the
+        // featureflag-middleware caveat.
+        Actor::Anonymous | Actor::Internal => global_auditlog_expansion(pool).await,
     }
 }
 
