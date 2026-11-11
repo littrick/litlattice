@@ -435,20 +435,65 @@ impl FileMatch {
 pub struct SearchChunk {
     pub files: Vec<FileMatch>,
     /// Number of shard crashes reported for this chunk.
+    ///
+    /// Kept as a convenience field for the existing wire consumers; it always
+    /// mirrors [`SearchChunk::stats`]`.crashes` when built by
+    /// [`SearchChunk::from_proto`].
     pub crashes: i64,
+    /// Full `zoekt.Stats` carried by the proto response.
+    pub stats: Stats,
+    /// Full `zoekt.Progress` carried by the proto response.
+    pub progress: Progress,
 }
 
 impl SearchChunk {
-    /// `SearchResponse.FromProto`.
+    /// `SearchResponse.FromProto` / `zoekt.SearchResultFromProto`:
+    /// converts the wire chunk without dropping `Stats` or `Progress`.
     pub fn from_proto(response: proto::SearchResponse) -> Self {
+        let stats = Stats::from_proto(response.stats);
+        let progress = Progress::from_proto(response.progress);
         Self {
             files: response
                 .files
                 .into_iter()
                 .map(FileMatch::from_proto)
                 .collect(),
-            crashes: response.stats.map(|stats| stats.crashes).unwrap_or(0),
+            crashes: stats.crashes,
+            stats,
+            progress,
         }
+    }
+
+    /// `zoekt.SearchResultFromProto` with `repoURLs`/`lineFragments` set to
+    /// the nil maps Sourcegraph passes (`grpc.go:44-53`). This is the lossless
+    /// adapter from the wire representation to the result-level type the
+    /// frontend streamer consumes.
+    pub fn to_search_result(&self) -> SearchResult {
+        SearchResult {
+            stats: self.stats.clone(),
+            progress: self.progress,
+            files: self.files.clone(),
+            repo_urls: BTreeMap::new(),
+            line_fragments: BTreeMap::new(),
+        }
+    }
+}
+
+impl From<SearchChunk> for SearchResult {
+    fn from(chunk: SearchChunk) -> Self {
+        Self {
+            stats: chunk.stats,
+            progress: chunk.progress,
+            files: chunk.files,
+            repo_urls: BTreeMap::new(),
+            line_fragments: BTreeMap::new(),
+        }
+    }
+}
+
+impl From<&SearchChunk> for SearchResult {
+    fn from(chunk: &SearchChunk) -> Self {
+        chunk.to_search_result()
     }
 }
 
@@ -496,6 +541,18 @@ pub struct Progress {
 }
 
 impl Progress {
+    /// `zoekt.ProgressFromProto` (`api_proto.go:334-340`). A missing proto
+    /// progress is the zero value, matching Go's nil-receiver getters.
+    pub fn from_proto(progress: Option<proto::Progress>) -> Self {
+        match progress {
+            Some(progress) => Self {
+                priority: progress.priority,
+                max_pending_priority: progress.max_pending_priority,
+            },
+            None => Self::default(),
+        }
+    }
+
     /// `(*zoekt.Progress).sizeBytes`.
     pub fn size_bytes(&self) -> u64 {
         2 * 8
@@ -528,6 +585,36 @@ pub struct Stats {
 }
 
 impl Stats {
+    /// `zoekt.StatsFromProto` (`api_proto.go:284-306`). A missing proto stats
+    /// message is the zero value, matching Go's nil-receiver getters.
+    pub fn from_proto(stats: Option<proto::Stats>) -> Self {
+        let Some(stats) = stats else {
+            return Self::default();
+        };
+        Self {
+            content_bytes_loaded: stats.content_bytes_loaded,
+            index_bytes_loaded: stats.index_bytes_loaded,
+            crashes: stats.crashes,
+            duration: duration_from_proto(stats.duration),
+            file_count: stats.file_count,
+            shard_files_considered: stats.shard_files_considered,
+            files_considered: stats.files_considered,
+            files_loaded: stats.files_loaded,
+            files_skipped: stats.files_skipped,
+            shards_scanned: stats.shards_scanned,
+            shards_skipped: stats.shards_skipped,
+            shards_skipped_filter: stats.shards_skipped_filter,
+            match_count: stats.match_count,
+            ngram_matches: stats.ngram_matches,
+            ngram_lookups: stats.ngram_lookups,
+            wait: duration_from_proto(stats.wait),
+            match_tree_construction: duration_from_proto(stats.match_tree_construction),
+            match_tree_search: duration_from_proto(stats.match_tree_search),
+            regexps_considered: stats.regexps_considered,
+            flush_reason: FlushReason::from_proto(stats.flush_reason),
+        }
+    }
+
     /// `(*zoekt.Stats).sizeBytes`: `16*8` plus one byte for `FlushReason`.
     pub fn size_bytes(&self) -> u64 {
         16 * 8 + 1
@@ -603,6 +690,14 @@ fn duration_to_proto(duration: Duration) -> ProtoDuration {
         seconds: duration.as_secs() as i64,
         nanos: duration.subsec_nanos() as i32,
     }
+}
+
+/// `durationpb.Duration.AsDuration`, but a missing/negative duration falls
+/// back to zero because `std::time::Duration` cannot represent negatives.
+fn duration_from_proto(duration: Option<ProtoDuration>) -> Duration {
+    duration
+        .and_then(|duration| Duration::try_from(duration).ok())
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -682,9 +777,21 @@ mod tests {
         let response = proto::SearchResponse {
             stats: Some(proto::Stats {
                 crashes: 3,
+                file_count: 2,
+                match_count: 5,
+                files_skipped: 1,
+                shards_skipped: 4,
+                duration: Some(ProtoDuration {
+                    seconds: 2,
+                    nanos: 500_000_000,
+                }),
+                flush_reason: proto::FlushReason::FinalFlush as i32,
                 ..proto::Stats::default()
             }),
-            progress: None,
+            progress: Some(proto::Progress {
+                priority: 1.5,
+                max_pending_priority: 9.25,
+            }),
             files: vec![proto::FileMatch {
                 score: 1.5,
                 file_name: b"main.go".to_vec(),
@@ -728,6 +835,15 @@ mod tests {
         };
         let chunk = SearchChunk::from_proto(response);
         assert_eq!(chunk.crashes, 3);
+        assert_eq!(chunk.stats.crashes, 3);
+        assert_eq!(chunk.stats.file_count, 2);
+        assert_eq!(chunk.stats.match_count, 5);
+        assert_eq!(chunk.stats.files_skipped, 1);
+        assert_eq!(chunk.stats.shards_skipped, 4);
+        assert_eq!(chunk.stats.duration, Duration::from_millis(2_500));
+        assert_eq!(chunk.stats.flush_reason, FlushReason::FinalFlush);
+        assert_eq!(chunk.progress.priority, 1.5);
+        assert_eq!(chunk.progress.max_pending_priority, 9.25);
         assert_eq!(chunk.files.len(), 1);
         let file = &chunk.files[0];
         assert_eq!(file.file_name, b"main.go");
@@ -745,5 +861,40 @@ mod tests {
         assert_eq!(symbol.parent_kind, "function");
         assert_eq!(file.language, "Go");
         assert_eq!(file.version, "abc123");
+
+        // `SearchResultFromProto`: the adapter keeps files/stats/progress and
+        // leaves the Sourcegraph-unused maps empty.
+        let result = chunk.to_search_result();
+        assert_eq!(result.stats, chunk.stats);
+        assert_eq!(result.progress, chunk.progress);
+        assert_eq!(result.files, chunk.files);
+        assert!(result.repo_urls.is_empty());
+        assert!(result.line_fragments.is_empty());
+        assert_eq!(SearchResult::from(&chunk), result);
+        assert_eq!(SearchResult::from(chunk.clone()), result);
+    }
+
+    #[test]
+    fn missing_stats_and_progress_become_zero_values() {
+        let chunk = SearchChunk::from_proto(proto::SearchResponse {
+            stats: None,
+            progress: None,
+            files: Vec::new(),
+        });
+        assert_eq!(chunk.crashes, 0);
+        assert_eq!(chunk.stats, Stats::default());
+        assert_eq!(chunk.progress, Progress::default());
+    }
+
+    #[test]
+    fn negative_proto_durations_fall_back_to_zero() {
+        let stats = Stats::from_proto(Some(proto::Stats {
+            duration: Some(ProtoDuration {
+                seconds: -1,
+                nanos: 0,
+            }),
+            ..proto::Stats::default()
+        }));
+        assert_eq!(stats.duration, Duration::ZERO);
     }
 }

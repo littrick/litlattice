@@ -10,9 +10,10 @@
 //! sender yields full `*zoekt.SearchResult` values. There is no context in this
 //! port: callers inject a [`std::time::Instant`] deadline and a `since`
 //! function (see §4 of the M9.8gz overview). `sg_zoekt::streamer::Streamer`
-//! yields wire [`sg_zoekt::types::SearchChunk`]s (files + crashes only), which
-//! would lose the `Stats` fields `sendMatches` needs, so this module defines
-//! its own full-result [`Streamer`] trait instead of changing the peer API.
+//! yields wire [`sg_zoekt::types::SearchChunk`]s, which now carry the full
+//! `Stats`/`Progress` the result-level [`Streamer`] needs; use
+//! [`wire_chunk_to_search_result`] to adapt them without changing event
+//! encoding (M9.8ib).
 
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -22,8 +23,9 @@ use sg_search_query::SearchType;
 use sg_zoekt::indexed_repo_revs::IndexedRepoRevs;
 use sg_zoekt::query::{BranchRepos, IndexedRequestType, Query};
 use sg_zoekt::types::{
-    FileMatch, SearchOptions, SearchResult, DEFAULT_DOCUMENT_RANKS_WEIGHT, DEFAULT_FLUSH_WALL_TIME,
-    DEFAULT_MAX_WALL_TIME, DEFAULT_SHARD_MAX_MATCH_COUNT, DEFAULT_TOTAL_MAX_MATCH_COUNT,
+    FileMatch, SearchChunk, SearchOptions, SearchResult, DEFAULT_DOCUMENT_RANKS_WEIGHT,
+    DEFAULT_FLUSH_WALL_TIME, DEFAULT_MAX_WALL_TIME, DEFAULT_SHARD_MAX_MATCH_COUNT,
+    DEFAULT_TOTAL_MAX_MATCH_COUNT,
 };
 
 use super::convert;
@@ -185,6 +187,15 @@ pub trait Streamer {
         options: &SearchOptions,
         sender: &mut dyn FnMut(SearchResult),
     ) -> Result<(), Self::Error>;
+}
+
+/// Lossless wire→result adapter (`zoekt.SearchResultFromProto`, see
+/// `internal/search/backend/grpc.go:44-53`): converts a wire
+/// [`SearchChunk`] into the full [`SearchResult`] this module's [`Streamer`]
+/// yields, preserving `files`, `stats` and `progress`. The `repo_urls` /
+/// `line_fragments` maps are empty because Sourcegraph passes `nil` for both.
+pub fn wire_chunk_to_search_result(chunk: SearchChunk) -> SearchResult {
+    SearchResult::from(chunk)
 }
 
 /// Errors returned by [`zoekt_search`] / [`do_zoekt_search_global`].
@@ -590,6 +601,30 @@ mod tests {
                 other => panic!("expected file match, got {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn wire_chunk_adapter_preserves_stats_and_progress() {
+        let chunk = SearchChunk {
+            files: vec![file(3, "repo", "v", &["HEAD"])],
+            crashes: 2,
+            stats: sg_zoekt::types::Stats {
+                crashes: 2,
+                file_count: 1,
+                match_count: 4,
+                ..Default::default()
+            },
+            progress: sg_zoekt::types::Progress {
+                priority: 1.5,
+                max_pending_priority: 8.0,
+            },
+        };
+        let result = wire_chunk_to_search_result(chunk.clone());
+        assert_eq!(result.files, chunk.files);
+        assert_eq!(result.stats, chunk.stats);
+        assert_eq!(result.progress, chunk.progress);
+        assert!(result.repo_urls.is_empty());
+        assert!(result.line_fragments.is_empty());
     }
 
     #[test]
