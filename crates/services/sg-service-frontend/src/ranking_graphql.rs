@@ -26,10 +26,25 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
+use sg_graphql::exec::{Actor, Arguments, ExecError, FieldValue, ObjectValue};
+use sg_graphql::json::Json;
+use sg_graphql::schema::{assemble, Schema, SchemaError};
 
 /// `conf.CodeIntelRankingDocumentReferenceCountsGraphKey`'s default when the
 /// site setting is empty (`internal/conf/computed.go:423-428`).
 pub const DEFAULT_GRAPH_KEY_ROOT: &str = "dev";
+
+/// `//go:embed` equivalent for
+/// `cmd/frontend/graphqlbackend/codeintel.ranking.graphql` (M9.8ic), byte
+/// identical to the baseline file.
+pub const CODEINTEL_RANKING_SCHEMA: &str = include_str!("codeintel.ranking.graphql");
+
+/// Append [`CODEINTEL_RANKING_SCHEMA`] to an already assembled schema, exactly
+/// like `schemas = append(schemas, codeintelRankingSchema)` followed by
+/// `strings.Join(schemas, "\n")` (`graphqlbackend.go:440-447`).
+pub fn append_ranking_schema(base: &Schema) -> Result<Schema, SchemaError> {
+    assemble(&[base.schema_string.as_str(), CODEINTEL_RANKING_SCHEMA])
+}
 
 // ---------------------------------------------------------------------------
 // Graph keys (`internal/codeintel/ranking/internal/shared/keys.go`)
@@ -565,6 +580,122 @@ fn date_time_to_json(value: Option<DateTime>) -> Value {
 }
 
 // ---------------------------------------------------------------------------
+// GraphQL object snapshots (`codeintel.ranking.graphql:21-90`)
+// ---------------------------------------------------------------------------
+
+/// `ProgressResolver` as a GraphQL object (`RankingSummaryProgress`).
+impl ObjectValue for ProgressResolver {
+    fn type_name(&self) -> &'static str {
+        "RankingSummaryProgress"
+    }
+
+    fn field(
+        &self,
+        field: &str,
+        _arguments: &Arguments,
+        _actor: Actor,
+    ) -> Result<Option<FieldValue>, ExecError> {
+        match field {
+            "startedAt" => Ok(Some(FieldValue::Json(Json::Str(
+                self.started_at().format_rfc3339(),
+            )))),
+            // `CompletedAt`: `gqlutil.DateTimeOrNil`.
+            "completedAt" => Ok(Some(date_time_field(self.completed_at()))),
+            "processed" => Ok(Some(FieldValue::Json(Json::Int(i64::from(
+                self.processed(),
+            ))))),
+            "total" => Ok(Some(FieldValue::Json(Json::Int(i64::from(self.total()))))),
+            _ => Ok(None),
+        }
+    }
+}
+
+/// `RankingSummaryResolver` as a GraphQL object (`RankingSummary`).
+impl ObjectValue for RankingSummaryResolver {
+    fn type_name(&self) -> &'static str {
+        "RankingSummary"
+    }
+
+    fn field(
+        &self,
+        field: &str,
+        _arguments: &Arguments,
+        _actor: Actor,
+    ) -> Result<Option<FieldValue>, ExecError> {
+        match field {
+            "graphKey" => Ok(Some(FieldValue::Json(Json::Str(
+                self.graph_key().to_owned(),
+            )))),
+            "visibleToZoekt" => Ok(Some(FieldValue::Json(Json::Bool(self.visible_to_zoekt())))),
+            "pathMapperProgress" => Ok(Some(FieldValue::Object(Arc::new(
+                self.path_mapper_progress(),
+            )))),
+            "referenceMapperProgress" => Ok(Some(FieldValue::Object(Arc::new(
+                self.reference_mapper_progress(),
+            )))),
+            // `ReducerProgress`: null when the baseline pointer is nil.
+            "reducerProgress" => Ok(Some(match self.reducer_progress() {
+                Some(progress) => FieldValue::Object(Arc::new(progress)),
+                None => FieldValue::Null,
+            })),
+            _ => Ok(None),
+        }
+    }
+}
+
+/// `globalRankingSummaryResolver` as a GraphQL object
+/// (`GlobalRankingSummary`).
+impl ObjectValue for GlobalRankingSummary {
+    fn type_name(&self) -> &'static str {
+        "GlobalRankingSummary"
+    }
+
+    fn field(
+        &self,
+        field: &str,
+        _arguments: &Arguments,
+        _actor: Actor,
+    ) -> Result<Option<FieldValue>, ExecError> {
+        match field {
+            // `RankingSummary`: `[]RankingSummaryResolver`, service order.
+            "rankingSummary" => Ok(Some(FieldValue::List {
+                items: self
+                    .ranking_summary()
+                    .iter()
+                    .cloned()
+                    .map(|summary| FieldValue::Object(Arc::new(summary)))
+                    .collect(),
+                element_type: Some("RankingSummary"),
+            })),
+            "derivativeGraphKey" => Ok(Some(match self.derivative_graph_key() {
+                Some(key) => FieldValue::Json(Json::Str(key.to_owned())),
+                None => FieldValue::Null,
+            })),
+            // `NextJobStartsAt`: `gqlutil.DateTimeOrNil`.
+            "nextJobStartsAt" => Ok(Some(date_time_field(self.next_job_starts_at()))),
+            "numExportedIndexes" => Ok(Some(FieldValue::Json(Json::Int(i64::from(
+                self.num_exported_indexes(),
+            ))))),
+            "numTargetIndexes" => Ok(Some(FieldValue::Json(Json::Int(i64::from(
+                self.num_target_indexes(),
+            ))))),
+            "numRepositoriesWithoutCurrentRanks" => Ok(Some(FieldValue::Json(Json::Int(
+                i64::from(self.num_repositories_without_current_ranks()),
+            )))),
+            _ => Ok(None),
+        }
+    }
+}
+
+/// `gqlutil.DateTimeOrNil` as a [`FieldValue`].
+fn date_time_field(value: Option<DateTime>) -> FieldValue {
+    match value {
+        Some(value) => FieldValue::Json(Json::Str(value.format_rfc3339())),
+        None => FieldValue::Null,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Root resolver (`root_resolver.go:20-103`)
 // ---------------------------------------------------------------------------
 
@@ -734,6 +865,29 @@ mod tests {
             RankingError::MustBeSiteAdmin.to_string(),
             "must be site admin"
         );
+    }
+
+    #[test]
+    fn appends_ranking_schema() {
+        let base = sg_graphql::schema::assemble_oss().expect("oss schema");
+        assert!(!base.types.contains_key("GlobalRankingSummary"));
+
+        let schema = append_ranking_schema(&base).expect("ranking schema");
+        assert!(schema.types.contains_key("GlobalRankingSummary"));
+        assert!(schema.types.contains_key("RankingSummary"));
+        assert!(schema.types.contains_key("RankingSummaryProgress"));
+        assert!(schema.types["Query"]
+            .fields
+            .iter()
+            .any(|field| field.name == "rankingSummary"));
+        assert!(schema.types["Mutation"]
+            .fields
+            .iter()
+            .any(|field| field.name == "bumpDerivativeGraphKey"));
+        assert!(schema.types["Mutation"]
+            .fields
+            .iter()
+            .any(|field| field.name == "deleteRankingProgress"));
     }
 
     #[test]

@@ -48,6 +48,72 @@ use crate::settings_merge::{final_settings, DEFAULT_SETTINGS_CONTENTS};
 /// Sync`) without changing the M9.8hq trait itself.
 pub type SearchContextsDatabaseHandle = Arc<dyn SearchContextsGraphqlDatabase + Send + Sync>;
 
+/// The ranking root resolver injected by the frontend (M9.8ic). `None` in
+/// [`SchemaGraphqlDeps`](crate::graphql_api::SchemaGraphqlDeps) reproduces an
+/// absent `CodeIntelResolver`/ranking surface (SDL not appended).
+pub type RankingResolverHandle = Arc<crate::ranking_graphql::RootResolver>;
+
+/// The ranking root fields prefetched by
+/// [`crate::graphql_api::SchemaGraphqlDeps::exec`] (async) and replayed by
+/// [`QueryRoot`]/[`MutationRoot`] (sync).
+#[derive(Debug, Clone, Default)]
+pub struct RankingRoots {
+    /// `Query.rankingSummary`; `None` when the field was not selected (or the
+    /// resolver is not injected).
+    pub summary: Option<Result<crate::ranking_graphql::GlobalRankingSummary, String>>,
+    /// Mutation outcomes keyed by root field name. `Ok(())` renders the
+    /// baseline non-nil `EmptyResponse` object.
+    pub mutations: HashMap<String, Result<(), String>>,
+}
+
+/// Run the selected ranking root operations before GraphQL execution, like the
+/// other async prefetch passes (settings/log events/feature flags). Only the
+/// selected root fields run; the `RootResolver` keeps the baseline's
+/// site-admin-before-service order and error strings.
+pub async fn prefetch_ranking_roots(
+    resolver: &crate::ranking_graphql::RootResolver,
+    fields: &[RootField],
+    is_mutation: bool,
+) -> RankingRoots {
+    let mut roots = RankingRoots::default();
+    for field in fields {
+        if !is_mutation && field.name == "rankingSummary" {
+            roots.summary = Some(
+                resolver
+                    .ranking_summary()
+                    .await
+                    .map_err(|error| error.to_string()),
+            );
+        } else if is_mutation && field.name == "bumpDerivativeGraphKey" {
+            roots.mutations.insert(
+                field.name.clone(),
+                resolver
+                    .bump_derivative_graph_key()
+                    .await
+                    .map(|_| ())
+                    .map_err(|error| error.to_string()),
+            );
+        } else if is_mutation && field.name == "deleteRankingProgress" {
+            let args = crate::ranking_graphql::DeleteRankingProgressArgs {
+                graph_key: field
+                    .arguments
+                    .string("graphKey")
+                    .unwrap_or_default()
+                    .to_owned(),
+            };
+            roots.mutations.insert(
+                field.name.clone(),
+                resolver
+                    .delete_ranking_progress(&args)
+                    .await
+                    .map(|_| ())
+                    .map_err(|error| error.to_string()),
+            );
+        }
+    }
+    roots
+}
+
 /// The `users` row fields the DB-backed `User` resolvers read, plus the
 /// primary `user_emails.email` (`userEmailsStore.GetPrimaryEmail`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2235,9 +2301,17 @@ impl FrontendRootResolver {
                 webhook_logs: HashMap::new(),
                 repositories_connections: HashMap::new(),
                 search_contexts: None,
+                ranking_summary: None,
             },
             mutation: MutationRoot::default(),
         }
+    }
+
+    /// Attach the request's prefetched ranking root fields (M9.8ic).
+    pub fn with_ranking_roots(mut self, roots: RankingRoots) -> Self {
+        self.query.ranking_summary = roots.summary;
+        self.mutation.ranking_mutations = roots.mutations;
+        self
     }
 
     /// Attach the request's pre-executed `Mutation` root fields.
@@ -2376,6 +2450,9 @@ struct QueryRoot {
     /// Optional search contexts database (M9.8hz). `None` means the SDL was
     /// not appended and the root fields are absent.
     search_contexts: Option<SearchContextsDatabaseHandle>,
+    /// Prefetched `Query.rankingSummary` (M9.8ic); `None` when not selected or
+    /// the ranking resolver is not injected.
+    ranking_summary: Option<Result<crate::ranking_graphql::GlobalRankingSummary, String>>,
 }
 
 /// `Mutation` root: `settingsMutation`/log events/temporary settings/feature
@@ -2385,6 +2462,9 @@ struct QueryRoot {
 pub struct MutationRoot {
     settings: crate::settings_mutation::MutationRoot,
     search_contexts: Option<SearchContextsDatabaseHandle>,
+    /// Prefetched `Mutation.bumpDerivativeGraphKey` /
+    /// `Mutation.deleteRankingProgress` outcomes (M9.8ic).
+    ranking_mutations: HashMap<String, Result<(), String>>,
 }
 
 impl ObjectValue for MutationRoot {
@@ -2412,6 +2492,17 @@ impl ObjectValue for MutationRoot {
                 arguments,
                 actor,
             );
+        }
+        // `CodeIntelResolver.BumpDerivativeGraphKey` / `DeleteRankingProgress`
+        // (M9.8ic): prefetched outcome replayed as the baseline non-nil
+        // `EmptyResponse` (`alwaysNil: null`) or the resolver error.
+        if let Some(outcome) = self.ranking_mutations.get(field) {
+            return match outcome {
+                Ok(()) => Ok(Some(FieldValue::Object(Arc::new(
+                    crate::temporary_settings::EmptyResponseObject,
+                )))),
+                Err(message) => Err(ExecError::new(message.clone())),
+            };
         }
         self.settings.field(field, arguments, actor)
     }
@@ -2965,6 +3056,14 @@ impl ObjectValue for QueryRoot {
                     None => Ok(None),
                 }
             }
+            // `CodeIntelResolver.RankingSummary` (M9.8ic): the async resolver
+            // result was prefetched in `SchemaGraphqlDeps::exec`; the owned
+            // snapshot answers the object fields.
+            "rankingSummary" => match &self.ranking_summary {
+                Some(Ok(summary)) => Ok(Some(FieldValue::Object(Arc::new(summary.clone())))),
+                Some(Err(message)) => Err(ExecError::new(message.clone())),
+                None => Ok(None),
+            },
             // `SearchContextsResolver` root fields (`search_contexts.go:20-39`):
             // dispatched through the M9.8hu registration layer (M9.8hz).
             "searchContexts"

@@ -405,6 +405,9 @@ pub struct SchemaGraphqlDeps {
     /// `SearchContextsResolver`'s database seam (M9.8hz); `None` reproduces an
     /// absent optional resolver (SDL not appended, root fields/types absent).
     search_contexts: Option<crate::graphql_resolvers::SearchContextsDatabaseHandle>,
+    /// `RankingServiceResolver`'s root resolver (M9.8ic); `None` reproduces an
+    /// absent ranking surface (SDL not appended, root fields/types absent).
+    ranking: Option<crate::graphql_resolvers::RankingResolverHandle>,
 }
 
 impl SchemaGraphqlDeps {
@@ -431,6 +434,7 @@ impl SchemaGraphqlDeps {
             site_configuration: None,
             repositories_connections: None,
             search_contexts: None,
+            ranking: None,
         }
     }
 
@@ -474,6 +478,7 @@ impl SchemaGraphqlDeps {
                 crate::repositories::PgRepositoriesConnectionStore::new(pool),
             )),
             search_contexts: None,
+            ranking: None,
         }
     }
 
@@ -632,6 +637,24 @@ impl SchemaGraphqlDeps {
         Ok(self)
     }
 
+    /// Enable the ranking GraphQL surface (M9.8ic): append
+    /// `codeintel.ranking.graphql` to the assembled schema and hand the root
+    /// resolver to the executor.
+    ///
+    /// This mirrors an `enterpriseServices.CodeIntelResolver` that includes the
+    /// ranking root resolver: the optional surface is present, so
+    /// `Query.rankingSummary` and the two ranking mutations are registered.
+    /// When it is never called the base schema and every existing response stay
+    /// byte-identical (the optional resolver's absence).
+    pub fn with_ranking(
+        mut self,
+        resolver: crate::graphql_resolvers::RankingResolverHandle,
+    ) -> Result<Self, sg_graphql::schema::SchemaError> {
+        self.schema = Arc::new(crate::ranking_graphql::append_ranking_schema(&self.schema)?);
+        self.ranking = Some(resolver);
+        Ok(self)
+    }
+
     /// Test hook: inject the store/user lookup without Redis or Postgres.
     #[cfg(test)]
     fn with_session_parts(
@@ -668,6 +691,7 @@ impl SchemaGraphqlDeps {
             site_configuration: None,
             repositories_connections: None,
             search_contexts: None,
+            ranking: None,
         }
     }
 }
@@ -792,6 +816,20 @@ impl GraphqlDeps for SchemaGraphqlDeps {
         // resolves fields synchronously, so run the (async) write paths now.
         // Only mutation operations perform side effects.
         let is_mutation = sg_graphql::exec::is_mutation_operation(&exec_request);
+        // `CodeIntelResolver.RankingSummary` / `BumpDerivativeGraphKey` /
+        // `DeleteRankingProgress` (M9.8ic): the resolver is async, so run the
+        // selected root operations before the synchronous executor.
+        let ranking_roots = match &self.ranking {
+            Some(resolver) => {
+                crate::graphql_resolvers::prefetch_ranking_roots(
+                    resolver.as_ref(),
+                    &fields,
+                    is_mutation,
+                )
+                .await
+            }
+            None => crate::graphql_resolvers::RankingRoots::default(),
+        };
         let mut mutation = match (&self.pool, &self.org_memberships) {
             (Some(pool), Some(store)) if is_mutation => {
                 crate::settings_mutation::prefetch_settings_mutation(
@@ -1086,7 +1124,8 @@ impl GraphqlDeps for SchemaGraphqlDeps {
             .with_webhook_logs(webhook_logs)
             .with_repositories_connections(repositories_connections)
             .with_mutation(mutation)
-            .with_search_contexts(self.search_contexts.clone());
+            .with_search_contexts(self.search_contexts.clone())
+            .with_ranking_roots(ranking_roots);
         if let Some(client_configuration) = client_configuration {
             roots = roots.with_client_configuration(client_configuration);
         }
