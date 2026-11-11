@@ -152,6 +152,7 @@ impl SiteConfigurationBackend for FakeBackend {
             Actor::Anonymous => Err("not authenticated".to_owned()),
             Actor::User { .. } if !self.viewer_site_admin => Err("must be site admin".to_owned()),
             Actor::User { .. } => Ok(()),
+            Actor::Internal => Ok(()),
         }
     }
 
