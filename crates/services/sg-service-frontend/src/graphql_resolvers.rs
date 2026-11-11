@@ -2332,6 +2332,7 @@ impl FrontendRootResolver {
                 ranking_summary: None,
                 search: None,
                 git: None,
+                slow_requests: None,
             },
             mutation: MutationRoot::default(),
         }
@@ -2371,6 +2372,15 @@ impl FrontendRootResolver {
     /// Attach the request's prefetched git object/commit data (M9.8ix).
     pub fn with_git(mut self, git: Option<Arc<crate::git_graphql::GitPrefetch>>) -> Self {
         self.query.git = git;
+        self
+    }
+
+    /// Attach the optional `Query.slowRequests` surface (M9.8jf).
+    pub fn with_slow_requests(
+        mut self,
+        surface: Arc<crate::slow_requests_tracer::SlowRequestsSurface>,
+    ) -> Self {
+        self.query.slow_requests = Some(surface);
         self
     }
 
@@ -2501,6 +2511,9 @@ struct QueryRoot {
     /// Prefetched gitserver object/commit data (M9.8ix); `None` when no
     /// `GitObjectSource` was injected (git fields stay unported).
     git: Option<Arc<crate::git_graphql::GitPrefetch>>,
+    /// Optional `Query.slowRequests` surface (M9.8jf); `None` keeps the field
+    /// unported (the baseline's "capture not enabled"/absent-resolver state).
+    slow_requests: Option<Arc<crate::slow_requests_tracer::SlowRequestsSurface>>,
 }
 
 /// `Mutation` root: `settingsMutation`/log events/temporary settings/feature
@@ -2706,6 +2719,15 @@ impl ObjectValue for QueryRoot {
                     None => Ok(None),
                 }
             }
+            // `schemaResolver.SlowRequests` (`slow_requests_tracer.go:63`):
+            // site-admin gated. `None` keeps the surface unported.
+            "slowRequests" => match &self.slow_requests {
+                Some(surface) => surface
+                    .resolve(actor, self.viewer_site_admin, arguments.string("after"))
+                    .map(|connection| Some(FieldValue::Object(Arc::new(connection))))
+                    .map_err(ExecError::new),
+                None => Ok(None),
+            },
             // `CurrentUser` -> `db.Users().GetByCurrentAuthUser`: anonymous
             // actors get `nil`; an authenticated actor gets the prefetched row
             // (or `nil` if it disappeared between authentication and here).
