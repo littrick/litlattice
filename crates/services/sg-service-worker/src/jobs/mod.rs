@@ -37,7 +37,6 @@ use crate::registry;
 
 pub mod adminanalytics;
 pub mod auth_sourcegraph_operator_cleaner;
-pub mod autoindex_config;
 pub mod authz_azuredevops;
 pub mod authz_azuredevops_client;
 pub mod authz_bitbucketcloud;
@@ -50,8 +49,10 @@ pub mod authz_github_user;
 pub mod authz_gitlab;
 pub mod authz_gitlab_client;
 pub mod authz_providers;
+pub mod autoindex_config;
 pub mod batches;
 pub mod batches_bulk_processor;
+pub mod batches_reconciler;
 pub mod batches_scheduler;
 pub mod bitbucket_project_permissions;
 pub mod bitbucket_server_client;
@@ -71,9 +72,9 @@ pub mod codeintel_autoindexing_jobselector;
 pub mod codeintel_autoindexing_package_inference;
 pub mod codeintel_autoindexing_path_patterns;
 pub mod codeintel_autoindexing_scheduler;
+pub mod codeintel_autoindexing_summary_builder;
 pub mod codeintel_commitgraph_updater;
 pub mod codeintel_dependency_jobs;
-pub mod codeintel_autoindexing_summary_builder;
 pub mod codeintel_metrics_reporter;
 pub mod codeintel_package_filter_applicator;
 pub mod codeintel_policies_repository_matcher;
@@ -241,6 +242,9 @@ pub fn all_jobs() -> Vec<(&'static str, Arc<dyn Job>)> {
                     Arc::new(batches_bulk_processor::BulkOperationProcessorJob::new())
                 }
                 "batches-janitor" => Arc::new(batches::BatchesJanitor::new()),
+                "batches-reconciler" => {
+                    Arc::new(batches_reconciler::BatchesReconcilerJob::new())
+                }
                 "batches-scheduler" => Arc::new(batches_scheduler::BatchesScheduler::new()),
                 "bitbucket-project-permissions" => {
                     Arc::new(bitbucket_project_permissions::BitbucketProjectPermissionsJob::new())
