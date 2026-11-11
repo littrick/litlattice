@@ -366,7 +366,12 @@ async fn run_case(case: &Case) -> Output {
                 identity: provisioner.seen.lock().unwrap().clone(),
             }
         }
-        sg_service_frontend::oauth_login::UserResolution::Failed { safe_message } => ResolverOut {
+        // OIDC never returns a status-bearing failure (that variant exists for
+        // `gitlaboauth.CallbackHandler`); keep it out of the normalized output.
+        sg_service_frontend::oauth_login::UserResolution::Failed { safe_message }
+        | sg_service_frontend::oauth_login::UserResolution::FailedWithStatus {
+            safe_message, ..
+        } => ResolverOut {
             outcome: "failed".to_owned(),
             user_id: 0,
             new_user: false,

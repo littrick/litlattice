@@ -56,6 +56,7 @@ pub mod middleware;
 pub mod mux;
 pub mod oauth_login;
 pub mod oauth_routes;
+pub mod oauth_wiring;
 pub mod oidc_login;
 pub mod org_store;
 pub mod otlp_wire;

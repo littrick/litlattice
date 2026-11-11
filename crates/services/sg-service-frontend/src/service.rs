@@ -595,22 +595,27 @@ impl Service for FrontendService {
         ));
 
         // M9.8jo: `/.auth/<provider>/{login,callback}` production seams. The
-        // resolver registry starts empty; M9.8jp/jq/jr register the
-        // GitHub/GitLab/OIDC `GetOrCreateUser` implementations after merge
-        // (until then a callback reports the baseline 500 instead of faking
-        // success). The session store and license reader are the chain's, so
-        // cookies and expiry behave identically.
-        let oauth_resolvers = Arc::new(crate::oauth_routes::OAuthUserResolverRegistry::new());
+        // resolver registry is rebuilt per configuration generation so provider
+        // edits take effect without a restart, and M9.8jp/jq/jr register the
+        // GitHub/GitLab/OIDC `GetOrCreateUser` implementations into it. A
+        // callback whose provider cannot be resolved keeps the baseline 500
+        // rather than faking success. The session store and license reader are
+        // the chain's, so cookies and expiry behave identically.
         let oauth_http: Arc<dyn crate::oauth_login::OAuthHttpClient> =
             Arc::new(crate::oauth_routes::ReqwestOAuthHttpClient::from_env());
         let oauth_store = Arc::clone(&chain_deps.session_store);
         let oauth_license = Arc::clone(&chain_deps.license);
         let oauth_cookie_key = chain_deps.session_cookie_key.clone();
         let oauth_pool = chain_pool.clone();
+        let oauth_wiring = Arc::new(crate::oauth_wiring::OAuthResolverWiring::new(
+            chain_pool.clone(),
+        ));
         let oauth_factory: crate::oauth_routes::OAuthRouteFactory = {
-            let resolvers = Arc::clone(&oauth_resolvers);
             let http = Arc::clone(&oauth_http);
+            let resolver_wiring = Arc::clone(&oauth_wiring);
             Arc::new(move |site: &sg_config::SiteConfiguration| {
+                let resolvers = Arc::new(crate::oauth_routes::OAuthUserResolverRegistry::new());
+                resolver_wiring.register(&resolvers, site);
                 let backend = Arc::new(crate::oauth_login::PgOAuthLoginBackend::new(
                     oauth_pool.clone(),
                     sg_metrics::VERSION,
@@ -627,7 +632,7 @@ impl Service for FrontendService {
                     http: Arc::clone(&http),
                     users,
                     events,
-                    resolvers: Arc::clone(&resolvers),
+                    resolvers,
                 })
             })
         };

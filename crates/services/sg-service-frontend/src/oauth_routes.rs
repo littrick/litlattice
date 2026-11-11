@@ -38,7 +38,8 @@ use sg_session::{parse_go_duration, SessionStore, COOKIE_NAME, SIGN_OUT_COOKIE};
 use crate::actor_chain::LicenseReader;
 use crate::authz::LicenseState;
 use crate::oauth_login::{
-    encode_query_sorted, handle_callback, handle_login, parse_query, safe_redirect_url,
+    encode_query_sorted, handle_callback, handle_login, parse_query, query_get,
+    safe_redirect_url,
     OAuthCallbackRequest, OAuthFlowDeps, OAuthFlowResponse, OAuthHttpClient, OAuthHttpResponse,
     OAuthLoginRequest, OAuthProviderConfig, OAuthProviders, OAuthSecurityEventSink,
     OAuthUserLookup, OAuthUserResolver, StateSource, TokenExchangeRequest, UserResolution,
@@ -309,11 +310,22 @@ pub struct OAuthRouteDeps {
 /// Builds [`OAuthRouteDeps`] for one site configuration generation.
 pub type OAuthRouteFactory = Arc<dyn Fn(&SiteConfiguration) -> Arc<OAuthRouteDeps> + Send + Sync>;
 
+/// Builds the per-request resolver for one service type. The callback's state
+/// parameter is passed because OpenID Connect uses it as the id_token nonce
+/// (`openidconnect/middleware.go:338-345`).
+pub type OAuthUserResolverFactory =
+    Arc<dyn Fn(Option<&str>) -> Arc<dyn OAuthUserResolver> + Send + Sync>;
+
 /// Provider-specific `GetOrCreateUser` implementations, keyed by
 /// `service_type` (`"github"` | `"gitlab"` | `"openidconnect"`).
+///
+/// A static registration is enough for providers whose resolver does not
+/// depend on the request; `register_factory` wins over `register` for the
+/// same key and is rebuilt per callback request.
 #[derive(Default)]
 pub struct OAuthUserResolverRegistry {
     resolvers: Mutex<HashMap<String, Arc<dyn OAuthUserResolver>>>,
+    factories: Mutex<HashMap<String, OAuthUserResolverFactory>>,
 }
 
 impl OAuthUserResolverRegistry {
@@ -327,11 +339,38 @@ impl OAuthUserResolverRegistry {
         }
     }
 
+    pub fn register_factory(
+        &self,
+        service_type: impl Into<String>,
+        factory: OAuthUserResolverFactory,
+    ) {
+        if let Ok(mut factories) = self.factories.lock() {
+            factories.insert(service_type.into(), factory);
+        }
+    }
+
     pub fn get(&self, service_type: &str) -> Option<Arc<dyn OAuthUserResolver>> {
         self.resolvers
             .lock()
             .ok()
             .and_then(|resolvers| resolvers.get(service_type).cloned())
+    }
+
+    /// The factory for `service_type`, falling back to a static registration.
+    pub fn get_for(
+        &self,
+        service_type: &str,
+        state: Option<&str>,
+    ) -> Option<Arc<dyn OAuthUserResolver>> {
+        if let Some(factory) = self
+            .factories
+            .lock()
+            .ok()
+            .and_then(|factories| factories.get(service_type).cloned())
+        {
+            return Some(factory(state));
+        }
+        self.get(service_type)
     }
 }
 
@@ -602,7 +641,7 @@ pub async fn auth_prefix_response_at<B>(
                 referer,
                 session_cookie: session_cookie.as_deref(),
             };
-            let resolver = resolver_for(service_type, deps);
+            let resolver = resolver_for(service_type, None, deps);
             let flow_deps = flow_deps(config, deps, resolver.as_ref(), false, now);
             handle_login(&flow_deps, &request).await
         }
@@ -617,7 +656,8 @@ pub async fn auth_prefix_response_at<B>(
                 session_cookie: session_cookie.as_deref(),
                 anonymous_uid: anonymous_uid.as_deref(),
             };
-            let resolver = resolver_for(service_type, deps);
+            let state_param = query_get(&query, "state");
+            let resolver = resolver_for(service_type, Some(&state_param), deps);
             let license_expired = matches!(
                 deps.license.product_license().await,
                 LicenseState::Expired | LicenseState::Error
@@ -653,9 +693,13 @@ pub async fn auth_prefix_response<B>(
     auth_prefix_response_at(req, config, deps, OffsetDateTime::now_utc()).await
 }
 
-fn resolver_for(service_type: &str, deps: &OAuthRouteDeps) -> Arc<dyn OAuthUserResolver> {
+fn resolver_for(
+    service_type: &str,
+    state: Option<&str>,
+    deps: &OAuthRouteDeps,
+) -> Arc<dyn OAuthUserResolver> {
     deps.resolvers
-        .get(service_type)
+        .get_for(service_type, state)
         .unwrap_or_else(|| Arc::new(MissingResolver))
 }
 

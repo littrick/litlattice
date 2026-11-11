@@ -475,7 +475,8 @@ fn github_oauth_resolver_harness() {
         let resolution = runtime.block_on(resolver.resolve(&case.access_token));
         let (new_user, user_id, safe_err_msg) = match resolution {
             UserResolution::Created { user_id, new_user } => (new_user, user_id, String::new()),
-            UserResolution::Failed { safe_message } => (false, 0, safe_message),
+            UserResolution::Failed { safe_message }
+            | UserResolution::FailedWithStatus { safe_message, .. } => (false, 0, safe_message),
         };
 
         let requests: Vec<Value> = http.snapshot().iter().map(request_value).collect();
