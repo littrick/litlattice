@@ -163,13 +163,19 @@ pub fn validate_site_against_raw(contents: &str, raw_site: &str) -> Result<Vec<S
     // parse error would already have surfaced above. `null` is a valid document
     // for `json.Unmarshal` and leaves the typed struct zero-valued.
     let parsed = sg_config::SiteConfiguration::parse(&unredacted).map_err(|err| err.to_string())?;
-    messages.extend(validate_custom(parsed.raw())?);
+    messages.extend(validate_custom(parsed.raw(), &parsed)?);
     Ok(messages)
 }
 
 /// `validateCustom`'s core rules (email, externalURL, gitUpdateInterval),
-/// followed by the two offline auth contributed validators.
-fn validate_custom(site: &Value) -> Result<Vec<String>, String> {
+/// followed by the contributed validators this port can evaluate offline:
+/// auth, encryption (mounted/noop), symbols and txemail. The order mirrors the
+/// baseline's `init()` registration order
+/// (`cmd/frontend/internal/conf/validation/*.go`).
+fn validate_custom(
+    site: &Value,
+    config: &sg_config::SiteConfiguration,
+) -> Result<Vec<String>, String> {
     if !site.is_null() && !site.is_object() {
         // `json.Unmarshal` into `schema.SiteConfiguration` rejects non-objects.
         return Err(format!(
@@ -268,7 +274,186 @@ fn validate_custom(site: &Value) -> Result<Vec<String>, String> {
         problems.push("at most 1 builtin auth provider may be used".to_owned());
     }
 
+    // `cmd/frontend/internal/conf/validation/encryption.go`.
+    if let Some(problem) = contributed_encryption_problem(config) {
+        problems.push(problem);
+    }
+    // `cmd/frontend/internal/conf/validation/symbols.go`.
+    if let Some(problem) = contributed_symbols_problem(site) {
+        problems.push(problem);
+    }
+    // `cmd/frontend/internal/conf/validation/txemail.go`.
+    problems.extend(contributed_txemail_problems(site));
+
     Ok(problems)
+}
+
+/// `validation/encryption.go` + `keyring.NewRing`: build every configured key
+/// in the baseline's field order and report the first failure.
+///
+/// `mounted` (env var / file, 32-byte secret) and `noop` are evaluated. The
+/// AWS/GCP KMS constructors probe their services, so they remain a seam here
+/// (overview §4.2).
+fn contributed_encryption_problem(config: &sg_config::SiteConfiguration) -> Option<String> {
+    let keys = config.encryption_keys()?;
+    let ordered = [
+        &keys.batch_changes_credential_key,
+        &keys.external_service_key,
+        &keys.github_app_key,
+        &keys.user_external_account_key,
+        &keys.webhook_key,
+        &keys.webhook_log_key,
+        &keys.executor_secret_key,
+    ];
+    for key in ordered.into_iter().flatten() {
+        if let Err(error) = build_encryption_key(key) {
+            return Some(format!("Invalid encryption.keys config: {error}"));
+        }
+    }
+    None
+}
+
+/// `keyring.NewKey` for the offline key kinds.
+fn build_encryption_key(config: &sg_config::EncryptionKeyConfig) -> Result<(), String> {
+    match config {
+        sg_config::EncryptionKeyConfig::Mounted(mounted) => {
+            sg_encryption::MountedKey::from_config(&sg_encryption::MountedKeyConfig {
+                keyname: mounted.keyname.clone(),
+                version: mounted.version.clone(),
+                env_var_name: mounted.env_var_name.clone(),
+                filepath: mounted.filepath.clone(),
+            })
+            .map(|_| ())
+            .map_err(|err| err.to_string())
+        }
+        sg_config::EncryptionKeyConfig::Noop => Ok(()),
+        // Network-backed KMS key construction is not ported (seam).
+        sg_config::EncryptionKeyConfig::Awskms(_) | sg_config::EncryptionKeyConfig::Cloudkms(_) => {
+            Ok(())
+        }
+        sg_config::EncryptionKeyConfig::Unknown(value) => Err(format!(
+            "couldn't configure key: {}",
+            serde_json::to_string(value).unwrap_or_default()
+        )),
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SymbolsParser {
+    Off,
+    Universal,
+    Scip,
+}
+
+/// `validation/symbols.go`: validate `syntaxHighlighting.symbols.engine`.
+/// The baseline iterates a Go map (random order) and returns the first
+/// failure; only corpora with a single invalid entry are deterministic.
+fn contributed_symbols_problem(site: &Value) -> Option<String> {
+    let engines = site
+        .get("syntaxHighlighting")?
+        .get("symbols")?
+        .get("engine")?
+        .as_object()?;
+    for (language, engine) in engines {
+        let engine = engine.as_str().unwrap_or_default();
+        let parser = match engine {
+            "off" => SymbolsParser::Off,
+            "universal-ctags" => SymbolsParser::Universal,
+            "scip-ctags" => SymbolsParser::Scip,
+            _ => return Some(format!("Not a valid Symbols.Engine: `{engine}`.")),
+        };
+        let language = normalize_language(language);
+        if parser == SymbolsParser::Scip && !symbol_language_supported(&language) {
+            return Some(format!(
+                "Not a valid Symbols.Engine for language: {language} `{engine}`."
+            ));
+        }
+    }
+    None
+}
+
+/// `languages.NormalizeLanguage`: lower-case plus the enry `c#` mapping.
+fn normalize_language(language: &str) -> String {
+    let normalized = language.to_lowercase();
+    if normalized == "c#" {
+        "c_sharp".to_owned()
+    } else {
+        normalized
+    }
+}
+
+/// `ctags_config.supportedLanguages` (`internal/ctags_config/ctags_config.go:60-77`).
+fn symbol_language_supported(language: &str) -> bool {
+    matches!(
+        language,
+        "c_sharp"
+            | "go"
+            | "java"
+            | "javascript"
+            | "hack"
+            | "kotlin"
+            | "magik"
+            | "python"
+            | "ruby"
+            | "rust"
+            | "scala"
+            | "typescript"
+            | "zig"
+    )
+}
+
+/// `validation/txemail.go`: validate the custom `email.templates`.
+fn contributed_txemail_problems(site: &Value) -> Vec<String> {
+    let mut problems = Vec::new();
+    let Some(templates) = site.get("email.templates") else {
+        return problems;
+    };
+    for name in ["resetPassword", "setPassword"] {
+        let Some(template) = templates.get(name).filter(|value| !value.is_null()) else {
+            continue;
+        };
+        let subject = template
+            .get("subject")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let html = template
+            .get("html")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if subject.is_empty() || html.is_empty() {
+            problems.push(format!(
+                "`email.templates.{name}` is invalid: fields 'subject' and 'html' are required"
+            ));
+            continue;
+        }
+        let text = template
+            .get("text")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if let Err(error) = sg_txemail::parse_template(&sg_txemail::Templates {
+            subject: subject.to_owned(),
+            html: html.to_owned(),
+            text: text.to_owned(),
+        }) {
+            problems.push(format!(
+                "`email.templates.{name}` is invalid: {}",
+                go_template_error(&error)
+            ));
+        }
+    }
+    problems
+}
+
+/// Go `text/template.Parse` error text for the single-line templates the
+/// corpus uses. `sg-txemail` reports the condition without the
+/// `template: :<line>:` prefix; `MissingEnd` is Go's EOF error.
+fn go_template_error(error: &sg_txemail::TxEmailError) -> String {
+    match error {
+        sg_txemail::TxEmailError::Template(sg_txemail::TemplateError::MissingEnd) => {
+            "template: :1: unexpected EOF".to_owned()
+        }
+        sg_txemail::TxEmailError::Template(other) => format!("template: :1: {other}"),
+    }
 }
 
 fn go_json_type(value: &Value) -> &'static str {
@@ -580,7 +765,7 @@ pub struct SiteRoot {
 }
 
 /// Prefetched `SiteConfiguration` fields (only the selected ones are `Some`).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SiteConfigurationRoot {
     pub return_safe_configs_only: bool,
     pub id: Option<Result<i32, String>>,
@@ -591,7 +776,7 @@ pub struct SiteConfigurationRoot {
 }
 
 /// Prefetched `SiteConfigurationChangeConnection` fields.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HistoryRoot {
     pub total_count: Option<Result<i32, String>>,
     pub page_info: Option<Result<ConnectionPageInfo, String>>,
@@ -599,7 +784,7 @@ pub struct HistoryRoot {
 }
 
 /// One prefetched `SiteConfigurationChange` node and its `author`.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChangeNodeRoot {
     pub node: SiteConfigurationChangeResolver,
     pub author: Option<Result<Option<UserData>, String>>,
@@ -696,10 +881,16 @@ pub async fn prefetch_site_configuration(
     };
 
     let validation_messages = if want_validation {
-        match &effective {
-            Some(Ok(contents)) => Some(validator.validate_site(contents).await),
-            Some(Err(message)) => Some(Err(message.clone())),
-            None => None,
+        // `siteConfigurationResolver.ValidationMessages` re-checks the admin
+        // (even for `returnSafeConfigsOnly`, where `EffectiveContents` skips
+        // it), `site.go:262-272`.
+        match backend.check_current_user_is_site_admin(actor).await {
+            Err(message) => Some(Err(message)),
+            Ok(()) => match &effective {
+                Some(Ok(contents)) => Some(validator.validate_site(contents).await),
+                Some(Err(message)) => Some(Err(message.clone())),
+                None => None,
+            },
         }
     } else {
         None
@@ -787,6 +978,84 @@ pub async fn prefetch_settings_subject_site_configuration(
     actor: Actor,
 ) -> Option<Result<SiteConfigurationRoot, String>> {
     let configuration_field = settings_subject_site_configuration_field(fields)?;
+    Some(
+        prefetch_site_configuration(
+            backend,
+            licenses,
+            validator,
+            history_store,
+            users,
+            configuration_field,
+            actor,
+        )
+        .await,
+    )
+}
+
+/// The `configuration` selection inside a settings cascade's Site subject, if
+/// any.
+///
+/// `SettingsCascade.subjects` is `[SettingsSubject!]!` and `configuration` is
+/// declared only on `Site`, so the selection lives under the `Site` inline
+/// fragment (`subjects { ... on Site { configuration } }`). The cascade itself
+/// may be reached from several roots (`Query.viewerSettings`,
+/// `Query.viewerConfiguration`, `SettingsSubject.settingsCascade`,
+/// `SettingsSubject.configurationCascade`), so the scan is recursive.
+pub fn settings_cascade_site_configuration_field(fields: &[RootField]) -> Option<&RootField> {
+    fields
+        .iter()
+        .find_map(settings_cascade_site_configuration_in_field)
+}
+
+fn settings_cascade_site_configuration_in_field(field: &RootField) -> Option<&RootField> {
+    if matches!(
+        field.name.as_str(),
+        "settingsCascade" | "configurationCascade" | "viewerSettings" | "viewerConfiguration"
+    ) {
+        if let Some(subjects) = selected(&field.selections, "subjects") {
+            if let Some(configuration) = selected(&subjects.selections, "configuration") {
+                return Some(configuration);
+            }
+            for (type_condition, selections) in &subjects.type_conditions {
+                if type_condition == "Site" {
+                    if let Some(configuration) = selected(selections, "configuration") {
+                        return Some(configuration);
+                    }
+                }
+            }
+        }
+    }
+    for child in &field.selections {
+        if let Some(configuration) = settings_cascade_site_configuration_in_field(child) {
+            return Some(configuration);
+        }
+    }
+    for (_, selections) in &field.type_conditions {
+        for child in selections {
+            if let Some(configuration) = settings_cascade_site_configuration_in_field(child) {
+                return Some(configuration);
+            }
+        }
+    }
+    None
+}
+
+/// Prefetch `SettingsCascade.subjects[... on Site].configuration`.
+///
+/// `None` means the operation did not select a Site `configuration` inside a
+/// settings cascade. The baseline performs one admin check/audit per
+/// `siteResolver.Configuration` call (one per cascade root); this prefetch
+/// performs one for the whole operation (overview §4.2).
+pub async fn prefetch_cascade_subject_site_configuration(
+    backend: &dyn SiteConfigurationBackend,
+    licenses: &dyn LicenseInfoProvider,
+    validator: &dyn SiteConfigValidator,
+    history_store: &dyn SiteConfigHistoryStore,
+    users: Option<&dyn UserLookupStore>,
+    fields: &[RootField],
+    actor: Actor,
+) -> Option<Result<SiteConfigurationRoot, String>> {
+    let configuration_field = settings_cascade_site_configuration_field(fields)?;
     Some(
         prefetch_site_configuration(
             backend,

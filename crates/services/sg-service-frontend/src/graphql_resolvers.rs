@@ -995,6 +995,13 @@ pub struct NestedPrefetch {
         (i64, crate::webhook_logs::WebhookLogsArgs),
         crate::webhook_logs::WebhookLogsConnectionLookup,
     >,
+    /// Prefetched `SettingsCascade.subjects[... on Site].configuration`
+    /// (M9.8jl). `None` when the operation did not select it.
+    pub cascade_site_configuration:
+        Option<Result<crate::config_graphql::SiteConfigurationRoot, String>>,
+    /// Live `auth.providers` snapshot for the Site subject reached through a
+    /// settings cascade (M9.8jl); `Site.authProviders`.
+    pub auth_providers: Option<Arc<crate::auth_providers_graphql::AuthProvidersRoot>>,
 }
 
 /// The database seam for `User.organizations` (`db.Orgs().GetByUserID` plus
@@ -1456,6 +1463,15 @@ pub async fn prefetch_nested(
                 let Some(kind) = relay_kind(id) else {
                     continue;
                 };
+                // `SettingsSubject` is an interface: fields declared only on
+                // the concrete subject type (`settingsCascade`,
+                // `latestSettings`) live in the matching inline fragment.
+                let mut subject_selections = field.selections.clone();
+                for (type_condition, selections) in &field.type_conditions {
+                    if type_condition == &kind {
+                        subject_selections.extend(selections.iter().cloned());
+                    }
+                }
                 let lookup = match kind.as_str() {
                     "User" => match unmarshal_relay_id(id) {
                         Err(error) => SettingsSubjectLookup::Error(error),
@@ -1473,7 +1489,7 @@ pub async fn prefetch_nested(
                                 } else {
                                     user_queue.push(UserJob {
                                         user: user.clone(),
-                                        selections: field.selections.clone(),
+                                        selections: subject_selections.clone(),
                                     });
                                     SettingsSubjectLookup::Found(SettingsSubjectData::User(user))
                                 }
@@ -1508,8 +1524,7 @@ pub async fn prefetch_nested(
                             SettingsSubjectLookup::Error(format!("site not found: {site_id:?}"))
                         }
                         Ok(_) => {
-                            let wants_settings = field
-                                .selections
+                            let wants_settings = subject_selections
                                 .iter()
                                 .any(|selection| selection.name == "latestSettings");
                             if wants_settings && !site_settings_fetched {
@@ -1528,7 +1543,7 @@ pub async fn prefetch_nested(
                             }
                             // `Site.SettingsCascade` (`site.go:161-171`):
                             // no access check for the site subject.
-                            let wants_cascade = field.selections.iter().any(|selection| {
+                            let wants_cascade = subject_selections.iter().any(|selection| {
                                 matches!(
                                     selection.name.as_str(),
                                     "settingsCascade" | "configurationCascade"
@@ -3644,15 +3659,26 @@ impl SettingsSubjectObject {
             SettingsSubjectData::Org(data) => Self::Org(
                 OrgObject::from_data_as_viewer(data, viewer_site_admin).with_nested(nested),
             ),
-            SettingsSubjectData::Site => Self::Site(SiteObject {
-                viewer_site_admin,
-                nested,
-                site: None,
-                // `settingsSubject(site)` has no live configuration snapshot in
-                // this port; `Site.authProviders` stays unported on that path
-                // (overview §4).
-                auth_providers: None,
-            }),
+            SettingsSubjectData::Site => {
+                // `SettingsCascade.subjects` reaches the Site subject through
+                // this path; its `configuration` was prefetched by
+                // `prefetch_cascade_subject_site_configuration` (M9.8jl).
+                let site = nested
+                    .cascade_site_configuration
+                    .clone()
+                    .map(|configuration| {
+                        Arc::new(crate::config_graphql::SiteRoot {
+                            configuration: Some(configuration),
+                        })
+                    });
+                let auth_providers = nested.auth_providers.clone();
+                Self::Site(SiteObject {
+                    viewer_site_admin,
+                    nested,
+                    site,
+                    auth_providers,
+                })
+            }
         }
     }
 }
