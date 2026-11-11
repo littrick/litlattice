@@ -592,6 +592,18 @@ impl SchemaGraphqlDeps {
         self
     }
 
+    /// Test hook: the `Query.node` membership/settings store without a real
+    /// database (M9.9d). `exec` only prefetches `Query.node` when both this
+    /// store and the repository lookup are present, exactly like the
+    /// production `with_session` wiring.
+    pub fn with_org_memberships_store(
+        mut self,
+        store: Arc<dyn crate::graphql_resolvers::OrgMembershipsStore>,
+    ) -> Self {
+        self.org_memberships = Some(store);
+        self
+    }
+
     /// Production rate limiting (`serve_cmd.go:436-448`): the Redis-backed
     /// GCRA watcher plus the live site configuration that carries
     /// `experimentalFeatures.rateLimitAnonymous`.
@@ -876,6 +888,14 @@ impl SchemaGraphqlDeps {
     ) -> Self {
         self.git_objects = Some(source);
         self
+    }
+
+    /// Test hook (M9.9d): whether `exec` will prefetch and replay gitserver
+    /// reads. Used by the wiring differential to assert the production
+    /// `service.rs` chain actually installs a [`GitObjectSource`].
+    #[doc(hidden)]
+    pub fn has_git_objects(&self) -> bool {
+        self.git_objects.is_some()
     }
 
     /// Wire the `Query.slowRequests` capture-list seam (M9.8jf).

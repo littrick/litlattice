@@ -525,11 +525,14 @@ impl Service for FrontendService {
         let search_executor: Arc<dyn crate::search_graphql::SearchExecutor> = Arc::new(
             crate::search_graphql::BackendSearchExecutor::new(Arc::clone(&search_deps)),
         );
-        // M9.8ix: `Repository.commit`, `GitObject` and `GitRef.target` read
-        // through gitserver via the shared `sg-git` client.
-        let graphql_deps = graphql_deps.with_git_objects(Arc::new(
-            crate::git_graphql::GitserverGitObjects::new(Arc::clone(wiring.live())),
-        ));
+        // M9.8ix/M9.9d: `Repository.commit`, `GitObject`, `GitRef.target`,
+        // tree entry `content`/`isSingleChild` and `GitCommit.path`/`symbols`
+        // read through gitserver via the shared `sg-git` client. The
+        // constructor is shared with the M9.9d wiring differential so the
+        // production assembly and its live address resolution stay testable.
+        let graphql_deps = graphql_deps.with_git_objects(
+            crate::git_graphql::production_git_source(Arc::clone(wiring.live())),
+        );
         // M9.8iy: `TreeEntry.symbols`/`TreeEntry.symbol`/`GitCommit.symbols`
         // use the same symbols endpoints as the search runtime (M9.8im); no
         // endpoints leaves the fields reporting the symbols error.

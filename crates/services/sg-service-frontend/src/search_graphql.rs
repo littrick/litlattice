@@ -2070,7 +2070,7 @@ impl ObjectValue for GitRefObject {
                     )),
                 },
                 None => Err(ExecError::new(
-                    "GitRef.target requires a gitserver object resolver, which is not ported",
+                    "GitRef.target requires the gitserver GitSource (not wired for this request)",
                 )),
             },
             "repository" => Ok(Some(FieldValue::Object(Arc::new(repository_object(

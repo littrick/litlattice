@@ -3233,7 +3233,7 @@ impl ObjectValue for QueryRoot {
                         };
                         let Some(git) = &self.git else {
                             return Err(ExecError::new(
-                                "GitCommit requires a gitserver commit resolver, which is not ported",
+                                "GitCommit requires the gitserver GitSource (not wired for this request)",
                             ));
                         };
                         match git.revisions.get(&(repo_id, spec.commit.clone())) {
