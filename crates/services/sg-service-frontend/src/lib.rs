@@ -67,6 +67,7 @@ pub mod rate_limit;
 pub mod repositories;
 pub mod repository_store;
 pub mod saml_auth;
+pub mod saml_wiring;
 pub mod search_client;
 pub mod search_commit_job;
 pub mod search_contexts;

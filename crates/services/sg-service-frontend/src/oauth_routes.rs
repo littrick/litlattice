@@ -568,7 +568,7 @@ fn redirect_response(method: &Method, location: &str) -> Response<BoxBody> {
 // Request facts (net/http helpers)
 // ---------------------------------------------------------------------------
 
-fn cookie_value<B>(req: &Request<B>, name: &str) -> Option<String> {
+pub(crate) fn cookie_value<B>(req: &Request<B>, name: &str) -> Option<String> {
     for value in req.headers().get_all(header::COOKIE) {
         let Ok(value) = value.to_str() else {
             continue;
@@ -588,7 +588,7 @@ fn query_pairs<B>(req: &Request<B>) -> Vec<(String, String)> {
     req.uri().query().map(parse_query).unwrap_or_default()
 }
 
-fn query_has<B>(req: &Request<B>, name: &str) -> bool {
+pub(crate) fn query_has<B>(req: &Request<B>, name: &str) -> bool {
     query_pairs(req).iter().any(|(key, _)| key == name)
 }
 

@@ -34,6 +34,7 @@ use crate::health;
 use crate::ipallowlist::{self, AllowlistEnv, IpAllowlistConfig};
 use crate::mux::{self, SecurityConfig};
 use crate::oauth_routes::{OAuthRouteConfig, OAuthRouteDeps, OAuthRouteFactory};
+use crate::saml_wiring::{SamlRouteDeps, SamlRouteFactory};
 use crate::search_stream::SearchDeps;
 use crate::tenant;
 use crate::trace_headers;
@@ -298,6 +299,8 @@ struct DerivedConfig {
     /// Production OAuth seams; `None` only in the tests that build
     /// [`LiveMiddleware`] without an OAuth factory.
     oauth: Option<Arc<OAuthRouteDeps>>,
+    /// Production SAML seams (`conf.Get()` per generation).
+    saml: Option<Arc<SamlRouteDeps>>,
     app_env: Arc<AppEnv>,
     app_config: AppConfig,
     app_deps: Arc<AppDeps>,
@@ -311,6 +314,7 @@ impl DerivedConfig {
         app_deps: Arc<AppDeps>,
         sign_out_factory: Option<&SignOutFactory>,
         oauth_factory: Option<&OAuthRouteFactory>,
+        saml_factory: Option<&SamlRouteFactory>,
     ) -> Self {
         // `conf.Watch` equivalent (`internal/tracer.newConfWatcher`): refresh
         // the process-global trace policy for each configuration generation.
@@ -332,6 +336,7 @@ impl DerivedConfig {
             chain_config,
             oauth_config: OAuthRouteConfig::from_site(site, app_env.dotcom),
             oauth: oauth_factory.map(|factory| factory(site)),
+            saml: saml_factory.map(|factory| factory(site)),
             app_env,
             app_config: AppConfig::from_site_config(site),
             app_deps,
@@ -353,6 +358,8 @@ pub struct LiveMiddleware {
     sign_out_factory: Option<SignOutFactory>,
     /// OAuth route dependencies rebuilt per configuration generation.
     oauth_factory: Option<OAuthRouteFactory>,
+    /// SAML route dependencies rebuilt per configuration generation.
+    saml_factory: Option<SamlRouteFactory>,
     cache: std::sync::Mutex<Option<(u64, Arc<DerivedConfig>)>>,
 }
 
@@ -364,6 +371,7 @@ impl LiveMiddleware {
         app_deps: Arc<AppDeps>,
         sign_out_factory: Option<SignOutFactory>,
         oauth_factory: Option<OAuthRouteFactory>,
+        saml_factory: Option<SamlRouteFactory>,
     ) -> Self {
         Self {
             live,
@@ -372,6 +380,7 @@ impl LiveMiddleware {
             app_deps,
             sign_out_factory,
             oauth_factory,
+            saml_factory,
             cache: std::sync::Mutex::new(None),
         }
     }
@@ -395,6 +404,7 @@ impl LiveMiddleware {
             Arc::clone(&self.app_deps),
             self.sign_out_factory.as_ref(),
             self.oauth_factory.as_ref(),
+            self.saml_factory.as_ref(),
         ));
         if let Ok(mut cache) = self.cache.lock() {
             *cache = Some((generation, Arc::clone(&derived)));
@@ -412,6 +422,7 @@ pub fn external_handler_with_live(
     allowlist_env: AllowlistEnv,
     sign_out_factory: Option<SignOutFactory>,
     oauth_factory: Option<OAuthRouteFactory>,
+    saml_factory: Option<SamlRouteFactory>,
     version: Bytes,
     blame_deps: Arc<dyn BlameDeps>,
     search_deps: Arc<dyn SearchDeps>,
@@ -428,6 +439,7 @@ pub fn external_handler_with_live(
         app_deps,
         sign_out_factory,
         oauth_factory,
+        saml_factory,
     ));
     Arc::new(move |mut req: Request<Incoming>| {
         let middleware = Arc::clone(&middleware);
@@ -451,6 +463,7 @@ pub fn external_handler_with_live(
                     let chain_config = derived.chain_config.clone();
                     let oauth_config = derived.oauth_config.clone();
                     let oauth = derived.oauth.clone();
+                    let saml = derived.saml.clone();
                     let app_env = Arc::clone(&derived.app_env);
                     let app_config = derived.app_config.clone();
                     let app_deps = Arc::clone(&derived.app_deps);
@@ -472,6 +485,7 @@ pub fn external_handler_with_live(
                             let chain_deps = Arc::clone(&chain_deps);
                             let oauth_config = oauth_config.clone();
                             let oauth = oauth.clone();
+                            let saml = saml.clone();
                             Box::pin(async move {
                                 match &route {
                                     // `/.api/` and `/` are the baseline's only
@@ -500,6 +514,19 @@ pub fn external_handler_with_live(
                                                     return response;
                                                 }
                                             }
+                                            // `saml.Middleware` (`auth/init.go:50`)
+                                            // serves `/.auth/saml/*` before the
+                                            // actor is consulted.
+                                            if let Some(deps) = &saml {
+                                                if let Some(response) =
+                                                    crate::saml_wiring::saml_route_response(
+                                                        deps, request, false, false,
+                                                    )
+                                                    .await
+                                                {
+                                                    return response;
+                                                }
+                                            }
                                         }
                                         match crate::actor_chain::run_external_chain(
                                             request,
@@ -517,6 +544,20 @@ pub fn external_handler_with_live(
                                                 // single-provider condition
                                                 // holds.
                                                 if mode == ExternalMode::App {
+                                                    // SAML's single-provider
+                                                    // redirect is unconditional
+                                                    // (it does not depend on the
+                                                    // access-requests setting).
+                                                    if let Some(deps) = &saml {
+                                                        if let Some(redirect) =
+                                                            crate::saml_wiring::saml_route_response(
+                                                                deps, request, false, true,
+                                                            )
+                                                            .await
+                                                        {
+                                                            return redirect;
+                                                        }
+                                                    }
                                                     if let Some(redirect) =
                                                         crate::oauth_routes::single_provider_redirect(
                                                             request,
@@ -537,6 +578,16 @@ pub fn external_handler_with_live(
                                                 if mode == ExternalMode::App
                                                     && !actor.is_authenticated()
                                                 {
+                                                    if let Some(deps) = &saml {
+                                                        if let Some(redirect) =
+                                                            crate::saml_wiring::saml_route_response(
+                                                                deps, request, false, true,
+                                                            )
+                                                            .await
+                                                        {
+                                                            return redirect;
+                                                        }
+                                                    }
                                                     if let Some(redirect) =
                                                         crate::oauth_routes::single_provider_redirect(
                                                             request,
@@ -953,6 +1004,7 @@ mod tests {
             AllowlistEnv::default(),
             Arc::new(AppEnv::default()),
             Arc::new(AppDeps::default()),
+            None,
             None,
             None,
         );

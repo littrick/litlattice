@@ -610,6 +610,11 @@ impl Service for FrontendService {
         let oauth_wiring = Arc::new(crate::oauth_wiring::OAuthResolverWiring::new(
             chain_pool.clone(),
         ));
+        // The OAuth factory's `move` closure takes the store/license/cookie
+        // key; keep copies for the SAML factory built alongside.
+        let saml_store = Arc::clone(&oauth_store);
+        let saml_license = Arc::clone(&oauth_license);
+        let saml_cookie_key = oauth_cookie_key.clone();
         let oauth_factory: crate::oauth_routes::OAuthRouteFactory = {
             let http = Arc::clone(&oauth_http);
             let resolver_wiring = Arc::clone(&oauth_wiring);
@@ -637,6 +642,64 @@ impl Service for FrontendService {
             })
         };
 
+        // M9.8jt: SAML endpoints and the single-SAML-provider sign-in
+        // redirect. Provider configuration, IdP metadata and the sign-in
+        // provider lists are rebuilt per configuration generation; the
+        // session store, license reader and provisioning seams are the
+        // actor chain's, so cookies and expiry behave identically.
+        let saml_http: Arc<dyn crate::saml_auth::SamlHttpClient> =
+            Arc::new(crate::saml_auth::ReqwestSamlHttpClient::new());
+        let saml_factory: crate::saml_wiring::SamlRouteFactory = {
+            let pool = chain_pool.clone();
+            let store = Arc::clone(&saml_store);
+            let license = Arc::clone(&saml_license);
+            let cookie_key = saml_cookie_key.clone();
+            let dotcom = {
+                let getenv = |key: &str| std::env::var(key).ok();
+                crate::service_connections::sourcegraph_dotcom_mode(&getenv)
+            };
+            let http = Arc::clone(&saml_http);
+            Arc::new(move |site: &sg_config::SiteConfiguration| {
+                let raw = site.raw();
+                let external_url = raw
+                    .get("externalURL")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned();
+                let secure = url::Url::parse(&external_url)
+                    .map(|url| url.scheme() == "https")
+                    .unwrap_or(false);
+                let configured_expiry = raw
+                    .get("auth.sessionExpiry")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_owned);
+                Arc::new(crate::saml_wiring::SamlRouteDeps {
+                    providers: crate::saml_auth::SamlProviderSet::from_site(
+                        site,
+                        Arc::clone(&http),
+                    ),
+                    sign_in_without_soap: crate::saml_auth::sign_in_providers_from_site(site, true),
+                    sign_in_with_soap: crate::saml_auth::sign_in_providers_from_site(site, false),
+                    auth_public: dotcom,
+                    external_url,
+                    store: Arc::clone(&store),
+                    ids: Arc::new(sg_session::OsSessionIdSource),
+                    cookie_key: cookie_key.clone(),
+                    secure,
+                    configured_expiry,
+                    license: Arc::clone(&license),
+                    provisioner: Arc::new(crate::saml_auth::PgSamlProvisioner::new(
+                        pool.clone(),
+                        dotcom,
+                    )),
+                    users: Arc::new(crate::saml_auth::PgSamlUsers::new(pool.clone())),
+                    suffix: Arc::new(crate::user_provisioning::OsUsernameSuffix),
+                    sourcegraph_dotcom: dotcom,
+                })
+            })
+        };
+
         sg_metrics::register_service_metadata(sg_metrics::VERSION);
         ctx.ready.mark_ready();
         ready.store(true, Ordering::SeqCst);
@@ -649,6 +712,7 @@ impl Service for FrontendService {
                 self.allowlist_env.clone(),
                 Some(sign_out_factory),
                 Some(oauth_factory),
+                Some(saml_factory),
                 self.version.bytes(),
                 blame_deps,
                 search_deps,
