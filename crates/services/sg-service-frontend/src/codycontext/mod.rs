@@ -14,11 +14,24 @@
 //! extension set in sorted order; the differential oracle pins the Go global
 //! to the same order.
 
+pub mod dotcom;
+pub mod embeddings;
 mod execution;
 mod punctuation;
 mod snowball;
 mod stop_words;
 
+pub use dotcom::{
+    add_limits_and_filter, file_match_to_context_match, go_float32_to_i32, CodyContextClient,
+    CodyGitserver, ContextList, DotcomContentFilter, EnterpriseContentFilter, FileChunkContext,
+    GetCodyContextResult, GetContextArgs, KeywordContextSearcher, KeywordPlanRequest,
+    KeywordSearchOutcome, RepoEmbeddingStore, RepoIdName, INVALID_CONFIG_ERROR,
+};
+pub use embeddings::{
+    EmbeddingCombinedSearchResults, EmbeddingSearchResult, EmbeddingsHttpRequest,
+    EmbeddingsHttpResponse, EmbeddingsHttpTransport, EmbeddingsSearch, EmbeddingsSearchParameters,
+    HttpEmbeddingsClient, ReqwestEmbeddingsHttpClient, SearchScoreDetails,
+};
 pub use execution::CodyContextExecutionJob;
 
 use std::collections::BTreeMap;

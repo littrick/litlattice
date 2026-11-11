@@ -51,7 +51,8 @@ use self::events::{EventAlert, EventFilter, EventMatch};
 use self::filters::SearchFilters;
 use self::progress::{Progress, ProgressAggregator, SearchEvent};
 use crate::search_client::{
-    Features, PlanDeps, PlanError as ClientPlanError, Protocol, SearchClient, SearchMode,
+    Features, Inputs as ClientInputs, PlanDeps, PlanError as ClientPlanError, Protocol,
+    SearchClient, SearchMode,
 };
 use crate::search_job::JobError;
 use crate::search_jobutil_job_builders as jb;
@@ -171,6 +172,16 @@ pub struct RepoPagerRuntimeClients {
 }
 
 impl RepoPagerRuntimeClients {
+    /// Own the pager collaborators. A caller that has a resolver/zoekt lister
+    /// (e.g. a test or a future resolver port) injects them here; production
+    /// assembly leaves [`TreeRuntimeClients::repo_pager`] `None`.
+    pub fn new(
+        pages: Arc<dyn crate::search_jobutil_repos::RepoPageSource + Send + Sync>,
+        zoekt: Arc<dyn crate::search_jobutil_repos::ZoektRepoLister + Send + Sync>,
+    ) -> Self {
+        Self { pages, zoekt }
+    }
+
     fn as_clients(&self) -> crate::search_job::RepoPagerClients<'_> {
         crate::search_job::RepoPagerClients {
             pages: self.pages.as_ref(),
@@ -215,6 +226,13 @@ impl TreeRuntimeClients {
             repo_pager: repo_pager.as_ref(),
         };
         f(&clients)
+    }
+
+    /// Inject the `RepoPagerJob` collaborators. Without this the tree keeps
+    /// the exact `"RepoPagerJob execution is not ported (M9.8hw)"` error.
+    pub fn with_repo_pager(mut self, repo_pager: Arc<RepoPagerRuntimeClients>) -> Self {
+        self.repo_pager = Some(repo_pager);
+        self
     }
 }
 
@@ -359,7 +377,10 @@ impl BackendDeps {
 /// data is absent: empty settings, no flags, no sanitization patterns and no
 /// dotcom mode. `searchContextsQuery` stays disabled because
 /// `Settings::experimental_features` is `None` (`client.go:95`).
-fn default_plan_deps() -> PlanDeps {
+///
+/// Public so the parent can build a [`SearchKeywordSearcher`] from the same
+/// `PlanDeps` the HTTP handler uses.
+pub fn default_plan_deps() -> PlanDeps {
     PlanDeps {
         user_settings: Box::new(|| Ok(crate::search_client::Settings::default())),
         feature_flags: Box::new(BTreeMap::new),
@@ -435,6 +456,120 @@ pub fn tree_inputs(inputs: &SearchInputs) -> TreeInputs {
     }
 }
 
+/// Map a successful `search_client::SearchClient::plan` to the handler's
+/// [`SearchInputs`]. Shared by [`BackendDeps`] and [`SearchKeywordSearcher`].
+///
+/// `Plan` never sets the cody fields; `addLimitsAndFilter` writes them after
+/// planning.
+pub fn inputs_from_plan(inputs: ClientInputs) -> SearchInputs {
+    let max_results = plan_max_results(
+        &inputs.plan,
+        search_jobutil_tree::default_limit(inputs.protocol),
+    );
+    SearchInputs {
+        max_results,
+        original_query: inputs.original_query,
+        plan: inputs.plan,
+        search_mode: inputs.search_mode,
+        pattern_type: inputs.pattern_type,
+        features: inputs.features,
+        protocol: inputs.protocol,
+        context_lines: inputs.context_lines,
+        sanitize_search_patterns: inputs.sanitize_search_patterns,
+        on_sourcegraph_dot_com: inputs.on_sourcegraph_dot_com,
+        cody_context: None,
+    }
+}
+
+/// The collected result of one job-tree run: events in stream order, then the
+/// `(alert, error)` pair `job.Job.Run` returned.
+pub struct TreeRunOutcome {
+    pub events: Vec<SearchEvent>,
+    pub alert: Option<EventAlert>,
+    pub error: Option<ExecuteError>,
+}
+
+/// Build the job tree from `inputs` and run it with `runner`.
+///
+/// Shared by [`BackendDeps::execute`] and [`SearchKeywordSearcher`]; both need
+/// the event sequence followed by the alert and error.
+pub fn run_inputs(
+    runner: &dyn JobRunner,
+    inputs: &SearchInputs,
+) -> Result<TreeRunOutcome, JobError> {
+    let mut job = search_jobutil_tree::new_plan_job(&tree_inputs(inputs), &inputs.plan)?;
+    let mut events = Vec::new();
+    let output = {
+        let mut sender = |event: SearchEvent| events.push(event);
+        runner.run(&mut job, &mut sender)
+    };
+    Ok(TreeRunOutcome {
+        events,
+        alert: output.alert,
+        error: output.error,
+    })
+}
+
+/// Production [`crate::codycontext::KeywordContextSearcher`]: `Plan` with the
+/// ported [`SearchClient`], then execute the built tree with the injected
+/// [`JobRunner`] (which sees the `addLimitsAndFilter` options through
+/// [`tree_inputs`]).
+pub struct SearchKeywordSearcher {
+    client: SearchClient,
+    runner: Arc<dyn JobRunner>,
+}
+
+impl SearchKeywordSearcher {
+    pub fn new(client: SearchClient, runner: Arc<dyn JobRunner>) -> Self {
+        Self { client, runner }
+    }
+}
+
+#[async_trait]
+impl crate::codycontext::KeywordContextSearcher for SearchKeywordSearcher {
+    async fn plan(
+        &self,
+        request: &crate::codycontext::KeywordPlanRequest,
+    ) -> Result<SearchInputs, String> {
+        let inputs = self
+            .client
+            .plan(
+                &request.version,
+                request.pattern_type.as_deref(),
+                &request.query,
+                request.search_mode,
+                request.protocol,
+                request.context_lines,
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(inputs_from_plan(inputs))
+    }
+
+    async fn execute(
+        &self,
+        inputs: &SearchInputs,
+    ) -> Result<crate::codycontext::KeywordSearchOutcome, String> {
+        let outcome =
+            run_inputs(self.runner.as_ref(), inputs).map_err(|JobError(message)| message)?;
+        if let Some(error) = outcome.error {
+            return Err(error.message);
+        }
+
+        let mut file_matches = Vec::new();
+        for event in outcome.events {
+            for result in event.results {
+                if let Match::File(file_match) = result {
+                    file_matches.push(file_match);
+                }
+            }
+        }
+        Ok(crate::codycontext::KeywordSearchOutcome {
+            file_matches,
+            alert: outcome.alert.map(|alert| (alert.title, alert.description)),
+        })
+    }
+}
+
 #[async_trait]
 impl SearchDeps for BackendDeps {
     async fn plan(&self, args: &Args) -> Result<SearchInputs, PlanError> {
@@ -461,25 +596,7 @@ impl SearchDeps for BackendDeps {
             )
             .map_err(map_plan_error)?;
 
-        let max_results = plan_max_results(
-            &inputs.plan,
-            search_jobutil_tree::default_limit(inputs.protocol),
-        );
-        Ok(SearchInputs {
-            max_results,
-            original_query: inputs.original_query,
-            plan: inputs.plan,
-            search_mode: inputs.search_mode,
-            pattern_type: inputs.pattern_type,
-            features: inputs.features,
-            protocol: inputs.protocol,
-            context_lines: inputs.context_lines,
-            sanitize_search_patterns: inputs.sanitize_search_patterns,
-            on_sourcegraph_dot_com: inputs.on_sourcegraph_dot_com,
-            // `Plan` never sets cody fields; the codycontext client (not
-            // ported) fills them after planning.
-            cody_context: None,
-        })
+        Ok(inputs_from_plan(inputs))
     }
 
     async fn execute(
@@ -487,8 +604,8 @@ impl SearchDeps for BackendDeps {
         inputs: &SearchInputs,
         _query: &str,
     ) -> Pin<Box<dyn Stream<Item = ExecuteItem> + Send>> {
-        let mut job = match search_jobutil_tree::new_plan_job(&tree_inputs(inputs), &inputs.plan) {
-            Ok(job) => job,
+        let outcome = match run_inputs(self.runner.as_ref(), inputs) {
+            Ok(outcome) => outcome,
             Err(JobError(message)) => {
                 return Box::pin(tokio_stream::iter(vec![ExecuteItem::Error {
                     message,
@@ -497,15 +614,12 @@ impl SearchDeps for BackendDeps {
             }
         };
 
-        let mut items: Vec<ExecuteItem> = Vec::new();
-        let output = {
-            let mut sender = |event: SearchEvent| items.push(ExecuteItem::Event(event));
-            self.runner.run(&mut job, &mut sender)
-        };
-        if let Some(alert) = output.alert {
+        let mut items: Vec<ExecuteItem> =
+            outcome.events.into_iter().map(ExecuteItem::Event).collect();
+        if let Some(alert) = outcome.alert {
             items.push(ExecuteItem::Alert(alert));
         }
-        if let Some(error) = output.error {
+        if let Some(error) = outcome.error {
             items.push(ExecuteItem::Error {
                 message: error.message,
                 unsupported: error.unsupported,

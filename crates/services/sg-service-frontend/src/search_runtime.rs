@@ -47,7 +47,7 @@ use crate::search_searcher_client::{
     SearcherClients, SearcherError, SearcherGitserver, SearcherLimiter, SymbolsClient,
     SymbolsParameters, SymbolsResponse, NOT_PORTED_MESSAGE,
 };
-use crate::search_stream::TreeRuntimeClients;
+use crate::search_stream::{RepoPagerRuntimeClients, TreeRuntimeClients};
 use crate::symbols_client::default_symbols_client;
 
 /// Failure to assemble the production runtime. The only mandatory endpoint is
@@ -143,6 +143,19 @@ pub fn assemble(
     connections: &ServiceConnections,
     site: &SiteConfiguration,
 ) -> Result<TreeRuntimeClients, RuntimeConfigError> {
+    assemble_with_repo_pager(pool, connections, site, None)
+}
+
+/// [`assemble`] plus optional `RepoPagerJob` collaborators. The resolver is
+/// not ported, so production passes `None`; a caller that can supply pages (a
+/// test or a future resolver port) injects them here. `None` keeps the exact
+/// `"RepoPagerJob execution is not ported (M9.8hw)"` fallback.
+pub fn assemble_with_repo_pager(
+    pool: &PgPool,
+    connections: &ServiceConnections,
+    site: &SiteConfiguration,
+    repo_pager: Option<Arc<RepoPagerRuntimeClients>>,
+) -> Result<TreeRuntimeClients, RuntimeConfigError> {
     if connections.zoekts.is_empty() {
         return Err(RuntimeConfigError::MissingZoekt);
     }
@@ -209,7 +222,7 @@ pub fn assemble(
         commit,
         // `repos.Resolver` is not ported; a caller that can supply pages sets
         // this bundle. `None` keeps the exact RepoPagerJob not-ported error.
-        repo_pager: None,
+        repo_pager,
     })
 }
 
