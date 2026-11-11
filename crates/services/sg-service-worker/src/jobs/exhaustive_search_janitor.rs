@@ -29,18 +29,23 @@
 //! Not ported: the concrete object storage (`internal/object`), which is
 //! behind the injected [`JobLogsBlobStore`] trait.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use sg_core::{ConfigError, EnvReader};
 use sg_db::exhaustive_search::{self as ex, Actor, GetJobLogsOptions, JobState, SearchJobLog};
 use sg_db::OffsetDateTime;
+use sg_objectstorage::{ObjectStore, S3Config, StorageConfig};
 use sqlx::{PgPool, Postgres, Transaction};
 use tokio_util::sync::CancellationToken;
 
 use crate::framework::periodic::{Handler, HandlerError, PeriodicRoutine};
 use crate::framework::BackgroundRoutine;
-use crate::jobs::exhaustive_search_job::append_errors;
+use crate::jobs::batches::parse_strconv_bool;
+use crate::jobs::exhaustive_search_job::{append_errors, is_enabled};
+use crate::jobs::exhaustive_search_service::{LazyObjectStorage, ObjectStorageLogBlobStore};
+use crate::jobs::{Job, JobConfig, JobDeps};
 
 /// `newJanitorJob`'s `goroutine.WithName`.
 pub const JANITOR_NAME: &str = "search_jobs_janitor";
@@ -422,6 +427,242 @@ pub fn new_search_jobs_janitor_routine(
         .into()
 }
 
+// ---------------------------------------------------------------------------
+// Worker job registration (M9.8id)
+// ---------------------------------------------------------------------------
+
+/// The standalone worker job name. The baseline has no such job: its janitor
+/// is the seventh routine of the `exhaustive-search-job` group
+/// (`cmd/worker/internal/search/job.go:130`). Because this slice must register
+/// the janitor while `exhaustive-search-job` stays unported (it needs the
+/// production searcher from M9.8hx), it is exposed as its own job.
+pub const JANITOR_JOB_NAME: &str = "exhaustive-search-janitor";
+
+/// `search.ObjectStorageConfig` (`internal/search/object_storage.go:16-60`):
+/// the `SEARCH_JOBS_UPLOAD_*` variables read by the `exhaustive-search-job`
+/// group.
+#[derive(Debug, Default)]
+pub struct SearchJobsObjectStorageConfig {
+    storage: Mutex<Option<StorageConfig>>,
+    errs: Mutex<Vec<String>>,
+}
+
+impl SearchJobsObjectStorageConfig {
+    /// The loaded storage config, or `None` when [`JobConfig::load`] has not
+    /// run.
+    pub fn storage(&self) -> Option<StorageConfig> {
+        self.storage
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+}
+
+impl JobConfig for SearchJobsObjectStorageConfig {
+    fn load(&self, env: &mut EnvReader) {
+        let mut errs = Vec::new();
+
+        let backend = env
+            .get(
+                "SEARCH_JOBS_UPLOAD_BACKEND",
+                "blobstore",
+                "The target file service for search jobs. S3, GCS, and Blobstore are supported.",
+            )
+            .to_lowercase();
+        let manage_bucket = get_bool(
+            env,
+            "SEARCH_JOBS_UPLOAD_MANAGE_BUCKET",
+            "false",
+            "Whether or not the client should manage the target bucket configuration.",
+            &mut errs,
+        );
+        let bucket = env.get(
+            "SEARCH_JOBS_UPLOAD_BUCKET",
+            "search-jobs",
+            "The name of the bucket to store search job results in.",
+        );
+
+        if !matches!(backend.as_str(), "blobstore" | "s3" | "gcs") {
+            errs.push(format!(
+                "invalid backend {backend:?} for SEARCH_JOBS_UPLOAD_BACKEND: must be S3, GCS, or Blobstore"
+            ));
+        }
+
+        let mut s3 = S3Config::default();
+        if matches!(backend.as_str(), "blobstore" | "s3") {
+            s3.region = env.get(
+                "SEARCH_JOBS_UPLOAD_AWS_REGION",
+                "us-east-1",
+                "The target AWS region.",
+            );
+            s3.endpoint = env.get(
+                "SEARCH_JOBS_UPLOAD_AWS_ENDPOINT",
+                &sg_codeintel::lsifuploadstore::blobstore_default_endpoint(),
+                "The target AWS endpoint.",
+            );
+            s3.use_path_style = get_bool(
+                env,
+                "SEARCH_JOBS_UPLOAD_AWS_USE_PATH_STYLE",
+                "false",
+                "Whether to use path calling (vs subdomain calling).",
+                &mut errs,
+            );
+            let ec2_role_credentials = get_bool(
+                env,
+                "SEARCH_JOBS_UPLOAD_AWS_USE_EC2_ROLE_CREDENTIALS",
+                "false",
+                "Whether to use the EC2 metadata API, or use the provided static credentials.",
+                &mut errs,
+            );
+
+            if !ec2_role_credentials {
+                s3.access_key_id = env.get(
+                    "SEARCH_JOBS_UPLOAD_AWS_ACCESS_KEY_ID",
+                    "AKIAIOSFODNN7EXAMPLE",
+                    "An AWS access key associated with a user with access to S3.",
+                );
+                s3.secret_access_key = env.get(
+                    "SEARCH_JOBS_UPLOAD_AWS_SECRET_ACCESS_KEY",
+                    "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+                    "An AWS secret key associated with a user with access to S3.",
+                );
+                s3.session_token = env.get(
+                    "SEARCH_JOBS_UPLOAD_AWS_SESSION_TOKEN",
+                    "",
+                    "An optional AWS session token associated with a user with access to S3.",
+                );
+            }
+        } else if backend == "gcs" {
+            // Registered like the baseline even though GCS is not implemented.
+            let _ = env.get(
+                "SEARCH_JOBS_UPLOAD_GCP_PROJECT_ID",
+                "",
+                "The project containing the GCS bucket.",
+            );
+            let _ = env.get(
+                "SEARCH_JOBS_UPLOAD_GOOGLE_APPLICATION_CREDENTIALS_FILE",
+                "",
+                "The path to a service account key file with access to GCS.",
+            );
+            let _ = env.get(
+                "SEARCH_JOBS_UPLOAD_GOOGLE_APPLICATION_CREDENTIALS_FILE_CONTENT",
+                "",
+                "The contents of a service account key file with access to GCS.",
+            );
+        }
+
+        *self.storage.lock().unwrap_or_else(PoisonError::into_inner) = Some(
+            StorageConfig {
+                backend,
+                manage_bucket,
+                bucket,
+                s3,
+            }
+            .normalize(),
+        );
+        *self.errs.lock().unwrap_or_else(PoisonError::into_inner) = errs;
+    }
+
+    fn validate(&self) -> Result<(), ConfigError> {
+        let errs = self
+            .errs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        match crate::config::combine_errors(&errs) {
+            Some(message) => Err(ConfigError::new(message)),
+            None => Ok(()),
+        }
+    }
+}
+
+/// `search.NewObjectStorage`'s storage config. GCS is not implemented by the
+/// Rust worker yet; the baseline would accept it.
+fn storage_config(config: &SearchJobsObjectStorageConfig) -> Result<StorageConfig, String> {
+    let config = config
+        .storage()
+        .ok_or_else(|| "search jobs object storage config was not loaded".to_owned())?;
+    match config.backend.as_str() {
+        "s3" | "blobstore" => Ok(config),
+        "gcs" => Err("not ported: GCS object storage".to_owned()),
+        other => Err(format!("unsupported object storage backend {other:?}")),
+    }
+}
+
+/// The `exhaustive-search-job` group's janitor as a standalone worker job.
+///
+/// `Routines` mirrors `searchJob.Routines`
+/// (`cmd/worker/internal/search/job.go:66-88`): disabled when
+/// `exhaustive.IsEnabled` is false, otherwise one periodic janitor backed by
+/// the search-jobs object storage.
+pub struct ExhaustiveSearchJanitorJob {
+    config: Arc<SearchJobsObjectStorageConfig>,
+}
+
+impl ExhaustiveSearchJanitorJob {
+    pub fn new() -> Self {
+        Self {
+            config: Arc::new(SearchJobsObjectStorageConfig::default()),
+        }
+    }
+}
+
+impl Default for ExhaustiveSearchJanitorJob {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl Job for ExhaustiveSearchJanitorJob {
+    fn configs(&self) -> Vec<Arc<dyn JobConfig>> {
+        vec![Arc::clone(&self.config) as Arc<dyn JobConfig>]
+    }
+
+    async fn routines(
+        &self,
+        deps: &JobDeps,
+        _setup_ctx: CancellationToken,
+    ) -> Result<Vec<BackgroundRoutine>, String> {
+        if !is_enabled(&deps.live_config) {
+            return Ok(Vec::new());
+        }
+
+        let store = ObjectStore::new(storage_config(&self.config)?)
+            .await
+            .map_err(|err| err.to_string())?;
+        let backend = Arc::new(LazyObjectStorage::new(Arc::new(store)));
+        let blobs = Arc::new(ObjectStorageLogBlobStore::new(backend));
+        let service: Arc<dyn JanitorService> =
+            Arc::new(PgJanitorService::new(deps.frontend.clone(), blobs));
+
+        Ok(vec![new_search_jobs_janitor_routine(
+            deps.frontend.clone(),
+            service,
+        )])
+    }
+}
+
+/// `BaseConfig.GetBool` with `strconv.ParseBool` spellings.
+fn get_bool(
+    env: &mut EnvReader,
+    name: &str,
+    default: &str,
+    description: &str,
+    errors: &mut Vec<String>,
+) -> bool {
+    let raw = env.get(name, default, description);
+    match parse_strconv_bool(&raw) {
+        Some(value) => value,
+        None => {
+            errors.push(format!(
+                "invalid bool {raw:?} for {name}: strconv.ParseBool: parsing {raw:?}: invalid syntax"
+            ));
+            false
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -486,6 +727,74 @@ mod tests {
         let routine = new_search_jobs_janitor_routine(pool, Arc::new(UnusedService));
         assert_eq!(routine.name(), "search_jobs_janitor");
         assert_eq!(routine.interval(), Duration::from_secs(8 * 60 * 60));
+    }
+
+    #[test]
+    fn janitor_job_is_registered_in_all_jobs() {
+        let jobs = crate::jobs::all_jobs();
+        assert!(jobs.iter().any(|(name, _)| *name == JANITOR_JOB_NAME));
+        // The baseline group stays unported until the production searcher is
+        // wired (M9.8hx).
+        let group = jobs
+            .iter()
+            .find(|(name, _)| *name == "exhaustive-search-job")
+            .expect("registry keeps the baseline name");
+        assert!(group.1.configs().is_empty());
+    }
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn clear_storage_env() {
+        for name in [
+            "SEARCH_JOBS_UPLOAD_BACKEND",
+            "SEARCH_JOBS_UPLOAD_MANAGE_BUCKET",
+            "SEARCH_JOBS_UPLOAD_BUCKET",
+            "SEARCH_JOBS_UPLOAD_AWS_REGION",
+            "SEARCH_JOBS_UPLOAD_AWS_ENDPOINT",
+            "SEARCH_JOBS_UPLOAD_AWS_USE_PATH_STYLE",
+            "SEARCH_JOBS_UPLOAD_AWS_USE_EC2_ROLE_CREDENTIALS",
+            "SEARCH_JOBS_UPLOAD_AWS_ACCESS_KEY_ID",
+            "SEARCH_JOBS_UPLOAD_AWS_SECRET_ACCESS_KEY",
+            "SEARCH_JOBS_UPLOAD_AWS_SESSION_TOKEN",
+            "SEARCH_JOBS_UPLOAD_GCP_PROJECT_ID",
+            "SEARCH_JOBS_UPLOAD_GOOGLE_APPLICATION_CREDENTIALS_FILE",
+            "SEARCH_JOBS_UPLOAD_GOOGLE_APPLICATION_CREDENTIALS_FILE_CONTENT",
+            "DEPLOY_TYPE",
+        ] {
+            std::env::remove_var(name);
+        }
+    }
+
+    #[test]
+    fn search_jobs_storage_config_defaults() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        clear_storage_env();
+        let config = SearchJobsObjectStorageConfig::default();
+        config.load(&mut EnvReader::new());
+        assert!(config.validate().is_ok());
+        let storage = storage_config(&config).expect("blobstore config");
+        assert_eq!(storage.backend, "blobstore");
+        assert!(storage.manage_bucket);
+        assert!(storage.s3.is_blobstore);
+        assert_eq!(storage.bucket, "search-jobs");
+        assert_eq!(storage.s3.region, "us-east-1");
+        assert_eq!(storage.s3.endpoint, "http://blobstore:9000");
+        assert_eq!(storage.s3.access_key_id, "AKIAIOSFODNN7EXAMPLE");
+    }
+
+    #[test]
+    fn gcs_backend_is_not_ported() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        clear_storage_env();
+        std::env::set_var("SEARCH_JOBS_UPLOAD_BACKEND", "gcs");
+        let config = SearchJobsObjectStorageConfig::default();
+        config.load(&mut EnvReader::new());
+        assert!(config.validate().is_ok());
+        assert_eq!(
+            storage_config(&config).expect_err("gcs not ported"),
+            "not ported: GCS object storage"
+        );
+        clear_storage_env();
     }
 
     struct UnusedService;

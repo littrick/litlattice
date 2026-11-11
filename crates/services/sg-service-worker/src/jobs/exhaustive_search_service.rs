@@ -55,15 +55,17 @@
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicI32, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use sg_db::exhaustive_search::{self as ex, Actor};
 use sqlx::PgPool;
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
+use tokio::io::AsyncReadExt;
 
-use crate::jobs::exhaustive_search_job::NewSearcher;
+use crate::jobs::exhaustive_search_job::{MatchWriter, MatchWriterFactory, NewSearcher};
 
 /// `JobLogsIterLimit`: rows read per page from the database.
 pub const JOB_LOGS_ITER_LIMIT: usize = 10_000;
@@ -842,6 +844,331 @@ pub fn new_json_writer(
     prefix: impl Into<String>,
 ) -> MatchJSONWriter {
     MatchJSONWriter::new(upload_store, prefix)
+}
+
+// ---------------------------------------------------------------------------
+// Object storage adapter (M9.8id)
+// ---------------------------------------------------------------------------
+
+/// `object.Storage`, mapped onto [`sg_objectstorage::ObjectStore`].
+///
+/// The Go interface has seven methods; `Compose` is intentionally absent (the
+/// GCS composition path is out of scope). Values are materialised because the
+/// worker seams ([`UploadStore`], `JobLogsBlobStore`) take bytes, not readers.
+#[async_trait]
+pub trait ObjectStorageBackend: Send + Sync {
+    /// `object.Storage.Init`.
+    async fn init(&self) -> Result<(), String>;
+
+    /// `object.Storage.Get`.
+    async fn get(&self, key: &str) -> Result<Vec<u8>, String>;
+
+    /// `object.Storage.Upload`; returns the number of bytes uploaded.
+    async fn upload(&self, key: &str, data: Vec<u8>) -> Result<i64, String>;
+
+    /// `object.Storage.Delete`.
+    async fn delete(&self, key: &str) -> Result<(), String>;
+
+    /// `object.Storage.List`: every key with the prefix.
+    async fn list_objects(&self, prefix: &str) -> Result<Vec<String>, String>;
+
+    /// `object.Storage.ExpireObjects`.
+    async fn expire_objects(&self, prefix: &str, max_age: Duration) -> Result<(), String>;
+}
+
+#[async_trait]
+impl ObjectStorageBackend for sg_objectstorage::ObjectStore {
+    async fn init(&self) -> Result<(), String> {
+        sg_objectstorage::ObjectStore::init(self)
+            .await
+            .map_err(|err| err.to_string())
+    }
+
+    async fn get(&self, key: &str) -> Result<Vec<u8>, String> {
+        let body = sg_objectstorage::ObjectStore::get(self, key)
+            .await
+            .map_err(|err| err.to_string())?;
+        let mut reader = body.into_async_read();
+        let mut data = Vec::new();
+        reader
+            .read_to_end(&mut data)
+            .await
+            .map_err(|err| err.to_string())?;
+        Ok(data)
+    }
+
+    async fn upload(&self, key: &str, data: Vec<u8>) -> Result<i64, String> {
+        sg_objectstorage::ObjectStore::upload(
+            self,
+            key,
+            sg_objectstorage::ObjectByteStream::from(data),
+        )
+        .await
+        .map_err(|err| err.to_string())
+    }
+
+    async fn delete(&self, key: &str) -> Result<(), String> {
+        sg_objectstorage::ObjectStore::delete(self, key)
+            .await
+            .map_err(|err| err.to_string())
+    }
+
+    async fn list_objects(&self, prefix: &str) -> Result<Vec<String>, String> {
+        sg_objectstorage::ObjectStore::list_objects(self, prefix)
+            .await
+            .map(|objects| objects.into_iter().map(|object| object.key).collect())
+            .map_err(|err| err.to_string())
+    }
+
+    async fn expire_objects(&self, prefix: &str, max_age: Duration) -> Result<(), String> {
+        sg_objectstorage::ObjectStore::expire_objects(self, prefix, max_age)
+            .await
+            .map_err(|err| err.to_string())
+    }
+}
+
+/// `object.CreateLazyStorage`: `Init` runs on first use, and a broken bucket
+/// does not fail worker startup.
+pub struct LazyObjectStorage<B: ObjectStorageBackend> {
+    backend: Arc<B>,
+    initialized: tokio::sync::OnceCell<()>,
+}
+
+impl<B: ObjectStorageBackend> LazyObjectStorage<B> {
+    pub fn new(backend: Arc<B>) -> LazyObjectStorage<B> {
+        LazyObjectStorage {
+            backend,
+            initialized: tokio::sync::OnceCell::new(),
+        }
+    }
+
+    async fn ensure_initialized(&self) -> Result<(), String> {
+        self.initialized
+            .get_or_try_init(|| async { self.backend.init().await })
+            .await
+            .map(|_| ())
+    }
+}
+
+#[async_trait]
+impl<B: ObjectStorageBackend> ObjectStorageBackend for LazyObjectStorage<B> {
+    async fn init(&self) -> Result<(), String> {
+        self.ensure_initialized().await
+    }
+
+    async fn get(&self, key: &str) -> Result<Vec<u8>, String> {
+        self.ensure_initialized().await?;
+        self.backend.get(key).await
+    }
+
+    async fn upload(&self, key: &str, data: Vec<u8>) -> Result<i64, String> {
+        self.ensure_initialized().await?;
+        self.backend.upload(key, data).await
+    }
+
+    async fn delete(&self, key: &str) -> Result<(), String> {
+        self.ensure_initialized().await?;
+        self.backend.delete(key).await
+    }
+
+    async fn list_objects(&self, prefix: &str) -> Result<Vec<String>, String> {
+        self.ensure_initialized().await?;
+        self.backend.list_objects(prefix).await
+    }
+
+    async fn expire_objects(&self, prefix: &str, max_age: Duration) -> Result<(), String> {
+        self.ensure_initialized().await?;
+        self.backend.expire_objects(prefix, max_age).await
+    }
+}
+
+/// `object.Storage` behind the service's [`UploadStore`] seam.
+pub struct ObjectStorageUploadStore<B: ObjectStorageBackend> {
+    backend: Arc<B>,
+}
+
+impl<B: ObjectStorageBackend> ObjectStorageUploadStore<B> {
+    pub fn new(backend: Arc<B>) -> ObjectStorageUploadStore<B> {
+        ObjectStorageUploadStore { backend }
+    }
+}
+
+#[async_trait]
+impl<B: ObjectStorageBackend> UploadStore for ObjectStorageUploadStore<B> {
+    async fn get(&self, key: &str) -> Result<Vec<u8>, String> {
+        self.backend.get(key).await
+    }
+
+    async fn upload(&self, key: &str, data: &[u8]) -> Result<i64, String> {
+        self.backend.upload(key, data.to_vec()).await
+    }
+
+    async fn delete(&self, key: &str) -> Result<(), String> {
+        self.backend.delete(key).await
+    }
+
+    async fn list(&self, prefix: &str) -> Result<UploadList, String> {
+        Ok(UploadList {
+            keys: self.backend.list_objects(prefix).await?,
+            error: None,
+        })
+    }
+}
+
+/// `object.Storage` behind the janitor's `JobLogsBlobStore` seam.
+pub struct ObjectStorageLogBlobStore<B: ObjectStorageBackend> {
+    backend: Arc<B>,
+}
+
+impl<B: ObjectStorageBackend> ObjectStorageLogBlobStore<B> {
+    pub fn new(backend: Arc<B>) -> ObjectStorageLogBlobStore<B> {
+        ObjectStorageLogBlobStore { backend }
+    }
+}
+
+#[async_trait]
+impl<B: ObjectStorageBackend> crate::jobs::exhaustive_search_janitor::JobLogsBlobStore
+    for ObjectStorageLogBlobStore<B>
+{
+    async fn upload(&self, key: &str, contents: Vec<u8>) -> Result<i64, String> {
+        self.backend.upload(key, contents).await
+    }
+
+    async fn delete(&self, key: &str) -> Result<(), String> {
+        self.backend.delete(key).await
+    }
+}
+
+/// Run an upload future from a synchronous `MatchWriter` call.
+///
+/// The worker runs on a multi-threaded tokio runtime, where `block_in_place`
+/// lets us wait for the async object store without stalling the other worker
+/// threads. A current-thread runtime (or no runtime at all) cannot be blocked,
+/// so the upload is handed to a dedicated thread with its own current-thread
+/// runtime.
+fn run_upload_blocking(uploader: Arc<BlobUploader>, data: Vec<u8>) -> Result<(), String> {
+    let upload = async move { uploader.upload_blob(&data).await };
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle)
+            if matches!(
+                handle.runtime_flavor(),
+                tokio::runtime::RuntimeFlavor::MultiThread
+            ) =>
+        {
+            tokio::task::block_in_place(|| handle.block_on(upload))
+        }
+        Ok(_) | Err(_) => std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|err| format!("building object storage upload runtime: {err}"))?;
+            runtime.block_on(upload)
+        })
+        .join()
+        .map_err(|_| "object storage upload thread panicked".to_owned())?,
+    }
+}
+
+/// `MatchWriter` over the service's object-store [`UploadStore`]: the same
+/// buffering, sharding and flush rules as [`BufferedWriter`]/[`BlobUploader`],
+/// exposed through the synchronous [`MatchWriter`] seam.
+pub struct ObjectStorageMatchWriter {
+    uploader: Arc<BlobUploader>,
+    flush_size: usize,
+    buf: Mutex<Vec<u8>>,
+}
+
+impl ObjectStorageMatchWriter {
+    fn new(uploader: Arc<BlobUploader>, flush_size: usize) -> ObjectStorageMatchWriter {
+        ObjectStorageMatchWriter {
+            uploader,
+            flush_size,
+            // Go grows the buffer up front; do the same (capped at 1 MiB).
+            buf: Mutex::new(Vec::with_capacity(flush_size.min(1024 * 1024))),
+        }
+    }
+
+    fn lock_buf(&self) -> std::sync::MutexGuard<'_, Vec<u8>> {
+        self.buf.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+impl MatchWriter for ObjectStorageMatchWriter {
+    fn write(&self, event_match: serde_json::Value) -> Result<(), String> {
+        let data = {
+            let mut buf = self.lock_buf();
+            let old_len = buf.len();
+            if let Err(err) = serde_json::to_writer(&mut *buf, &event_match) {
+                // Reset the buffer to where it was before failing to marshal.
+                buf.truncate(old_len);
+                return Err(err.to_string());
+            }
+            // `json.Encoder.Encode` terminates every value with a newline.
+            buf.push(b'\n');
+
+            if buf.len() >= self.flush_size {
+                Some(buf.split_off(0))
+            } else {
+                None
+            }
+        };
+
+        match data {
+            Some(data) => run_upload_blocking(Arc::clone(&self.uploader), data),
+            None => Ok(()),
+        }
+    }
+
+    fn flush(&self) -> Result<(), String> {
+        let data = {
+            let mut buf = self.lock_buf();
+            if buf.is_empty() {
+                None
+            } else {
+                Some(buf.split_off(0))
+            }
+        };
+
+        match data {
+            Some(data) => run_upload_blocking(Arc::clone(&self.uploader), data),
+            None => Ok(()),
+        }
+    }
+}
+
+/// `service.NewJSONWriter` behind the worker's [`MatchWriterFactory`] seam.
+pub struct ObjectStorageMatchWriterFactory {
+    store: Arc<dyn UploadStore>,
+    flush_size: usize,
+}
+
+impl ObjectStorageMatchWriterFactory {
+    pub fn new(store: Arc<dyn UploadStore>) -> ObjectStorageMatchWriterFactory {
+        ObjectStorageMatchWriterFactory {
+            store,
+            flush_size: BUFFERED_JSON_WRITER_FLUSH_SIZE,
+        }
+    }
+
+    /// Test hook for `newBufferedWriter(flushSize, ...)`; production always
+    /// uses the 100 MiB default above.
+    pub fn with_flush_size(mut self, flush_size: usize) -> ObjectStorageMatchWriterFactory {
+        self.flush_size = flush_size;
+        self
+    }
+
+    pub fn flush_size(&self) -> usize {
+        self.flush_size
+    }
+}
+
+impl MatchWriterFactory for ObjectStorageMatchWriterFactory {
+    fn new_writer(&self, key: &str) -> Result<Box<dyn MatchWriter>, String> {
+        Ok(Box::new(ObjectStorageMatchWriter::new(
+            Arc::new(BlobUploader::new(Arc::clone(&self.store), key)),
+            self.flush_size,
+        )))
+    }
 }
 
 // ---------------------------------------------------------------------------
