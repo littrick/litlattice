@@ -7,6 +7,7 @@
 //! ids are plaintext). `Delete` with `HardDelete` removes the matching rows.
 
 use sqlx::postgres::PgPool;
+use sqlx::types::time::OffsetDateTime;
 use sqlx::Row;
 
 use crate::users::DbError;
@@ -391,6 +392,94 @@ RETURNING id, user_id, service_type, service_id, client_id, account_id,
 
     tx.commit().await?;
     account_from_row(&row).map_err(UpsertError::Database)
+}
+
+/// One live `user_external_accounts` row with the `created_at`/`updated_at`
+/// columns the GraphQL `ExternalAccount` node exposes (M9.8ka).
+///
+/// Kept separate from [`ExternalAccount`] so the many worker test literals that
+/// construct that type keep compiling; the columns are identical apart from the
+/// two timestamps.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternalAccountWithTimestamps {
+    pub id: i32,
+    pub user_id: i32,
+    pub service_type: String,
+    pub service_id: String,
+    pub client_id: String,
+    pub account_id: String,
+    /// `account_data` (encrypted at rest). `None` is the SQL NULL.
+    pub account_data: Option<String>,
+    pub encryption_key_id: String,
+    pub created_at: OffsetDateTime,
+    pub updated_at: OffsetDateTime,
+}
+
+const ACCOUNT_WITH_TIMESTAMPS_COLUMNS: &str = "id, user_id, service_type, service_id, \
+     client_id, account_id, account_data, encryption_key_id, created_at, updated_at";
+
+fn account_with_timestamps_from_row(
+    row: &sqlx::postgres::PgRow,
+) -> Result<ExternalAccountWithTimestamps, sqlx::Error> {
+    Ok(ExternalAccountWithTimestamps {
+        id: row.try_get("id")?,
+        user_id: row.try_get("user_id")?,
+        service_type: row.try_get("service_type")?,
+        service_id: row.try_get("service_id")?,
+        client_id: row.try_get("client_id")?,
+        account_id: row.try_get("account_id")?,
+        account_data: row.try_get("account_data")?,
+        encryption_key_id: row.try_get("encryption_key_id")?,
+        created_at: row.try_get("created_at")?,
+        updated_at: row.try_get("updated_at")?,
+    })
+}
+
+/// `userExternalAccountsStore.List` for `User.externalAccounts` (M9.8ka):
+/// live accounts of one user, `ORDER BY id ASC`, no pagination (the GraphQL
+/// connection applies `first`/+1 next-page probing in memory).
+pub async fn list_for_user_with_timestamps(
+    pool: &PgPool,
+    user_id: i32,
+) -> Result<Vec<ExternalAccountWithTimestamps>, sqlx::Error> {
+    let rows = sqlx::query(&format!(
+        "SELECT {ACCOUNT_WITH_TIMESTAMPS_COLUMNS} FROM user_external_accounts \
+         WHERE deleted_at IS NULL AND user_id = $1 ORDER BY id ASC"
+    ))
+    .bind(user_id)
+    .fetch_all(pool)
+    .await?;
+    rows.iter().map(account_with_timestamps_from_row).collect()
+}
+
+/// `userExternalAccountsStore.Count` for `User.externalAccounts` (M9.8ka):
+/// ignores the connection's pagination.
+pub async fn count_for_user(pool: &PgPool, user_id: i32) -> Result<i64, sqlx::Error> {
+    let row = sqlx::query(
+        "SELECT COUNT(*) FROM user_external_accounts \
+         WHERE deleted_at IS NULL AND user_id = $1",
+    )
+    .bind(user_id)
+    .fetch_one(pool)
+    .await?;
+    Ok(row.get("count"))
+}
+
+/// `userExternalAccountsStore.Get` for `externalAccountByID` (M9.8ka).
+pub async fn get_with_timestamps(
+    pool: &PgPool,
+    id: i32,
+) -> Result<Option<ExternalAccountWithTimestamps>, sqlx::Error> {
+    let row = sqlx::query(&format!(
+        "SELECT {ACCOUNT_WITH_TIMESTAMPS_COLUMNS} FROM user_external_accounts \
+         WHERE id = $1 AND deleted_at IS NULL LIMIT 1"
+    ))
+    .bind(id)
+    .fetch_optional(pool)
+    .await?;
+    row.as_ref()
+        .map(account_with_timestamps_from_row)
+        .transpose()
 }
 
 /// `userExternalAccountsStore.TouchExpired`: mark the accounts expired.

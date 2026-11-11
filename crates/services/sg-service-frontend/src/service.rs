@@ -437,7 +437,7 @@ impl Service for FrontendService {
                     )),
                     Arc::new(
                         crate::external_services::PgExternalServiceConnectionStore::new(
-                            session_pool,
+                            session_pool.clone(),
                         ),
                     ),
                     Arc::clone(&keyring),
@@ -448,7 +448,22 @@ impl Service for FrontendService {
                 .with_site_configuration(Arc::clone(wiring.store()), Arc::clone(wiring.server()))
                 // M9.8jg: `Site.authProviders` reads the live `auth.providers`
                 // configuration snapshot on every request.
-                .with_auth_providers(Arc::clone(wiring.live()));
+                .with_auth_providers(Arc::clone(wiring.live()))
+                // M9.8ka: `User.externalAccounts` and the `ExternalAccount`
+                // node read `user_external_accounts`; the provider registry is
+                // rebuilt from `auth.providers` per request.
+                .with_external_accounts(
+                    Arc::new(
+                        crate::external_accounts_graphql::PgExternalAccountsStore::new(
+                            session_pool.clone(),
+                        ),
+                    ),
+                    keyring.user_external_account_key(),
+                    Arc::clone(wiring.live()),
+                    crate::service_connections::sourcegraph_dotcom_mode(&|key: &str| {
+                        std::env::var(key).ok()
+                    }),
+                );
         // M9.8jf/M9.8jj: `Query.slowRequests` reads the FIFO list whose
         // capacity is `observability.captureSlowGraphQLRequestsLimit`
         // (`conf.Get()` per request in the baseline; here from the current

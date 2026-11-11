@@ -463,6 +463,20 @@ pub struct SchemaGraphqlDeps {
     /// `Site.authProviders`'s live configuration source (M9.8jg). `None` keeps
     /// the field unported (transport-only tests without a configuration).
     auth_providers: Option<Arc<LiveConfig>>,
+    /// `User.externalAccounts` / `Query.node(ExternalAccount)` seams (M9.8ka).
+    /// `None` keeps both surfaces unported.
+    external_accounts: Option<ExternalAccountsDeps>,
+}
+
+/// Seams for the external-account GraphQL surface (M9.8ka): the
+/// `user_external_accounts` table, the user-external-account encryption key and
+/// the live configuration that supplies `auth.providers`/`ssc.samsHostName`
+/// plus the dotcom switch.
+pub struct ExternalAccountsDeps {
+    pub store: Arc<dyn crate::external_accounts_graphql::ExternalAccountsStore>,
+    pub key: Option<Arc<dyn sg_encryption::Key>>,
+    pub live: Arc<LiveConfig>,
+    pub dotcom: bool,
 }
 
 impl SchemaGraphqlDeps {
@@ -497,6 +511,7 @@ impl SchemaGraphqlDeps {
             symbols: None,
             slow_requests: None,
             auth_providers: None,
+            external_accounts: None,
         }
     }
 
@@ -548,6 +563,7 @@ impl SchemaGraphqlDeps {
             symbols: None,
             slow_requests: None,
             auth_providers: None,
+            external_accounts: None,
         }
     }
 
@@ -680,6 +696,25 @@ impl SchemaGraphqlDeps {
     /// from the live `auth.providers` site configuration on every request.
     pub fn with_auth_providers(mut self, live: Arc<LiveConfig>) -> Self {
         self.auth_providers = Some(live);
+        self
+    }
+
+    /// Enable the external-account GraphQL surface (M9.8ka): the
+    /// `user_external_accounts` table, the user-external-account encryption key
+    /// (`keyring.UserExternalAccountKey`) and the live configuration.
+    pub fn with_external_accounts(
+        mut self,
+        store: Arc<dyn crate::external_accounts_graphql::ExternalAccountsStore>,
+        key: Option<Arc<dyn sg_encryption::Key>>,
+        live: Arc<LiveConfig>,
+        dotcom: bool,
+    ) -> Self {
+        self.external_accounts = Some(ExternalAccountsDeps {
+            store,
+            key,
+            live,
+            dotcom,
+        });
         self
     }
 
@@ -897,6 +932,7 @@ impl SchemaGraphqlDeps {
             symbols: None,
             slow_requests: None,
             auth_providers: None,
+            external_accounts: None,
         }
     }
 }
@@ -1157,7 +1193,7 @@ impl GraphqlDeps for SchemaGraphqlDeps {
                 }
             }
         }
-        let nodes = match (&self.org_memberships, &self.repositories) {
+        let mut nodes = match (&self.org_memberships, &self.repositories) {
             (Some(memberships_store), Some(repositories)) => {
                 crate::graphql_resolvers::prefetch_node_roots(
                     memberships_store.as_ref(),
@@ -1189,6 +1225,29 @@ impl GraphqlDeps for SchemaGraphqlDeps {
             }
             _ => crate::graphql_resolvers::NodeRoots::default(),
         };
+        // `Query.node(kind: "ExternalAccount")` (M9.8ka): the row lookup and
+        // `ExternalAccount.user` are async, so resolve the whole node now.
+        let external_accounts_registry = self.external_accounts.as_ref().map(|deps| {
+            crate::external_accounts_graphql::registry_from_site(&deps.live.current().site)
+        });
+        if let (Some(deps), Some(registry)) = (&self.external_accounts, &external_accounts_registry)
+        {
+            let lookups = crate::external_accounts_graphql::prefetch_external_account_nodes(
+                deps.store.as_ref(),
+                registry,
+                deps.key.clone(),
+                self.users
+                    .as_ref()
+                    .map(|users| users.as_ref() as &dyn crate::graphql_resolvers::UserLookupStore),
+                &fields,
+                request.actor,
+                site_admin,
+            )
+            .await;
+            if !lookups.is_empty() {
+                nodes.external_accounts = lookups;
+            }
+        }
         // `Repository.commit`, `GitObject` and `GitRef.target` (M9.8ix) read
         // through gitserver; perform those lookups now and replay them from the
         // synchronous resolvers. `repositories`/`repository_redirects`/`nodes`/
@@ -1264,6 +1323,35 @@ impl GraphqlDeps for SchemaGraphqlDeps {
             ),
             _ => Arc::new(crate::graphql_resolvers::NestedPrefetch::default()),
         };
+        // `User.externalAccounts` (M9.8ka): prefetch every selected connection
+        // and the `CodySubscription` inputs the node objects replay.
+        if let (Some(deps), Some(registry)) = (&self.external_accounts, &external_accounts_registry)
+        {
+            let lookup = crate::graphql_resolvers::prefetch_user_external_accounts(
+                deps.store.as_ref(),
+                registry,
+                deps.key.clone(),
+                &fields,
+                current_user.as_ref(),
+                &users,
+                &users_connections,
+                &nodes,
+                request.actor,
+                site_admin,
+            )
+            .await;
+            if !lookup.is_empty() {
+                Arc::make_mut(&mut nested).user_external_accounts = lookup;
+            }
+            Arc::make_mut(&mut nested).external_account_cody = Some(Arc::new(
+                crate::external_accounts_graphql::CodySubscriptionConfig {
+                    dotcom: deps.dotcom,
+                    sams_service_id: crate::external_accounts_graphql::sams_service_id(
+                        &deps.live.current().site,
+                    ),
+                },
+            ));
+        }
         let user = current_user.map(crate::graphql_resolvers::UserObject::from_data);
         // `Query.clientConfiguration` reads `external_services` and the
         // site configuration's `parentSourcegraph`; prefetch only when the
