@@ -154,10 +154,17 @@ impl JobRunner for UnportedJobRunner {
 }
 
 /// Injected runtime clients for [`TreeJobRunner`] (`job.RuntimeClients`).
+///
+/// `searcher`/`commit` are the owned bundles assembled by
+/// [`crate::search_runtime`]; they are borrowed for the duration of one
+/// `run` and stay `None` when the corresponding endpoints are not configured
+/// (the tree then keeps the existing per-kind not-ported errors).
 pub struct TreeRuntimeClients {
     pub db: Arc<dyn crate::search_job::PrivateRepoLister + Send + Sync>,
     pub zoekt: Arc<dyn crate::search_job::JobStreamer + Send + Sync>,
     pub max_repos: Option<i64>,
+    pub searcher: Option<Arc<crate::search_runtime::SearcherRuntimeClients>>,
+    pub commit: Option<Arc<crate::search_runtime::CommitRuntimeClientsOwned>>,
 }
 
 /// Runs the constructed job tree with injected clients.
@@ -185,7 +192,17 @@ impl TreeJobRunner {
                 db,
                 zoekt,
                 max_repos,
+                searcher: None,
+                commit: None,
             }),
+        }
+    }
+
+    /// Inject the full owned runtime assembled by
+    /// [`crate::search_runtime::assemble`] (or a fake bundle in tests).
+    pub fn with_clients(runtime: TreeRuntimeClients) -> Self {
+        Self {
+            runtime: Some(runtime),
         }
     }
 }
@@ -201,12 +218,17 @@ impl JobRunner for TreeJobRunner {
                 }),
             };
         };
+        let searcher = runtime
+            .searcher
+            .as_ref()
+            .map(|clients| clients.as_clients());
+        let commit = runtime.commit.as_ref().map(|clients| clients.as_clients());
         let clients = crate::search_job::RuntimeClients {
             db: runtime.db.as_ref(),
             zoekt: runtime.zoekt.as_ref(),
             max_repos: runtime.max_repos,
-            searcher: None,
-            commit: None,
+            searcher: searcher.as_ref(),
+            commit: commit.as_ref(),
         };
         let ctx = crate::search_job::JobContext { deadline: None };
         match crate::search_job::SearchJob::run(job, &ctx, &clients, sender) {
@@ -277,6 +299,16 @@ impl BackendDeps {
             client: SearchClient::new(plan_deps),
             runner,
         }
+    }
+
+    /// Production seam (M9.8im): inject the assembled search runtime while
+    /// keeping the ported plan loaders.
+    pub fn with_runtime(pool: sqlx::PgPool, runtime: TreeRuntimeClients) -> Self {
+        Self::with_deps(
+            pool,
+            default_plan_deps(),
+            Arc::new(TreeJobRunner::with_clients(runtime)),
+        )
     }
 }
 
