@@ -63,6 +63,7 @@ pub mod search_jobutil_misc_jobs;
 pub mod search_jobutil_repos;
 pub mod search_jobutil_tree;
 pub mod search_result_merger;
+pub mod search_runtime;
 pub mod search_searcher_client;
 pub mod search_searcher_jobs;
 pub mod search_source;

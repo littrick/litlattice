@@ -600,7 +600,7 @@ fn is_retriable(code: tonic::Code) -> bool {
 /// Drive `future` to completion from a synchronous context (same runtime
 /// strategy as `sg_zoekt::streamer`): `block_in_place` on a multi-thread
 /// runtime, otherwise a dedicated thread with its own current-thread runtime.
-fn run_to_completion<F>(future: F) -> F::Output
+pub(crate) fn run_to_completion<F>(future: F) -> F::Output
 where
     F: std::future::Future + Send,
     F::Output: Send,
@@ -755,7 +755,7 @@ pub fn grpc_client_from_endpoints(endpoints: Vec<String>) -> Option<GrpcSearcher
 
 /// Boxed production default: gRPC transport with endpoints, `NotPortedSearcher`
 /// without them.
-pub fn default_searcher_client(endpoints: Vec<String>) -> Box<dyn SearcherClient> {
+pub fn default_searcher_client(endpoints: Vec<String>) -> Box<dyn SearcherClient + Send + Sync> {
     match grpc_client_from_endpoints(endpoints) {
         Some(client) => Box::new(client),
         None => Box::new(NotPortedSearcher),

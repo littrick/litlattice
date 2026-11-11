@@ -255,8 +255,37 @@ impl Service for FrontendService {
         // GraphQL stores read the same primary pool.
         let search_contexts_pool = search_pool.clone();
         let ranking_pool = search_pool.clone();
+        // M9.8im: assemble the search runtime from the same static endpoints
+        // `serve_cmd` uses (the live service connections). Missing zoekt
+        // endpoints or an invalid endpoint list keeps the pre-existing
+        // `TreeJobRunner::unconfigured()` behavior byte-for-byte.
+        let search_site = wiring.live().current().site.clone();
         let search_deps: Arc<dyn crate::search_stream::SearchDeps> =
-            Arc::new(crate::search_stream::BackendDeps::new(search_pool));
+            match crate::service_connections::service_connections() {
+                Ok(connections) => {
+                    match crate::search_runtime::assemble(&search_pool, &connections, &search_site)
+                    {
+                        Ok(runtime) => Arc::new(crate::search_stream::BackendDeps::with_runtime(
+                            search_pool,
+                            runtime,
+                        )),
+                        Err(error) => {
+                            tracing::warn!(
+                                error = %error,
+                                "search runtime is not configured; search execution is not ported"
+                            );
+                            Arc::new(crate::search_stream::BackendDeps::new(search_pool))
+                        }
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        error = %error,
+                        "service connections unavailable; search execution is not ported"
+                    );
+                    Arc::new(crate::search_stream::BackendDeps::new(search_pool))
+                }
+            };
         // `serve_cmd.go:143`: `keyring.Init` builds the encryption keys from
         // the site configuration and fails startup when one cannot be
         // constructed. The `conf.Watch` equivalent below rebuilds the ring in
