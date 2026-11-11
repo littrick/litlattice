@@ -182,6 +182,44 @@ pub struct Commit {
     pub message: String,
 }
 
+/// `gitdomain.GitObject` (`ID`/`Type`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitObject {
+    pub oid: String,
+    pub object_type: GitObjectType,
+}
+
+/// `gitdomain.ObjectType`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GitObjectType {
+    Commit,
+    Tag,
+    Tree,
+    Blob,
+    Unknown,
+}
+
+/// `gitdomain.Signature` as the commit resolvers see it (name, email and the
+/// optional timestamp; a missing date is the Unix epoch after
+/// `(*timestamppb.Timestamp)(nil).AsTime()`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitSignature {
+    pub name: String,
+    pub email: String,
+    pub date: Option<prost_types::Timestamp>,
+}
+
+/// `gitdomain.Commit` with the full committer signature, used by the GraphQL
+/// git commit resolver (the narrower [`Commit`] keeps the existing callers).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitDetails {
+    pub oid: String,
+    pub parents: Vec<String>,
+    pub author: CommitSignature,
+    pub committer: Option<CommitSignature>,
+    pub message: String,
+}
+
 /// `gitserver.CommitsOrder`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommitsOrder {
@@ -681,6 +719,80 @@ impl GitserverClient {
         Ok(commit_from_proto(commit))
     }
 
+    /// `gitserver.Client.GetCommit` with the full committer signature, for
+    /// the GraphQL git commit resolver.
+    pub async fn get_commit_details(
+        &self,
+        repo: &str,
+        commit: &str,
+    ) -> Result<CommitDetails, Error> {
+        let mut client = self.client_for(repo).await?;
+        self.get_commit_details_with(&mut client, repo, commit)
+            .await
+    }
+
+    /// [`Self::get_commit_details`] against an explicitly resolved shard.
+    pub async fn get_commit_details_at(
+        &self,
+        addr: &str,
+        repo: &str,
+        commit: &str,
+    ) -> Result<CommitDetails, Error> {
+        let mut client = self.client(addr).await?;
+        self.get_commit_details_with(&mut client, repo, commit)
+            .await
+    }
+
+    async fn get_commit_details_with(
+        &self,
+        client: &mut Client,
+        repo: &str,
+        commit: &str,
+    ) -> Result<CommitDetails, Error> {
+        let context = format!("get commit {repo}@{commit}");
+        let response = client
+            .get_commit(pb::GetCommitRequest {
+                repo_name: repo.to_owned(),
+                commit: commit.to_owned(),
+                include_modified_files: false,
+            })
+            .await
+            .map_err(|status| translate_status(status, &context))?;
+        let commit = response.into_inner().commit.unwrap_or_default();
+        Ok(commit_details_from_proto(commit))
+    }
+
+    /// `gitserver.Client.GetObject`: resolve a revspec to a Git object. The
+    /// response's 20-byte ID is hex-encoded; a response without a 20-byte ID
+    /// is the zero `gitdomain.OID` (40 zeros).
+    pub async fn get_object(&self, repo: &str, object_name: &str) -> Result<GitObject, Error> {
+        let addr = self
+            .addr_for(repo)
+            .ok_or_else(|| Error::Message("no gitserver address configured".to_owned()))?
+            .to_owned();
+        self.get_object_at(&addr, repo, object_name).await
+    }
+
+    /// `GetObject` against an explicitly resolved shard.
+    pub async fn get_object_at(
+        &self,
+        addr: &str,
+        repo: &str,
+        object_name: &str,
+    ) -> Result<GitObject, Error> {
+        let mut client = self.client(addr).await?;
+        let context = format!("get object {repo} {object_name}");
+        let response = client
+            .get_object(pb::GetObjectRequest {
+                repo: repo.to_owned(),
+                object_name: object_name.to_owned(),
+            })
+            .await
+            .map_err(|status| translate_status(status, &context))?
+            .into_inner();
+        Ok(git_object_from_proto(response.object.unwrap_or_default()))
+    }
+
     /// `gitserver.Client.Commits` (`CommitsOptions.ToProto` + a `CommitLog`
     /// stream), reduced to the commit fields the code-intel commit graph
     /// updater reads.
@@ -787,6 +899,50 @@ fn commit_from_proto(commit: pb::GitCommit) -> Commit {
         committer_date: commit.committer.and_then(|committer| committer.date),
         message: String::from_utf8_lossy(&commit.message).into_owned(),
     }
+}
+
+/// `gitdomain.CommitFromProto` with the full committer signature.
+fn commit_details_from_proto(commit: pb::GitCommit) -> CommitDetails {
+    let author = commit.author.unwrap_or_default();
+    CommitDetails {
+        oid: commit.oid,
+        parents: commit.parents,
+        author: CommitSignature {
+            name: String::from_utf8_lossy(&author.name).into_owned(),
+            email: String::from_utf8_lossy(&author.email).into_owned(),
+            date: author.date,
+        },
+        // `gitdomain.CommitFromProto` always installs a non-nil committer: an
+        // absent proto signature becomes the empty name/email with a nil date
+        // (`SignatureResolver` then reports the zero time).
+        committer: Some({
+            let committer = commit.committer.unwrap_or_default();
+            CommitSignature {
+                name: String::from_utf8_lossy(&committer.name).into_owned(),
+                email: String::from_utf8_lossy(&committer.email).into_owned(),
+                date: committer.date,
+            }
+        }),
+        message: String::from_utf8_lossy(&commit.message).into_owned(),
+    }
+}
+
+/// `gitdomain.GitObject.FromProto`: a 20-byte ID becomes the 40-char hex OID;
+/// any other length is the zero `OID` (`hex.EncodeToString` of 20 zero bytes).
+fn git_object_from_proto(object: pb::GitObject) -> GitObject {
+    let oid = if object.id.len() == 20 {
+        object.id.iter().map(|byte| format!("{byte:02x}")).collect()
+    } else {
+        "0".repeat(40)
+    };
+    let object_type = match pb::git_object::ObjectType::try_from(object.r#type) {
+        Ok(pb::git_object::ObjectType::Commit) => GitObjectType::Commit,
+        Ok(pb::git_object::ObjectType::Tag) => GitObjectType::Tag,
+        Ok(pb::git_object::ObjectType::Tree) => GitObjectType::Tree,
+        Ok(pb::git_object::ObjectType::Blob) => GitObjectType::Blob,
+        _ => GitObjectType::Unknown,
+    };
+    GitObject { oid, object_type }
 }
 
 /// Translate a gRPC status into the baseline's `gitdomain` error types by

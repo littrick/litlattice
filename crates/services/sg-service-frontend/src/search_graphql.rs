@@ -240,12 +240,16 @@ fn execution_error_message(error: SearchExecutionError) -> String {
 }
 
 /// `Query.search`'s field value: a `Search` object, or the plan/execute error.
-pub fn search_field(root: &SearchRoot) -> Result<Option<FieldValue>, ExecError> {
+pub fn search_field(
+    root: &SearchRoot,
+    git: Option<Arc<crate::git_graphql::GitPrefetch>>,
+) -> Result<Option<FieldValue>, ExecError> {
     match root {
         SearchRoot::Error(message) => Err(ExecError::new(message.clone())),
         SearchRoot::Completed(_) | SearchRoot::Alert { .. } => {
             Ok(Some(FieldValue::Object(Arc::new(SearchObject {
                 root: root.clone(),
+                git,
             }))))
         }
     }
@@ -261,6 +265,7 @@ fn empty_stats() -> Stats {
 
 struct SearchObject {
     root: SearchRoot,
+    git: Option<Arc<crate::git_graphql::GitPrefetch>>,
 }
 
 impl ObjectValue for SearchObject {
@@ -283,6 +288,7 @@ impl ObjectValue for SearchObject {
                         alert: execution.alert.clone(),
                         repo_names: execution.repo_names.clone(),
                         elapsed_ms: execution.elapsed_ms,
+                        git: self.git.clone(),
                     },
                     SearchRoot::Alert { alert } => SearchResultsObject {
                         matches: Vec::new(),
@@ -290,6 +296,7 @@ impl ObjectValue for SearchObject {
                         alert: Some(alert.clone()),
                         repo_names: Vec::new(),
                         elapsed_ms: 0,
+                        git: self.git.clone(),
                     },
                     SearchRoot::Error(_) => unreachable!(),
                 };
@@ -321,6 +328,7 @@ struct SearchResultsObject {
     alert: Option<EventAlert>,
     repo_names: Vec<(i32, String)>,
     elapsed_ms: i32,
+    git: Option<Arc<crate::git_graphql::GitPrefetch>>,
 }
 
 impl SearchResultsObject {
@@ -388,8 +396,11 @@ impl ObjectValue for SearchResultsObject {
     ) -> Result<Option<FieldValue>, ExecError> {
         match field {
             "results" => {
-                let items: Vec<FieldValue> =
-                    self.matches.iter().filter_map(match_to_object).collect();
+                let items: Vec<FieldValue> = self
+                    .matches
+                    .iter()
+                    .filter_map(|match_| match_to_object(match_, self.git.clone()))
+                    .collect();
                 Ok(Some(FieldValue::List {
                     items,
                     element_type: Some("SearchResult"),
@@ -472,13 +483,17 @@ fn status_repositories(repos: Vec<MinimalRepo>) -> FieldValue {
     }
 }
 
-fn match_to_object(match_: &Match) -> Option<FieldValue> {
+fn match_to_object(
+    match_: &Match,
+    git: Option<Arc<crate::git_graphql::GitPrefetch>>,
+) -> Option<FieldValue> {
     match match_ {
         Match::File(file) => Some(FieldValue::Object(Arc::new(FileMatchObject {
             match_: file.clone(),
         }))),
         Match::Commit(commit) => Some(FieldValue::Object(Arc::new(CommitSearchResultObject {
             match_: commit.clone(),
+            git,
         }))),
         Match::Repo(repo) => Some(FieldValue::Object(Arc::new(repository_object(
             &MinimalRepo {
@@ -519,6 +534,7 @@ impl ObjectValue for SearchResultsStatsObject {
                     alert: None,
                     repo_names: Vec::new(),
                     elapsed_ms: 0,
+                    git: None,
                 };
                 Ok(Some(FieldValue::Json(Json::Str(
                     results.approximate_result_count(),
@@ -940,6 +956,7 @@ impl ObjectValue for ChunkMatchObject {
 
 struct CommitSearchResultObject {
     match_: crate::search_stream::convert::CommitMatch,
+    git: Option<Arc<crate::git_graphql::GitPrefetch>>,
 }
 
 impl ObjectValue for CommitSearchResultObject {
@@ -983,10 +1000,15 @@ impl ObjectValue for CommitSearchResultObject {
                 commit: Some(self.match_.commit.clone()),
                 input_rev: None,
             })))),
-            "refs" => Ok(Some(git_ref_list(&self.match_.repo, &self.match_.refs))),
+            "refs" => Ok(Some(git_ref_list(
+                &self.match_.repo,
+                &self.match_.refs,
+                self.git.clone(),
+            ))),
             "sourceRefs" => Ok(Some(git_ref_list(
                 &self.match_.repo,
                 &self.match_.source_refs,
+                self.git.clone(),
             ))),
             "messagePreview" => match &self.match_.message_preview {
                 Some(preview) => Ok(Some(FieldValue::Object(Arc::new(
@@ -1967,13 +1989,22 @@ impl ObjectValue for LanguageStatisticsObject {
     }
 }
 
-/// `GitRefResolver` (`git_ref.go:72-133`), minus `target`.
-struct GitRefObject {
+/// `GitRefResolver` (`git_ref.go:72-133`).
+pub(crate) struct GitRefObject {
     repo: MinimalRepo,
     name: String,
+    git: Option<Arc<crate::git_graphql::GitPrefetch>>,
 }
 
 impl GitRefObject {
+    pub(crate) fn new(
+        repo: MinimalRepo,
+        name: String,
+        git: Option<Arc<crate::git_graphql::GitPrefetch>>,
+    ) -> Self {
+        Self { repo, name, git }
+    }
+
     fn abbrev_name(&self) -> &str {
         let prefix = git_ref_prefix(&self.name);
         self.name.strip_prefix(prefix).unwrap_or(&self.name)
@@ -2012,11 +2043,36 @@ impl ObjectValue for GitRefObject {
             "type" => Ok(Some(FieldValue::Json(Json::Str(
                 git_ref_type(&self.name).to_owned(),
             )))),
-            // The baseline lazily resolves the target through gitserver
-            // (`gitObjectResolver`); no gitserver client is ported here.
-            "target" => Err(ExecError::new(
-                "GitRef.target requires a gitserver object resolver, which is not ported",
-            )),
+            // `GitRefResolver.Target` (`git_ref.go:100-127`) loads the object
+            // through gitserver; the prefetch phase has already done so.
+            "target" => match &self.git {
+                Some(git) => match git.objects.get(&(self.repo.id, self.name.clone())) {
+                    Some(crate::git_graphql::ObjectLookup::Found(object)) => {
+                        Ok(Some(FieldValue::Object(Arc::new(
+                            crate::git_graphql::GitObjectResolverObject::from_object(
+                                self.repo.clone(),
+                                object.clone(),
+                                Some(git.clone()),
+                            ),
+                        ))))
+                    }
+                    Some(crate::git_graphql::ObjectLookup::Error(message)) => {
+                        Ok(Some(FieldValue::Object(Arc::new(
+                            crate::git_graphql::GitObjectResolverObject::with_error(
+                                self.repo.clone(),
+                                message.clone(),
+                                Some(git.clone()),
+                            ),
+                        ))))
+                    }
+                    None => Err(ExecError::new(
+                        "GitRef.target was not prefetched for this ref revision",
+                    )),
+                },
+                None => Err(ExecError::new(
+                    "GitRef.target requires a gitserver object resolver, which is not ported",
+                )),
+            },
             "repository" => Ok(Some(FieldValue::Object(Arc::new(repository_object(
                 &self.repo,
             ))))),
@@ -2026,7 +2082,11 @@ impl ObjectValue for GitRefObject {
     }
 }
 
-fn git_ref_list(repo: &MinimalRepo, refs: &[String]) -> FieldValue {
+fn git_ref_list(
+    repo: &MinimalRepo,
+    refs: &[String],
+    git: Option<Arc<crate::git_graphql::GitPrefetch>>,
+) -> FieldValue {
     FieldValue::List {
         items: refs
             .iter()
@@ -2034,6 +2094,7 @@ fn git_ref_list(repo: &MinimalRepo, refs: &[String]) -> FieldValue {
                 FieldValue::Object(Arc::new(GitRefObject {
                     repo: repo.clone(),
                     name: name.clone(),
+                    git: git.clone(),
                 }))
             })
             .collect(),
