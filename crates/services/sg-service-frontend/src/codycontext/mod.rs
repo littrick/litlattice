@@ -21,6 +21,7 @@ mod stop_words;
 
 pub use execution::CodyContextExecutionJob;
 
+use std::collections::BTreeMap;
 use std::sync::{Arc, OnceLock};
 
 use regex::Regex;
@@ -32,6 +33,7 @@ use sg_search_query::parser::{parse, SearchType};
 use sg_search_query::pipeline::for_search_type;
 use sg_search_query::printer::string_human;
 use sg_search_query::transformer::to_basic_query;
+use sg_service_searcher::filter::IgnoreMatcher;
 
 use crate::search_job::JobError;
 
@@ -43,6 +45,9 @@ pub const DEFAULT_TEXT_RESULTS_COUNT: i32 = 3;
 pub const SYMBOL_RESULTS_COUNT: i32 = 3;
 /// `maxKeywords`.
 pub const MAX_KEYWORDS: usize = 10;
+
+/// `codyIgnoreFile` (`cmd/frontend/internal/codycontext/dotcom.go:17`).
+pub const CODY_IGNORE_FILE: &str = ".cody/ignore";
 
 /// The fixed error shared by `NewSearchJob` and `parseQuery`.
 pub const MULTI_CLAUSE_ERROR: &str =
@@ -115,6 +120,54 @@ impl CodyFileMatcher {
             CodyFileMatcher::AcceptAll => true,
             CodyFileMatcher::Custom(matcher) => matcher(repo_id, path),
         }
+    }
+}
+
+/// `getIgnoreMatcher` (`dotcom.go:113-132`) minus the gitserver read: a
+/// missing `.cody/ignore` yields the empty matcher (ignore nothing), otherwise
+/// the contents are parsed with zoekt's `ignore` rules.
+pub fn parse_ignore_file(contents: Option<&str>) -> Result<IgnoreMatcher, String> {
+    match contents {
+        None => Ok(IgnoreMatcher::default()),
+        Some(contents) => IgnoreMatcher::parse(contents),
+    }
+}
+
+/// The per-repo matcher map built by `dotcomRepoFilter.getFilter`
+/// (`dotcom.go:56-94`).
+#[derive(Clone, Default)]
+pub struct RepoContentFilter {
+    filters: BTreeMap<i32, IgnoreMatcher>,
+}
+
+impl RepoContentFilter {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// `getFilter`'s loop body. A repo whose ignore file cannot be parsed is
+    /// excluded: no entry is stored and the matcher accepts every path. The
+    /// error is returned for the caller to log.
+    pub fn insert(&mut self, repo_id: i32, ignore_file: Option<&str>) -> Result<(), String> {
+        match parse_ignore_file(ignore_file) {
+            Ok(matcher) => {
+                self.filters.insert(repo_id, matcher);
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// `getFilter`'s returned closure: `!ok || !ignore(path)`.
+    pub fn accepts(&self, repo_id: i32, path: &str) -> bool {
+        self.filters
+            .get(&repo_id)
+            .is_none_or(|matcher| !matcher.matches(path))
+    }
+
+    /// Wrap the map as the `search.Features.CodyFileMatcher` seam.
+    pub fn into_file_matcher(self) -> CodyFileMatcher {
+        CodyFileMatcher::Custom(Arc::new(move |repo_id, path| self.accepts(repo_id, path)))
     }
 }
 

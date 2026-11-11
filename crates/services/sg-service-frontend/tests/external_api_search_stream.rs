@@ -494,6 +494,7 @@ fn inputs() -> SearchInputs {
         context_lines: 1,
         sanitize_search_patterns: Vec::new(),
         on_sourcegraph_dot_com: false,
+        cody_context: None,
     }
 }
 
