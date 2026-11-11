@@ -22,6 +22,7 @@ pub mod authz;
 pub mod blame;
 pub mod client_configuration;
 pub mod clone_urls;
+pub mod codycontext;
 pub mod config;
 pub mod config_graphql;
 pub mod configuration_api;

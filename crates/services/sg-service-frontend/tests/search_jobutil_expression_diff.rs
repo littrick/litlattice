@@ -421,6 +421,7 @@ fn run_case(case: &Case) -> Value {
         max_repos: None,
         searcher: None,
         commit: None,
+        repo_pager: None,
     };
     let ctx = RunContext::default();
     let mut events: Vec<SearchEvent> = Vec::new();

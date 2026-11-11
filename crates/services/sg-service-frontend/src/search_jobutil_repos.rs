@@ -722,6 +722,7 @@ mod tests {
             max_repos: None,
             searcher: None,
             commit: None,
+            repo_pager: None,
         }
     }
 

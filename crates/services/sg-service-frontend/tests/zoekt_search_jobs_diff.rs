@@ -577,6 +577,7 @@ fn run_job(case: &Case) -> Value {
         max_repos: None,
         searcher: None,
         commit: None,
+        repo_pager: None,
     };
     let ctx = JobContext {
         deadline: deadline(&case.deadline),

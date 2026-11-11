@@ -216,6 +216,7 @@ fn output_job_tree(
         original_query: String::new(),
         sub_repo_enabled: false,
         cody_context_hook: None,
+        cody_context: None,
     };
     let job = new_plan_job(&inputs, &plan).map_err(|error| error.0)?;
     let view = JobTreeView::new(&job);

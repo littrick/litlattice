@@ -229,6 +229,7 @@ impl JobRunner for TreeJobRunner {
             max_repos: runtime.max_repos,
             searcher: searcher.as_ref(),
             commit: commit.as_ref(),
+            repo_pager: None,
         };
         let ctx = crate::search_job::JobContext { deadline: None };
         match crate::search_job::SearchJob::run(job, &ctx, &clients, sender) {
@@ -383,6 +384,7 @@ fn tree_inputs(inputs: &SearchInputs) -> TreeInputs {
         sub_repo_enabled: false,
         // `codycontext.NewSearchJob` is not ported.
         cody_context_hook: None,
+        cody_context: None,
     }
 }
 

@@ -137,6 +137,7 @@ fn inputs(case: &Case) -> TreeInputs {
         original_query: case.original_query.clone(),
         sub_repo_enabled: false,
         cody_context_hook: None,
+        cody_context: None,
     }
 }
 
