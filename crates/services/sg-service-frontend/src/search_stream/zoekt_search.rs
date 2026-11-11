@@ -189,6 +189,27 @@ pub trait Streamer {
     ) -> Result<(), Self::Error>;
 }
 
+/// The blocking adapter from
+/// [`sg_zoekt::streamer::BlockingStreamer`] drives an async
+/// `sg_zoekt::streamer::Streamer` to completion and can therefore be consumed
+/// through this module's synchronous [`Streamer`] directly (M9.8ig). Event
+/// encoding and job decisions are unchanged.
+impl<S> Streamer for sg_zoekt::streamer::BlockingStreamer<S>
+where
+    S: sg_zoekt::streamer::Streamer,
+{
+    type Error = S::Error;
+
+    fn stream_search(
+        &self,
+        query: &Query,
+        options: &SearchOptions,
+        sender: &mut dyn FnMut(SearchResult),
+    ) -> Result<(), Self::Error> {
+        self.stream_search_blocking(query, options, sender)
+    }
+}
+
 /// Lossless wire→result adapter (`zoekt.SearchResultFromProto`, see
 /// `internal/search/backend/grpc.go:44-53`): converts a wire
 /// [`SearchChunk`] into the full [`SearchResult`] this module's [`Streamer`]
@@ -656,6 +677,68 @@ mod tests {
     }
 
     impl std::error::Error for TestError {}
+
+    #[derive(Clone)]
+    struct FakeAsyncStreamer {
+        chunks: Vec<SearchChunk>,
+    }
+
+    impl sg_zoekt::streamer::Streamer for FakeAsyncStreamer {
+        type Error = TestError;
+
+        async fn list(
+            &self,
+            _query: &Query,
+            _opts: Option<sg_zoekt::types::ListOptions>,
+        ) -> Result<sg_zoekt::types::ListResponse, TestError> {
+            Ok(sg_zoekt::types::ListResponse::default())
+        }
+
+        async fn stream_search(
+            &self,
+            _query: &Query,
+            _options: &SearchOptions,
+            sender: &mut (dyn FnMut(SearchChunk) + Send),
+        ) -> Result<(), TestError> {
+            for chunk in &self.chunks {
+                sender(chunk.clone());
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn blocking_streamer_satisfies_the_synchronous_streamer_trait() {
+        let streamer = sg_zoekt::streamer::BlockingStreamer::new(FakeAsyncStreamer {
+            chunks: vec![
+                SearchChunk {
+                    stats: sg_zoekt::types::Stats {
+                        file_count: 1,
+                        ..Default::default()
+                    },
+                    ..SearchChunk::default()
+                },
+                SearchChunk {
+                    stats: sg_zoekt::types::Stats {
+                        match_count: 2,
+                        ..Default::default()
+                    },
+                    ..SearchChunk::default()
+                },
+            ],
+        });
+        let mut results = Vec::new();
+        Streamer::stream_search(
+            &streamer,
+            &Query::Const(true),
+            &SearchOptions::default(),
+            &mut |result| results.push(result),
+        )
+        .expect("fake stream succeeds");
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].stats.file_count, 1);
+        assert_eq!(results[1].stats.match_count, 2);
+    }
 
     #[test]
     fn zoekt_search_skips_empty_repo_set_and_emits_timeout() {

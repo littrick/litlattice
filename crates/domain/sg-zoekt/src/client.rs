@@ -20,7 +20,7 @@ use crate::types::{ListOptions, ListResponse, SearchChunk, SearchOptions};
 pub const MAX_RECV_MESSAGE_SIZE: usize = 128 * 1024 * 1024;
 
 /// Failure talking to a zoekt-webserver.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum Error {
     /// The caller cancelled the request at the client side.
     Canceled,
@@ -157,6 +157,36 @@ impl Client {
     }
 }
 
+/// Adapts the raw async [`Client`] to [`crate::streamer::Streamer`] so it can
+/// be driven by [`crate::streamer::BlockingStreamer`] (M9.8ig).
+///
+/// `Client::stream_search` takes a cancellation token; this adapter passes a
+/// fresh token that is never cancelled, matching the baseline
+/// `zoektGRPCClient.StreamSearch` (which cancels only through the surrounding
+/// context). Callers that need cancellation should drive the token-aware
+/// method directly or use the wrapping streamers.
+impl crate::streamer::Streamer for Client {
+    type Error = Error;
+
+    /// `zoekt.Streamer.List`. A `None` option maps to
+    /// [`ListOptions::default`] (the proto default field), which the
+    /// webserver treats like an unset option.
+    async fn list(&self, query: &Query, opts: Option<ListOptions>) -> Result<ListResponse, Error> {
+        Client::list(self, query, opts.unwrap_or_default()).await
+    }
+
+    /// `zoekt.Streamer.StreamSearch` without cancellation.
+    async fn stream_search(
+        &self,
+        query: &Query,
+        options: &SearchOptions,
+        sender: &mut (dyn FnMut(SearchChunk) + Send),
+    ) -> Result<(), Error> {
+        let cancel = CancellationToken::new();
+        Client::stream_search(self, query, options, &cancel, sender).await
+    }
+}
+
 fn build_endpoint(endpoint: &str) -> Result<Endpoint, Error> {
     let uri = if endpoint.contains("://") {
         endpoint.to_owned()
@@ -170,6 +200,12 @@ fn build_endpoint(endpoint: &str) -> Result<Endpoint, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn client_implements_the_async_streamer_trait() {
+        fn assert_streamer<S: crate::streamer::Streamer>() {}
+        assert_streamer::<Client>();
+    }
 
     #[test]
     fn accepts_bare_and_scheme_endpoints() {
