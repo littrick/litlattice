@@ -1343,12 +1343,31 @@ impl JobNode {
                     swallow_error_when_canceled: true,
                 })
             }
-            // The blocking collector (`searchJob.Run`) needs the unported
-            // result layer; the construction side is ported (M9.8ju).
-            NodeKind::CodyContext { .. } => {
-                return Err(JobError(
-                    "CodyContextSearchJob execution is not ported (M9.8ju)".to_owned(),
-                ));
+            // `codycontext.searchJob.Run`: the blocking collector is ported in
+            // `codycontext::execution` (M9.8jy); convert the out-of-line
+            // symbol/code/text sub-jobs to combinators.
+            NodeKind::CodyContext {
+                symbol_job,
+                code_job,
+                text_job,
+                patterns,
+                code_count,
+                text_count,
+                file_matcher,
+            } => {
+                let symbol_job = match symbol_job {
+                    Some(job) => Some(job.to_combinator()?),
+                    None => None,
+                };
+                Box::new(codycontext::CodyContextExecutionJob::new(
+                    symbol_job,
+                    code_job.to_combinator()?,
+                    text_job.to_combinator()?,
+                    patterns.clone(),
+                    *code_count,
+                    *text_count,
+                    file_matcher.clone(),
+                ))
             }
             NodeKind::SearcherText
             | NodeKind::SearcherSymbol { .. }
