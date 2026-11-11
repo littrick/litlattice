@@ -478,6 +478,80 @@ pub async fn set_query_trigger_next_run(
     Ok(())
 }
 
+/// `UpsertLastSearched` (`internal/database/code_monitor_last_searched.go`).
+pub const UPSERT_LAST_SEARCHED_SQL: &str = "
+INSERT INTO cm_last_searched (monitor_id, repo_id, commit_oids)
+VALUES ($1, $2, $3)
+ON CONFLICT (monitor_id, repo_id) DO UPDATE
+SET commit_oids = $4
+";
+
+/// `codeMonitorStore.UpsertLastSearched`. A nil slice is stored as `[]`
+/// (baseline "appease non-null constraint" behavior).
+pub async fn upsert_last_searched(
+    pool: &PgPool,
+    monitor_id: i64,
+    repo_id: i32,
+    commit_oids: &[String],
+) -> Result<(), sqlx::Error> {
+    let commit_oids = commit_oids.to_vec();
+    sqlx::query(UPSERT_LAST_SEARCHED_SQL)
+        .bind(monitor_id)
+        .bind(repo_id)
+        .bind(commit_oids.clone())
+        .bind(commit_oids)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// `GetLastSearched` (`internal/database/code_monitor_last_searched.go`).
+pub const GET_LAST_SEARCHED_SQL: &str = "
+SELECT commit_oids
+FROM cm_last_searched
+WHERE monitor_id = $1
+	AND repo_id = $2
+LIMIT 1
+";
+
+/// `codeMonitorStore.GetLastSearched`. `sql.ErrNoRows` maps to `None`
+/// (baseline returns `nil, nil`).
+pub async fn get_last_searched(
+    pool: &PgPool,
+    monitor_id: i64,
+    repo_id: i32,
+) -> Result<Option<Vec<String>>, sqlx::Error> {
+    let row: Option<(Vec<String>,)> = sqlx::query_as(GET_LAST_SEARCHED_SQL)
+        .bind(monitor_id)
+        .bind(repo_id)
+        .fetch_optional(pool)
+        .await?;
+    Ok(row.map(|row| row.0))
+}
+
+/// `updateTriggerJobLogsFmtStr`
+/// (`internal/database/code_monitor_trigger_jobs.go:113-117`).
+pub const UPDATE_TRIGGER_JOB_WITH_LOGS_SQL: &str = "
+UPDATE cm_trigger_jobs
+SET logs = logs || $1::json
+WHERE id = $2
+";
+
+/// `codeMonitorStore.UpdateTriggerJobWithLogs`; `entry` is the
+/// `TriggerJobLogs` JSON object.
+pub async fn update_trigger_job_with_logs(
+    pool: &PgPool,
+    trigger_job_id: i32,
+    entry: &serde_json::Value,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(UPDATE_TRIGGER_JOB_WITH_LOGS_SQL)
+        .bind(entry)
+        .bind(trigger_job_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 /// `logSearchFmtStr`.
 pub const UPDATE_TRIGGER_JOB_WITH_RESULTS_SQL: &str =
     "UPDATE cm_trigger_jobs SET query_string = $1, search_results = $2::jsonb WHERE id = $3";

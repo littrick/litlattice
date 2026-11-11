@@ -44,6 +44,7 @@ use sg_zoekt::query::{self as zoekt_query, IndexedRequestType};
 
 use crate::codycontext::{self, CodyContextJobParts, CodyContextOptions, CodyFileMatcher};
 use crate::search_client::{Features, Protocol, SearchMode};
+use crate::search_commit_job::CodeMonitorHookHandle;
 use crate::search_contexts::{parse_repository_revisions, ParsedRepoFilter, RepoVisibility};
 use crate::search_job::{
     GlobalTextSearchJob, JobContext, JobError, RepoSubsetTextSearchJob, RuntimeClients, SearchJob,
@@ -443,6 +444,8 @@ enum NodeKind {
         repos: Vec<RepositoryRevisions>,
         diff: bool,
         limit: i64,
+        /// `commit.SearchJob.CodeMonitorSearchWrapper`.
+        code_monitor_search_wrapper: Option<CodeMonitorHookHandle>,
     },
     Structural {
         pattern_info: jb::TextPatternInfo,
@@ -569,6 +572,79 @@ impl JobNode {
 
     fn is_noop(&self) -> bool {
         matches!(self.kind, NodeKind::Noop)
+    }
+
+    /// `Job.Children` for the code-monitor tree rewrite.
+    pub fn children(&self) -> &[JobNode] {
+        &self.children
+    }
+
+    /// `*commit.SearchJob`.
+    pub fn is_commit_search_job(&self) -> bool {
+        matches!(self.kind, NodeKind::Commit { .. })
+    }
+
+    /// `*repos.ComputeExcludedJob` or `*jobutil.NoopJob` (not `codycontext`'s
+    /// distinct no-op type).
+    pub fn is_noop_or_compute_excluded_job(&self) -> bool {
+        matches!(self.kind, NodeKind::Noop | NodeKind::ComputeExcluded { .. })
+    }
+
+    /// Copy this node with new children (equivalent to `job.Map` rebuilding a
+    /// container after mapping its children).
+    pub fn with_children(&self, children: Vec<JobNode>) -> JobNode {
+        JobNode {
+            kind: self.kind.clone(),
+            children,
+        }
+    }
+
+    /// `commit.SearchJob` copy with `CodeMonitorSearchWrapper` set. The runner
+    /// always executes commit jobs with concurrency 1 (`SearchJob.Concurrency`
+    /// is not modelled separately; `CommitLeafJob` uses 1).
+    pub fn with_code_monitor_hook(&self, hook: CodeMonitorHookHandle) -> JobNode {
+        match &self.kind {
+            NodeKind::Commit {
+                query,
+                git_query,
+                repos,
+                diff,
+                limit,
+                ..
+            } => JobNode {
+                kind: NodeKind::Commit {
+                    query: query.clone(),
+                    git_query: git_query.clone(),
+                    repos: repos.clone(),
+                    diff: *diff,
+                    limit: *limit,
+                    code_monitor_search_wrapper: Some(hook),
+                },
+                children: self.children.clone(),
+            },
+            _ => self.clone(),
+        }
+    }
+
+    /// Replacement for `*repos.ComputeExcludedJob` / `*jobutil.NoopJob`.
+    pub fn as_noop(&self) -> JobNode {
+        new_noop_job()
+    }
+
+    /// Number of commit leaves carrying a `CodeMonitorSearchWrapper`.
+    pub fn code_monitor_hook_count(&self) -> usize {
+        let own = matches!(
+            &self.kind,
+            NodeKind::Commit {
+                code_monitor_search_wrapper: Some(_),
+                ..
+            }
+        ) as usize;
+        own + self
+            .children
+            .iter()
+            .map(JobNode::code_monitor_hook_count)
+            .sum::<usize>()
     }
 
     fn name_str(&self) -> &'static str {
@@ -1076,6 +1152,7 @@ fn set_tree_repos(node: &JobNode, resolved: &ResolvedRepos) -> JobNode {
             git_query,
             diff,
             limit,
+            code_monitor_search_wrapper,
             ..
         } => NodeKind::Commit {
             query: query.clone(),
@@ -1083,6 +1160,7 @@ fn set_tree_repos(node: &JobNode, resolved: &ResolvedRepos) -> JobNode {
             repos: resolved.unindexed.clone(),
             diff: *diff,
             limit: *limit,
+            code_monitor_search_wrapper: code_monitor_search_wrapper.clone(),
         },
         other => other.clone(),
     };
@@ -1175,6 +1253,7 @@ struct CommitLeafJob {
     repos: Vec<RepositoryRevisions>,
     diff: bool,
     limit: i64,
+    code_monitor_search_wrapper: Option<CodeMonitorHookHandle>,
 }
 
 impl comb::CombinatorJob for CommitLeafJob {
@@ -1200,7 +1279,7 @@ impl comb::CombinatorJob for CommitLeafJob {
             limit: self.limit,
             include_modified_files: false,
             concurrency: 1,
-            code_monitor_search_wrapper: None,
+            code_monitor_search_wrapper: self.code_monitor_search_wrapper.clone(),
         };
         match job.run(&ctx.as_job_context(), commit_clients, stream) {
             Ok(()) => (None, None),
@@ -1292,6 +1371,7 @@ impl JobNode {
                 repos,
                 diff,
                 limit,
+                code_monitor_search_wrapper,
                 ..
             } => Box::new(CommitLeafJob {
                 name: self.name_str(),
@@ -1299,6 +1379,7 @@ impl JobNode {
                 repos: repos.clone(),
                 diff: *diff,
                 limit: *limit,
+                code_monitor_search_wrapper: code_monitor_search_wrapper.clone(),
             }),
             NodeKind::StaticEvents { events, error } => Box::new(comb::StaticJob::new(
                 events.iter().map(StaticEvent::to_search_event).collect(),
@@ -1596,6 +1677,7 @@ impl JobNode {
             repos,
             diff,
             limit,
+            code_monitor_search_wrapper: None,
         })
     }
 
@@ -1985,6 +2067,7 @@ pub fn new_basic_job(inputs: &TreeInputs, basic: &Basic) -> Result<JobNode, JobE
             repos: Vec::new(),
             diff,
             limit: i64::from(file_match_limit),
+            code_monitor_search_wrapper: None,
         });
         children.push(repo_pager_with_partitioning(
             commit_job,

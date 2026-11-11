@@ -30,6 +30,8 @@
 //!
 //! See `docs/overviews/m9_8ia_commit_search_job_overview.md`.
 
+use std::fmt;
+use std::sync::Arc;
 use std::sync::OnceLock;
 
 use prost_types::Timestamp;
@@ -70,6 +72,46 @@ pub type CodeMonitorHook = dyn Fn(
     + Send
     + Sync;
 
+/// Shared handle to a [`CodeMonitorHook`]. The job tree stores the hook on
+/// `SearchJob.CodeMonitorSearchWrapper` (`commit.go:27-45`); an `Arc` lets the
+/// same hook be attached to the tree while [`CodeMonitorHookHandle`] stays
+/// `Debug`/`PartialEq` for [`crate::search_jobutil_tree::JobNode`].
+#[derive(Clone)]
+pub struct CodeMonitorHookHandle(Arc<CodeMonitorHook>);
+
+impl CodeMonitorHookHandle {
+    pub fn new(hook: Arc<CodeMonitorHook>) -> Self {
+        Self(hook)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn call(
+        &self,
+        ctx: &JobContext,
+        db: &dyn CommitUserDB,
+        gitserver: &dyn GitserverClient,
+        request: &pb::SearchRequest,
+        repo_id: u32,
+        do_search: &mut DoSearchFunc<'_>,
+    ) -> Result<(), JobError> {
+        (self.0)(ctx, db, gitserver, request, repo_id, do_search)
+    }
+}
+
+impl fmt::Debug for CodeMonitorHookHandle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("CodeMonitorHook")
+    }
+}
+
+impl PartialEq for CodeMonitorHookHandle {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for CodeMonitorHookHandle {}
+
 /// `GitserverClient.Search` (`commit.go:42-45`). `on_matches` receives each
 /// streamed batch of commit matches; the return value is `limitHit`.
 ///
@@ -82,6 +124,22 @@ pub trait GitserverClient {
         request: &pb::SearchRequest,
         on_matches: &mut dyn FnMut(Vec<pb::CommitMatch>),
     ) -> Result<bool, SearcherError>;
+
+    /// `gitserver.Client.ResolveRevision` (`commit.go:42-45`), used by the
+    /// code-monitor hook. `RevisionNotFound` is distinguished through
+    /// [`SearcherErrorKind::RevisionNotFound`]; the default reports an
+    /// explicit unsupported error so injected test clients keep working.
+    fn resolve_revision(
+        &self,
+        repo: &str,
+        rev: &str,
+        ensure_revision: bool,
+    ) -> Result<String, SearcherError> {
+        let _ = (repo, rev, ensure_revision);
+        Err(SearcherError::other(
+            "gitserver ResolveRevision is not supported by this client",
+        ))
+    }
 }
 
 /// The subset of `db.Users()`/`db.UserEmails()` username expansion reads.
@@ -118,7 +176,7 @@ pub struct SearchJob {
     pub include_modified_files: bool,
     pub concurrency: usize,
     /// `CodeMonitorSearchWrapper`; `None` runs `doSearch` directly.
-    pub code_monitor_search_wrapper: Option<Box<CodeMonitorHook>>,
+    pub code_monitor_search_wrapper: Option<CodeMonitorHookHandle>,
 }
 
 impl SearchJob {
@@ -163,7 +221,7 @@ impl SearchJob {
                 let mut do_search = |args: &pb::SearchRequest| {
                     do_search(args, repo_rev, &repo, diff, clients, stream)
                 };
-                hook(
+                hook.call(
                     _ctx,
                     clients.db,
                     clients.gitserver,
