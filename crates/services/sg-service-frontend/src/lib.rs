@@ -116,6 +116,7 @@ pub mod temporary_settings;
 pub mod tenant;
 pub mod trace_headers;
 pub mod trace_policy;
+pub mod ui_assets;
 pub mod user_provisioning;
 pub mod user_store;
 pub mod version;

@@ -230,7 +230,8 @@ pub fn external_handler(
     let app_env = Arc::new(AppEnv::from_env());
     let app_config = AppConfig {
         external_url: security.external_url.clone(),
-        branding_favicon: String::new(),
+        cors_origin: security.cors_origin.clone(),
+        ..AppConfig::default()
     };
     let app_deps = Arc::new(AppDeps::production());
     Arc::new(move |mut req: Request<Incoming>| {
@@ -270,6 +271,19 @@ pub fn external_handler(
                                         )
                                         .await
                                     }
+                                    // `/.assets/` is mounted beside the actor
+                                    // chain in the baseline, not inside it.
+                                    mux::Route::Assets { path } => match &app_deps.ui_assets {
+                                        Some(assets) => crate::ui_assets::serve_asset(
+                                            request,
+                                            &path,
+                                            &app_config.cors_origin,
+                                            assets.readonly().as_ref(),
+                                        ),
+                                        None => {
+                                            mux::not_found_dispatch(mux::Route::Assets { path })
+                                        }
+                                    },
                                     other => mux::not_found_dispatch(other),
                                 }
                             })
@@ -657,6 +671,19 @@ pub fn external_handler_with_live(
                                                 }
                                                 response
                                             }
+                                        }
+                                    }
+                                    // `/.assets/` is mounted on the outer mux
+                                    // beside the actor chain.
+                                    mux::Route::Assets { path } => {
+                                        match &app_deps.ui_assets {
+                                            Some(assets) => crate::ui_assets::serve_asset(
+                                                request,
+                                                path,
+                                                &app_config.cors_origin,
+                                                assets.readonly().as_ref(),
+                                            ),
+                                            None => mux::not_found_dispatch(route.clone()),
                                         }
                                     }
                                     other => mux::not_found_dispatch(other.clone()),

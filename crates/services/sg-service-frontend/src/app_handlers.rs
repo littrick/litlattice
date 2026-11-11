@@ -64,6 +64,8 @@ pub struct AppEnv {
     pub assets_root: String,
     /// `env.InsecureDev`.
     pub insecure_dev: bool,
+    /// `version.Version()` (`"0.0.0+dev"` for dev builds).
+    pub build_version: String,
     /// `internalapi.Client.URL`, the root of the internal HTTP API.
     pub internal_api_url: String,
 }
@@ -76,6 +78,7 @@ impl Default for AppEnv {
             deploy_type: "kubernetes".to_owned(),
             assets_root: "/.assets".to_owned(),
             insecure_dev: false,
+            build_version: "0.0.0+dev".to_owned(),
             internal_api_url: "http://sourcegraph-frontend-internal:80".to_owned(),
         }
     }
@@ -99,19 +102,42 @@ impl AppEnv {
             },
             assets_root: get("ASSETS_ROOT", "/.assets"),
             insecure_dev: go_parse_bool(&get("INSECURE_DEV", "false")),
+            // `internal/version` reads `/version.txt` at init and otherwise
+            // keeps the unreleased-development default.
+            build_version: std::fs::read_to_string("/version.txt")
+                .unwrap_or_else(|_| "0.0.0+dev".to_owned()),
             internal_api_url: "http://sourcegraph-frontend-internal:80".to_owned(),
         }
     }
 }
 
-/// The two site-configuration fields the handlers read
-/// (`conf.ExternalURLParsed()`, `conf.Branding().Favicon`).
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+/// The site-configuration fields the handlers read (`conf.ExternalURLParsed()`,
+/// `conf.Branding()`, `conf.Get().CorsOrigin`).
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AppConfig {
     /// Raw `externalURL` (empty means the baseline's `http://example.com`).
     pub external_url: String,
     /// `branding.favicon` (empty means "use the default asset").
     pub branding_favicon: String,
+    /// `conf.Get().CorsOrigin`; empty unless configured.
+    pub cors_origin: String,
+    /// `conf.Branding().BrandName` (defaults to `Sourcegraph`).
+    pub brand_name: String,
+    /// `branding.light != nil || branding.dark != nil` — suppresses the
+    /// default mark preload in `newCommon`.
+    pub branding_has_theme: bool,
+}
+
+impl Default for AppConfig {
+    fn default() -> Self {
+        Self {
+            external_url: String::new(),
+            branding_favicon: String::new(),
+            cors_origin: String::new(),
+            brand_name: "Sourcegraph".to_owned(),
+            branding_has_theme: false,
+        }
+    }
 }
 
 impl AppConfig {
@@ -122,15 +148,36 @@ impl AppConfig {
             .and_then(serde_json::Value::as_str)
             .unwrap_or_default()
             .to_owned();
-        let branding_favicon = raw
-            .get("branding")
+        let cors_origin = raw
+            .get("corsOrigin")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        let branding = raw.get("branding");
+        let branding_favicon = branding
             .and_then(|branding| branding.get("favicon"))
             .and_then(serde_json::Value::as_str)
             .unwrap_or_default()
             .to_owned();
+        // `conf.Branding()` replaces a missing or empty name with the default.
+        let brand_name = branding
+            .and_then(|branding| branding.get("brandName"))
+            .and_then(serde_json::Value::as_str)
+            .filter(|name| !name.is_empty())
+            .unwrap_or("Sourcegraph")
+            .to_owned();
+        let branding_has_theme = branding
+            .map(|branding| {
+                branding.get("light").is_some_and(|v| !v.is_null())
+                    || branding.get("dark").is_some_and(|v| !v.is_null())
+            })
+            .unwrap_or(false);
         Self {
             external_url,
             branding_favicon,
+            cors_origin,
+            brand_name,
+            branding_has_theme,
         }
     }
 
@@ -334,16 +381,27 @@ pub struct AppDeps {
     /// The remaining app handlers (M9.8jb); every entry is optional so an
     /// unwired process still answers the mux 404.
     pub more: crate::app_handlers_more::MoreDeps,
+    /// The UI asset provider (`ui/assets.Provider`): the web build manifest and
+    /// the hashed bundles it names. `None` keeps the UI route at the mux 404
+    /// that M9.8iu measured.
+    pub ui_assets: Option<Arc<sg_ui::UiAssets>>,
 }
 
 impl AppDeps {
     /// Production wiring (the internal API client is created lazily by the
     /// caller through [`GoImportersCounter::with_doer`]).
     pub fn production() -> Self {
+        // `cmd/frontend/shared/service.go:24-26`.
+        let root = if std::env::var("WEB_BUILDER_DEV_SERVER").as_deref() == Ok("1") {
+            sg_ui::DEV_ASSETS_PATH
+        } else {
+            sg_ui::DEFAULT_ASSET_PATH
+        };
         Self {
             go_importers: GoImportersCounter::with_doer(Arc::new(SgHttpDoer::new())),
             sign_out: None,
             more: crate::app_handlers_more::MoreDeps::default(),
+            ui_assets: Some(Arc::new(sg_ui::UiAssets::for_path(root))),
         }
     }
 
@@ -353,12 +411,19 @@ impl AppDeps {
             go_importers: GoImportersCounter::with_mock(mock),
             sign_out: None,
             more: crate::app_handlers_more::MoreDeps::default(),
+            ui_assets: None,
         }
     }
 
     /// Attach the per-generation sign-out wiring.
     pub fn with_sign_out(mut self, wiring: SignOutWiring) -> Self {
         self.sign_out = Some(Arc::new(wiring));
+        self
+    }
+
+    /// Attach a UI asset provider (hashed bundle manifest + file reader).
+    pub fn with_ui_assets(mut self, assets: Arc<sg_ui::UiAssets>) -> Self {
+        self.ui_assets = Some(assets);
         self
     }
 }

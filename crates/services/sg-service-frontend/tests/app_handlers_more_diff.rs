@@ -322,9 +322,8 @@ async fn app_handlers_more_diff() {
         };
         let config = AppConfig::default();
         let deps = AppDeps {
-            go_importers: Default::default(),
-            sign_out: None,
             more: more_deps(case),
+            ..AppDeps::default()
         };
         let method = Method::from_bytes(case.method.as_bytes()).expect("method");
         let mut req = Request::builder()

@@ -4287,6 +4287,7 @@ dependencies = [
  "sg-settings-schema",
  "sg-site-schema",
  "sg-txemail",
+ "sg-ui",
  "sg-zoekt",
  "sha1 0.10.7",
  "sha2 0.10.9",
@@ -4585,6 +4586,9 @@ dependencies = [
 [[package]]
 name = "sg-ui"
 version = "0.1.0"
+dependencies = [
+ "serde_json",
+]
 
 [[package]]
 name = "sg-zoekt"
