@@ -14,17 +14,18 @@
 //! * the revision handler runs one search and streams the matches into a
 //!   writer (the baseline's `service.NewJSONWriter`).
 //!
-//! The search execution itself (`service.FromSearchClient`, i.e. the Go search
-//! client and job pipeline) is not ported, so the handlers depend on the
-//! injected [`NewSearcher`] / [`MatchWriterFactory`] traits — the same seam the
-//! baseline exposes to its tests (`newSearchJobRoutines` takes a
-//! `newSearcherFactory`). [`SearchJob`] is registered under
-//! `exhaustive-search-job` in `all_jobs()` and assembles the baseline's seven
-//! routines. Its production searcher factory is
+//! The handlers depend on the injected [`NewSearcher`] /
+//! [`MatchWriterFactory`] traits — the same seam the baseline exposes to its
+//! tests (`newSearchJobRoutines` takes a `newSearcherFactory`). [`SearchJob`]
+//! is registered under `exhaustive-search-job` in `all_jobs()` and assembles
+//! the baseline's seven routines. Its production searcher factory is
 //! [`FromSearchClient::production`] with the plan implemented by
-//! [`crate::jobs::exhaustive_search_searcher::PlanSearchClient`]. Repository
-//! resolution and job execution remain explicit not-ported seams until
-//! `repos.Resolver` and the exhaustive job runner are ported.
+//! [`crate::jobs::exhaustive_search_searcher::PlanSearchClient`], the M9.10a
+//! `repos.Resolver` adapted as
+//! [`FrontendRepoResolver`](crate::jobs::exhaustive_search_searcher::FrontendRepoResolver)
+//! and the job tree executed by
+//! [`ProductionJobRunner`](crate::jobs::exhaustive_search_searcher::ProductionJobRunner)
+//! (M9.11b). Tests inject a fake through [`SearchJob::with_searcher_factory`].
 //!
 //! The janitor (`search_jobs_janitor`) lives in
 //! [`crate::jobs::exhaustive_search_janitor`] and is assembled by
@@ -552,20 +553,23 @@ pub type NewSearcherFactory = Arc<dyn Fn() -> Arc<dyn NewSearcher> + Send + Sync
 /// `routines` mirrors `searchJob.Routines`: disabled when
 /// [`is_enabled`] is false, otherwise it builds the same lazy object storage
 /// as the M9.8id janitor and assembles the seven routines. The production
-/// searcher factory is [`FromSearchClient::production`]: `client.Plan` is
-/// real, while repository resolution and job execution are explicit
-/// not-ported seams. Tests and the differential harness inject a fake through
-/// [`SearchJob::with_searcher_factory`].
+/// searcher factory is [`FromSearchClient::production`] over the live-config
+/// runtime: `client.Plan`, the M9.10a `repos.Resolver` and the exhaustive job
+/// tree are all real (M9.11b). Tests and the differential harness inject a
+/// fake through [`SearchJob::with_searcher_factory`].
 pub struct SearchJob {
     config: Arc<SearchJobsObjectStorageConfig>,
-    new_searcher_factory: NewSearcherFactory,
+    /// `Some` when a test/harness overrode `newSearcherFactory`; `None` uses
+    /// the live-config production runtime.
+    new_searcher_factory: Option<NewSearcherFactory>,
 }
 
 impl SearchJob {
     pub fn new() -> Self {
-        Self::with_searcher_factory(Arc::new(|| {
-            Arc::new(FromSearchClient::production(JobClients::not_ported()))
-        }))
+        Self {
+            config: Arc::new(SearchJobsObjectStorageConfig::default()),
+            new_searcher_factory: None,
+        }
     }
 
     /// The baseline's `newSearcherFactory` seam. Production uses
@@ -573,8 +577,32 @@ impl SearchJob {
     pub fn with_searcher_factory(factory: NewSearcherFactory) -> Self {
         Self {
             config: Arc::new(SearchJobsObjectStorageConfig::default()),
-            new_searcher_factory: factory,
+            new_searcher_factory: Some(factory),
         }
+    }
+
+    /// `newSearcherFactory` (`job.go:76-79`): the production adapter bundle
+    /// over the M9.10a resolver and the exhaustive job tree.
+    fn production_searcher(pool: &PgPool, live_config: &LiveConfig) -> Arc<dyn NewSearcher> {
+        let config = live_config.current();
+        let runtime = sg_service_frontend::search_runtime::assemble_exhaustive(
+            pool,
+            &config.service_connections,
+            &config.site,
+        );
+        let clients = JobClients::new(
+            Arc::new(
+                crate::jobs::exhaustive_search_searcher::FrontendRepoResolver::new(Arc::clone(
+                    &runtime.resolver,
+                )),
+            ),
+            Arc::new(
+                crate::jobs::exhaustive_search_searcher::ProductionJobRunner::new(
+                    runtime.clients.clone(),
+                ),
+            ),
+        );
+        Arc::new(FromSearchClient::production(clients))
     }
 
     /// The search-jobs object storage config shared with `loadConfigs`.
@@ -601,7 +629,10 @@ impl SearchJob {
             Arc::new(ObjectStorageMatchWriterFactory::new(uploads));
         let blob_store: Arc<dyn JobLogsBlobStore> =
             Arc::new(ObjectStorageLogBlobStore::new(backend));
-        let new_searcher = (self.new_searcher_factory)();
+        let new_searcher = match &self.new_searcher_factory {
+            Some(factory) => factory(),
+            None => Self::production_searcher(&deps.frontend, &deps.live_config),
+        };
 
         Ok(assemble_search_job_routines(
             deps.frontend.clone(),

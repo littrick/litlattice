@@ -196,6 +196,7 @@ impl RepoPagerRuntimeClients {
 /// [`crate::search_runtime`]; they are borrowed for the duration of one
 /// `run` and stay `None` when the corresponding endpoints are not configured
 /// (the tree then keeps the existing per-kind not-ported errors).
+#[derive(Clone)]
 pub struct TreeRuntimeClients {
     pub db: Arc<dyn crate::search_job::PrivateRepoLister + Send + Sync>,
     pub zoekt: Arc<dyn crate::search_job::JobStreamer + Send + Sync>,

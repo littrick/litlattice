@@ -2197,6 +2197,38 @@ pub fn new_text_search_job(
     ))
 }
 
+/// `Exhaustive.Job` (`exhaustive_job.go:127-133`): resolve the exhaustive
+/// `repoPagerJob` with a single pre-resolved `RepositoryRevisions`, which
+/// `setRepos` assigns to the unindexed leaf.
+///
+/// The exhaustive searcher already resolved the repo/rev, so this bypasses
+/// the pager and returns a directly executable leaf; it is the Rust
+/// equivalent of `repoPagerJob.child.Resolve(resolvedRepos{unindexed:
+/// []search.RepositoryRevisions{repoRevs}})`.
+pub fn exhaustive_job_node(
+    exhaustive: &crate::search_jobutil_exhaustive::Exhaustive,
+    repo_revs: RepositoryRevisions,
+) -> Result<JobNode, JobError> {
+    use crate::search_jobutil_exhaustive::ExhaustiveChild;
+
+    match &exhaustive.repo_pager_job.child {
+        ExhaustiveChild::SearcherText(job) => Ok(JobNode::leaf(NodeKind::SearcherText {
+            pattern_info: to_searcher_pattern_info(&job.pattern_info),
+            path_regexps: job.path_regexps.clone(),
+            indexed: job.indexed,
+            num_context_lines: job.num_context_lines,
+            use_full_deadline: job.use_full_deadline,
+            repos: vec![repo_revs],
+        })),
+        ExhaustiveChild::Commit(job) => Ok(JobNode::commit(
+            crate::search_jobutil_exhaustive::git_query_node_to_proto(&job.query),
+            vec![repo_revs],
+            job.diff,
+            job.limit,
+        )),
+    }
+}
+
 /// Convert the job-builder `search.TextPatternInfo` into the searcher job's
 /// view (`search_searcher_jobs::TextPatternInfo`).
 fn to_searcher_pattern_info(

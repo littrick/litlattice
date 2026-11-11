@@ -274,6 +274,107 @@ fn assemble_inner(
     })
 }
 
+/// Production collaborators for the exhaustive-search worker
+/// (`cmd/worker/internal/search/job.go:76-79`): the real `repos.Resolver`
+/// (M9.10a) plus the job-tree runtime.
+#[derive(Clone)]
+pub struct ExhaustiveRuntime {
+    /// `job.RuntimeClients`, reduced to the tree executor's bundle.
+    pub clients: TreeRuntimeClients,
+    /// `repos.Resolver`, shared with the search-job `RepoResolver` seam.
+    pub resolver: Arc<Resolver>,
+}
+
+/// Assemble the exhaustive-search execution runtime.
+///
+/// Unlike [`assemble`], this does not require zoekt endpoints: exhaustive
+/// search always runs with `index:no` (`searcher.go:37-39`), so the job tree
+/// only needs searcher/commit clients (optional, per configuration) and the
+/// resolver. The repo pager is still injected (M9.10a) even though the
+/// exhaustive runner assigns each leaf its single resolved repo directly.
+pub fn assemble_exhaustive(
+    pool: &PgPool,
+    connections: &ServiceConnections,
+    site: &SiteConfiguration,
+) -> ExhaustiveRuntime {
+    let max_repos = max_repos_from_site(site);
+    let db = Arc::new(PgPrivateRepoLister::new(pool.clone()));
+    let gitserver = Arc::new(GitClient::new(connections.git_servers.clone()));
+
+    let searcher = if connections.searchers.is_empty() {
+        None
+    } else {
+        let searcher_connection_cache = Arc::new(SearcherGrpcConnectionCache::new());
+        let searcher_client: Arc<dyn SearcherClient + Send + Sync> =
+            match grpc_client_from_endpoints(connections.searchers.clone()) {
+                Some(client) => {
+                    Arc::new(client.with_connection_cache(Arc::clone(&searcher_connection_cache)))
+                }
+                None => Arc::from(default_searcher_client(Vec::new())),
+            };
+        Some(Arc::new(SearcherRuntimeClients {
+            client: searcher_client,
+            limiter: Arc::new(NoopSearcherLimiter),
+            gitserver: Arc::new(GitSearcherGitserver {
+                client: Arc::clone(&gitserver),
+            }),
+            symbols: match default_symbols_client(connections.symbols.clone()) {
+                Some(client) => Arc::from(client),
+                None => Arc::new(NotPortedSymbols),
+            },
+            searcher_connection_cache,
+        }))
+    };
+
+    let commit = if connections.git_servers.is_empty() {
+        None
+    } else {
+        Some(Arc::new(CommitRuntimeClientsOwned {
+            db: Arc::new(PgCommitUserDB::new(pool.clone())),
+            gitserver: Arc::new(GitCommitGitserver {
+                client: Arc::clone(&gitserver),
+            }),
+        }))
+    };
+
+    // Exhaustive queries never touch indexed zoekt (`index:no`); the
+    // resolver's zoekt lister only backs `repohasfile` filters, which are not
+    // reachable here.
+    let resolver_zoekt = Arc::new(UnconfiguredResolverZoekt);
+    let resolver = Arc::new(Resolver {
+        db: Arc::new(PgRepoResolverDb {
+            pool: pool.clone(),
+            search_contexts: Arc::new(PgSearchContextsStore::new(pool.clone())),
+        }),
+        gitserver: Arc::new(GitResolverGitserver {
+            client: Arc::clone(&gitserver),
+        }),
+        zoekt: resolver_zoekt.clone(),
+        searcher: searcher.as_ref().map(|searcher| {
+            Arc::new(SearcherResolverSearcher {
+                client: Arc::clone(&searcher.client),
+            }) as Arc<dyn ResolverSearcher>
+        }),
+        max_repos,
+    });
+    let repo_pager = Arc::new(RepoPagerRuntimeClients::new(
+        Arc::new(ResolverRepoPageSource::new(Arc::clone(&resolver))),
+        resolver_zoekt,
+    ));
+
+    ExhaustiveRuntime {
+        clients: TreeRuntimeClients {
+            db,
+            zoekt: Arc::new(UnconfiguredJobStreamer),
+            max_repos,
+            searcher,
+            commit,
+            repo_pager: Some(repo_pager),
+        },
+        resolver,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // `repos.Resolver` production adapters (M9.10a)
 // ---------------------------------------------------------------------------
@@ -334,6 +435,16 @@ impl crate::search_repos::RepoResolverDb for PgRepoResolverDb {
                 .collect()
         })
         .map_err(|error| JobError(error.to_string()))
+    }
+
+    fn list_minimal_repos_by_ids(
+        &self,
+        ids: &[i32],
+    ) -> Result<Vec<db_repos::RepoListItem>, JobError> {
+        let pool = self.pool.clone();
+        let ids = ids.to_vec();
+        run_to_completion(async move { db_repos::minimal_repos_by_ids(&pool, &ids).await })
+            .map_err(|error| JobError(error.to_string()))
     }
 }
 
