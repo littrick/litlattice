@@ -11,9 +11,9 @@ sg-proto = { path = "../../net/sg-proto" }
 base64 = { workspace = true }
 ring = "0.17"
 serde = { workspace = true }
+serde_json = { workspace = true }
 tonic = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
-serde_json = { workspace = true }
 prost-types = { workspace = true }

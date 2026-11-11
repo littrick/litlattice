@@ -15,6 +15,7 @@ pub mod codeintel_autoindex_queue;
 pub mod codeintel_autoindexing_config;
 pub mod codeintel_autoindexing_dependencies;
 pub mod codeintel_autoindexing_enqueuer;
+pub mod codeintel_autoindexing_summary;
 pub mod codeintel_codegraph;
 pub mod codeintel_commitgraph;
 pub mod codeintel_dependencies;

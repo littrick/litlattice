@@ -7,8 +7,8 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
-sg-codeintel = { path = "../../domain/sg-codeintel" }
 async-trait = { workspace = true }
+sg-codeintel = { path = "../../domain/sg-codeintel" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sqlx = { workspace = true }

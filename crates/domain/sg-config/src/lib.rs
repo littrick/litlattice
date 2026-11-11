@@ -306,6 +306,15 @@ impl SiteConfiguration {
             .and_then(serde_json::Value::as_i64)
     }
 
+    /// `conf.CodeIntelAutoIndexingEnabled`: the `codeIntelAutoIndexing.enabled`
+    /// site setting, defaulting to false. A non-boolean value makes the
+    /// baseline reject the whole site configuration; this accessor treats it
+    /// as unset (same caveat as the policy accessor below, see
+    /// `06_worker.md` §34).
+    pub fn codeintel_autoindexing_enabled(&self) -> bool {
+        self.bool_field("codeIntelAutoIndexing.enabled")
+    }
+
     /// `conf.CodeIntelAutoIndexingPolicyRepositoryMatchLimit`: the
     /// `codeIntelAutoIndexing.policyRepositoryMatchLimit` site setting. The
     /// baseline field is a `*int` with a dotted JSON key; a missing value or
@@ -459,6 +468,38 @@ impl SiteConfiguration {
             .unwrap_or(false)
     }
 
+    /// `experimentalFeatures.perforceChangelistMapping == "enabled"`: the gate
+    /// the Perforce changelist mapper checks on every invocation
+    /// (`conf.Get().ExperimentalFeatures.PerforceChangelistMapping`). Any
+    /// value other than `enabled`, including unset/null, disables it.
+    pub fn perforce_changelist_mapping_enabled(&self) -> bool {
+        self.experimental_features()
+            .and_then(|features| features.get("perforceChangelistMapping"))
+            .and_then(serde_json::Value::as_str)
+            .map(|value| value == "enabled")
+            .unwrap_or(false)
+    }
+
+    /// `experimentalFeatures.commitGraphUpdates.defaultBranchOnly`: repository
+    /// name patterns for which the code-intel commit graph updater walks only
+    /// the default branch (`commitgraph.Config`'s `HeadTopoOnly` strategy).
+    /// Invalid patterns are skipped by the caller (`regexp.MatchString`
+    /// reports the error and the pattern does not match).
+    pub fn commit_graph_updates_default_branch_only(&self) -> Vec<String> {
+        self.experimental_features()
+            .and_then(|features| features.get("commitGraphUpdates"))
+            .and_then(|updates| updates.get("defaultBranchOnly"))
+            .and_then(serde_json::Value::as_array)
+            .map(|patterns| {
+                patterns
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// `experimentalFeatures.codeintelSyntacticIndexingEnabled`: the gate the
     /// syntactic indexing scheduler checks on every invocation
     /// (`conf.Get().ExperimentalFeatures.CodeintelSyntacticIndexingEnabled`).
@@ -555,18 +596,6 @@ impl SiteConfiguration {
                     .collect()
             })
             .unwrap_or_default()
-    }
-
-    /// `experimentalFeatures.perforceChangelistMapping == "enabled"`: the gate
-    /// the Perforce changelist mapper checks on every invocation
-    /// (`conf.Get().ExperimentalFeatures.PerforceChangelistMapping`). Any
-    /// value other than `enabled`, including unset/null, disables it.
-    pub fn perforce_changelist_mapping_enabled(&self) -> bool {
-        self.experimental_features()
-            .and_then(|features| features.get("perforceChangelistMapping"))
-            .and_then(serde_json::Value::as_str)
-            .map(|value| value == "enabled")
-            .unwrap_or(false)
     }
 
     /// `experimentalFeatures`.
