@@ -33,6 +33,7 @@ pub mod external_services;
 pub mod extsvc_config_file;
 pub mod feature_flag_mutations;
 pub mod feature_flag_store;
+pub mod git_commit_extra;
 pub mod git_graphql;
 pub mod goimportpath;
 pub mod graphql_api;

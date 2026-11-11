@@ -31,6 +31,10 @@ pub type TarByteStream = Pin<Box<dyn Stream<Item = io::Result<Bytes>> + Send>>;
 pub type SearchResponseStream =
     Pin<Box<dyn Stream<Item = Result<pb::SearchResponse, Error>> + Send>>;
 
+/// `gitserver.DevNullSHA`: the empty-tree object used by comparisons whose
+/// base is `/dev/null`.
+pub const DEV_NULL_SHA: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+
 /// Error returned by every gitserver operation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Error {
@@ -239,6 +243,33 @@ pub struct CommitsOptions {
     pub max_commits: u32,
     pub skip: u32,
     pub order: Option<CommitsOrder>,
+    /// `MessageQuery`: only commits whose message contains this substring.
+    pub message_query: String,
+    /// `Author`: only commits whose author matches this.
+    pub author: String,
+    /// `Path`: only commits that touch this path.
+    pub path: String,
+    /// `Follow`: follow the path beyond renames.
+    pub follow_path_renames: bool,
+}
+
+/// `gitserver.DiffOptions.RangeType`: `".."` (`ONLY_IN_HEAD`) or `"..."`
+/// (`INTERSECTION`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiffRangeType {
+    /// `BASE..HEAD`: only commits reachable from HEAD but not BASE.
+    OnlyInHead,
+    /// `BASE...HEAD`: the symmetric difference.
+    Intersection,
+}
+
+/// `gitserver.DiffOptions` for `RawDiff`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RawDiffOptions {
+    pub base: String,
+    pub head: String,
+    pub range_type: Option<DiffRangeType>,
+    pub paths: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -801,6 +832,34 @@ impl GitserverClient {
         repo: &str,
         options: &CommitsOptions,
     ) -> Result<Vec<Commit>, Error> {
+        Ok(self
+            .commit_log_commits(repo, options)
+            .await?
+            .into_iter()
+            .map(commit_from_proto)
+            .collect())
+    }
+
+    /// `gitserver.Client.Commits` with the full committer signature, as the
+    /// GraphQL commit connection resolvers consume it.
+    pub async fn commits_details(
+        &self,
+        repo: &str,
+        options: &CommitsOptions,
+    ) -> Result<Vec<CommitDetails>, Error> {
+        Ok(self
+            .commit_log_commits(repo, options)
+            .await?
+            .into_iter()
+            .map(commit_details_from_proto)
+            .collect())
+    }
+
+    async fn commit_log_commits(
+        &self,
+        repo: &str,
+        options: &CommitsOptions,
+    ) -> Result<Vec<pb::GitCommit>, Error> {
         // `CommitsOptions.ToProto`.
         if !options.ranges.is_empty() && options.all_refs {
             return Err(Error::Message(
@@ -834,10 +893,10 @@ impl GitserverClient {
                 follow_only_first_parent: false,
                 include_modified_files: false,
                 order: order as i32,
-                message_query: Vec::new(),
-                author_query: Vec::new(),
-                path: Vec::new(),
-                follow_path_renames: false,
+                message_query: options.message_query.as_bytes().to_vec(),
+                author_query: options.author.as_bytes().to_vec(),
+                path: options.path.as_bytes().to_vec(),
+                follow_path_renames: options.follow_path_renames,
             })
             .await
             .map_err(|status| translate_status(status, &context))?
@@ -851,11 +910,93 @@ impl GitserverClient {
         {
             for response in chunk.commits {
                 if let Some(commit) = response.commit {
-                    commits.push(commit_from_proto(commit));
+                    commits.push(commit);
                 }
             }
         }
         Ok(commits)
+    }
+
+    /// `gitserver.Client.MergeBase`.
+    pub async fn merge_base(&self, repo: &str, base: &str, head: &str) -> Result<String, Error> {
+        let mut client = self.client_for(repo).await?;
+        let context = format!("merge base {repo}");
+        let response = client
+            .merge_base(pb::MergeBaseRequest {
+                repo_name: repo.to_owned(),
+                base: base.as_bytes().to_vec(),
+                head: head.as_bytes().to_vec(),
+            })
+            .await
+            .map_err(|status| translate_status(status, &context))?
+            .into_inner();
+        Ok(response.merge_base_commit_sha)
+    }
+
+    /// `gitserver.Client.BehindAhead`: `(behind, ahead)`.
+    pub async fn behind_ahead(
+        &self,
+        repo: &str,
+        left: &str,
+        right: &str,
+    ) -> Result<(u32, u32), Error> {
+        let mut client = self.client_for(repo).await?;
+        let context = format!("behind ahead {repo}");
+        let response = client
+            .behind_ahead(pb::BehindAheadRequest {
+                repo_name: repo.to_owned(),
+                left: left.as_bytes().to_vec(),
+                right: right.as_bytes().to_vec(),
+            })
+            .await
+            .map_err(|status| translate_status(status, &context))?
+            .into_inner();
+        Ok((response.behind, response.ahead))
+    }
+
+    /// `gitserver.Client.Diff`: the raw multi-file unified diff for the range.
+    pub async fn raw_diff(
+        &self,
+        repo: &str,
+        options: &RawDiffOptions,
+    ) -> Result<Vec<u8>, Error> {
+        let mut client = self.client_for(repo).await?;
+        let context = format!("raw diff {repo}");
+        let comparison_type = match options.range_type {
+            Some(DiffRangeType::OnlyInHead) => {
+                pb::raw_diff_request::ComparisonType::OnlyInHead as i32
+            }
+            Some(DiffRangeType::Intersection) | None => {
+                pb::raw_diff_request::ComparisonType::Intersection as i32
+            }
+        };
+        let mut stream = client
+            .raw_diff(pb::RawDiffRequest {
+                repo_name: repo.to_owned(),
+                base_rev_spec: options.base.as_bytes().to_vec(),
+                head_rev_spec: options.head.as_bytes().to_vec(),
+                comparison_type,
+                paths: options
+                    .paths
+                    .iter()
+                    .map(|path| path.as_bytes().to_vec())
+                    .collect(),
+                inter_hunk_context: None,
+                context_lines: None,
+            })
+            .await
+            .map_err(|status| translate_status(status, &context))?
+            .into_inner();
+
+        let mut raw = Vec::new();
+        while let Some(chunk) = stream
+            .message()
+            .await
+            .map_err(|status| translate_status(status, &context))?
+        {
+            raw.extend_from_slice(&chunk.chunk);
+        }
+        Ok(raw)
     }
 
     /// `gitserver.Client.Search` (`internal/gitserver/client.go:588-635`): stream

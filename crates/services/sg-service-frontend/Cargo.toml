@@ -24,6 +24,7 @@ sg-redis = { path = "../../data/sg-redis" }
 sg-search-query = { path = "../../domain/sg-search-query" }
 sg-session = { path = "../../domain/sg-session" }
 sg-service-searcher = { path = "../sg-service-searcher" }
+sg-service-gitserver = { path = "../sg-service-gitserver" }
 sg-settings-schema = { path = "../../domain/sg-settings-schema" }
 sg-site-schema = { path = "../../domain/sg-site-schema" }
 sg-zoekt = { path = "../../domain/sg-zoekt" }
