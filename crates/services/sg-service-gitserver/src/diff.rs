@@ -39,6 +39,9 @@ pub struct Hunk {
     pub new_lines: i32,
     pub section: Vec<u8>,
     pub body: Vec<u8>,
+    /// `godiff.Hunk.OrigNoNewlineAt`: the body offset at which the original
+    /// file's missing trailing newline is reported (0 = no marker).
+    pub orig_no_newline_at: i32,
 }
 
 /// A parse failure; the search RPC surfaces it as an `UNKNOWN` status.
@@ -399,7 +402,8 @@ impl<'a> Parser<'a> {
             }
             if line == NO_NEWLINE_MESSAGE {
                 if last_line_from_orig {
-                    // Keep the newline: the next line is from the new file.
+                    // Keep the newline but record that the orig had none.
+                    current.orig_no_newline_at = current.body.len() as i32;
                 } else if !current.body.is_empty() {
                     current.body.pop();
                 }
@@ -488,6 +492,7 @@ fn parse_hunk_header(line: &[u8], line_number: usize, offset: usize) -> Result<H
         new_lines,
         section,
         body: Vec::new(),
+        orig_no_newline_at: 0,
     })
 }
 

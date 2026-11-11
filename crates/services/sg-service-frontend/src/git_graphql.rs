@@ -56,7 +56,7 @@ use crate::search_stream::convert::{go_url_path, Match, MinimalRepo};
 
 /// Maximum parent-commit recursion depth prefetched for a selection set.
 /// Cycles are only possible through the query's nested `parents` selections.
-const MAX_COMMIT_DEPTH: usize = 16;
+pub(crate) const MAX_COMMIT_DEPTH: usize = 16;
 
 /// `gitdomain.GitObjectType` as the GraphQL `GitObjectType` enum.
 pub fn git_object_type_name(object_type: GitObjectType) -> &'static str {
@@ -134,6 +134,12 @@ pub trait GitObjectSource: Send + Sync {
         repo_name: &str,
         revspec: &str,
     ) -> Result<sg_git::GitObject, GitSourceError>;
+
+    /// The extra commit reads (ancestors/diff/languages/...). Sources that do
+    /// not implement them leave the extra resolvers unavailable (M9.8iz).
+    fn commit_extra(&self) -> Option<&dyn crate::git_commit_extra::GitCommitExtraSource> {
+        None
+    }
 }
 
 /// Production [`GitObjectSource`] over the live site configuration's
@@ -151,7 +157,7 @@ impl GitserverGitObjects {
         }
     }
 
-    async fn client_for(
+    pub(crate) async fn client_for(
         &self,
         repo: &str,
     ) -> Result<(Arc<sg_git::GitserverClient>, String), GitSourceError> {
@@ -214,6 +220,10 @@ impl GitObjectSource for GitserverGitObjects {
             .await
             .map_err(GitSourceError::from)
     }
+
+    fn commit_extra(&self) -> Option<&dyn crate::git_commit_extra::GitCommitExtraSource> {
+        Some(self)
+    }
 }
 
 /// `Repository.Commit(rev:)`'s `ResolveRev` outcome.
@@ -248,6 +258,8 @@ pub struct GitPrefetch {
     pub revisions: HashMap<(i32, String), RevisionLookup>,
     pub objects: HashMap<(i32, String), ObjectLookup>,
     pub commits: HashMap<(i32, String), CommitLookup>,
+    /// M9.8iz: the remaining `GitCommit` fields.
+    pub extra: crate::git_commit_extra::CommitExtraPrefetch,
 }
 
 impl GitPrefetch {
@@ -375,7 +387,7 @@ fn repo_of(data: &crate::graphql_resolvers::RepositoryData) -> MinimalRepo {
     }
 }
 
-async fn load_revision(
+pub(crate) async fn load_revision(
     source: &dyn GitObjectSource,
     prefetch: &mut GitPrefetch,
     repo: &MinimalRepo,
@@ -452,6 +464,12 @@ async fn prefetch_parent(
     selections: &[RootField],
     depth: usize,
 ) {
+    // The extra commit fields only need the OID, so prefetch them even when no
+    // core data field is selected.
+    crate::git_commit_extra::prefetch_commit_extra(
+        source, prefetch, repo, oid, selections, depth,
+    )
+    .await;
     if depth > MAX_COMMIT_DEPTH || !commit_needs_data(selections) {
         return;
     }
@@ -479,7 +497,7 @@ async fn prefetch_parent(
 
 /// Prefetch a commit reached through `Repository.Commit` (i.e. after a
 /// `ResolveRev`), then its selected parents.
-async fn prefetch_commit_data(
+pub(crate) async fn prefetch_commit_data(
     source: &dyn GitObjectSource,
     prefetch: &mut GitPrefetch,
     repo: &MinimalRepo,
@@ -487,6 +505,12 @@ async fn prefetch_commit_data(
     selections: &[RootField],
     depth: usize,
 ) {
+    // The extra commit fields only need the OID, so prefetch them even when no
+    // core data field is selected.
+    crate::git_commit_extra::prefetch_commit_extra(
+        source, prefetch, repo, oid, selections, depth,
+    )
+    .await;
     if depth > MAX_COMMIT_DEPTH || !commit_needs_data(selections) {
         return;
     }
@@ -1119,7 +1143,7 @@ impl ObjectValue for GitCommitResolverObject {
                 items: Vec::new(),
                 element_type: Some("ExternalLink"),
             })),
-            _ => Ok(None),
+            _ => crate::git_commit_extra::commit_extra_field(self, field, _arguments),
         }
     }
 }
