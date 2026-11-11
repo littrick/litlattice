@@ -1012,6 +1012,12 @@ pub struct NestedPrefetch {
     /// `CodySubscription` inputs for `ExternalAccount` nodes (M9.8ka).
     pub external_account_cody:
         Option<Arc<crate::external_accounts_graphql::CodySubscriptionConfig>>,
+    /// `Site.externalAccounts` connections keyed by their argument set
+    /// (M9.9b).
+    pub site_external_accounts: HashMap<
+        crate::external_accounts_graphql::SiteExternalAccountsArgs,
+        crate::external_accounts_graphql::SiteExternalAccountsLookup,
+    >,
 }
 
 /// The database seam for `User.organizations` (`db.Orgs().GetByUserID` plus
@@ -2162,6 +2168,8 @@ pub async fn prefetch_user_external_accounts(
                 key.clone(),
                 user_id,
                 first,
+                actor,
+                viewer_site_admin,
             )
             .await;
             results.insert((user_id, first), lookup);
@@ -3943,10 +3951,33 @@ impl ObjectValue for SiteObject {
     fn field(
         &self,
         field: &str,
-        _arguments: &Arguments,
+        arguments: &Arguments,
         _actor: Actor,
     ) -> Result<Option<FieldValue>, ExecError> {
         match field {
+            // `siteResolver.ExternalAccounts` (`external_accounts.go:21-53`):
+            // the site-admin gate and connection are prefetched (M9.9b).
+            "externalAccounts" => {
+                let args =
+                    crate::external_accounts_graphql::SiteExternalAccountsArgs::from_arguments(
+                        arguments,
+                    );
+                Ok(match self.nested.site_external_accounts.get(&args) {
+                    Some(crate::external_accounts_graphql::SiteExternalAccountsLookup::Found(
+                        data,
+                    )) => Some(FieldValue::Object(Arc::new(
+                        crate::external_accounts_graphql::SiteExternalAccountsConnectionObject::from_data(
+                            data.clone(),
+                            self.viewer_site_admin,
+                            self.nested.clone(),
+                        ),
+                    ))),
+                    Some(crate::external_accounts_graphql::SiteExternalAccountsLookup::Error(
+                        message,
+                    )) => return Err(ExecError::new(message.clone())),
+                    None => None,
+                })
+            }
             "id" => Ok(Some(FieldValue::Json(Json::Str(Self::relay_id())))),
             "settingsURL" => Ok(Some(FieldValue::Json(Json::Str(
                 "/site-admin/global-settings".to_owned(),

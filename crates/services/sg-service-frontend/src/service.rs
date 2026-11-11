@@ -463,6 +463,22 @@ impl Service for FrontendService {
                     crate::service_connections::sourcegraph_dotcom_mode(&|key: &str| {
                         std::env::var(key).ok()
                     }),
+                )
+                // M9.9b: `AddExternalAccount`/`DeleteExternalAccount` side
+                // effects. Gerrit's network verification stays an explicit
+                // seam (overview §4).
+                .with_external_account_services(
+                    Some(Arc::new(
+                        crate::external_accounts_graphql::PgPermsSyncScheduler::new(
+                            session_pool.clone(),
+                        ),
+                    )),
+                    Some(Arc::new(
+                        crate::external_accounts_graphql::PgExternalAccountFeatureFlags::new(
+                            session_pool.clone(),
+                        ),
+                    )),
+                    None,
                 );
         // M9.8jf/M9.8jj: `Query.slowRequests` reads the FIFO list whose
         // capacity is `observability.captureSlowGraphQLRequestsLimit`
