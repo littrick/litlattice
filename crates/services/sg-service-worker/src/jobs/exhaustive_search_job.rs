@@ -18,17 +18,15 @@
 //! client and job pipeline) is not ported, so the handlers depend on the
 //! injected [`NewSearcher`] / [`MatchWriterFactory`] traits — the same seam the
 //! baseline exposes to its tests (`newSearchJobRoutines` takes a
-//! `newSearcherFactory`). The job is therefore not registered in
-//! `all_jobs()` yet: without a production factory enabling it would only fail
-//! at startup.
+//! `newSearcherFactory`). [`SearchJob`] is registered under
+//! `exhaustive-search-job` in `all_jobs()` and assembles the baseline's seven
+//! routines. Its production searcher factory is
+//! [`FromSearchClient::not_ported`], so handlers dequeue records but fail at
+//! `new_search` until a real `SearchClient` is wired.
 //!
 //! The janitor (`search_jobs_janitor`) lives in
 //! [`crate::jobs::exhaustive_search_janitor`] and is assembled by
-//! [`new_search_job_routines`] too, with the blobstore injected.
-//!
-//! Not ported yet: the concrete object storage behind
-//! `JobLogsBlobStore`, `service.NewSearcherFake`, and the
-//! `exhaustive-search-job` registration.
+//! [`assemble_search_job_routines`] too, with the blobstore injected.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -49,10 +47,20 @@ use crate::framework::dbworker::{
     WorkerRoutine,
 };
 use crate::framework::BackgroundRoutine;
+use crate::jobs::exhaustive_search_janitor::{
+    new_search_jobs_janitor_routine, storage_config, JobLogsBlobStore, PgJanitorService,
+    SearchJobsObjectStorageConfig,
+};
+use crate::jobs::exhaustive_search_searcher::FromSearchClient;
+use crate::jobs::exhaustive_search_service::{
+    LazyObjectStorage, ObjectStorageLogBlobStore, ObjectStorageMatchWriterFactory,
+    ObjectStorageUploadStore, UploadStore,
+};
 use crate::jobs::exhaustive_search_workers::{
     new_exhaustive_search_job_worker_store, new_repo_search_job_worker_store,
     new_rev_search_job_worker_store,
 };
+use crate::jobs::{Job, JobConfig, JobDeps};
 
 /// `exhaustive_search_worker`.
 pub const SEARCH_WORKER_NAME: &str = "exhaustive_search_worker";
@@ -419,16 +427,26 @@ pub fn new_exhaustive_search_repo_revision_worker_resetter(
     )
 }
 
+/// The result of `searchJob.newSearchJobRoutines`: the seven background
+/// routines plus the worker/resetter options the group was assembled with.
+/// The options are exposed for the differential harness; the routines are all
+/// that `Job::routines` returns.
+pub struct SearchJobRoutines {
+    pub routines: Vec<BackgroundRoutine>,
+    pub worker_options: Vec<WorkerOptions>,
+    pub resetter_options: Vec<ResetterOptions>,
+}
+
 /// `searchJob.newSearchJobRoutines` after the database, upload store and
 /// searcher factory have been resolved: the seven routines (three workers,
-/// three resetters, the janitor).
-pub fn new_search_job_routines(
+/// three resetters, the janitor) in the baseline's order.
+pub fn assemble_search_job_routines(
     pool: PgPool,
     new_searcher: Arc<dyn NewSearcher>,
     writer_factory: Arc<dyn MatchWriterFactory>,
-    blob_store: Arc<dyn crate::jobs::exhaustive_search_janitor::JobLogsBlobStore>,
+    blob_store: Arc<dyn JobLogsBlobStore>,
     config: &SearchJobConfig,
-) -> Vec<BackgroundRoutine> {
+) -> SearchJobRoutines {
     let search_worker_store = Arc::new(new_exhaustive_search_job_worker_store(pool.clone()));
     let repo_worker_store = Arc::new(new_repo_search_job_worker_store(pool.clone()));
     let rev_worker_store = Arc::new(new_rev_search_job_worker_store(pool.clone()));
@@ -469,15 +487,32 @@ pub fn new_search_job_routines(
         Arc::clone(&rev_worker_store),
     ));
 
+    let worker_options = vec![
+        search_worker.options().clone(),
+        repo_worker.options().clone(),
+        rev_worker.options().clone(),
+    ];
+    let resetter_options = vec![
+        ResetterOptions {
+            name: SEARCH_RESETTER_NAME.to_owned(),
+            interval: RESETTER_INTERVAL,
+        },
+        ResetterOptions {
+            name: REPO_RESETTER_NAME.to_owned(),
+            interval: RESETTER_INTERVAL,
+        },
+        ResetterOptions {
+            name: REV_RESETTER_NAME.to_owned(),
+            interval: RESETTER_INTERVAL,
+        },
+    ];
+
     let janitor_pool = pool.clone();
     let janitor_service: Arc<dyn crate::jobs::exhaustive_search_janitor::JanitorService> =
-        Arc::new(crate::jobs::exhaustive_search_janitor::PgJanitorService::new(pool, blob_store));
-    let janitor = crate::jobs::exhaustive_search_janitor::new_search_jobs_janitor_routine(
-        janitor_pool,
-        janitor_service,
-    );
+        Arc::new(PgJanitorService::new(pool, blob_store));
+    let janitor = new_search_jobs_janitor_routine(janitor_pool, janitor_service);
 
-    vec![
+    let routines = vec![
         BackgroundRoutine::DbBacked(search_worker as Arc<dyn DbBackedRoutine>),
         BackgroundRoutine::DbBacked(repo_worker as Arc<dyn DbBackedRoutine>),
         BackgroundRoutine::DbBacked(rev_worker as Arc<dyn DbBackedRoutine>),
@@ -485,7 +520,115 @@ pub fn new_search_job_routines(
         BackgroundRoutine::DbBacked(repo_resetter as Arc<dyn DbBackedRoutine>),
         BackgroundRoutine::DbBacked(rev_resetter as Arc<dyn DbBackedRoutine>),
         janitor,
-    ]
+    ];
+
+    SearchJobRoutines {
+        routines,
+        worker_options,
+        resetter_options,
+    }
+}
+
+/// The routines half of [`assemble_search_job_routines`].
+pub fn new_search_job_routines(
+    pool: PgPool,
+    new_searcher: Arc<dyn NewSearcher>,
+    writer_factory: Arc<dyn MatchWriterFactory>,
+    blob_store: Arc<dyn JobLogsBlobStore>,
+    config: &SearchJobConfig,
+) -> Vec<BackgroundRoutine> {
+    assemble_search_job_routines(pool, new_searcher, writer_factory, blob_store, config).routines
+}
+
+/// The factory the baseline's `searchJob.Routines` receives
+/// (`newSearcherFactory`): one searcher for the whole group.
+pub type NewSearcherFactory = Arc<dyn Fn() -> Arc<dyn NewSearcher> + Send + Sync>;
+
+/// `searchJob` (`cmd/worker/internal/search/job.go`): the
+/// `exhaustive-search-job` group.
+///
+/// `routines` mirrors `searchJob.Routines`: disabled when
+/// [`is_enabled`] is false, otherwise it builds the same lazy object storage
+/// as the M9.8id janitor and assembles the seven routines. The production
+/// searcher factory is [`FromSearchClient::not_ported`] because the real
+/// `SearchClient::plan`/job execution is not ported (M9.8hv); tests and the
+/// differential harness inject a fake through [`WithSearcherFactory`].
+pub struct SearchJob {
+    config: Arc<SearchJobsObjectStorageConfig>,
+    new_searcher_factory: NewSearcherFactory,
+}
+
+impl SearchJob {
+    pub fn new() -> Self {
+        Self::with_searcher_factory(Arc::new(|| Arc::new(FromSearchClient::not_ported())))
+    }
+
+    /// The baseline's `newSearcherFactory` seam. Production uses
+    /// [`Self::new`]; tests inject a fake searcher.
+    pub fn with_searcher_factory(factory: NewSearcherFactory) -> Self {
+        Self {
+            config: Arc::new(SearchJobsObjectStorageConfig::default()),
+            new_searcher_factory: factory,
+        }
+    }
+
+    /// The search-jobs object storage config shared with `loadConfigs`.
+    pub fn config(&self) -> Arc<SearchJobsObjectStorageConfig> {
+        Arc::clone(&self.config)
+    }
+
+    /// `searchJob.Routines`: the assembled routines or an empty list when the
+    /// feature is disabled.
+    pub async fn assemble(&self, deps: &JobDeps) -> Result<SearchJobRoutines, String> {
+        if !is_enabled(&deps.live_config) {
+            return Ok(SearchJobRoutines {
+                routines: Vec::new(),
+                worker_options: Vec::new(),
+                resetter_options: Vec::new(),
+            });
+        }
+
+        let store = sg_objectstorage::ObjectStore::new(storage_config(&self.config)?)
+            .await
+            .map_err(|err| err.to_string())?;
+        let backend = Arc::new(LazyObjectStorage::new(Arc::new(store)));
+        let uploads: Arc<dyn UploadStore> =
+            Arc::new(ObjectStorageUploadStore::new(Arc::clone(&backend)));
+        let writer_factory: Arc<dyn MatchWriterFactory> =
+            Arc::new(ObjectStorageMatchWriterFactory::new(uploads));
+        let blob_store: Arc<dyn JobLogsBlobStore> =
+            Arc::new(ObjectStorageLogBlobStore::new(backend));
+        let new_searcher = (self.new_searcher_factory)();
+
+        Ok(assemble_search_job_routines(
+            deps.frontend.clone(),
+            new_searcher,
+            writer_factory,
+            blob_store,
+            &SearchJobConfig::default(),
+        ))
+    }
+}
+
+impl Default for SearchJob {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl Job for SearchJob {
+    fn configs(&self) -> Vec<Arc<dyn JobConfig>> {
+        vec![Arc::clone(&self.config) as Arc<dyn JobConfig>]
+    }
+
+    async fn routines(
+        &self,
+        deps: &JobDeps,
+        _setup_ctx: CancellationToken,
+    ) -> Result<Vec<BackgroundRoutine>, String> {
+        Ok(self.assemble(deps).await?.routines)
+    }
 }
 
 #[cfg(test)]
@@ -579,5 +722,60 @@ mod tests {
         fn new_writer(&self, _key: &str) -> Result<Box<dyn MatchWriter>, String> {
             Err("unused".into())
         }
+    }
+
+    struct UnusedBlobs;
+
+    #[async_trait]
+    impl JobLogsBlobStore for UnusedBlobs {
+        async fn upload(&self, _key: &str, _contents: Vec<u8>) -> Result<i64, String> {
+            Err("unused".into())
+        }
+
+        async fn delete(&self, _key: &str) -> Result<(), String> {
+            Err("unused".into())
+        }
+    }
+
+    #[tokio::test]
+    async fn assembles_the_seven_baseline_routines() {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://unused@localhost/unused")
+            .expect("lazy pool");
+        let assembled = assemble_search_job_routines(
+            pool,
+            Arc::new(UnusedSearcher),
+            Arc::new(UnusedWriters),
+            Arc::new(UnusedBlobs),
+            &SearchJobConfig::default(),
+        );
+
+        let names: Vec<&str> = assembled.routines.iter().map(|r| r.name()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "exhaustive_search_worker",
+                "exhaustive_search_repo_worker",
+                "exhaustive_search_repo_revision_worker",
+                "exhaustive_search_worker_resetter",
+                "exhaustive_search_repo_worker_resetter",
+                "exhaustive_search_repo_revision_worker_resetter",
+                "search_jobs_janitor",
+            ]
+        );
+        assert_eq!(assembled.worker_options.len(), 3);
+        assert_eq!(assembled.resetter_options.len(), 3);
+        for options in &assembled.worker_options {
+            assert_eq!(options.num_handlers, NUM_HANDLERS);
+            assert_eq!(options.heartbeat_interval, HEARTBEAT_INTERVAL);
+            assert_eq!(options.interval, DEFAULT_WORKER_INTERVAL);
+        }
+        for options in &assembled.resetter_options {
+            assert_eq!(options.interval, RESETTER_INTERVAL);
+        }
+        assert_eq!(
+            assembled.routines.last().map(|r| r.interval()),
+            Some(crate::jobs::exhaustive_search_janitor::JANITOR_INTERVAL)
+        );
     }
 }

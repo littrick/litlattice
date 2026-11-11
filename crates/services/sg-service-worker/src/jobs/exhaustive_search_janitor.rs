@@ -36,16 +36,15 @@ use async_trait::async_trait;
 use sg_core::{ConfigError, EnvReader};
 use sg_db::exhaustive_search::{self as ex, Actor, GetJobLogsOptions, JobState, SearchJobLog};
 use sg_db::OffsetDateTime;
-use sg_objectstorage::{ObjectStore, S3Config, StorageConfig};
+use sg_objectstorage::{S3Config, StorageConfig};
 use sqlx::{PgPool, Postgres, Transaction};
 use tokio_util::sync::CancellationToken;
 
 use crate::framework::periodic::{Handler, HandlerError, PeriodicRoutine};
 use crate::framework::BackgroundRoutine;
 use crate::jobs::batches::parse_strconv_bool;
-use crate::jobs::exhaustive_search_job::{append_errors, is_enabled};
-use crate::jobs::exhaustive_search_service::{LazyObjectStorage, ObjectStorageLogBlobStore};
-use crate::jobs::{Job, JobConfig, JobDeps};
+use crate::jobs::exhaustive_search_job::append_errors;
+use crate::jobs::JobConfig;
 
 /// `newJanitorJob`'s `goroutine.WithName`.
 pub const JANITOR_NAME: &str = "search_jobs_janitor";
@@ -428,15 +427,8 @@ pub fn new_search_jobs_janitor_routine(
 }
 
 // ---------------------------------------------------------------------------
-// Worker job registration (M9.8id)
+// `exhaustive-search-job` config
 // ---------------------------------------------------------------------------
-
-/// The standalone worker job name. The baseline has no such job: its janitor
-/// is the seventh routine of the `exhaustive-search-job` group
-/// (`cmd/worker/internal/search/job.go:130`). Because this slice must register
-/// the janitor while `exhaustive-search-job` stays unported (it needs the
-/// production searcher from M9.8hx), it is exposed as its own job.
-pub const JANITOR_JOB_NAME: &str = "exhaustive-search-janitor";
 
 /// `search.ObjectStorageConfig` (`internal/search/object_storage.go:16-60`):
 /// the `SEARCH_JOBS_UPLOAD_*` variables read by the `exhaustive-search-job`
@@ -578,7 +570,9 @@ impl JobConfig for SearchJobsObjectStorageConfig {
 
 /// `search.NewObjectStorage`'s storage config. GCS is not implemented by the
 /// Rust worker yet; the baseline would accept it.
-fn storage_config(config: &SearchJobsObjectStorageConfig) -> Result<StorageConfig, String> {
+pub(crate) fn storage_config(
+    config: &SearchJobsObjectStorageConfig,
+) -> Result<StorageConfig, String> {
     let config = config
         .storage()
         .ok_or_else(|| "search jobs object storage config was not loaded".to_owned())?;
@@ -586,60 +580,6 @@ fn storage_config(config: &SearchJobsObjectStorageConfig) -> Result<StorageConfi
         "s3" | "blobstore" => Ok(config),
         "gcs" => Err("not ported: GCS object storage".to_owned()),
         other => Err(format!("unsupported object storage backend {other:?}")),
-    }
-}
-
-/// The `exhaustive-search-job` group's janitor as a standalone worker job.
-///
-/// `Routines` mirrors `searchJob.Routines`
-/// (`cmd/worker/internal/search/job.go:66-88`): disabled when
-/// `exhaustive.IsEnabled` is false, otherwise one periodic janitor backed by
-/// the search-jobs object storage.
-pub struct ExhaustiveSearchJanitorJob {
-    config: Arc<SearchJobsObjectStorageConfig>,
-}
-
-impl ExhaustiveSearchJanitorJob {
-    pub fn new() -> Self {
-        Self {
-            config: Arc::new(SearchJobsObjectStorageConfig::default()),
-        }
-    }
-}
-
-impl Default for ExhaustiveSearchJanitorJob {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-#[async_trait]
-impl Job for ExhaustiveSearchJanitorJob {
-    fn configs(&self) -> Vec<Arc<dyn JobConfig>> {
-        vec![Arc::clone(&self.config) as Arc<dyn JobConfig>]
-    }
-
-    async fn routines(
-        &self,
-        deps: &JobDeps,
-        _setup_ctx: CancellationToken,
-    ) -> Result<Vec<BackgroundRoutine>, String> {
-        if !is_enabled(&deps.live_config) {
-            return Ok(Vec::new());
-        }
-
-        let store = ObjectStore::new(storage_config(&self.config)?)
-            .await
-            .map_err(|err| err.to_string())?;
-        let backend = Arc::new(LazyObjectStorage::new(Arc::new(store)));
-        let blobs = Arc::new(ObjectStorageLogBlobStore::new(backend));
-        let service: Arc<dyn JanitorService> =
-            Arc::new(PgJanitorService::new(deps.frontend.clone(), blobs));
-
-        Ok(vec![new_search_jobs_janitor_routine(
-            deps.frontend.clone(),
-            service,
-        )])
     }
 }
 
@@ -730,16 +670,19 @@ mod tests {
     }
 
     #[test]
-    fn janitor_job_is_registered_in_all_jobs() {
+    fn exhaustive_search_job_group_is_registered() {
         let jobs = crate::jobs::all_jobs();
-        assert!(jobs.iter().any(|(name, _)| *name == JANITOR_JOB_NAME));
-        // The baseline group stays unported until the production searcher is
-        // wired (M9.8hx).
         let group = jobs
             .iter()
             .find(|(name, _)| *name == "exhaustive-search-job")
             .expect("registry keeps the baseline name");
-        assert!(group.1.configs().is_empty());
+        // The group owns the search-jobs object storage config (and, once
+        // assembled, the janitor routine); the standalone janitor job from
+        // M9.8id is no longer registered separately.
+        assert_eq!(group.1.configs().len(), 1);
+        assert!(!jobs
+            .iter()
+            .any(|(name, _)| *name == "exhaustive-search-janitor"));
     }
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());

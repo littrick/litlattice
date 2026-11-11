@@ -216,10 +216,15 @@ impl Job for UnportedJob {
     }
 }
 
-/// The baseline's `builtins` map, in the sorted order `jobNames` produces,
-/// plus the standalone exhaustive-search janitor.
+/// The baseline's `builtins` map, in the sorted order `jobNames` produces.
+///
+/// `exhaustive-search-job` owns all seven of its routines (three workers,
+/// three resetters and the janitor). The M9.8id standalone
+/// `exhaustive-search-janitor` job was folded back into the group by M9.8ik:
+/// keeping both would run the janitor twice under the default `all`
+/// allowlist.
 pub fn all_jobs() -> Vec<(&'static str, Arc<dyn Job>)> {
-    let mut jobs: Vec<(&'static str, Arc<dyn Job>)> = registry::JOB_NAMES
+    let jobs: Vec<(&'static str, Arc<dyn Job>)> = registry::JOB_NAMES
         .iter()
         .map(|&name| {
             let job: Arc<dyn Job> = match name {
@@ -235,6 +240,9 @@ pub fn all_jobs() -> Vec<(&'static str, Arc<dyn Job>)> {
                 "cody-gateway-usage-check" => Arc::new(codygateway::CodyGatewayUsageCheck),
                 "cody-llm-token-counter" => Arc::new(completions::CodyLlmTokenCounter),
                 "event-logs-janitor" => Arc::new(eventlogs::EventLogsJanitor),
+                "exhaustive-search-job" => {
+                    Arc::new(exhaustive_search_job::SearchJob::new())
+                }
                 "executors-janitor" => Arc::new(executors::ExecutorsJanitor::new()),
                 "executors-metricsserver" => {
                     Arc::new(executors_metrics::ExecutorsMetricsServer::new())
@@ -334,16 +342,6 @@ pub fn all_jobs() -> Vec<(&'static str, Arc<dyn Job>)> {
             (name, job)
         })
         .collect();
-
-    // M9.8id: the baseline registers the janitor as the seventh routine of
-    // the `exhaustive-search-job` group. That group is still unported (it
-    // needs the production searcher from M9.8hx), so the janitor is exposed
-    // as its own job. It is deliberately not added to `registry::JOB_NAMES`:
-    // that table mirrors the baseline's 56-name `builtins` map byte for byte.
-    jobs.push((
-        exhaustive_search_janitor::JANITOR_JOB_NAME,
-        Arc::new(exhaustive_search_janitor::ExhaustiveSearchJanitorJob::new()),
-    ));
 
     jobs
 }
