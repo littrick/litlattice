@@ -9,6 +9,8 @@
 //! not ported yet; `docs/overviews/m9_8dx_frontend_skeleton_overview.md`
 //! records what each missing layer is supposed to do.
 
+pub mod actor_chain;
+pub mod actor_chain_adapters;
 pub mod actor_middleware;
 pub mod app_handlers;
 pub mod app_handlers_more;

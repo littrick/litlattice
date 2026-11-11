@@ -179,6 +179,9 @@ impl Service for FrontendService {
         let session_pool = pool.clone();
         let settings_pool = pool.clone();
         let sign_out_pool = pool.clone();
+        // The external actor chain's Postgres adapters (tokens, users,
+        // site-admin flags, security events).
+        let chain_pool = pool.clone();
         // `app.NewHandler`'s `/-/sign-out` reads `conf.Get()` per request; the
         // wiring is rebuilt for each configuration generation in
         // `LiveMiddleware`, so the factory closes over the pool only.
@@ -549,6 +552,26 @@ impl Service for FrontendService {
             background.spawn(async move { debug::serve(&addr, ready, shutdown).await });
         }
 
+        // `newExternalHTTPHandler`'s `AccessTokenAuth → Cookie → Auth →
+        // AnonymousUID → featureflag → PostAuth` chain's production seams.
+        let chain_deps = Arc::new(crate::actor_chain::ChainDeps::new(
+            Arc::new(crate::actor_chain_adapters::PgAccessTokenAuth::new(
+                chain_pool.clone(),
+                Arc::clone(wiring.live()),
+            )),
+            Arc::new(crate::session_auth::RedisSessionStore::from_env()),
+            Arc::new(crate::session_auth::PgSessionUsers::new(chain_pool.clone())),
+            std::env::var("SRC_SESSION_COOKIE_KEY")
+                .unwrap_or_default()
+                .into_bytes(),
+            Arc::new(crate::actor_chain_adapters::LiveLicenseReader::new(
+                Arc::clone(wiring.live()),
+            )),
+            Arc::new(crate::actor_chain_adapters::PgSiteAdminChecker::new(
+                chain_pool,
+            )),
+        ));
+
         sg_metrics::register_service_metadata(sg_metrics::VERSION);
         ctx.ready.mark_ready();
         ready.store(true, Ordering::SeqCst);
@@ -564,6 +587,7 @@ impl Service for FrontendService {
                 blame_deps,
                 search_deps,
                 graphql_deps,
+                chain_deps,
             ),
             ctx.shutdown.clone(),
         )

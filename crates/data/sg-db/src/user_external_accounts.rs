@@ -24,6 +24,25 @@ pub struct UserExternalAccount {
     pub encryption_key_id: String,
 }
 
+/// `userExternalAccountsStore.Count(ctx, {UserID, ServiceType})`
+/// (`internal/database/external_accounts.go:486`): the SOAP account count the
+/// access-token middleware uses.
+pub async fn count_for_user_service(
+    pool: &PgPool,
+    user_id: i32,
+    service_type: &str,
+) -> Result<i64, sqlx::Error> {
+    let row = sqlx::query(
+        "SELECT COUNT(*) FROM user_external_accounts \
+         WHERE deleted_at IS NULL AND user_id = $1 AND service_type = $2",
+    )
+    .bind(user_id)
+    .bind(service_type)
+    .fetch_one(pool)
+    .await?;
+    Ok(row.get("count"))
+}
+
 /// `userExternalAccountsStore.List(ctx, {UserID})`.
 pub async fn list_for_user(
     pool: &PgPool,
