@@ -320,6 +320,19 @@ impl<C: Clock> GrpcConnectionCache<C> {
         self.created.load(Ordering::SeqCst)
     }
 
+    /// Drop a cached entry, reporting whether one existed.
+    ///
+    /// The baseline never evicts explicitly (grpc-go's `ClientConn` transparently
+    /// reconnects after a transport failure). A lazily-built tonic [`Channel`]
+    /// does not: it belongs to the Tokio runtime that created it, so once a
+    /// failed RPC tears the connection down — or the creating runtime is gone —
+    /// the cached channel can never serve another call. Callers therefore evict
+    /// on failure so the next attempt re-dials, which is observably what the
+    /// baseline's reconnecting `ClientConn` does.
+    pub fn remove(&self, endpoint: &str) -> bool {
+        lock(&self.connections).remove(endpoint).is_some()
+    }
+
     /// Number of cached addresses (observation aid).
     pub fn len(&self) -> usize {
         lock(&self.connections).len()
@@ -349,11 +362,20 @@ fn build_channel(endpoint: &str) -> Result<Channel, SearcherError> {
 /// tests can inject a counting source without changing the transport wiring.
 pub trait GrpcChannelSource: Send + Sync {
     fn channel(&self, endpoint: &str) -> Result<Channel, SearcherError>;
+
+    /// Forget the cached connection for `endpoint` after a failed RPC, so the
+    /// next attempt starts from a fresh dial (see
+    /// [`GrpcConnectionCache::remove`]). Default: nothing to do.
+    fn invalidate(&self, _endpoint: &str) {}
 }
 
 impl<C: Clock> GrpcChannelSource for GrpcConnectionCache<C> {
     fn channel(&self, endpoint: &str) -> Result<Channel, SearcherError> {
         GrpcConnectionCache::channel(self, endpoint)
+    }
+
+    fn invalidate(&self, endpoint: &str) {
+        GrpcConnectionCache::remove(self, endpoint);
     }
 }
 

@@ -232,6 +232,12 @@ pub trait SearcherConnector: Send + Sync {
         &self,
         endpoint: &str,
     ) -> Result<pb::searcher_service_client::SearcherServiceClient<Channel>, SearcherError>;
+
+    /// Drop any pooled connection for `endpoint` after a failed RPC. The
+    /// baseline's shared `grpc.ClientConn` reconnects transparently; a cached
+    /// tonic channel cannot, so it is evicted and the retry re-dials. Default:
+    /// the connector owns no pool.
+    fn invalidate(&self, _endpoint: &str) {}
 }
 
 /// Default connector: `Channel::from_shared(...).connect_lazy()`.
@@ -294,6 +300,10 @@ impl SearcherConnector for CachedSearcherConnector {
         Ok(pb::searcher_service_client::SearcherServiceClient::new(
             channel,
         ))
+    }
+
+    fn invalidate(&self, endpoint: &str) {
+        self.source.invalidate(&connection_key(endpoint));
     }
 }
 
@@ -462,11 +472,19 @@ impl GrpcSearcherClient {
             if attempt > 0 {
                 tokio::time::sleep(self.retry.backoff(attempt)).await;
             }
+            let outcome = self.search_endpoint(endpoint, request).await;
+            if outcome.error.is_some() {
+                // The baseline's shared `grpc.ClientConn` reconnects after a
+                // failed RPC; a pooled tonic channel cannot, so drop it before
+                // the retry (inner loop below, or the caller's outer retry on
+                // `SearcherErrorKind::Timeout`). The retry re-dials.
+                self.connector.invalidate(endpoint);
+            }
             let AttemptOutcome {
                 matches,
                 limit_hit,
                 error,
-            } = self.search_endpoint(endpoint, request).await;
+            } = outcome;
             match error {
                 None => return (matches, Ok(limit_hit.unwrap_or(false))),
                 Some(AttemptFailure::Status {
