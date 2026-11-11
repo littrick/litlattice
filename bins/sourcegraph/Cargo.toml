@@ -11,3 +11,12 @@ name = "sourcegraph"
 path = "src/main.rs"
 
 [dependencies]
+sg-core = { path = "../../crates/base/sg-core" }
+sg-entry = { path = "../../crates/base/sg-entry" }
+sg-log = { path = "../../crates/base/sg-log" }
+sg-service-frontend = { path = "../../crates/services/sg-service-frontend" }
+sg-service-gitserver = { path = "../../crates/services/sg-service-gitserver" }
+sg-service-repo-updater = { path = "../../crates/services/sg-service-repo-updater" }
+sg-service-searcher = { path = "../../crates/services/sg-service-searcher" }
+sg-service-worker = { path = "../../crates/services/sg-service-worker" }
+tokio = { workspace = true }

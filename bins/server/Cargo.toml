@@ -11,3 +11,7 @@ name = "server"
 path = "src/main.rs"
 
 [dependencies]
+sg-core = { path = "../../crates/base/sg-core" }
+sg-entry = { path = "../../crates/base/sg-entry" }
+sg-log = { path = "../../crates/base/sg-log" }
+tokio = { workspace = true }
