@@ -2036,7 +2036,7 @@ fn order_racing_jobs(root: JobNode) -> JobNode {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, PartialEq)]
-enum GitNode {
+pub(crate) enum GitNode {
     Boolean(bool),
     AuthorMatches {
         expr: String,
@@ -2071,7 +2071,7 @@ enum GitNode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum GitOperatorKind {
+pub(crate) enum GitOperatorKind {
     And,
     Or,
     Not,
@@ -2181,7 +2181,10 @@ fn git_new_not(operand: GitNode) -> GitNode {
 }
 
 /// `QueryToGitQuery` (`internal/search/commit/commit.go:213-236`).
-fn query_to_git_query(basic: &Basic, diff: bool) -> GitNode {
+///
+/// Shared with [`crate::search_commit_job`], which translates the resulting
+/// tree to the gitserver `QueryNode` proto.
+pub(crate) fn query_to_git_query(basic: &Basic, diff: bool) -> GitNode {
     let case_sensitive = basic.is_case_sensitive();
     let mut res = Vec::with_capacity(basic.parameters.0.len() + 2);
 

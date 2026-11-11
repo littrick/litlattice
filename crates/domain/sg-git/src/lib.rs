@@ -27,6 +27,10 @@ type Client = pb::gitserver_service_client::GitserverServiceClient<tonic::transp
 /// A stream of tar archive bytes (`gitserver.Archive`).
 pub type TarByteStream = Pin<Box<dyn Stream<Item = io::Result<Bytes>> + Send>>;
 
+/// A stream of `gitserver.Search` responses (`gitserver.Client.Search`).
+pub type SearchResponseStream =
+    Pin<Box<dyn Stream<Item = Result<pb::SearchResponse, Error>> + Send>>;
+
 /// Error returned by every gitserver operation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Error {
@@ -736,6 +740,34 @@ impl GitserverClient {
             }
         }
         Ok(commits)
+    }
+
+    /// `gitserver.Client.Search` (`internal/gitserver/client.go:588-635`): stream
+    /// commit-search responses for `repo`. The first error is reported when the
+    /// call is established; later stream errors are delivered as items, so callers
+    /// can drain the stream like the baseline's `Recv` loop.
+    ///
+    /// The request is the generated [`pb::SearchRequest`], which mirrors
+    /// `protocol.SearchRequest` field for field (`ToProto` in
+    /// `internal/gitserver/protocol/gitserver.go`). The baseline folds
+    /// `SearchResponse_LimitHit` into a single boolean and converts every
+    /// `SearchResponse_Match` with `CommitMatchFromProto`; that accumulation is
+    /// left to the caller so this wrapper stays a thin transport.
+    pub async fn search(
+        &self,
+        repo: &str,
+        request: pb::SearchRequest,
+    ) -> Result<SearchResponseStream, Error> {
+        let mut client = self.client_for(repo).await?;
+        let context = format!("search {repo}");
+        let response = client
+            .search(request)
+            .await
+            .map_err(|status| translate_status(status, &context))?
+            .into_inner();
+        Ok(Box::pin(response.map(move |item| {
+            item.map_err(|status| translate_status(status, &context))
+        })))
     }
 }
 
