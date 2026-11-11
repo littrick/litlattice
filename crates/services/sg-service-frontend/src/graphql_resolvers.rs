@@ -2302,9 +2302,16 @@ impl FrontendRootResolver {
                 repositories_connections: HashMap::new(),
                 search_contexts: None,
                 ranking_summary: None,
+                search: None,
             },
             mutation: MutationRoot::default(),
         }
+    }
+
+    /// Attach the request's prefetched `Query.search` result (M9.8ie).
+    pub fn with_search_roots(mut self, search: Option<crate::search_graphql::SearchRoot>) -> Self {
+        self.query.search = search;
+        self
     }
 
     /// Attach the request's prefetched ranking root fields (M9.8ic).
@@ -2453,6 +2460,9 @@ struct QueryRoot {
     /// Prefetched `Query.rankingSummary` (M9.8ic); `None` when not selected or
     /// the ranking resolver is not injected.
     ranking_summary: Option<Result<crate::ranking_graphql::GlobalRankingSummary, String>>,
+    /// Prefetched `Query.search` (M9.8ie); `None` when the field was not
+    /// selected or no search executor is injected.
+    search: Option<crate::search_graphql::SearchRoot>,
 }
 
 /// `Mutation` root: `settingsMutation`/log events/temporary settings/feature
@@ -3062,6 +3072,12 @@ impl ObjectValue for QueryRoot {
             "rankingSummary" => match &self.ranking_summary {
                 Some(Ok(summary)) => Ok(Some(FieldValue::Object(Arc::new(summary.clone())))),
                 Some(Err(message)) => Err(ExecError::new(message.clone())),
+                None => Ok(None),
+            },
+            // `schemaResolver.Search` (M9.8ie): the async plan/execute result
+            // was prefetched in `SchemaGraphqlDeps::exec`.
+            "search" => match &self.search {
+                Some(root) => crate::search_graphql::search_field(root),
                 None => Ok(None),
             },
             // `SearchContextsResolver` root fields (`search_contexts.go:20-39`):
