@@ -544,6 +544,22 @@ pub fn external_handler_with_live(
                                                 // single-provider condition
                                                 // holds.
                                                 if mode == ExternalMode::App {
+                                                    // `openidconnect.Middleware`
+                                                    // runs before SAML in
+                                                    // `auth/init.go`.
+                                                    if let Some(deps) = &oauth {
+                                                        if let Some(redirect) =
+                                                            crate::oauth_routes::oidc_app_redirect(
+                                                                request,
+                                                                &oauth_config,
+                                                                deps,
+                                                                false,
+                                                            )
+                                                            .await
+                                                        {
+                                                            return redirect;
+                                                        }
+                                                    }
                                                     // SAML's single-provider
                                                     // redirect is unconditional
                                                     // (it does not depend on the
@@ -578,6 +594,19 @@ pub fn external_handler_with_live(
                                                 if mode == ExternalMode::App
                                                     && !actor.is_authenticated()
                                                 {
+                                                    if let Some(deps) = &oauth {
+                                                        if let Some(redirect) =
+                                                            crate::oauth_routes::oidc_app_redirect(
+                                                                request,
+                                                                &oauth_config,
+                                                                deps,
+                                                                false,
+                                                            )
+                                                            .await
+                                                        {
+                                                            return redirect;
+                                                        }
+                                                    }
                                                     if let Some(deps) = &saml {
                                                         if let Some(redirect) =
                                                             crate::saml_wiring::saml_route_response(

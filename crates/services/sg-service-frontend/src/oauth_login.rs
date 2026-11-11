@@ -1315,7 +1315,10 @@ pub fn go_url_string(url: &GoUrl) -> String {
         out.push_str(&url.scheme);
         out.push(':');
     }
-    if !url.scheme.is_empty() || !url.host.is_empty() {
+    // Go's `URL.String` only writes the `//` authority marker when a host is
+    // present (`url.Parse("https://")` renders as `"https:"`). A scheme with
+    // an empty host (OmitHost) is therefore printed without `//`.
+    if !url.host.is_empty() {
         out.push_str("//");
         out.push_str(&url.host);
     }
@@ -1325,6 +1328,258 @@ pub fn go_url_string(url: &GoUrl) -> String {
         out.push_str(&url.raw_query);
     }
     out
+}
+
+/// Go `strconv.Quote` for the byte shapes `url.Parse` errors carry. Only ASCII
+/// controls need the `\a\b\f\n\r\t\v`/`\xNN` spellings; the rest is passed
+/// through.
+pub fn go_strconv_quote(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('"');
+    for ch in value.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\u{07}' => out.push_str("\\a"),
+            '\u{08}' => out.push_str("\\b"),
+            '\u{0c}' => out.push_str("\\f"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{0b}' => out.push_str("\\v"),
+            c if (c as u32) < 0x20 || c as u32 == 0x7f => {
+                out.push_str(&format!("\\x{:02x}", c as u32));
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+fn go_url_error(url: &str, inner: &str) -> String {
+    format!("parse {}: {}", go_strconv_quote(url), inner)
+}
+
+/// `url.unescape`'s `%` validation (`encodePath`/`encodeFragment` only need the
+/// escape shape; those modes never reject a raw byte).
+fn invalid_url_escape(value: &str, offset: usize) -> String {
+    let bytes = value.as_bytes();
+    let end = (offset + 3).min(bytes.len());
+    let escape = String::from_utf8_lossy(&bytes[offset..end]);
+    format!("invalid URL escape {}", go_strconv_quote(&escape))
+}
+
+fn validate_percent_escapes(value: &str) -> Result<(), String> {
+    let bytes = value.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            if index + 2 >= bytes.len()
+                || !bytes[index + 1].is_ascii_hexdigit()
+                || !bytes[index + 2].is_ascii_hexdigit()
+            {
+                return Err(invalid_url_escape(value, index));
+            }
+            index += 3;
+        } else {
+            index += 1;
+        }
+    }
+    Ok(())
+}
+
+/// `url.parseHost` for the shapes a configured `ssoURL` can contain.
+fn validate_host(host: &str) -> Result<(), String> {
+    let valid_port = |port: &str| {
+        port.is_empty()
+            || (port.starts_with(':') && port[1..].bytes().all(|byte| byte.is_ascii_digit()))
+    };
+    if host.starts_with('[') {
+        let Some(close) = host.rfind(']') else {
+            return Err("missing ']' in host".to_owned());
+        };
+        let colon_port = &host[close + 1..];
+        if !valid_port(colon_port) {
+            return Err(format!(
+                "invalid port {} after host",
+                go_strconv_quote(colon_port)
+            ));
+        }
+    } else if let Some(index) = host.rfind(':') {
+        let colon_port = &host[index..];
+        if !valid_port(colon_port) {
+            return Err(format!(
+                "invalid port {} after host",
+                go_strconv_quote(colon_port)
+            ));
+        }
+    }
+    let bytes = host.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'%' => {
+                if index + 2 >= bytes.len()
+                    || !bytes[index + 1].is_ascii_hexdigit()
+                    || !bytes[index + 2].is_ascii_hexdigit()
+                {
+                    return Err(invalid_url_escape(host, index));
+                }
+                let value = u8::from_str_radix(&host[index + 1..index + 3], 16).unwrap_or(0);
+                if value < 8 && &host[index..index + 3] != "%25" {
+                    return Err(invalid_url_escape(host, index));
+                }
+                index += 3;
+            }
+            byte if byte < 0x80 && !host_byte_allowed(byte) => {
+                return Err(format!(
+                    "invalid character {} in host name",
+                    go_strconv_quote(&(byte as char).to_string())
+                ));
+            }
+            _ => index += 1,
+        }
+    }
+    Ok(())
+}
+
+/// The ASCII bytes `shouldEscape(c, encodeHost)` keeps: unreserved +
+/// sub-delims + `:` `[` `]`. Everything else is escaped (i.e. rejected when
+/// unescaped) by Go.
+fn host_byte_allowed(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric()
+        || matches!(
+            byte,
+            b'-' | b'.'
+                | b'_'
+                | b'~'
+                | b'!'
+                | b'$'
+                | b'&'
+                | b'\''
+                | b'('
+                | b')'
+                | b'*'
+                | b'+'
+                | b','
+                | b';'
+                | b'='
+                | b':'
+                | b'['
+                | b']'
+        )
+}
+
+/// A strict `url.Parse` used where a parse failure is observable (GitLab's
+/// `SSOLoginHandler`): returns Go's exact `err.Error()` text. Unlike
+/// [`go_parse_url`], this validates the scheme, control bytes and `%` escapes.
+pub fn go_parse_url_checked(input: &str) -> Result<GoUrl, String> {
+    // `Parse` cuts the fragment first; parse errors are wrapped with the
+    // pre-fragment URL, fragment escape errors with the whole input.
+    let (u, fragment) = match input.split_once('#') {
+        Some((u, fragment)) => (u, Some(fragment)),
+        None => (input, None),
+    };
+    let parse_error = |inner: &str| go_url_error(u, inner);
+
+    if u.bytes().any(|byte| byte < 0x20 || byte == 0x7f) {
+        return Err(parse_error("net/url: invalid control character in URL"));
+    }
+
+    // `getScheme`.
+    let mut scheme = String::new();
+    let mut rest = u;
+    let bytes = u.as_bytes();
+    for (index, &byte) in bytes.iter().enumerate() {
+        match byte {
+            b'a'..=b'z' | b'A'..=b'Z' => {}
+            b'0'..=b'9' | b'+' | b'-' | b'.' if index > 0 => {}
+            b':' => {
+                if index == 0 {
+                    return Err(parse_error("missing protocol scheme"));
+                }
+                scheme = u[..index].to_ascii_lowercase();
+                rest = &u[index + 1..];
+                break;
+            }
+            _ => break,
+        }
+    }
+
+    // `rest, url.RawQuery = strings.Cut(rest, "?")`.
+    let (mut path, raw_query) = match rest.split_once('?') {
+        Some((path, query)) => (path, query.to_owned()),
+        None => (rest, String::new()),
+    };
+
+    if !path.starts_with('/') {
+        if !scheme.is_empty() {
+            // `url.Opaque = rest`; `URL.String` renders `scheme:opaque` and
+            // does not unescape the opaque part.
+            return finish_checked(
+                scheme,
+                String::new(),
+                path,
+                raw_query,
+                fragment,
+                input,
+                u,
+                false,
+            );
+        }
+        let segment = path.split('/').next().unwrap_or(path);
+        if segment.contains(':') {
+            return Err(parse_error(
+                "first path segment in URL cannot contain colon",
+            ));
+        }
+    }
+
+    // `(scheme != "" || !viaRequest && !HasPrefix(rest, "///")) && HasPrefix(rest, "//")`.
+    let has_authority = path.starts_with("//") && (!scheme.is_empty() || !path.starts_with("///"));
+    let mut host = String::new();
+    if has_authority {
+        let after = &path[2..];
+        let end = after.find('/').unwrap_or(after.len());
+        let authority = &after[..end];
+        path = &after[end..];
+        host = match authority.rfind('@') {
+            Some(index) => &authority[index + 1..],
+            None => authority,
+        }
+        .to_owned();
+        validate_host(&host)?;
+    }
+
+    finish_checked(scheme, host, path, raw_query, fragment, input, u, true)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finish_checked(
+    scheme: String,
+    host: String,
+    path: &str,
+    raw_query: String,
+    fragment: Option<&str>,
+    input: &str,
+    pre_fragment: &str,
+    validate_path: bool,
+) -> Result<GoUrl, String> {
+    if validate_path {
+        validate_percent_escapes(path).map_err(|inner| go_url_error(pre_fragment, &inner))?;
+    }
+    if let Some(fragment) = fragment {
+        if !fragment.is_empty() {
+            validate_percent_escapes(fragment).map_err(|inner| go_url_error(input, &inner))?;
+        }
+    }
+    Ok(GoUrl {
+        scheme,
+        host,
+        path: path.to_owned(),
+        raw_query,
+    })
 }
 
 pub fn query_get(query: &[(String, String)], key: &str) -> String {

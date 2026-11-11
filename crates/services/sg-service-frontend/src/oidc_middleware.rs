@@ -36,7 +36,7 @@ use time::OffsetDateTime;
 
 use sg_config::SiteConfiguration;
 use sg_session::write::{SessionManager, WriteOptions};
-use sg_session::{SessionIdSource, SessionStore, COOKIE_NAME};
+use sg_session::{SessionIdSource, SessionStore, COOKIE_NAME, SIGN_OUT_COOKIE};
 
 use crate::actor_chain::LicenseReader;
 use crate::authz::LicenseState;
@@ -273,6 +273,21 @@ async fn handle_login<B>(
         return error_response(500, DISCOVERY_SAFE);
     };
 
+    auth_request_redirect(req, config, deps, provider, &discovery, redirect, now).await
+}
+
+/// `RedirectToAuthRequest` (`middleware.go:487-530`), shared by `/login` and
+/// the automatic single-provider redirect.
+async fn auth_request_redirect<B>(
+    req: &Request<B>,
+    config: &OidcMiddlewareConfig,
+    deps: &OidcMiddlewareRuntime,
+    provider: &OpenIdConnectAuthProvider,
+    discovery: &OidcProvider,
+    mut redirect: String,
+    now: OffsetDateTime,
+) -> OAuthFlowResponse {
+    // No valid screen at the root: default to `/search`.
     if redirect.is_empty() || redirect == "/" {
         redirect = "/search".to_owned();
     }
@@ -291,6 +306,7 @@ async fn handle_login<B>(
         return error_response(500, SAVE_STATE_SAFE);
     }
 
+    let query = parse_query(req.uri().query().unwrap_or_default());
     let location = authorization_url(
         &discovery.document.authorization_endpoint,
         provider,
@@ -301,6 +317,70 @@ async fn handle_login<B>(
     let mut response = redirect_response(&location);
     response.set_cookies = manager.cookies;
     response
+}
+
+/// The automatic single-provider redirect (`middleware.go:124-141`). The
+/// caller has already taken over the OIDC endpoints; `redirect` is
+/// `auth.SafeRedirectURL(r.URL.String())`.
+#[allow(clippy::too_many_arguments)]
+pub async fn app_auto_redirect<B>(
+    req: &Request<B>,
+    config: &OidcMiddlewareConfig,
+    deps: &OidcMiddlewareRuntime,
+    authenticated: bool,
+    sign_in_types: &[String],
+    redirect: &str,
+    now: OffsetDateTime,
+) -> Option<OAuthFlowResponse> {
+    if authenticated {
+        return None;
+    }
+    // Defensive: the OIDC endpoints never reach the app-chain decision.
+    let path = req.uri().path();
+    if path == CALLBACK_ALIAS
+        || (path.starts_with(AUTH_PREFIX) && path[AUTH_PREFIX.len()..].starts_with('/'))
+    {
+        return None;
+    }
+    // `!conf.AuthPublic()`, i.e. not dotcom.
+    if config.dotcom {
+        return None;
+    }
+    // `len(ps) == 1 && ps[0].Config().Openidconnect != nil`.
+    if sign_in_types.len() != 1 || sign_in_types[0] != "openidconnect" {
+        return None;
+    }
+    // `!session.HasSignOutCookie(r)`.
+    if cookie_value(req, SIGN_OUT_COOKIE).is_some() {
+        return None;
+    }
+    // `GetProviderAndClient(..., ps[0].ConfigID().ID, GetProvider)`: the single
+    // visible OpenID Connect config.
+    let Some(provider) = config
+        .configs
+        .iter()
+        .find(|config| !config.hidden && !config.no_sign_in)
+    else {
+        return Some(error_response(500, MISCONFIGURED_SAFE));
+    };
+    if provider.issuer.is_empty() {
+        return Some(error_response(500, MISCONFIGURED_SAFE));
+    }
+    let Ok(discovery) = discover(deps.discovery_http.as_ref(), &provider.issuer).await else {
+        return Some(error_response(500, DISCOVERY_SAFE));
+    };
+    Some(
+        auth_request_redirect(
+            req,
+            config,
+            deps,
+            provider,
+            &discovery,
+            redirect.to_owned(),
+            now,
+        )
+        .await,
+    )
 }
 
 fn find_config<'a>(
