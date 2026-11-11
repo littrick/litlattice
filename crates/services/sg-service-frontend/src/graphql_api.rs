@@ -408,6 +408,9 @@ pub struct SchemaGraphqlDeps {
     /// `Mutation.updateSiteConfiguration`'s configuration store/server seams;
     /// `None` in transport-only tests.
     site_configuration: Option<crate::site_configuration_mutation::SiteConfigurationDeps>,
+    /// `Query.site.configuration`'s read-only seams (M9.8je); `None` leaves
+    /// the configuration field unported while `Site`'s other fields resolve.
+    config_graphql: Option<crate::config_graphql::ConfigGraphqlDeps>,
     /// `Query.repositories`'s database seam; `None` in transport-only tests.
     repositories_connections: Option<Arc<dyn crate::repositories::RepositoriesConnectionStore>>,
     /// `SearchContextsResolver`'s database seam (M9.8hz); `None` reproduces an
@@ -459,6 +462,7 @@ impl SchemaGraphqlDeps {
             log_events: None,
             feature_flags: None,
             site_configuration: None,
+            config_graphql: None,
             repositories_connections: None,
             search_contexts: None,
             ranking: None,
@@ -506,6 +510,7 @@ impl SchemaGraphqlDeps {
                 crate::feature_flag_store::PgFeatureFlagStore::new(pool.clone()),
             )),
             site_configuration: None,
+            config_graphql: None,
             repositories_connections: Some(Arc::new(
                 crate::repositories::PgRepositoriesConnectionStore::new(pool),
             )),
@@ -641,6 +646,29 @@ impl SchemaGraphqlDeps {
     ) -> Self {
         self.site_configuration =
             Some(crate::site_configuration_mutation::SiteConfigurationDeps { store, server });
+        self
+    }
+
+    /// Enable the read-only configuration surface (`Query.site.configuration`,
+    /// M9.8je): the configuration store, the `critical_and_site_config` table
+    /// and the shared `product_licenses` adapter.
+    pub fn with_config_graphql(
+        mut self,
+        store: Arc<sg_config::store::ConfigStore>,
+        pool: sqlx::PgPool,
+    ) -> Self {
+        self.config_graphql = Some(crate::config_graphql::ConfigGraphqlDeps::new(pool, store));
+        self
+    }
+
+    /// Test hook: install configuration-surface seams directly (a fake license
+    /// store can be supplied through
+    /// [`crate::config_graphql::ConfigGraphqlDeps::with_license_store`]).
+    pub fn with_config_graphql_deps(
+        mut self,
+        deps: crate::config_graphql::ConfigGraphqlDeps,
+    ) -> Self {
+        self.config_graphql = Some(deps);
         self
     }
 
@@ -825,6 +853,7 @@ impl SchemaGraphqlDeps {
             log_events: None,
             feature_flags: None,
             site_configuration: None,
+            config_graphql: None,
             repositories_connections: None,
             search_contexts: None,
             ranking: None,
@@ -1291,6 +1320,37 @@ impl GraphqlDeps for SchemaGraphqlDeps {
                 Arc::make_mut(&mut nested).external_service_webhook_logs = nested_webhook_logs;
             }
         }
+        // `Query.site.configuration` (`site.go:100-272`): admin checks,
+        // `conf.Raw()`, `product_licenses` and the config history are async, so
+        // prefetch the selected read-only fields before the synchronous
+        // executor replays them.
+        let site = match &self.config_graphql {
+            Some(deps) => {
+                let backend = crate::config_graphql::ProductionSiteConfigurationBackend::new(
+                    deps.pool.clone(),
+                    Arc::clone(&deps.store),
+                    site_admin,
+                );
+                let validator = crate::config_graphql::ConfigStoreSiteConfigValidator::new(
+                    Arc::clone(&deps.store),
+                );
+                let history =
+                    crate::config_graphql::PgSiteConfigHistoryStore::new(deps.pool.clone());
+                crate::config_graphql::prefetch_site(
+                    &backend,
+                    deps.licenses.as_ref(),
+                    &validator,
+                    &history,
+                    self.users.as_ref().map(|users| {
+                        users.as_ref() as &dyn crate::graphql_resolvers::UserLookupStore
+                    }),
+                    &fields,
+                    request.actor,
+                )
+                .await
+            }
+            None => None,
+        };
         let mut roots =
             crate::graphql_resolvers::FrontendRootResolver::with_prefetched_organizations(
                 user,
@@ -1314,7 +1374,8 @@ impl GraphqlDeps for SchemaGraphqlDeps {
             .with_search_contexts(self.search_contexts.clone())
             .with_ranking_roots(ranking_roots)
             .with_search_roots(search_root)
-            .with_git(git);
+            .with_git(git)
+            .with_site(site);
         if let Some(surface) = &self.slow_requests {
             roots = roots.with_slow_requests(Arc::clone(surface));
         }
