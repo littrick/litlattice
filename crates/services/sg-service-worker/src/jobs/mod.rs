@@ -54,6 +54,7 @@ pub mod batches;
 pub mod batches_bulk_processor;
 pub mod batches_reconciler;
 pub mod batches_scheduler;
+pub mod batches_workspace_resolver;
 pub mod bitbucket_project_permissions;
 pub mod bitbucket_server_client;
 pub mod code_monitor_action_runner;
@@ -246,6 +247,9 @@ pub fn all_jobs() -> Vec<(&'static str, Arc<dyn Job>)> {
                     Arc::new(batches_reconciler::BatchesReconcilerJob::new())
                 }
                 "batches-scheduler" => Arc::new(batches_scheduler::BatchesScheduler::new()),
+                "batches-workspace-resolver" => Arc::new(
+                    batches_workspace_resolver::BatchesWorkspaceResolver::new(),
+                ),
                 "bitbucket-project-permissions" => {
                     Arc::new(bitbucket_project_permissions::BitbucketProjectPermissionsJob::new())
                 }

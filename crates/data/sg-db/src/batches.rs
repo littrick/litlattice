@@ -1317,3 +1317,380 @@ mod reconciler_tests {
         assert!(RECONCILER_HEARTBEAT_QUERY.contains("::text[]::bigint[]"));
     }
 }
+
+// ---------------------------------------------------------------------------
+// M9.9i: `batches-workspace-resolver` worker store
+// (`internal/batches/store/worker_batch_spec_resolution.go`).
+//
+// Delimited from the changeset-syncer queries above to keep sibling slices'
+// edits independent. Only the existing `batch_spec_resolution_jobs` columns
+// are touched; migrations stay owned by the Go `migrator`.
+// ---------------------------------------------------------------------------
+
+/// `batchSpecResolutionWorkerOpts` knobs.
+pub const BATCH_SPEC_RESOLUTION_TABLE: &str = "batch_spec_resolution_jobs";
+/// `Options.RetryAfter`.
+pub const BATCH_SPEC_RESOLUTION_RETRY_AFTER_SECONDS: i32 = 5;
+/// `Options.MaxNumRetries` (0: the first error is terminal).
+pub const BATCH_SPEC_RESOLUTION_MAX_NUM_RETRIES: i32 = 0;
+
+/// A `batch_spec_resolution_jobs` row as the worker store returns it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BatchSpecResolutionJobRow {
+    pub id: i64,
+    pub batch_spec_id: i32,
+    pub initiator_id: i32,
+    pub state: String,
+    pub failure_message: Option<String>,
+    pub started_at: Option<OffsetDateTime>,
+    pub finished_at: Option<OffsetDateTime>,
+    pub process_after: Option<OffsetDateTime>,
+    pub num_resets: i32,
+    pub num_failures: i32,
+    pub worker_hostname: String,
+    pub created_at: OffsetDateTime,
+    pub updated_at: OffsetDateTime,
+}
+
+/// The generic `dbworker/store` dequeue statement with this store's
+/// `OrderByExpression` (`state = 'errored', updated_at DESC`) and
+/// `RetryAfter`/`MaxNumRetries` literals. `{select}` is replaced by
+/// [`DEQUEUE_SELECT`].
+const DEQUEUE_QUERY: &str = "
+WITH potential_candidates AS (
+	SELECT
+		id AS candidate_id,
+		ROW_NUMBER() OVER (ORDER BY state = 'errored', updated_at DESC) AS order
+	FROM batch_spec_resolution_jobs
+	WHERE
+		(
+			(
+				state = 'queued' AND
+				(process_after IS NULL OR process_after <= $1)
+			) OR (
+				0 > 0 AND
+				state = 'errored' AND
+				$1 - finished_at > (5 * '1 second'::interval)
+			)
+		)
+
+	ORDER BY state = 'errored', updated_at DESC
+	LIMIT 50
+),
+candidate AS (
+	SELECT
+		id FROM batch_spec_resolution_jobs
+	JOIN potential_candidates pc ON pc.candidate_id = id
+	WHERE
+		-- Recheck state.
+		state IN ('queued', 'errored')
+	ORDER BY pc.order
+	FOR UPDATE OF batch_spec_resolution_jobs SKIP LOCKED
+	LIMIT 1
+),
+updated_record AS (
+	UPDATE
+		batch_spec_resolution_jobs
+	SET
+		state='processing', started_at=$1::timestamp, last_heartbeat_at=$1::timestamp, finished_at=NULL, failure_message=NULL, execution_logs=NULL, worker_hostname=$2
+	WHERE
+		id IN (SELECT id FROM candidate)
+)
+SELECT
+	{select}
+FROM
+	batch_spec_resolution_jobs
+WHERE
+	id IN (SELECT id FROM candidate)
+";
+
+/// `batchSpecResolutionJobColums` with the dequeue-updated expressions
+/// substituted; aliases keep the row decodable by name.
+const DEQUEUE_SELECT: &str = "batch_spec_resolution_jobs.id, batch_spec_resolution_jobs.batch_spec_id, batch_spec_resolution_jobs.initiator_id, 'processing' AS state, NULL::text AS failure_message, $1 AS started_at, NULL::timestamptz AS finished_at, batch_spec_resolution_jobs.process_after, batch_spec_resolution_jobs.num_resets, batch_spec_resolution_jobs.num_failures, $2 AS worker_hostname, batch_spec_resolution_jobs.created_at, batch_spec_resolution_jobs.updated_at";
+
+const HEARTBEAT_QUERY: &str = "
+WITH alive_candidates AS (
+	SELECT
+		id
+	FROM
+		batch_spec_resolution_jobs
+	WHERE
+		id = ANY ($1::text[]::int[]) AND state = 'processing'
+	ORDER BY
+		id ASC
+	FOR UPDATE
+)
+UPDATE
+	batch_spec_resolution_jobs
+SET
+	last_heartbeat_at = $2
+WHERE
+	id IN (SELECT id FROM alive_candidates)
+RETURNING id, cancel
+";
+
+const MARK_COMPLETE_QUERY: &str = "
+UPDATE batch_spec_resolution_jobs
+SET state = 'completed', finished_at = clock_timestamp()
+WHERE id = $1 AND state = 'processing'
+RETURNING id
+";
+
+const MARK_ERRORED_QUERY: &str = "
+UPDATE batch_spec_resolution_jobs
+SET state = CASE WHEN cancel THEN 'canceled' WHEN num_failures + 1 >= 0 THEN 'failed' ELSE 'errored' END,
+	finished_at = clock_timestamp(),
+	failure_message = $2,
+	num_failures = CASE WHEN cancel THEN num_failures ELSE num_failures + 1 END
+WHERE id = $1 AND state = 'processing'
+RETURNING id
+";
+
+const MARK_FAILED_QUERY: &str = "
+UPDATE batch_spec_resolution_jobs
+SET state = CASE WHEN cancel THEN 'canceled' ELSE 'failed' END,
+	finished_at = clock_timestamp(),
+	failure_message = $2,
+	num_failures = CASE WHEN cancel THEN num_failures ELSE num_failures + 1 END
+WHERE id = $1 AND state = 'processing'
+RETURNING id
+";
+
+fn nullable<'r, T>(row: &'r sqlx::postgres::PgRow, column: &str) -> Option<T>
+where
+    T: sqlx::Decode<'r, sqlx::Postgres> + sqlx::Type<sqlx::Postgres>,
+{
+    row.try_get::<Option<T>, _>(column).ok().flatten()
+}
+
+fn scan_resolution_job(row: sqlx::postgres::PgRow) -> BatchSpecResolutionJobRow {
+    BatchSpecResolutionJobRow {
+        id: row.get("id"),
+        batch_spec_id: row.get("batch_spec_id"),
+        initiator_id: row.get("initiator_id"),
+        state: row.get("state"),
+        failure_message: nullable(&row, "failure_message"),
+        started_at: nullable(&row, "started_at"),
+        finished_at: nullable(&row, "finished_at"),
+        process_after: nullable(&row, "process_after"),
+        num_resets: row.get("num_resets"),
+        num_failures: row.get("num_failures"),
+        worker_hostname: row.get("worker_hostname"),
+        created_at: row.get("created_at"),
+        updated_at: row.get("updated_at"),
+    }
+}
+
+/// `(*store[BatchSpecResolutionJob]).Dequeue`.
+pub async fn dequeue_batch_spec_resolution_job(
+    pool: &PgPool,
+    now: OffsetDateTime,
+    worker_hostname: &str,
+) -> Result<Option<BatchSpecResolutionJobRow>, sqlx::Error> {
+    let sql = DEQUEUE_QUERY.replace("{select}", DEQUEUE_SELECT);
+    let rows = sqlx::query(&sql)
+        .bind(now)
+        .bind(worker_hostname)
+        .fetch_all(pool)
+        .await?;
+    Ok(rows.into_iter().next().map(scan_resolution_job))
+}
+
+/// `(*store[BatchSpecResolutionJob]).Heartbeat`: `(known, canceled)` ids.
+pub async fn heartbeat_batch_spec_resolution_jobs(
+    pool: &PgPool,
+    now: OffsetDateTime,
+    ids: &[String],
+) -> Result<(Vec<i64>, Vec<i64>), sqlx::Error> {
+    if ids.is_empty() {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    let rows = sqlx::query(HEARTBEAT_QUERY)
+        .bind(ids)
+        .bind(now)
+        .fetch_all(pool)
+        .await?;
+    let mut known = Vec::with_capacity(rows.len());
+    let mut canceled = Vec::new();
+    for row in rows {
+        let id: i64 = row.get("id");
+        known.push(id);
+        if row.get::<bool, _>("cancel") {
+            canceled.push(id);
+        }
+    }
+    Ok((known, canceled))
+}
+
+/// `(*store[BatchSpecResolutionJob]).MarkComplete`.
+pub async fn mark_batch_spec_resolution_job_complete(
+    pool: &PgPool,
+    id: i64,
+) -> Result<bool, sqlx::Error> {
+    let row = sqlx::query(MARK_COMPLETE_QUERY)
+        .bind(id)
+        .fetch_optional(pool)
+        .await?;
+    Ok(row.is_some())
+}
+
+/// `(*store[BatchSpecResolutionJob]).MarkErrored`.
+pub async fn mark_batch_spec_resolution_job_errored(
+    pool: &PgPool,
+    id: i64,
+    failure_message: &str,
+) -> Result<bool, sqlx::Error> {
+    let row = sqlx::query(MARK_ERRORED_QUERY)
+        .bind(id)
+        .bind(failure_message)
+        .fetch_optional(pool)
+        .await?;
+    Ok(row.is_some())
+}
+
+/// `(*store[BatchSpecResolutionJob]).MarkFailed`.
+pub async fn mark_batch_spec_resolution_job_failed(
+    pool: &PgPool,
+    id: i64,
+    failure_message: &str,
+) -> Result<bool, sqlx::Error> {
+    let row = sqlx::query(MARK_FAILED_QUERY)
+        .bind(id)
+        .bind(failure_message)
+        .fetch_optional(pool)
+        .await?;
+    Ok(row.is_some())
+}
+
+// ---------------------------------------------------------------------------
+// M9.9i: batch spec read + resolution persistence (handler side).
+// ---------------------------------------------------------------------------
+
+/// The subset of `batch_specs` the resolution handler reads.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BatchSpecRow {
+    pub id: i64,
+    pub rand_id: String,
+    pub raw_spec: String,
+    pub spec: serde_json::Value,
+    pub namespace_user_id: Option<i32>,
+    pub namespace_org_id: Option<i32>,
+    pub user_id: Option<i32>,
+    pub allow_unsupported: bool,
+    pub allow_ignored: bool,
+    pub no_cache: bool,
+}
+
+/// `(*store.Store).GetBatchSpec` with `GetBatchSpecOpts{ID}`.
+pub async fn get_batch_spec(pool: &PgPool, id: i64) -> Result<Option<BatchSpecRow>, sqlx::Error> {
+    let row = sqlx::query(
+        r#"
+SELECT id, rand_id, raw_spec, spec, namespace_user_id, namespace_org_id, user_id,
+       allow_unsupported, allow_ignored, no_cache
+FROM batch_specs
+WHERE id = $1
+"#,
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|row| BatchSpecRow {
+        id: row.get("id"),
+        rand_id: row.get("rand_id"),
+        raw_spec: row.get("raw_spec"),
+        spec: row.get("spec"),
+        namespace_user_id: row.get("namespace_user_id"),
+        namespace_org_id: row.get("namespace_org_id"),
+        user_id: row.get("user_id"),
+        allow_unsupported: row.get("allow_unsupported"),
+        allow_ignored: row.get("allow_ignored"),
+        no_cache: row.get("no_cache"),
+    }))
+}
+
+/// One `batch_spec_workspaces` insert row (`btypes.BatchSpecWorkspace`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct BatchSpecWorkspaceInsert {
+    pub batch_spec_id: i64,
+    pub changeset_spec_ids: Vec<i64>,
+    pub repo_id: i32,
+    pub branch: String,
+    pub commit: String,
+    pub path: String,
+    pub file_matches: Vec<String>,
+    pub only_fetch_workspace: bool,
+    pub ignored: bool,
+    pub unsupported: bool,
+    pub skipped: bool,
+    pub cached_result_found: bool,
+    pub step_cache_results: serde_json::Value,
+}
+
+/// `(*store.Store).CreateBatchSpecWorkspace`.
+pub async fn create_batch_spec_workspaces(
+    pool: &PgPool,
+    workspaces: &[BatchSpecWorkspaceInsert],
+) -> Result<(), sqlx::Error> {
+    for workspace in workspaces {
+        sqlx::query(
+            r#"
+INSERT INTO batch_spec_workspaces
+    (batch_spec_id, changeset_spec_ids, repo_id, branch, commit, path, file_matches,
+     only_fetch_workspace, ignored, unsupported, skipped, cached_result_found,
+     step_cache_results)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+"#,
+        )
+        .bind(workspace.batch_spec_id as i32)
+        .bind(sqlx::types::Json(&workspace.changeset_spec_ids))
+        .bind(workspace.repo_id)
+        .bind(&workspace.branch)
+        .bind(&workspace.commit)
+        .bind(&workspace.path)
+        .bind(&workspace.file_matches)
+        .bind(workspace.only_fetch_workspace)
+        .bind(workspace.ignored)
+        .bind(workspace.unsupported)
+        .bind(workspace.skipped)
+        .bind(workspace.cached_result_found)
+        .bind(sqlx::types::Json(&workspace.step_cache_results))
+        .execute(pool)
+        .await?;
+    }
+    Ok(())
+}
+
+/// One imported `changeset_specs` insert row (`ChangesetSpecTypeExisting`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ImportChangesetSpecInsert {
+    pub rand_id: String,
+    pub batch_spec_id: i64,
+    pub repo_id: i32,
+    pub user_id: Option<i32>,
+    pub external_id: String,
+}
+
+/// `(*store.Store).CreateChangesetSpec` for `importChangesets` entries
+/// (`type = 'existing'`).
+pub async fn create_import_changeset_specs(
+    pool: &PgPool,
+    specs: &[ImportChangesetSpecInsert],
+) -> Result<(), sqlx::Error> {
+    for spec in specs {
+        sqlx::query(
+            r#"
+INSERT INTO changeset_specs
+    (rand_id, batch_spec_id, repo_id, user_id, external_id, type)
+VALUES ($1, $2, $3, $4, $5, 'existing')
+"#,
+        )
+        .bind(&spec.rand_id)
+        .bind(spec.batch_spec_id)
+        .bind(spec.repo_id)
+        .bind(spec.user_id)
+        .bind(&spec.external_id)
+        .execute(pool)
+        .await?;
+    }
+    Ok(())
+}
