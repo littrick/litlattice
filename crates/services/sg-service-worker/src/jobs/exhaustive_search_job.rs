@@ -53,8 +53,8 @@ use crate::jobs::exhaustive_search_janitor::{
 };
 use crate::jobs::exhaustive_search_searcher::FromSearchClient;
 use crate::jobs::exhaustive_search_service::{
-    LazyObjectStorage, ObjectStorageLogBlobStore, ObjectStorageMatchWriterFactory,
-    ObjectStorageUploadStore, UploadStore,
+    new_object_storage, ObjectStorageBackend, ObjectStorageLogBlobStore,
+    ObjectStorageMatchWriterFactory, ObjectStorageUploadStore, UploadStore,
 };
 use crate::jobs::exhaustive_search_workers::{
     new_exhaustive_search_job_worker_store, new_repo_search_job_worker_store,
@@ -588,10 +588,8 @@ impl SearchJob {
             });
         }
 
-        let store = sg_objectstorage::ObjectStore::new(storage_config(&self.config)?)
-            .await
-            .map_err(|err| err.to_string())?;
-        let backend = Arc::new(LazyObjectStorage::new(Arc::new(store)));
+        let backend: Arc<dyn ObjectStorageBackend> =
+            new_object_storage(storage_config(&self.config)?).await?;
         let uploads: Arc<dyn UploadStore> =
             Arc::new(ObjectStorageUploadStore::new(Arc::clone(&backend)));
         let writer_factory: Arc<dyn MatchWriterFactory> =

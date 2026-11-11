@@ -36,7 +36,7 @@ use async_trait::async_trait;
 use sg_core::{ConfigError, EnvReader};
 use sg_db::exhaustive_search::{self as ex, Actor, GetJobLogsOptions, JobState, SearchJobLog};
 use sg_db::OffsetDateTime;
-use sg_objectstorage::{S3Config, StorageConfig};
+use sg_objectstorage::{GcsConfig, S3Config, StorageConfig};
 use sqlx::{PgPool, Postgres, Transaction};
 use tokio_util::sync::CancellationToken;
 
@@ -481,6 +481,7 @@ impl JobConfig for SearchJobsObjectStorageConfig {
         }
 
         let mut s3 = S3Config::default();
+        let mut gcs = GcsConfig::default();
         if matches!(backend.as_str(), "blobstore" | "s3") {
             s3.region = env.get(
                 "SEARCH_JOBS_UPLOAD_AWS_REGION",
@@ -525,18 +526,17 @@ impl JobConfig for SearchJobsObjectStorageConfig {
                 );
             }
         } else if backend == "gcs" {
-            // Registered like the baseline even though GCS is not implemented.
-            let _ = env.get(
+            gcs.project_id = env.get(
                 "SEARCH_JOBS_UPLOAD_GCP_PROJECT_ID",
                 "",
                 "The project containing the GCS bucket.",
             );
-            let _ = env.get(
+            gcs.credentials_file = env.get(
                 "SEARCH_JOBS_UPLOAD_GOOGLE_APPLICATION_CREDENTIALS_FILE",
                 "",
                 "The path to a service account key file with access to GCS.",
             );
-            let _ = env.get(
+            gcs.credentials_file_contents = env.get(
                 "SEARCH_JOBS_UPLOAD_GOOGLE_APPLICATION_CREDENTIALS_FILE_CONTENT",
                 "",
                 "The contents of a service account key file with access to GCS.",
@@ -549,6 +549,7 @@ impl JobConfig for SearchJobsObjectStorageConfig {
                 manage_bucket,
                 bucket,
                 s3,
+                gcs,
             }
             .normalize(),
         );
@@ -568,8 +569,7 @@ impl JobConfig for SearchJobsObjectStorageConfig {
     }
 }
 
-/// `search.NewObjectStorage`'s storage config. GCS is not implemented by the
-/// Rust worker yet; the baseline would accept it.
+/// `search.NewObjectStorage`'s storage config.
 pub(crate) fn storage_config(
     config: &SearchJobsObjectStorageConfig,
 ) -> Result<StorageConfig, String> {
@@ -577,8 +577,7 @@ pub(crate) fn storage_config(
         .storage()
         .ok_or_else(|| "search jobs object storage config was not loaded".to_owned())?;
     match config.backend.as_str() {
-        "s3" | "blobstore" => Ok(config),
-        "gcs" => Err("not ported: GCS object storage".to_owned()),
+        "s3" | "blobstore" | "gcs" => Ok(config),
         other => Err(format!("unsupported object storage backend {other:?}")),
     }
 }
@@ -726,17 +725,17 @@ mod tests {
     }
 
     #[test]
-    fn gcs_backend_is_not_ported() {
+    fn gcs_backend_is_accepted() {
         let _guard = ENV_LOCK.lock().expect("env lock");
         clear_storage_env();
         std::env::set_var("SEARCH_JOBS_UPLOAD_BACKEND", "gcs");
+        std::env::set_var("SEARCH_JOBS_UPLOAD_GCP_PROJECT_ID", "pid");
         let config = SearchJobsObjectStorageConfig::default();
         config.load(&mut EnvReader::new());
         assert!(config.validate().is_ok());
-        assert_eq!(
-            storage_config(&config).expect_err("gcs not ported"),
-            "not ported: GCS object storage"
-        );
+        let storage = storage_config(&config).expect("gcs config");
+        assert_eq!(storage.backend, "gcs");
+        assert_eq!(storage.gcs.project_id, "pid");
         clear_storage_env();
     }
 
