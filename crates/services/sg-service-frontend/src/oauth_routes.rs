@@ -38,11 +38,11 @@ use sg_session::{parse_go_duration, SessionStore, COOKIE_NAME, SIGN_OUT_COOKIE};
 use crate::actor_chain::LicenseReader;
 use crate::authz::LicenseState;
 use crate::oauth_login::{
-    encode_query_sorted, handle_callback, handle_login, parse_query, query_get,
-    safe_redirect_url,
-    OAuthCallbackRequest, OAuthFlowDeps, OAuthFlowResponse, OAuthHttpClient, OAuthHttpResponse,
-    OAuthLoginRequest, OAuthProviderConfig, OAuthProviders, OAuthSecurityEventSink,
-    OAuthUserLookup, OAuthUserResolver, StateSource, TokenExchangeRequest, UserResolution,
+    encode_query_sorted, handle_callback, handle_login, parse_query, query_get, safe_redirect_url,
+    select_login_provider, LoginProviderSelection, OAuthCallbackRequest, OAuthFlowDeps,
+    OAuthFlowResponse, OAuthHttpClient, OAuthHttpResponse, OAuthLoginRequest, OAuthProviderConfig,
+    OAuthProviders, OAuthSecurityEventSink, OAuthUserLookup, OAuthUserResolver, StateSource,
+    TokenExchangeRequest, UserResolution,
 };
 
 /// `cmd/frontend/auth.AuthURLPrefix`.
@@ -643,6 +643,25 @@ pub async fn auth_prefix_response_at<B>(
             };
             let resolver = resolver_for(service_type, None, deps);
             let flow_deps = flow_deps(config, deps, resolver.as_ref(), false, now);
+            // `gitlaboauth.parseProvider` selects `SSOLoginHandler` when
+            // `ssoURL` is set; every other provider uses the plain login.
+            if service_type == crate::gitlab_oauth::GITLAB_SERVICE_TYPE {
+                if let LoginProviderSelection::Matched { provider, .. } =
+                    select_login_provider(&flow_deps, &request)
+                {
+                    if !provider.sso_url.is_empty() {
+                        return Some(with_outer_vary(flow_response(
+                            crate::gitlab_oauth::handle_gitlab_login(
+                                &flow_deps,
+                                &request,
+                                &provider.sso_url,
+                            )
+                            .await,
+                            &method,
+                        )));
+                    }
+                }
+            }
             handle_login(&flow_deps, &request).await
         }
         "/callback" => {

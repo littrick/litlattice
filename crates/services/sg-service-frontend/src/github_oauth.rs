@@ -19,6 +19,8 @@
 //! is the production transport. No network is used by the differential
 //! harness.
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use async_trait::async_trait;
 use serde::Deserialize;
 
@@ -43,6 +45,8 @@ const ACCEPT_PREVIEWS: [&str; 2] = [
 
 const USER_FETCH_FAILED: &str = "Could not read GitHub user from callback request.";
 const NO_VERIFIED_EMAIL: &str = "Could not get verified email for GitHub user. Check that your GitHub account has a verified email that matches one of your Sourcegraph verified emails.";
+const NOT_ALLOWED_ORGS_OR_TEAMS: &str =
+    "user does not belong to allowed GitHub organizations or teams.";
 
 /// One HTTP request the resolver issues. Header ordering is preserved; the
 /// differential harness records exactly these fields.
@@ -56,11 +60,13 @@ pub struct GithubHttpRequest {
     pub accept: Vec<String>,
 }
 
-/// One HTTP response (status + body text).
+/// One HTTP response (status + body text + `Link` header).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GithubHttpResponse {
     pub status: u16,
     pub body: String,
+    /// The `Link` response header; pagination uses `rel="next"`.
+    pub link: String,
 }
 
 /// Injectable GitHub REST transport (no network in tests).
@@ -99,8 +105,15 @@ impl GithubHttpTransport for ReqwestGithubHttpClient {
         builder = builder.header(reqwest::header::AUTHORIZATION, &request.authorization);
         let response = builder.send().await.map_err(|err| err.to_string())?;
         let status = response.status().as_u16();
+        // `http.Header.Get("Link")` returns the first value.
+        let link = response
+            .headers()
+            .get(reqwest::header::LINK)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_owned();
         let body = response.text().await.map_err(|err| err.to_string())?;
-        Ok(GithubHttpResponse { status, body })
+        Ok(GithubHttpResponse { status, body, link })
     }
 }
 
@@ -152,6 +165,23 @@ struct GithubEmail {
     verified: bool,
 }
 
+/// `githubsvc.Org` (only the field the allow-list matches).
+#[derive(Debug, Deserialize)]
+struct GithubOrg {
+    #[serde(default)]
+    login: String,
+}
+
+/// `githubsvc.Team` (only the fields the allow-list matches: `Name` +
+/// `Organization.Login`; the slug is *not* used by the baseline).
+#[derive(Debug, Deserialize)]
+struct GithubTeam {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    organization: Option<GithubOrg>,
+}
+
 /// The GitHub OAuth `SessionIssuerHelper`.
 pub struct GithubOAuthResolver<'a> {
     service_id: String,
@@ -162,6 +192,10 @@ pub struct GithubOAuthResolver<'a> {
     store: &'a dyn ProvisionStore,
     suffix: &'a dyn UsernameSuffixSource,
     sourcegraph_dotcom: bool,
+    /// `sessionIssuerHelper.allowOrgs`.
+    allow_orgs: Vec<String>,
+    /// `sessionIssuerHelper.allowOrgsMap` (org login → team names).
+    allow_orgs_map: BTreeMap<String, Vec<String>>,
 }
 
 impl<'a> GithubOAuthResolver<'a> {
@@ -186,7 +220,21 @@ impl<'a> GithubOAuthResolver<'a> {
             store,
             suffix,
             sourcegraph_dotcom,
+            allow_orgs: Vec::new(),
+            allow_orgs_map: BTreeMap::new(),
         }
+    }
+
+    /// `auth.providers[].allowOrgs` / `allowOrgsMap` (`sessionIssuerHelper`).
+    #[must_use]
+    pub fn with_org_restrictions(
+        mut self,
+        allow_orgs: Vec<String>,
+        allow_orgs_map: BTreeMap<String, Vec<String>>,
+    ) -> Self {
+        self.allow_orgs = allow_orgs;
+        self.allow_orgs_map = allow_orgs_map;
+        self
     }
 
     fn endpoint(&self, path: &str) -> String {
@@ -237,6 +285,126 @@ impl<'a> GithubOAuthResolver<'a> {
         verified
     }
 
+    fn paginated_request(&self, access_token: &str, path: &str, page: u32) -> GithubHttpRequest {
+        GithubHttpRequest {
+            method: "GET".to_owned(),
+            url: self.endpoint(&format!("{path}?per_page=100&page={page}")),
+            authorization: format!("Bearer {access_token}"),
+            accept: ACCEPT_PREVIEWS.iter().map(|v| (*v).to_owned()).collect(),
+        }
+    }
+
+    /// `V3Client.GetAuthenticatedUserOrgs` (`/user/orgs`), returning the page
+    /// and `respState.hasNextPage()`.
+    async fn fetch_orgs(
+        &self,
+        access_token: &str,
+        page: u32,
+    ) -> Result<(Vec<GithubOrg>, bool), ()> {
+        let request = self.paginated_request(access_token, "/user/orgs", page);
+        let response = self.http.execute(&request).await.map_err(|_| ())?;
+        let has_next = response.link.contains("rel=\"next\"");
+        // `doRequest` leaves `result` untouched for 204/304.
+        if response.status == 204 || response.status == 304 {
+            return Ok((Vec::new(), has_next));
+        }
+        if !(200..400).contains(&response.status) {
+            return Err(());
+        }
+        let orgs = serde_json::from_str(&response.body).map_err(|_| ())?;
+        Ok((orgs, has_next))
+    }
+
+    /// `V3Client.GetAuthenticatedUserTeams` (`/user/teams`).
+    async fn fetch_teams(
+        &self,
+        access_token: &str,
+        page: u32,
+    ) -> Result<(Vec<GithubTeam>, bool), ()> {
+        let request = self.paginated_request(access_token, "/user/teams", page);
+        let response = self.http.execute(&request).await.map_err(|_| ())?;
+        let has_next = response.link.contains("rel=\"next\"");
+        if response.status == 204 || response.status == 304 {
+            return Ok((Vec::new(), has_next));
+        }
+        if !(200..400).contains(&response.status) {
+            return Err(());
+        }
+        let teams = serde_json::from_str(&response.body).map_err(|_| ())?;
+        Ok((teams, has_next))
+    }
+
+    /// `sessionIssuerHelper.verifyUserOrgs`: page through `/user/orgs` and
+    /// match `Org.Login`; an API error is a denial.
+    async fn verify_user_orgs(&self, access_token: &str) -> bool {
+        let allowed: BTreeSet<&str> = self.allow_orgs.iter().map(String::as_str).collect();
+        let mut page = 1u32;
+        loop {
+            let Ok((orgs, has_next)) = self.fetch_orgs(access_token, page).await else {
+                return false;
+            };
+            if orgs.iter().any(|org| allowed.contains(org.login.as_str())) {
+                return true;
+            }
+            if !has_next {
+                return false;
+            }
+            page += 1;
+        }
+    }
+
+    /// `sessionIssuerHelper.verifyUserTeams`: match `Team.Name` under
+    /// `Team.Organization.Login` (not the slug); an API error is a denial.
+    async fn verify_user_teams(&self, access_token: &str) -> bool {
+        let allowed: BTreeMap<&str, BTreeSet<&str>> = self
+            .allow_orgs_map
+            .iter()
+            .map(|(org, teams)| {
+                (
+                    org.as_str(),
+                    teams.iter().map(String::as_str).collect::<BTreeSet<_>>(),
+                )
+            })
+            .collect();
+        let mut page = 1u32;
+        loop {
+            let Ok((teams, has_next)) = self.fetch_teams(access_token, page).await else {
+                return false;
+            };
+            let matched = teams.iter().any(|team| {
+                let Some(org) = team.organization.as_ref() else {
+                    return false;
+                };
+                allowed
+                    .get(org.login.as_str())
+                    .is_some_and(|names| names.contains(team.name.as_str()))
+            });
+            if matched {
+                return true;
+            }
+            if !has_next {
+                return false;
+            }
+            page += 1;
+        }
+    }
+
+    /// `sessionIssuerHelper.verifyUserOrgsAndTeams`: both allow-lists empty is
+    /// an unconditional pass with **zero** extra API calls; otherwise orgs are
+    /// checked before teams and either match passes.
+    async fn verify_user_orgs_and_teams(&self, access_token: &str) -> bool {
+        if self.allow_orgs.is_empty() && self.allow_orgs_map.is_empty() {
+            return true;
+        }
+        if !self.allow_orgs.is_empty() && self.verify_user_orgs(access_token).await {
+            return true;
+        }
+        if !self.allow_orgs_map.is_empty() && self.verify_user_teams(access_token).await {
+            return true;
+        }
+        false
+    }
+
     /// `sessionIssuerHelper.GetOrCreateUser`. Public so the differential
     /// harness can call it with a bare access token.
     pub async fn resolve(&self, access_token: &str) -> UserResolution {
@@ -261,6 +429,14 @@ impl<'a> GithubOAuthResolver<'a> {
         if verified_emails.is_empty() {
             return UserResolution::Failed {
                 safe_message: NO_VERIFIED_EMAIL.to_owned(),
+            };
+        }
+
+        // 🚨 SECURITY: Ensure the user belongs to one of the allow-listed orgs
+        // or teams, if any. No allow-list means no extra API calls.
+        if !self.verify_user_orgs_and_teams(access_token).await {
+            return UserResolution::Failed {
+                safe_message: NOT_ALLOWED_ORGS_OR_TEAMS.to_owned(),
             };
         }
 

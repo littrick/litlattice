@@ -32,6 +32,7 @@
 //! * GitLab/OIDC seams do not carry `avatar_url` (the baseline stores
 //!   `gUser.AvatarURL` / `claims.Picture` on user creation).
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -42,19 +43,19 @@ use sqlx::PgPool;
 
 use sg_config::SiteConfiguration;
 
-use crate::gitlab_oauth::{
-    self, GitlabApiClient, GitlabHttpResponse, GitlabOAuthProvider, GitlabUserRequest,
-    GitlabUserResolver, ProvisionOutcome as GitlabProvisionOutcome,
-    ProvisionError as GitlabProvisionError, Provisioner as GitlabProvisioner,
-};
 use crate::github_oauth::{
     GithubHttpTransport, GithubOAuthResolver, ReqwestGithubHttpClient, GITHUB_SERVICE_TYPE,
+};
+use crate::gitlab_oauth::{
+    self, GitlabApiClient, GitlabHttpResponse, GitlabOAuthProvider, GitlabUserRequest,
+    GitlabUserResolver, ProvisionError as GitlabProvisionError,
+    ProvisionOutcome as GitlabProvisionOutcome, Provisioner as GitlabProvisioner,
 };
 use crate::oauth_login::{LoginState, OAuthToken, OAuthUserResolver, UserResolution};
 use crate::oauth_routes::OAuthUserResolverRegistry;
 use crate::oidc_login::{
     self, OidcHttpClient, OidcHttpResponse, OidcLoginResolver, OpenIdConnectAuthProvider,
-    ProvisionOutcome as OidcProvisionOutcome, ProvisionError as OidcProvisionError,
+    ProvisionError as OidcProvisionError, ProvisionOutcome as OidcProvisionOutcome,
     Provisioner as OidcProvisioner,
 };
 use crate::user_provisioning::{
@@ -103,7 +104,11 @@ impl ReqwestGitlabApiClient {
             .and_then(|value| value.to_str().ok())
             .unwrap_or_default()
             .to_owned();
-        let body = response.bytes().await.map_err(|err| err.to_string())?.to_vec();
+        let body = response
+            .bytes()
+            .await
+            .map_err(|err| err.to_string())?
+            .to_vec();
         Ok(GitlabHttpResponse {
             status,
             content_type,
@@ -162,7 +167,11 @@ impl OidcHttpClient for ReqwestOidcHttpClient {
         }
         let response = builder.send().await.map_err(|err| err.to_string())?;
         let status = response.status().as_u16();
-        let body = response.bytes().await.map_err(|err| err.to_string())?.to_vec();
+        let body = response
+            .bytes()
+            .await
+            .map_err(|err| err.to_string())?
+            .to_vec();
         Ok(OidcHttpResponse { status, body })
     }
 }
@@ -175,7 +184,6 @@ impl OidcHttpClient for ReqwestOidcHttpClient {
 struct GitlabProvisionerAdapter {
     pool: PgPool,
     dotcom: bool,
-    client_id: String,
 }
 
 impl GitlabProvisionerAdapter {
@@ -194,15 +202,13 @@ impl GitlabProvisionerAdapter {
         let identity = ExternalIdentity {
             service_type: &identity.service_type,
             service_id: &identity.service_id,
-            client_id: &self.client_id,
+            client_id: &identity.client_id,
             account_id: &identity.account_id,
             login: &identity.login,
             email: &identity.email,
             email_verified: identity.email_verified,
             display_name: identity.display_name.as_deref().unwrap_or_default(),
-            // The GitLab seam does not carry the avatar URL; see the module
-            // errata.
-            avatar_url: "",
+            avatar_url: &identity.avatar_url,
             create_if_not_exist,
         };
         match user_provisioning::get_or_create_user(&deps, &identity).await {
@@ -238,7 +244,6 @@ impl GitlabProvisioner for GitlabProvisionerAdapter {
 struct OidcProvisionerAdapter {
     pool: PgPool,
     dotcom: bool,
-    client_id: String,
     create_if_not_exist: bool,
 }
 
@@ -258,15 +263,13 @@ impl OidcProvisioner for OidcProvisionerAdapter {
         let identity = ExternalIdentity {
             service_type: identity.service_type,
             service_id: identity.service_id,
-            client_id: &self.client_id,
+            client_id: identity.client_id,
             account_id: identity.account_id,
             login: identity.login,
             email: identity.email,
             email_verified: identity.email_verified,
             display_name: identity.display_name.unwrap_or_default(),
-            // The OIDC seam does not carry the avatar URL; see the module
-            // errata (`claims.Picture` is dropped).
-            avatar_url: "",
+            avatar_url: identity.avatar_url,
             create_if_not_exist: self.create_if_not_exist,
         };
         match user_provisioning::get_or_create_user(&deps, &identity).await {
@@ -297,6 +300,10 @@ struct GithubConfig {
     client_id: String,
     allow_signup: bool,
     base_url: String,
+    /// `auth.providers[].allowOrgs`.
+    allow_orgs: Vec<String>,
+    /// `auth.providers[].allowOrgsMap` (org login → allowed team names).
+    allow_orgs_map: BTreeMap<String, Vec<String>>,
 }
 
 impl GithubConfig {
@@ -310,6 +317,28 @@ fn string_field(obj: &serde_json::Map<String, serde_json::Value>, key: &str) -> 
         .and_then(serde_json::Value::as_str)
         .unwrap_or_default()
         .to_owned()
+}
+
+fn string_list(value: Option<&serde_json::Value>) -> Vec<String> {
+    value
+        .and_then(serde_json::Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn allow_orgs_map(value: Option<&serde_json::Value>) -> BTreeMap<String, Vec<String>> {
+    let Some(map) = value.and_then(serde_json::Value::as_object) else {
+        return BTreeMap::new();
+    };
+    map.iter()
+        .map(|(org, teams)| (org.clone(), string_list(Some(teams))))
+        .collect()
 }
 
 /// `extsvc.NormalizeBaseURL`: lowercase the host and keep a trailing `/` on the
@@ -356,6 +385,8 @@ fn github_configs(site: &SiteConfiguration) -> Vec<GithubConfig> {
                 .and_then(serde_json::Value::as_bool)
                 .unwrap_or(false),
             base_url: raw_url,
+            allow_orgs: string_list(obj.get("allowOrgs")),
+            allow_orgs_map: allow_orgs_map(obj.get("allowOrgsMap")),
         });
     }
     configs
@@ -387,11 +418,9 @@ fn oidc_configs(site: &SiteConfiguration) -> Vec<OpenIdConnectAuthProvider> {
         if obj.get("type").and_then(serde_json::Value::as_str) != Some("openidconnect") {
             continue;
         }
-        let Ok(mut config) =
-            serde_json::from_value::<OpenIdConnectAuthProvider>(serde_json::Value::Object(
-                obj.clone(),
-            ))
-        else {
+        let Ok(mut config) = serde_json::from_value::<OpenIdConnectAuthProvider>(
+            serde_json::Value::Object(obj.clone()),
+        ) else {
             continue;
         };
         if config.provider_type.is_empty() {
@@ -440,6 +469,8 @@ struct GithubResolverAdapter {
     allow_signup: bool,
     base_url: String,
     dotcom: bool,
+    allow_orgs: Vec<String>,
+    allow_orgs_map: BTreeMap<String, Vec<String>>,
     http: Arc<dyn GithubHttpTransport>,
     pool: PgPool,
 }
@@ -470,7 +501,8 @@ impl OAuthUserResolver for GithubResolverAdapter {
             &store,
             &suffix,
             self.dotcom,
-        );
+        )
+        .with_org_restrictions(self.allow_orgs.clone(), self.allow_orgs_map.clone());
         resolver.get_or_create_user(token).await
     }
 }
@@ -553,6 +585,8 @@ impl OAuthResolverWiring {
                     allow_signup: config.allow_signup,
                     base_url: config.base_url.clone(),
                     dotcom,
+                    allow_orgs: config.allow_orgs.clone(),
+                    allow_orgs_map: config.allow_orgs_map.clone(),
                     http: Arc::clone(&http),
                     pool: pool.clone(),
                 }) as Arc<dyn OAuthUserResolver>
@@ -576,12 +610,10 @@ impl OAuthResolverWiring {
                     .as_deref()
                     .and_then(|id| providers.iter().find(|provider| provider.config_id() == id))
                     .unwrap_or(&providers[0]);
-                let provisioner: Arc<dyn GitlabProvisioner> =
-                    Arc::new(GitlabProvisionerAdapter {
-                        pool: pool.clone(),
-                        dotcom,
-                        client_id: provider.client_id.clone(),
-                    });
+                let provisioner: Arc<dyn GitlabProvisioner> = Arc::new(GitlabProvisionerAdapter {
+                    pool: pool.clone(),
+                    dotcom,
+                });
                 Arc::new(GitlabUserResolver::new(
                     provider,
                     Arc::clone(&api),
@@ -618,7 +650,6 @@ impl OAuthResolverWiring {
                 let provisioner: Arc<dyn OidcProvisioner> = Arc::new(OidcProvisionerAdapter {
                     pool: pool.clone(),
                     dotcom,
-                    client_id: config.client_id.clone(),
                     create_if_not_exist,
                 });
                 let resolver = OidcLoginResolver::new(
@@ -718,11 +749,15 @@ mod tests {
         let registry = OAuthUserResolverRegistry::new();
         wiring().register(&registry, &site());
         assert_eq!(
-            registry.get_for("github", None).map(|r| r.service_id().to_owned()),
+            registry
+                .get_for("github", None)
+                .map(|r| r.service_id().to_owned()),
             Some("https://github.example/".to_owned())
         );
         assert_eq!(
-            registry.get_for("gitlab", None).map(|r| r.service_id().to_owned()),
+            registry
+                .get_for("gitlab", None)
+                .map(|r| r.service_id().to_owned()),
             Some("https://gitlab.example/".to_owned())
         );
         assert_eq!(

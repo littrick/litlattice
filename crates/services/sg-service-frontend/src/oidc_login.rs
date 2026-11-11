@@ -738,11 +738,15 @@ pub async fn fetch_user_info(
 pub struct ExternalIdentity<'a> {
     pub service_type: &'a str,
     pub service_id: &'a str,
+    /// `extsvc.AccountSpec.ClientID` (`p.ClientID`).
+    pub client_id: &'a str,
     pub account_id: &'a str,
     pub login: &'a str,
     pub email: &'a str,
     pub email_verified: bool,
     pub display_name: Option<&'a str>,
+    /// `UserProps.AvatarURL` (`claims.Picture`).
+    pub avatar_url: &'a str,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -987,11 +991,13 @@ impl OidcLoginResolver {
         let identity = ExternalIdentity {
             service_type: &self.config.provider_type,
             service_id: &self.config.issuer,
+            client_id: &self.config.client_id,
             account_id: &id_token.subject,
             login: &login,
             email: &userinfo.email,
             email_verified: true,
             display_name: Some(&display_name),
+            avatar_url: &userinfo.claims.picture,
         };
         match self.provisioner.get_or_create_user(&identity).await {
             Ok(ProvisionOutcome::Created { user_id }) => UserResolution::Created {

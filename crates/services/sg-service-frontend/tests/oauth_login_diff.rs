@@ -529,6 +529,7 @@ fn oauth_login_harness() {
             scopes: case.provider.scopes.clone(),
             redirect_url: case.provider.redirect_url.clone(),
             config_id: format!("{}::{}", case.provider.service_id, case.provider.client_id),
+            sso_url: String::new(),
         };
         let providers = OAuthProviders::from_configs(vec![provider.clone()]);
         let store = Arc::new(RecordingStore::default());

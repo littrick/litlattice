@@ -100,6 +100,8 @@ impl Provisioner for FakeProvisioner {
             email: identity.email.to_owned(),
             email_verified: identity.email_verified,
             display_name: identity.display_name.unwrap_or_default().to_owned(),
+            client_id: identity.client_id.to_owned(),
+            avatar_url: identity.avatar_url.to_owned(),
         });
         match self.outcome.as_str() {
             "error" => Err(ProvisionError {
@@ -177,6 +179,8 @@ struct IdentityOut {
     email: String,
     email_verified: bool,
     display_name: String,
+    client_id: String,
+    avatar_url: String,
 }
 
 #[derive(Serialize)]

@@ -202,6 +202,10 @@ struct ProvisionedOut {
     display_name: String,
     #[serde(rename = "createIfNotExist")]
     create_if_not_exist: bool,
+    #[serde(rename = "clientId")]
+    client_id: String,
+    #[serde(rename = "avatarUrl")]
+    avatar_url: String,
 }
 
 #[derive(Serialize)]
@@ -390,6 +394,8 @@ impl Provisioner for FakeProvisioner {
             email_verified: identity.email_verified,
             display_name: identity.display_name.clone().unwrap_or_default(),
             create_if_not_exist,
+            client_id: identity.client_id.clone(),
+            avatar_url: identity.avatar_url.clone(),
         });
         match self.mode.as_str() {
             "created" => Ok(ProvisionOutcome::Created {

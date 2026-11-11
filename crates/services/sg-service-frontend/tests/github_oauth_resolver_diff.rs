@@ -149,6 +149,7 @@ impl GithubHttpTransport for FakeHttp {
         Ok(GithubHttpResponse {
             status: api.status,
             body: api.body.clone(),
+            link: String::new(),
         })
     }
 }
