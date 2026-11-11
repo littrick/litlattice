@@ -720,6 +720,7 @@ mod tests {
                 ..FileMatch::default()
             }],
             crashes: 0,
+            ..SearchChunk::default()
         }
     }
 

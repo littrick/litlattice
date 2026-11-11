@@ -807,6 +807,7 @@ mod tests {
                 ..FileMatch::default()
             }],
             crashes: 0,
+            ..sg_zoekt::types::SearchChunk::default()
         }
     }
 
