@@ -438,13 +438,13 @@ fn config_id_or_hash(obj: &Map<String, Value>, canonical: &str) -> String {
 
 /// `base64.RawURLEncoding.EncodeToString(sha256(data)[:16])`
 /// (`openidconnect/config.go:134-145`, `saml/config.go:176-189`).
-fn hash_config_id(canonical: &str) -> String {
+pub(crate) fn hash_config_id(canonical: &str) -> String {
     let digest = Sha256::digest(canonical.as_bytes());
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&digest[..16])
 }
 
 /// `saml.withConfigDefaults` (`saml/config.go:144-158`).
-fn saml_service_provider_issuer(obj: &Map<String, Value>, external_url: &str) -> String {
+pub(crate) fn saml_service_provider_issuer(obj: &Map<String, Value>, external_url: &str) -> String {
     let configured = string_field(obj, "serviceProviderIssuer");
     if !configured.is_empty() || external_url.is_empty() {
         return configured;
@@ -649,7 +649,7 @@ fn go_json_oidc(obj: &Map<String, Value>) -> String {
 
 /// `schema.SAMLAuthProvider` (field declaration order), after
 /// `withConfigDefaults` has filled `serviceProviderIssuer`.
-fn go_json_saml(obj: &Map<String, Value>, default_issuer: &str) -> String {
+pub(crate) fn go_json_saml(obj: &Map<String, Value>, default_issuer: &str) -> String {
     let mut fields = GoFields::new();
     push_string_slice(&mut fields, "allowGroups", obj);
     push_pointer_bool(&mut fields, "allowSignup", obj);
