@@ -163,6 +163,7 @@ pub async fn external_response_with_ipallowlist_async<'a, B, F>(
     next: F,
 ) -> Response<BoxBody>
 where
+    B: hyper::body::Body<Data = Bytes> + Unpin,
     F: for<'b> FnOnce(
         &'b mut Request<B>,
     ) -> std::pin::Pin<
@@ -247,7 +248,7 @@ pub fn external_handler(
                             Box::pin(async move {
                                 match route {
                                     mux::Route::App => {
-                                        app_router::dispatch_async(
+                                        app_router::dispatch_async_with_body(
                                             request,
                                             &app_env,
                                             &app_config,
@@ -436,7 +437,7 @@ pub fn external_handler_with_live(
                                         .await
                                     }
                                     mux::Route::App => {
-                                        app_router::dispatch_async(
+                                        app_router::dispatch_async_with_body(
                                             request,
                                             &app_env,
                                             &app_config,
