@@ -22,6 +22,8 @@
 //!
 //! Only the operations the current workers need are implemented here.
 
+pub mod gcs;
+
 use std::fmt;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -48,6 +50,8 @@ pub struct S3Config {
     pub session_token: String,
 }
 
+pub use gcs::{GcsConfig, GcsError, GcsHttpRequest, GcsHttpResponse, GcsStore, GcsTransport};
+
 /// `object.StorageConfig`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct StorageConfig {
@@ -55,6 +59,7 @@ pub struct StorageConfig {
     pub manage_bucket: bool,
     pub bucket: String,
     pub s3: S3Config,
+    pub gcs: GcsConfig,
 }
 
 impl StorageConfig {

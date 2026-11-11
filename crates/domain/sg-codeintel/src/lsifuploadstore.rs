@@ -179,6 +179,7 @@ pub fn storage_config(config: &Config) -> Result<sg_objectstorage::StorageConfig
                 secret_access_key: config.s3_secret_access_key.clone(),
                 session_token: config.s3_session_token.clone(),
             },
+            gcs: sg_objectstorage::GcsConfig::default(),
         }
         .normalize()),
         "gcs" => Err("GCS upload storage is not implemented by the Rust worker".to_owned()),

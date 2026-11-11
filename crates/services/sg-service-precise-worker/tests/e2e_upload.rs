@@ -100,6 +100,7 @@ async fn e2e_upload_matches_go_harness() {
                 secret_access_key: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_owned(),
                 session_token: String::new(),
             },
+            gcs: Default::default(),
         })
         .await
         .expect("construct object store"),

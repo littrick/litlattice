@@ -136,6 +136,7 @@ async fn prelude_diff() {
                 secret_access_key: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_owned(),
                 session_token: String::new(),
             },
+            gcs: Default::default(),
         })
         .await
         .expect("construct object store"),

@@ -927,6 +927,65 @@ impl ObjectStorageBackend for sg_objectstorage::ObjectStore {
     }
 }
 
+#[async_trait]
+impl ObjectStorageBackend for sg_objectstorage::GcsStore {
+    async fn init(&self) -> Result<(), String> {
+        sg_objectstorage::GcsStore::init(self)
+            .await
+            .map_err(|err| err.to_string())
+    }
+
+    async fn get(&self, key: &str) -> Result<Vec<u8>, String> {
+        sg_objectstorage::GcsStore::get(self, key)
+            .await
+            .map_err(|err| err.to_string())
+    }
+
+    async fn upload(&self, key: &str, data: Vec<u8>) -> Result<i64, String> {
+        sg_objectstorage::GcsStore::upload(self, key, &data)
+            .await
+            .map_err(|err| err.to_string())
+    }
+
+    async fn delete(&self, key: &str) -> Result<(), String> {
+        sg_objectstorage::GcsStore::delete(self, key)
+            .await
+            .map_err(|err| err.to_string())
+    }
+
+    async fn list_objects(&self, prefix: &str) -> Result<Vec<String>, String> {
+        sg_objectstorage::GcsStore::list_objects(self, prefix)
+            .await
+            .map_err(|err| err.to_string())
+    }
+
+    async fn expire_objects(&self, prefix: &str, max_age: Duration) -> Result<(), String> {
+        sg_objectstorage::GcsStore::expire_objects(self, prefix, max_age)
+            .await
+            .map_err(|err| err.to_string())
+    }
+}
+
+/// `object.NewFromConfig`: dispatch on `StorageConfig.Backend` to the S3 or GCS
+/// store, wrapped in [`LazyObjectStorage`] like the baseline.
+pub async fn new_object_storage(
+    config: sg_objectstorage::StorageConfig,
+) -> Result<Arc<dyn ObjectStorageBackend>, String> {
+    match config.backend.as_str() {
+        "gcs" => {
+            let store = sg_objectstorage::GcsStore::new(config).map_err(|err| err.to_string())?;
+            Ok(Arc::new(LazyObjectStorage::new(Arc::new(store))))
+        }
+        "s3" | "blobstore" => {
+            let store = sg_objectstorage::ObjectStore::new(config)
+                .await
+                .map_err(|err| err.to_string())?;
+            Ok(Arc::new(LazyObjectStorage::new(Arc::new(store))))
+        }
+        other => Err(format!("unsupported object storage backend {other:?}")),
+    }
+}
+
 /// `object.CreateLazyStorage`: `Init` runs on first use, and a broken bucket
 /// does not fail worker startup.
 pub struct LazyObjectStorage<B: ObjectStorageBackend> {
@@ -983,18 +1042,18 @@ impl<B: ObjectStorageBackend> ObjectStorageBackend for LazyObjectStorage<B> {
 }
 
 /// `object.Storage` behind the service's [`UploadStore`] seam.
-pub struct ObjectStorageUploadStore<B: ObjectStorageBackend> {
+pub struct ObjectStorageUploadStore<B: ObjectStorageBackend + ?Sized> {
     backend: Arc<B>,
 }
 
-impl<B: ObjectStorageBackend> ObjectStorageUploadStore<B> {
+impl<B: ObjectStorageBackend + ?Sized> ObjectStorageUploadStore<B> {
     pub fn new(backend: Arc<B>) -> ObjectStorageUploadStore<B> {
         ObjectStorageUploadStore { backend }
     }
 }
 
 #[async_trait]
-impl<B: ObjectStorageBackend> UploadStore for ObjectStorageUploadStore<B> {
+impl<B: ObjectStorageBackend + ?Sized> UploadStore for ObjectStorageUploadStore<B> {
     async fn get(&self, key: &str) -> Result<Vec<u8>, String> {
         self.backend.get(key).await
     }
@@ -1016,18 +1075,18 @@ impl<B: ObjectStorageBackend> UploadStore for ObjectStorageUploadStore<B> {
 }
 
 /// `object.Storage` behind the janitor's `JobLogsBlobStore` seam.
-pub struct ObjectStorageLogBlobStore<B: ObjectStorageBackend> {
+pub struct ObjectStorageLogBlobStore<B: ObjectStorageBackend + ?Sized> {
     backend: Arc<B>,
 }
 
-impl<B: ObjectStorageBackend> ObjectStorageLogBlobStore<B> {
+impl<B: ObjectStorageBackend + ?Sized> ObjectStorageLogBlobStore<B> {
     pub fn new(backend: Arc<B>) -> ObjectStorageLogBlobStore<B> {
         ObjectStorageLogBlobStore { backend }
     }
 }
 
 #[async_trait]
-impl<B: ObjectStorageBackend> crate::jobs::exhaustive_search_janitor::JobLogsBlobStore
+impl<B: ObjectStorageBackend + ?Sized> crate::jobs::exhaustive_search_janitor::JobLogsBlobStore
     for ObjectStorageLogBlobStore<B>
 {
     async fn upload(&self, key: &str, contents: Vec<u8>) -> Result<i64, String> {

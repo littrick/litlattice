@@ -47,6 +47,7 @@ async fn blobstore_roundtrip() {
             ),
             ..S3Config::default()
         },
+        gcs: Default::default(),
     };
     let store = ObjectStore::new(config).await.expect("client construction");
 

@@ -58,7 +58,7 @@ use serde::{Deserialize, Serialize};
 use sg_config::{LiveConfig, SiteConfiguration};
 use sg_db::OffsetDateTime;
 use sg_licensing::license_key_based_access_token;
-use sg_objectstorage::{S3Config, StorageConfig};
+use sg_objectstorage::{GcsConfig, S3Config, StorageConfig};
 use sqlx::postgres::PgPool;
 use sqlx::Row;
 use tokio_util::sync::CancellationToken;
@@ -68,7 +68,7 @@ use crate::framework::dbworker::{
 };
 use crate::framework::BackgroundRoutine;
 use crate::jobs::batches::parse_strconv_bool;
-use crate::jobs::exhaustive_search_service::{LazyObjectStorage, ObjectStorageBackend};
+use crate::jobs::exhaustive_search_service::{new_object_storage, ObjectStorageBackend};
 use crate::jobs::repo_embedding_scheduler::{embeddings_config, force_allow_embeddings};
 use crate::jobs::{Job, JobConfig, JobDeps};
 use crate::paths::{compile, GlobPattern};
@@ -2127,6 +2127,7 @@ impl JobConfig for EmbeddingsObjectStorageConfig {
         }
 
         let mut s3 = S3Config::default();
+        let mut gcs = GcsConfig::default();
         if matches!(backend.as_str(), "blobstore" | "s3") {
             s3.region = env.get(
                 "EMBEDDINGS_UPLOAD_AWS_REGION",
@@ -2171,17 +2172,17 @@ impl JobConfig for EmbeddingsObjectStorageConfig {
                 );
             }
         } else if backend == "gcs" {
-            let _ = env.get(
+            gcs.project_id = env.get(
                 "EMBEDDINGS_UPLOAD_GCP_PROJECT_ID",
                 "",
                 "The project containing the GCS bucket.",
             );
-            let _ = env.get(
+            gcs.credentials_file = env.get(
                 "EMBEDDINGS_UPLOAD_GOOGLE_APPLICATION_CREDENTIALS_FILE",
                 "",
                 "The path to a service account key file with access to GCS.",
             );
-            let _ = env.get(
+            gcs.credentials_file_contents = env.get(
                 "EMBEDDINGS_UPLOAD_GOOGLE_APPLICATION_CREDENTIALS_FILE_CONTENT",
                 "",
                 "The contents of a service account key file with access to GCS.",
@@ -2197,6 +2198,7 @@ impl JobConfig for EmbeddingsObjectStorageConfig {
                 manage_bucket,
                 bucket,
                 s3,
+                gcs,
             }
             .normalize(),
         );
@@ -2219,7 +2221,7 @@ impl JobConfig for EmbeddingsObjectStorageConfig {
     }
 }
 
-/// `embeddings.NewObjectStorage`'s storage config; GCS is not ported.
+/// `embeddings.NewObjectStorage`'s storage config.
 pub fn object_storage_config(
     config: &EmbeddingsObjectStorageConfig,
 ) -> Result<StorageConfig, String> {
@@ -2227,8 +2229,7 @@ pub fn object_storage_config(
         .storage()
         .ok_or_else(|| "embeddings object storage config was not loaded".to_owned())?;
     match storage.backend.as_str() {
-        "s3" | "blobstore" => Ok(storage),
-        "gcs" => Err("not ported: GCS object storage".to_owned()),
+        "s3" | "blobstore" | "gcs" => Ok(storage),
         other => Err(format!("unsupported object storage backend {other:?}")),
     }
 }
@@ -2265,11 +2266,7 @@ impl Job for RepoEmbeddingJob {
         _setup_ctx: CancellationToken,
     ) -> Result<Vec<BackgroundRoutine>, String> {
         let storage = object_storage_config(&self.storage)?;
-        let backend = sg_objectstorage::ObjectStore::new(storage)
-            .await
-            .map_err(|err| err.to_string())?;
-        let upload: Arc<dyn ObjectStorageBackend> =
-            Arc::new(LazyObjectStorage::new(Arc::new(backend)));
+        let upload: Arc<dyn ObjectStorageBackend> = new_object_storage(storage).await?;
 
         let unified = deps.live_config.current();
         let git: Arc<dyn GitServer> = Arc::new(sg_git::GitserverClient::new(
