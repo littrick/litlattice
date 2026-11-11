@@ -424,6 +424,10 @@ pub struct SchemaGraphqlDeps {
     /// the pre-wiring frontend: the `search` root field has no prefetched
     /// value and resolves as unported (`null`).
     search_executor: Option<Arc<dyn crate::search_graphql::SearchExecutor>>,
+    /// `Repository.commit`, `GitObject` and `GitRef.target`'s gitserver seam
+    /// (M9.8ix). `None` reproduces the pre-wiring frontend: those fields
+    /// resolve as unported (`null`/error).
+    git_objects: Option<Arc<dyn crate::git_graphql::GitObjectSource>>,
 }
 
 impl SchemaGraphqlDeps {
@@ -453,6 +457,7 @@ impl SchemaGraphqlDeps {
             ranking: None,
             ranking_service: None,
             search_executor: None,
+            git_objects: None,
         }
     }
 
@@ -499,6 +504,7 @@ impl SchemaGraphqlDeps {
             ranking: None,
             ranking_service: None,
             search_executor: None,
+            git_objects: None,
         }
     }
 
@@ -711,6 +717,20 @@ impl SchemaGraphqlDeps {
         self
     }
 
+    /// Wire the gitserver object/commit seam (M9.8ix).
+    ///
+    /// `Repository.commit`, `GitObject` and `GitRef.target` read through
+    /// gitserver, so `exec` performs those lookups asynchronously and replays
+    /// them through the synchronous resolvers. When never called the fields
+    /// keep their pre-wiring (unported) behavior.
+    pub fn with_git_objects(
+        mut self,
+        source: Arc<dyn crate::git_graphql::GitObjectSource>,
+    ) -> Self {
+        self.git_objects = Some(source);
+        self
+    }
+
     /// Assemble the M9.8ii production surfaces in one testable step.
     ///
     /// This is the same chain `service.rs` uses: search contexts are gated by
@@ -777,6 +797,7 @@ impl SchemaGraphqlDeps {
             ranking: None,
             ranking_service: None,
             search_executor: None,
+            git_objects: None,
         }
     }
 }
@@ -1061,6 +1082,24 @@ impl GraphqlDeps for SchemaGraphqlDeps {
             }
             _ => crate::graphql_resolvers::NodeRoots::default(),
         };
+        // `Repository.commit`, `GitObject` and `GitRef.target` (M9.8ix) read
+        // through gitserver; perform those lookups now and replay them from the
+        // synchronous resolvers. `repositories`/`repository_redirects`/`nodes`/
+        // `search_root` are still owned here (they move into the roots below).
+        let git = match &self.git_objects {
+            Some(source) => Some(Arc::new(
+                crate::git_graphql::prefetch_git(
+                    source.as_ref(),
+                    &repositories,
+                    &repository_redirects,
+                    &nodes,
+                    search_root.as_ref(),
+                    &fields,
+                )
+                .await,
+            )),
+            None => None,
+        };
         // `Query.namespace`/`Query.namespaceByName` share the user/org store
         // seam with `Query.node`.
         let namespaces = match &self.org_memberships {
@@ -1235,7 +1274,8 @@ impl GraphqlDeps for SchemaGraphqlDeps {
             .with_mutation(mutation)
             .with_search_contexts(self.search_contexts.clone())
             .with_ranking_roots(ranking_roots)
-            .with_search_roots(search_root);
+            .with_search_roots(search_root)
+            .with_git(git);
         if let Some(client_configuration) = client_configuration {
             roots = roots.with_client_configuration(client_configuration);
         }

@@ -41,6 +41,7 @@ use crate::search_contexts_schema::{
     SearchContextsFieldArgs, SearchContextsFieldValue, SearchContextsOperation,
     SearchContextsResolverDispatch,
 };
+use crate::search_stream::convert::MinimalRepo;
 use crate::settings_merge::{final_settings, DEFAULT_SETTINGS_CONTENTS};
 
 /// A search contexts GraphQL database handle. The extra auto-trait bounds keep
@@ -649,6 +650,33 @@ pub async fn prefetch_node_roots(
                 .await;
 
                 roots.webhook_logs.insert(id.to_owned(), lookup);
+            }
+            // `gitCommitByID`/`gitRefByID` both call `repositoryByID`
+            // (`db.Repos().Get`) before resolving the git data; prefetch the
+            // repository row here so `QueryRoot::field` only replays it.
+            "GitCommit" | "GitRef" => {
+                let repo_relay = if kind == "GitCommit" {
+                    crate::git_graphql::parse_git_commit_relay_id(id).map(|spec| spec.repository)
+                } else {
+                    crate::git_graphql::parse_git_ref_relay_id(id).map(|spec| spec.repository)
+                };
+                let Ok(repo_relay) = repo_relay else {
+                    continue;
+                };
+                let Ok(repo_id) = unmarshal_relay_id(&repo_relay) else {
+                    continue;
+                };
+                if roots.repositories.contains_key(&repo_id) {
+                    continue;
+                }
+                let lookup = match repositories
+                    .by_id(repo_id, viewer_uid(actor), viewer_site_admin)
+                    .await
+                {
+                    Ok(lookup) => lookup,
+                    Err(error) => RepoLookup::Error(error),
+                };
+                roots.repositories.insert(repo_id, lookup);
             }
             _ => {
                 let Ok(node_id) = unmarshal_relay_id(id) else {
@@ -1964,7 +1992,7 @@ pub trait CloneUrlResolver: Send + Sync {
 }
 
 /// What `Query.repository` arguments ask for.
-enum RepositoryArg {
+pub(crate) enum RepositoryArg {
     Key(RepoKey),
     /// `cloneURL` mapped through [`CloneUrlResolver`].
     CloneUrl(String),
@@ -1974,7 +2002,7 @@ enum RepositoryArg {
 
 /// `schemaResolver.Repository`: `uri` is a deprecated alias for `name` when
 /// `name` is absent (`graphqlbackend.go:847-856`).
-fn repository_arg(arguments: &Arguments) -> RepositoryArg {
+pub(crate) fn repository_arg(arguments: &Arguments) -> RepositoryArg {
     if let Some(name) = arguments.string("name") {
         return RepositoryArg::Key(RepoKey::Name(name.to_owned()));
     }
@@ -2303,6 +2331,7 @@ impl FrontendRootResolver {
                 search_contexts: None,
                 ranking_summary: None,
                 search: None,
+                git: None,
             },
             mutation: MutationRoot::default(),
         }
@@ -2336,6 +2365,12 @@ impl FrontendRootResolver {
     ) -> Self {
         self.query.search_contexts = search_contexts.clone();
         self.mutation.search_contexts = search_contexts;
+        self
+    }
+
+    /// Attach the request's prefetched git object/commit data (M9.8ix).
+    pub fn with_git(mut self, git: Option<Arc<crate::git_graphql::GitPrefetch>>) -> Self {
+        self.query.git = git;
         self
     }
 
@@ -2463,6 +2498,9 @@ struct QueryRoot {
     /// Prefetched `Query.search` (M9.8ie); `None` when the field was not
     /// selected or no search executor is injected.
     search: Option<crate::search_graphql::SearchRoot>,
+    /// Prefetched gitserver object/commit data (M9.8ix); `None` when no
+    /// `GitObjectSource` was injected (git fields stay unported).
+    git: Option<Arc<crate::git_graphql::GitPrefetch>>,
 }
 
 /// `Mutation` root: `settingsMutation`/log events/temporary settings/feature
@@ -2620,7 +2658,7 @@ impl QueryRoot {
                 let node_id = unmarshal_relay_id(id).map_err(ExecError::new)?;
                 match self.nodes.repositories.get(&node_id) {
                     Some(RepoLookup::Found(data)) => Ok(Some(FieldValue::Object(Arc::new(
-                        RepositoryObject::from_data(data.clone()),
+                        RepositoryObject::from_data(data.clone()).with_git(self.git.clone()),
                     )))),
                     Some(RepoLookup::NotFound) => Ok(Some(FieldValue::Null)),
                     Some(RepoLookup::Blocked { name, reason }) => Err(ExecError::new(format!(
@@ -2685,7 +2723,7 @@ impl ObjectValue for QueryRoot {
             "repository" => match repository_arg(arguments) {
                 RepositoryArg::Key(key) => match self.repositories.get(&key) {
                     Some(RepoLookup::Found(data)) => Ok(Some(FieldValue::Object(Arc::new(
-                        RepositoryObject::from_data(data.clone()),
+                        RepositoryObject::from_data(data.clone()).with_git(self.git.clone()),
                     )))),
                     Some(RepoLookup::NotFound) => Ok(Some(FieldValue::Null)),
                     Some(RepoLookup::Blocked { name, reason }) => Err(ExecError::new(format!(
@@ -2699,7 +2737,7 @@ impl ObjectValue for QueryRoot {
                 RepositoryArg::CloneUrl(clone_url) => {
                     match self.repositories.get(&RepoKey::CloneUrl(clone_url)) {
                         Some(RepoLookup::Found(data)) => Ok(Some(FieldValue::Object(Arc::new(
-                            RepositoryObject::from_data(data.clone()),
+                            RepositoryObject::from_data(data.clone()).with_git(self.git.clone()),
                         )))),
                         Some(RepoLookup::NotFound) => Ok(Some(FieldValue::Null)),
                         Some(RepoLookup::Blocked { name, reason }) => Err(ExecError::new(format!(
@@ -2720,7 +2758,7 @@ impl ObjectValue for QueryRoot {
             "repositoryRedirect" => match repository_redirect_arg(arguments) {
                 RepositoryRedirectArg::Key(key) => match self.repository_redirects.get(&key) {
                     Some(RepoLookup::Found(data)) => Ok(Some(FieldValue::Object(Arc::new(
-                        RepositoryObject::from_data(data.clone()),
+                        RepositoryObject::from_data(data.clone()).with_git(self.git.clone()),
                     )))),
                     Some(RepoLookup::NotFound) => Ok(Some(FieldValue::Null)),
                     Some(RepoLookup::Blocked { name, reason }) => Err(ExecError::new(format!(
@@ -2736,7 +2774,7 @@ impl ObjectValue for QueryRoot {
                         .get(&RepositoryRedirectKey::CloneUrl(clone_url))
                     {
                         Some(RepoLookup::Found(data)) => Ok(Some(FieldValue::Object(Arc::new(
-                            RepositoryObject::from_data(data.clone()),
+                            RepositoryObject::from_data(data.clone()).with_git(self.git.clone()),
                         )))),
                         Some(RepoLookup::NotFound) => Ok(Some(FieldValue::Null)),
                         Some(RepoLookup::Blocked { name, reason }) => Err(ExecError::new(format!(
@@ -2894,6 +2932,88 @@ impl ObjectValue for QueryRoot {
                         Some(Err(message)) => Err(ExecError::new(message.clone())),
                         None => Ok(None),
                     },
+                    // `NodeResolvers()["GitCommit"]` → `gitCommitByID`
+                    // (`git_commit.go:34-39`): `repositoryByID` then
+                    // `repo.Commit(Rev: oid)`. A missing revision is `null`.
+                    "GitCommit" => {
+                        let spec = crate::git_graphql::parse_git_commit_relay_id(id)
+                            .map_err(ExecError::new)?;
+                        let repo_id =
+                            unmarshal_relay_id(&spec.repository).map_err(ExecError::new)?;
+                        let data = match self.nodes.repositories.get(&repo_id) {
+                            Some(RepoLookup::Found(data)) => data.clone(),
+                            Some(RepoLookup::NotFound) => return Ok(Some(FieldValue::Null)),
+                            Some(RepoLookup::Blocked { name, reason }) => {
+                                return Err(ExecError::new(format!(
+                                    "repository {name} has been blocked. reason: {reason}"
+                                )))
+                            }
+                            Some(RepoLookup::Error(message)) => {
+                                return Err(ExecError::new(message.clone()))
+                            }
+                            None => return Ok(None),
+                        };
+                        let Some(git) = &self.git else {
+                            return Err(ExecError::new(
+                                "GitCommit requires a gitserver commit resolver, which is not ported",
+                            ));
+                        };
+                        match git.revisions.get(&(repo_id, spec.commit.clone())) {
+                            Some(crate::git_graphql::RevisionLookup::Found(oid)) => {
+                                let (commit, commit_error) = git.commit_data(repo_id, oid);
+                                Ok(Some(FieldValue::Object(Arc::new(
+                                    crate::git_graphql::GitCommitResolverObject {
+                                        repo: MinimalRepo {
+                                            id: data.id,
+                                            name: data.name.clone(),
+                                        },
+                                        oid: oid.clone(),
+                                        // `CommitFromID` uses `args.Rev`, the
+                                        // relay's "c" member.
+                                        input_rev: Some(spec.commit),
+                                        commit,
+                                        commit_error,
+                                        git: self.git.clone(),
+                                    },
+                                ))))
+                            }
+                            Some(crate::git_graphql::RevisionLookup::NotFound) => {
+                                Ok(Some(FieldValue::Null))
+                            }
+                            Some(crate::git_graphql::RevisionLookup::Error(message)) => {
+                                Err(ExecError::new(message.clone()))
+                            }
+                            None => Ok(None),
+                        }
+                    }
+                    // `NodeResolvers()["GitRef"]` → `gitRefByID`
+                    // (`git_ref.go:58-69`): a lazy `GitRefResolver`.
+                    "GitRef" => {
+                        let spec = crate::git_graphql::parse_git_ref_relay_id(id)
+                            .map_err(ExecError::new)?;
+                        let repo_id =
+                            unmarshal_relay_id(&spec.repository).map_err(ExecError::new)?;
+                        match self.nodes.repositories.get(&repo_id) {
+                            Some(RepoLookup::Found(data)) => Ok(Some(FieldValue::Object(
+                                Arc::new(crate::search_graphql::GitRefObject::new(
+                                    MinimalRepo {
+                                        id: data.id,
+                                        name: data.name.clone(),
+                                    },
+                                    spec.rev,
+                                    self.git.clone(),
+                                )),
+                            ))),
+                            Some(RepoLookup::NotFound) => Ok(Some(FieldValue::Null)),
+                            Some(RepoLookup::Blocked { name, reason }) => Err(ExecError::new(
+                                format!("repository {name} has been blocked. reason: {reason}"),
+                            )),
+                            Some(RepoLookup::Error(message)) => {
+                                Err(ExecError::new(message.clone()))
+                            }
+                            None => Ok(None),
+                        }
+                    }
                     _ => self.node_int32(kind.as_str(), id),
                 }
             }
@@ -3077,7 +3197,7 @@ impl ObjectValue for QueryRoot {
             // `schemaResolver.Search` (M9.8ie): the async plan/execute result
             // was prefetched in `SchemaGraphqlDeps::exec`.
             "search" => match &self.search {
-                Some(root) => crate::search_graphql::search_field(root),
+                Some(root) => crate::search_graphql::search_field(root, self.git.clone()),
                 None => Ok(None),
             },
             // `SearchContextsResolver` root fields (`search_contexts.go:20-39`):
@@ -4417,11 +4537,28 @@ impl ObjectValue for OrgConnectionObject {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RepositoryObject {
     data: RepositoryData,
+    /// The request's git prefetch data (M9.8ix); `None` leaves `commit` and
+    /// `GitRef.target` unported, matching a transport-only resolver.
+    git: Option<Arc<crate::git_graphql::GitPrefetch>>,
 }
 
 impl RepositoryObject {
     pub fn from_data(data: RepositoryData) -> Self {
-        Self { data }
+        Self { data, git: None }
+    }
+
+    /// Attach the request's prefetched git data (M9.8ix).
+    pub fn with_git(mut self, git: Option<Arc<crate::git_graphql::GitPrefetch>>) -> Self {
+        self.git = git;
+        self
+    }
+
+    /// The repository's `(id, name)` as the git resolvers key their data.
+    pub(crate) fn minimal_repo(&self) -> crate::search_stream::convert::MinimalRepo {
+        crate::search_stream::convert::MinimalRepo {
+            id: self.data.id,
+            name: self.data.name.clone(),
+        }
     }
 
     /// `relay.MarshalID("Repository", id)`:
@@ -4439,10 +4576,46 @@ impl ObjectValue for RepositoryObject {
     fn field(
         &self,
         field: &str,
-        _arguments: &Arguments,
+        arguments: &Arguments,
         _actor: Actor,
     ) -> Result<Option<FieldValue>, ExecError> {
         match field {
+            // `RepositoryResolver.Commit` (`repository.go:296-310`): the rev is
+            // resolved with `ResolveRev`; a missing revision is `null`.
+            "commit" => {
+                let Some(rev) = arguments.string("rev") else {
+                    return Ok(None);
+                };
+                let Some(git) = &self.git else {
+                    return Ok(None);
+                };
+                let input_rev = arguments
+                    .string("inputRevspec")
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| rev.to_owned());
+                match git.revisions.get(&(self.data.id, rev.to_owned())) {
+                    Some(crate::git_graphql::RevisionLookup::Found(oid)) => {
+                        let (commit, commit_error) = git.commit_data(self.data.id, oid);
+                        Ok(Some(FieldValue::Object(Arc::new(
+                            crate::git_graphql::GitCommitResolverObject {
+                                repo: self.minimal_repo(),
+                                oid: oid.clone(),
+                                input_rev: Some(input_rev),
+                                commit,
+                                commit_error,
+                                git: self.git.clone(),
+                            },
+                        ))))
+                    }
+                    Some(crate::git_graphql::RevisionLookup::NotFound) => {
+                        Ok(Some(FieldValue::Null))
+                    }
+                    Some(crate::git_graphql::RevisionLookup::Error(message)) => {
+                        Err(ExecError::new(message.clone()))
+                    }
+                    None => Ok(None),
+                }
+            }
             "id" => Ok(Some(FieldValue::Json(Json::Str(Self::relay_id(
                 self.data.id,
             ))))),
