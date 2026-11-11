@@ -43,6 +43,7 @@ pub mod graphql_resolvers;
 pub mod health;
 pub mod internal_api;
 pub mod ipallowlist;
+pub mod license_config;
 pub mod log_events;
 pub mod log_events_metrics;
 pub mod middleware;

@@ -2332,6 +2332,7 @@ impl FrontendRootResolver {
                 ranking_summary: None,
                 search: None,
                 git: None,
+                site: None,
             },
             mutation: MutationRoot::default(),
         }
@@ -2371,6 +2372,12 @@ impl FrontendRootResolver {
     /// Attach the request's prefetched git object/commit data (M9.8ix).
     pub fn with_git(mut self, git: Option<Arc<crate::git_graphql::GitPrefetch>>) -> Self {
         self.query.git = git;
+        self
+    }
+
+    /// Attach the request's prefetched read-only `Query.site` data (M9.8je).
+    pub fn with_site(mut self, site: Option<crate::config_graphql::SiteRoot>) -> Self {
+        self.query.site = site.map(Arc::new);
         self
     }
 
@@ -2501,6 +2508,9 @@ struct QueryRoot {
     /// Prefetched gitserver object/commit data (M9.8ix); `None` when no
     /// `GitObjectSource` was injected (git fields stay unported).
     git: Option<Arc<crate::git_graphql::GitPrefetch>>,
+    /// Prefetched read-only `Query.site.configuration` data (M9.8je); `None`
+    /// when the configuration surface was not injected or not selected.
+    site: Option<Arc<crate::config_graphql::SiteRoot>>,
 }
 
 /// `Mutation` root: `settingsMutation`/log events/temporary settings/feature
@@ -2685,6 +2695,13 @@ impl ObjectValue for QueryRoot {
         actor: Actor,
     ) -> Result<Option<FieldValue>, ExecError> {
         match field {
+            // `schemaResolver.Site` (`site.go:74-76`): no arguments and no
+            // access check; `Site.configuration` re-checks admin itself.
+            "site" => Ok(Some(FieldValue::Object(Arc::new(SiteObject {
+                viewer_site_admin: self.viewer_site_admin,
+                nested: self.nested.clone(),
+                site: self.site.clone(),
+            })))),
             // `schemaResolver.SettingsSubject` (`settings_subject.go:16-23`):
             // `nodeByID` dispatch + `settingsSubjectForNodeAndCheckAccess`;
             // User/Org access failures are reported here.
@@ -3528,6 +3545,7 @@ impl SettingsSubjectObject {
             SettingsSubjectData::Site => Self::Site(SiteObject {
                 viewer_site_admin,
                 nested,
+                site: None,
             }),
         }
     }
@@ -3565,6 +3583,9 @@ impl ObjectValue for SettingsSubjectObject {
 pub struct SiteObject {
     viewer_site_admin: bool,
     nested: Arc<NestedPrefetch>,
+    /// Prefetched `Query.site.configuration` data (M9.8je). `None` for the
+    /// `settingsSubject(site)` path, where `configuration` stays unported.
+    site: Option<Arc<crate::config_graphql::SiteRoot>>,
 }
 
 impl SiteObject {
@@ -3616,6 +3637,19 @@ impl ObjectValue for SiteObject {
                 self.viewer_site_admin,
                 field == "configurationCascade",
             ),
+            // `siteResolver.Configuration` (`site.go:100-138`); the result is
+            // prefetched because the admin check and `conf.Raw()` are async
+            // (M9.8je).
+            "configuration" => match &self.site {
+                None => Ok(None),
+                Some(site) => match &site.configuration {
+                    None => Ok(None),
+                    Some(Err(message)) => Err(ExecError::new(message.clone())),
+                    Some(Ok(root)) => Ok(Some(FieldValue::Object(Arc::new(
+                        crate::config_graphql::SiteConfigurationObject::new(root.clone()),
+                    )))),
+                },
+            },
             _ => Ok(None),
         }
     }
