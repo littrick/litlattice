@@ -1367,7 +1367,7 @@ impl GraphqlDeps for SchemaGraphqlDeps {
         // `conf.Raw()`, `product_licenses` and the config history are async, so
         // prefetch the selected read-only fields before the synchronous
         // executor replays them.
-        let (site, settings_subject_site) = match &self.config_graphql {
+        let (site, settings_subject_site, cascade_site_configuration) = match &self.config_graphql {
             Some(deps) => {
                 let backend = crate::config_graphql::ProductionSiteConfigurationBackend::new(
                     deps.pool.clone(),
@@ -1409,10 +1409,27 @@ impl GraphqlDeps for SchemaGraphqlDeps {
                     .map(|configuration| crate::config_graphql::SiteRoot {
                         configuration: Some(configuration),
                     });
-                (site, settings_subject_site)
+                // `settingsCascade.subjects[... on Site].configuration`
+                // (`settings_cascade.go:27-37`, `site.go:100-138`): same
+                // resolver, prefetched once per operation (M9.8jl).
+                let cascade_site_configuration =
+                    crate::config_graphql::prefetch_cascade_subject_site_configuration(
+                        &backend,
+                        deps.licenses.as_ref(),
+                        &validator,
+                        &history,
+                        lookup_users,
+                        &fields,
+                        request.actor,
+                    )
+                    .await;
+                (site, settings_subject_site, cascade_site_configuration)
             }
-            None => (None, None),
+            None => (None, None, None),
         };
+        // The Site subject reached through a settings cascade replays the
+        // prefetched configuration from `NestedPrefetch` (M9.8jl).
+        Arc::make_mut(&mut nested).cascade_site_configuration = cascade_site_configuration;
         // `Query.slowRequests` (`slow_requests_tracer.go:63`): the `after`
         // cursor and the nodes' `user`/`repository` rows are async, so resolve
         // whole connections before the sync executor replays the fields.
@@ -1434,6 +1451,16 @@ impl GraphqlDeps for SchemaGraphqlDeps {
             }
             None => std::collections::HashMap::new(),
         };
+        // `Site.authProviders` (`auth_providers.go:10`): the baseline's
+        // `providers.SortedProviders()` reflects the current `conf.Get()`; do
+        // the same from the live snapshot, per request. Both `Query.site` and
+        // the cascade's Site subject replay this snapshot (M9.8jl).
+        let auth_providers_root = self.auth_providers.as_ref().map(|live| {
+            Arc::new(crate::auth_providers_graphql::AuthProvidersRoot::from_site(
+                &live.current().site,
+            ))
+        });
+        Arc::make_mut(&mut nested).auth_providers = auth_providers_root.clone();
         let mut roots =
             crate::graphql_resolvers::FrontendRootResolver::with_prefetched_organizations(
                 user,
@@ -1460,13 +1487,8 @@ impl GraphqlDeps for SchemaGraphqlDeps {
             .with_git(git)
             .with_site(site)
             .with_settings_subject_site_configuration(settings_subject_site);
-        // `Site.authProviders` (`auth_providers.go:10`): the baseline's
-        // `providers.SortedProviders()` reflects the current `conf.Get()`; do
-        // the same from the live snapshot, per request.
-        if let Some(live) = &self.auth_providers {
-            roots = roots.with_auth_providers(Some(Arc::new(
-                crate::auth_providers_graphql::AuthProvidersRoot::from_site(&live.current().site),
-            )));
+        if let Some(auth_providers_root) = auth_providers_root {
+            roots = roots.with_auth_providers(Some(auth_providers_root));
         }
         if let Some(surface) = &self.slow_requests {
             roots = roots.with_slow_requests(Arc::clone(surface));
