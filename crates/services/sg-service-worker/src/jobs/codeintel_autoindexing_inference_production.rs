@@ -196,7 +196,7 @@ impl GitService for GitserverGitService {
                     .map(|entry| DirEntry {
                         name: entry.name,
                         is_dir: entry.is_dir,
-                    })
+                    }) // the inference `DirEntry` carries no size; `sg_git::DirEntry.size` is unused here
                     .collect()
             })
     }

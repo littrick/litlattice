@@ -118,6 +118,7 @@ pub mod perms_syncer_job;
 pub mod policies_matcher;
 pub mod ratelimit;
 pub mod repo_embedding_janitor;
+pub mod repo_embedding_job;
 pub mod repo_embedding_scheduler;
 pub mod repostatistics;
 pub mod sourcegraph_accounts_notifications;
@@ -324,6 +325,7 @@ pub fn all_jobs() -> Vec<(&'static str, Arc<dyn Job>)> {
                 "repo-embedding-janitor" => {
                     Arc::new(repo_embedding_janitor::RepoEmbeddingJanitor::new())
                 }
+                "repo-embedding-job" => Arc::new(repo_embedding_job::RepoEmbeddingJob::new()),
                 "repo-embedding-scheduler" => {
                     Arc::new(repo_embedding_scheduler::RepoEmbeddingScheduler::new())
                 }

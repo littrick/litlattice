@@ -142,6 +142,9 @@ pub struct FileInfo {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DirEntry {
     pub name: String,
+    /// `FileInfo.Size`: added for the embeddings `readLister.List`/`Diff`
+    /// paths, which report file sizes to the indexer.
+    pub size: i64,
     pub is_dir: bool,
 }
 
@@ -153,6 +156,7 @@ const MODE_DIR: u32 = 1 << 31;
 fn dir_entry(file_info: &pb::FileInfo) -> DirEntry {
     DirEntry {
         name: String::from_utf8_lossy(&file_info.name).into_owned(),
+        size: file_info.size,
         is_dir: file_info.mode & MODE_DIR != 0,
     }
 }

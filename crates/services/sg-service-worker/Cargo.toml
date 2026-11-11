@@ -37,6 +37,7 @@ google-cloud-auth = { workspace = true }
 http = { workspace = true }
 http-body-util = { workspace = true }
 hyper = { workspace = true }
+md5 = { workspace = true }
 prost = { workspace = true }
 prost-types = { workspace = true }
 reqwest = { workspace = true }
