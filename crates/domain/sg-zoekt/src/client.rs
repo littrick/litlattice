@@ -68,6 +68,16 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
+/// `HorizontalSearcher`'s rollout classification for real zoekt clients.
+///
+/// The baseline inspects the concrete `*net.DNSError` / `*net.OpError` values
+/// via `errors.As`. A gRPC transport failure arrives as a `tonic::Status`
+/// (wrapped in [`Error::Status`]) which does not wrap those net types, so the
+/// baseline does not classify it as a rollout error either. This port therefore
+/// uses the trait default ([`crate::horizontal::RolloutError::Other`]): errors
+/// propagate instead of being swallowed into a crash event.
+impl crate::horizontal_searcher::ClientError for Error {}
+
 /// A zoekt-webserver client.
 #[derive(Debug, Clone)]
 pub struct Client {

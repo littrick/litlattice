@@ -51,6 +51,7 @@ pub mod search_contexts;
 pub mod search_contexts_graphql;
 pub mod search_contexts_schema;
 pub mod search_contexts_store;
+pub mod search_env;
 pub mod search_graphql;
 pub mod search_job;
 pub mod search_job_printer;

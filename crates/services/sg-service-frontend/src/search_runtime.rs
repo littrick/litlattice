@@ -4,8 +4,10 @@
 //! (`internal/search/client/client.go`, `cmd/frontend/internal/search`) for
 //! the ported job tree:
 //!
-//! * zoekt: [`sg_zoekt::client::Client`] dialed from the configured endpoints
-//!   and driven through the M9.8ig blocking [`BlockingStreamer`];
+//! * zoekt: the M9.8ir [`crate::search_env::IndexedJobStreamer`] — the
+//!   `Indexed()` stack (`CachedSearcher(ttl) → MeteredSearcher("") →
+//!   HorizontalSearcher` over the configured endpoints with the cached indexed
+//!   dialer) driven through the M9.8ig blocking bridge;
 //! * db: a Postgres [`PrivateRepoLister`] for `privateReposForActor`;
 //! * searcher (`index:no`): the M9.8il [`default_searcher_client`] plus the
 //!   gitserver revision resolver;
@@ -35,14 +37,11 @@ use tokio_stream::StreamExt;
 use sg_config::{ServiceConnections, SiteConfiguration};
 use sg_git::GitserverClient as GitClient;
 use sg_proto::gitserver as pb;
-use sg_zoekt::client as zoekt_client;
 use sg_zoekt::indexed_repo_revs::MinimalRepo;
-use sg_zoekt::query::Query;
-use sg_zoekt::streamer::BlockingStreamer;
-use sg_zoekt::types::{SearchOptions, SearchResult};
 
 use crate::search_commit_job::{searcher_error_from_git, CommitUserDB, CommitUserEmail};
-use crate::search_job::{JobError, JobStreamer, PrivateRepoLister, ReposListOptions};
+use crate::search_env::{IndexedError, IndexedJobStreamer};
+use crate::search_job::{JobError, PrivateRepoLister, ReposListOptions};
 use crate::search_searcher_client::{
     default_searcher_client, run_to_completion, SearcherClient, SearcherClients, SearcherError,
     SearcherGitserver, SearcherLimiter, SymbolsClient, SymbolsParameters, SymbolsResponse,
@@ -144,7 +143,12 @@ pub fn assemble(
     }
 
     let max_repos = max_repos_from_site(site);
-    let zoekt = Arc::new(ZoektJobStreamer::new(&connections.zoekts)?);
+    let zoekt = Arc::new(
+        IndexedJobStreamer::from_connections(connections).map_err(|error| match error {
+            IndexedError::MissingZoekt => RuntimeConfigError::MissingZoekt,
+            IndexedError::Endpoint(message) => RuntimeConfigError::ZoektEndpoint(message),
+        })?,
+    );
     let db = Arc::new(PgPrivateRepoLister::new(pool.clone()));
 
     let gitserver = Arc::new(GitClient::new(connections.git_servers.clone()));
@@ -185,50 +189,6 @@ pub fn assemble(
         searcher,
         commit,
     })
-}
-
-/// The production [`JobStreamer`]: every configured zoekt endpoint is a
-/// [`BlockingStreamer<Client>`]; [`JobStreamer::stream_search`] drives them in
-/// configuration order.
-///
-/// The baseline `HorizontalSearcher` runs the endpoints concurrently and
-/// de-duplicates/flushes through `FlushSender`; this sequential fan-out keeps
-/// the same search chunks but not the concurrent ordering/aggregation (see the
-/// overview's §4 errata).
-pub struct ZoektJobStreamer {
-    streamers: Vec<BlockingStreamer<zoekt_client::Client>>,
-}
-
-impl ZoektJobStreamer {
-    /// Dial (lazily) every endpoint. Endpoint parsing errors abort assembly.
-    pub fn new(endpoints: &[String]) -> Result<Self, RuntimeConfigError> {
-        let mut streamers = Vec::with_capacity(endpoints.len());
-        for endpoint in endpoints {
-            let client = zoekt_client::Client::connect_lazy(endpoint)
-                .map_err(|error| RuntimeConfigError::ZoektEndpoint(error.to_string()))?;
-            streamers.push(BlockingStreamer::new(client));
-        }
-        if streamers.is_empty() {
-            return Err(RuntimeConfigError::MissingZoekt);
-        }
-        Ok(Self { streamers })
-    }
-}
-
-impl JobStreamer for ZoektJobStreamer {
-    fn stream_search(
-        &self,
-        query: &Query,
-        options: &SearchOptions,
-        sender: &mut dyn FnMut(SearchResult),
-    ) -> Result<(), JobError> {
-        for streamer in &self.streamers {
-            streamer
-                .stream_search_blocking(query, options, sender)
-                .map_err(|error| JobError(error.to_string()))?;
-        }
-        Ok(())
-    }
 }
 
 /// `db.Repos().ListMinimalRepos` for `privateReposForActor`.
@@ -490,8 +450,11 @@ impl SymbolsClient for NotPortedSymbols {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::search_job::JobStreamer;
     use crate::search_jobutil_tree::JobNode;
     use crate::search_stream::{JobRunner, TreeJobRunner};
+    use sg_zoekt::query::Query;
+    use sg_zoekt::types::{SearchOptions, SearchResult};
     use std::sync::Mutex;
 
     fn site(raw: serde_json::Value) -> SiteConfiguration {
