@@ -408,6 +408,10 @@ pub struct SchemaGraphqlDeps {
     /// `RankingServiceResolver`'s root resolver (M9.8ic); `None` reproduces an
     /// absent ranking surface (SDL not appended, root fields/types absent).
     ranking: Option<crate::graphql_resolvers::RankingResolverHandle>,
+    /// `schemaResolver.Search`'s execution seam (M9.8ie). `None` reproduces
+    /// the pre-wiring frontend: the `search` root field has no prefetched
+    /// value and resolves as unported (`null`).
+    search_executor: Option<Arc<dyn crate::search_graphql::SearchExecutor>>,
 }
 
 impl SchemaGraphqlDeps {
@@ -435,6 +439,7 @@ impl SchemaGraphqlDeps {
             repositories_connections: None,
             search_contexts: None,
             ranking: None,
+            search_executor: None,
         }
     }
 
@@ -479,6 +484,7 @@ impl SchemaGraphqlDeps {
             )),
             search_contexts: None,
             ranking: None,
+            search_executor: None,
         }
     }
 
@@ -655,6 +661,21 @@ impl SchemaGraphqlDeps {
         Ok(self)
     }
 
+    /// Inject the `Query.search` execution seam (M9.8ie).
+    ///
+    /// The baseline `schemaResolver.Search` plans and executes through the
+    /// search client; this port hands the async planning/execution to the
+    /// executor so `exec` can prefetch the root field and replay the owned
+    /// result snapshot synchronously. When never called, no prefetch happens
+    /// and every existing response stays byte-identical.
+    pub fn with_search_executor(
+        mut self,
+        executor: Arc<dyn crate::search_graphql::SearchExecutor>,
+    ) -> Self {
+        self.search_executor = Some(executor);
+        self
+    }
+
     /// Test hook: inject the store/user lookup without Redis or Postgres.
     #[cfg(test)]
     fn with_session_parts(
@@ -692,6 +713,7 @@ impl SchemaGraphqlDeps {
             repositories_connections: None,
             search_contexts: None,
             ranking: None,
+            search_executor: None,
         }
     }
 }
@@ -829,6 +851,14 @@ impl GraphqlDeps for SchemaGraphqlDeps {
                 .await
             }
             None => crate::graphql_resolvers::RankingRoots::default(),
+        };
+        // `schemaResolver.Search` (M9.8ie): plan + execute through the
+        // injected seam before the synchronous executor replays the snapshot.
+        let search_root = match &self.search_executor {
+            Some(executor) => {
+                crate::search_graphql::prefetch_search_roots(executor.as_ref(), &fields).await
+            }
+            None => None,
         };
         let mut mutation = match (&self.pool, &self.org_memberships) {
             (Some(pool), Some(store)) if is_mutation => {
@@ -1125,7 +1155,8 @@ impl GraphqlDeps for SchemaGraphqlDeps {
             .with_repositories_connections(repositories_connections)
             .with_mutation(mutation)
             .with_search_contexts(self.search_contexts.clone())
-            .with_ranking_roots(ranking_roots);
+            .with_ranking_roots(ranking_roots)
+            .with_search_roots(search_root);
         if let Some(client_configuration) = client_configuration {
             roots = roots.with_client_configuration(client_configuration);
         }
