@@ -1,12 +1,14 @@
 //! `/.api/search/stream`: the frontend search event stream.
 //!
 //! Mirrors `cmd/frontend/internal/search/search.go` (server side) and the
-//! `internal/search/streaming*` packages. Search planning/execution and the
-//! repository metadata lookups sit behind [`SearchDeps`]; the production
-//! implementation ([`BackendDeps`]) wires Postgres for metadata but reports
-//! that the search backend itself is not ported yet.
+//! `internal/search/streaming*` packages. [`BackendDeps`] wires the ported
+//! `search_client::SearchClient::plan` and builds the job tree with
+//! `search_jobutil_tree::new_plan_job`; job execution itself sits behind the
+//! injected [`JobRunner`] (the default runner reports that search execution is
+//! not ported yet).
 //!
-//! See `docs/overviews/m9_8ew_frontend_search_stream_overview.md`.
+//! See `docs/overviews/m9_8ew_frontend_search_stream_overview.md` and
+//! `docs/overviews/m9_8hs_search_stream_wiring_overview.md`.
 //!
 //! The response body is assembled before it is returned (the event loop is
 //! sequential: `tokio::select!` over the execution stream and the baseline's
@@ -25,7 +27,7 @@ pub mod zoekt_search;
 
 pub use args::parse_url_query;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Instant;
@@ -36,6 +38,8 @@ use flate2::write::GzEncoder;
 use flate2::Compression;
 use http::{header, HeaderName, HeaderValue, Request, Response};
 use http_body_util::BodyExt;
+use sg_search_query::basic::Plan;
+use sg_search_query::parser::SearchType;
 use time::OffsetDateTime;
 use tokio::time::{sleep_until, Duration, Instant as TokioInstant};
 use tokio_stream::Stream;
@@ -46,13 +50,38 @@ use self::convert::{FromMatchOptions, Match, RepoMetadata};
 use self::events::{EventAlert, EventFilter, EventMatch};
 use self::filters::SearchFilters;
 use self::progress::{Progress, ProgressAggregator, SearchEvent};
+use crate::search_client::{
+    Features, PlanDeps, PlanError as ClientPlanError, Protocol, SearchClient, SearchMode,
+};
+use crate::search_job::JobError;
+use crate::search_jobutil_job_builders as jb;
+use crate::search_jobutil_tree::{self, JobNode, TreeInputs};
 
 /// Search inputs produced by planning a query (`search.Inputs`).
+///
+/// `max_results` is `Inputs.MaxResults()`; the remaining fields feed the job
+/// tree construction in [`SearchDeps::execute`].
 #[derive(Debug, Clone)]
 pub struct SearchInputs {
     /// `Inputs.MaxResults()`.
     pub max_results: i64,
     pub original_query: String,
+    /// `Inputs.Plan` (`search_jobutil_tree::new_plan_job` input).
+    pub plan: Plan,
+    /// `Inputs.SearchMode`.
+    pub search_mode: SearchMode,
+    /// `Inputs.PatternType`.
+    pub pattern_type: SearchType,
+    /// `Inputs.Features`.
+    pub features: Features,
+    /// `Inputs.Protocol`.
+    pub protocol: Protocol,
+    /// `Inputs.ContextLines`.
+    pub context_lines: i32,
+    /// `Inputs.SanitizeSearchPatterns`.
+    pub sanitize_search_patterns: Vec<String>,
+    /// `Inputs.OnSourcegraphDotCom`.
+    pub on_sourcegraph_dot_com: bool,
 }
 
 /// A planned search error (`*client.QueryError` or any other error).
@@ -84,6 +113,46 @@ pub enum ExecuteItem {
     },
 }
 
+/// An `Execute` error (`*query.UnsupportedError` selects the alert path).
+#[derive(Debug, Clone)]
+pub struct ExecuteError {
+    pub message: String,
+    pub unsupported: bool,
+}
+
+/// The `(*search.Alert, error)` pair a baseline `job.Job.Run` returns.
+#[derive(Debug, Clone, Default)]
+pub struct JobRunOutput {
+    pub alert: Option<EventAlert>,
+    pub error: Option<ExecuteError>,
+}
+
+/// The execution seam of [`SearchDeps::execute`].
+///
+/// The baseline calls `planJob.Run(ctx, JobClients(), stream)`; this port
+/// injects the runner so the tree construction can be exercised without a
+/// real searcher/zoekt/gitserver stack. Events are delivered through `sender`;
+/// the returned pair maps to the trailing [`ExecuteItem::Alert`] /
+/// [`ExecuteItem::Error`] items.
+pub trait JobRunner: Send + Sync {
+    fn run(&self, job: &mut JobNode, sender: &mut dyn FnMut(SearchEvent)) -> JobRunOutput;
+}
+
+/// Default runner: job execution is not ported yet.
+pub struct UnportedJobRunner;
+
+impl JobRunner for UnportedJobRunner {
+    fn run(&self, _job: &mut JobNode, _sender: &mut dyn FnMut(SearchEvent)) -> JobRunOutput {
+        JobRunOutput {
+            alert: None,
+            error: Some(ExecuteError {
+                message: "search execution is not ported yet".to_owned(),
+                unsupported: false,
+            }),
+        }
+    }
+}
+
 /// The seams the handler needs from the rest of the system.
 #[async_trait]
 pub trait SearchDeps: Send + Sync {
@@ -111,33 +180,181 @@ pub trait SearchDeps: Send + Sync {
     fn is_authenticated(&self) -> bool;
 }
 
-/// Production deps: Postgres-backed metadata; the search backend itself is
-/// not ported yet, so [`SearchDeps::plan`] fails and the handler streams an
-/// `error` event (see the overview's errata).
+/// Production deps: Postgres-backed metadata, the ported
+/// `search_client::SearchClient::plan`, and an injected [`JobRunner`].
+///
+/// The default runner reports that search execution is not ported yet, so the
+/// handler streams an `error` event after planning succeeds (see the
+/// overview's §4).
 pub struct BackendDeps {
     pool: sqlx::PgPool,
+    client: SearchClient,
+    runner: Arc<dyn JobRunner>,
 }
 
 impl BackendDeps {
     pub fn new(pool: sqlx::PgPool) -> Self {
-        Self { pool }
+        Self::with_deps(pool, default_plan_deps(), Arc::new(UnportedJobRunner))
+    }
+
+    /// Test/differential seam: inject the `Plan` loaders and the runner.
+    pub fn with_deps(pool: sqlx::PgPool, plan_deps: PlanDeps, runner: Arc<dyn JobRunner>) -> Self {
+        Self {
+            pool,
+            client: SearchClient::new(plan_deps),
+            runner,
+        }
+    }
+}
+
+/// Production `Plan` loaders. No settings/feature-flag/actor/search-context
+/// services are ported yet, so this mirrors the baseline defaults where the
+/// data is absent: empty settings, no flags, no sanitization patterns and no
+/// dotcom mode. `searchContextsQuery` stays disabled because
+/// `Settings::experimental_features` is `None` (`client.go:95`).
+fn default_plan_deps() -> PlanDeps {
+    PlanDeps {
+        user_settings: Box::new(|| Ok(crate::search_client::Settings::default())),
+        feature_flags: Box::new(BTreeMap::new),
+        resolve_search_context: Arc::new(|context: &str| {
+            Err(format!(
+                "search context resolution is not ported yet (context: {context})"
+            ))
+        }),
+        sanitize_search_patterns: Box::new(Vec::new),
+        on_sourcegraph_dot_com: false,
+    }
+}
+
+/// `client.QueryError` / generic `Plan` errors, as the handler distinguishes
+/// them (`search.go:126-137`).
+fn map_plan_error(err: ClientPlanError) -> PlanError {
+    match err {
+        ClientPlanError::Query { err, .. } => {
+            // `sg-search-query`'s pipeline currently returns `String` errors,
+            // so the `*query.ExpectedOperand` type is recovered from its fixed
+            // message prefix (`ExpectedOperand.Msg`).
+            let expected_operand = err.starts_with("expected operand");
+            PlanError::Query {
+                message: err,
+                expected_operand,
+            }
+        }
+        other => PlanError::Other(other.to_string()),
+    }
+}
+
+/// `Inputs.MaxResults()` (`types.go:185-199`): the last `count:` in the plan's
+/// `ToQ()`, else the protocol default.
+fn plan_max_results(plan: &Plan, default_limit: i64) -> i64 {
+    if let Some(count) = plan
+        .iter()
+        .rev()
+        .find_map(|basic| jb::parameters_count(&basic.parameters))
+    {
+        return count;
+    }
+    if default_limit != 0 {
+        default_limit
+    } else {
+        jb::DEFAULT_MAX_SEARCH_RESULTS
+    }
+}
+
+/// `search.Inputs` fields the job tree reads.
+fn tree_inputs(inputs: &SearchInputs) -> TreeInputs {
+    TreeInputs {
+        protocol: inputs.protocol,
+        pattern_type: inputs.pattern_type,
+        // `search.includeForks`/`includeArchived` are not modelled by
+        // `search_client::Settings` yet.
+        user_settings: jb::UserSettings::default(),
+        features: inputs.features,
+        context_lines: inputs.context_lines,
+        sanitize_search_patterns: inputs.sanitize_search_patterns.clone(),
+        on_sourcegraph_dot_com: inputs.on_sourcegraph_dot_com,
+        original_query: inputs.original_query.clone(),
+        // `authz.SubRepoEnabled` is not ported.
+        sub_repo_enabled: false,
+        // `codycontext.NewSearchJob` is not ported.
+        cody_context_hook: None,
     }
 }
 
 #[async_trait]
 impl SearchDeps for BackendDeps {
-    async fn plan(&self, _args: &Args) -> Result<SearchInputs, PlanError> {
-        Err(PlanError::Other(
-            "search backend is not ported yet".to_owned(),
-        ))
+    async fn plan(&self, args: &Args) -> Result<SearchInputs, PlanError> {
+        let pattern_type = if args.pattern_type.is_empty() {
+            None
+        } else {
+            Some(args.pattern_type.as_str())
+        };
+        // `search.Mode(args.SearchMode)`; the port models 0/1.
+        let search_mode = if args.search_mode == i64::from(SearchMode::SmartSearch.as_int()) {
+            SearchMode::SmartSearch
+        } else {
+            SearchMode::Precise
+        };
+        let inputs = self
+            .client
+            .plan(
+                &args.version,
+                pattern_type,
+                &args.query,
+                search_mode,
+                Protocol::Streaming,
+                args.context_lines,
+            )
+            .map_err(map_plan_error)?;
+
+        let max_results = plan_max_results(
+            &inputs.plan,
+            search_jobutil_tree::default_limit(inputs.protocol),
+        );
+        Ok(SearchInputs {
+            max_results,
+            original_query: inputs.original_query,
+            plan: inputs.plan,
+            search_mode: inputs.search_mode,
+            pattern_type: inputs.pattern_type,
+            features: inputs.features,
+            protocol: inputs.protocol,
+            context_lines: inputs.context_lines,
+            sanitize_search_patterns: inputs.sanitize_search_patterns,
+            on_sourcegraph_dot_com: inputs.on_sourcegraph_dot_com,
+        })
     }
 
     async fn execute(
         &self,
-        _inputs: &SearchInputs,
+        inputs: &SearchInputs,
         _query: &str,
     ) -> Pin<Box<dyn Stream<Item = ExecuteItem> + Send>> {
-        Box::pin(tokio_stream::empty())
+        let mut job = match search_jobutil_tree::new_plan_job(&tree_inputs(inputs), &inputs.plan) {
+            Ok(job) => job,
+            Err(JobError(message)) => {
+                return Box::pin(tokio_stream::iter(vec![ExecuteItem::Error {
+                    message,
+                    unsupported: false,
+                }]))
+            }
+        };
+
+        let mut items: Vec<ExecuteItem> = Vec::new();
+        let output = {
+            let mut sender = |event: SearchEvent| items.push(ExecuteItem::Event(event));
+            self.runner.run(&mut job, &mut sender)
+        };
+        if let Some(alert) = output.alert {
+            items.push(ExecuteItem::Alert(alert));
+        }
+        if let Some(error) = output.error {
+            items.push(ExecuteItem::Error {
+                message: error.message,
+                unsupported: error.unsupported,
+            });
+        }
+        Box::pin(tokio_stream::iter(items))
     }
 
     async fn repo_metadata(&self, ids: &[i32]) -> Result<HashMap<i32, RepoMetadata>, String> {
