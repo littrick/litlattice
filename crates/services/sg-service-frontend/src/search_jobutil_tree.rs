@@ -1053,8 +1053,12 @@ impl comb::CombinatorJob for TreeRepoPagerJob {
         };
 
         let max_alerter = comb::MaxAlerter::new();
-        let pages = repo_pager.pages.pages();
-        for page in &pages {
+        // `repoPagerJob.Run` resolves with the node's `search.RepoOptions`
+        // (`repo_pager_job.go:98-121`). The production pager reads them; the
+        // option-unaware default implementation ignores them.
+        let resolve_options = crate::search_repos::ResolveOptions::from_tree(&self.repo_opts);
+        let resolved_pages = repo_pager.pages.resolve_pages(&resolve_options);
+        for page in &resolved_pages.pages {
             page.maybe_send_stats(stream);
 
             let resolved = if self.skip_partitioning {
@@ -1091,7 +1095,7 @@ impl comb::CombinatorJob for TreeRepoPagerJob {
             }
         }
 
-        match repo_pager.pages.error() {
+        match resolved_pages.error {
             Some(err) => (max_alerter.alert(), Some(comb::JobFailure::Message(err.0))),
             None => (max_alerter.alert(), None),
         }

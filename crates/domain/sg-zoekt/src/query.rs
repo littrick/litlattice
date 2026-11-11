@@ -498,7 +498,7 @@ fn to_file_filters(
 
 /// `QueryForFileContentArgs`: path/content regexps scoped to repository
 /// matches, optionally negated.
-fn query_for_file_content_args(opt: &RepoHasFileContentArgs, case_sensitive: bool) -> Query {
+pub fn query_for_file_content_args(opt: &RepoHasFileContentArgs, case_sensitive: bool) -> Query {
     let mut children = Vec::new();
     if !opt.path.is_empty() {
         children.push(Query::Regexp {

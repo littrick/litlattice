@@ -640,7 +640,7 @@ fn parse_git_timestamp(value: &str) -> Timestamp {
     )
 }
 
-fn parse_git_date(value: &str) -> Option<OffsetDateTime> {
+pub(crate) fn parse_git_date(value: &str) -> Option<OffsetDateTime> {
     parse_git_internal(value)
         .or_else(|| parse_date_only(value))
         .or_else(|| {

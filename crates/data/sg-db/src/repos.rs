@@ -512,6 +512,392 @@ fn is_empty_json_object(value: &serde_json::Value) -> bool {
     matches!(value, serde_json::Value::Object(map) if map.is_empty())
 }
 
+// ---------------------------------------------------------------------------
+// `Repos().ListMinimalRepos` for the search repository resolver (M9.10a)
+// ---------------------------------------------------------------------------
+
+/// `database.RepoKVPFilter`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RepoKvpFilter {
+    pub key: String,
+    pub value: Option<String>,
+    pub negated: bool,
+    pub key_only: bool,
+}
+
+/// `database.RepoTopicFilter`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RepoTopicFilter {
+    pub topic: String,
+    pub negated: bool,
+}
+
+/// One `types.Cursor`. `value` is the string form the Go cursor carries;
+/// `stars`/`id` values are parsed as integers when the condition is built.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RepoListCursor {
+    pub column: String,
+    pub value: String,
+    pub direction: String,
+}
+
+/// `database.RepoListSort` (`field`, `descending`, `nulls`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RepoListSort {
+    pub field: String,
+    pub descending: bool,
+    pub nulls: Option<String>,
+}
+
+impl RepoListSort {
+    pub fn stars_desc_nulls_last() -> Self {
+        Self {
+            field: "stars".to_owned(),
+            descending: true,
+            nulls: Some("LAST".to_owned()),
+        }
+    }
+
+    pub fn id_desc() -> Self {
+        Self {
+            field: "id".to_owned(),
+            descending: true,
+            nulls: None,
+        }
+    }
+}
+
+/// Subset of `database.ReposListOptions` the resolver constructs
+/// (`internal/search/repos/repos.go:250-285`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RepoListOptions {
+    pub include_patterns: Vec<String>,
+    pub exclude_pattern: String,
+    pub description_patterns: Vec<String>,
+    pub case_sensitive_patterns: bool,
+    pub kvp_filters: Vec<RepoKvpFilter>,
+    pub topic_filters: Vec<RepoTopicFilter>,
+    pub cursors: Vec<RepoListCursor>,
+    pub limit: i64,
+    pub no_forks: bool,
+    pub only_forks: bool,
+    pub no_archived: bool,
+    pub only_archived: bool,
+    pub no_private: bool,
+    pub only_private: bool,
+    pub only_cloned: bool,
+    /// `0` means "no search-context join".
+    pub search_context_id: i64,
+    pub order_by: Vec<RepoListSort>,
+}
+
+/// `types.MinimalRepo` fields the resolver reads.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RepoListItem {
+    pub id: i32,
+    pub name: String,
+    pub stars: i64,
+    /// `types.MinimalRepo.ExternalRepo`.
+    pub external_id: String,
+    pub external_service_type: String,
+    pub external_service_id: String,
+}
+
+/// One `database.RepoChangelistIDs`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RepoChangelistIDs {
+    pub repo_id: i32,
+    pub changelist_ids: Vec<i64>,
+}
+
+/// `AuthzQueryConds` for the fixed anonymous actor (`BypassAuthz=false`,
+/// `AuthenticatedUserID=0`), identical to [`super::repos`]'s
+/// `search_runtime::PgPrivateRepoLister` condition.
+const AUTHZ_CONDITION: &str = r#"(
+    EXISTS (SELECT 1 FROM user_repo_permissions WHERE repo_id = repo.id AND user_id IS NULL)
+    OR NOT repo.private
+    OR EXISTS (
+        SELECT 1 FROM external_services es
+        JOIN external_service_repos esr ON (
+            esr.external_service_id = es.id AND esr.repo_id = repo.id
+            AND es.unrestricted = TRUE AND es.deleted_at IS NULL
+        )
+    )
+    OR EXISTS (
+        SELECT 1 FROM user_repo_permissions WHERE repo_id = repo.id AND user_id = 0
+    )
+)"#;
+
+/// `(*repoStore).ListMinimalRepos` for the repository resolver.
+///
+/// This is the `listSQL` condition subset M9.10a reaches. Include patterns are
+/// always evaluated as regular expressions (the baseline's exact/LIKE
+/// optimization is not ported; see the M9.10a overview §2.4).
+pub async fn list_minimal_repos(
+    pool: &PgPool,
+    options: &RepoListOptions,
+) -> Result<Vec<RepoListItem>, sqlx::Error> {
+    let mut sql = String::from(
+        "SELECT repo.id, repo.name, COALESCE(repo.stars, 0) AS stars, \
+                COALESCE(repo.external_id, '') AS external_id, \
+                COALESCE(repo.external_service_type, '') AS external_service_type, \
+                COALESCE(repo.external_service_id, '') AS external_service_id \
+         FROM repo",
+    );
+    let mut arguments: Vec<String> = Vec::new();
+
+    if options.only_cloned {
+        sql.push_str(" JOIN gitserver_repos gr ON gr.repo_id = repo.id");
+    }
+    if options.search_context_id != 0 {
+        sql.push_str(
+            " JOIN (SELECT DISTINCT repo_id, search_context_id FROM search_context_repos) dscr \
+              ON repo.id = dscr.repo_id",
+        );
+    }
+
+    sql.push_str(" WHERE repo.deleted_at IS NULL AND repo.blocked IS NULL");
+
+    for pattern in &options.include_patterns {
+        arguments.push(pattern.clone());
+        if options.case_sensitive_patterns {
+            sql.push_str(&format!(" AND repo.name::text ~ ${}", arguments.len()));
+        } else {
+            sql.push_str(&format!(" AND lower(repo.name) ~ lower(${})", arguments.len()));
+        }
+    }
+    if !options.exclude_pattern.is_empty() {
+        arguments.push(options.exclude_pattern.clone());
+        if options.case_sensitive_patterns {
+            sql.push_str(&format!(" AND repo.name !~* ${}", arguments.len()));
+        } else {
+            sql.push_str(&format!(" AND lower(repo.name) !~* ${}", arguments.len()));
+        }
+    }
+    for pattern in &options.description_patterns {
+        arguments.push(pattern.clone());
+        sql.push_str(&format!(
+            " AND lower(repo.description) ~* lower(${})",
+            arguments.len()
+        ));
+    }
+    for filter in &options.kvp_filters {
+        let mut conds = Vec::new();
+        arguments.push(filter.key.clone());
+        conds.push(format!("key ~* ${}", arguments.len()));
+        if filter.key_only {
+            conds.push("value IS NULL".to_owned());
+        } else if let Some(value) = &filter.value {
+            arguments.push(value.clone());
+            conds.push(format!("value ~* ${}", arguments.len()));
+        } else {
+            conds.push("value IS NULL".to_owned());
+        }
+        let cond = format!(
+            "EXISTS (SELECT 1 FROM repo_kvps WHERE repo_id = repo.id AND {})",
+            conds.join(" AND ")
+        );
+        if filter.negated {
+            sql.push_str(&format!(" AND NOT ({cond})"));
+        } else {
+            sql.push_str(&format!(" AND ({cond})"));
+        }
+    }
+    for filter in &options.topic_filters {
+        arguments.push(filter.topic.clone());
+        let cond = format!("repo.topics @> ARRAY[${}]::text[]", arguments.len());
+        if filter.negated {
+            sql.push_str(&format!(" AND NOT ({cond})"));
+        } else {
+            sql.push_str(&format!(" AND ({cond})"));
+        }
+    }
+    if options.no_forks {
+        sql.push_str(" AND NOT repo.fork");
+    }
+    if options.only_forks {
+        sql.push_str(" AND repo.fork");
+    }
+    if options.no_archived {
+        sql.push_str(" AND NOT repo.archived");
+    }
+    if options.only_archived {
+        sql.push_str(" AND repo.archived");
+    }
+    if options.no_private {
+        sql.push_str(" AND NOT repo.private");
+    }
+    if options.only_private {
+        sql.push_str(" AND repo.private");
+    }
+    if options.only_cloned {
+        sql.push_str(" AND gr.clone_status = 'cloned'");
+    }
+    if options.search_context_id != 0 {
+        arguments.push(options.search_context_id.to_string());
+        sql.push_str(&format!(" AND dscr.search_context_id = ${}", arguments.len()));
+    }
+
+    // `parseCursorConds`: same-direction cursors only; `next` is `>=` and
+    // `prev` is `<=`. The resolver only emits `prev`.
+    if !options.cursors.is_empty() {
+        let mut direction = String::new();
+        let mut columns = Vec::new();
+        let mut values = Vec::new();
+        for cursor in &options.cursors {
+            if cursor.column.is_empty() || cursor.value.is_empty() {
+                continue;
+            }
+            if direction.is_empty() {
+                direction = cursor.direction.clone();
+            } else if direction != cursor.direction {
+                return Err(sqlx::Error::Protocol(
+                    "multi-cursors must have the same direction".to_owned(),
+                ));
+            }
+            match cursor.column.as_str() {
+                "stars" | "id" => {
+                    let value: i64 = cursor.value.parse().map_err(|_| {
+                        sqlx::Error::Protocol(format!(
+                            "missing or invalid cursor: {:?}",
+                            cursor.value
+                        ))
+                    })?;
+                    columns.push(format!("repo.{}", cursor.column));
+                    arguments.push(value.to_string());
+                    values.push(format!("${}::bigint", arguments.len()));
+                }
+                "name" => {
+                    columns.push("repo.name".to_owned());
+                    arguments.push(cursor.value.clone());
+                    values.push(format!("${}::citext", arguments.len()));
+                }
+                "created_at" => {
+                    columns.push("repo.created_at".to_owned());
+                    arguments.push(cursor.value.clone());
+                    values.push(format!("${}::timestamptz", arguments.len()));
+                }
+                other => {
+                    return Err(sqlx::Error::Protocol(format!(
+                        "missing or invalid cursor: {other:?}"
+                    )))
+                }
+            }
+        }
+        let operator = match direction.as_str() {
+            "next" => ">=",
+            "prev" => "<=",
+            other => {
+                return Err(sqlx::Error::Protocol(format!(
+                    "missing or invalid cursor direction: {other:?}"
+                )))
+            }
+        };
+        if !columns.is_empty() {
+            sql.push_str(&format!(
+                " AND ({}) {} ({})",
+                columns.join(", "),
+                operator,
+                values.join(", ")
+            ));
+        }
+    }
+
+    sql.push_str(" AND ");
+    sql.push_str(AUTHZ_CONDITION);
+
+    if options.order_by.is_empty() {
+        sql.push_str(" ORDER BY repo.id");
+    } else {
+        let mut parts = Vec::new();
+        for sort in &options.order_by {
+            let column = match sort.field.as_str() {
+                "stars" | "id" | "name" | "created_at" | "size" => {
+                    format!("repo.{}", sort.field)
+                }
+                other => {
+                    return Err(sqlx::Error::Protocol(format!(
+                        "missing or invalid repo sort field: {other:?}"
+                    )))
+                }
+            };
+            let mut part = column;
+            if sort.descending {
+                part.push_str(" DESC");
+            }
+            if let Some(nulls) = &sort.nulls {
+                part.push_str(" NULLS ");
+                part.push_str(nulls);
+            }
+            parts.push(part);
+        }
+        sql.push_str(" ORDER BY ");
+        sql.push_str(&parts.join(", "));
+    }
+    if options.limit > 0 {
+        sql.push_str(&format!(" LIMIT {}", options.limit));
+    }
+
+    let mut query = sqlx::query(&sql);
+    for argument in &arguments {
+        query = query.bind(argument);
+    }
+    let rows = query.fetch_all(pool).await?;
+    let mut repos = Vec::with_capacity(rows.len());
+    for row in rows {
+        repos.push(RepoListItem {
+            id: row.try_get("id")?,
+            name: row.try_get("name")?,
+            stars: row.try_get("stars")?,
+            external_id: row.try_get("external_id")?,
+            external_service_type: row.try_get("external_service_type")?,
+            external_service_id: row.try_get("external_service_id")?,
+        });
+    }
+    Ok(repos)
+}
+
+/// `BatchGetRepoCommitChangelist` (`internal/database/repo_commits_changelists.go`).
+///
+/// Returns `repo_id -> changelist_id -> commit_sha`.
+pub async fn batch_get_repo_commit_changelist(
+    pool: &PgPool,
+    repos: &[RepoChangelistIDs],
+) -> Result<std::collections::BTreeMap<i32, std::collections::BTreeMap<i64, String>>, sqlx::Error>
+{
+    use std::collections::BTreeMap;
+    let mut result: BTreeMap<i32, BTreeMap<i64, String>> = BTreeMap::new();
+    if repos.is_empty() {
+        return Ok(result);
+    }
+    let repo_ids: Vec<i32> = repos.iter().map(|repo| repo.repo_id).collect();
+    let changelist_ids: Vec<i64> = repos
+        .iter()
+        .flat_map(|repo| repo.changelist_ids.iter().copied())
+        .collect();
+    let rows = sqlx::query(
+        r#"
+SELECT repo_id, perforce_changelist_id, commit_sha
+FROM repo_commits_changelists
+WHERE repo_id = ANY($1) AND perforce_changelist_id = ANY($2)
+"#,
+    )
+    .bind(&repo_ids)
+    .bind(&changelist_ids)
+    .fetch_all(pool)
+    .await?;
+    for row in rows {
+        let repo_id: i32 = row.try_get("repo_id")?;
+        let changelist_id: i64 = row.try_get("perforce_changelist_id")?;
+        let commit_sha: String = row.try_get("commit_sha")?;
+        result
+            .entry(repo_id)
+            .or_default()
+            .insert(changelist_id, commit_sha);
+    }
+    Ok(result)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

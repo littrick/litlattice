@@ -77,6 +77,21 @@ impl<S> BlockingStreamer<S> {
 }
 
 impl<S: Streamer> BlockingStreamer<S> {
+    /// `zoekt.Streamer.List`, blocking.
+    ///
+    /// The repository resolver calls `List` from a synchronous job run (see
+    /// `search_repos::filter_repo_has_file_content`); this bridge runs the
+    /// wrapped async transport to completion with the same runtime strategy
+    /// as [`Self::stream_search_blocking`].
+    pub fn list_blocking(
+        &self,
+        query: &Query,
+        opts: Option<ListOptions>,
+    ) -> Result<ListResponse, S::Error> {
+        let future = self.inner.list(query, opts);
+        run_to_completion(future)
+    }
+
     /// `zoekt.Streamer.StreamSearch`, blocking.
     ///
     /// Each received chunk is converted with

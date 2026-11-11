@@ -173,11 +173,34 @@ impl RepoPage {
     }
 }
 
+/// The options-aware result of one resolver run: pages plus the terminal
+/// error (`RepoPageSource::resolve_pages`).
+#[derive(Debug, Clone, Default)]
+pub struct ResolvedPages {
+    pub pages: Vec<RepoPage>,
+    pub error: Option<JobError>,
+}
+
 /// `repos.Resolver.Iterator` reduced to its observable behavior: a sequence
 /// of pages followed by an optional terminal error.
 pub trait RepoPageSource {
     fn pages(&self) -> Vec<RepoPage>;
     fn error(&self) -> Option<JobError>;
+
+    /// Options-aware resolution used by the production tree pager
+    /// (`repo_pager_job.go:98-121`: `resolver.Iterator(ctx, repoOpts)`).
+    ///
+    /// The default keeps option-unaware implementations (tests and the
+    /// M9.8hw seams) working: they return their fixed pages/error.
+    fn resolve_pages(
+        &self,
+        _options: &crate::search_repos::ResolveOptions,
+    ) -> ResolvedPages {
+        ResolvedPages {
+            pages: self.pages(),
+            error: self.error(),
+        }
+    }
 }
 
 /// `db.Repos().GetRepoDescriptionsByIDs`.

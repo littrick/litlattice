@@ -165,6 +165,16 @@ impl IndexedRepoRevs {
             .collect()
     }
 
+    /// `query.BranchRepos` wire form of [`Self::branch_repos`], for
+    /// `zoektquery.NewAnd(&zoektquery.BranchesRepos{...}, q)` in
+    /// `FilterRepoHasFileContent`.
+    pub fn branch_repos_query(&self) -> Vec<crate::query::BranchRepos> {
+        self.branch_repos()
+            .into_iter()
+            .map(|branch| branch.to_query_branch_repos())
+            .collect()
+    }
+
     /// `(*IndexedRepoRevs).GetRepoRevsFromBranchRepos`.
     ///
     /// Replaces revision values that are not branch names known to zoekt with
@@ -248,6 +258,20 @@ impl IndexedRepoRevs {
             },
             input_revs,
         )
+    }
+}
+
+impl IndexedBranchRepos {
+    /// Convert to the `query.BranchRepos` wire form (portable roaring).
+    pub fn to_query_branch_repos(&self) -> crate::query::BranchRepos {
+        let mut repos = Vec::new();
+        self.repos
+            .serialize_into(&mut repos)
+            .expect("serializing a roaring bitmap into a Vec cannot fail");
+        crate::query::BranchRepos {
+            branch: self.branch.clone(),
+            repos,
+        }
     }
 }
 

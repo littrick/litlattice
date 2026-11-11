@@ -35,13 +35,22 @@ use sqlx::PgPool;
 use tokio_stream::StreamExt;
 
 use sg_config::{ServiceConnections, SiteConfiguration};
+use sg_db::repos as db_repos;
 use sg_git::GitserverClient as GitClient;
 use sg_proto::gitserver as pb;
 use sg_zoekt::indexed_repo_revs::MinimalRepo;
+use sg_zoekt::query::Query;
+use sg_zoekt::types::{ListOptions, ListResponse, RepoListField};
 
 use crate::search_commit_job::{searcher_error_from_git, CommitUserDB, CommitUserEmail};
+use crate::search_contexts::RequestContext;
+use crate::search_contexts_store::PgSearchContextsStore;
 use crate::search_env::{IndexedError, IndexedJobStreamer, SearcherGrpcConnectionCache};
 use crate::search_job::{JobError, JobStreamer, PrivateRepoLister, ReposListOptions};
+use crate::search_repos::{
+    GitserverError, Resolver, ResolverGitserver, ResolverRepoPageSource,
+    ResolverSearcher, ResolverZoektLister,
+};
 use crate::search_searcher_client::{
     default_searcher_client, grpc_client_from_endpoints, run_to_completion, SearcherClient,
     SearcherClients, SearcherError, SearcherGitserver, SearcherLimiter, SymbolsClient,
@@ -143,18 +152,27 @@ pub fn assemble(
     connections: &ServiceConnections,
     site: &SiteConfiguration,
 ) -> Result<TreeRuntimeClients, RuntimeConfigError> {
-    assemble_with_repo_pager(pool, connections, site, None)
+    assemble_inner(pool, connections, site, None)
 }
 
-/// [`assemble`] plus optional `RepoPagerJob` collaborators. The resolver is
-/// not ported, so production passes `None`; a caller that can supply pages (a
-/// test or a future resolver port) injects them here. `None` keeps the exact
-/// `"RepoPagerJob execution is not ported (M9.8hw)"` fallback.
+/// [`assemble`] plus an optional test override for the `RepoPagerJob`
+/// collaborators. `Some` wins; `None` builds the production
+/// [`ResolverRepoPageSource`] like [`assemble`] (M9.10a), so differential
+/// harnesses can still substitute fakes.
 pub fn assemble_with_repo_pager(
     pool: &PgPool,
     connections: &ServiceConnections,
     site: &SiteConfiguration,
     repo_pager: Option<Arc<RepoPagerRuntimeClients>>,
+) -> Result<TreeRuntimeClients, RuntimeConfigError> {
+    assemble_inner(pool, connections, site, repo_pager)
+}
+
+fn assemble_inner(
+    pool: &PgPool,
+    connections: &ServiceConnections,
+    site: &SiteConfiguration,
+    explicit_repo_pager: Option<Arc<RepoPagerRuntimeClients>>,
 ) -> Result<TreeRuntimeClients, RuntimeConfigError> {
     if connections.zoekts.is_empty() {
         return Err(RuntimeConfigError::MissingZoekt);
@@ -214,16 +232,219 @@ pub fn assemble_with_repo_pager(
         }))
     };
 
+    // `repos.Resolver` (M9.10a). The production resolver shares the zoekt
+    // streamer, gitserver client and (when configured) searcher client with
+    // the rest of the job tree. `explicit_repo_pager` is the test override.
+    let repo_pager = match explicit_repo_pager {
+        Some(repo_pager) => Some(repo_pager),
+        None => {
+            let resolver_zoekt = Arc::new(IndexedResolverZoekt {
+                streamer: Arc::clone(&zoekt),
+            });
+            let resolver = Arc::new(Resolver {
+                db: Arc::new(PgRepoResolverDb {
+                    pool: pool.clone(),
+                    search_contexts: Arc::new(PgSearchContextsStore::new(pool.clone())),
+                }),
+                gitserver: Arc::new(GitResolverGitserver {
+                    client: Arc::clone(&gitserver),
+                }),
+                zoekt: resolver_zoekt.clone(),
+                searcher: searcher.as_ref().map(|searcher| {
+                    Arc::new(SearcherResolverSearcher {
+                        client: Arc::clone(&searcher.client),
+                    }) as Arc<dyn ResolverSearcher>
+                }),
+                max_repos,
+            });
+            Some(Arc::new(RepoPagerRuntimeClients::new(
+                Arc::new(ResolverRepoPageSource::new(resolver)),
+                resolver_zoekt,
+            )))
+        }
+    };
+
     Ok(TreeRuntimeClients {
         db,
         zoekt,
         max_repos,
         searcher,
         commit,
-        // `repos.Resolver` is not ported; a caller that can supply pages sets
-        // this bundle. `None` keeps the exact RepoPagerJob not-ported error.
         repo_pager,
     })
+}
+
+// ---------------------------------------------------------------------------
+// `repos.Resolver` production adapters (M9.10a)
+// ---------------------------------------------------------------------------
+
+/// `database.DB` reads used by the repository resolver.
+struct PgRepoResolverDb {
+    pool: PgPool,
+    search_contexts: Arc<PgSearchContextsStore>,
+}
+
+impl crate::search_repos::RepoResolverDb for PgRepoResolverDb {
+    fn resolve_search_context(
+        &self,
+        spec: &str,
+        ctx: &RequestContext,
+    ) -> Result<crate::search_contexts::SearchContext, JobError> {
+        crate::search_contexts::resolve_search_context_spec(
+            self.search_contexts.as_ref(),
+            ctx,
+            spec,
+        )
+        .map_err(|error| JobError(error.to_string()))
+    }
+
+    fn list_minimal_repos(
+        &self,
+        options: &db_repos::RepoListOptions,
+    ) -> Result<Vec<db_repos::RepoListItem>, JobError> {
+        let pool = self.pool.clone();
+        let options = options.clone();
+        run_to_completion(async move { db_repos::list_minimal_repos(&pool, &options).await })
+            .map_err(|error| JobError(error.to_string()))
+    }
+
+    fn get_search_context_repository_revisions(
+        &self,
+        id: i64,
+    ) -> Result<Vec<crate::search_contexts::SearchContextRepositoryRevisions>, JobError> {
+        use crate::search_contexts::SearchContextsDatabase;
+        self.search_contexts
+            .get_search_context_repository_revisions(id)
+            .map_err(|error| JobError(error.to_string()))
+    }
+
+    fn batch_get_repo_commit_changelist(
+        &self,
+        repos: &[db_repos::RepoChangelistIDs],
+    ) -> Result<std::collections::BTreeMap<u32, std::collections::BTreeMap<i64, String>>, JobError>
+    {
+        let pool = self.pool.clone();
+        let repos = repos.to_vec();
+        run_to_completion(async move {
+            db_repos::batch_get_repo_commit_changelist(&pool, &repos).await
+        })
+        .map(|map| {
+            map.into_iter()
+                .map(|(repo_id, revs)| (repo_id as u32, revs))
+                .collect()
+        })
+        .map_err(|error| JobError(error.to_string()))
+    }
+}
+
+/// `gitserver.Client` methods used by the resolver.
+struct GitResolverGitserver {
+    client: Arc<GitClient>,
+}
+
+fn gitserver_error(error: sg_git::Error) -> GitserverError {
+    match error {
+        sg_git::Error::RevisionNotFound { .. }
+        | sg_git::Error::RepoNotFound { .. }
+        | sg_git::Error::NotFound(_) => GitserverError::Missing,
+        other => GitserverError::Fatal(other.to_string()),
+    }
+}
+
+fn timestamp_of(value: time::OffsetDateTime) -> prost_types::Timestamp {
+    prost_types::Timestamp {
+        seconds: value.unix_timestamp(),
+        nanos: value.nanosecond() as i32,
+    }
+}
+
+impl ResolverGitserver for GitResolverGitserver {
+    fn resolve_revision(&self, repo: &str, rev: &str) -> Result<String, GitserverError> {
+        let client = Arc::clone(&self.client);
+        let repo = repo.to_owned();
+        let rev = rev.to_owned();
+        run_to_completion(async move { client.resolve_revision(&repo, &rev, false).await })
+            .map_err(gitserver_error)
+    }
+
+    fn list_refs(&self, repo: &str) -> Result<Vec<String>, JobError> {
+        let client = Arc::clone(&self.client);
+        let repo = repo.to_owned();
+        run_to_completion(async move {
+            client
+                .list_refs(&repo, false, false, &[], None)
+                .await
+        })
+        .map(|refs| refs.into_iter().map(|git_ref| git_ref.name).collect())
+        .map_err(|error| JobError(error.to_string()))
+    }
+
+    fn commits_after(
+        &self,
+        repo: &str,
+        rev: &str,
+        after: time::OffsetDateTime,
+    ) -> Result<usize, GitserverError> {
+        let client = Arc::clone(&self.client);
+        let repo = repo.to_owned();
+        let rev = if rev.is_empty() { "HEAD" } else { rev }.to_owned();
+        let options = sg_git::CommitsOptions {
+            ranges: vec![rev],
+            after: Some(timestamp_of(after)),
+            max_commits: 2,
+            ..sg_git::CommitsOptions::default()
+        };
+        run_to_completion(async move { client.commits(&repo, &options).await })
+            .map(|commits| commits.len())
+            .map_err(gitserver_error)
+    }
+}
+
+/// `zoekt.Streamer` for the resolver: `List` on the production indexed stack.
+struct IndexedResolverZoekt {
+    streamer: Arc<IndexedJobStreamer>,
+}
+
+impl ResolverZoektLister for IndexedResolverZoekt {
+    fn list(
+        &self,
+        query: &Query,
+        opts: Option<ListOptions>,
+    ) -> Result<ListResponse, JobError> {
+        self.streamer
+            .streamer()
+            .list_blocking(query, opts)
+            .map_err(|error| JobError(error.to_string()))
+    }
+}
+
+/// `zoekt.Streamer.List` consumed by `RepoPagerJob`'s partitioning
+/// (`PartitionRepos` lists `Const(true)` with the repos map).
+impl crate::search_jobutil_repos::ZoektRepoLister for IndexedResolverZoekt {
+    fn list(&self) -> Result<ListResponse, JobError> {
+        ResolverZoektLister::list(
+            self,
+            &Query::Const(true),
+            Some(ListOptions {
+                field: RepoListField::ReposMap,
+            }),
+        )
+    }
+}
+
+/// `searcher.Search` for `filterRepoHasFileContent`.
+struct SearcherResolverSearcher {
+    client: Arc<dyn SearcherClient + Send + Sync>,
+}
+
+impl ResolverSearcher for SearcherResolverSearcher {
+    fn search(&self, request: &crate::search_searcher_client::protocol::Request) -> Result<bool, JobError> {
+        let mut found = false;
+        self.client
+            .search(request, &mut |_| found = true)
+            .map_err(|error| JobError(error.to_string()))?;
+        Ok(found)
+    }
 }
 
 /// Zoekt streamer placeholder for commit-only job trees. Code-monitor
@@ -270,13 +491,58 @@ pub fn assemble_commit_search(
         }))
     };
 
+    // Code-monitor plans use `repoPagerJob{skipPartitioning:true}` and only
+    // commit leaves, so the resolver's zoekt lister is never called; the
+    // searcher (requires-index `repo:contains.*` filters) is not wired.
+    let resolver_zoekt = Arc::new(UnconfiguredResolverZoekt);
+    let resolver = Arc::new(Resolver {
+        db: Arc::new(PgRepoResolverDb {
+            pool: pool.clone(),
+            search_contexts: Arc::new(PgSearchContextsStore::new(pool.clone())),
+        }),
+        gitserver: Arc::new(GitResolverGitserver {
+            client: Arc::clone(&gitserver),
+        }),
+        zoekt: resolver_zoekt.clone(),
+        searcher: None,
+        max_repos: max_repos_from_site(site),
+    });
+    let repo_pager = Arc::new(RepoPagerRuntimeClients::new(
+        Arc::new(ResolverRepoPageSource::new(resolver)),
+        resolver_zoekt,
+    ));
+
     TreeRuntimeClients {
         db,
         zoekt: Arc::new(UnconfiguredJobStreamer),
         max_repos: max_repos_from_site(site),
         searcher: None,
         commit,
-        repo_pager: None,
+        repo_pager: Some(repo_pager),
+    }
+}
+
+/// Zoekt placeholder for the commit-search resolver (see
+/// [`assemble_commit_search`]).
+struct UnconfiguredResolverZoekt;
+
+impl ResolverZoektLister for UnconfiguredResolverZoekt {
+    fn list(
+        &self,
+        _query: &Query,
+        _opts: Option<ListOptions>,
+    ) -> Result<ListResponse, JobError> {
+        Err(JobError(
+            "zoekt is not configured for this search".to_owned(),
+        ))
+    }
+}
+
+impl crate::search_jobutil_repos::ZoektRepoLister for UnconfiguredResolverZoekt {
+    fn list(&self) -> Result<ListResponse, JobError> {
+        Err(JobError(
+            "zoekt is not configured for this search".to_owned(),
+        ))
     }
 }
 
