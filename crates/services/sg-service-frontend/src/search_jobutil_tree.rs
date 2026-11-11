@@ -14,10 +14,15 @@
 //! * the structural `orderRacingJobs` rewriting.
 //!
 //! The result is an enumerable [`JobNode`] tree implementing [`SearchJob`]
-//! (Name/Children/Attributes). Job *execution* is not ported: [`SearchJob::run`]
-//! returns an error. No GraphQL/HTTP/gRPC/DB is touched.
+//! (Name/Children/Attributes). [`SearchJob::run`] executes the tree: the
+//! wrappers reuse the ported `search_jobutil_combinators` /
+//! `search_jobutil_expression` semantics, and the zoekt text/symbol leaves
+//! delegate to the ported jobs in [`crate::search_job`]. Searcher, commit,
+//! structural and repo-pager leaves still return an explicit per-kind
+//! "not ported" error. No GraphQL/HTTP/gRPC/DB is touched.
 //!
-//! See `docs/overviews/m9_8ho_jobutil_tree_overview.md`.
+//! See `docs/overviews/m9_8ho_jobutil_tree_overview.md` and
+//! `docs/overviews/m9_8hw_jobutil_tree_run_overview.md`.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -32,17 +37,25 @@ use sg_search_query::parser::SearchType;
 use sg_search_query::predicate::parse_as_predicate;
 use sg_search_query::validate::YesNoOnly;
 use sg_zoekt::global_query::{default_global_query_scope, GlobalZoektQuery};
+use sg_zoekt::indexed_repo_revs::IndexedRepoRevs;
 use sg_zoekt::languages::lang_to_file_regexp;
 use sg_zoekt::query::{self as zoekt_query, IndexedRequestType};
 
 use crate::search_client::{Features, Protocol};
 use crate::search_contexts::{parse_repository_revisions, ParsedRepoFilter, RepoVisibility};
-use crate::search_job::{JobContext, JobError, RuntimeClients, SearchJob, Verbosity};
+use crate::search_job::{
+    GlobalTextSearchJob, JobContext, JobError, RepoSubsetTextSearchJob, RuntimeClients, SearchJob,
+    SymbolSearchJob, Verbosity,
+};
+use crate::search_jobutil_combinators as comb;
 use crate::search_jobutil_combinators::format_go_duration;
+use crate::search_jobutil_expression as expr;
 use crate::search_jobutil_filters::{
     patterns_in_tree, ContainsPatternError, ContainsPatternStage, PatternNode as FilterPatternNode,
 };
 use crate::search_jobutil_job_builders as jb;
+use crate::search_stream::progress::SearchEvent;
+use crate::search_stream::zoekt_search::{SelectPath, ZoektParameters};
 
 // ---------------------------------------------------------------------------
 // Inputs
@@ -403,21 +416,35 @@ enum NodeKind {
         pattern_info: jb::TextPatternInfo,
     },
     ZoektRepoSubsetText {
-        query: String,
-        typ: &'static str,
+        /// `Repos`; `None` models a nil pointer.
+        repos: Option<IndexedRepoRevs>,
+        query: zoekt_query::Query,
+        /// `ZoektQueryRegexps`: also passed as path regexps at run time.
+        zoekt_query_regexps: Vec<String>,
+        zoekt_params: ZoektParameters,
     },
     ZoektSymbol {
-        query: String,
+        /// `Repos`; `None` models a nil pointer.
+        repos: Option<IndexedRepoRevs>,
+        query: zoekt_query::Query,
+        zoekt_params: ZoektParameters,
     },
     ZoektGlobalText {
-        query: String,
-        typ: &'static str,
-        repo_opts: TreeRepoOptions,
+        global: GlobalZoektQuery,
+        zoekt_params: ZoektParameters,
+        /// `search.RepoOptions` passed to the global job.
+        repo_opts: sg_zoekt::global_query::RepoOptions,
+        global_zoekt_query_regexps: Vec<String>,
+        /// Construction-time repo options, rendered in `Attributes`.
+        tree_repo_opts: TreeRepoOptions,
     },
     ZoektGlobalSymbol {
-        query: String,
-        typ: &'static str,
-        repo_opts: TreeRepoOptions,
+        global: GlobalZoektQuery,
+        zoekt_params: ZoektParameters,
+        /// `search.RepoOptions` passed to the global job.
+        repo_opts: sg_zoekt::global_query::RepoOptions,
+        /// Construction-time repo options, rendered in `Attributes`.
+        tree_repo_opts: TreeRepoOptions,
     },
     ComputeExcluded {
         repo_opts: TreeRepoOptions,
@@ -553,26 +580,38 @@ impl JobNode {
                 );
                 res
             }
-            NodeKind::ZoektRepoSubsetText { query, typ } => vec![
-                ("query".to_owned(), query.clone()),
-                ("type".to_owned(), (*typ).to_owned()),
-            ],
-            NodeKind::ZoektSymbol { query } => vec![("query".to_owned(), query.clone())],
-            NodeKind::ZoektGlobalText {
+            NodeKind::ZoektRepoSubsetText {
                 query,
-                typ,
-                repo_opts,
+                zoekt_params,
+                ..
+            } => vec![
+                ("query".to_owned(), query.to_string()),
+                (
+                    "type".to_owned(),
+                    indexed_request_type_str(zoekt_params.typ).to_owned(),
+                ),
+            ],
+            NodeKind::ZoektSymbol { query, .. } => vec![("query".to_owned(), query.to_string())],
+            NodeKind::ZoektGlobalText {
+                global,
+                zoekt_params,
+                tree_repo_opts,
+                ..
             }
             | NodeKind::ZoektGlobalSymbol {
-                query,
-                typ,
-                repo_opts,
+                global,
+                zoekt_params,
+                tree_repo_opts,
+                ..
             } => {
                 let mut res = vec![
-                    ("query".to_owned(), query.clone()),
-                    ("type".to_owned(), (*typ).to_owned()),
+                    ("query".to_owned(), global.query.to_string()),
+                    (
+                        "type".to_owned(),
+                        indexed_request_type_str(zoekt_params.typ).to_owned(),
+                    ),
                 ];
-                res.extend(repo_opts.scoped_attributes());
+                res.extend(tree_repo_opts.scoped_attributes());
                 res
             }
             NodeKind::ComputeExcluded { repo_opts } => repo_opts.scoped_attributes(),
@@ -632,13 +671,16 @@ impl JobNode {
 impl SearchJob for JobNode {
     fn run(
         &mut self,
-        _ctx: &JobContext,
-        _clients: &RuntimeClients<'_>,
-        _stream: &mut dyn FnMut(crate::search_stream::progress::SearchEvent),
+        ctx: &JobContext,
+        clients: &RuntimeClients<'_>,
+        stream: &mut dyn FnMut(SearchEvent),
     ) -> Result<(), JobError> {
-        Err(JobError(
-            "job execution is not ported (M9.8ho construction-only)".to_owned(),
-        ))
+        let run_ctx = comb::RunContext::new(ctx.deadline);
+        let mut job = self.to_combinator()?;
+        match job.run(&run_ctx, clients, stream).1 {
+            None => Ok(()),
+            Some(failure) => Err(JobError(failure.to_string())),
+        }
     }
 
     fn name(&self) -> &'static str {
@@ -657,6 +699,336 @@ impl SearchJob for JobNode {
             Verbosity::None => Vec::new(),
             Verbosity::Basic | Verbosity::Max => self.basic_attributes(),
         }
+    }
+}
+
+/// The single child a unary wrapper runs; `NoopJob` when absent (defensive:
+/// construction never produces a childless unary node).
+fn only_child(mut children: Vec<Box<dyn comb::CombinatorJob>>) -> Box<dyn comb::CombinatorJob> {
+    match children.len() {
+        0 => comb::new_noop_job(),
+        1 => children.pop().expect("one child"),
+        _ => comb::new_sequential_job(false, children),
+    }
+}
+
+fn indexed_request_type_str(typ: IndexedRequestType) -> &'static str {
+    match typ {
+        IndexedRequestType::Text => "text",
+        IndexedRequestType::Symbol => "symbol",
+    }
+}
+
+/// Stores compiled path regexps as their source, keeping [`JobNode`] `Clone +
+/// PartialEq` (`regex::Regex` is not `PartialEq`).
+fn regexp_patterns(regexps: Vec<Regex>) -> Vec<String> {
+    regexps
+        .into_iter()
+        .map(|regexp| regexp.as_str().to_owned())
+        .collect()
+}
+
+/// Recompiles the path regexps at run time; they were compiled once during
+/// construction, so a failure here is not expected.
+fn compile_regexps(patterns: &[String]) -> Result<Vec<Regex>, JobError> {
+    patterns
+        .iter()
+        .map(|pattern| Regex::new(pattern).map_err(|error| JobError(error.to_string())))
+        .collect()
+}
+
+fn alert_pattern_type(value: &str) -> SearchType {
+    match value {
+        "regex" => SearchType::Regex,
+        "literal" => SearchType::Literal,
+        "structural" => SearchType::Structural,
+        "codycontext" => SearchType::CodyContext,
+        "keyword" => SearchType::Keyword,
+        _ => SearchType::Standard,
+    }
+}
+
+/// Adapts a childless [`crate::search_job`] leaf to [`comb::CombinatorJob`].
+struct TreeLeafJob {
+    name: &'static str,
+    job: Box<dyn SearchJob>,
+    /// `SymbolSearchJob` / `GlobalSymbolSearchJob` drop errors once the
+    /// context is canceled (baseline `if ctx.Err() == nil`).
+    swallow_error_when_canceled: bool,
+}
+
+impl comb::CombinatorJob for TreeLeafJob {
+    fn run(
+        &mut self,
+        ctx: &comb::RunContext,
+        clients: &RuntimeClients<'_>,
+        stream: comb::Sender<'_>,
+    ) -> (Option<comb::Alert>, Option<comb::JobFailure>) {
+        let job_ctx = ctx.as_job_context();
+        match self.job.run(&job_ctx, clients, stream) {
+            Ok(()) => (None, None),
+            Err(err) => {
+                if self.swallow_error_when_canceled && ctx.is_canceled() {
+                    (None, None)
+                } else {
+                    (None, Some(comb::JobFailure::Message(err.to_string())))
+                }
+            }
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        self.name
+    }
+}
+
+/// `searchalert.Observer` stand-in: preserves the child's error. The
+/// baseline observer's DB-backed timeout/smart-search alerts are not ported
+/// (see the overview's errata); `Observers` therefore never attaches an alert.
+#[derive(Debug, Default)]
+struct ErrorPreservingObserver {
+    error: Option<comb::JobFailure>,
+}
+
+impl comb::AlertObserver for ErrorPreservingObserver {
+    fn set_has_results(&mut self, _has_results: bool) {}
+
+    fn observe_error(&mut self, _ctx: &comb::RunContext, err: &comb::JobFailure) {
+        self.error = Some(err.clone());
+    }
+
+    fn done(&mut self) -> (Option<comb::Alert>, Option<comb::JobFailure>) {
+        (None, self.error.take())
+    }
+}
+
+impl JobNode {
+    /// Converts this tree into the executable combinator representation.
+    fn to_combinator(&self) -> Result<Box<dyn comb::CombinatorJob>, JobError> {
+        let mut children = Vec::with_capacity(self.children.len());
+        for child in &self.children {
+            children.push(child.to_combinator()?);
+        }
+
+        Ok(match &self.kind {
+            NodeKind::Noop => comb::new_noop_job(),
+            // `LogJob.Run` only writes event logs when authenticated; events
+            // and errors pass through unchanged.
+            NodeKind::Log => only_child(children),
+            NodeKind::Sequential { ensure_unique } => {
+                comb::new_sequential_job(*ensure_unique, children)
+            }
+            NodeKind::Parallel => comb::new_parallel_job(children),
+            NodeKind::And => expr::new_and_job(children),
+            NodeKind::Or => expr::new_or_job(children),
+            NodeKind::Timeout { nanos } => {
+                let timeout = Duration::from_nanos((*nanos).max(0) as u64);
+                comb::new_timeout_job(timeout, only_child(children))
+            }
+            NodeKind::Limit { limit } => comb::new_limit_job(*limit, only_child(children)),
+            NodeKind::Alert {
+                query,
+                original_query,
+                pattern_type,
+            } => {
+                let inputs = comb::AlertInputs {
+                    query: query.clone(),
+                    original_query: original_query.clone(),
+                    pattern_type: alert_pattern_type(pattern_type),
+                    ..comb::AlertInputs::default()
+                };
+                comb::new_alert_job(
+                    inputs,
+                    only_child(children),
+                    Box::new(|| Box::new(ErrorPreservingObserver::default())),
+                )
+            }
+            NodeKind::ZoektRepoSubsetText {
+                repos,
+                query,
+                zoekt_query_regexps,
+                zoekt_params,
+            } => {
+                let job = RepoSubsetTextSearchJob {
+                    repos: repos.clone(),
+                    query: query.clone(),
+                    zoekt_query_regexps: compile_regexps(zoekt_query_regexps)?,
+                    typ: zoekt_params.typ,
+                    zoekt_params: zoekt_params.clone(),
+                    since: None,
+                };
+                Box::new(TreeLeafJob {
+                    name: self.name_str(),
+                    job: Box::new(job),
+                    swallow_error_when_canceled: false,
+                })
+            }
+            NodeKind::ZoektSymbol {
+                repos,
+                query,
+                zoekt_params,
+            } => {
+                let job = SymbolSearchJob {
+                    repos: repos.clone(),
+                    query: query.clone(),
+                    zoekt_params: zoekt_params.clone(),
+                    since: None,
+                };
+                Box::new(TreeLeafJob {
+                    name: self.name_str(),
+                    job: Box::new(job),
+                    swallow_error_when_canceled: true,
+                })
+            }
+            NodeKind::ZoektGlobalText {
+                global,
+                zoekt_params,
+                repo_opts,
+                global_zoekt_query_regexps,
+                ..
+            } => {
+                let job = GlobalTextSearchJob {
+                    global_zoekt_query: global.clone(),
+                    zoekt_params: zoekt_params.clone(),
+                    repo_opts: repo_opts.clone(),
+                    global_zoekt_query_regexps: compile_regexps(global_zoekt_query_regexps)?,
+                };
+                Box::new(TreeLeafJob {
+                    name: self.name_str(),
+                    job: Box::new(job),
+                    swallow_error_when_canceled: false,
+                })
+            }
+            NodeKind::ZoektGlobalSymbol {
+                global,
+                zoekt_params,
+                repo_opts,
+                ..
+            } => {
+                // `GlobalSymbolSearchJob`: same as the global text job but
+                // with nil path regexps and `ctx.Err() == nil` swallowing.
+                let job = GlobalTextSearchJob {
+                    global_zoekt_query: global.clone(),
+                    zoekt_params: zoekt_params.clone(),
+                    repo_opts: repo_opts.clone(),
+                    global_zoekt_query_regexps: Vec::new(),
+                };
+                Box::new(TreeLeafJob {
+                    name: self.name_str(),
+                    job: Box::new(job),
+                    swallow_error_when_canceled: true,
+                })
+            }
+            NodeKind::SearcherText
+            | NodeKind::SearcherSymbol { .. }
+            | NodeKind::Commit { .. }
+            | NodeKind::Structural { .. }
+            | NodeKind::ComputeExcluded { .. }
+            | NodeKind::FileContains { .. }
+            | NodeKind::FileHasOwners { .. }
+            | NodeKind::FileHasContributors { .. }
+            | NodeKind::Select { .. }
+            | NodeKind::SelectOwners
+            | NodeKind::Sanitize
+            | NodeKind::SubRepoPerms
+            | NodeKind::RepoPager { .. }
+            | NodeKind::ReposPartial
+            | NodeKind::RepoSearch { .. } => {
+                return Err(JobError(format!(
+                    "{} execution is not ported (M9.8hw)",
+                    self.name_str()
+                )));
+            }
+        })
+    }
+
+    /// Public constructors used by the execution differential harness.
+    pub fn noop() -> JobNode {
+        new_noop_job()
+    }
+
+    pub fn log(child: JobNode) -> JobNode {
+        new_log_job(child)
+    }
+
+    pub fn limit(limit: i64, child: JobNode) -> JobNode {
+        new_limit_job(limit, child)
+    }
+
+    pub fn timeout(nanos: i64, child: JobNode) -> JobNode {
+        new_timeout_job(nanos, child)
+    }
+
+    pub fn sequential(ensure_unique: bool, children: Vec<JobNode>) -> JobNode {
+        new_sequential_job(ensure_unique, children)
+    }
+
+    pub fn parallel(children: Vec<JobNode>) -> JobNode {
+        new_parallel_job(children)
+    }
+
+    pub fn and(children: Vec<JobNode>) -> JobNode {
+        new_and_job(children)
+    }
+
+    pub fn or(children: Vec<JobNode>) -> JobNode {
+        new_or_job(children)
+    }
+
+    pub fn zoekt_repo_subset_text(
+        repos: Option<IndexedRepoRevs>,
+        query: zoekt_query::Query,
+        zoekt_query_regexps: Vec<String>,
+        zoekt_params: ZoektParameters,
+    ) -> JobNode {
+        JobNode::leaf(NodeKind::ZoektRepoSubsetText {
+            repos,
+            query,
+            zoekt_query_regexps,
+            zoekt_params,
+        })
+    }
+
+    pub fn zoekt_symbol(
+        repos: Option<IndexedRepoRevs>,
+        query: zoekt_query::Query,
+        zoekt_params: ZoektParameters,
+    ) -> JobNode {
+        JobNode::leaf(NodeKind::ZoektSymbol {
+            repos,
+            query,
+            zoekt_params,
+        })
+    }
+
+    pub fn zoekt_global_text(
+        global: GlobalZoektQuery,
+        zoekt_params: ZoektParameters,
+        repo_opts: sg_zoekt::global_query::RepoOptions,
+        global_zoekt_query_regexps: Vec<String>,
+        tree_repo_opts: TreeRepoOptions,
+    ) -> JobNode {
+        JobNode::leaf(NodeKind::ZoektGlobalText {
+            global,
+            zoekt_params,
+            repo_opts,
+            global_zoekt_query_regexps,
+            tree_repo_opts,
+        })
+    }
+
+    pub fn zoekt_global_symbol(
+        global: GlobalZoektQuery,
+        zoekt_params: ZoektParameters,
+        repo_opts: sg_zoekt::global_query::RepoOptions,
+        tree_repo_opts: TreeRepoOptions,
+    ) -> JobNode {
+        JobNode::leaf(NodeKind::ZoektGlobalSymbol {
+            global,
+            zoekt_params,
+            repo_opts,
+            tree_repo_opts,
+        })
     }
 }
 
@@ -906,9 +1278,16 @@ pub fn new_basic_job(inputs: &TreeInputs, basic: &Basic) -> Result<JobNode, JobE
     let repo_options = TreeRepoOptions::from_job_builders(&job_repo_options);
     let contains_ref_globs = contains_ref_globs(&b);
 
+    // `filter.SelectPathFromString(b.FindValue(query.FieldSelect))`.
+    let selector = jb::select_path_from_string(&q_string_value(&b.to_parse_tree(), FIELD_SELECT))
+        .unwrap_or_default();
     let builder = JobBuilder {
         result_types,
         features: inputs.features,
+        pattern_type: inputs.pattern_type,
+        file_match_limit,
+        select: selector,
+        num_context_lines: inputs.context_lines,
     };
 
     if result_types.has(jb::ResultTypes::FILE | jb::ResultTypes::PATH) {
@@ -1091,6 +1470,10 @@ pub fn new_text_search_job(
 struct JobBuilder {
     result_types: jb::ResultTypes,
     features: Features,
+    pattern_type: SearchType,
+    file_match_limit: i32,
+    select: jb::SelectPath,
+    num_context_lines: i32,
 }
 
 impl JobBuilder {
@@ -1118,6 +1501,21 @@ impl JobBuilder {
     fn zoekt_features(&self) -> zoekt_query::Features {
         zoekt_query::Features {
             content_based_lang_filters: self.features.content_based_lang_filters,
+        }
+    }
+
+    /// `search.ZoektParameters` constructed by the baseline job builder.
+    fn zoekt_parameters(&self, typ: IndexedRequestType) -> ZoektParameters {
+        ZoektParameters {
+            typ,
+            file_match_limit: self.file_match_limit,
+            select: SelectPath(self.select.clone()),
+            num_context_lines: self.num_context_lines,
+            features: crate::search_stream::zoekt_search::Features {
+                debug: self.features.debug,
+            },
+            pattern_type: self.pattern_type,
+            ..ZoektParameters::default()
         }
     }
 }
@@ -1160,19 +1558,27 @@ fn new_zoekt_global_search(
         RepoVisibility::Private | RepoVisibility::Any
     );
     let global = GlobalZoektQuery::new(zoekt_query, default_scope, include_private);
-    let query = global.query.to_string();
+    let zoekt_params = builder.zoekt_parameters(typ);
+    let global_repo_opts = zoekt_repo_options(repo_options);
 
     Ok(match typ {
         IndexedRequestType::Symbol => JobNode::leaf(NodeKind::ZoektGlobalSymbol {
-            query,
-            typ: "symbol",
-            repo_opts: repo_options.clone(),
+            global,
+            zoekt_params,
+            repo_opts: global_repo_opts,
+            tree_repo_opts: repo_options.clone(),
         }),
-        IndexedRequestType::Text => JobNode::leaf(NodeKind::ZoektGlobalText {
-            query,
-            typ: "text",
-            repo_opts: repo_options.clone(),
-        }),
+        IndexedRequestType::Text => {
+            // `zoektQueryPatternsAsRegexps(globalZoektQuery.Query)`.
+            let regexps = regexp_patterns(jb::zoekt_query_patterns_as_regexps(&global.query));
+            JobNode::leaf(NodeKind::ZoektGlobalText {
+                global,
+                zoekt_params,
+                repo_opts: global_repo_opts,
+                global_zoekt_query_regexps: regexps,
+                tree_repo_opts: repo_options.clone(),
+            })
+        }
     })
 }
 
@@ -1190,14 +1596,24 @@ fn new_zoekt_search(
     )
     .map_err(|error| JobError(error.to_string()))?;
 
+    let zoekt_params = builder.zoekt_parameters(typ);
+
     Ok(match typ {
         IndexedRequestType::Symbol => JobNode::leaf(NodeKind::ZoektSymbol {
-            query: zoekt_query.to_string(),
+            repos: None,
+            query: zoekt_query,
+            zoekt_params,
         }),
-        IndexedRequestType::Text => JobNode::leaf(NodeKind::ZoektRepoSubsetText {
-            query: zoekt_query.to_string(),
-            typ: "text",
-        }),
+        IndexedRequestType::Text => {
+            // `ZoektQueryRegexps: zoektQueryPatternsAsRegexps(zoektQuery)`.
+            let regexps = regexp_patterns(jb::zoekt_query_patterns_as_regexps(&zoekt_query));
+            JobNode::leaf(NodeKind::ZoektRepoSubsetText {
+                repos: None,
+                query: zoekt_query,
+                zoekt_query_regexps: regexps,
+                zoekt_params,
+            })
+        }
     })
 }
 
