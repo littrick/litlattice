@@ -226,6 +226,17 @@ impl GitserverGitObjects {
         }
     }
 
+    /// `connection.GitserverAddresses.AddrForRepo` under the live
+    /// configuration (M9.9d). Pure configuration lookup: no dial and no
+    /// client construction, so the differential harness can assert the
+    /// production wiring resolves the configured fixed endpoint offline.
+    #[doc(hidden)]
+    pub fn address_for_repo(&self, repo: &str) -> Option<String> {
+        let unified = self.live.current();
+        let addresses = sg_git::addresses::GitserverAddresses::from_unified(&unified);
+        addresses.addr_for_repo(repo).map(str::to_owned)
+    }
+
     pub(crate) async fn client_for(
         &self,
         repo: &str,
@@ -337,6 +348,16 @@ impl GitObjectSource for GitserverGitObjects {
             .await
             .map_err(GitSourceError::from)
     }
+}
+
+/// The production [`GitObjectSource`] the frontend installs on
+/// [`SchemaGraphqlDeps`](crate::graphql_api::SchemaGraphqlDeps) (M9.9d).
+///
+/// `service.rs` calls this with the live configuration; the differential
+/// harness uses the same constructor with a fixed endpoint to assert the
+/// assembly and address resolution without touching the network.
+pub fn production_git_source(live: Arc<sg_config::LiveConfig>) -> Arc<GitserverGitObjects> {
+    Arc::new(GitserverGitObjects::new(live))
 }
 
 /// `Repository.Commit(rev:)`'s `ResolveRev` outcome.
@@ -1186,7 +1207,7 @@ impl GitObjectResolverObject {
         };
         let Some(git) = &self.git else {
             return Err(ExecError::new(
-                "GitObject requires a gitserver object resolver, which is not ported",
+                "GitObject requires the gitserver GitSource (not wired for this request)",
             ));
         };
         match git.object(self.repo.id, revspec) {
@@ -1224,7 +1245,7 @@ impl ObjectValue for GitObjectResolverObject {
                 let object_oid = self.resolve()?.0;
                 let Some(git) = &self.git else {
                     return Err(ExecError::new(
-                        "GitObject.commit requires a gitserver commit resolver, which is not ported",
+                        "GitObject.commit requires the gitserver GitSource (not wired for this request)",
                     ));
                 };
                 match git.revisions.get(&(self.repo.id, object_oid.clone())) {

@@ -813,7 +813,7 @@ fn git_of<'a>(
 ) -> Result<&'a Arc<GitPrefetch>, ExecError> {
     obj.git.as_ref().ok_or_else(|| {
         ExecError::new(format!(
-            "{field} requires a gitserver resolver, which is not ported"
+            "{field} requires the gitserver GitSource (not wired for this request)"
         ))
     })
 }

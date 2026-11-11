@@ -666,7 +666,7 @@ impl GitTreeEntryObject {
     fn content_bytes(&self) -> Result<&[u8], ExecError> {
         let Some(git) = &self.git else {
             return Err(ExecError::new(
-                "tree entry content requires a gitserver resolver, which is not ported",
+                "tree entry content requires the gitserver GitSource (not wired for this request)",
             ));
         };
         match git.content(self.repo.id, &self.oid, self.path()) {
@@ -715,7 +715,7 @@ impl GitTreeEntryObject {
         }
         let Some(git) = &self.git else {
             return Err(ExecError::new(
-                "tree entry isSingleChild requires a gitserver resolver, which is not ported",
+                "tree entry isSingleChild requires the gitserver GitSource (not wired for this request)",
             ));
         };
         let dir_path = go_path_dir(self.path());
@@ -735,7 +735,7 @@ impl GitTreeEntryObject {
     fn symbols_field(&self, arguments: &Arguments) -> Result<Option<FieldValue>, ExecError> {
         let Some(git) = &self.git else {
             return Err(ExecError::new(
-                "tree entry symbols requires a gitserver resolver, which is not ported",
+                "tree entry symbols requires the gitserver GitSource (not wired for this request)",
             ));
         };
         let symbols = compute_symbols(
@@ -760,7 +760,7 @@ impl GitTreeEntryObject {
     fn symbol_field(&self, arguments: &Arguments) -> Result<Option<FieldValue>, ExecError> {
         let Some(git) = &self.git else {
             return Err(ExecError::new(
-                "tree entry symbol requires a gitserver resolver, which is not ported",
+                "tree entry symbol requires the gitserver GitSource (not wired for this request)",
             ));
         };
         let line = arguments.i64("line").unwrap_or_default() as i32;
@@ -1124,7 +1124,7 @@ pub fn commit_tree_entry_field(
     let path = arguments.string("path").unwrap_or("");
     let Some(git) = &commit.git else {
         return Err(ExecError::new(
-            "GitCommit.path requires a gitserver resolver, which is not ported",
+            "GitCommit.path requires the gitserver GitSource (not wired for this request)",
         ));
     };
     match git.tree_entry(commit.repo.id, &commit.oid, path) {
@@ -1166,7 +1166,7 @@ pub fn commit_symbols_field(
 ) -> Result<Option<FieldValue>, ExecError> {
     let Some(git) = &commit.git else {
         return Err(ExecError::new(
-            "GitCommit.symbols requires a gitserver resolver, which is not ported",
+            "GitCommit.symbols requires the gitserver GitSource (not wired for this request)",
         ));
     };
     let symbols = compute_symbols(
