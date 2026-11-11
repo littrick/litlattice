@@ -205,6 +205,7 @@ impl JobRunner for TreeJobRunner {
             db: runtime.db.as_ref(),
             zoekt: runtime.zoekt.as_ref(),
             max_repos: runtime.max_repos,
+            searcher: None,
         };
         let ctx = crate::search_job::JobContext { deadline: None };
         match crate::search_job::SearchJob::run(job, &ctx, &clients, sender) {
