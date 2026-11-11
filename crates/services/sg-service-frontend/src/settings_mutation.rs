@@ -85,6 +85,10 @@ pub struct MutationRoot {
     /// `Mutation.updateSiteConfiguration` outcomes
     /// (`crate::site_configuration_mutation::prefetch_update_site_configuration`).
     site_configuration: HashMap<String, Result<bool, String>>,
+    /// `Mutation.addExternalAccount` / `deleteExternalAccount` outcomes
+    /// (`crate::external_accounts_graphql::prefetch_external_account_mutations`,
+    /// M9.9b).
+    external_accounts: HashMap<String, Result<(), String>>,
 }
 
 impl MutationRoot {
@@ -115,6 +119,16 @@ impl MutationRoot {
         outcome: Result<bool, String>,
     ) -> Self {
         self.site_configuration.insert(field.into(), outcome);
+        self
+    }
+
+    /// Attach a prefetched external-account mutation outcome.
+    pub fn with_external_account_mutation(
+        mut self,
+        field: impl Into<String>,
+        outcome: Result<(), String>,
+    ) -> Self {
+        self.external_accounts.insert(field.into(), outcome);
         self
     }
 
@@ -203,6 +217,18 @@ impl ObjectValue for MutationRoot {
                 Some(Err(message)) => Err(ExecError::new(message.clone())),
                 None => Ok(None),
             },
+            // `schemaResolver.AddExternalAccount` / `DeleteExternalAccount`
+            // return a non-nil `&EmptyResponse{}` on success and the resolver
+            // error otherwise (M9.9b).
+            "addExternalAccount" | "deleteExternalAccount" => {
+                match self.external_accounts.get(field) {
+                    Some(Ok(())) => Ok(Some(FieldValue::Object(Arc::new(
+                        crate::temporary_settings::EmptyResponseObject,
+                    )))),
+                    Some(Err(message)) => Err(ExecError::new(message.clone())),
+                    None => Ok(None),
+                }
+            }
             // `schemaResolver.LogUserEvent` has been a no-op since PR 38826.
             "logUserEvent" => Ok(Some(FieldValue::Null)),
             // `OverwriteTemporarySettings` / `EditTemporarySettings` return a

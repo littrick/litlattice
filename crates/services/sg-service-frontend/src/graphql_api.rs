@@ -477,6 +477,13 @@ pub struct ExternalAccountsDeps {
     pub key: Option<Arc<dyn sg_encryption::Key>>,
     pub live: Arc<LiveConfig>,
     pub dotcom: bool,
+    /// `Mutation.addExternalAccount` / `deleteExternalAccount` side-effect
+    /// seams (M9.9b). `None` keeps scheduling a no-op, the feature flag false
+    /// and Gerrit not ported.
+    pub perms_sync: Option<Arc<dyn crate::external_accounts_graphql::PermsSyncScheduler>>,
+    pub feature_flags:
+        Option<Arc<dyn crate::external_accounts_graphql::ExternalAccountFeatureFlags>>,
+    pub gerrit: Option<Arc<dyn crate::external_accounts_graphql::GerritAccountService>>,
 }
 
 impl SchemaGraphqlDeps {
@@ -714,7 +721,29 @@ impl SchemaGraphqlDeps {
             key,
             live,
             dotcom,
+            perms_sync: None,
+            feature_flags: None,
+            gerrit: None,
         });
+        self
+    }
+
+    /// Enable the external-account mutation side effects (M9.9b): the
+    /// permissions-sync scheduler, the deletion feature flag and the Gerrit
+    /// network seam.
+    pub fn with_external_account_services(
+        mut self,
+        perms_sync: Option<Arc<dyn crate::external_accounts_graphql::PermsSyncScheduler>>,
+        feature_flags: Option<
+            Arc<dyn crate::external_accounts_graphql::ExternalAccountFeatureFlags>,
+        >,
+        gerrit: Option<Arc<dyn crate::external_accounts_graphql::GerritAccountService>>,
+    ) -> Self {
+        if let Some(deps) = self.external_accounts.as_mut() {
+            deps.perms_sync = perms_sync;
+            deps.feature_flags = feature_flags;
+            deps.gerrit = gerrit;
+        }
         self
     }
 
@@ -1248,6 +1277,30 @@ impl GraphqlDeps for SchemaGraphqlDeps {
                 nodes.external_accounts = lookups;
             }
         }
+        // `Mutation.addExternalAccount` / `Mutation.deleteExternalAccount`
+        // (M9.9b): run the writes and their side effects before the
+        // synchronous executor.
+        if let (Some(deps), Some(registry)) = (&self.external_accounts, &external_accounts_registry)
+        {
+            if is_mutation {
+                let outcomes =
+                    crate::external_accounts_graphql::prefetch_external_account_mutations(
+                        deps.store.as_ref(),
+                        registry,
+                        deps.key.clone(),
+                        deps.perms_sync.as_deref(),
+                        deps.feature_flags.as_deref(),
+                        deps.gerrit.as_deref(),
+                        &fields,
+                        request.actor,
+                        site_admin,
+                    )
+                    .await;
+                for (field, outcome) in outcomes {
+                    mutation = mutation.with_external_account_mutation(field, outcome);
+                }
+            }
+        }
         // `Repository.commit`, `GitObject` and `GitRef.target` (M9.8ix) read
         // through gitserver; perform those lookups now and replay them from the
         // synchronous resolvers. `repositories`/`repository_redirects`/`nodes`/
@@ -1351,6 +1404,23 @@ impl GraphqlDeps for SchemaGraphqlDeps {
                     ),
                 },
             ));
+            // `Site.externalAccounts` (M9.9b): a site-admin-only connection
+            // with the same `Limit++` next-page probe as the user connection.
+            let site_lookups = crate::external_accounts_graphql::prefetch_site_external_accounts(
+                deps.store.as_ref(),
+                registry,
+                deps.key.clone(),
+                self.users
+                    .as_ref()
+                    .map(|users| users.as_ref() as &dyn crate::graphql_resolvers::UserLookupStore),
+                &fields,
+                request.actor,
+                site_admin,
+            )
+            .await;
+            if !site_lookups.is_empty() {
+                Arc::make_mut(&mut nested).site_external_accounts = site_lookups;
+            }
         }
         let user = current_user.map(crate::graphql_resolvers::UserObject::from_data);
         // `Query.clientConfiguration` reads `external_services` and the
