@@ -48,6 +48,7 @@ pub mod search_client;
 pub mod search_contexts;
 pub mod search_job;
 pub mod search_jobutil_combinators;
+pub mod search_jobutil_exhaustive;
 pub mod search_jobutil_expression;
 pub mod search_jobutil_filters;
 pub mod search_jobutil_job_builders;
