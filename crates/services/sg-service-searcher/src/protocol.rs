@@ -92,6 +92,40 @@ impl Request {
         }
     }
 
+    /// Baseline `Request.ToProto`.
+    pub fn to_proto(&self) -> pb::SearchRequest {
+        pb::SearchRequest {
+            repo: self.repo.clone(),
+            repo_id: self.repo_id,
+            commit_oid: self.commit.clone(),
+            indexed: self.indexed,
+            pattern_info: Some(pb::PatternInfo {
+                is_structural: self.pattern_info.is_structural,
+                is_case_sensitive: self.pattern_info.is_case_sensitive,
+                exclude_pattern: self.pattern_info.exclude_paths.clone(),
+                include_patterns: self.pattern_info.include_paths.clone(),
+                path_patterns_are_case_sensitive: self
+                    .pattern_info
+                    .path_patterns_are_case_sensitive,
+                limit: i64::from(self.pattern_info.limit),
+                pattern_matches_content: self.pattern_info.pattern_matches_content,
+                pattern_matches_path: self.pattern_info.pattern_matches_path,
+                comby_rule: self.pattern_info.comby_rule.clone(),
+                languages: self.pattern_info.languages.clone(),
+                select: self.pattern_info.select.clone(),
+                include_langs: self.pattern_info.include_langs.clone(),
+                exclude_langs: self.pattern_info.exclude_langs.clone(),
+                query: self.pattern_info.query.as_ref().map(QueryNode::to_proto),
+            }),
+            branch: self.branch.clone(),
+            fetch_timeout: Some(prost_types::Duration {
+                seconds: self.fetch_timeout.as_secs() as i64,
+                nanos: self.fetch_timeout.subsec_nanos() as i32,
+            }),
+            num_context_lines: self.num_context_lines,
+        }
+    }
+
     /// Baseline `validateParams`.
     pub fn validate(&self) -> Result<(), String> {
         if self.repo.is_empty() {
@@ -180,6 +214,20 @@ impl FileMatch {
             limit_hit: self.limit_hit,
         }
     }
+
+    /// Baseline `FileMatch.FromProto`.
+    pub fn from_proto(file_match: &pb::FileMatch) -> Self {
+        Self {
+            path: String::from_utf8_lossy(&file_match.path).into_owned(),
+            language: String::from_utf8_lossy(&file_match.language).into_owned(),
+            chunk_matches: file_match
+                .chunk_matches
+                .iter()
+                .map(ChunkMatch::from_proto)
+                .collect(),
+            limit_hit: file_match.limit_hit,
+        }
+    }
 }
 
 /// A contiguous region of a file around one or more matches.
@@ -198,6 +246,19 @@ impl ChunkMatch {
             ranges: self.ranges.iter().map(Range::to_proto).collect(),
         }
     }
+
+    /// Baseline `ChunkMatch.FromProto` (bytes `Content` -> string).
+    pub fn from_proto(chunk: &pb::ChunkMatch) -> Self {
+        Self {
+            content: String::from_utf8_lossy(&chunk.content).into_owned(),
+            content_start: chunk
+                .content_start
+                .as_ref()
+                .map(Location::from_proto)
+                .unwrap_or_default(),
+            ranges: chunk.ranges.iter().map(Range::from_proto).collect(),
+        }
+    }
 }
 
 /// A match span within a chunk.
@@ -212,6 +273,22 @@ impl Range {
         pb::Range {
             start: Some(self.start.to_proto()),
             end: Some(self.end.to_proto()),
+        }
+    }
+
+    /// Baseline `Range.FromProto`.
+    pub fn from_proto(range: &pb::Range) -> Self {
+        Self {
+            start: range
+                .start
+                .as_ref()
+                .map(Location::from_proto)
+                .unwrap_or_default(),
+            end: range
+                .end
+                .as_ref()
+                .map(Location::from_proto)
+                .unwrap_or_default(),
         }
     }
 }
@@ -232,6 +309,15 @@ impl Location {
             column: self.column,
         }
     }
+
+    /// Baseline `Location.FromProto`.
+    pub fn from_proto(location: &pb::Location) -> Self {
+        Self {
+            offset: location.offset,
+            line: location.line,
+            column: location.column,
+        }
+    }
 }
 
 fn node_from_proto(node: &pb::QueryNode) -> Option<QueryNode> {
@@ -250,6 +336,39 @@ fn node_from_proto(node: &pb::QueryNode) -> Option<QueryNode> {
         Value::Or(or) => Some(QueryNode::Or(
             or.children.iter().filter_map(node_from_proto).collect(),
         )),
+    }
+}
+
+impl QueryNode {
+    /// Baseline `QueryNode.ToProto`.
+    pub fn to_proto(&self) -> pb::QueryNode {
+        match self {
+            Self::Pattern(pattern) => pb::QueryNode {
+                value: Some(pb::query_node::Value::Pattern(pattern.to_proto())),
+            },
+            Self::And(children) => pb::QueryNode {
+                value: Some(pb::query_node::Value::And(pb::AndNode {
+                    children: children.iter().map(QueryNode::to_proto).collect(),
+                })),
+            },
+            Self::Or(children) => pb::QueryNode {
+                value: Some(pb::query_node::Value::Or(pb::OrNode {
+                    children: children.iter().map(QueryNode::to_proto).collect(),
+                })),
+            },
+        }
+    }
+}
+
+impl PatternNode {
+    /// Baseline `PatternNode.ToProto`.
+    pub fn to_proto(&self) -> pb::PatternNode {
+        pb::PatternNode {
+            value: self.value.clone(),
+            is_negated: self.is_negated,
+            is_regexp: self.is_regexp,
+            boost: self.boost,
+        }
     }
 }
 
@@ -449,5 +568,79 @@ mod tests {
                 boost: false,
             }))
         );
+    }
+
+    #[test]
+    fn converts_to_proto_and_back() {
+        let request = valid_request();
+        let proto = request.to_proto();
+        assert_eq!(proto.repo, "github.com/gorilla/mux");
+        assert_eq!(proto.repo_id, 1);
+        assert_eq!(proto.commit_oid, "0123456789012345678901234567890123456789");
+        assert_eq!(proto.pattern_info.as_ref().unwrap().limit, 10);
+        assert_eq!(Request::from_proto(&proto), request);
+
+        let mut request = valid_request();
+        request.fetch_timeout = Duration::new(2, 500_000_000);
+        let proto = request.to_proto();
+        let fetch_timeout = proto.fetch_timeout.expect("fetch timeout");
+        assert_eq!(fetch_timeout.seconds, 2);
+        assert_eq!(fetch_timeout.nanos, 500_000_000);
+        assert_eq!(
+            Request::from_proto(&proto).fetch_timeout,
+            request.fetch_timeout
+        );
+    }
+
+    #[test]
+    fn converts_file_matches_from_proto() {
+        let file_match = pb::FileMatch {
+            path: b"src/main.go".to_vec(),
+            language: b"go".to_vec(),
+            limit_hit: true,
+            chunk_matches: vec![pb::ChunkMatch {
+                content: b"route".to_vec(),
+                content_start: Some(pb::Location {
+                    offset: 5,
+                    line: 2,
+                    column: 3,
+                }),
+                ranges: vec![pb::Range {
+                    start: Some(pb::Location {
+                        offset: 5,
+                        line: 2,
+                        column: 3,
+                    }),
+                    end: Some(pb::Location {
+                        offset: 10,
+                        line: 2,
+                        column: 8,
+                    }),
+                }],
+            }],
+        };
+        let converted = FileMatch::from_proto(&file_match);
+        assert_eq!(converted.path, "src/main.go");
+        assert_eq!(converted.language, "go");
+        assert!(converted.limit_hit);
+        assert_eq!(converted.chunk_matches.len(), 1);
+        assert_eq!(converted.chunk_matches[0].content, "route");
+        assert_eq!(
+            converted.chunk_matches[0].content_start,
+            Location {
+                offset: 5,
+                line: 2,
+                column: 3
+            }
+        );
+        assert_eq!(
+            converted.chunk_matches[0].ranges[0].end,
+            Location {
+                offset: 10,
+                line: 2,
+                column: 8
+            }
+        );
+        assert_eq!(FileMatch::from_proto(&converted.to_proto()), converted);
     }
 }
