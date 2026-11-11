@@ -28,7 +28,9 @@
 
 use std::sync::OnceLock;
 
+use bytes::Bytes;
 use http::{Method, Request, Response};
+use http_body_util::BodyExt;
 use regex::Regex;
 use tonic::body::BoxBody;
 
@@ -259,6 +261,7 @@ pub async fn dispatch_route<B>(
     env: &AppEnv,
     config: &AppConfig,
     deps: &AppDeps,
+    body: Option<&[u8]>,
 ) -> Response<BoxBody> {
     let Resolution::Route { name, vars } = resolution else {
         // `StrictSlash` redirect; dispatch handles the query.
@@ -280,9 +283,24 @@ pub async fn dispatch_route<B>(
         }
         RouteName::DebugHeaders => app_handlers::debug_headers(req),
         RouteName::SignOut => app_handlers::sign_out(req, deps).await,
-        // The old-tree redirect is a repository-aware handler outside this
-        // slice; everything else (auth flows, archives, pings, UI) is also
-        // unported and answers the mux 404 for now.
+        RouteName::VerifyEmail => crate::app_handlers_more::verify_email(req, &deps.more).await,
+        RouteName::UsageStatsDownload => {
+            crate::app_handlers_more::usage_stats(req, &deps.more).await
+        }
+        RouteName::OneClickExportArchive => {
+            crate::app_handlers_more::one_click_export(req, &deps.more, body).await
+        }
+        RouteName::LatestPing => crate::app_handlers_more::latest_ping(req, &deps.more).await,
+        RouteName::Editor => crate::app_handlers_more::editor(req, &deps.more).await,
+        RouteName::Debug => crate::app_handlers_more::debug(req, &deps.more, env).await,
+        RouteName::OldTreeRedirect => crate::app_handlers_more::old_tree_redirect(
+            req,
+            vars.repo.as_deref().unwrap_or(""),
+            vars.rev.as_deref().unwrap_or(""),
+            vars.path.as_deref().unwrap_or(""),
+        ),
+        // Auth flows and the UI are outside this slice and still answer the
+        // mux 404.
         _ => app_handlers::not_found(),
     }
 }
@@ -294,6 +312,40 @@ pub async fn dispatch_async<B>(
     env: &AppEnv,
     config: &AppConfig,
     deps: &AppDeps,
+) -> Response<BoxBody>
+where
+    B: Send,
+{
+    dispatch_async_inner(req, env, config, deps, None).await
+}
+
+/// [`dispatch_async`] with the request body collected for the handlers that
+/// read it (`/-/one-click-export`). The live listeners use this entry point;
+/// the router differential keeps `dispatch_async` for `Request<()>` cases.
+pub async fn dispatch_async_with_body<B>(
+    req: &mut Request<B>,
+    env: &AppEnv,
+    config: &AppConfig,
+    deps: &AppDeps,
+) -> Response<BoxBody>
+where
+    B: hyper::body::Body<Data = Bytes> + Unpin + Send,
+{
+    let body = match req.body_mut().collect().await {
+        Ok(collected) => Some(collected.to_bytes()),
+        // A body read error is not observable here: the baseline's decode
+        // would fail too, and the corpus does not exercise it.
+        Err(_) => None,
+    };
+    dispatch_async_inner(req, env, config, deps, body.as_deref()).await
+}
+
+async fn dispatch_async_inner<B>(
+    req: &mut Request<B>,
+    env: &AppEnv,
+    config: &AppConfig,
+    deps: &AppDeps,
+    body: Option<&[u8]>,
 ) -> Response<BoxBody>
 where
     B: Send,
@@ -323,7 +375,9 @@ where
             let location = with_query(req.uri().query(), &location);
             app_handlers::redirect(&*req, &location, 301)
         }
-        Resolution::Route { .. } => dispatch_route(&*req, resolution, env, config, deps).await,
+        Resolution::Route { .. } => {
+            dispatch_route(&*req, resolution, env, config, deps, body).await
+        }
     }
 }
 

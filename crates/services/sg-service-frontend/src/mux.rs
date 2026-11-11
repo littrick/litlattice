@@ -162,7 +162,7 @@ pub async fn route_async<B, F>(
     dispatch: F,
 ) -> Response<BoxBody>
 where
-    B: Send,
+    B: hyper::body::Body<Data = Bytes> + Unpin + Send,
     F: for<'a> FnOnce(
         Route,
         &'a mut Request<B>,

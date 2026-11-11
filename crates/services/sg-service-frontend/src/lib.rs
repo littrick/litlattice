@@ -9,14 +9,16 @@
 //! not ported yet; `docs/overviews/m9_8dx_frontend_skeleton_overview.md`
 //! records what each missing layer is supposed to do.
 
-pub mod audit;
 pub mod app_handlers;
+pub mod app_handlers_more;
 pub mod app_router;
+pub mod audit;
 pub mod auth;
 pub mod blame;
 pub mod client_configuration;
 pub mod clone_urls;
 pub mod config;
+pub mod config_graphql;
 pub mod configuration_api;
 pub mod configuration_server;
 pub mod configuration_source;

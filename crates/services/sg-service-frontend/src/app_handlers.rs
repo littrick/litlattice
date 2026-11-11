@@ -331,6 +331,9 @@ pub struct AppDeps {
     pub go_importers: GoImportersCounter,
     /// `/-/sign-out`; `None` until the live middleware supplies a pool.
     pub sign_out: Option<Arc<SignOutWiring>>,
+    /// The remaining app handlers (M9.8jb); every entry is optional so an
+    /// unwired process still answers the mux 404.
+    pub more: crate::app_handlers_more::MoreDeps,
 }
 
 impl AppDeps {
@@ -340,6 +343,7 @@ impl AppDeps {
         Self {
             go_importers: GoImportersCounter::with_doer(Arc::new(SgHttpDoer::new())),
             sign_out: None,
+            more: crate::app_handlers_more::MoreDeps::default(),
         }
     }
 
@@ -348,6 +352,7 @@ impl AppDeps {
         Self {
             go_importers: GoImportersCounter::with_mock(mock),
             sign_out: None,
+            more: crate::app_handlers_more::MoreDeps::default(),
         }
     }
 
@@ -750,7 +755,7 @@ fn assets_url(env: &AppEnv, path: &str) -> String {
 }
 
 /// `path.Clean`, without the `mux.cleanPath` trailing-slash preservation.
-fn go_path_clean(path: &str) -> String {
+pub(crate) fn go_path_clean(path: &str) -> String {
     if path.is_empty() {
         return ".".to_owned();
     }
@@ -782,7 +787,7 @@ fn go_path_clean(path: &str) -> String {
 }
 
 /// `url.QueryEscape` (`encodeQueryComponent`): space becomes `+`.
-fn go_query_escape(value: &str) -> String {
+pub(crate) fn go_query_escape(value: &str) -> String {
     let mut escaped = String::with_capacity(value.len());
     for byte in value.bytes() {
         let safe = byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~');
@@ -800,7 +805,7 @@ fn go_query_escape(value: &str) -> String {
 
 /// `url.escape(s, encodePath)` — only `?` among the reserved characters is
 /// escaped; everything outside the unreserved set is percent-encoded.
-fn go_path_escape(value: &str) -> String {
+pub(crate) fn go_path_escape(value: &str) -> String {
     let mut escaped = String::with_capacity(value.len());
     for byte in value.bytes() {
         let safe = byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~');
@@ -820,7 +825,7 @@ fn go_path_escape(value: &str) -> String {
 
 /// `url.Values.Get` without the `+`-as-space surprise: Go's `Query()` decodes
 /// `+` to a space, which is what `form_urlencoded` does here.
-fn query_param(query: Option<&str>, name: &str) -> Option<String> {
+pub(crate) fn query_param(query: Option<&str>, name: &str) -> Option<String> {
     let query = query?;
     url::form_urlencoded::parse(query.as_bytes())
         .find(|(key, _)| key.as_ref() == name)
