@@ -419,6 +419,7 @@ fn run_case(case: &Case) -> Value {
         db: &db,
         zoekt: &zoekt,
         max_repos: None,
+        searcher: None,
     };
     let ctx = RunContext::default();
     let mut events: Vec<SearchEvent> = Vec::new();

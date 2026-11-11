@@ -486,6 +486,7 @@ mod tests {
             db,
             zoekt,
             max_repos: None,
+            searcher: None,
         }
     }
 

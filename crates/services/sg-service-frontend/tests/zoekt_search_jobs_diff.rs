@@ -575,6 +575,7 @@ fn run_job(case: &Case) -> Value {
         db: &lister,
         zoekt: &streamer,
         max_repos: None,
+        searcher: None,
     };
     let ctx = JobContext {
         deadline: deadline(&case.deadline),

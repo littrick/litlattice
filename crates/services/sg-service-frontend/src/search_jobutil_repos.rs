@@ -720,6 +720,7 @@ mod tests {
             db: lister,
             zoekt: streamer,
             max_repos: None,
+            searcher: None,
         }
     }
 

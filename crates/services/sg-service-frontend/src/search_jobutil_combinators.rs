@@ -1391,6 +1391,7 @@ mod tests {
             db: &LISTER,
             zoekt: &STREAMER,
             max_repos: None,
+            searcher: None,
         }
     }
 }
