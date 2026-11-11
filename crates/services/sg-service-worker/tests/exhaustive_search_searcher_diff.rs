@@ -399,6 +399,7 @@ fn inputs_from_plan(plan: &PlanSpec) -> Inputs {
         features: Default::default(),
         context_lines: 1,
         sub_repo_enabled: false,
+        source: None,
     }
 }
 

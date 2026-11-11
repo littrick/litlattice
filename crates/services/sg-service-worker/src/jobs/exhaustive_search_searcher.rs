@@ -17,23 +17,28 @@
 //! * [`SearcherQuery::search`] handles match writing, write-error precedence,
 //!   and the `HEAD` + `RevisionNotFound` success case (`searcher.go:166-218`).
 //!
-//! A minimal local port of `jobutil.NewExhaustive` validation lives here
-//! because `sg-service-worker` neither depends on `sg-service-frontend` (where
-//! M9.8hp ported the full job) nor on the query parser. The [`Inputs`] model is
-//! the *already planned* query: [`SearchClient::plan`] is the `client.Plan`
-//! seam, so the injected client supplies the parsed [`Basic`]s (pattern values,
-//! parameter values, predicate tokens and labels). Only the validation sequence
-//! and the pager fields the searcher observes are reproduced; the job leaf is
-//! modelled as [`ExhaustiveChild`].
+//! A minimal local port of `jobutil.NewExhaustive` validation lives here.
+//! The [`Inputs`] model is the *already planned* query: [`SearchClient::plan`]
+//! is the `client.Plan` seam, so the injected client supplies the parsed
+//! [`Basic`]s (pattern values, parameter values, predicate tokens and labels).
+//! Only the validation sequence and the pager fields the searcher observes are
+//! reproduced; the job leaf is modelled as [`ExhaustiveChild`]. When `Inputs`
+//! carries [`SourcePlan`] (always the case for the production
+//! [`PlanSearchClient`]), the full M9.8hp frontend `jobutil.Exhaustive` is
+//! built too and exposed as `Exhaustive::execution`.
 //!
 //! DB/gitserver/zoekt/searcher access is behind the injected [`RepoResolver`]
 //! and [`JobRunner`] seams, both part of [`JobClients`] (the baseline's
-//! `job.RuntimeClients`). The default implementations return explicit
-//! not-ported errors. `isSameUser` reads the baseline's context actor, which
-//! Rust does not have; [`UserContext`] is the injected stand-in.
+//! `job.RuntimeClients`). [`JobClients::not_ported`] keeps the M9.9a explicit
+//! not-ported seams; production uses [`FrontendRepoResolver`] (the M9.10a
+//! `repos.Resolver`) and [`ProductionJobRunner`] (the frontend job tree), both
+//! wired in `crate::jobs::exhaustive_search_job::SearchJob` (M9.11b).
+//! `isSameUser` reads the baseline's context actor, which Rust does not have;
+//! [`UserContext`] is the injected stand-in.
 //!
 //! See `docs/overviews/m9_8hv_exhaustive_searcher_overview.md`.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -49,6 +54,7 @@ use sg_insights_query::sg_search_query::{
     },
     parser::SearchType as QuerySearchType,
     transformer::lowercase_field_names,
+    validate::YesNoOnly,
 };
 use sg_zoekt::indexed_repo_revs::{MinimalRepo, RepositoryRevisions, RepositoryRevisionsRepo};
 use sg_zoekt::languages::{get_language_by_name_or_alias, lang_to_file_regexp};
@@ -205,6 +211,22 @@ pub struct Inputs {
     pub context_lines: i32,
     /// `authz.SubRepoEnabled(authz.DefaultSubRepoPermsChecker)`.
     pub sub_repo_enabled: bool,
+    /// The full parsed query, when this `Inputs` came from
+    /// [`PlanSearchClient`]. The production job runner needs the complete
+    /// `sg_search_query` plan that `client.Plan` produced; the reduced
+    /// [`Plan`] above is only what the M9.9a validation/searcher shape reads.
+    /// Hand-built test inputs leave this `None` (the M9.9a seam stays
+    /// injectable).
+    pub source: Option<SourcePlan>,
+}
+
+/// The original `client.Plan` result fields the exhaustive job tree builder
+/// consumes (`search.Inputs.Plan`/`Plan.ToQ()`/`PatternType`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SourcePlan {
+    pub plan: sgq::basic::Plan,
+    pub query: Vec<QueryNode>,
+    pub pattern_type: QuerySearchType,
 }
 
 impl Inputs {
@@ -436,6 +458,10 @@ pub fn parse_repository_revisions(repo_and_optional_rev: &str) -> ParsedRepoFilt
 pub struct RepoOptions {
     pub repo_filters: Vec<ParsedRepoFilter>,
     pub minus_repo_filters: Vec<String>,
+    /// `repoOptionsCopy.OnlyCloned` set by the commit/diff branch
+    /// (`exhaustive_job.go:74-87`). Not observable in M9.9a's planned model,
+    /// but the production resolver's DB query reads it.
+    pub only_cloned: bool,
 }
 
 impl RepoOptions {
@@ -469,6 +495,7 @@ fn to_repo_options(basic: &Basic) -> RepoOptions {
     RepoOptions {
         repo_filters,
         minus_repo_filters,
+        only_cloned: false,
     }
 }
 
@@ -519,6 +546,11 @@ pub struct Exhaustive {
     pub skip_partitioning: bool,
     /// `commit.SearchJob.Limit` (`parameters.maxResults`).
     pub limit: i64,
+    /// The full frontend `jobutil.Exhaustive` built from
+    /// [`Inputs::source`]. `Some` when `Inputs` came from
+    /// [`PlanSearchClient`]; [`ProductionJobRunner`] executes it. Hand-built
+    /// test inputs keep the M9.9a not-ported runner.
+    pub execution: Option<sg_service_frontend::search_jobutil_exhaustive::Exhaustive>,
 }
 
 /// `toTextPatternInfo`'s empty-pattern guard (`job.go:713-724`).
@@ -644,6 +676,24 @@ pub fn new_exhaustive(inputs: &Inputs) -> Result<Exhaustive, String> {
         };
 
     let contains_ref_globs = repo_options.contains_ref_globs();
+    let repo_options = RepoOptions {
+        only_cloned,
+        ..repo_options
+    };
+
+    // `jobutil.NewExhaustive` builds the real (full) job tree. Production
+    // inputs carry the original parsed plan, so the runner can execute it;
+    // hand-built test inputs keep the not-ported runner.
+    let execution = match &inputs.source {
+        Some(source) => {
+            let frontend_inputs = frontend_exhaustive_inputs(inputs, source);
+            Some(
+                sg_service_frontend::search_jobutil_exhaustive::new_exhaustive(&frontend_inputs)
+                    .map_err(|error| error.0)?,
+            )
+        }
+        None => None,
+    };
 
     Ok(Exhaustive {
         repo_options,
@@ -652,7 +702,36 @@ pub fn new_exhaustive(inputs: &Inputs) -> Result<Exhaustive, String> {
         contains_ref_globs,
         skip_partitioning,
         limit,
+        execution,
     })
+}
+
+/// Convert the worker plan model into the frontend builder's `Inputs`
+/// (`search.Inputs`) so the full `jobutil.NewExhaustive` can run.
+fn frontend_exhaustive_inputs(
+    inputs: &Inputs,
+    source: &SourcePlan,
+) -> sg_service_frontend::search_jobutil_exhaustive::Inputs {
+    sg_service_frontend::search_jobutil_exhaustive::Inputs {
+        plan: source.plan.clone(),
+        query: source.query.clone(),
+        pattern_type: source.pattern_type,
+        user_settings: sg_service_frontend::search_jobutil_job_builders::UserSettings {
+            search_include_forks: inputs.user_settings.search_include_forks,
+            search_include_archived: inputs.user_settings.search_include_archived,
+        },
+        protocol: match inputs.protocol {
+            Protocol::Streaming => sg_service_frontend::search_client::Protocol::Streaming,
+            Protocol::Batch => sg_service_frontend::search_client::Protocol::Batch,
+            Protocol::Exhaustive => sg_service_frontend::search_client::Protocol::Exhaustive,
+        },
+        features: sg_service_frontend::search_client::Features {
+            content_based_lang_filters: inputs.features.content_based_lang_filters,
+            debug: inputs.features.debug,
+        },
+        context_lines: inputs.context_lines,
+        sub_repo_enabled: inputs.sub_repo_enabled,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -833,6 +912,258 @@ const NOT_PORTED_REPOS: &str = "not ported: exhaustive search repository resolut
 const NOT_PORTED_SEARCH: &str = "not ported: exhaustive search job execution";
 
 // ---------------------------------------------------------------------------
+// Production runtime (`repos.Resolver` and `job.Run`, M9.11b)
+// ---------------------------------------------------------------------------
+
+/// Production [`RepoResolver`]: the M9.10a `search_repos::Resolver` behind
+/// the worker's reduced request model (`searcher.go:71-164`).
+pub struct FrontendRepoResolver {
+    resolver: Arc<sg_service_frontend::search_repos::Resolver>,
+}
+
+impl FrontendRepoResolver {
+    pub fn new(resolver: Arc<sg_service_frontend::search_repos::Resolver>) -> Self {
+        Self { resolver }
+    }
+}
+
+/// Map a worker revision specifier to the frontend resolver's representation
+/// (`search_contexts.RevisionSpecifier`).
+fn to_frontend_revision(
+    rev: &RevisionSpecifier,
+) -> sg_service_frontend::search_contexts::RevisionSpecifier {
+    use sg_service_frontend::search_contexts::RevisionSpecifier as Frontend;
+    match rev {
+        RevisionSpecifier::RevSpec(value) => Frontend {
+            rev_spec: value.clone(),
+            ..Frontend::default()
+        },
+        RevisionSpecifier::RefGlob(value) => Frontend {
+            ref_glob: value.clone(),
+            ..Frontend::default()
+        },
+        RevisionSpecifier::ExcludeRefGlob(value) => Frontend {
+            exclude_ref_glob: value.clone(),
+            ..Frontend::default()
+        },
+        RevisionSpecifier::RevAtTime(value) => Frontend {
+            rev_spec: value.clone(),
+            rev_at_time: true,
+            ..Frontend::default()
+        },
+    }
+}
+
+/// Build `search.RepoOptions` for the resolver. Exhaustive searches always
+/// run with `index:no` and the commit/diff branch sets `OnlyCloned`.
+fn to_frontend_resolve_options(
+    options: &RepoOptions,
+) -> sg_service_frontend::search_repos::ResolveOptions {
+    sg_service_frontend::search_repos::ResolveOptions {
+        repo_filters: options
+            .repo_filters
+            .iter()
+            .map(
+                |filter| sg_service_frontend::search_contexts::ParsedRepoFilter {
+                    repo: filter.repo.clone(),
+                    revs: filter.revs.iter().map(to_frontend_revision).collect(),
+                },
+            )
+            .collect(),
+        minus_repo_filters: options.minus_repo_filters.clone(),
+        only_cloned: options.only_cloned,
+        use_index: YesNoOnly::No,
+        ..sg_service_frontend::search_repos::ResolveOptions::default()
+    }
+}
+
+fn to_frontend_repo_rev_specs(
+    specs: &RepoRevSpecs,
+) -> sg_service_frontend::search_repos::RepoRevSpecs {
+    sg_service_frontend::search_repos::RepoRevSpecs {
+        repo: sg_zoekt::indexed_repo_revs::RepositoryRevisionsRepo {
+            id: specs.repo.id,
+            name: specs.repo.name.clone(),
+        },
+        revs: specs.revs.iter().map(to_frontend_revision).collect(),
+        external_service_type: None,
+    }
+}
+
+fn from_frontend_repo_rev_specs(
+    specs: sg_service_frontend::search_repos::RepoRevSpecs,
+) -> RepoRevSpecs {
+    RepoRevSpecs {
+        repo: MinimalRepo {
+            id: specs.repo.id,
+            name: specs.repo.name,
+        },
+        revs: specs
+            .revs
+            .into_iter()
+            .map(|rev| {
+                if rev.rev_at_time {
+                    RevisionSpecifier::RevAtTime(rev.rev_spec)
+                } else if !rev.ref_glob.is_empty() {
+                    RevisionSpecifier::RefGlob(rev.ref_glob)
+                } else if !rev.exclude_ref_glob.is_empty() {
+                    RevisionSpecifier::ExcludeRefGlob(rev.exclude_ref_glob)
+                } else {
+                    RevisionSpecifier::RevSpec(rev.rev_spec)
+                }
+            })
+            .collect(),
+    }
+}
+
+/// `isReposMissingError` (`searcher.go:229-231`) over the resolver's terminal
+/// error strings.
+fn runtime_error_from_resolver(error: sg_service_frontend::search_job::JobError) -> RuntimeError {
+    if error.0 == sg_service_frontend::search_repos::ERR_NO_RESOLVED_REPOS
+        || error.0 == sg_service_frontend::search_repos::ERR_MISSING_REPO_REVS
+    {
+        RuntimeError::repos_missing(error.0)
+    } else {
+        RuntimeError::other(error.0)
+    }
+}
+
+impl RepoResolver for FrontendRepoResolver {
+    fn iterate_repo_revs(&self, repo_options: &RepoOptions) -> RepoRevSpecsIterator {
+        let options = to_frontend_resolve_options(repo_options);
+        let (associated, error) = self.resolver.iterate_repo_revs(&options);
+        RepoRevSpecsIterator {
+            pages: vec![associated
+                .into_iter()
+                .map(from_frontend_repo_rev_specs)
+                .collect()],
+            error: error.map(runtime_error_from_resolver),
+        }
+    }
+
+    fn resolve_revision_specs(
+        &self,
+        repo_options: &RepoOptions,
+        repo_rev_specs: &[RepoRevSpecs],
+    ) -> ResolveOutcome {
+        let options = to_frontend_resolve_options(repo_options);
+        let specs: Vec<_> = repo_rev_specs
+            .iter()
+            .map(to_frontend_repo_rev_specs)
+            .collect();
+        let (resolved, error) = self.resolver.resolve_rev_specs(&options, specs);
+        ResolveOutcome {
+            resolved: Resolved {
+                repo_revs: resolved.repo_revs,
+                backends_missing: resolved.backends_missing,
+            },
+            error: error.map(runtime_error_from_resolver),
+        }
+    }
+
+    fn list_minimal_repos(&self, repo_id: i32) -> Result<Vec<MinimalRepo>, String> {
+        self.resolver
+            .minimal_repos_by_ids(&[repo_id])
+            .map(|repos| {
+                repos
+                    .into_iter()
+                    .map(|repo| MinimalRepo {
+                        id: repo.id as u32,
+                        name: repo.name,
+                    })
+                    .collect()
+            })
+            .map_err(|error| error.0)
+    }
+}
+
+/// Production [`JobRunner`]: executes the frontend `jobutil.Exhaustive` leaf
+/// with the assembled job-tree runtime.
+pub struct ProductionJobRunner {
+    clients: sg_service_frontend::search_stream::TreeRuntimeClients,
+    /// Stands in for `time.Now()` in `FromMatch` (`CommitMatch.Detail`).
+    now: time::OffsetDateTime,
+}
+
+impl ProductionJobRunner {
+    pub fn new(clients: sg_service_frontend::search_stream::TreeRuntimeClients) -> Self {
+        Self {
+            clients,
+            now: time::OffsetDateTime::now_utc(),
+        }
+    }
+
+    /// Deterministic variant for the differential harness.
+    pub fn with_now(
+        clients: sg_service_frontend::search_stream::TreeRuntimeClients,
+        now: time::OffsetDateTime,
+    ) -> Self {
+        Self { clients, now }
+    }
+}
+
+impl JobRunner for ProductionJobRunner {
+    fn run(&self, exhaustive: &Exhaustive, repo_revs: &RepositoryRevisions) -> SearchOutcome {
+        let Some(execution) = exhaustive.execution.as_ref() else {
+            return SearchOutcome {
+                events: Vec::new(),
+                error: Some(RuntimeError::other(NOT_PORTED_SEARCH)),
+            };
+        };
+
+        let mut node = match sg_service_frontend::search_jobutil_tree::exhaustive_job_node(
+            execution,
+            repo_revs.clone(),
+        ) {
+            Ok(node) => node,
+            Err(error) => {
+                return SearchOutcome {
+                    events: Vec::new(),
+                    error: Some(RuntimeError::other(error.0)),
+                }
+            }
+        };
+
+        let runner =
+            sg_service_frontend::search_stream::TreeJobRunner::with_clients(self.clients.clone());
+        let mut results = Vec::new();
+        let output =
+            sg_service_frontend::search_stream::JobRunner::run(&runner, &mut node, &mut |event| {
+                for matched in &event.results {
+                    let event_match = sg_service_frontend::search_stream::convert::from_match(
+                        matched,
+                        &HashMap::new(),
+                        sg_service_frontend::search_stream::convert::FromMatchOptions {
+                            chunk_matches: true,
+                            // `MaxContentLineLength: -1` (do not truncate).
+                            max_content_line_length: -1,
+                            now: self.now,
+                        },
+                    );
+                    if let Ok(value) = serde_json::from_str(&event_match.encode()) {
+                        results.push(value);
+                    }
+                }
+            });
+
+        let mut events = Vec::new();
+        if !results.is_empty() {
+            events.push(SearchEvent { results });
+        }
+        let error = output.error.map(|error| {
+            // `JobFailure` only carries the message; recover the
+            // `RevisionNotFound` classification for the `HEAD` success case.
+            if error.message.starts_with("revision not found") {
+                RuntimeError::revision_not_found(error.message)
+            } else {
+                RuntimeError::other(error.message)
+            }
+        });
+        SearchOutcome { events, error }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // SearchClient
 // ---------------------------------------------------------------------------
 
@@ -946,6 +1277,11 @@ impl SearchClient for PlanSearchClient {
             features: self.features,
             context_lines: context_lines.unwrap_or(self.default_context_lines),
             sub_repo_enabled: false,
+            source: Some(SourcePlan {
+                query: sgq::basic::plan_to_q(&plan),
+                plan,
+                pattern_type: search_type,
+            }),
         })
     }
 
@@ -1487,6 +1823,7 @@ mod tests {
             features: Features::default(),
             context_lines: 1,
             sub_repo_enabled: false,
+            source: None,
         }
     }
 

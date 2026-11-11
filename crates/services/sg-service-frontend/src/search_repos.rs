@@ -367,6 +367,16 @@ pub trait RepoResolverDb: Send + Sync {
         &self,
         repos: &[RepoChangelistIDs],
     ) -> Result<BTreeMap<u32, BTreeMap<i64, String>>, JobError>;
+
+    /// `Repos().ListMinimalRepos(IDs: ids)` for the exhaustive searcher's
+    /// `minimalRepo` lookup (`searcher.go:196-207`). The default keeps the
+    /// explicit not-ported behavior for fakes that only implement the pager
+    /// reads.
+    fn list_minimal_repos_by_ids(&self, _ids: &[i32]) -> Result<Vec<RepoListItem>, JobError> {
+        Err(JobError(
+            "ListMinimalRepos by IDs is not ported for this resolver".to_owned(),
+        ))
+    }
 }
 
 /// A missing revision/repository (`*gitdomain.RevisionNotFoundError` /
@@ -526,6 +536,12 @@ impl Resolver {
             return (Resolved::default(), Some(error));
         }
         (resolved, maybe_missing_repo_revs_error(&missing))
+    }
+
+    /// `DB.Repos().ListMinimalRepos(ctx, ReposListOptions{IDs: ids})`, used by
+    /// the exhaustive searcher's `minimalRepo` (`searcher.go:196-207`).
+    pub fn minimal_repos_by_ids(&self, ids: &[i32]) -> Result<Vec<RepoListItem>, JobError> {
+        self.db.list_minimal_repos_by_ids(ids)
     }
 
     /// `Resolver.resolve` (`repos.go:198-214`).

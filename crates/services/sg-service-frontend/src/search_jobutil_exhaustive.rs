@@ -30,6 +30,7 @@
 //!
 //! See `docs/overviews/m9_8hp_jobutil_exhaustive_overview.md`.
 
+use sg_proto::gitserver as pb;
 use sg_search_query::basic::{q_string_value, Basic, Plan};
 use sg_search_query::fields::{
     FIELD_AFTER, FIELD_AUTHOR, FIELD_BEFORE, FIELD_COMMITTER, FIELD_CONTENT, FIELD_FILE,
@@ -592,6 +593,77 @@ fn query_to_git_query(basic: &Basic, diff: bool) -> GitQueryNode {
         nodes.push(predicate);
     }
     reduce(new_and(nodes))
+}
+
+/// Translate the exhaustive commit leaf's [`GitQueryNode`] into the gitserver
+/// `QueryNode` proto executed by `search_commit_job` (the same conversion as
+/// [`crate::search_commit_job::query_to_git_query`], but from the already
+/// reduced tree).
+pub fn git_query_node_to_proto(node: &GitQueryNode) -> pb::QueryNode {
+    use pb::query_node::Value;
+
+    fn timestamp(value: &str) -> prost_types::Timestamp {
+        match crate::search_commit_job::parse_git_date(value) {
+            Some(datetime) => prost_types::Timestamp {
+                seconds: datetime.unix_timestamp(),
+                nanos: datetime.nanosecond() as i32,
+            },
+            // `time.Time{}` in Go (`search_commit_job::GO_ZERO_SECONDS`).
+            None => prost_types::Timestamp {
+                seconds: -62_135_596_800,
+                nanos: 0,
+            },
+        }
+    }
+
+    let value = match node {
+        GitQueryNode::Boolean(value) => Value::Boolean(pb::BooleanNode { value: *value }),
+        GitQueryNode::AuthorMatches { expr, ignore_case } => {
+            Value::AuthorMatches(pb::AuthorMatchesNode {
+                expr: expr.clone(),
+                ignore_case: *ignore_case,
+            })
+        }
+        GitQueryNode::CommitterMatches { expr, ignore_case } => {
+            Value::CommitterMatches(pb::CommitterMatchesNode {
+                expr: expr.clone(),
+                ignore_case: *ignore_case,
+            })
+        }
+        GitQueryNode::CommitBefore { time } => Value::CommitBefore(pb::CommitBeforeNode {
+            timestamp: Some(timestamp(time)),
+        }),
+        GitQueryNode::CommitAfter { time } => Value::CommitAfter(pb::CommitAfterNode {
+            timestamp: Some(timestamp(time)),
+        }),
+        GitQueryNode::MessageMatches { expr, ignore_case } => {
+            Value::MessageMatches(pb::MessageMatchesNode {
+                expr: expr.clone(),
+                ignore_case: *ignore_case,
+            })
+        }
+        GitQueryNode::DiffMatches { expr, ignore_case } => {
+            Value::DiffMatches(pb::DiffMatchesNode {
+                expr: expr.clone(),
+                ignore_case: *ignore_case,
+            })
+        }
+        GitQueryNode::DiffModifiesFile { expr, ignore_case } => {
+            Value::DiffModifiesFile(pb::DiffModifiesFileNode {
+                expr: expr.clone(),
+                ignore_case: *ignore_case,
+            })
+        }
+        GitQueryNode::Operator { kind, operands } => Value::Operator(pb::OperatorNode {
+            kind: match kind {
+                GitOperatorKind::And => pb::OperatorKind::And as i32,
+                GitOperatorKind::Or => pb::OperatorKind::Or as i32,
+                GitOperatorKind::Not => pb::OperatorKind::Not as i32,
+            },
+            operands: operands.iter().map(git_query_node_to_proto).collect(),
+        }),
+    };
+    pb::QueryNode { value: Some(value) }
 }
 
 /// `gitdomain.ParseGitDate` (`date.go:17-90`), returning the rendered

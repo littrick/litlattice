@@ -857,6 +857,46 @@ pub async fn list_minimal_repos(
     Ok(repos)
 }
 
+/// `Repos().ListMinimalRepos(ctx, ReposListOptions{IDs: ids})`: the
+/// exhaustive searcher's `minimalRepo` lookup (`searcher.go:196-207`). The
+/// default list conditions (`deleted_at IS NULL`, `blocked IS NULL`) and
+/// `ORDER BY repo.id` match `list_minimal_repos`; only the `IDs` filter is
+/// added (no schema change).
+pub async fn minimal_repos_by_ids(
+    pool: &PgPool,
+    ids: &[i32],
+) -> Result<Vec<RepoListItem>, sqlx::Error> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let rows = sqlx::query(
+        r#"
+SELECT repo.id, repo.name, COALESCE(repo.stars, 0) AS stars,
+       COALESCE(repo.external_id, '') AS external_id,
+       COALESCE(repo.external_service_type, '') AS external_service_type,
+       COALESCE(repo.external_service_id, '') AS external_service_id
+FROM repo
+WHERE repo.deleted_at IS NULL AND repo.blocked IS NULL AND repo.id = ANY($1)
+ORDER BY repo.id
+"#,
+    )
+    .bind(ids)
+    .fetch_all(pool)
+    .await?;
+    rows.iter()
+        .map(|row| {
+            Ok(RepoListItem {
+                id: row.try_get("id")?,
+                name: row.try_get("name")?,
+                stars: row.try_get("stars")?,
+                external_id: row.try_get("external_id")?,
+                external_service_type: row.try_get("external_service_type")?,
+                external_service_id: row.try_get("external_service_id")?,
+            })
+        })
+        .collect()
+}
+
 /// `BatchGetRepoCommitChangelist` (`internal/database/repo_commits_changelists.go`).
 ///
 /// Returns `repo_id -> changelist_id -> commit_sha`.
