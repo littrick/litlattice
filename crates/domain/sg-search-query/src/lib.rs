@@ -9,14 +9,17 @@
 //! baseline heuristics, and the `Hoist` rewrite applied to unambiguous
 //! `and`/`or` expressions.
 //!
-//! Not ported in this slice: predicate argument semantics (`Predicate.Unmarshal`),
-//! repository revision parsing and `PrettyJSON`. Predicate syntax is still
-//! scanned and labeled `IsPredicate` so parse trees match the baseline.
-//! `ToJSON` is ported as [`to_json`] (M9.8fx).
+//! Validation (`validate.rs`) ports `validate.go`: field rules, Go-regexp
+//! compilation, language/date/select checks, predicate argument
+//! unmarshalling, repository revision parsing and ref globs. `PrettyJSON` is
+//! not ported; `ToJSON` is ported as [`to_json`] (M9.8fx).
 
 pub mod basic;
 pub mod fields;
+mod go_base64;
+pub mod go_regexp;
 pub mod labels;
+pub mod language;
 pub mod mapper;
 pub mod node;
 pub mod parser;
