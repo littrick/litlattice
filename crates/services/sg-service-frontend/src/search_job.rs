@@ -158,6 +158,14 @@ pub struct RuntimeClients<'a> {
     /// `limits.SearchLimits(conf.Get()).MaxRepos`; `None` uses the baseline
     /// default `math.MaxInt32 >> 1`.
     pub max_repos: Option<i64>,
+    /// Injected searcher (`index:no`) collaborators: the searcher service
+    /// client/limiter, gitserver revision resolution and the symbols service.
+    /// `None` means the searcher backend is not wired; the jobs in
+    /// [`crate::search_searcher_jobs`] then fail with the explicit
+    /// `searcher backend is not ported yet` error.
+    ///
+    /// Additive: the zoekt jobs in this module never read it.
+    pub searcher: Option<&'a crate::search_searcher_client::SearcherClients<'a>>,
 }
 
 impl RuntimeClients<'_> {
@@ -543,6 +551,7 @@ mod tests {
             db,
             zoekt,
             max_repos: None,
+            searcher: None,
         }
     }
 
