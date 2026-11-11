@@ -77,6 +77,10 @@ pub fn git_object_type_name(object_type: GitObjectType) -> &'static str {
 pub struct GitSourceError {
     pub message: String,
     pub revision_not_found: bool,
+    /// `os.IsNotExist`: only a gitserver `FileNotFoundPayload` (never a
+    /// `RevisionNotFoundPayload`), which the tree-entry `path()` lookup turns
+    /// into `(nil, nil)`.
+    pub not_exist: bool,
 }
 
 impl GitSourceError {
@@ -84,6 +88,7 @@ impl GitSourceError {
         Self {
             message: message.into(),
             revision_not_found: false,
+            not_exist: false,
         }
     }
 
@@ -91,15 +96,28 @@ impl GitSourceError {
         Self {
             message: message.into(),
             revision_not_found: true,
+            not_exist: false,
+        }
+    }
+
+    /// `&os.PathError{Op: "open", Err: os.ErrNotExist}`.
+    pub fn not_exist(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            revision_not_found: false,
+            not_exist: true,
         }
     }
 }
 
 impl From<sg_git::Error> for GitSourceError {
     fn from(error: sg_git::Error) -> Self {
+        let not_exist = matches!(error, sg_git::Error::NotFound(_))
+            || matches!(error, sg_git::Error::FileNotExist { .. });
         Self {
             revision_not_found: error.is_revision_not_found(),
             message: error.to_string(),
+            not_exist,
         }
     }
 }
@@ -139,6 +157,50 @@ pub trait GitObjectSource: Send + Sync {
     /// not implement them leave the extra resolvers unavailable (M9.8iz).
     fn commit_extra(&self) -> Option<&dyn crate::git_commit_extra::GitCommitExtraSource> {
         None
+    }
+
+    /// `gitserver.Client.Stat` (M9.8iy).
+    ///
+    /// Defaulted so the existing M9.8ix fakes keep compiling; the production
+    /// implementation overrides it and the tree-entry prefetcher requires it.
+    async fn stat(
+        &self,
+        _repo_id: i32,
+        _repo_name: &str,
+        _oid: &str,
+        _path: &str,
+    ) -> Result<sg_git::FileStat, GitSourceError> {
+        Err(GitSourceError::new(
+            "GitObjectSource::stat is not implemented",
+        ))
+    }
+
+    /// `gitserver.Client.ReadDir` (M9.8iy); only the entry names are needed
+    /// (`IsSingleChild`).
+    async fn read_dir(
+        &self,
+        _repo_id: i32,
+        _repo_name: &str,
+        _oid: &str,
+        _path: &str,
+        _recursive: bool,
+    ) -> Result<Vec<String>, GitSourceError> {
+        Err(GitSourceError::new(
+            "GitObjectSource::read_dir is not implemented",
+        ))
+    }
+
+    /// `gitserver.Client.NewFileReader` (M9.8iy): the full file content.
+    async fn read_file(
+        &self,
+        _repo_id: i32,
+        _repo_name: &str,
+        _oid: &str,
+        _path: &str,
+    ) -> Result<Vec<u8>, GitSourceError> {
+        Err(GitSourceError::new(
+            "GitObjectSource::read_file is not implemented",
+        ))
     }
 }
 
@@ -224,6 +286,50 @@ impl GitObjectSource for GitserverGitObjects {
     fn commit_extra(&self) -> Option<&dyn crate::git_commit_extra::GitCommitExtraSource> {
         Some(self)
     }
+
+    async fn stat(
+        &self,
+        _repo_id: i32,
+        repo_name: &str,
+        oid: &str,
+        path: &str,
+    ) -> Result<sg_git::FileStat, GitSourceError> {
+        let (client, addr) = self.client_for(repo_name).await?;
+        client
+            .stat_at(&addr, repo_name, oid, path)
+            .await
+            .map_err(GitSourceError::from)
+    }
+
+    async fn read_dir(
+        &self,
+        _repo_id: i32,
+        repo_name: &str,
+        oid: &str,
+        path: &str,
+        recursive: bool,
+    ) -> Result<Vec<String>, GitSourceError> {
+        let (client, addr) = self.client_for(repo_name).await?;
+        let entries = client
+            .read_dir_entries_at(&addr, repo_name, oid, path, recursive)
+            .await
+            .map_err(GitSourceError::from)?;
+        Ok(entries.into_iter().map(|entry| entry.name).collect())
+    }
+
+    async fn read_file(
+        &self,
+        _repo_id: i32,
+        repo_name: &str,
+        oid: &str,
+        path: &str,
+    ) -> Result<Vec<u8>, GitSourceError> {
+        let (client, addr) = self.client_for(repo_name).await?;
+        client
+            .read_file_at(&addr, repo_name, oid, path)
+            .await
+            .map_err(GitSourceError::from)
+    }
 }
 
 /// `Repository.Commit(rev:)`'s `ResolveRev` outcome.
@@ -249,22 +355,119 @@ pub enum CommitLookup {
     Error(String),
 }
 
+/// `gitserver.Client.Stat` outcome for one tree entry (`GitCommit.path`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TreeEntryLookup {
+    Found(sg_git::FileStat),
+    /// `os.IsNotExist`: `GitCommit.tree`/`blob`/`file` resolve to `null`.
+    NotFound,
+    Error(String),
+}
+
+/// `NewFileReader` outcome (`GitTreeEntry.content`/`byteSize`/`totalLines`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ContentLookup {
+    Found(Vec<u8>),
+    Error(String),
+}
+
+/// `ReadDir` outcome (`GitTreeEntry.isSingleChild`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DirLookup {
+    Found(Vec<String>),
+    Error(String),
+}
+
 /// All gitserver data prefetched for one GraphQL request.
 ///
 /// Keys are `(repo id, revspec/oid)`; the repository name travels with the
-/// objects that need it (URLs and `repository` fields).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// objects that need it (URLs and `repository` fields). Tree-entry keys are
+/// `(repo id, oid, path)`.
+#[derive(Default)]
 pub struct GitPrefetch {
     pub revisions: HashMap<(i32, String), RevisionLookup>,
     pub objects: HashMap<(i32, String), ObjectLookup>,
     pub commits: HashMap<(i32, String), CommitLookup>,
     /// M9.8iz: the remaining `GitCommit` fields.
     pub extra: crate::git_commit_extra::CommitExtraPrefetch,
+    pub tree_entries: HashMap<(i32, String, String), TreeEntryLookup>,
+    pub contents: HashMap<(i32, String, String), ContentLookup>,
+    pub dirs: HashMap<(i32, String, String), DirLookup>,
+    /// Submodule clone URLs seen while prefetching tree entries (the
+    /// `path.Join(repoName, submoduleURL)` form, M9.8iy).
+    pub submodule_urls: Vec<String>,
+    /// `cloneURLToRepoName` results for [`Self::submodule_urls`], keyed by the
+    /// same string. `None` records a failed/unresolvable lookup, matching the
+    /// baseline's empty `url.URL{}`.
+    pub submodule_repo_names: HashMap<String, Option<String>>,
+    /// `symbol.DefaultZoektSymbolsClient()` injection point. `GitTreeEntry` /
+    /// `GitCommit` `symbols` call the (synchronous) gRPC client here.
+    pub symbols: Option<Arc<dyn crate::search_searcher_client::SymbolsClient + Send + Sync>>,
+}
+
+impl Clone for GitPrefetch {
+    fn clone(&self) -> Self {
+        Self {
+            revisions: self.revisions.clone(),
+            objects: self.objects.clone(),
+            commits: self.commits.clone(),
+            extra: self.extra.clone(),
+            tree_entries: self.tree_entries.clone(),
+            contents: self.contents.clone(),
+            dirs: self.dirs.clone(),
+            submodule_urls: self.submodule_urls.clone(),
+            submodule_repo_names: self.submodule_repo_names.clone(),
+            symbols: self.symbols.clone(),
+        }
+    }
+}
+
+impl std::fmt::Debug for GitPrefetch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GitPrefetch")
+            .field("revisions", &self.revisions)
+            .field("objects", &self.objects)
+            .field("commits", &self.commits)
+            .field("extra", &self.extra)
+            .field("tree_entries", &self.tree_entries)
+            .field("contents", &self.contents)
+            .field("dirs", &self.dirs)
+            .field("submodule_urls", &self.submodule_urls)
+            .field("submodule_repo_names", &self.submodule_repo_names)
+            .field(
+                "symbols",
+                &self.symbols.as_ref().map(|_| "<symbols client>"),
+            )
+            .finish()
+    }
 }
 
 impl GitPrefetch {
     fn object(&self, repo_id: i32, revspec: &str) -> Option<&ObjectLookup> {
         self.objects.get(&(repo_id, revspec.to_owned()))
+    }
+
+    /// The prefetched `Stat` for `(oid, path)`.
+    pub fn tree_entry(&self, repo_id: i32, oid: &str, path: &str) -> Option<&TreeEntryLookup> {
+        self.tree_entries
+            .get(&(repo_id, oid.to_owned(), path.to_owned()))
+    }
+
+    /// The prefetched content for `(oid, path)`.
+    pub fn content(&self, repo_id: i32, oid: &str, path: &str) -> Option<&ContentLookup> {
+        self.contents
+            .get(&(repo_id, oid.to_owned(), path.to_owned()))
+    }
+
+    /// The prefetched directory listing for `(oid, path)`.
+    pub fn dir(&self, repo_id: i32, oid: &str, path: &str) -> Option<&DirLookup> {
+        self.dirs.get(&(repo_id, oid.to_owned(), path.to_owned()))
+    }
+
+    /// `cloneURLToRepoName` result for a submodule URL (`None` when the lookup
+    /// was not prefetched or failed).
+    pub fn submodule_repo_name(&self, url: &str) -> Option<String> {
+        self.submodule_repo_names.get(url).cloned().flatten()
     }
 
     /// The commit data for `oid` and the error that prevented loading it.
@@ -470,29 +673,7 @@ async fn prefetch_parent(
         source, prefetch, repo, oid, selections, depth,
     )
     .await;
-    if depth > MAX_COMMIT_DEPTH || !commit_needs_data(selections) {
-        return;
-    }
-    load_commit(source, prefetch, repo, oid).await;
-    let parents = match prefetch.commits.get(&(repo.id, oid.to_owned())) {
-        Some(CommitLookup::Found(commit)) => Some(commit.parents.clone()),
-        _ => None,
-    };
-    if let Some(parents) = parents {
-        if let Some(parents_field) = find_field(selections, "parents") {
-            for parent in parents {
-                Box::pin(prefetch_parent(
-                    source,
-                    prefetch,
-                    repo,
-                    &parent,
-                    &parents_field.selections,
-                    depth + 1,
-                ))
-                .await;
-            }
-        }
-    }
+    prefetch_commit_fields(source, prefetch, repo, oid, selections, depth).await;
 }
 
 /// Prefetch a commit reached through `Repository.Commit` (i.e. after a
@@ -511,7 +692,30 @@ pub(crate) async fn prefetch_commit_data(
         source, prefetch, repo, oid, selections, depth,
     )
     .await;
-    if depth > MAX_COMMIT_DEPTH || !commit_needs_data(selections) {
+    prefetch_commit_fields(source, prefetch, repo, oid, selections, depth).await;
+}
+
+/// The shared body of [`prefetch_parent`]/[`prefetch_commit_data`].
+///
+/// `tree`/`blob`/`file`/`path` (M9.8iy) do not need `GetCommit`, so their
+/// prefetch runs before the `commit_needs_data` early return; `GitCommit.tree`
+/// then re-enters this function for the nested commit selection.
+async fn prefetch_commit_fields(
+    source: &dyn GitObjectSource,
+    prefetch: &mut GitPrefetch,
+    repo: &MinimalRepo,
+    oid: &str,
+    selections: &[RootField],
+    depth: usize,
+) {
+    if depth > MAX_COMMIT_DEPTH {
+        return;
+    }
+    crate::git_tree_entry_graphql::prefetch_commit_entries(
+        source, prefetch, repo, oid, selections, depth,
+    )
+    .await;
+    if !commit_needs_data(selections) {
         return;
     }
     load_commit(source, prefetch, repo, oid).await;
@@ -763,6 +967,34 @@ pub async fn prefetch_git(
     prefetch
 }
 
+/// [`prefetch_git`] plus the M9.8iy seams: the symbols client
+/// (`symbol.DefaultZoektSymbolsClient`) and the `cloneURLToRepoName`
+/// resolver used by submodule URLs.
+#[allow(clippy::too_many_arguments)]
+pub async fn prefetch_git_with(
+    source: &dyn GitObjectSource,
+    repositories: &HashMap<RepoKey, RepoLookup>,
+    repository_redirects: &HashMap<RepositoryRedirectKey, RepoLookup>,
+    nodes: &NodeRoots,
+    search: Option<&crate::search_graphql::SearchRoot>,
+    fields: &[RootField],
+    symbols: Option<Arc<dyn crate::search_searcher_client::SymbolsClient + Send + Sync>>,
+    clone_urls: Option<&dyn crate::graphql_resolvers::CloneUrlResolver>,
+) -> GitPrefetch {
+    let mut prefetch = prefetch_git(
+        source,
+        repositories,
+        repository_redirects,
+        nodes,
+        search,
+        fields,
+    )
+    .await;
+    crate::git_tree_entry_graphql::prefetch_submodule_repos(&mut prefetch, clone_urls).await;
+    prefetch.symbols = symbols;
+    prefetch
+}
+
 // ---------------------------------------------------------------------------
 // Relay IDs
 // ---------------------------------------------------------------------------
@@ -838,7 +1070,7 @@ pub fn git_commit_relay_id(repo_id: i32, oid: &str) -> String {
 // Resolvers
 // ---------------------------------------------------------------------------
 
-fn repository_data(repo: &MinimalRepo) -> crate::graphql_resolvers::RepositoryData {
+pub(crate) fn repository_data(repo: &MinimalRepo) -> crate::graphql_resolvers::RepositoryData {
     crate::graphql_resolvers::RepositoryData {
         id: repo.id,
         name: repo.name.clone(),
@@ -1084,7 +1316,7 @@ impl ObjectValue for GitCommitResolverObject {
     fn field(
         &self,
         field: &str,
-        _arguments: &Arguments,
+        arguments: &Arguments,
         _actor: Actor,
     ) -> Result<Option<FieldValue>, ExecError> {
         match field {
@@ -1143,7 +1375,14 @@ impl ObjectValue for GitCommitResolverObject {
                 items: Vec::new(),
                 element_type: Some("ExternalLink"),
             })),
-            _ => crate::git_commit_extra::commit_extra_field(self, field, _arguments),
+            // M9.8iy: `GitCommitResolver.Tree`/`Blob`/`File`/`Path`
+            // (`git_commit.go:240-308`).
+            "tree" | "blob" | "file" | "path" => {
+                crate::git_tree_entry_graphql::commit_tree_entry_field(self, field, arguments)
+            }
+            // `GitCommitResolver.Symbols` (`symbols.go:59-76`).
+            "symbols" => crate::git_tree_entry_graphql::commit_symbols_field(self, arguments),
+            _ => crate::git_commit_extra::commit_extra_field(self, field, arguments),
         }
     }
 }

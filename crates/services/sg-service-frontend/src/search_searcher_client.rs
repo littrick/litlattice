@@ -161,6 +161,10 @@ pub struct SymbolsParameters {
 pub struct SymbolsResponse {
     pub symbols: Vec<convert::Symbol>,
     pub limit_hit: bool,
+    /// `result.Symbol.FileLimited` per symbol (`symbols`' parallel vector).
+    /// Kept out of [`convert::Symbol`] because the search jobs do not consume
+    /// it; the GraphQL symbol resolvers do (`Symbol.fileLocal`).
+    pub file_limited: Vec<bool>,
 }
 
 /// `symbols.Client.Search` (`internal/symbols/client.go:58-104`).

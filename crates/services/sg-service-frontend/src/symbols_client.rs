@@ -286,26 +286,34 @@ impl SymbolsClient for GrpcSymbolsClient {
             }
         }
 
-        let mut symbols: Vec<convert::Symbol> = response
+        // `result.Symbol.FileLimited` travels alongside the reduced
+        // `convert::Symbol` so the GraphQL symbols resolvers can expose
+        // `fileLocal` without widening the shared search-job result type.
+        let mut pairs: Vec<(convert::Symbol, bool)> = response
             .symbols
             .into_iter()
-            .map(|symbol| convert::Symbol {
-                name: symbol.name,
-                path: symbol.path,
-                line: symbol.line,
-                character: symbol.character,
-                kind: symbol.kind,
-                language: symbol.language,
-                parent: symbol.parent,
-                parent_kind: symbol.parent_kind,
+            .map(|symbol| {
+                (
+                    convert::Symbol {
+                        name: symbol.name,
+                        path: symbol.path,
+                        line: symbol.line,
+                        character: symbol.character,
+                        kind: symbol.kind,
+                        language: symbol.language,
+                        parent: symbol.parent,
+                        parent_kind: symbol.parent_kind,
+                    },
+                    symbol.file_limited,
+                )
             })
             .collect();
 
         if self.sub_repo_perms.enabled() {
-            let mut filtered = Vec::with_capacity(symbols.len());
-            for symbol in symbols.drain(..) {
+            let mut filtered = Vec::with_capacity(pairs.len());
+            for (symbol, file_limited) in pairs.drain(..) {
                 match self.sub_repo_perms.include(&params.repo, &symbol.path) {
-                    Ok(true) => filtered.push(symbol),
+                    Ok(true) => filtered.push((symbol, file_limited)),
                     Ok(false) => {}
                     Err(error) => {
                         return Err(SearcherError::other(format!(
@@ -314,12 +322,14 @@ impl SymbolsClient for GrpcSymbolsClient {
                     }
                 }
             }
-            symbols = filtered;
+            pairs = filtered;
         }
 
+        let (symbols, file_limited) = pairs.into_iter().unzip();
         Ok(SymbolsResponse {
             symbols,
             limit_hit: response.limit_hit,
+            file_limited,
         })
     }
 }

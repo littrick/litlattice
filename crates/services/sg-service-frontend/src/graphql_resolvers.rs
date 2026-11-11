@@ -4534,7 +4534,9 @@ impl ObjectValue for OrgConnectionObject {
 
 /// `RepositoryResolver` (`cmd/frontend/graphqlbackend/repository.go`), limited
 /// to the fields present in the row returned by `repoStore.GetByName`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+// `GitPrefetch` holds the symbols client (a trait object), so it cannot be
+// compared; `RepositoryObject`'s equality had no callers.
+#[derive(Debug, Clone)]
 pub struct RepositoryObject {
     data: RepositoryData,
     /// The request's git prefetch data (M9.8ix); `None` leaves `commit` and
