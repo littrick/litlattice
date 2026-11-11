@@ -475,15 +475,89 @@ pub fn apply_tracing_config(site: &SiteConfiguration) -> Option<OtelStartup> {
 // OTel initialization seam
 // ---------------------------------------------------------------------------
 
-/// A finished span handed to an injected exporter. This intentionally carries
-/// only the fields this slice can produce; spans are never sent over a
-/// network.
-#[derive(Clone, Debug, PartialEq)]
+/// A finished span handed to an injected exporter.
+///
+/// The fields mirror what `tracetransform.span` reads from an SDK
+/// `ReadOnlySpan`, so [`request_from_span_data`] can reproduce the OTLP wire
+/// shape. The default values describe an unspecified, empty span; the ids are
+/// hex strings because the trace middleware renders them that way.
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct SpanData {
     pub name: String,
     pub trace_id: String,
     pub span_id: String,
     pub attributes: Vec<Attribute>,
+    pub trace_state: String,
+    pub parent_span_id: Option<String>,
+    /// `buildSpanFlags(sd.Parent())`: `SPAN_FLAGS_CONTEXT_HAS_IS_REMOTE_MASK`
+    /// (0x100) always, plus `SPAN_FLAGS_CONTEXT_IS_REMOTE_MASK` (0x200) when
+    /// the parent is remote.
+    pub flags: u32,
+    pub kind: crate::otlp_wire::SpanKind,
+    pub start_time_unix_nano: u64,
+    pub end_time_unix_nano: u64,
+    pub status: crate::otlp_wire::Status,
+    pub events: Vec<crate::otlp_wire::SpanEvent>,
+    pub links: Vec<crate::otlp_wire::SpanLink>,
+    pub dropped_attributes_count: u32,
+    pub dropped_events_count: u32,
+    pub dropped_links_count: u32,
+    pub resource: Option<crate::otlp_wire::Resource>,
+    pub scope: Option<crate::otlp_wire::InstrumentationScope>,
+}
+
+fn attribute_to_key_value(attribute: &Attribute) -> crate::otlp_wire::KeyValue {
+    use crate::otlp_wire::AnyValue;
+    let value = match &attribute.value {
+        AttributeValue::String(value) => AnyValue::String(value.clone()),
+        AttributeValue::Int64(value) => AnyValue::Int(*value),
+        AttributeValue::Bool(value) => AnyValue::Bool(*value),
+        AttributeValue::StringSlice(values) => {
+            AnyValue::Array(values.iter().cloned().map(AnyValue::String).collect())
+        }
+    };
+    crate::otlp_wire::KeyValue {
+        key: attribute.key.clone(),
+        value,
+    }
+}
+
+/// Convert a finished [`SpanData`] into the OTLP span `tracetransform.span`
+/// would build.
+pub fn wire_span_from_span_data(span: &SpanData) -> crate::otlp_wire::WireSpan {
+    let trace_id = crate::otlp_wire::parse_trace_id(&span.trace_id).unwrap_or([0u8; 16]);
+    let span_id = crate::otlp_wire::parse_span_id(&span.span_id).unwrap_or([0u8; 8]);
+    // `span.Parent().SpanID().IsValid()`: only non-zero parent ids are written.
+    let parent_span_id = span
+        .parent_span_id
+        .as_deref()
+        .and_then(crate::otlp_wire::parse_span_id)
+        .filter(|id| id.iter().any(|byte| *byte != 0));
+    crate::otlp_wire::WireSpan {
+        trace_id,
+        span_id,
+        trace_state: span.trace_state.clone(),
+        parent_span_id,
+        flags: span.flags,
+        name: span.name.clone(),
+        kind: span.kind,
+        start_time_unix_nano: span.start_time_unix_nano,
+        end_time_unix_nano: span.end_time_unix_nano,
+        attributes: span.attributes.iter().map(attribute_to_key_value).collect(),
+        dropped_attributes_count: span.dropped_attributes_count,
+        events: span.events.clone(),
+        dropped_events_count: span.dropped_events_count,
+        links: span.links.clone(),
+        dropped_links_count: span.dropped_links_count,
+        status: Some(span.status.clone()),
+    }
+}
+
+/// Convert a finished [`SpanData`] into the OTLP request `tracetransform.Spans`
+/// would build for a single resource/scope group.
+pub fn request_from_span_data(span: &SpanData) -> crate::otlp_wire::ExportTraceServiceRequest {
+    let wire = wire_span_from_span_data(span);
+    crate::otlp_wire::build_request(span.resource.as_ref(), span.scope.as_ref(), &[wire])
 }
 
 /// The exporter seam standing in for the OTel SDK's span processors. Tests
@@ -590,6 +664,18 @@ pub struct OtlpExporterConfig {
     pub insecure: bool,
 }
 
+impl OtlpExporterConfig {
+    /// The HTTP wire format the baseline selects for this protocol.
+    ///
+    /// `grpc` has no OTLP/HTTP encoding here. `http/json` maps to
+    /// `otlptracehttp`, which in SDK v1.27 always marshals protobuf, so the
+    /// wire format is [`crate::otlp_wire::HttpWireFormat::Protobuf`] despite
+    /// the protocol name (see the M9.8jm overview errata).
+    pub fn wire_format(&self) -> Option<crate::otlp_wire::HttpWireFormat> {
+        crate::otlp_wire::HttpWireFormat::for_protocol(self.protocol)
+    }
+}
+
 /// `otlpenv.GetEndpoint`: the first set env wins; unset uses the default.
 pub fn otlp_endpoint(env: impl Fn(&str) -> Option<String>) -> String {
     env("OTEL_EXPORTER_OTLP_ENDPOINT").unwrap_or_else(|| DEFAULT_OTLP_ENDPOINT.to_owned())
@@ -641,7 +727,22 @@ pub fn otlp_exporter_config_from_env(
 /// recording transport; production uses [`NoopSpanTransport`], so an injected
 /// exporter never performs I/O.
 pub trait SpanTransport: Send + Sync {
-    fn send(&self, spans: &[SpanData]) -> Result<(), String>;
+    /// Send a batch of finished spans. The default converts each span into its
+    /// OTLP request shape and delegates to [`SpanTransport::send_request`].
+    fn send(&self, spans: &[SpanData]) -> Result<(), String> {
+        for span in spans {
+            self.send_request(&request_from_span_data(span))?;
+        }
+        Ok(())
+    }
+
+    /// Send one fully-modeled OTLP `ExportTraceServiceRequest`. This is the
+    /// wire-encoding entry point used by the HTTP transport.
+    fn send_request(
+        &self,
+        request: &crate::otlp_wire::ExportTraceServiceRequest,
+    ) -> Result<(), String>;
+
     fn shutdown(&self) {}
 }
 
@@ -650,6 +751,13 @@ pub struct NoopSpanTransport;
 
 impl SpanTransport for NoopSpanTransport {
     fn send(&self, _spans: &[SpanData]) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn send_request(
+        &self,
+        _request: &crate::otlp_wire::ExportTraceServiceRequest,
+    ) -> Result<(), String> {
         Ok(())
     }
 }
@@ -674,7 +782,7 @@ impl OtlpSpanExporter {
 
 impl SpanExporter for OtlpSpanExporter {
     fn export(&self, span: &SpanData) {
-        let _ = self.transport.send(std::slice::from_ref(span));
+        let _ = self.transport.send_request(&request_from_span_data(span));
     }
 
     fn shutdown(&self) {
@@ -880,6 +988,7 @@ mod tests {
             trace_id: "t".to_owned(),
             span_id: "s".to_owned(),
             attributes: vec![sampling_retain(true).unwrap()],
+            ..SpanData::default()
         };
         assert!(runtime.export(&span));
 
