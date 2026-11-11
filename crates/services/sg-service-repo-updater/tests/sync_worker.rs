@@ -70,6 +70,7 @@ async fn worker_runs_a_queued_job_to_completion() {
         ),
         Arc::new(ExtsvcSourceFactory::new(
             None,
+            None,
             Arc::new(sg_keyring::Keyring::default()),
         )),
         None,

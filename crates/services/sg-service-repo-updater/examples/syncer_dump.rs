@@ -148,6 +148,7 @@ async fn main() {
         ExternalServiceReposStore::new(pool.clone()),
         Arc::new(ExtsvcSourceFactory::new(
             None,
+            None,
             Arc::new(sg_keyring::Keyring::default()),
         )),
         None,

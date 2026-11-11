@@ -95,7 +95,7 @@ fn syncer_with(
         ExternalServiceReposStore::new(pool.clone()),
         // `OTHER` sources configured with explicit clone URLs never touch
         // the HTTP client.
-        Arc::new(ExtsvcSourceFactory::new(None, keyring)),
+        Arc::new(ExtsvcSourceFactory::new(None, None, keyring)),
         Some(tx),
         Arc::new(SystemClock),
         Arc::new(Metrics::new()),
@@ -349,6 +349,7 @@ async fn emits_syncer_and_source_metrics() {
         ExternalServiceReposStore::new(pool.clone()),
         Arc::new(ExtsvcSourceFactory::new(
             None,
+            None,
             Arc::new(sg_keyring::Keyring::default()),
         )),
         None,
@@ -438,6 +439,7 @@ async fn emits_store_metrics_for_create_update_and_delete() {
             Arc::clone(&metrics) as Arc<dyn sg_db::external_service_repos::StoreObserver>
         ),
         Arc::new(ExtsvcSourceFactory::new(
+            None,
             None,
             Arc::new(sg_keyring::Keyring::default()),
         )),
