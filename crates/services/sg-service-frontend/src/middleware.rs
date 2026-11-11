@@ -33,6 +33,7 @@ use crate::graphql_api::GraphqlDeps;
 use crate::health;
 use crate::ipallowlist::{self, AllowlistEnv, IpAllowlistConfig};
 use crate::mux::{self, SecurityConfig};
+use crate::oauth_routes::{OAuthRouteConfig, OAuthRouteDeps, OAuthRouteFactory};
 use crate::search_stream::SearchDeps;
 use crate::tenant;
 use crate::trace_headers;
@@ -291,6 +292,12 @@ struct DerivedConfig {
     /// The actor/authz chain's per-snapshot configuration (`conf.Get()` per
     /// request in the baseline).
     chain_config: ChainConfig,
+    /// `/.auth/<provider>/{login,callback}` routing (`conf.Get()` per
+    /// generation).
+    oauth_config: OAuthRouteConfig,
+    /// Production OAuth seams; `None` only in the tests that build
+    /// [`LiveMiddleware`] without an OAuth factory.
+    oauth: Option<Arc<OAuthRouteDeps>>,
     app_env: Arc<AppEnv>,
     app_config: AppConfig,
     app_deps: Arc<AppDeps>,
@@ -303,6 +310,7 @@ impl DerivedConfig {
         app_env: Arc<AppEnv>,
         app_deps: Arc<AppDeps>,
         sign_out_factory: Option<&SignOutFactory>,
+        oauth_factory: Option<&OAuthRouteFactory>,
     ) -> Self {
         // `conf.Watch` equivalent (`internal/tracer.newConfWatcher`): refresh
         // the process-global trace policy for each configuration generation.
@@ -322,6 +330,8 @@ impl DerivedConfig {
             trace_url_template: trace_headers::url_template(site),
             security,
             chain_config,
+            oauth_config: OAuthRouteConfig::from_site(site, app_env.dotcom),
+            oauth: oauth_factory.map(|factory| factory(site)),
             app_env,
             app_config: AppConfig::from_site_config(site),
             app_deps,
@@ -341,6 +351,8 @@ pub struct LiveMiddleware {
     /// `/-/sign-out` wiring rebuilt per configuration generation (the
     /// baseline reads `conf.Get()` per request).
     sign_out_factory: Option<SignOutFactory>,
+    /// OAuth route dependencies rebuilt per configuration generation.
+    oauth_factory: Option<OAuthRouteFactory>,
     cache: std::sync::Mutex<Option<(u64, Arc<DerivedConfig>)>>,
 }
 
@@ -351,6 +363,7 @@ impl LiveMiddleware {
         app_env: Arc<AppEnv>,
         app_deps: Arc<AppDeps>,
         sign_out_factory: Option<SignOutFactory>,
+        oauth_factory: Option<OAuthRouteFactory>,
     ) -> Self {
         Self {
             live,
@@ -358,6 +371,7 @@ impl LiveMiddleware {
             app_env,
             app_deps,
             sign_out_factory,
+            oauth_factory,
             cache: std::sync::Mutex::new(None),
         }
     }
@@ -380,6 +394,7 @@ impl LiveMiddleware {
             Arc::clone(&self.app_env),
             Arc::clone(&self.app_deps),
             self.sign_out_factory.as_ref(),
+            self.oauth_factory.as_ref(),
         ));
         if let Ok(mut cache) = self.cache.lock() {
             *cache = Some((generation, Arc::clone(&derived)));
@@ -396,6 +411,7 @@ pub fn external_handler_with_live(
     live: Arc<LiveConfig>,
     allowlist_env: AllowlistEnv,
     sign_out_factory: Option<SignOutFactory>,
+    oauth_factory: Option<OAuthRouteFactory>,
     version: Bytes,
     blame_deps: Arc<dyn BlameDeps>,
     search_deps: Arc<dyn SearchDeps>,
@@ -411,6 +427,7 @@ pub fn external_handler_with_live(
         app_env,
         app_deps,
         sign_out_factory,
+        oauth_factory,
     ));
     Arc::new(move |mut req: Request<Incoming>| {
         let middleware = Arc::clone(&middleware);
@@ -432,6 +449,8 @@ pub fn external_handler_with_live(
                 |req| {
                     let security = derived.security.clone();
                     let chain_config = derived.chain_config.clone();
+                    let oauth_config = derived.oauth_config.clone();
+                    let oauth = derived.oauth.clone();
                     let app_env = Arc::clone(&derived.app_env);
                     let app_config = derived.app_config.clone();
                     let app_deps = Arc::clone(&derived.app_deps);
@@ -451,6 +470,8 @@ pub fn external_handler_with_live(
                             let graphql_deps = Arc::clone(&graphql_deps);
                             let chain_config = chain_config.clone();
                             let chain_deps = Arc::clone(&chain_deps);
+                            let oauth_config = oauth_config.clone();
+                            let oauth = oauth.clone();
                             Box::pin(async move {
                                 match &route {
                                     // `/.api/` and `/` are the baseline's only
@@ -461,6 +482,25 @@ pub fn external_handler_with_live(
                                             mux::Route::Api => ExternalMode::Api,
                                             _ => ExternalMode::App,
                                         };
+                                        // The provider middlewares run before
+                                        // `RequireAuthMiddleware` (and before
+                                        // `AnonymousUID`/featureflag/PostAuth)
+                                        // and take over their whole prefix
+                                        // without consulting the actor.
+                                        if mode == ExternalMode::App {
+                                            if let Some(deps) = &oauth {
+                                                if let Some(response) =
+                                                    crate::oauth_routes::auth_prefix_response(
+                                                        request,
+                                                        &oauth_config,
+                                                        deps,
+                                                    )
+                                                    .await
+                                                {
+                                                    return response;
+                                                }
+                                            }
+                                        }
                                         match crate::actor_chain::run_external_chain(
                                             request,
                                             mode,
@@ -469,8 +509,44 @@ pub fn external_handler_with_live(
                                         )
                                         .await
                                         {
-                                            ChainOutcome::Reject(response) => response,
+                                            ChainOutcome::Reject(response) => {
+                                                // `RequireAuthMiddleware` is
+                                                // inside the provider
+                                                // middlewares: replace its
+                                                // sign-in redirect when the
+                                                // single-provider condition
+                                                // holds.
+                                                if mode == ExternalMode::App {
+                                                    if let Some(redirect) =
+                                                        crate::oauth_routes::single_provider_redirect(
+                                                            request,
+                                                            &oauth_config,
+                                                            false,
+                                                        )
+                                                    {
+                                                        if crate::oauth_routes::is_sign_in_redirect(
+                                                            &response,
+                                                        ) {
+                                                            return redirect;
+                                                        }
+                                                    }
+                                                }
+                                                response
+                                            }
                                             ChainOutcome::Proceed { actor, vary } => {
+                                                if mode == ExternalMode::App
+                                                    && !actor.is_authenticated()
+                                                {
+                                                    if let Some(redirect) =
+                                                        crate::oauth_routes::single_provider_redirect(
+                                                            request,
+                                                            &oauth_config,
+                                                            false,
+                                                        )
+                                                    {
+                                                        return redirect;
+                                                    }
+                                                }
                                                 request.extensions_mut().insert(ChainActor(actor));
                                                 let mut response = match &route {
                                                     mux::Route::Api => {
@@ -877,6 +953,7 @@ mod tests {
             AllowlistEnv::default(),
             Arc::new(AppEnv::default()),
             Arc::new(AppDeps::default()),
+            None,
             None,
         );
 

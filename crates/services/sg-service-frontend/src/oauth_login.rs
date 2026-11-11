@@ -175,7 +175,10 @@ impl OAuthProviders {
                         auth_url: format!("{base}/login/oauth/authorize"),
                         token_url: format!("{base}/login/oauth/access_token"),
                         scopes,
-                        redirect_url: oauth_callback_url(external_url, service_type),
+                        // `githuboauth/provider.go` does *not* set
+                        // `oauth2.Config.RedirectURL` (unlike GitLab), so
+                        // `AuthCodeURL` has no `redirect_uri` parameter.
+                        redirect_url: String::new(),
                     });
                 }
                 "gitlab" => {
@@ -648,6 +651,14 @@ const ERR_SAVE_STATE: &str = "Failed to saving state to session";
 const ERR_REFERER: &str = "Failed to parse URL from Referrer header.";
 const ERR_DECODE_CTX_STATE: &str =
     "Authentication failed. Try signing in again (and clearing cookies for the current site). The error was: could not get decode OAuth state.";
+
+/// The baseline `Users().GetByID` failure body ("could not initiate session.").
+/// Exposed for [`crate::oauth_routes`]'s unregistered-resolver seam so a
+/// provider without a resolver reports the baseline error instead of faking a
+/// successful login. M9.8jo; no change to the flow.
+pub fn could_not_initiate_session_message() -> &'static str {
+    ERR_GET_USER
+}
 
 /// `newOAuthFlowHandler`'s `/login` branch + the provider's `stateHandler` +
 /// `gologin.LoginHandler`.
