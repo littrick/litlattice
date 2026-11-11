@@ -53,6 +53,7 @@ pub mod log_events_metrics;
 pub mod middleware;
 pub mod mux;
 pub mod oauth_login;
+pub mod oauth_routes;
 pub mod org_store;
 pub mod otlp_wire;
 pub mod parse_search_query;

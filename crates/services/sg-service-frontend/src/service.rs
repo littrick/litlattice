@@ -590,9 +590,47 @@ impl Service for FrontendService {
                 Arc::clone(wiring.live()),
             )),
             Arc::new(crate::actor_chain_adapters::PgSiteAdminChecker::new(
-                chain_pool,
+                chain_pool.clone(),
             )),
         ));
+
+        // M9.8jo: `/.auth/<provider>/{login,callback}` production seams. The
+        // resolver registry starts empty; M9.8jp/jq/jr register the
+        // GitHub/GitLab/OIDC `GetOrCreateUser` implementations after merge
+        // (until then a callback reports the baseline 500 instead of faking
+        // success). The session store and license reader are the chain's, so
+        // cookies and expiry behave identically.
+        let oauth_resolvers = Arc::new(crate::oauth_routes::OAuthUserResolverRegistry::new());
+        let oauth_http: Arc<dyn crate::oauth_login::OAuthHttpClient> =
+            Arc::new(crate::oauth_routes::ReqwestOAuthHttpClient::from_env());
+        let oauth_store = Arc::clone(&chain_deps.session_store);
+        let oauth_license = Arc::clone(&chain_deps.license);
+        let oauth_cookie_key = chain_deps.session_cookie_key.clone();
+        let oauth_pool = chain_pool.clone();
+        let oauth_factory: crate::oauth_routes::OAuthRouteFactory = {
+            let resolvers = Arc::clone(&oauth_resolvers);
+            let http = Arc::clone(&oauth_http);
+            Arc::new(move |site: &sg_config::SiteConfiguration| {
+                let backend = Arc::new(crate::oauth_login::PgOAuthLoginBackend::new(
+                    oauth_pool.clone(),
+                    sg_metrics::VERSION,
+                    sg_db::security_event_logs::security_event_logs_in_database(site.raw()),
+                ));
+                let users: Arc<dyn crate::oauth_login::OAuthUserLookup> = backend.clone();
+                let events: Arc<dyn crate::oauth_login::OAuthSecurityEventSink> = backend;
+                Arc::new(crate::oauth_routes::OAuthRouteDeps {
+                    store: Arc::clone(&oauth_store),
+                    ids: Arc::new(sg_session::OsSessionIdSource),
+                    state_source: Arc::new(crate::oauth_login::OsStateSource),
+                    cookie_key: oauth_cookie_key.clone(),
+                    license: Arc::clone(&oauth_license),
+                    http: Arc::clone(&http),
+                    users,
+                    events,
+                    resolvers: Arc::clone(&resolvers),
+                })
+            })
+        };
 
         sg_metrics::register_service_metadata(sg_metrics::VERSION);
         ctx.ready.mark_ready();
@@ -605,6 +643,7 @@ impl Service for FrontendService {
                 Arc::clone(wiring.live()),
                 self.allowlist_env.clone(),
                 Some(sign_out_factory),
+                Some(oauth_factory),
                 self.version.bytes(),
                 blame_deps,
                 search_deps,
