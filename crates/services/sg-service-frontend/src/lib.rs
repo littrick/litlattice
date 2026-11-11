@@ -41,6 +41,7 @@ pub mod github_oauth;
 pub mod git_comparison_graphql;
 pub mod git_graphql;
 pub mod git_tree_entry_graphql;
+pub mod gitlab_oauth;
 pub mod goimportpath;
 pub mod graphql_api;
 pub mod graphql_metrics;
