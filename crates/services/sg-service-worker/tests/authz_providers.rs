@@ -61,6 +61,7 @@ async fn authz_providers_matches_go_harness() {
             acls_license_error: license_error.map(str::to_owned),
             enable_github_internal_repo_visibility: false,
             cache_kv: Some(cache_kv.clone()),
+            ..Default::default()
         };
         let result = providers_from_config(&pool, &site, &keyring, &opts).await;
 
@@ -118,10 +119,12 @@ async fn authz_providers_matches_go_harness() {
         [
             "azuredevops:authzprovider",
             "extsvc:bitbucketcloud:12012",
+            "extsvc:bitbucketserver:12015",
             "extsvc:gerrit:12013",
             "extsvc:github:12001",
             "extsvc:github:12003",
-            "extsvc:github:12004"
+            "extsvc:github:12004",
+            "extsvc:perforce:12016"
         ]
     );
 

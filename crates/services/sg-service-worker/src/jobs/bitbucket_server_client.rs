@@ -1,21 +1,23 @@
 #![forbid(unsafe_code)]
 
-//! The `internal/extsvc/bitbucketserver` subset the
-//! `bitbucket-project-permissions` worker needs: config decoding, client
-//! construction (`NewClient`) and `ProjectRepos` pagination.
+//! The `internal/extsvc/bitbucketserver` subset used by the worker:
+//! configuration decoding, client construction (`NewClient`), pagination and
+//! the API calls the authz provider and the `bitbucket-project-permissions`
+//! job need.
 //!
-//! The baseline client (`internal/extsvc/bitbucketserver/client.go`) is large;
-//! this port keeps only the request path the job uses:
+//! Requirement/response semantics follow `client.go`:
 //!
 //! * authentication selection exactly as `NewClient`:
 //!   `authorization == nil || authorization.oauth2` → `token` becomes an
 //!   `OAuthBearerToken`, otherwise `username`/`password` become `BasicAuth`;
 //!   `authorization.oauth` (two-legged OAuth 1.0a) requires RSA request
-//!   signing, which this port does not implement (docs §74.3);
+//!   signing, which this port does not implement (docs §74.3); constructing
+//!   such a client is an error, which the provider registry reports as a
+//!   serious problem (deny-by-default);
 //! * the URL is resolved the way `(*Client).do` does: join the base path with
 //!   the relative API path, then take scheme/host from the configured URL;
-//! * `ProjectRepos` walks `rest/api/1.0/projects/{key}/repos` with
-//!   `limit=1000` and follows `nextPageStart` while `isLastPage` is false;
+//! * page queries are `url.Values.Encode`-equivalent (`limit`/`start` sorted,
+//!   filters sorted by key);
 //! * a non-2xx response is a `Bitbucket API HTTP error: code=%d url=%q
 //!   body=%q`, made non-retryable for the same status codes
 //!   `errcode.MaybeMakeNonRetryable` covers.
@@ -23,10 +25,14 @@
 //! Not ported: the `certificate` client option (custom CA roots), rate
 //! limiting (`ratelimit.InstrumentedLimiter`), request metrics and tracing.
 //! All are observability/TLS-configuration concerns that do not change the
-//! request sequence for the job.
+//! request sequence.
+
+use std::io::Cursor;
 
 use base64::Engine;
+use roaring::RoaringBitmap;
 use serde::Deserialize;
+use serde_json::Value;
 use url::Url;
 
 /// `schema.BitbucketServerConnection`, reduced to the fields used here.
@@ -39,6 +45,8 @@ pub struct BitbucketServerConnection {
     #[serde(default)]
     pub password: String,
     #[serde(default)]
+    pub plugin: Option<BitbucketServerPlugin>,
+    #[serde(default)]
     pub token: String,
     #[serde(default)]
     pub url: String,
@@ -49,10 +57,46 @@ pub struct BitbucketServerConnection {
 /// `schema.BitbucketServerAuthorization`.
 #[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
 pub struct BitbucketServerAuthorization {
+    #[serde(default, rename = "identityProvider")]
+    pub identity_provider: Option<Value>,
+    #[serde(default)]
+    pub oauth: Option<BitbucketServerOAuth>,
     #[serde(default)]
     pub oauth2: bool,
+}
+
+/// `schema.BitbucketServerOAuth`.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+pub struct BitbucketServerOAuth {
+    #[serde(default, rename = "consumerKey")]
+    pub consumer_key: String,
+    #[serde(default, rename = "signingKey")]
+    pub signing_key: String,
+}
+
+/// `schema.BitbucketServerPlugin`.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+pub struct BitbucketServerPlugin {
     #[serde(default)]
-    pub oauth: Option<serde_json::Value>,
+    pub permissions: String,
+}
+
+impl BitbucketServerAuthorization {
+    /// `identityProvider.username` (the schema is a tagged union with only
+    /// this member).
+    pub fn username_identity(&self) -> bool {
+        self.identity_provider
+            .as_ref()
+            .and_then(|idp| idp.get("type"))
+            .and_then(Value::as_str)
+            == Some("username")
+    }
+
+    pub fn has_identity_provider(&self) -> bool {
+        self.identity_provider
+            .as_ref()
+            .is_some_and(|value| !value.is_null())
+    }
 }
 
 /// `bitbucketserver.Repo`, reduced to the identifier the handler matches
@@ -67,26 +111,81 @@ pub struct Repo {
     pub name: String,
 }
 
-/// `bitbucketserver.PageToken`.
-#[derive(Debug, Clone, Default, Deserialize)]
-struct PageToken {
+/// `bitbucketserver.User`.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+pub struct User {
     #[serde(default)]
-    limit: i64,
+    pub name: String,
+    #[serde(default, rename = "emailAddress")]
+    pub email_address: String,
+    #[serde(default)]
+    pub id: i64,
+    #[serde(default, rename = "displayName")]
+    pub display_name: String,
+    #[serde(default)]
+    pub active: bool,
+    #[serde(default)]
+    pub slug: String,
+    #[serde(default, rename = "type")]
+    pub user_type: String,
+}
+
+impl User {
+    /// `json.Marshal(User)`: Go's struct tags omit empty fields except `id`
+    /// is `omitempty` as well (so `""`, `0`, `false` are dropped). Rust
+    /// serialises every field, so the provider builds the account-data JSON
+    /// explicitly with [`Self::to_account_data_json`].
+    pub fn to_account_data_json(&self) -> String {
+        // `json.Marshal` emits struct fields in declaration order (a plain
+        // `serde_json::Map` would sort the keys), so build the object in
+        // source order.
+        let escaped = |value: &str| Value::String(value.to_owned()).to_string();
+        let mut parts: Vec<String> = Vec::new();
+        if !self.name.is_empty() {
+            parts.push(format!("\"name\":{}", escaped(&self.name)));
+        }
+        if !self.email_address.is_empty() {
+            parts.push(format!("\"emailAddress\":{}", escaped(&self.email_address)));
+        }
+        if self.id != 0 {
+            parts.push(format!("\"id\":{}", self.id));
+        }
+        if !self.display_name.is_empty() {
+            parts.push(format!("\"displayName\":{}", escaped(&self.display_name)));
+        }
+        if self.active {
+            parts.push("\"active\":true".to_owned());
+        }
+        if !self.slug.is_empty() {
+            parts.push(format!("\"slug\":{}", escaped(&self.slug)));
+        }
+        if !self.user_type.is_empty() {
+            parts.push(format!("\"type\":{}", escaped(&self.user_type)));
+        }
+        format!("{{{}}}", parts.join(","))
+    }
+}
+
+/// `bitbucketserver.PageToken`.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+pub struct PageToken {
+    #[serde(default)]
+    pub limit: i64,
     #[serde(default, rename = "isLastPage")]
-    is_last_page: bool,
+    pub is_last_page: bool,
     #[serde(default, rename = "nextPageStart")]
-    next_page_start: i64,
+    pub next_page_start: i64,
 }
 
 impl PageToken {
-    fn has_more(&self) -> bool {
+    pub fn has_more(&self) -> bool {
         !self.is_last_page
     }
 
     /// `PageToken.Values`: `start` only when non-zero, `limit` only when
     /// non-zero. `url.Values.Encode` sorts the keys, so `limit` precedes
     /// `start`.
-    fn query(&self) -> Vec<(String, String)> {
+    pub fn query(&self) -> Vec<(String, String)> {
         let mut query = Vec::new();
         if self.next_page_start != 0 {
             query.push(("start".to_owned(), self.next_page_start.to_string()));
@@ -99,13 +198,95 @@ impl PageToken {
     }
 }
 
-#[derive(Debug, Clone)]
-enum Auth {
+/// `bitbucketserver.UserFilter`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UserFilter {
+    /// `Filter`: substring match on username, name or email.
+    pub filter: String,
+    /// `Group`.
+    pub group: String,
+    /// `Permission`.
+    pub permission: PermissionFilter,
+}
+
+/// `bitbucketserver.PermissionFilter`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PermissionFilter {
+    pub root: String,
+    pub project_id: String,
+    pub project_key: String,
+    pub repository_id: String,
+    pub repository_slug: String,
+    /// `index` is 1-based (`UserFilters.EncodeTo` increments before assigning),
+    /// so the first permission filter uses `permission.1`.
+    pub index: usize,
+}
+
+impl UserFilter {
+    pub fn by_filter(username: &str) -> Self {
+        Self {
+            filter: username.to_owned(),
+            ..Self::default()
+        }
+    }
+
+    pub fn by_repo_read(repository_id: &str) -> Self {
+        Self {
+            permission: PermissionFilter {
+                root: "REPO_READ".to_owned(),
+                repository_id: repository_id.to_owned(),
+                index: 1,
+                ..PermissionFilter::default()
+            },
+            ..Self::default()
+        }
+    }
+
+    /// `UserFilter.EncodeTo` appending to the encoded query pairs.
+    fn encode_into(&self, query: &mut Vec<(String, String)>) {
+        if !self.filter.is_empty() {
+            query.push(("filter".to_owned(), self.filter.clone()));
+        }
+        if !self.group.is_empty() {
+            query.push(("group".to_owned(), self.group.clone()));
+        }
+        if !self.permission.root.is_empty() {
+            let mut key = "permission".to_owned();
+            if self.permission.index != 0 {
+                key.push('.');
+                key.push_str(&self.permission.index.to_string());
+            }
+            query.push((key.clone(), self.permission.root.clone()));
+            if !self.permission.project_id.is_empty() {
+                query.push((format!("{key}.projectId"), self.permission.project_id.clone()));
+            }
+            if !self.permission.project_key.is_empty() {
+                query.push((format!("{key}.projectKey"), self.permission.project_key.clone()));
+            }
+            if !self.permission.repository_id.is_empty() {
+                query.push((
+                    format!("{key}.repositoryId"),
+                    self.permission.repository_id.clone(),
+                ));
+            }
+            if !self.permission.repository_slug.is_empty() {
+                query.push((
+                    format!("{key}.repositorySlug"),
+                    self.permission.repository_slug.clone(),
+                ));
+            }
+        }
+    }
+}
+
+/// `bitbucketserver.Client.Auth`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Auth {
     Basic { username: String, password: String },
     Bearer { token: String },
 }
 
-/// A `bitbucketserver.Client` limited to `ProjectRepos`.
+/// A `bitbucketserver.Client` limited to the authz/worker calls.
 #[derive(Debug, Clone)]
 pub struct BitbucketServerClient {
     base: Url,
@@ -128,6 +309,10 @@ impl BitbucketServerClient {
                 if authorization.oauth2 {
                     Self::default_auth(config)
                 } else if authorization.oauth.is_some() {
+                    // OAuth1 request signing (RSA-SHA1) is not ported; the
+                    // baseline's `SetOAuth` accepts a valid key pair and then
+                    // signs each request with a random nonce, which cannot be
+                    // reproduced deterministically. Deny by construction.
                     return Err(BitbucketServerError::retryable(
                         "authorization.oauth.signingKey: OAuth 1.0 request signing is not implemented by the Rust worker"
                             .to_owned(),
@@ -159,6 +344,49 @@ impl BitbucketServerClient {
         }
     }
 
+    /// The `httpcli.Doer` the client would use (`httpcli.ExternalClient` in
+    /// the baseline); exposed so OAuth token refresh posts with the same
+    /// transport.
+    pub fn http_client(&self) -> reqwest::Client {
+        self.http.clone()
+    }
+
+    /// `(*Client).WithAuthenticator`.
+    pub fn with_authenticator(&self, auth: Auth) -> Self {
+        Self {
+            base: self.base.clone(),
+            auth,
+            http: self.http.clone(),
+        }
+    }
+
+    /// `(*Client).WithAuthenticator(&auth.OAuthBearerToken{Token: token})`.
+    pub fn with_bearer_token(&self, token: &str) -> Self {
+        self.with_authenticator(Auth::Bearer {
+            token: token.to_owned(),
+        })
+    }
+
+    /// `(*Client).Sudo`: only OAuth1 clients are sudoable in the baseline;
+    /// this port never constructs one, so this always returns the baseline's
+    /// error text for non-OAuth clients.
+    pub fn sudo(&self, _username: &str) -> Result<Self, BitbucketServerError> {
+        Err(BitbucketServerError::retryable(
+            "bitbucketserver.Client: OAuth not configured".to_owned(),
+        ))
+    }
+
+    /// `(*Client).Username`.
+    pub fn username(&self) -> Result<String, BitbucketServerError> {
+        match &self.auth {
+            Auth::Basic { username, .. } => Ok(username.clone()),
+            Auth::Bearer { .. } => Err(BitbucketServerError::retryable(
+                "bitbucketserver.Client: authentication method does not include a username"
+                    .to_owned(),
+            )),
+        }
+    }
+
     fn auth_header(&self) -> String {
         match &self.auth {
             Auth::Basic { username, password } => format!(
@@ -182,8 +410,12 @@ impl BitbucketServerClient {
         url.set_path(&joined);
         url.set_query(None);
         if !query.is_empty() {
+            // `url.Values.Encode` sorts by key; values within one key keep
+            // their insertion order (stable sort).
+            let mut query = query.to_vec();
+            query.sort_by(|left, right| left.0.cmp(&right.0));
             let mut pairs = url.query_pairs_mut();
-            for (key, value) in query {
+            for (key, value) in &query {
                 pairs.append_pair(key, value);
             }
         }
@@ -211,22 +443,118 @@ impl BitbucketServerClient {
         loop {
             let url = self.request_url(&path, &token.query());
             let body = self.send(url).await?;
-            let page: PageToken = match serde_json::from_slice::<Page<Repo>>(&body) {
-                Ok(page) => {
-                    repos.extend(page.values);
-                    page.token
-                }
-                Err(err) => {
-                    return Err(BitbucketServerError::retryable(format!(
-                        "failed to unmarshal response to JSON: {err}"
-                    )))
-                }
-            };
-            if !page.has_more() {
+            let page = self.decode_page::<Repo>(&body)?;
+            repos.extend(page.values);
+            if !page.token.has_more() {
                 return Ok(repos);
             }
-            token = page;
+            token = page.token;
         }
+    }
+
+    /// `Client.Users`: one page of `rest/api/1.0/users` with the filters.
+    pub async fn users(
+        &self,
+        token: &PageToken,
+        filters: &[UserFilter],
+    ) -> Result<(Vec<User>, PageToken), BitbucketServerError> {
+        let mut query = Vec::new();
+        let mut permission_count = 0;
+        for filter in filters {
+            let mut filter = filter.clone();
+            // `UserFilters.EncodeTo` numbers permission filters starting at 1,
+            // so even a single filter uses `permission.1=...`.
+            if !filter.permission.root.is_empty() {
+                permission_count += 1;
+                filter.permission.index = permission_count;
+            }
+            filter.encode_into(&mut query);
+        }
+        query.extend(token.query());
+        let url = self.request_url("rest/api/1.0/users", &query);
+        let body = self.send(url).await?;
+        let page = self.decode_page::<User>(&body)?;
+        Ok((page.values, page.token))
+    }
+
+    /// `Client.UserPermissions`: global permissions of `username`.
+    pub async fn user_permissions(
+        &self,
+        username: &str,
+    ) -> Result<Vec<String>, BitbucketServerError> {
+        #[derive(Deserialize)]
+        struct PermissionEntry {
+            #[serde(default)]
+            user: Option<User>,
+            #[serde(default)]
+            permission: String,
+        }
+
+        #[derive(Deserialize)]
+        struct Response {
+            #[serde(default)]
+            values: Vec<PermissionEntry>,
+        }
+
+        let url = self.request_url(
+            "rest/api/1.0/admin/permissions/users",
+            &[("filter".to_owned(), username.to_owned())],
+        );
+        let body = self.send(url).await?;
+        let response: Response = serde_json::from_slice(&body).map_err(|err| {
+            BitbucketServerError::retryable(format!(
+                "failed to unmarshal response to JSON: {err}"
+            ))
+        })?;
+        Ok(response
+            .values
+            .into_iter()
+            .filter(|entry| {
+                entry
+                    .user
+                    .as_ref()
+                    .is_some_and(|user| user.name == username)
+            })
+            .map(|entry| entry.permission)
+            .collect())
+    }
+
+    /// `Client.Repos`: one page of `rest/api/1.0/repos`, merging the
+    /// caller's query strings (e.g. `?visibility=private`).
+    pub async fn repos(
+        &self,
+        token: &PageToken,
+        search_queries: &[&str],
+    ) -> Result<(Vec<Repo>, PageToken), BitbucketServerError> {
+        let mut query = parse_query_strings(search_queries)?;
+        query.extend(token.query());
+        let url = self.request_url("rest/api/1.0/repos", &query);
+        let body = self.send(url).await?;
+        let page = self.decode_page::<Repo>(&body)?;
+        Ok((page.values, page.token))
+    }
+
+    /// `Client.RepoIDs`: the roaring-bitmap plugin endpoint.
+    pub async fn repo_ids(&self, permission: &str) -> Result<Vec<u32>, BitbucketServerError> {
+        let url = self.request_url(
+            "rest/sourcegraph-admin/1.0/permissions/repositories",
+            &[("permission".to_owned(), permission.to_owned())],
+        );
+        let body = self.send(url).await?;
+        let bitmap = RoaringBitmap::deserialize_from(Cursor::new(&body))
+            .map_err(|err| BitbucketServerError::retryable(err.to_string()))?;
+        Ok(bitmap.iter().collect())
+    }
+
+    fn decode_page<T: for<'de> Deserialize<'de>>(
+        &self,
+        body: &[u8],
+    ) -> Result<Page<T>, BitbucketServerError> {
+        serde_json::from_slice::<Page<T>>(body).map_err(|err| {
+            BitbucketServerError::retryable(format!(
+                "failed to unmarshal response to JSON: {err}"
+            ))
+        })
     }
 
     async fn send(&self, url: Url) -> Result<Vec<u8>, BitbucketServerError> {
@@ -252,9 +580,23 @@ impl BitbucketServerClient {
     }
 }
 
+/// `parseQueryStrings`: merge `?a=b&c=d` fragments. `url.ParseQuery`
+/// percent-decodes and treats `+` as space; `form_urlencoded` matches.
+fn parse_query_strings(query_strings: &[&str]) -> Result<Vec<(String, String)>, BitbucketServerError> {
+    let mut query = Vec::new();
+    for raw in query_strings {
+        let trimmed = raw.strip_prefix('?').unwrap_or(raw);
+        for (key, value) in url::form_urlencoded::parse(trimmed.as_bytes()) {
+            query.push((key.into_owned(), value.into_owned()));
+        }
+    }
+    Ok(query)
+}
+
 /// Deserialises `{..., "values": [...]}` while keeping the page token fields
 /// at the same level.
 #[derive(Debug, Deserialize)]
+#[serde(bound(deserialize = "T: Deserialize<'de>"))]
 struct Page<T> {
     #[serde(flatten)]
     token: PageToken,
@@ -347,12 +689,14 @@ mod tests {
             r#"{"url":"https://bbs.example.com/","token":"t","username":"u","password":"p"}"#,
         );
         assert_eq!(client.auth_header(), "Bearer t");
+        assert!(client.username().is_err());
     }
 
     #[test]
     fn username_password_become_basic_auth() {
         let client = client(r#"{"url":"https://bbs.example.com/","username":"u","password":"p"}"#);
         assert_eq!(client.auth_header(), "Basic dTpw");
+        assert_eq!(client.username().expect("username"), "u");
     }
 
     #[test]
@@ -380,6 +724,13 @@ mod tests {
     }
 
     #[test]
+    fn sudo_requires_oauth1() {
+        let client = client(r#"{"url":"https://bbs.example.com/","username":"u","password":"p"}"#);
+        let err = client.sudo("alice").expect_err("not sudoable");
+        assert_eq!(err.message, "bitbucketserver.Client: OAuth not configured");
+    }
+
+    #[test]
     fn page_query_matches_url_values_encoding() {
         assert_eq!(
             PageToken {
@@ -399,6 +750,24 @@ mod tests {
             vec![
                 ("limit".to_owned(), "2".to_owned()),
                 ("start".to_owned(), "2".to_owned())
+            ]
+        );
+    }
+
+    #[test]
+    fn user_filter_encoding_matches_url_values() {
+        let mut query = Vec::new();
+        UserFilter::by_filter("alice").encode_into(&mut query);
+        assert_eq!(query, vec![("filter".to_owned(), "alice".to_owned())]);
+
+        let mut query = Vec::new();
+        UserFilter::by_repo_read("42").encode_into(&mut query);
+        query.sort();
+        assert_eq!(
+            query,
+            vec![
+                ("permission.1".to_owned(), "REPO_READ".to_owned()),
+                ("permission.1.repositoryId".to_owned(), "42".to_owned()),
             ]
         );
     }
@@ -456,5 +825,19 @@ mod tests {
     #[test]
     fn go_quote_escapes_control_characters() {
         assert_eq!(go_quote("a\"b\\c\nd"), r#""a\"b\\c\nd""#);
+    }
+
+    #[test]
+    fn user_account_data_json_omits_empty_fields_like_go() {
+        let user = User {
+            name: "alice".to_owned(),
+            id: 7,
+            active: true,
+            ..User::default()
+        };
+        assert_eq!(
+            user.to_account_data_json(),
+            r#"{"name":"alice","id":7,"active":true}"#
+        );
     }
 }

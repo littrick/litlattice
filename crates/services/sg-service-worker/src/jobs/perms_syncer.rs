@@ -138,6 +138,19 @@ impl UserPermsError {
     }
 }
 
+/// `FetchAccount`'s result including the account data the provider wants
+/// persisted (`extsvc.Account.AccountData`). The store encrypts both blobs
+/// before writing them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FetchedExternalAccount {
+    pub spec: ExternalAccountSpec,
+    /// `AccountData.Data` (plaintext JSON/bytes as returned by the provider).
+    pub account_data: Vec<u8>,
+    /// `AccountData.AuthData` (OAuth2 tokens); empty when the provider does
+    /// not create credentials.
+    pub auth_data: Vec<u8>,
+}
+
 /// `authz.Provider` subset used by the syncer.
 #[async_trait]
 pub trait AuthzProvider: Send + Sync {
@@ -160,6 +173,18 @@ pub trait AuthzProvider: Send + Sync {
         _user: &UserRecord,
     ) -> Result<Option<ExternalAccountSpec>, String> {
         Ok(None)
+    }
+    /// `FetchAccount` with the account data. Providers that only determine an
+    /// identity fall back to [`Self::fetch_account`] and persist empty data.
+    async fn fetch_account_with_data(
+        &self,
+        user: &UserRecord,
+    ) -> Result<Option<FetchedExternalAccount>, String> {
+        Ok(self.fetch_account(user).await?.map(|spec| FetchedExternalAccount {
+            spec,
+            account_data: Vec::new(),
+            auth_data: Vec::new(),
+        }))
     }
     /// `FetchUserPerms`: private repositories the account can read.
     async fn fetch_user_perms(

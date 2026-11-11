@@ -99,10 +99,10 @@ impl Job for PermsSyncerJob {
             Arc::clone(&deps.keyring),
             cache_kv,
         ));
-        let fetcher = Arc::new(ExternalAccountPermsFetcher::new(
-            pool.clone(),
-            Arc::clone(&registry),
-        ));
+        let fetcher = Arc::new(
+            ExternalAccountPermsFetcher::new(pool.clone(), Arc::clone(&registry))
+                .with_user_external_account_key(deps.keyring.user_external_account_key()),
+        );
         let syncer = Arc::new(PermsSyncer::new(pool.clone(), registry, fetcher));
 
         let repo_store = Arc::new(PermissionSyncJobsWorkerStore::new(

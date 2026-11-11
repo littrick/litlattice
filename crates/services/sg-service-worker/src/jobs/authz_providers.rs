@@ -68,6 +68,7 @@ use super::authz_bitbucketcloud::{
     TYPE_BITBUCKETCLOUD,
 };
 use super::authz_bitbucketcloud_client::{BitbucketCloudAuth, BitbucketCloudRestClient};
+use super::authz_bitbucketserver::{new_bitbucketserver_authz_provider, TYPE_BITBUCKETSERVER};
 use super::authz_gerrit::{GerritProvider, TYPE_GERRIT};
 use super::authz_gerrit_client::GerritRestClient;
 use super::authz_github::{
@@ -83,6 +84,10 @@ use super::authz_gitlab::{
     GITLAB_PROJECT_VISIBILITY_EXPERIMENTAL, TYPE_GITLAB,
 };
 use super::authz_gitlab_client::GitlabRestClientProvider;
+use super::authz_perforce::{
+    GrpcPerforceGitserver, PerforceGitserver, PerforceProvider, TYPE_PERFORCE,
+};
+use super::bitbucket_server_client::BitbucketServerConnection as BitbucketServerConfig;
 use super::perms_syncer::{AuthzProvider, ProviderRegistry};
 
 /// `providers.ProvidersFromConfig`'s external service kinds, in its order.
@@ -131,6 +136,9 @@ pub struct ProvidersOptions {
     /// back to an in-memory cache for callers without a Redis pool; production
     /// passes the shared pool so the cache lives in Redis like the baseline.
     pub cache_kv: Option<sg_redis::KeyValue>,
+    /// `connection.NewGitserverAddresses(conf.Get())`: the shard list the
+    /// Perforce provider's gitserver RPCs are routed over.
+    pub gitserver_addresses: sg_git::addresses::GitserverAddresses,
 }
 
 /// One parsed GitHub external service.
@@ -147,6 +155,18 @@ struct GitlabConnection {
 
 /// One parsed Bitbucket Cloud external service.
 struct BitbucketCloudConnection {
+    service: ExternalService,
+    config: Value,
+}
+
+/// One parsed Bitbucket Server external service.
+struct BitbucketServerConnectionEntry {
+    service: ExternalService,
+    config: Value,
+}
+
+/// One parsed Perforce external service.
+struct PerforceConnection {
     service: ExternalService,
     config: Value,
 }
@@ -208,6 +228,8 @@ pub async fn providers_from_config(
     let mut github_conns = Vec::new();
     let mut gitlab_conns = Vec::new();
     let mut bitbucketcloud_conns = Vec::new();
+    let mut bitbucketserver_conns = Vec::new();
+    let mut perforce_conns = Vec::new();
     let mut gerrit_conns = Vec::new();
     let mut azuredevops_conns = Vec::new();
     let mut serious_problems = Vec::new();
@@ -251,6 +273,10 @@ pub async fn providers_from_config(
                 gitlab_conns.push(GitlabConnection { service, config });
             } else if service.kind == "BITBUCKETCLOUD" {
                 bitbucketcloud_conns.push(BitbucketCloudConnection { service, config });
+            } else if service.kind == "BITBUCKETSERVER" {
+                bitbucketserver_conns.push(BitbucketServerConnectionEntry { service, config });
+            } else if service.kind == "PERFORCE" {
+                perforce_conns.push(PerforceConnection { service, config });
             } else if service.kind == "GERRIT" {
                 gerrit_conns.push(GerritConnection { service, config });
             } else if service.kind == "AZUREDEVOPS" {
@@ -264,12 +290,15 @@ pub async fn providers_from_config(
         }
     }
 
-    // `authz.go`: GitHub providers first, then GitLab. The OAuth branch needs
-    // `auth.providers`, which `newAuthzProvider` receives as its `ps` argument.
+    // `authz.go`'s `initResult.Append` order: GitHub, GitLab, Bitbucket
+    // Server, Perforce, Bitbucket Cloud, Gerrit, Azure DevOps.
     let gitlab_authn = gitlab_oauth_providers(site);
     let bitbucketcloud_authn = bitbucketcloud_oauth_providers(site);
     let github = github_new_authz_providers(&github_conns, site, keyring, pool, opts);
     let gitlab = gitlab_new_authz_providers(&gitlab_conns, &gitlab_authn, keyring, pool, opts);
+    let bitbucketserver =
+        bitbucketserver_new_authz_providers(&bitbucketserver_conns, keyring, opts);
+    let perforce = perforce_new_authz_providers(&perforce_conns, keyring, pool, opts);
     let bitbucketcloud = bitbucketcloud_new_authz_providers(
         &bitbucketcloud_conns,
         &bitbucketcloud_authn,
@@ -283,16 +312,22 @@ pub async fn providers_from_config(
 
     let mut providers = github.providers;
     providers.extend(gitlab.providers);
+    providers.extend(bitbucketserver.providers);
+    providers.extend(perforce.providers);
     providers.extend(bitbucketcloud.providers);
     providers.extend(gerrit.providers);
     providers.extend(azuredevops.providers);
     let mut warnings = github.warnings;
     warnings.extend(gitlab.warnings);
+    warnings.extend(bitbucketserver.warnings);
+    warnings.extend(perforce.warnings);
     warnings.extend(bitbucketcloud.warnings);
     warnings.extend(gerrit.warnings);
     warnings.extend(azuredevops.warnings);
     let mut invalid_connections = github.invalid_connections;
     invalid_connections.extend(gitlab.invalid_connections);
+    invalid_connections.extend(bitbucketserver.invalid_connections);
+    invalid_connections.extend(perforce.invalid_connections);
     invalid_connections.extend(bitbucketcloud.invalid_connections);
     invalid_connections.extend(gerrit.invalid_connections);
     invalid_connections.extend(azuredevops.invalid_connections);
@@ -302,6 +337,8 @@ pub async fn providers_from_config(
         serious_problems: {
             serious_problems.extend(github.serious_problems);
             serious_problems.extend(gitlab.serious_problems);
+            serious_problems.extend(bitbucketserver.serious_problems);
+            serious_problems.extend(perforce.serious_problems);
             serious_problems.extend(bitbucketcloud.serious_problems);
             serious_problems.extend(gerrit.serious_problems);
             serious_problems.extend(azuredevops.serious_problems);
@@ -519,6 +556,146 @@ fn new_gitlab_authz_provider(
         // members nil in the baseline.
         _ => Err("No identityProvider was specified".to_owned()),
     }
+}
+
+/// `bitbucketserver.NewAuthzProviders`: one provider per connection;
+/// construction failures are serious problems for
+/// `extsvc.TypeBitbucketServer`.
+fn bitbucketserver_new_authz_providers(
+    conns: &[BitbucketServerConnectionEntry],
+    keyring: &Keyring,
+    opts: &ProvidersOptions,
+) -> ProviderInitResult {
+    let mut result = ProviderInitResult::default();
+    for conn in conns {
+        let plugin_perm = conn
+            .config
+            .get("plugin")
+            .and_then(|plugin| plugin.get("permissions"))
+            .and_then(Value::as_str)
+            == Some("enabled");
+        let urn = sg_extsvc::urn(&conn.service.kind, conn.service.id);
+
+        // `bitbucketserver.NewClient` and `NewOAuthProvider` both parse
+        // `conn.url`; the code host service ID is the normalized form (an
+        // unparsable URL reaches the client constructor below as an error).
+        let service_id = conn
+            .config
+            .get("url")
+            .and_then(Value::as_str)
+            .and_then(|raw| Url::parse(raw).ok())
+            .map(|url| normalize_base_url(&url))
+            .unwrap_or_default();
+
+        let parsed: BitbucketServerConfig = match serde_json::from_value(conn.config.clone()) {
+            Ok(parsed) => parsed,
+            Err(err) => {
+                result
+                    .invalid_connections
+                    .push(TYPE_BITBUCKETSERVER.to_owned());
+                result.serious_problems.push(err.to_string());
+                continue;
+            }
+        };
+
+        let provider = new_bitbucketserver_authz_provider(
+            &parsed,
+            &urn,
+            &service_id,
+            plugin_perm,
+            opts.acls_license_error.as_deref(),
+            keyring.user_external_account_key(),
+            reqwest::Client::new(),
+        );
+
+        match provider {
+            Ok(Some(provider)) => result.providers.push(provider),
+            Ok(None) => {}
+            Err(err) => {
+                result
+                    .invalid_connections
+                    .push(TYPE_BITBUCKETSERVER.to_owned());
+                result.serious_problems.push(err);
+            }
+        }
+    }
+    result
+}
+
+/// `perforce.NewAuthzProviders`.
+fn perforce_new_authz_providers(
+    conns: &[PerforceConnection],
+    keyring: &Keyring,
+    pool: &PgPool,
+    opts: &ProvidersOptions,
+) -> ProviderInitResult {
+    let mut result = ProviderInitResult::default();
+    let gitserver: Arc<dyn PerforceGitserver> = Arc::new(GrpcPerforceGitserver::new(
+        opts.gitserver_addresses.clone(),
+    ));
+
+    for conn in conns {
+        let Some(authorization) = conn
+            .config
+            .get("authorization")
+            .filter(|value| !value.is_null())
+        else {
+            continue;
+        };
+
+        // `licensing.Check(licensing.FeatureACLs)`.
+        if let Some(message) = &opts.acls_license_error {
+            result.invalid_connections.push(TYPE_PERFORCE.to_owned());
+            result.serious_problems.push(message.clone());
+            continue;
+        }
+
+        let sub_repo_permissions = authorization
+            .get("subRepoPermissions")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let ignore_rules_with_host = authorization
+            .get("ignoreRulesWithHost")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+
+        // Depots are forced to be directories when sub-repo permissions are
+        // enabled (`newAuthzProvider`).
+        let mut depots = Vec::new();
+        if sub_repo_permissions {
+            if let Some(values) = conn.config.get("depots").and_then(Value::as_array) {
+                for depot in values.iter().filter_map(Value::as_str) {
+                    depots.push(if depot.ends_with('/') {
+                        depot.to_owned()
+                    } else {
+                        format!("{depot}/")
+                    });
+                }
+            }
+        }
+
+        let string = |key: &str| {
+            conn.config
+                .get(key)
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned()
+        };
+        let urn = sg_extsvc::urn(&conn.service.kind, conn.service.id);
+        let provider = PerforceProvider::new(
+            urn,
+            string("p4.port"),
+            string("p4.user"),
+            string("p4.passwd"),
+            depots,
+            ignore_rules_with_host,
+            pool.clone(),
+            keyring.user_external_account_key(),
+            gitserver.clone(),
+        );
+        result.providers.push(Arc::new(provider));
+    }
+    result
 }
 
 /// `bitbucketcloud.NewAuthzProviders`: one provider per connection with
@@ -1072,6 +1249,7 @@ impl ProviderRegistry for ConfigAuthzProviders {
             acls_license_error: (self.acls_error)(&site.license_key()),
             enable_github_internal_repo_visibility: enable_github_internal_repo_visibility(site),
             cache_kv: self.cache_kv.clone(),
+            gitserver_addresses: sg_git::addresses::GitserverAddresses::from_unified(&unified),
         };
         providers_from_config(&self.pool, site, &self.keyring, &opts)
             .await
