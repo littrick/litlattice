@@ -5,19 +5,21 @@
 //! The Go package turns a `codycontext` query into three bounded keyword
 //! searches (symbols, code, text) by lowercasing, stripping punctuation,
 //! dropping stop words, Snowball-stemming the remaining terms and OR-ing
-//! them. This module ports the construction side faithfully; the blocking
-//! `searchJob.Run` (result collection, `result.Key` de-duplication and the
-//! `fileMatcher` filter) is not ported because the result layer is not
-//! available in the tree execution model (see the M9.8ju overview).
+//! them. The construction side lives here; the blocking `searchJob.Run`
+//! (result collection, `result.Key` de-duplication, the `fileMatcher` filter,
+//! alert/error merging and cancellation) is in [`execution`].
 //!
 //! Determinism note: the baseline `textFileFilter` is built from a Go map,
 //! whose iteration order is randomized. [`text_file_filter`] uses the same
 //! extension set in sorted order; the differential oracle pins the Go global
 //! to the same order.
 
+mod execution;
 mod punctuation;
 mod snowball;
 mod stop_words;
+
+pub use execution::CodyContextExecutionJob;
 
 use std::sync::{Arc, OnceLock};
 
@@ -37,7 +39,7 @@ use crate::search_job::JobError;
 pub const DEFAULT_CODE_RESULTS_COUNT: i32 = 12;
 /// `DefaultTextResultsCount`.
 pub const DEFAULT_TEXT_RESULTS_COUNT: i32 = 3;
-/// `SymbolResultsCount` (only used by the unported `Run`).
+/// `SymbolResultsCount` (the symbol sub-search limit, capped by `codeCount`).
 pub const SYMBOL_RESULTS_COUNT: i32 = 3;
 /// `maxKeywords`.
 pub const MAX_KEYWORDS: usize = 10;
