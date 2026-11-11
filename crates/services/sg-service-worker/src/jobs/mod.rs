@@ -70,6 +70,7 @@ pub mod codeintel_autoindexing_jobselector;
 pub mod codeintel_autoindexing_package_inference;
 pub mod codeintel_autoindexing_path_patterns;
 pub mod codeintel_autoindexing_scheduler;
+pub mod codeintel_commitgraph_updater;
 pub mod codeintel_dependency_jobs;
 pub mod codeintel_metrics_reporter;
 pub mod codeintel_package_filter_applicator;
@@ -273,6 +274,9 @@ pub fn all_jobs() -> Vec<(&'static str, Arc<dyn Job>)> {
                 "codeintel-autoindexing-scheduler" => {
                     Arc::new(codeintel_autoindexing_scheduler::AutoindexingScheduler::new())
                 }
+                "codeintel-commitgraph-updater" => Arc::new(
+                    codeintel_commitgraph_updater::CodeIntelCommitGraphUpdater::new(),
+                ),
                 "codeintel-ranking-file-reference-counter" => Arc::new(
                     codeintel_ranking_file_reference_counter::RankingFileReferenceCounter::new(),
                 ),

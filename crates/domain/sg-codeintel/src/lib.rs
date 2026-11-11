@@ -7,6 +7,7 @@
 //! worker job construct the same upload store from the same environment
 //! variables, so the loader lives here instead of in either service.
 
+pub mod commitgraph;
 pub mod glob;
 pub mod lsifuploadstore;
 pub mod packagefilters;
