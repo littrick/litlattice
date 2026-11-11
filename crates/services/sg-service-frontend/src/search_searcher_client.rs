@@ -26,10 +26,12 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use sg_proto::searcher as pb;
+use sg_zoekt::cached::Clock;
 use tonic::transport::Channel;
 
 pub use sg_service_searcher::protocol;
 
+use crate::search_env::{GrpcChannelSource, GrpcConnectionCache, SearcherGrpcConnectionCache};
 use crate::search_stream::convert;
 
 /// Message used when the searcher backend has not been wired yet.
@@ -258,6 +260,43 @@ impl SearcherConnector for ChannelConnector {
     }
 }
 
+/// `searcher.Search`'s cache key: the baseline parses the endpoint URL and
+/// calls `connectionCache.GetConnection(parsed.Host)`, so the cache is keyed
+/// by `host:port` and an explicit scheme is not part of the key.
+pub fn connection_key(endpoint: &str) -> String {
+    match endpoint.split_once("://") {
+        Some((_, host)) => host.to_owned(),
+        None => endpoint.to_owned(),
+    }
+}
+
+/// Production connector: fetch the lazy channel from the shared
+/// [`SearcherGrpcConnectionCache`] (the baseline `grpc.ClientConn` cache).
+///
+/// Differential tests inject a counting [`GrpcChannelSource`] here to observe
+/// cache misses (channel creations).
+pub struct CachedSearcherConnector {
+    source: Arc<dyn GrpcChannelSource>,
+}
+
+impl CachedSearcherConnector {
+    pub fn new(source: Arc<dyn GrpcChannelSource>) -> Self {
+        Self { source }
+    }
+}
+
+impl SearcherConnector for CachedSearcherConnector {
+    fn connect(
+        &self,
+        endpoint: &str,
+    ) -> Result<pb::searcher_service_client::SearcherServiceClient<Channel>, SearcherError> {
+        let channel = self.source.channel(&connection_key(endpoint))?;
+        Ok(pb::searcher_service_client::SearcherServiceClient::new(
+            channel,
+        ))
+    }
+}
+
 /// Retry policy attached to every `Search` call (`retry_grpc.go` +
 /// `defaults.RetryPolicy`): `Unavailable`/`ResourceExhausted` retried before
 /// the first streamed message, bounded attempts and exponential backoff.
@@ -360,11 +399,20 @@ impl fmt::Debug for GrpcSearcherClient {
 
 impl GrpcSearcherClient {
     pub fn new(endpoints: Vec<String>) -> Self {
+        // A standalone client owns its cache; `search_runtime::assemble`
+        // injects the process-wide shared instance via `with_connection_cache`.
+        let cache = Arc::new(SearcherGrpcConnectionCache::new());
         Self {
             endpoints,
-            connector: Arc::new(ChannelConnector),
+            connector: Arc::new(CachedSearcherConnector::new(cache)),
             retry: RetryConfig::from_env(),
         }
+    }
+
+    /// Inject the shared connection cache (`RuntimeClients.SearcherGRPCConnectionCache`).
+    pub fn with_connection_cache<C: Clock>(mut self, cache: Arc<GrpcConnectionCache<C>>) -> Self {
+        self.connector = Arc::new(CachedSearcherConnector::new(cache));
+        self
     }
 
     /// Inject a test connector (for in-process fake gRPC servers).
