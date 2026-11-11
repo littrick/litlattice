@@ -4063,11 +4063,14 @@ name = "sg-extsvc"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "base64 0.22.1",
  "regex",
  "serde",
  "serde_json",
  "sg-config",
+ "sha2 0.10.9",
  "thiserror 1.0.69",
+ "time",
  "tokio",
  "tracing",
  "url",
