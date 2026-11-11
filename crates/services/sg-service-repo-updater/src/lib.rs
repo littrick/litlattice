@@ -61,6 +61,47 @@ impl sg_extsvc::HttpGetter for HttpClientGetter {
     }
 }
 
+/// `httpcli.Doer` adapter for the code-host clients (`GITHUB`). The GitHub
+/// source only issues `GET` and `POST` requests.
+struct HttpClientDoer(sg_http::HttpClient);
+
+#[async_trait]
+impl sg_extsvc::HttpDoer for HttpClientDoer {
+    async fn do_request(
+        &self,
+        request: sg_extsvc::HttpRequest,
+    ) -> Result<sg_extsvc::HttpResponse, String> {
+        let response = match request.method.as_str() {
+            "GET" => {
+                self.0
+                    .get_with_headers(&request.url, &request.headers)
+                    .await?
+            }
+            "POST" => {
+                self.0
+                    .post(&request.url, &request.headers, request.body)
+                    .await?
+            }
+            other => {
+                return Err(format!(
+                    "unsupported HTTP method {other:?} for the GitHub client"
+                ))
+            }
+        };
+        let mut headers = Vec::new();
+        for (name, values) in response.headers {
+            for value in values {
+                headers.push((name.clone(), value));
+            }
+        }
+        Ok(sg_extsvc::HttpResponse {
+            status: response.status,
+            headers,
+            body: response.body,
+        })
+    }
+}
+
 pub fn service_name() -> &'static str {
     "repo-updater"
 }
@@ -203,11 +244,18 @@ impl Service for RepoUpdaterService {
         ));
 
         // `repos.NewSyncer` + `repos.NewSourcer`. `OTHER` fetches src-expose
-        // listings over HTTP; code-host kinds are not implemented yet. The
-        // factory decrypts `external_services.config` with the keyring.
+        // listings over HTTP; `GITHUB` uses the v3/v4 clients through the
+        // same transport. The factory decrypts `external_services.config`
+        // with the keyring.
         let http: Arc<dyn sg_extsvc::HttpGetter> =
             Arc::new(HttpClientGetter(sg_http::HttpClient::new()));
-        let source_factory = Arc::new(ExtsvcSourceFactory::new(Some(http), Arc::clone(&keyring)));
+        let doer: Arc<dyn sg_extsvc::HttpDoer> =
+            Arc::new(HttpClientDoer(sg_http::HttpClient::new()));
+        let source_factory = Arc::new(ExtsvcSourceFactory::new(
+            Some(http),
+            Some(doer),
+            Arc::clone(&keyring),
+        ));
         // The relay below subscribes before any sync runs, so no diff is
         // dropped. The buffer only matters when the relay lags.
         let (diff_tx, _) = tokio::sync::broadcast::channel(64);

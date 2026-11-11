@@ -81,17 +81,29 @@ pub trait SourceFactory: Send + Sync {
     async fn source(&self, service: &ExternalService) -> Result<Box<dyn Source>, String>;
 }
 
-/// `repos.NewSource` for the kinds `sg-extsvc` implements (`OTHER`).
+/// `repos.NewSource` for the kinds `sg-extsvc` implements (`OTHER`,
+/// `GITHUB`).
 pub struct ExtsvcSourceFactory {
     http: Option<Arc<dyn HttpGetter>>,
+    /// The code-host transport (`httpcli.Doer`). Production passes an
+    /// `sg-http::HttpClient` adapter; tests inject fixed responses.
+    doer: Option<Arc<dyn sg_extsvc::HttpDoer>>,
     /// `database.ExternalServices.getEncryptionKey()`: the ring is read on
     /// every source construction, so a rebuilt ring applies immediately.
     keyring: Arc<Keyring>,
 }
 
 impl ExtsvcSourceFactory {
-    pub fn new(http: Option<Arc<dyn HttpGetter>>, keyring: Arc<Keyring>) -> Self {
-        Self { http, keyring }
+    pub fn new(
+        http: Option<Arc<dyn HttpGetter>>,
+        doer: Option<Arc<dyn sg_extsvc::HttpDoer>>,
+        keyring: Arc<Keyring>,
+    ) -> Self {
+        Self {
+            http,
+            doer,
+            keyring,
+        }
     }
 }
 
@@ -117,7 +129,7 @@ impl SourceFactory for ExtsvcSourceFactory {
             encryption_key_id: service.encryption_key_id.clone(),
             unrestricted: service.unrestricted,
         };
-        sg_extsvc::new_source(source_service, self.http.clone())
+        sg_extsvc::new_source(source_service, self.http.clone(), self.doer.clone())
     }
 }
 
@@ -317,7 +329,7 @@ impl Syncer {
     ) -> Result<(), String> {
         let src = self.sourcer.source(svc).await?;
 
-        if let Err(err) = src.check_connection() {
+        if let Err(err) = src.check_connection().await {
             tracing::warn!(
                 error = %err,
                 "connection check failed. syncing repositories might still succeed."

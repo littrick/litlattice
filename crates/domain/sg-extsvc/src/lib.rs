@@ -12,7 +12,10 @@
 //! configuration before calling [`new_source`], like `svc.Config.Decrypt(ctx)`
 //! in the baseline.
 
+pub mod auth;
 pub mod exclude;
+pub mod github;
+pub mod github_source;
 pub mod other;
 pub mod ratelimit;
 pub mod reposource;
@@ -22,6 +25,8 @@ use std::collections::BTreeMap;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
+/// `extsvc.KindGitHub`.
+pub const KIND_GITHUB: &str = "GITHUB";
 /// `extsvc.KindOther`.
 pub const KIND_OTHER: &str = "OTHER";
 /// `extsvc.TypeOther` (lowercase, stored in `repo.external_service_type`).
@@ -249,14 +254,41 @@ pub trait HttpGetter: Send + Sync {
     async fn get(&self, url: &str) -> Result<Vec<u8>, String>;
 }
 
+/// An outbound HTTP request once the client has built it. The GitHub client
+/// only uses `GET` and `POST`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HttpRequest {
+    pub method: String,
+    pub url: String,
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+}
+
+/// An HTTP response with the status, header values in wire order and body.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HttpResponse {
+    pub status: u16,
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+}
+
+/// `httpcli.Doer`: the injectable transport seam. Production uses
+/// `sg-http::HttpClient`; tests and the differential harness inject fixed
+/// responses.
+#[async_trait]
+pub trait HttpDoer: Send + Sync {
+    async fn do_request(&self, request: HttpRequest) -> Result<HttpResponse, String>;
+}
+
 /// `repos.Source`.
 #[async_trait]
 pub trait Source: Send + Sync {
     /// `Source.ListRepos`. The baseline streams over a channel; this slice
-    /// materialises the results because the `OTHER` source is config-bounded.
+    /// materialises the results because the sources are config-bounded.
     async fn list_repos(&self) -> Vec<SourceResult>;
-    /// `Source.CheckConnection`; `OTHER` always succeeds.
-    fn check_connection(&self) -> Result<(), String> {
+    /// `Source.CheckConnection`; sources without a code-host API succeed
+    /// without a request.
+    async fn check_connection(&self) -> Result<(), String> {
         Ok(())
     }
     /// `Source.ExternalServices`.
@@ -267,9 +299,18 @@ pub trait Source: Send + Sync {
 pub fn new_source(
     service: SourceService,
     http: Option<std::sync::Arc<dyn HttpGetter>>,
+    doer: Option<std::sync::Arc<dyn HttpDoer>>,
 ) -> Result<Box<dyn Source>, String> {
     if service.kind.eq_ignore_ascii_case(KIND_OTHER) {
         Ok(Box::new(other::OtherSource::new(service, http)?))
+    } else if service.kind.eq_ignore_ascii_case(KIND_GITHUB) {
+        let doer = doer.ok_or_else(|| {
+            format!(
+                "cannot create source for kind {:?}: no HTTP transport configured",
+                service.kind
+            )
+        })?;
+        Ok(Box::new(github_source::GitHubSource::new(service, doer)?))
     } else {
         Err(format!("cannot create source for kind {:?}", service.kind))
     }
