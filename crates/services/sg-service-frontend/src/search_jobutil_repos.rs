@@ -721,6 +721,7 @@ mod tests {
             zoekt: streamer,
             max_repos: None,
             searcher: None,
+            commit: None,
         }
     }
 

@@ -29,6 +29,7 @@ use std::time::Duration;
 
 use regex::Regex;
 
+use sg_proto::gitserver as pb;
 use sg_search_query::basic::{plan_to_q, q_string, q_string_value, Basic, Plan};
 use sg_search_query::fields::{FIELD_FILE, FIELD_REPO, FIELD_SELECT};
 use sg_search_query::labels::Labels;
@@ -37,11 +38,11 @@ use sg_search_query::parser::SearchType;
 use sg_search_query::predicate::parse_as_predicate;
 use sg_search_query::validate::YesNoOnly;
 use sg_zoekt::global_query::{default_global_query_scope, GlobalZoektQuery};
-use sg_zoekt::indexed_repo_revs::IndexedRepoRevs;
+use sg_zoekt::indexed_repo_revs::{IndexedRepoRevs, RepositoryRevisions};
 use sg_zoekt::languages::lang_to_file_regexp;
 use sg_zoekt::query::{self as zoekt_query, IndexedRequestType};
 
-use crate::search_client::{Features, Protocol};
+use crate::search_client::{Features, Protocol, SearchMode};
 use crate::search_contexts::{parse_repository_revisions, ParsedRepoFilter, RepoVisibility};
 use crate::search_job::{
     GlobalTextSearchJob, JobContext, JobError, RepoSubsetTextSearchJob, RuntimeClients, SearchJob,
@@ -54,7 +55,8 @@ use crate::search_jobutil_filters::{
     patterns_in_tree, ContainsPatternError, ContainsPatternStage, PatternNode as FilterPatternNode,
 };
 use crate::search_jobutil_job_builders as jb;
-use crate::search_stream::progress::SearchEvent;
+use crate::search_stream::convert::Match;
+use crate::search_stream::progress::{RepoStatusMap, SearchEvent, Stats};
 use crate::search_stream::zoekt_search::{SelectPath, ZoektParameters};
 
 // ---------------------------------------------------------------------------
@@ -401,6 +403,9 @@ enum NodeKind {
         query: String,
         original_query: String,
         pattern_type: &'static str,
+        /// `search.Inputs.SearchMode`; `Precise` for trees produced by
+        /// `new_plan_job` (construction does not model the runtime mode).
+        search_mode: SearchMode,
     },
     SearcherText,
     SearcherSymbol {
@@ -408,7 +413,12 @@ enum NodeKind {
         limit: i64,
     },
     Commit {
+        /// `gitprotocol.Node.String()`, rendered in `Attributes`.
         query: String,
+        /// Structured gitserver query executed by `search_commit_job`.
+        git_query: Box<pb::QueryNode>,
+        /// `SearchJob.Repos`; empty until the repo pager is ported.
+        repos: Vec<RepositoryRevisions>,
         diff: bool,
         limit: i64,
     },
@@ -476,6 +486,37 @@ enum NodeKind {
         repo_opts: TreeRepoOptions,
         repo_name_patterns: Vec<String>,
     },
+    /// Fixed-event leaf used only by the execution differential harness.
+    StaticEvents {
+        events: Vec<StaticEvent>,
+        error: Option<comb::JobFailure>,
+    },
+}
+
+/// One fixed event emitted by a [`NodeKind::StaticEvents`] leaf.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StaticEvent {
+    pub results: Vec<Match>,
+    pub is_limit_hit: bool,
+    /// `(repo id, RepoStatus bits)` pairs.
+    pub status: Vec<(i32, u8)>,
+}
+
+impl StaticEvent {
+    fn to_search_event(&self) -> SearchEvent {
+        let mut status = RepoStatusMap::default();
+        for (id, bits) in &self.status {
+            status.update(*id, *bits);
+        }
+        SearchEvent {
+            results: self.results.clone(),
+            stats: Stats {
+                is_limit_hit: self.is_limit_hit,
+                status,
+                ..Stats::default()
+            },
+        }
+    }
 }
 
 impl JobNode {
@@ -530,6 +571,7 @@ impl JobNode {
             NodeKind::RepoPager { .. } => "RepoPagerJob",
             NodeKind::ReposPartial => "PartialReposJob",
             NodeKind::RepoSearch { .. } => "RepoSearchJob",
+            NodeKind::StaticEvents { .. } => "StaticEventsJob",
         }
     }
 
@@ -543,7 +585,8 @@ impl JobNode {
             | NodeKind::SelectOwners
             | NodeKind::Sanitize
             | NodeKind::SubRepoPerms
-            | NodeKind::ReposPartial => Vec::new(),
+            | NodeKind::ReposPartial
+            | NodeKind::StaticEvents { .. } => Vec::new(),
             NodeKind::Sequential { ensure_unique } => {
                 vec![("ensureUnique".to_owned(), ensure_unique.to_string())]
             }
@@ -553,6 +596,7 @@ impl JobNode {
                 query,
                 original_query,
                 pattern_type,
+                ..
             } => vec![
                 ("query".to_owned(), query.clone()),
                 ("originalQuery".to_owned(), original_query.clone()),
@@ -566,7 +610,9 @@ impl JobNode {
                 res.push(("limit".to_owned(), limit.to_string()));
                 res
             }
-            NodeKind::Commit { query, diff, limit } => vec![
+            NodeKind::Commit {
+                query, diff, limit, ..
+            } => vec![
                 ("query".to_owned(), query.clone()),
                 ("diff".to_owned(), diff.to_string()),
                 ("limit".to_owned(), limit.to_string()),
@@ -668,6 +714,26 @@ impl JobNode {
     }
 }
 
+impl JobNode {
+    /// Runs the tree and exposes the baseline `(alert, error)` pair.
+    ///
+    /// [`SearchJob::run`] cannot carry an alert (the ported interface returns
+    /// only `Result<(), JobError>`), so it delegates here and drops the alert;
+    /// the execution differential harness uses this method to compare alerts.
+    pub fn run_with_alert(
+        &mut self,
+        ctx: &JobContext,
+        clients: &RuntimeClients<'_>,
+        stream: &mut dyn FnMut(SearchEvent),
+    ) -> (Option<comb::Alert>, Option<comb::JobFailure>) {
+        let run_ctx = comb::RunContext::new(ctx.deadline);
+        match self.to_combinator() {
+            Ok(mut job) => job.run(&run_ctx, clients, stream),
+            Err(err) => (None, Some(comb::JobFailure::Message(err.0))),
+        }
+    }
+}
+
 impl SearchJob for JobNode {
     fn run(
         &mut self,
@@ -675,9 +741,7 @@ impl SearchJob for JobNode {
         clients: &RuntimeClients<'_>,
         stream: &mut dyn FnMut(SearchEvent),
     ) -> Result<(), JobError> {
-        let run_ctx = comb::RunContext::new(ctx.deadline);
-        let mut job = self.to_combinator()?;
-        match job.run(&run_ctx, clients, stream).1 {
+        match self.run_with_alert(ctx, clients, stream).1 {
             None => Ok(()),
             Some(failure) => Err(JobError(failure.to_string())),
         }
@@ -782,23 +846,122 @@ impl comb::CombinatorJob for TreeLeafJob {
     }
 }
 
-/// `searchalert.Observer` stand-in: preserves the child's error. The
-/// baseline observer's DB-backed timeout/smart-search alerts are not ported
-/// (see the overview's errata); `Observers` therefore never attaches an alert.
-#[derive(Debug, Default)]
-struct ErrorPreservingObserver {
+/// `searchalert.Observer` subset reachable from the tree (`observer.go:28-45,
+/// 177-219`): context errors are ignored, errors that `errorToAlert` cannot
+/// convert are accumulated, `Done` adds the structural-search hint and drops
+/// residual errors once results were seen. DB/repo-resolution alert branches
+/// are not ported (no DB seam here).
+struct TreeAlertObserver {
+    inputs: comb::AlertInputs,
+    has_results: bool,
+    alert: Option<comb::Alert>,
     error: Option<comb::JobFailure>,
 }
 
-impl comb::AlertObserver for ErrorPreservingObserver {
-    fn set_has_results(&mut self, _has_results: bool) {}
+impl TreeAlertObserver {
+    fn new(inputs: comb::AlertInputs) -> Self {
+        Self {
+            inputs,
+            has_results: false,
+            alert: None,
+            error: None,
+        }
+    }
 
-    fn observe_error(&mut self, _ctx: &comb::RunContext, err: &comb::JobFailure) {
-        self.error = Some(err.clone());
+    fn append_error(&mut self, error: comb::JobFailure) {
+        self.error = Some(match self.error.take() {
+            None => error,
+            Some(comb::JobFailure::Multi(mut errors)) => {
+                errors.push(error);
+                comb::JobFailure::Multi(errors)
+            }
+            Some(existing) => comb::JobFailure::Multi(vec![existing, error]),
+        });
+    }
+}
+
+impl comb::AlertObserver for TreeAlertObserver {
+    fn set_has_results(&mut self, has_results: bool) {
+        self.has_results = has_results;
+    }
+
+    fn observe_error(&mut self, ctx: &comb::RunContext, err: &comb::JobFailure) {
+        // `isContextError`: a canceled/expired context wins over the error's
+        // identity; such errors are reported through progress stats instead.
+        if ctx.err().is_some() || err.is_canceled() || err.is_deadline_exceeded() {
+            return;
+        }
+        for part in err.parts() {
+            if let comb::JobFailure::Message(message) = part {
+                self.append_error(comb::JobFailure::Message(message.clone()));
+            }
+        }
     }
 
     fn done(&mut self) -> (Option<comb::Alert>, Option<comb::JobFailure>) {
-        (None, self.error.take())
+        if !self.has_results
+            && self.inputs.pattern_type != SearchType::Structural
+            && comb::has_match_hole(&self.inputs.original_query)
+        {
+            let structural = comb::alert_for_structural_search_not_set(&self.inputs.original_query);
+            if self
+                .alert
+                .as_ref()
+                .is_none_or(|alert| structural.priority > alert.priority)
+            {
+                self.alert = Some(structural);
+            }
+        }
+        if self.has_results && self.error.is_some() {
+            return (self.alert.take(), None);
+        }
+        (self.alert.take(), self.error.take())
+    }
+}
+
+/// `NodeKind::Commit` execution: delegates to [`crate::search_commit_job`]
+/// when the injected runtime clients include commit seams.
+struct CommitLeafJob {
+    name: &'static str,
+    query: pb::QueryNode,
+    repos: Vec<RepositoryRevisions>,
+    diff: bool,
+    limit: i64,
+}
+
+impl comb::CombinatorJob for CommitLeafJob {
+    fn run(
+        &mut self,
+        ctx: &comb::RunContext,
+        clients: &RuntimeClients<'_>,
+        stream: comb::Sender<'_>,
+    ) -> (Option<comb::Alert>, Option<comb::JobFailure>) {
+        let Some(commit_clients) = clients.commit else {
+            return (
+                None,
+                Some(comb::JobFailure::Message(format!(
+                    "{} execution is not ported (M9.8if)",
+                    self.name
+                ))),
+            );
+        };
+        let mut job = crate::search_commit_job::SearchJob {
+            query: self.query.clone(),
+            repos: self.repos.clone(),
+            diff: self.diff,
+            limit: self.limit,
+            include_modified_files: false,
+            concurrency: 1,
+            code_monitor_search_wrapper: None,
+        };
+        match job.run(&ctx.as_job_context(), commit_clients, stream) {
+            Ok(()) => (None, None),
+            Err(error) => (None, Some(comb::JobFailure::Message(error.to_string()))),
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        self.name
     }
 }
 
@@ -830,19 +993,47 @@ impl JobNode {
                 query,
                 original_query,
                 pattern_type,
+                search_mode,
             } => {
                 let inputs = comb::AlertInputs {
                     query: query.clone(),
                     original_query: original_query.clone(),
                     pattern_type: alert_pattern_type(pattern_type),
+                    search_mode: *search_mode,
                     ..comb::AlertInputs::default()
                 };
+                let observer_inputs = inputs.clone();
                 comb::new_alert_job(
                     inputs,
                     only_child(children),
-                    Box::new(|| Box::new(ErrorPreservingObserver::default())),
+                    Box::new(move || Box::new(TreeAlertObserver::new(observer_inputs.clone()))),
                 )
             }
+            // Select over the tree child; keeps the child's alert/error pair
+            // (the `SearchJob`-based `SelectJob` has no alert slot).
+            NodeKind::Select { select } => {
+                Box::new(crate::search_jobutil_filters::SelectCombinatorJob::new(
+                    select.clone(),
+                    only_child(children),
+                ))
+            }
+            NodeKind::Commit {
+                git_query,
+                repos,
+                diff,
+                limit,
+                ..
+            } => Box::new(CommitLeafJob {
+                name: self.name_str(),
+                query: (**git_query).clone(),
+                repos: repos.clone(),
+                diff: *diff,
+                limit: *limit,
+            }),
+            NodeKind::StaticEvents { events, error } => Box::new(comb::StaticJob::new(
+                events.iter().map(StaticEvent::to_search_event).collect(),
+                error.clone(),
+            )),
             NodeKind::ZoektRepoSubsetText {
                 repos,
                 query,
@@ -921,13 +1112,11 @@ impl JobNode {
             }
             NodeKind::SearcherText
             | NodeKind::SearcherSymbol { .. }
-            | NodeKind::Commit { .. }
             | NodeKind::Structural { .. }
             | NodeKind::ComputeExcluded { .. }
             | NodeKind::FileContains { .. }
             | NodeKind::FileHasOwners { .. }
             | NodeKind::FileHasContributors { .. }
-            | NodeKind::Select { .. }
             | NodeKind::SelectOwners
             | NodeKind::Sanitize
             | NodeKind::SubRepoPerms
@@ -1029,6 +1218,52 @@ impl JobNode {
             repo_opts,
             tree_repo_opts,
         })
+    }
+
+    /// `NewAlertJob` harness constructor: wraps `child` with the same fields
+    /// `new_alert_job` reads, including the runtime `search_mode`.
+    pub fn alert(inputs: &comb::AlertInputs, child: JobNode) -> JobNode {
+        if child.is_noop() {
+            return child;
+        }
+        JobNode::new(
+            NodeKind::Alert {
+                query: inputs.query.clone(),
+                original_query: inputs.original_query.clone(),
+                pattern_type: comb::pattern_type_str(inputs.pattern_type),
+                search_mode: inputs.search_mode,
+            },
+            vec![child],
+        )
+    }
+
+    /// `NewSelectJob` harness constructor.
+    pub fn select(path: Vec<String>, child: JobNode) -> JobNode {
+        JobNode::new(NodeKind::Select { select: path }, vec![child])
+    }
+
+    /// `commit.SearchJob` leaf harness constructor: the query tree and repos
+    /// are resolved at construction time (the repo pager is still unported in
+    /// production construction).
+    pub fn commit(
+        git_query: pb::QueryNode,
+        repos: Vec<RepositoryRevisions>,
+        diff: bool,
+        limit: i64,
+    ) -> JobNode {
+        let query = crate::search_commit_job::query_node_string(&git_query);
+        JobNode::leaf(NodeKind::Commit {
+            query,
+            git_query: Box::new(git_query),
+            repos,
+            diff,
+            limit,
+        })
+    }
+
+    /// Fixed-event leaf harness constructor.
+    pub fn static_events(events: Vec<StaticEvent>, error: Option<comb::JobFailure>) -> JobNode {
+        JobNode::leaf(NodeKind::StaticEvents { events, error })
     }
 }
 
@@ -1184,6 +1419,8 @@ fn new_alert_job(inputs: &TreeInputs, plan: &Plan, child: JobNode) -> JobNode {
             query,
             original_query: inputs.original_query.clone(),
             pattern_type: crate::search_jobutil_combinators::pattern_type_str(inputs.pattern_type),
+            // `TreeInputs` does not model the runtime `search.SearchMode`.
+            search_mode: SearchMode::Precise,
         },
         vec![child],
     )
@@ -1351,6 +1588,12 @@ pub fn new_basic_job(inputs: &TreeInputs, basic: &Basic) -> Result<JobNode, JobE
         let _ = own;
         let commit_job = JobNode::leaf(NodeKind::Commit {
             query: query_to_git_query(&original_query, diff).to_string(),
+            git_query: Box::new(crate::search_commit_job::query_to_git_query(
+                &original_query,
+                diff,
+            )),
+            // Repo pager is not ported; the leaf runs with no repos.
+            repos: Vec::new(),
             diff,
             limit: i64::from(file_match_limit),
         });

@@ -775,6 +775,7 @@ mod tests {
             zoekt: &streamer,
             max_repos: None,
             searcher: None,
+            commit: None,
         };
         let mut text = TextSearchJob {
             pattern_info: TextPatternInfo::default(),

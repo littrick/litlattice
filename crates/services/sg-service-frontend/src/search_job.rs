@@ -166,6 +166,13 @@ pub struct RuntimeClients<'a> {
     ///
     /// Additive: the zoekt jobs in this module never read it.
     pub searcher: Option<&'a crate::search_searcher_client::SearcherClients<'a>>,
+    /// Injected commit-search collaborators (`gitserver.Search` and the
+    /// username-expansion DB reads). `None` means the commit/diff leaf is not
+    /// configured; `JobNode::run` then returns the explicit per-kind
+    /// not-ported error instead of panicking.
+    ///
+    /// Additive: the jobs in this module never read it.
+    pub commit: Option<&'a crate::search_commit_job::CommitRuntimeClients<'a>>,
 }
 
 impl RuntimeClients<'_> {
@@ -552,6 +559,7 @@ mod tests {
             zoekt,
             max_repos: None,
             searcher: None,
+            commit: None,
         }
     }
 

@@ -34,9 +34,10 @@
 use std::collections::{BTreeMap, HashSet};
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+use regex::Regex;
 use sg_search_query::fields::FIELD_TIMEOUT;
 use sg_search_query::parser::SearchType;
 use sg_search_query::pipeline::{init, run};
@@ -171,6 +172,35 @@ pub fn alert_for_timeout(
                 ..Alert::default()
             }
         }
+    }
+}
+
+/// Go `comby.MatchHoleRegexp` (`internal/comby/translate.go:12-31`).
+pub fn has_match_hole(query: &str) -> bool {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    let regex = REGEX.get_or_init(|| {
+        Regex::new(r":\[(\w+)\]|:\[\[(\w+)\]\]|:\[(\w+)\.\]|:\[(\w+)\\n\]|:\[( +(\w+)?)?\]|\.\.\.")
+            .expect("match-hole regex")
+    });
+    regex.is_match(query)
+}
+
+/// `search.AlertForStructuralSearchNotSet` (`internal/search/alert.go:152-165`).
+pub fn alert_for_structural_search_not_set(query_string: &str) -> Alert {
+    Alert {
+        prometheus_type: "structural_search_not_set".to_owned(),
+        title: "No results".to_owned(),
+        description: "It looks like you're trying to run a structural search, but it is not \
+                      enabled using the patterntype keyword or UI toggle."
+            .to_owned(),
+        proposed_queries: vec![QueryDescription {
+            description: "Activate structural search".to_owned(),
+            query: query_string.to_owned(),
+            pattern_type: SearchType::Structural,
+            annotations: BTreeMap::new(),
+        }],
+        kind: String::new(),
+        priority: 0,
     }
 }
 
@@ -556,6 +586,37 @@ impl<J: SearchJob> CombinatorJob for SearchJobAdapter<J> {
 
     fn attributes(&self, verbosity: Verbosity) -> Vec<(String, String)> {
         self.job.attributes(verbosity)
+    }
+}
+
+/// A fixed-event leaf used by the execution differential harness to drive
+/// wrapper jobs (`Alert`, `Select`) without the zoekt/searcher stack.
+pub struct StaticJob {
+    events: Vec<SearchEvent>,
+    error: Option<JobFailure>,
+}
+
+impl StaticJob {
+    pub fn new(events: Vec<SearchEvent>, error: Option<JobFailure>) -> Self {
+        Self { events, error }
+    }
+}
+
+impl CombinatorJob for StaticJob {
+    fn run(
+        &mut self,
+        _ctx: &RunContext,
+        _clients: &RuntimeClients<'_>,
+        stream: Sender<'_>,
+    ) -> (Option<Alert>, Option<JobFailure>) {
+        for event in &self.events {
+            stream(event.clone());
+        }
+        (None, self.error.clone())
+    }
+
+    fn name(&self) -> &'static str {
+        "StaticEventsJob"
     }
 }
 
@@ -1392,6 +1453,7 @@ mod tests {
             zoekt: &STREAMER,
             max_repos: None,
             searcher: None,
+            commit: None,
         }
     }
 }

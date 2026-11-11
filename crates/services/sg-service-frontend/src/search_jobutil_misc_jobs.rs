@@ -1012,6 +1012,7 @@ mod tests {
             zoekt,
             max_repos: None,
             searcher: None,
+            commit: None,
         }
     }
 
