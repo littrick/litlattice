@@ -456,6 +456,12 @@ pub enum UserResolution {
     Created { user_id: i32, new_user: bool },
     /// `safeErrMsg`; the issuer returns it as the 500 body.
     Failed { safe_message: String },
+    /// A provider callback failure that the baseline surfaces *before* the
+    /// session issuer (e.g. `gitlaboauth.CallbackHandler`'s
+    /// `gologin.DefaultFailureHandler`, which answers 400 with the error
+    /// text). Such a failure logs no security event and does not delete the
+    /// `oauthState` session value.
+    FailedWithStatus { status: u16, safe_message: String },
 }
 
 #[async_trait]
@@ -724,21 +730,27 @@ pub async fn handle_callback(
     };
 
     let resolution = deps.resolver.get_or_create_user(&token).await;
-    let (user_id, new_user, safe_message) = match resolution {
+    let (user_id, new_user, failure) = match resolution {
         UserResolution::Created { user_id, new_user } => (user_id, new_user, None),
-        UserResolution::Failed { safe_message } => (0, false, Some(safe_message)),
+        UserResolution::Failed { safe_message } => (0, false, Some((500, safe_message, true))),
+        UserResolution::FailedWithStatus {
+            status,
+            safe_message,
+        } => (0, false, Some((status, safe_message, false))),
     };
-    if let Some(safe_message) = safe_message {
-        let mut response = error_response(500, &safe_message);
-        log_event(
-            deps,
-            request,
-            deps.resolver.failure_event_name(),
-            0,
-            request.anonymous_uid.unwrap_or_default(),
-        )
-        .await;
-        finish_and_delete_state(&mut manager, &mut response).await;
+    if let Some((status, safe_message, issuer_failure)) = failure {
+        let mut response = error_response(status, &safe_message);
+        if issuer_failure {
+            log_event(
+                deps,
+                request,
+                deps.resolver.failure_event_name(),
+                0,
+                request.anonymous_uid.unwrap_or_default(),
+            )
+            .await;
+            finish_and_delete_state(&mut manager, &mut response).await;
+        }
         return response;
     }
 
