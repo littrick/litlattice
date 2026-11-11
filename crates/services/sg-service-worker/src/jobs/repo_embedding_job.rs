@@ -27,10 +27,11 @@
 //!
 //! The production [`RepoEmbeddingJob`] assembles the worker with the
 //! `EMBEDDINGS_UPLOAD_*` object storage, the gitserver client, the PG job
-//! store and the PG ranking service. The default embeddings client factory is
-//! [`NotPortedEmbeddingsClientFactory`]: the provider clients (sourcegraph /
-//! OpenAI / Azure) are not ported, so dequeued jobs fail with an explicit
-//! not-ported error while the wiring stays real.
+//! store and the PG ranking service. [`LiveEmbeddingsClientFactory`] selects
+//! the sourcegraph / OpenAI / Azure OpenAI client from the live site
+//! configuration (see [`embeddings_provider_config`] for the baseline
+//! defaults) and injects the client through [`SgEmbeddingsClientAdapter`].
+//! [`NotPortedEmbeddingsClientFactory`] is retained only as a test double.
 //!
 //! ## Deviations
 //!
@@ -56,6 +57,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use sg_config::{LiveConfig, SiteConfiguration};
 use sg_db::OffsetDateTime;
+use sg_licensing::license_key_based_access_token;
 use sg_objectstorage::{S3Config, StorageConfig};
 use sqlx::postgres::PgPool;
 use sqlx::Row;
@@ -473,13 +475,15 @@ pub trait EmbeddingsClient: Send + Sync {
     fn get_model_identifier(&self) -> String;
 }
 
-/// `embed.NewEmbeddingsClient`: the concrete provider clients are not ported.
+/// `embed.NewEmbeddingsClient`, injectable for the differential harness.
 pub trait EmbeddingsClientFactory: Send + Sync {
     fn new_client(&self, config: &EmbeddingsJobConfig)
         -> Result<Arc<dyn EmbeddingsClient>, String>;
 }
 
-/// `embed.NewEmbeddingsClient`'s not-ported default.
+/// Explicit failure for providers the slice deliberately does not support
+/// (retained as a test double; production uses
+/// [`LiveEmbeddingsClientFactory`]).
 #[derive(Debug, Default, Clone, Copy)]
 pub struct NotPortedEmbeddingsClientFactory;
 
@@ -492,6 +496,173 @@ impl EmbeddingsClientFactory for NotPortedEmbeddingsClientFactory {
             "not ported: embeddings client for provider {:?}",
             config.provider
         ))
+    }
+}
+
+/// Adapts an `sg-embeddings` client to the io trait.
+pub struct SgEmbeddingsClientAdapter {
+    inner: Arc<dyn sg_embeddings::EmbeddingsClient>,
+}
+
+impl SgEmbeddingsClientAdapter {
+    pub fn new(inner: Arc<dyn sg_embeddings::EmbeddingsClient>) -> Self {
+        Self { inner }
+    }
+}
+
+#[async_trait]
+impl EmbeddingsClient for SgEmbeddingsClientAdapter {
+    async fn get_document_embeddings(
+        &self,
+        documents: Vec<String>,
+    ) -> Result<EmbeddingsResults, EmbeddingsClientError> {
+        self.inner
+            .get_document_embeddings(documents)
+            .await
+            .map(|results| EmbeddingsResults {
+                embeddings: results.embeddings,
+                failed: results.failed,
+                dimensions: results.dimensions,
+            })
+            .map_err(|err| match err {
+                sg_embeddings::EmbeddingsError::RateLimitExceeded(_) => {
+                    EmbeddingsClientError::RateLimitExceeded
+                }
+                other => EmbeddingsClientError::Other(other.to_string()),
+            })
+    }
+
+    fn get_dimensions(&self) -> Result<usize, String> {
+        self.inner.get_dimensions()
+    }
+
+    fn get_model_identifier(&self) -> String {
+        self.inner.get_model_identifier()
+    }
+}
+
+/// `conf.GetEmbeddingsConfig`'s provider fields (endpoint/model/dimensions/
+/// access token), with the baseline defaults. `None` mirrors the nil config
+/// (the gate itself is shared with the scheduler's port).
+pub fn embeddings_provider_config(
+    site: &SiteConfiguration,
+    force_allow: bool,
+) -> Option<sg_embeddings::ProviderConfig> {
+    // Exact nil semantics (cody, internal flag, legacy enabled, credentials).
+    crate::jobs::repo_embedding_scheduler::embeddings_config(site, force_allow)?;
+
+    let raw = site.raw();
+    let embeddings = raw.get("embeddings").filter(|value| !value.is_null());
+    let string = |key: &str| {
+        embeddings
+            .and_then(|value| value.get(key))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_owned()
+    };
+
+    let provider_name = {
+        let provider = string("provider");
+        if provider.is_empty() {
+            "sourcegraph".to_owned()
+        } else {
+            provider
+        }
+    };
+    let provider = sg_embeddings::Provider::try_from_name(&provider_name).ok()?;
+
+    // `If endpoint is not set, fall back to URL, it's the previous name`.
+    let mut endpoint = {
+        let endpoint = string("endpoint");
+        if endpoint.is_empty() {
+            string("url")
+        } else {
+            endpoint
+        }
+    };
+    let mut model = string("model");
+    let mut dimensions = embeddings
+        .and_then(|value| value.get("dimensions"))
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(0);
+
+    let access_token = match provider {
+        sg_embeddings::Provider::Sourcegraph => {
+            let token = string("accessToken");
+            if token.is_empty() {
+                // `getSourcegraphProviderAccessToken`: the license-derived
+                // token when none is configured.
+                let license_key = site.license_key();
+                if license_key.is_empty() {
+                    return None;
+                }
+                license_key_based_access_token(&license_key)
+            } else {
+                token
+            }
+        }
+        sg_embeddings::Provider::OpenAI | sg_embeddings::Provider::AzureOpenAI => {
+            string("accessToken")
+        }
+    };
+
+    match provider {
+        sg_embeddings::Provider::Sourcegraph => {
+            if endpoint.is_empty() {
+                endpoint = "https://cody-gateway.sourcegraph.com/v1/embeddings".to_owned();
+            }
+            if model.is_empty() {
+                model = "openai/text-embedding-ada-002".to_owned();
+            }
+            model = model.to_lowercase();
+            if dimensions <= 0 && model == "openai/text-embedding-ada-002" {
+                dimensions = 1536;
+            }
+        }
+        sg_embeddings::Provider::OpenAI => {
+            if endpoint.is_empty() {
+                endpoint = "https://api.openai.com/v1/embeddings".to_owned();
+            }
+            if model.is_empty() {
+                model = "text-embedding-ada-002".to_owned();
+            }
+            model = model.to_lowercase();
+            if dimensions <= 0 && model == "text-embedding-ada-002" {
+                dimensions = 1536;
+            }
+        }
+        sg_embeddings::Provider::AzureOpenAI => {
+            model = model.to_lowercase();
+        }
+    }
+    Some(sg_embeddings::ProviderConfig {
+        provider,
+        access_token,
+        model,
+        endpoint,
+        dimensions,
+    })
+}
+
+/// The production factory: recomputes the provider config from the live site
+/// configuration and builds the matching `sg-embeddings` client.
+pub struct LiveEmbeddingsClientFactory {
+    pub live_config: Arc<LiveConfig>,
+    pub transport: Arc<dyn sg_embeddings::HttpTransport>,
+}
+
+impl EmbeddingsClientFactory for LiveEmbeddingsClientFactory {
+    fn new_client(
+        &self,
+        _config: &EmbeddingsJobConfig,
+    ) -> Result<Arc<dyn EmbeddingsClient>, String> {
+        let site = self.live_config.current().site.clone();
+        let provider_config = embeddings_provider_config(&site, force_allow_embeddings())
+            .ok_or_else(|| {
+                "embeddings are not configured (conf.GetEmbeddingsConfig returned nil)".to_owned()
+            })?;
+        let inner = sg_embeddings::new_client(&provider_config, Arc::clone(&self.transport))?;
+        Ok(Arc::new(SgEmbeddingsClientAdapter::new(inner)))
     }
 }
 
@@ -2111,7 +2282,10 @@ impl Job for RepoEmbeddingJob {
             git,
             context_service: Arc::new(DefaultContextService),
             ranking: Arc::new(PgRankingService::new(deps.frontend.clone())),
-            client_factory: Arc::new(NotPortedEmbeddingsClientFactory),
+            client_factory: Arc::new(LiveEmbeddingsClientFactory {
+                live_config: Arc::clone(&deps.live_config),
+                transport: Arc::new(sg_embeddings::ReqwestTransport::new()),
+            }),
             live_config: Arc::clone(&deps.live_config),
             batch_size: embeddings_batch_size()?,
         };
@@ -2265,5 +2439,148 @@ mod tests {
         assert_eq!(*name, "repo-embedding-job");
         assert_eq!(job.configs().len(), 1);
         assert_eq!(job.description(), "");
+    }
+
+    fn parse_site(json: &str) -> SiteConfiguration {
+        SiteConfiguration::parse(json).expect("valid site config")
+    }
+
+    #[test]
+    fn provider_config_matches_get_embeddings_config_defaults() {
+        // sourcegraph: license-derived token, default endpoint/model/dims.
+        let site = parse_site(r#"{"cody.enabled": true, "licenseKey": "key"}"#);
+        let config = embeddings_provider_config(&site, true).expect("configured");
+        assert_eq!(config.provider, sg_embeddings::Provider::Sourcegraph);
+        assert_eq!(config.access_token, license_key_based_access_token("key"));
+        assert_eq!(
+            config.endpoint,
+            "https://cody-gateway.sourcegraph.com/v1/embeddings"
+        );
+        assert_eq!(config.model, "openai/text-embedding-ada-002");
+        assert_eq!(config.dimensions, 1536);
+
+        // An explicit token wins; model is lowercased.
+        let site = parse_site(
+            r#"{"cody.enabled": true, "embeddings": {"provider": "sourcegraph", "accessToken": "TOK", "model": "OpenAI/Text-Embedding-Ada-002"}}"#,
+        );
+        let config = embeddings_provider_config(&site, true).expect("configured");
+        assert_eq!(config.access_token, "TOK");
+        assert_eq!(config.model, "openai/text-embedding-ada-002");
+        assert_eq!(config.dimensions, 1536);
+
+        // `url` is the deprecated name of `endpoint`.
+        let site = parse_site(
+            r#"{"cody.enabled": true, "embeddings": {"provider": "sourcegraph", "accessToken": "t", "url": "http://u/v1/embeddings"}}"#,
+        );
+        assert_eq!(
+            embeddings_provider_config(&site, true)
+                .expect("configured")
+                .endpoint,
+            "http://u/v1/embeddings"
+        );
+
+        // openai defaults.
+        let site = parse_site(
+            r#"{"cody.enabled": true, "embeddings": {"provider": "openai", "accessToken": "t"}}"#,
+        );
+        let config = embeddings_provider_config(&site, true).expect("configured");
+        assert_eq!(config.provider, sg_embeddings::Provider::OpenAI);
+        assert_eq!(config.endpoint, "https://api.openai.com/v1/embeddings");
+        assert_eq!(config.model, "text-embedding-ada-002");
+        assert_eq!(config.dimensions, 1536);
+
+        // azure-openai keeps the configured endpoint/dimensions and lowercases
+        // the model; a token is optional at the config layer.
+        let site = parse_site(
+            r#"{"cody.enabled": true, "embeddings": {"provider": "azure-openai", "endpoint": "https://x/", "model": "MY-DEPLOY", "dimensions": 8}}"#,
+        );
+        let config = embeddings_provider_config(&site, true).expect("configured");
+        assert_eq!(config.provider, sg_embeddings::Provider::AzureOpenAI);
+        assert_eq!(config.endpoint, "https://x/");
+        assert_eq!(config.model, "my-deploy");
+        assert_eq!(config.dimensions, 8);
+        assert_eq!(config.access_token, "");
+
+        // Unknown providers and a failed gate are nil.
+        let site = parse_site(
+            r#"{"cody.enabled": true, "embeddings": {"provider": "bogus", "accessToken": "t"}}"#,
+        );
+        assert_eq!(embeddings_provider_config(&site, true), None);
+        let site = parse_site(r#"{"cody.enabled": true, "licenseKey": "key"}"#);
+        assert_eq!(embeddings_provider_config(&site, false), None);
+    }
+
+    struct FakeSgClient {
+        error: Option<sg_embeddings::EmbeddingsError>,
+    }
+
+    #[async_trait]
+    impl sg_embeddings::EmbeddingsClient for FakeSgClient {
+        async fn get_query_embedding(
+            &self,
+            _query: String,
+        ) -> Result<sg_embeddings::EmbeddingsResults, sg_embeddings::EmbeddingsError> {
+            unreachable!()
+        }
+
+        async fn get_document_embeddings(
+            &self,
+            _documents: Vec<String>,
+        ) -> Result<sg_embeddings::EmbeddingsResults, sg_embeddings::EmbeddingsError> {
+            match &self.error {
+                Some(error) => Err(error.clone()),
+                None => Ok(sg_embeddings::EmbeddingsResults {
+                    embeddings: vec![1.0, 2.0],
+                    failed: vec![1],
+                    dimensions: 2,
+                }),
+            }
+        }
+
+        fn get_dimensions(&self) -> Result<usize, String> {
+            Ok(2)
+        }
+
+        fn get_model_identifier(&self) -> String {
+            "sourcegraph/model".to_owned()
+        }
+    }
+
+    #[tokio::test]
+    async fn adapter_maps_results_and_rate_limits() {
+        let adapter = SgEmbeddingsClientAdapter::new(Arc::new(FakeSgClient { error: None }));
+        let results = adapter
+            .get_document_embeddings(vec!["a".to_owned()])
+            .await
+            .expect("ok");
+        assert_eq!(results.embeddings, vec![1.0, 2.0]);
+        assert_eq!(results.failed, vec![1]);
+        assert_eq!(results.dimensions, 2);
+        assert_eq!(adapter.get_dimensions().unwrap(), 2);
+        assert_eq!(adapter.get_model_identifier(), "sourcegraph/model");
+
+        let rate_limited = SgEmbeddingsClientAdapter::new(Arc::new(FakeSgClient {
+            error: Some(sg_embeddings::EmbeddingsError::RateLimitExceeded(
+                sg_embeddings::RetryAfter::Seconds(3),
+            )),
+        }));
+        assert_eq!(
+            rate_limited
+                .get_document_embeddings(vec!["a".to_owned()])
+                .await
+                .unwrap_err(),
+            EmbeddingsClientError::RateLimitExceeded
+        );
+
+        let other = SgEmbeddingsClientAdapter::new(Arc::new(FakeSgClient {
+            error: Some(sg_embeddings::EmbeddingsError::Other("bomb".to_owned())),
+        }));
+        assert_eq!(
+            other
+                .get_document_embeddings(vec!["a".to_owned()])
+                .await
+                .unwrap_err(),
+            EmbeddingsClientError::Other("bomb".to_owned())
+        );
     }
 }
