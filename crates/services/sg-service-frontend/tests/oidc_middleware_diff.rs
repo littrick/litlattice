@@ -43,7 +43,8 @@ use sg_service_frontend::oauth_login::{
     OAuthSecurityEventSink, OAuthUserLookup, OAuthUserRecord, TokenExchangeRequest,
 };
 use sg_service_frontend::oauth_routes::{
-    auth_prefix_response_at, OAuthRouteConfig, OAuthRouteDeps, OAuthUserResolverRegistry,
+    auth_prefix_response_at, oidc_app_redirect_at, OAuthRouteConfig, OAuthRouteDeps,
+    OAuthUserResolverRegistry,
 };
 use sg_service_frontend::oidc_login::{
     ExternalIdentity, OidcHttpClient, OidcHttpResponse, OpenIdConnectAuthProvider, ProvisionError,
@@ -83,6 +84,15 @@ struct Case {
     provision: ProvisionJson,
     #[serde(rename = "nowUnix")]
     now_unix: i64,
+    // M9.8jw app-chain auto-redirect knobs; absent in the M9.8js corpus.
+    #[serde(rename = "appRedirect", default)]
+    app_redirect: bool,
+    #[serde(default)]
+    authenticated: bool,
+    #[serde(default)]
+    dotcom: bool,
+    #[serde(default)]
+    api: bool,
 }
 
 fn default_method() -> String {
@@ -682,7 +692,8 @@ fn build_clients(case: &Case) -> (Arc<dyn OidcHttpClient>, Arc<dyn OAuthHttpClie
 
 async fn run_case(case: &Case) -> Output {
     let site = SiteConfiguration::parse(&case.site).expect("site configuration");
-    let config = OAuthRouteConfig::from_site(&site, false);
+    // `dotcom` doubles as `conf.AuthPublic()` for the auto-redirect condition.
+    let config = OAuthRouteConfig::from_site(&site, case.dotcom);
     let now = OffsetDateTime::from_unix_timestamp(case.now_unix).expect("timestamp");
     let options = WriteOptions::new(config.secure);
 
@@ -760,7 +771,18 @@ async fn run_case(case: &Case) -> Output {
     };
 
     let request = build_request(case, cookie.as_deref());
-    let response = match auth_prefix_response_at(&request, &config, &deps, now).await {
+    let response = if case.app_redirect {
+        // M9.8jw: the App-chain automatic single-provider redirect. The API
+        // listener skips it (`!isAPIRequest`).
+        if case.api {
+            None
+        } else {
+            oidc_app_redirect_at(&request, &config, &deps, case.authenticated, now).await
+        }
+    } else {
+        auth_prefix_response_at(&request, &config, &deps, now).await
+    };
+    let response = match response {
         Some(response) => response,
         None => append_outer_vary(next_response()),
     };

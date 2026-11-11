@@ -30,9 +30,9 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::oauth_login::{
-    encode_query_sorted, go_parse_url, go_url_string, handle_login, html_escape, parse_query,
-    GoUrl, OAuthFlowDeps, OAuthFlowResponse, OAuthLoginRequest, OAuthProviderConfig, OAuthToken,
-    OAuthUserResolver, UserResolution,
+    encode_query_sorted, go_parse_url, go_parse_url_checked, go_url_string, handle_login,
+    html_escape, parse_query, GoUrl, OAuthFlowDeps, OAuthFlowResponse, OAuthLoginRequest,
+    OAuthProviderConfig, OAuthToken, OAuthUserResolver, UserResolution,
 };
 
 pub const GITLAB_SERVICE_TYPE: &str = "gitlab";
@@ -41,6 +41,7 @@ pub const GITLAB_SUCCESS_EVENT: &str = "GitLabAuthSucceeded";
 pub const GITLAB_FAILURE_EVENT: &str = "GitLabAuthFailed";
 
 const CONTENT_TYPE_HTML: &str = "text/html; charset=utf-8";
+const CONTENT_TYPE_TEXT: &str = "text/plain; charset=utf-8";
 
 // ---------------------------------------------------------------------------
 // Config parsing (`gitlaboauth/config.go`, `gitlaboauth/provider.go`).
@@ -291,8 +292,20 @@ pub async fn handle_gitlab_login(
         return response;
     }
     let redirect = format!("{}?{}", auth_url.path, auth_url.raw_query);
-    let Some(mut sso) = go_parse_url(sso_url) else {
-        return response;
+    // `url.Parse(ssoAuthURL)` failure → `gologin`'s DefaultFailureHandler:
+    // `http.Error(w, err.Error(), 400)` keeps the `stateHandler`'s session
+    // cookie/Redis write but replaces the redirect body/headers.
+    let mut sso = match go_parse_url_checked(sso_url) {
+        Ok(sso) => sso,
+        Err(error) => {
+            return OAuthFlowResponse {
+                status: 400,
+                location: String::new(),
+                content_type: CONTENT_TYPE_TEXT.to_owned(),
+                body: format!("{error}\n").into_bytes(),
+                set_cookies: response.set_cookies,
+            };
+        }
     };
     let mut pairs = parse_query(&sso.raw_query);
     pairs.push(("redirect".to_owned(), redirect));

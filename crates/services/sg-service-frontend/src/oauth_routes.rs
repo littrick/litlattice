@@ -282,6 +282,26 @@ impl OAuthRouteConfig {
         })
     }
 
+    /// The OpenID Connect middleware's per-configuration values (M9.8js).
+    pub fn oidc_config(&self) -> crate::oidc_middleware::OidcMiddlewareConfig {
+        crate::oidc_middleware::OidcMiddlewareConfig {
+            configs: self.oidc_configs.clone(),
+            external_url: self.external_url.clone(),
+            secure: self.secure,
+            configured_expiry: self.configured_expiry.clone(),
+            dotcom: self.dotcom,
+        }
+    }
+
+    /// `providers.SignInProviders(skip_soap)` reduced to provider types.
+    pub fn sign_in_types(&self, skip_soap: bool) -> &[String] {
+        if skip_soap {
+            &self.sign_in_without_soap
+        } else {
+            &self.sign_in_with_soap
+        }
+    }
+
     fn find_provider(&self, service_type: &str) -> Option<&OAuthProviderConfig> {
         self.providers
             .providers
@@ -636,13 +656,7 @@ pub async fn auth_prefix_response_at<B>(
     // prefix before the generic flow mux. When the parent wires the runtime,
     // hand those paths to it; otherwise keep the M9.8jo dispatch.
     if let Some(oidc) = &deps.oidc {
-        let oidc_config = crate::oidc_middleware::OidcMiddlewareConfig {
-            configs: config.oidc_configs.clone(),
-            external_url: config.external_url.clone(),
-            secure: config.secure,
-            configured_expiry: config.configured_expiry.clone(),
-            dotcom: config.dotcom,
-        };
+        let oidc_config = config.oidc_config();
         if let Some(flow) =
             crate::oidc_middleware::handle_oidc_auth(req, &oidc_config, oidc, now).await
         {
@@ -817,6 +831,45 @@ pub fn single_provider_redirect<B>(
     // `AccessTokenAuth` and `CookieMiddleware` run before the provider
     // middleware in the baseline (`AnonymousUID`/`featureflag` run after it).
     Some(with_outer_vary(redirect_response(req.method(), &location)))
+}
+
+/// The OpenID Connect middleware's automatic single-provider redirect
+/// (`openidconnect/middleware.go:124-141`). Returns `None` when the condition
+/// does not hold or the OIDC runtime is not wired; the parent evaluates this
+/// before SAML's automatic redirect.
+pub async fn oidc_app_redirect_at<B>(
+    req: &Request<B>,
+    config: &OAuthRouteConfig,
+    deps: &OAuthRouteDeps,
+    authenticated: bool,
+    now: OffsetDateTime,
+) -> Option<Response<BoxBody>> {
+    let oidc = deps.oidc.as_ref()?;
+    // `providers.SignInProviders(!r.URL.Query().Has("sourcegraph-operator"))`.
+    let skip_soap = !query_has(req, "sourcegraph-operator");
+    // `auth.SafeRedirectURL(r.URL.String())`.
+    let redirect = safe_redirect_url(&request_uri(req));
+    let flow = crate::oidc_middleware::app_auto_redirect(
+        req,
+        &config.oidc_config(),
+        oidc,
+        authenticated,
+        config.sign_in_types(skip_soap),
+        &redirect,
+        now,
+    )
+    .await?;
+    // `AccessTokenAuth` and `CookieMiddleware` wrap the provider middlewares.
+    Some(with_outer_vary(flow_response(flow, req.method())))
+}
+
+pub async fn oidc_app_redirect<B>(
+    req: &Request<B>,
+    config: &OAuthRouteConfig,
+    deps: &OAuthRouteDeps,
+    authenticated: bool,
+) -> Option<Response<BoxBody>> {
+    oidc_app_redirect_at(req, config, deps, authenticated, OffsetDateTime::now_utc()).await
 }
 
 /// Whether a chain rejection is `RequireAuthMiddleware`'s sign-in redirect
