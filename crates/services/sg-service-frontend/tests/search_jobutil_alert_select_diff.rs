@@ -529,10 +529,15 @@ fn result_match(spec: &ResultSpec) -> Match {
                     message: commit.message.clone(),
                     author: signature(&commit.author),
                     committer: signature(&commit.committer),
+                    parents: Vec::new(),
                 },
                 repo: minimal_repo(spec.repo.as_ref().expect("repo spec")),
                 message_preview: matched_string(&spec.message_preview),
                 diff_preview: matched_string(&spec.diff_preview),
+                refs: Vec::new(),
+                source_refs: Vec::new(),
+                diff: Vec::new(),
+                modified_files: Vec::new(),
             })
         }
         other => panic!("unknown result kind {other}"),

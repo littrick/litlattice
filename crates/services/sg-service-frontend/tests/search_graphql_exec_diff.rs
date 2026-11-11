@@ -157,6 +157,7 @@ fn commit_match() -> CommitMatch {
                 email: "bob@example.com".to_owned(),
                 date: committer_date(),
             },
+            parents: Vec::new(),
         },
         repo: repo(2, "gitlab.com/a/b"),
         message_preview: Some(MatchedString {
@@ -164,6 +165,10 @@ fn commit_match() -> CommitMatch {
             matched_ranges: vec![range(0, 0, 0, 3, 3)],
         }),
         diff_preview: None,
+        refs: Vec::new(),
+        source_refs: Vec::new(),
+        diff: Vec::new(),
+        modified_files: Vec::new(),
     }
 }
 
