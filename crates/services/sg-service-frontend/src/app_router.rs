@@ -302,7 +302,58 @@ pub async fn dispatch_route<B>(
         ),
         // `ui.Router()`: static pages, legacy redirects and the SPA shell.
         RouteName::Ui => crate::ui_assets::serve_ui(req, path, env, config, deps),
-        // Auth flows are outside this slice and still answer the mux 404.
+        // Built-in auth handlers are wired per configuration generation; an
+        // unwired process (e.g. the router differential) keeps the mux 404.
+        RouteName::SignUp => match deps.userpasswd.as_deref() {
+            Some(wiring) => crate::userpasswd::handle_sign_up(&wiring.deps, req, body).await,
+            None => app_handlers::not_found(),
+        },
+        RouteName::RequestAccess => match deps.userpasswd.as_deref() {
+            Some(wiring) => crate::userpasswd::handle_request_access(&wiring.deps, req, body).await,
+            None => app_handlers::not_found(),
+        },
+        RouteName::SiteInit => match deps.userpasswd.as_deref() {
+            Some(wiring) => crate::userpasswd::handle_site_init(&wiring.deps, req, body).await,
+            None => app_handlers::not_found(),
+        },
+        RouteName::SignIn => match deps.userpasswd.as_deref() {
+            Some(wiring) => crate::userpasswd::handle_sign_in(&wiring.deps, req, body).await,
+            None => app_handlers::not_found(),
+        },
+        RouteName::UnlockAccount => match deps.userpasswd.as_deref() {
+            Some(wiring) => {
+                crate::userpasswd::handle_unlock_account(&wiring.deps, req, body).await
+            }
+            None => app_handlers::not_found(),
+        },
+        RouteName::UnlockUserAccount => match deps.userpasswd.as_deref() {
+            Some(wiring) => {
+                crate::userpasswd::handle_unlock_user_account(&wiring.deps, req, body).await
+            }
+            None => app_handlers::not_found(),
+        },
+        RouteName::ResetPasswordInit => match deps.userpasswd.as_deref() {
+            Some(wiring) => {
+                crate::userpasswd::handle_reset_password_init(&wiring.deps, req, body).await
+            }
+            None => app_handlers::not_found(),
+        },
+        RouteName::ResetPasswordCode => match deps.userpasswd.as_deref() {
+            Some(wiring) => {
+                crate::userpasswd::handle_reset_password_code(&wiring.deps, req, body).await
+            }
+            None => app_handlers::not_found(),
+        },
+        RouteName::CheckUsernameTaken => match deps.userpasswd.as_deref() {
+            Some(wiring) => {
+                crate::userpasswd::handle_check_username_taken(
+                    &wiring.deps,
+                    vars.username.as_deref().unwrap_or(""),
+                )
+                .await
+            }
+            None => app_handlers::not_found(),
+        },
         _ => app_handlers::not_found(),
     }
 }

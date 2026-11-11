@@ -213,6 +213,26 @@ impl Service for FrontendService {
                 }
             })
         };
+        // Built-in auth (`/-/sign-in`, `/-/sign-up`, `/-/site-init`, ...):
+        // rebuilt per configuration generation. The Redis cache pool backs the
+        // account-lockout keys; an unreachable Redis degrades to the
+        // disabled lockout store.
+        let userpasswd_factory: crate::userpasswd::UserpasswdFactory = {
+            let pool = pool.clone();
+            let cache = sg_redis::KeyValue::connect(&sg_redis::cache_endpoint())
+                .await
+                .ok();
+            Arc::new(move |site: &SiteConfiguration, external_url: &str| {
+                crate::userpasswd::UserpasswdWiring {
+                    deps: Arc::new(crate::userpasswd::UserpasswdDeps::production(
+                        pool.clone(),
+                        cache.clone(),
+                        site,
+                        external_url,
+                    )),
+                }
+            })
+        };
         let source = crate::configuration_source::DbConfigurationSource::new(pool)
             .map_err(ServiceError::new)?;
         crate::configuration_startup::override_from_env(&source)
@@ -762,6 +782,7 @@ impl Service for FrontendService {
                 Arc::clone(wiring.live()),
                 self.allowlist_env.clone(),
                 Some(sign_out_factory),
+                Some(userpasswd_factory),
                 Some(oauth_factory),
                 Some(saml_factory),
                 self.version.bytes(),

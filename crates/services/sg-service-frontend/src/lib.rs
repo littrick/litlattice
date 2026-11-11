@@ -119,6 +119,7 @@ pub mod trace_policy;
 pub mod ui_assets;
 pub mod user_provisioning;
 pub mod user_store;
+pub mod userpasswd;
 pub mod version;
 pub mod webhook_logs;
 

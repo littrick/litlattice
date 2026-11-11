@@ -33,8 +33,10 @@ sg-ui = { path = "../../domain/sg-ui" }
 sg-zoekt = { path = "../../domain/sg-zoekt" }
 async-trait = { workspace = true }
 base64 = { workspace = true }
+bcrypt = "0.17"
 bytes = { workspace = true }
 flate2 = { workspace = true }
+hmac = { workspace = true }
 http = { workspace = true }
 http-body-util = { workspace = true }
 hyper = { workspace = true }
