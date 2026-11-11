@@ -680,4 +680,76 @@ mod tests {
             Some("https://gitlab.com/::client")
         );
     }
+
+    fn lazy_pool() -> PgPool {
+        sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://sourcegraph:sourcegraph@localhost/sourcegraph")
+            .expect("lazy pool")
+    }
+
+    fn wiring() -> OAuthResolverWiring {
+        OAuthResolverWiring::with_clients(
+            lazy_pool(),
+            false,
+            Arc::new(crate::github_oauth::ReqwestGithubHttpClient::from_default_client()),
+            Arc::new(ReqwestGitlabApiClient::from_default_client()),
+            Arc::new(ReqwestOidcHttpClient::from_default_client()),
+        )
+    }
+
+    fn site() -> SiteConfiguration {
+        SiteConfiguration::parse(
+            r#"{
+                "externalURL": "https://sourcegraph.example.com",
+                "auth.providers": [
+                    {"type": "github", "url": "https://GitHub.Example", "clientID": "gh"},
+                    {"type": "gitlab", "url": "https://gitlab.example", "clientID": "one"},
+                    {"type": "gitlab", "url": "https://gitlab.example", "clientID": "two"},
+                    {"type": "openidconnect", "issuer": "https://idp.example",
+                     "clientID": "oidc", "allowSignup": false}
+                ]
+            }"#,
+        )
+        .expect("site config")
+    }
+
+    #[tokio::test]
+    async fn register_creates_one_resolver_per_oauth_service_type() {
+        let registry = OAuthUserResolverRegistry::new();
+        wiring().register(&registry, &site());
+        assert_eq!(
+            registry.get_for("github", None).map(|r| r.service_id().to_owned()),
+            Some("https://github.example/".to_owned())
+        );
+        assert_eq!(
+            registry.get_for("gitlab", None).map(|r| r.service_id().to_owned()),
+            Some("https://gitlab.example/".to_owned())
+        );
+        assert_eq!(
+            registry
+                .get_for("openidconnect", Some(""))
+                .map(|r| r.service_id().to_owned()),
+            Some("https://idp.example".to_owned())
+        );
+        assert!(registry.get_for("azure", None).is_none());
+    }
+
+    #[tokio::test]
+    async fn register_selects_the_provider_named_by_the_state() {
+        let registry = OAuthUserResolverRegistry::new();
+        wiring().register(&registry, &site());
+        let state = LoginState {
+            redirect: "/search".to_owned(),
+            provider_id: "https://gitlab.example/::two".to_owned(),
+            csrf: "csrf".to_owned(),
+            op: "create".to_owned(),
+        }
+        .encode();
+        let resolver = registry
+            .get_for("gitlab", Some(&state))
+            .expect("gitlab resolver");
+        assert_eq!(resolver.service_id(), "https://gitlab.example/");
+        // The unknown provider falls back to the first configured provider.
+        assert!(registry.get_for("gitlab", Some("garbage")).is_some());
+    }
 }
