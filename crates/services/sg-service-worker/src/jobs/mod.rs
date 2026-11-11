@@ -51,6 +51,7 @@ pub mod authz_gitlab;
 pub mod authz_gitlab_client;
 pub mod authz_providers;
 pub mod batches;
+pub mod batches_bulk_processor;
 pub mod batches_scheduler;
 pub mod bitbucket_project_permissions;
 pub mod bitbucket_server_client;
@@ -235,6 +236,9 @@ pub fn all_jobs() -> Vec<(&'static str, Arc<dyn Job>)> {
                 "aggregated-users-statistics" => Arc::new(users::AggregatedUsersStatistics),
                 "auth-sourcegraph-operator-cleaner" => {
                     Arc::new(auth_sourcegraph_operator_cleaner::SourcegraphOperatorCleaner::new())
+                }
+                "batches-bulk-processor" => {
+                    Arc::new(batches_bulk_processor::BulkOperationProcessorJob::new())
                 }
                 "batches-janitor" => Arc::new(batches::BatchesJanitor::new()),
                 "batches-scheduler" => Arc::new(batches_scheduler::BatchesScheduler::new()),
