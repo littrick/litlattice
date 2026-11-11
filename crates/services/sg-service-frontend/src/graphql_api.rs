@@ -1324,7 +1324,7 @@ impl GraphqlDeps for SchemaGraphqlDeps {
         // `conf.Raw()`, `product_licenses` and the config history are async, so
         // prefetch the selected read-only fields before the synchronous
         // executor replays them.
-        let site = match &self.config_graphql {
+        let (site, settings_subject_site) = match &self.config_graphql {
             Some(deps) => {
                 let backend = crate::config_graphql::ProductionSiteConfigurationBackend::new(
                     deps.pool.clone(),
@@ -1336,20 +1336,39 @@ impl GraphqlDeps for SchemaGraphqlDeps {
                 );
                 let history =
                     crate::config_graphql::PgSiteConfigHistoryStore::new(deps.pool.clone());
-                crate::config_graphql::prefetch_site(
+                let lookup_users = self
+                    .users
+                    .as_ref()
+                    .map(|users| users.as_ref() as &dyn crate::graphql_resolvers::UserLookupStore);
+                let site = crate::config_graphql::prefetch_site(
                     &backend,
                     deps.licenses.as_ref(),
                     &validator,
                     &history,
-                    self.users.as_ref().map(|users| {
-                        users.as_ref() as &dyn crate::graphql_resolvers::UserLookupStore
-                    }),
+                    lookup_users,
                     &fields,
                     request.actor,
                 )
-                .await
+                .await;
+                // `Query.settingsSubject(id: <Site>).configuration` is a separate
+                // root entry point; the baseline audits/checks it per resolver.
+                let settings_subject_site =
+                    crate::config_graphql::prefetch_settings_subject_site_configuration(
+                        &backend,
+                        deps.licenses.as_ref(),
+                        &validator,
+                        &history,
+                        lookup_users,
+                        &fields,
+                        request.actor,
+                    )
+                    .await
+                    .map(|configuration| crate::config_graphql::SiteRoot {
+                        configuration: Some(configuration),
+                    });
+                (site, settings_subject_site)
             }
-            None => None,
+            None => (None, None),
         };
         let mut roots =
             crate::graphql_resolvers::FrontendRootResolver::with_prefetched_organizations(
@@ -1375,7 +1394,8 @@ impl GraphqlDeps for SchemaGraphqlDeps {
             .with_ranking_roots(ranking_roots)
             .with_search_roots(search_root)
             .with_git(git)
-            .with_site(site);
+            .with_site(site)
+            .with_settings_subject_site_configuration(settings_subject_site);
         if let Some(surface) = &self.slow_requests {
             roots = roots.with_slow_requests(Arc::clone(surface));
         }

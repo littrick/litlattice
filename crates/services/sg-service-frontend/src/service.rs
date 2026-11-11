@@ -395,6 +395,11 @@ impl Service for FrontendService {
         });
         let graphql_deps =
             SchemaGraphqlDeps::with_session(Arc::clone(&graphql_schema), session_pool.clone())
+                // M9.8jh: the read-only `Query.site.configuration` /
+                // `settingsSubject(site).configuration` surface shares the same
+                // `ConfigStore` the update loop writes, so a write is visible to
+                // the next query.
+                .with_config_graphql(Arc::clone(wiring.store()), session_pool.clone())
                 .with_client_configuration(
                     Arc::new(
                         crate::client_configuration::PgExternalServiceConfigSource::new(
