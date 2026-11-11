@@ -347,6 +347,38 @@ pub trait SiteAdminChecker: Send + Sync {
     async fn check_current_user_is_site_admin(&self) -> Result<(), RankingError>;
 }
 
+/// `auth.CheckCurrentUserIsSiteAdmin(ctx, db)` for one already-authenticated
+/// GraphQL request (M9.8ii production wiring).
+///
+/// The baseline reads the actor from `context.Context`; the port's executor
+/// knows the request actor and the current user's `site_admin` flag, so the
+/// production path builds this checker per request instead of giving the
+/// request-less [`SiteAdminChecker`] trait a context parameter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ViewerSiteAdminChecker {
+    actor: Actor,
+    site_admin: bool,
+}
+
+impl ViewerSiteAdminChecker {
+    pub fn new(actor: Actor, site_admin: bool) -> Self {
+        Self { actor, site_admin }
+    }
+}
+
+#[async_trait]
+impl SiteAdminChecker for ViewerSiteAdminChecker {
+    async fn check_current_user_is_site_admin(&self) -> Result<(), RankingError> {
+        match self.actor {
+            // `auth.CurrentUser` returns nil for an anonymous request:
+            // `auth.ErrNotAuthenticated`.
+            Actor::Anonymous => Err(RankingError::Service("not authenticated".to_owned())),
+            Actor::User { .. } if !self.site_admin => Err(RankingError::MustBeSiteAdmin),
+            Actor::User { .. } => Ok(()),
+        }
+    }
+}
+
 /// The three `operations` names registered by `newOperations`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RankingOperation {
