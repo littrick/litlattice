@@ -432,7 +432,10 @@ impl Service for FrontendService {
                 )
                 .with_clone_urls(clone_url_resolver)
                 .with_log_events(log_events_store, Arc::clone(wiring.live()))
-                .with_site_configuration(Arc::clone(wiring.store()), Arc::clone(wiring.server()));
+                .with_site_configuration(Arc::clone(wiring.store()), Arc::clone(wiring.server()))
+                // M9.8jg: `Site.authProviders` reads the live `auth.providers`
+                // configuration snapshot on every request.
+                .with_auth_providers(Arc::clone(wiring.live()));
         // M9.8jf: `Query.slowRequests` reads the FIFO list whose capacity is
         // `observability.captureSlowGraphQLRequestsLimit` (`conf.Get()` per
         // request in the baseline; here from the current configuration

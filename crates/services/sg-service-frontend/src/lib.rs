@@ -17,6 +17,7 @@ pub mod app_handlers_more;
 pub mod app_router;
 pub mod audit;
 pub mod auth;
+pub mod auth_providers_graphql;
 pub mod authz;
 pub mod blame;
 pub mod client_configuration;

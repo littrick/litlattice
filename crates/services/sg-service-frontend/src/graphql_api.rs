@@ -438,6 +438,9 @@ pub struct SchemaGraphqlDeps {
     /// `Query.slowRequests`'s capture-list seam (M9.8jf). `None` keeps the
     /// field unported (the pre-wiring frontend).
     slow_requests: Option<Arc<crate::slow_requests_tracer::SlowRequestsSurface>>,
+    /// `Site.authProviders`'s live configuration source (M9.8jg). `None` keeps
+    /// the field unported (transport-only tests without a configuration).
+    auth_providers: Option<Arc<LiveConfig>>,
 }
 
 impl SchemaGraphqlDeps {
@@ -471,6 +474,7 @@ impl SchemaGraphqlDeps {
             git_objects: None,
             symbols: None,
             slow_requests: None,
+            auth_providers: None,
         }
     }
 
@@ -521,6 +525,7 @@ impl SchemaGraphqlDeps {
             git_objects: None,
             symbols: None,
             slow_requests: None,
+            auth_providers: None,
         }
     }
 
@@ -646,6 +651,13 @@ impl SchemaGraphqlDeps {
     ) -> Self {
         self.site_configuration =
             Some(crate::site_configuration_mutation::SiteConfigurationDeps { store, server });
+        self
+    }
+
+    /// Enable `Site.authProviders` (M9.8jg): the provider directory is derived
+    /// from the live `auth.providers` site configuration on every request.
+    pub fn with_auth_providers(mut self, live: Arc<LiveConfig>) -> Self {
+        self.auth_providers = Some(live);
         self
     }
 
@@ -862,6 +874,7 @@ impl SchemaGraphqlDeps {
             git_objects: None,
             symbols: None,
             slow_requests: None,
+            auth_providers: None,
         }
     }
 }
@@ -1404,6 +1417,14 @@ impl GraphqlDeps for SchemaGraphqlDeps {
             .with_git(git)
             .with_site(site)
             .with_settings_subject_site_configuration(settings_subject_site);
+        // `Site.authProviders` (`auth_providers.go:10`): the baseline's
+        // `providers.SortedProviders()` reflects the current `conf.Get()`; do
+        // the same from the live snapshot, per request.
+        if let Some(live) = &self.auth_providers {
+            roots = roots.with_auth_providers(Some(Arc::new(
+                crate::auth_providers_graphql::AuthProvidersRoot::from_site(&live.current().site),
+            )));
+        }
         if let Some(surface) = &self.slow_requests {
             roots = roots.with_slow_requests(Arc::clone(surface));
         }
