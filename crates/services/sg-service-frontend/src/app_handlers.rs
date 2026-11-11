@@ -22,6 +22,10 @@ use http_body_util::Full;
 use tonic::body::BoxBody;
 
 use sg_config::SiteConfiguration;
+use sg_session::{SessionUserLookup, COOKIE_NAME};
+use time::OffsetDateTime;
+
+use crate::sign_out::{serve_sign_out, SignOutDeps, SignOutRequest};
 
 /// `badge.go:52`: the shields.io logo data URI.
 const BADGE_LOGO: &str =
@@ -305,10 +309,28 @@ impl GoImportersCounter {
     }
 }
 
+/// The `/-/sign-out` dependencies for one configuration generation.
+///
+/// Built by the live middleware from the `PgPool` (the session store is read
+/// from the environment) so that `auth.providers` changes are picked up like
+/// the baseline's per-request `conf.Get()`.
+pub struct SignOutWiring {
+    pub deps: Arc<SignOutDeps>,
+    /// Actor resolution for `recordSecurityEvent`; `None` leaves the actor
+    /// anonymous.
+    pub users: Option<Arc<dyn SessionUserLookup>>,
+}
+
+/// Builds [`SignOutWiring`] from the current site configuration and the
+/// external URL.
+pub type SignOutFactory = Arc<dyn Fn(&SiteConfiguration, &str) -> SignOutWiring + Send + Sync>;
+
 /// The dependencies the app router needs beyond configuration.
 #[derive(Clone, Default)]
 pub struct AppDeps {
     pub go_importers: GoImportersCounter,
+    /// `/-/sign-out`; `None` until the live middleware supplies a pool.
+    pub sign_out: Option<Arc<SignOutWiring>>,
 }
 
 impl AppDeps {
@@ -317,6 +339,7 @@ impl AppDeps {
     pub fn production() -> Self {
         Self {
             go_importers: GoImportersCounter::with_doer(Arc::new(SgHttpDoer::new())),
+            sign_out: None,
         }
     }
 
@@ -324,8 +347,102 @@ impl AppDeps {
     pub fn with_mock(mock: GoImportersMock) -> Self {
         Self {
             go_importers: GoImportersCounter::with_mock(mock),
+            sign_out: None,
         }
     }
+
+    /// Attach the per-generation sign-out wiring.
+    pub fn with_sign_out(mut self, wiring: SignOutWiring) -> Self {
+        self.sign_out = Some(Arc::new(wiring));
+        self
+    }
+}
+
+/// The `/-/sign-out` request adapter (`serveSignOutHandler`).
+///
+/// The baseline resolves the actor in outer middleware and hands the cookies
+/// to `session` helpers; here the actor is resolved from the same `sgs`
+/// cookie with the session read path, and the response is translated back to
+/// the `http.Redirect` + `Set-Cookie` shape.
+pub async fn sign_out<B>(req: &Request<B>, deps: &AppDeps) -> Response<BoxBody> {
+    let Some(wiring) = deps.sign_out.as_deref() else {
+        return not_found();
+    };
+    let headers = req.headers();
+    let session_cookie = cookie_value(headers, COOKIE_NAME);
+    let sign_out_cookie = cookie_value(headers, "sg-signout").is_some();
+    let anonymous_uid = cookie_value(headers, "sourcegraphAnonymousUid");
+    let now = OffsetDateTime::now_utc();
+
+    let actor_uid = match (&wiring.users, session_cookie.as_deref()) {
+        (Some(users), Some(cookie)) => {
+            match sg_session::authenticate(
+                wiring.deps.store.as_ref(),
+                users.as_ref(),
+                &wiring.deps.cookie_key,
+                Some(cookie),
+                now,
+            )
+            .await
+            {
+                sg_session::SessionAuthOutcome::Authenticated { uid } => uid,
+                _ => 0,
+            }
+        }
+        _ => 0,
+    };
+
+    let request = SignOutRequest {
+        actor_uid,
+        path: req.uri().path(),
+        // `r.URL.Host` is empty for server requests.
+        host: "",
+        anonymous_uid: anonymous_uid.as_deref(),
+        session_cookie: session_cookie.as_deref(),
+        sign_out_cookie,
+        now,
+    };
+    let outcome = serve_sign_out(&wiring.deps, &request).await;
+
+    let mut response =
+        empty_response(StatusCode::from_u16(outcome.status).unwrap_or(StatusCode::SEE_OTHER));
+    if let Ok(value) = HeaderValue::from_str(&outcome.location) {
+        response.headers_mut().insert(header::LOCATION, value);
+    }
+    if let Ok(value) = HeaderValue::from_str(&outcome.content_type) {
+        response.headers_mut().insert(header::CONTENT_TYPE, value);
+    }
+    for cookie in &outcome.set_cookies {
+        if let Ok(value) = HeaderValue::from_str(cookie) {
+            response.headers_mut().append(header::SET_COOKIE, value);
+        }
+    }
+    *response.body_mut() = tonic::body::boxed(Full::new(Bytes::from(outcome.body)));
+    response
+}
+
+/// `r.Cookie(name)`: the first matching cookie across the `Cookie` headers.
+fn cookie_value(headers: &http::HeaderMap, name: &str) -> Option<String> {
+    for value in headers.get_all(header::COOKIE) {
+        let Ok(cookies) = value.to_str() else {
+            continue;
+        };
+        for cookie in cookies.split(';') {
+            let cookie = cookie.trim();
+            let Some((key, value)) = cookie.split_once('=') else {
+                continue;
+            };
+            if key.trim() == name {
+                let value = value.trim();
+                let value = value
+                    .strip_prefix('"')
+                    .and_then(|value| value.strip_suffix('"'))
+                    .unwrap_or(value);
+                return Some(value.to_owned());
+            }
+        }
+    }
+    None
 }
 
 /// `robotsTxt` (`misc_handlers.go:22-42`).
@@ -940,6 +1057,114 @@ mod tests {
                 .and_then(|v| json_field_ci(v, "matchcount"))
                 .and_then(serde_json::Value::as_i64),
             Some(7)
+        );
+    }
+    struct EmptyStore;
+
+    #[async_trait::async_trait]
+    impl sg_session::SessionStore for EmptyStore {
+        async fn load(&self, _id: &str) -> Result<Option<Vec<u8>>, sg_session::SessionStoreError> {
+            Ok(None)
+        }
+
+        async fn save(
+            &self,
+            _id: &str,
+            _payload: Vec<u8>,
+            _ttl_seconds: i64,
+        ) -> Result<(), sg_session::SessionStoreError> {
+            Ok(())
+        }
+
+        async fn delete(&self, _id: &str) -> Result<(), sg_session::SessionStoreError> {
+            Ok(())
+        }
+    }
+
+    struct OkDb;
+
+    #[async_trait::async_trait]
+    impl crate::sign_out::SignOutDb for OkDb {
+        async fn invalidate_sessions(&self, _uid: i32) -> Result<(), String> {
+            Ok(())
+        }
+
+        async fn log_security_event(
+            &self,
+            _event: crate::sign_out::SecurityEventRecord,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+
+        async fn insert_event_log(
+            &self,
+            _event: sg_db::telemetry_events::EventLogRow,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    struct NoRemote;
+
+    #[async_trait::async_trait]
+    impl crate::sign_out::SsoRemoteSignOut for NoRemote {
+        async fn sign_out(
+            &self,
+            _kind: crate::sign_out::SsoProviderKind,
+            _session_data: Option<serde_json::Value>,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn sign_out_adapter_maps_the_baseline_response() {
+        let wiring = SignOutWiring {
+            deps: Arc::new(SignOutDeps {
+                store: Arc::new(EmptyStore),
+                ids: Arc::new(sg_session::FixedSessionIdSource(
+                    "BUILTSESSIONIDBUILTSESSIONIDBUILTSESSIONID".into(),
+                )),
+                cookie_key: b"m9-wiring-key".to_vec(),
+                secure: true,
+                db: Arc::new(OkDb),
+                sso_plans: Vec::new(),
+                sso_remote: Arc::new(NoRemote),
+                external_url: "https://example.com".to_owned(),
+            }),
+            users: None,
+        };
+        let deps = AppDeps::default().with_sign_out(wiring);
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("/-/sign-out")
+            .header(header::COOKIE, "sourcegraphAnonymousUid=anon-1")
+            .body(())
+            .expect("request");
+
+        let response = sign_out(&request, &deps).await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(response.headers()[header::LOCATION], "/search");
+        assert_eq!(
+            response.headers()[header::CONTENT_TYPE],
+            "text/html; charset=utf-8"
+        );
+        let cookies: Vec<String> = response
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .map(|value| value.to_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(cookies.len(), 2, "{cookies:?}");
+        assert!(cookies[0].starts_with("sgs="), "{cookies:?}");
+        assert!(cookies[0].contains("Max-Age=2592000"), "{cookies:?}");
+        assert_eq!(cookies[1], "sg-signout=true; Path=/; Secure");
+
+        // Without a pool-backed wiring the route is the unported 404 (the
+        // differential harness path).
+        assert_eq!(
+            sign_out(&request, &AppDeps::default()).await.status(),
+            StatusCode::NOT_FOUND
         );
     }
 }

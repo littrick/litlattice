@@ -23,7 +23,7 @@ use tonic::body::BoxBody;
 
 use sg_config::LiveConfig;
 
-use crate::app_handlers::{AppConfig, AppDeps, AppEnv};
+use crate::app_handlers::{AppConfig, AppDeps, AppEnv, SignOutFactory};
 use crate::app_router;
 use crate::auth;
 use crate::blame::BlameDeps;
@@ -286,12 +286,21 @@ impl DerivedConfig {
         env: &AllowlistEnv,
         app_env: Arc<AppEnv>,
         app_deps: Arc<AppDeps>,
+        sign_out_factory: Option<&SignOutFactory>,
     ) -> Self {
+        let security = SecurityConfig::from_site_config(site);
+        let app_deps = match sign_out_factory {
+            Some(factory) => {
+                let wiring = factory(site, &security.external_url);
+                Arc::new((*app_deps).clone().with_sign_out(wiring))
+            }
+            None => app_deps,
+        };
         Self {
             allowlist: ipallowlist::compile(site, env).map(Arc::new),
             forbid_all: auth::forbidden(site),
             trace_url_template: trace_headers::url_template(site),
-            security: SecurityConfig::from_site_config(site),
+            security,
             app_env,
             app_config: AppConfig::from_site_config(site),
             app_deps,
@@ -308,6 +317,9 @@ pub struct LiveMiddleware {
     allowlist_env: AllowlistEnv,
     app_env: Arc<AppEnv>,
     app_deps: Arc<AppDeps>,
+    /// `/-/sign-out` wiring rebuilt per configuration generation (the
+    /// baseline reads `conf.Get()` per request).
+    sign_out_factory: Option<SignOutFactory>,
     cache: std::sync::Mutex<Option<(u64, Arc<DerivedConfig>)>>,
 }
 
@@ -317,12 +329,14 @@ impl LiveMiddleware {
         allowlist_env: AllowlistEnv,
         app_env: Arc<AppEnv>,
         app_deps: Arc<AppDeps>,
+        sign_out_factory: Option<SignOutFactory>,
     ) -> Self {
         Self {
             live,
             allowlist_env,
             app_env,
             app_deps,
+            sign_out_factory,
             cache: std::sync::Mutex::new(None),
         }
     }
@@ -344,6 +358,7 @@ impl LiveMiddleware {
             &self.allowlist_env,
             Arc::clone(&self.app_env),
             Arc::clone(&self.app_deps),
+            self.sign_out_factory.as_ref(),
         ));
         if let Ok(mut cache) = self.cache.lock() {
             *cache = Some((generation, Arc::clone(&derived)));
@@ -358,6 +373,7 @@ impl LiveMiddleware {
 pub fn external_handler_with_live(
     live: Arc<LiveConfig>,
     allowlist_env: AllowlistEnv,
+    sign_out_factory: Option<SignOutFactory>,
     version: Bytes,
     blame_deps: Arc<dyn BlameDeps>,
     search_deps: Arc<dyn SearchDeps>,
@@ -366,7 +382,13 @@ pub fn external_handler_with_live(
     let api_live = Arc::clone(&live);
     let app_env = Arc::new(AppEnv::from_env());
     let app_deps = Arc::new(AppDeps::production());
-    let middleware = Arc::new(LiveMiddleware::new(live, allowlist_env, app_env, app_deps));
+    let middleware = Arc::new(LiveMiddleware::new(
+        live,
+        allowlist_env,
+        app_env,
+        app_deps,
+        sign_out_factory,
+    ));
     Arc::new(move |mut req: Request<Incoming>| {
         let middleware = Arc::clone(&middleware);
         let api_live = Arc::clone(&api_live);
@@ -777,6 +799,7 @@ mod tests {
             AllowlistEnv::default(),
             Arc::new(AppEnv::default()),
             Arc::new(AppDeps::default()),
+            None,
         );
 
         let derived = middleware.current();

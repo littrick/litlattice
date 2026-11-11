@@ -167,6 +167,25 @@ impl Service for FrontendService {
         let search_pool = blame_pool.clone();
         let session_pool = pool.clone();
         let settings_pool = pool.clone();
+        let sign_out_pool = pool.clone();
+        // `app.NewHandler`'s `/-/sign-out` reads `conf.Get()` per request; the
+        // wiring is rebuilt for each configuration generation in
+        // `LiveMiddleware`, so the factory closes over the pool only.
+        let sign_out_factory: crate::app_handlers::SignOutFactory = {
+            let pool = sign_out_pool;
+            Arc::new(move |site: &SiteConfiguration, external_url: &str| {
+                crate::app_handlers::SignOutWiring {
+                    deps: Arc::new(crate::sign_out::SignOutDeps::production(
+                        pool.clone(),
+                        site,
+                        external_url,
+                    )),
+                    users: Some(Arc::new(crate::session_auth::PgSessionUsers::new(
+                        pool.clone(),
+                    ))),
+                }
+            })
+        };
         let source = crate::configuration_source::DbConfigurationSource::new(pool)
             .map_err(ServiceError::new)?;
         crate::configuration_startup::override_from_env(&source)
@@ -496,6 +515,7 @@ impl Service for FrontendService {
             middleware::external_handler_with_live(
                 Arc::clone(wiring.live()),
                 self.allowlist_env.clone(),
+                Some(sign_out_factory),
                 self.version.bytes(),
                 blame_deps,
                 search_deps,

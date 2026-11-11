@@ -21,9 +21,10 @@
 //! [`RouteName`] and are answered with `http.NotFound` by default. The parent
 //! can inspect [`RouteName`]/[`Vars`] and wire them later.
 //!
-//! `/-/sign-out` is deliberately absent: M9.8iv owns that route and the parent
-//! merges it after this slice. Such requests currently fall through to the UI
-//! fallback (404), which is the same response this slice would produce anyway.
+//! `/-/sign-out` is registered here and dispatched to
+//! [`crate::sign_out::serve_sign_out`] through [`AppDeps::sign_out`]; without
+//! that wiring (no `PgPool`, e.g. the harness) it answers the same 404 as the
+//! other unported handlers.
 
 use std::sync::OnceLock;
 
@@ -46,6 +47,7 @@ pub enum RouteName {
     SiteInit,
     VerifyEmail,
     SignIn,
+    SignOut,
     UnlockAccount,
     UnlockUserAccount,
     ResetPasswordInit,
@@ -78,6 +80,7 @@ impl RouteName {
             RouteName::SiteInit => "site-init",
             RouteName::VerifyEmail => "verify-email",
             RouteName::SignIn => "sign-in",
+            RouteName::SignOut => "sign-out",
             RouteName::UnlockAccount => "unlock-account",
             RouteName::UnlockUserAccount => "unlock-user-account",
             RouteName::ResetPasswordInit => "reset-password.init",
@@ -155,7 +158,7 @@ pub fn resolve(method: &Method, path: &str) -> Resolution {
     exact!("/-/site-init", POST, RouteName::SiteInit);
     exact!("/-/verify-email", GET, RouteName::VerifyEmail);
     exact!("/-/sign-in", POST, RouteName::SignIn);
-    // `/-/sign-out` is intentionally not registered (see the module docs).
+    exact!("/-/sign-out", GET, RouteName::SignOut);
     exact!("/-/unlock-account", POST, RouteName::UnlockAccount);
     exact!("/-/unlock-user-account", POST, RouteName::UnlockUserAccount);
     exact!("/-/reset-password-init", POST, RouteName::ResetPasswordInit);
@@ -276,6 +279,7 @@ pub async fn dispatch_route<B>(
             app_handlers::redirect(req, "https://sourcegraph.com/go", 302)
         }
         RouteName::DebugHeaders => app_handlers::debug_headers(req),
+        RouteName::SignOut => app_handlers::sign_out(req, deps).await,
         // The old-tree redirect is a repository-aware handler outside this
         // slice; everything else (auth flows, archives, pings, UI) is also
         // unported and answers the mux 404 for now.
