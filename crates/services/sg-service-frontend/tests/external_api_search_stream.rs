@@ -471,9 +471,19 @@ struct Case {
 }
 
 fn inputs() -> SearchInputs {
+    use sg_search_query::parser::SearchType;
+    use sg_service_frontend::search_client::{Features, Protocol, SearchMode};
     SearchInputs {
         max_results: 10000,
         original_query: "foo".to_owned(),
+        plan: sg_search_query::pipeline_query("foo", SearchType::Standard).expect("plan"),
+        search_mode: SearchMode::Precise,
+        pattern_type: SearchType::Standard,
+        features: Features::default(),
+        protocol: Protocol::Streaming,
+        context_lines: 1,
+        sanitize_search_patterns: Vec::new(),
+        on_sourcegraph_dot_com: false,
     }
 }
 

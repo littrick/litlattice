@@ -134,10 +134,13 @@ impl std::fmt::Display for PlanError {
 
 impl std::error::Error for PlanError {}
 
-pub type SettingsLoader = Box<dyn Fn() -> Result<Settings, String>>;
-pub type FeatureFlagLoader = Box<dyn Fn() -> BTreeMap<String, bool>>;
-pub type SearchContextResolver = Arc<dyn Fn(&str) -> Result<String, String>>;
-pub type SanitizePatternsLoader = Box<dyn Fn() -> Vec<String>>;
+// The `Send + Sync` bounds let a `searchClient` live inside the frontend's
+// `Arc<dyn SearchDeps>` (M9.8hs). They are additive: every existing loader
+// already captures `Send + Sync` state.
+pub type SettingsLoader = Box<dyn Fn() -> Result<Settings, String> + Send + Sync>;
+pub type FeatureFlagLoader = Box<dyn Fn() -> BTreeMap<String, bool> + Send + Sync>;
+pub type SearchContextResolver = Arc<dyn Fn(&str) -> Result<String, String> + Send + Sync>;
+pub type SanitizePatternsLoader = Box<dyn Fn() -> Vec<String> + Send + Sync>;
 
 /// Injected dependencies of [`SearchClient::plan`].
 ///
