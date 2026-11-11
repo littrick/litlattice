@@ -331,6 +331,10 @@ pub struct AppDeps {
     pub go_importers: GoImportersCounter,
     /// `/-/sign-out`; `None` until the live middleware supplies a pool.
     pub sign_out: Option<Arc<SignOutWiring>>,
+    /// Built-in auth (`/-/sign-in`, `/-/sign-up`, ...); `None` until the live
+    /// middleware supplies a pool, in which case those routes keep answering
+    /// the mux 404.
+    pub userpasswd: Option<Arc<crate::userpasswd::UserpasswdWiring>>,
     /// The remaining app handlers (M9.8jb); every entry is optional so an
     /// unwired process still answers the mux 404.
     pub more: crate::app_handlers_more::MoreDeps,
@@ -343,6 +347,7 @@ impl AppDeps {
         Self {
             go_importers: GoImportersCounter::with_doer(Arc::new(SgHttpDoer::new())),
             sign_out: None,
+            userpasswd: None,
             more: crate::app_handlers_more::MoreDeps::default(),
         }
     }
@@ -352,6 +357,7 @@ impl AppDeps {
         Self {
             go_importers: GoImportersCounter::with_mock(mock),
             sign_out: None,
+            userpasswd: None,
             more: crate::app_handlers_more::MoreDeps::default(),
         }
     }
@@ -359,6 +365,12 @@ impl AppDeps {
     /// Attach the per-generation sign-out wiring.
     pub fn with_sign_out(mut self, wiring: SignOutWiring) -> Self {
         self.sign_out = Some(Arc::new(wiring));
+        self
+    }
+
+    /// Attach the per-generation built-in auth wiring.
+    pub fn with_userpasswd(mut self, wiring: crate::userpasswd::UserpasswdWiring) -> Self {
+        self.userpasswd = Some(Arc::new(wiring));
         self
     }
 }

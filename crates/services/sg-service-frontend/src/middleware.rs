@@ -313,6 +313,7 @@ impl DerivedConfig {
         app_env: Arc<AppEnv>,
         app_deps: Arc<AppDeps>,
         sign_out_factory: Option<&SignOutFactory>,
+        userpasswd_factory: Option<&crate::userpasswd::UserpasswdFactory>,
         oauth_factory: Option<&OAuthRouteFactory>,
         saml_factory: Option<&SamlRouteFactory>,
     ) -> Self {
@@ -325,6 +326,13 @@ impl DerivedConfig {
             Some(factory) => {
                 let wiring = factory(site, &security.external_url);
                 Arc::new((*app_deps).clone().with_sign_out(wiring))
+            }
+            None => app_deps,
+        };
+        let app_deps = match userpasswd_factory {
+            Some(factory) => {
+                let wiring = factory(site, &security.external_url);
+                Arc::new((*app_deps).clone().with_userpasswd(wiring))
             }
             None => app_deps,
         };
@@ -356,6 +364,8 @@ pub struct LiveMiddleware {
     /// `/-/sign-out` wiring rebuilt per configuration generation (the
     /// baseline reads `conf.Get()` per request).
     sign_out_factory: Option<SignOutFactory>,
+    /// Built-in auth wiring rebuilt per configuration generation.
+    userpasswd_factory: Option<crate::userpasswd::UserpasswdFactory>,
     /// OAuth route dependencies rebuilt per configuration generation.
     oauth_factory: Option<OAuthRouteFactory>,
     /// SAML route dependencies rebuilt per configuration generation.
@@ -370,6 +380,7 @@ impl LiveMiddleware {
         app_env: Arc<AppEnv>,
         app_deps: Arc<AppDeps>,
         sign_out_factory: Option<SignOutFactory>,
+        userpasswd_factory: Option<crate::userpasswd::UserpasswdFactory>,
         oauth_factory: Option<OAuthRouteFactory>,
         saml_factory: Option<SamlRouteFactory>,
     ) -> Self {
@@ -379,6 +390,7 @@ impl LiveMiddleware {
             app_env,
             app_deps,
             sign_out_factory,
+            userpasswd_factory,
             oauth_factory,
             saml_factory,
             cache: std::sync::Mutex::new(None),
@@ -403,6 +415,7 @@ impl LiveMiddleware {
             Arc::clone(&self.app_env),
             Arc::clone(&self.app_deps),
             self.sign_out_factory.as_ref(),
+            self.userpasswd_factory.as_ref(),
             self.oauth_factory.as_ref(),
             self.saml_factory.as_ref(),
         ));
@@ -421,6 +434,7 @@ pub fn external_handler_with_live(
     live: Arc<LiveConfig>,
     allowlist_env: AllowlistEnv,
     sign_out_factory: Option<SignOutFactory>,
+    userpasswd_factory: Option<crate::userpasswd::UserpasswdFactory>,
     oauth_factory: Option<OAuthRouteFactory>,
     saml_factory: Option<SamlRouteFactory>,
     version: Bytes,
@@ -438,6 +452,7 @@ pub fn external_handler_with_live(
         app_env,
         app_deps,
         sign_out_factory,
+        userpasswd_factory,
         oauth_factory,
         saml_factory,
     ));
@@ -1033,6 +1048,7 @@ mod tests {
             AllowlistEnv::default(),
             Arc::new(AppEnv::default()),
             Arc::new(AppDeps::default()),
+            None,
             None,
             None,
             None,

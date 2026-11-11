@@ -324,6 +324,7 @@ async fn app_handlers_more_diff() {
         let deps = AppDeps {
             go_importers: Default::default(),
             sign_out: None,
+            userpasswd: None,
             more: more_deps(case),
         };
         let method = Method::from_bytes(case.method.as_bytes()).expect("method");
