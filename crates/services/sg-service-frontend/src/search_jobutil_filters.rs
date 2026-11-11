@@ -31,6 +31,7 @@ use std::time::Instant;
 use regex::Regex;
 
 use crate::search_job::{JobContext, JobError, RuntimeClients, SearchJob, Verbosity};
+use crate::search_jobutil_combinators as comb;
 use crate::search_stream::convert::{
     quote_meta, select_kind, ChunkMatch, CommitMatch, FileMatch, Match, MatchedString, RepoMatch,
 };
@@ -885,6 +886,50 @@ impl SelectJob {
     }
 }
 
+/// `newSelectingStream`'s per-`Run` state: the `select:` transform plus the
+/// dedup set. One instance is created per run, like the baseline's closure.
+#[derive(Debug, Default)]
+pub struct SelectDeduper {
+    path: Vec<String>,
+    dedup: HashSet<MatchKey>,
+}
+
+impl SelectDeduper {
+    pub fn new(path: Vec<String>) -> Self {
+        Self {
+            path,
+            dedup: HashSet::new(),
+        }
+    }
+
+    /// Applies `Match.Select` and the dedup rules to one event.
+    pub fn filter(&mut self, mut event: SearchEvent) -> SearchEvent {
+        let results = std::mem::take(&mut event.results);
+        let mut selected = Vec::with_capacity(results.len());
+        for result in results {
+            let Some(current) = select_match(&result, &self.path) else {
+                continue;
+            };
+            let seen = self.dedup.contains(&match_key(&current));
+            let is_file_match = matches!(current, Match::File(_));
+            if seen && !is_file_match {
+                continue;
+            }
+            if seen && is_file_match {
+                if let Match::File(fm) = &current {
+                    if is_path_match(fm) {
+                        continue;
+                    }
+                }
+            }
+            self.dedup.insert(match_key(&current));
+            selected.push(current);
+        }
+        event.results = selected;
+        event
+    }
+}
+
 impl SearchJob for SelectJob {
     fn run(
         &mut self,
@@ -892,34 +937,8 @@ impl SearchJob for SelectJob {
         clients: &RuntimeClients<'_>,
         stream: &mut dyn FnMut(SearchEvent),
     ) -> Result<(), JobError> {
-        let path = &self.path;
-        let mut dedup: HashSet<MatchKey> = HashSet::new();
-        let mut selecting = |event: SearchEvent| {
-            let mut event = event;
-            let results = std::mem::take(&mut event.results);
-            let mut selected = Vec::with_capacity(results.len());
-            for result in results {
-                let Some(current) = select_match(&result, path) else {
-                    continue;
-                };
-                let seen = dedup.contains(&match_key(&current));
-                let is_file_match = matches!(current, Match::File(_));
-                if seen && !is_file_match {
-                    continue;
-                }
-                if seen && is_file_match {
-                    if let Match::File(fm) = &current {
-                        if is_path_match(fm) {
-                            continue;
-                        }
-                    }
-                }
-                dedup.insert(match_key(&current));
-                selected.push(current);
-            }
-            event.results = selected;
-            stream(event);
-        };
+        let mut dedup = SelectDeduper::new(self.path.clone());
+        let mut selecting = |event: SearchEvent| stream(dedup.filter(event));
         self.child.run(ctx, clients, &mut selecting)
     }
 
@@ -928,6 +947,55 @@ impl SearchJob for SelectJob {
     }
 
     fn children(&self) -> Vec<&dyn SearchJob> {
+        vec![self.child.as_ref()]
+    }
+
+    fn attributes(&self, verbosity: Verbosity) -> Vec<(String, String)> {
+        let mut res = Vec::new();
+        if matches!(verbosity, Verbosity::Basic | Verbosity::Max) {
+            res.push((
+                "select".to_owned(),
+                string_slice(self.path.iter().map(String::as_str)),
+            ));
+        }
+        res
+    }
+}
+
+/// `selectJob.Run` over a [`comb::CombinatorJob`] child.
+///
+/// Behaves exactly like [`SelectJob`] (same transform and dedup) but keeps the
+/// child's `(alert, error)` pair, including error classification, so a select
+/// node nested in the job tree does not change what an outer `AlertJob`
+/// observes.
+pub struct SelectCombinatorJob {
+    path: Vec<String>,
+    child: Box<dyn comb::CombinatorJob>,
+}
+
+impl SelectCombinatorJob {
+    pub fn new(path: Vec<String>, child: Box<dyn comb::CombinatorJob>) -> Self {
+        Self { path, child }
+    }
+}
+
+impl comb::CombinatorJob for SelectCombinatorJob {
+    fn run(
+        &mut self,
+        ctx: &comb::RunContext,
+        clients: &RuntimeClients<'_>,
+        stream: comb::Sender<'_>,
+    ) -> (Option<comb::Alert>, Option<comb::JobFailure>) {
+        let mut dedup = SelectDeduper::new(self.path.clone());
+        let mut selecting = |event: SearchEvent| stream(dedup.filter(event));
+        self.child.run(ctx, clients, &mut selecting)
+    }
+
+    fn name(&self) -> &'static str {
+        "SelectJob"
+    }
+
+    fn children(&self) -> Vec<&dyn comb::CombinatorJob> {
         vec![self.child.as_ref()]
     }
 
@@ -1262,6 +1330,7 @@ mod tests {
             zoekt,
             max_repos: None,
             searcher: None,
+            commit: None,
         }
     }
 

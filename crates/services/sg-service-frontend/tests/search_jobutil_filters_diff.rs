@@ -655,6 +655,7 @@ fn run_job(job: &mut dyn SearchJob) -> (Vec<SearchEvent>, Option<JobError>) {
         zoekt: &streamer,
         max_repos: None,
         searcher: None,
+        commit: None,
     };
     let ctx = JobContext::default();
     let mut events = Vec::new();
@@ -854,6 +855,7 @@ fn run_contributor(case: &Case) -> Value {
         zoekt: &streamer,
         max_repos: None,
         searcher: None,
+        commit: None,
     };
     let ctx = JobContext { deadline };
     let mut out = Vec::new();

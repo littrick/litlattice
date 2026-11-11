@@ -706,6 +706,7 @@ fn run_case(case: &Case) -> Value {
         zoekt: &zoekt,
         max_repos: None,
         searcher: None,
+        commit: None,
     };
 
     let mut events: Vec<SearchEvent> = Vec::new();
