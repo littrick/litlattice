@@ -2340,6 +2340,7 @@ impl FrontendRootResolver {
                 search: None,
                 git: None,
                 slow_requests: None,
+                slow_requests_prefetch: HashMap::new(),
                 site: None,
                 settings_subject_site: None,
                 auth_providers: None,
@@ -2400,6 +2401,19 @@ impl FrontendRootResolver {
         surface: Arc<crate::slow_requests_tracer::SlowRequestsSurface>,
     ) -> Self {
         self.query.slow_requests = Some(surface);
+        self
+    }
+
+    /// Attach the request's prefetched `Query.slowRequests` connections
+    /// (including resolved `user`/`repository` nodes), keyed by `after`.
+    pub fn with_slow_requests_prefetch(
+        mut self,
+        prefetch: HashMap<
+            String,
+            Result<Arc<crate::slow_requests_tracer::SlowRequestConnectionObject>, String>,
+        >,
+    ) -> Self {
+        self.query.slow_requests_prefetch = prefetch;
         self
     }
 
@@ -2549,6 +2563,12 @@ struct QueryRoot {
     /// Optional `Query.slowRequests` surface (M9.8jf); `None` keeps the field
     /// unported (the baseline's "capture not enabled"/absent-resolver state).
     slow_requests: Option<Arc<crate::slow_requests_tracer::SlowRequestsSurface>>,
+    /// Prefetched `Query.slowRequests` connections, keyed by the `after` cursor
+    /// (see [`crate::slow_requests_tracer::prefetch_slow_requests`]).
+    slow_requests_prefetch: HashMap<
+        String,
+        Result<Arc<crate::slow_requests_tracer::SlowRequestConnectionObject>, String>,
+    >,
     /// Prefetched read-only `Query.site.configuration` data (M9.8je); `None`
     /// when the configuration surface was not injected or not selected.
     site: Option<Arc<crate::config_graphql::SiteRoot>>,
@@ -2784,13 +2804,24 @@ impl ObjectValue for QueryRoot {
             }
             // `schemaResolver.SlowRequests` (`slow_requests_tracer.go:63`):
             // site-admin gated. `None` keeps the surface unported.
-            "slowRequests" => match &self.slow_requests {
-                Some(surface) => surface
-                    .resolve(actor, self.viewer_site_admin, arguments.string("after"))
-                    .map(|connection| Some(FieldValue::Object(Arc::new(connection))))
-                    .map_err(ExecError::new),
-                None => Ok(None),
-            },
+            "slowRequests" => {
+                let after = arguments.string("after").unwrap_or("0");
+                if let Some(result) = self.slow_requests_prefetch.get(after) {
+                    return match result {
+                        Ok(connection) => Ok(Some(FieldValue::Object(
+                            Arc::clone(connection) as Arc<dyn ObjectValue>
+                        ))),
+                        Err(error) => Err(ExecError::new(error.clone())),
+                    };
+                }
+                match &self.slow_requests {
+                    Some(surface) => surface
+                        .resolve(actor, self.viewer_site_admin, arguments.string("after"))
+                        .map(|connection| Some(FieldValue::Object(Arc::new(connection))))
+                        .map_err(ExecError::new),
+                    None => Ok(None),
+                }
+            }
             // `CurrentUser` -> `db.Users().GetByCurrentAuthUser`: anonymous
             // actors get `nil`; an authenticated actor gets the prefetched row
             // (or `nil` if it disappeared between authentication and here).
