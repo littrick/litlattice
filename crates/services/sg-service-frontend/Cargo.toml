@@ -29,6 +29,7 @@ sg-service-gitserver = { path = "../sg-service-gitserver" }
 sg-settings-schema = { path = "../../domain/sg-settings-schema" }
 sg-site-schema = { path = "../../domain/sg-site-schema" }
 sg-txemail = { path = "../../domain/sg-txemail" }
+sg-ui = { path = "../../domain/sg-ui" }
 sg-zoekt = { path = "../../domain/sg-zoekt" }
 async-trait = { workspace = true }
 base64 = { workspace = true }

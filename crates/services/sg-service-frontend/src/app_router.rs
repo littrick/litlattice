@@ -258,6 +258,7 @@ pub fn resolve(method: &Method, path: &str) -> Resolution {
 pub async fn dispatch_route<B>(
     req: &Request<B>,
     resolution: Resolution,
+    path: &str,
     env: &AppEnv,
     config: &AppConfig,
     deps: &AppDeps,
@@ -299,8 +300,9 @@ pub async fn dispatch_route<B>(
             vars.rev.as_deref().unwrap_or(""),
             vars.path.as_deref().unwrap_or(""),
         ),
-        // Auth flows and the UI are outside this slice and still answer the
-        // mux 404.
+        // `ui.Router()`: static pages, legacy redirects and the SPA shell.
+        RouteName::Ui => crate::ui_assets::serve_ui(req, path, env, config, deps),
+        // Auth flows are outside this slice and still answer the mux 404.
         _ => app_handlers::not_found(),
     }
 }
@@ -376,7 +378,7 @@ where
             app_handlers::redirect(&*req, &location, 301)
         }
         Resolution::Route { .. } => {
-            dispatch_route(&*req, resolution, env, config, deps, body).await
+            dispatch_route(&*req, resolution, &path, env, config, deps, body).await
         }
     }
 }

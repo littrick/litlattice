@@ -88,11 +88,13 @@ async fn app_router_diff() {
             deploy_type: case.deploy_type.clone(),
             assets_root: "/.assets".to_owned(),
             insecure_dev: case.insecure_dev,
+            build_version: "0.0.0+dev".to_owned(),
             internal_api_url: "http://sourcegraph-frontend-internal:80".to_owned(),
         };
         let config = AppConfig {
             external_url: case.external_url.clone(),
             branding_favicon: case.branding_favicon.clone(),
+            ..AppConfig::default()
         };
         let deps = deps(case);
         let mut req = request(case);
