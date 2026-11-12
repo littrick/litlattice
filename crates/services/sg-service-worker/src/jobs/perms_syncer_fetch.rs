@@ -15,11 +15,11 @@
 //!   repository IDs (exact matches, then inclusion/exclusion `SIMILAR TO`
 //!   matches, private repositories only).
 //!
-//! Sub-repository permissions are deliberately not ported here: the
-//! `sub_repo_permissions` storage is a later slice, so the temporary-error
-//! retention covers repository-level permissions only. Account-data encryption
-//! is also not ported (the upsert writes empty auth/account data); neither
-//! omission changes account identity or the repository set.
+//! Account data returned by `FetchAccount` is encrypted with the
+//! user-external-account keyring and written with `upsert_with_data`
+//! (`encryptData`: auth data first, then account data; the key ID comes from
+//! the last encryption). Sub-repository permissions are covered both on the
+//! happy path and on the temporary-error retention path.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -32,6 +32,7 @@ use sg_db::sub_repo_perms::{
 };
 use sg_db::user_external_accounts::{self, ExternalAccountsListOptions};
 use sg_db::users::UserRecord;
+use sg_encryption::Key;
 use sqlx::postgres::PgPool;
 
 use super::perms_syncer::{
@@ -52,6 +53,8 @@ pub struct ExternalAccountPermsFetcher {
     pool: PgPool,
     repo_store: RepoStore,
     registry: Arc<dyn ProviderRegistry>,
+    /// `keyring.Default().UserExternalAccountKey`.
+    user_external_account_key: Option<Arc<dyn Key>>,
     /// `dotcom.SourcegraphDotComMode()`.
     dotcom_mode: bool,
 }
@@ -66,8 +69,15 @@ impl ExternalAccountPermsFetcher {
             repo_store: RepoStore::new(pool.clone()),
             pool,
             registry,
+            user_external_account_key: None,
             dotcom_mode,
         }
+    }
+
+    /// The user-external-account keyring `Upsert` encrypts account data with.
+    pub fn with_user_external_account_key(mut self, key: Option<Arc<dyn Key>>) -> Self {
+        self.user_external_account_key = key;
+        self
     }
 
     /// Override the dot-com mode (the baseline reads the environment once at
@@ -75,6 +85,38 @@ impl ExternalAccountPermsFetcher {
     pub fn with_dotcom_mode(mut self, dotcom_mode: bool) -> Self {
         self.dotcom_mode = dotcom_mode;
         self
+    }
+
+    /// `userExternalAccountsStore.Upsert`'s encryption step (`encryptData`):
+    /// encrypt `auth_data` first, then `account_data`; the key ID is the one
+    /// from the last non-empty encryption.
+    async fn encrypted_account_data(
+        &self,
+        fetched: &super::perms_syncer::FetchedExternalAccount,
+    ) -> Result<(String, String, String), String> {
+        let key = self.user_external_account_key.as_deref();
+        let (auth_data, auth_key_id) = if fetched.auth_data.is_empty() {
+            (String::new(), String::new())
+        } else {
+            let plain = String::from_utf8_lossy(&fetched.auth_data);
+            sg_encryption::maybe_encrypt(key, &plain)
+                .await
+                .map_err(|err| err.to_string())?
+        };
+        let (account_data, account_key_id) = if fetched.account_data.is_empty() {
+            (String::new(), String::new())
+        } else {
+            let plain = String::from_utf8_lossy(&fetched.account_data);
+            sg_encryption::maybe_encrypt(key, &plain)
+                .await
+                .map_err(|err| err.to_string())?
+        };
+        let key_id = if !fetched.account_data.is_empty() {
+            account_key_id
+        } else {
+            auth_key_id
+        };
+        Ok((auth_data, account_data, key_id))
     }
 
     async fn providers_by_service_id(&self) -> HashMap<String, Arc<dyn AuthzProvider>> {
@@ -176,7 +218,7 @@ impl UserPermsFetcher for ExternalAccountPermsFetcher {
                 continue;
             }
 
-            match provider.fetch_account(user).await {
+            match provider.fetch_account_with_data(user).await {
                 Err(message) => {
                     results.statuses.push(CodeHostState::new_provider_status(
                         provider.service_id(),
@@ -186,11 +228,27 @@ impl UserPermsFetcher for ExternalAccountPermsFetcher {
                     ));
                 }
                 Ok(None) => {}
-                Ok(Some(spec)) => {
-                    match user_external_accounts::upsert(&self.pool, user.id, &spec).await {
-                        // Baseline only logs upsert errors.
+                Ok(Some(fetched)) => {
+                    let data = self.encrypted_account_data(&fetched).await;
+                    match data {
+                        // Encryption/upsert errors are only logged by the
+                        // baseline; the account is simply not added.
                         Err(_) => {}
-                        Ok(account) => accounts.push(account),
+                        Ok((auth_data, account_data, key_id)) => {
+                            match user_external_accounts::upsert_with_data(
+                                &self.pool,
+                                user.id,
+                                &fetched.spec,
+                                &auth_data,
+                                &account_data,
+                                &key_id,
+                            )
+                            .await
+                            {
+                                Err(_) => {}
+                                Ok(account) => accounts.push(account),
+                            }
+                        }
                     }
                 }
             }
