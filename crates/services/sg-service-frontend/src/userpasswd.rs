@@ -134,6 +134,23 @@ pub fn can_send_email(site: &SiteConfiguration) -> bool {
         .is_some_and(|value| !value.is_null())
 }
 
+/// `conf.PermissionsUserMapping().BindID`: the flat `permissions.userMapping`
+/// key. A missing or non-`email`/`username` `bindID` falls back to `email`
+/// (`internal/conf/computed.go:1445-1458`). `enabled` is not consulted on the
+/// pending-permissions path (`internal/database/authz.go:127-162`).
+pub fn permissions_user_mapping_bind_id(site: &SiteConfiguration) -> String {
+    let bind_id = site
+        .raw()
+        .get("permissions.userMapping")
+        .and_then(|mapping| mapping.get("bindID"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    match bind_id {
+        "email" | "username" => bind_id.to_owned(),
+        _ => "email".to_owned(),
+    }
+}
+
 /// `conf.IsAccessRequestEnabled`.
 pub fn access_request_enabled(site: &SiteConfiguration) -> bool {
     match site.raw().get("auth.accessRequest") {
@@ -725,7 +742,10 @@ impl UserpasswdDeps {
             .unwrap_or_default()
             .into_bytes();
         let email: Arc<dyn EmailSender> = Arc::new(TxEmailSender::new(site));
-        let store: Arc<dyn UserpasswdStore> = Arc::new(PgUserpasswdStore::new(pool));
+        let store: Arc<dyn UserpasswdStore> = Arc::new(PgUserpasswdStore::new(
+            pool,
+            permissions_user_mapping_bind_id(site),
+        ));
         let lockout: Arc<dyn LockoutStore> = match cache {
             Some(cache) => Arc::new(RedisLockoutStore::from_env(
                 cache,
@@ -2070,11 +2090,16 @@ pub async fn handle_request_access<B>(
 /// Production [`UserpasswdStore`] over the existing tables.
 pub struct PgUserpasswdStore {
     pool: PgPool,
+    /// `conf.PermissionsUserMapping().BindID`, normalized at construction.
+    permissions_bind_id: String,
 }
 
 impl PgUserpasswdStore {
-    pub fn new(pool: PgPool) -> Self {
-        Self { pool }
+    pub fn new(pool: PgPool, permissions_bind_id: impl Into<String>) -> Self {
+        Self {
+            pool,
+            permissions_bind_id: permissions_bind_id.into(),
+        }
     }
 }
 
@@ -2275,19 +2300,19 @@ impl UserpasswdStore for PgUserpasswdStore {
     }
 
     async fn grant_pending_permissions(&self, user_id: i32) -> Result<(), StoreError> {
-        // Go: `db.Authz().GrantPendingPermissions(ctx, {UserID, Perm: authz.Read,
-        // Type: authz.PermRepos})` (`database/authz.go:98`). It enumerates the
-        // user's external accounts and, via `permissions.userMapping`, verified
-        // emails / username, then calls `PermsStore.GrantPendingPermissions`
-        // for each. The frontend has no `AuthzStore` adapter: only the
-        // low-level `sg_db::perms_store::grant_pending_permissions` statement
-        // exists, and the user-mapping helper + `sourcegraph` service
-        // constants live in the worker crate. There is also no
-        // `permssync.SchedulePermsSync`. Wiring this would mean inventing a new
-        // authz subsystem, so it stays a logged no-op; the baseline ignores the
-        // error and continues (see `docs/overviews/m9_20a_mail_wiring_overview.md` §4).
-        tracing::info!(user_id, "grant pending permissions not ported (no-op)");
-        Ok(())
+        // `db.Authz().GrantPendingPermissions(ctx, {UserID, Perm: authz.Read,
+        // Type: authz.PermRepos})` (`internal/database/authz.go:98`): enumerate
+        // the user's live external accounts plus the configured user-mapping
+        // identity, then grant each pending set in one transaction. The handler
+        // ignores failures and continues (`handlers.go:291-297`).
+        sg_db::authz::grant_pending_permissions(
+            &self.pool,
+            user_id,
+            &self.permissions_bind_id,
+            OffsetDateTime::now_utc(),
+        )
+        .await
+        .map_err(|error| StoreError::Other(error.to_string()))
     }
 
     async fn set_last_verification(
@@ -2973,6 +2998,42 @@ mod tests {
         assert_eq!(claims.user_id, 7);
         assert!(verify_unlock_token(&key, "bad.token.value").is_err());
         assert!(verify_unlock_token(&key, &token.replace(".", "..")).is_err());
+    }
+
+    #[test]
+    fn permissions_user_mapping_bind_id_matches_go_normalization() {
+        // Missing / unset -> email.
+        assert_eq!(permissions_user_mapping_bind_id(&site("{}")), "email");
+        assert_eq!(
+            permissions_user_mapping_bind_id(&site(r#"{"permissions.userMapping":{}}"#)),
+            "email"
+        );
+        // Invalid values fall back to email regardless of `enabled`.
+        assert_eq!(
+            permissions_user_mapping_bind_id(&site(
+                r#"{"permissions.userMapping":{"enabled":true,"bindID":"login"}}"#
+            )),
+            "email"
+        );
+        assert_eq!(
+            permissions_user_mapping_bind_id(&site(
+                r#"{"permissions.userMapping":{"bindID":12}}"#
+            )),
+            "email"
+        );
+        // Valid values are preserved; `enabled:false` is not consulted.
+        assert_eq!(
+            permissions_user_mapping_bind_id(&site(
+                r#"{"permissions.userMapping":{"enabled":false,"bindID":"username"}}"#
+            )),
+            "username"
+        );
+        assert_eq!(
+            permissions_user_mapping_bind_id(&site(
+                r#"{"permissions.userMapping":{"enabled":true,"bindID":"email"}}"#
+            )),
+            "email"
+        );
     }
 
     #[test]
