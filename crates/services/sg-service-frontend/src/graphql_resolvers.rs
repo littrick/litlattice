@@ -2537,6 +2537,7 @@ impl FrontendRootResolver {
     ) -> Self {
         Self {
             query: QueryRoot {
+                inventory: Arc::new(InventoryRoots::default()),
                 user,
                 repositories,
                 users,
@@ -2564,11 +2565,15 @@ impl FrontendRootResolver {
                 settings_subject_site: None,
                 auth_providers: None,
                 rbac: crate::rbac_graphql::RbacRoots::default(),
-                executor_secret_roots: crate::executor_secrets_graphql::ExecutorSecretRoots::default(),
+                executor_secret_roots:
+                    crate::executor_secrets_graphql::ExecutorSecretRoots::default(),
                 saved_searches: None,
                 code_monitors: None,
             },
-            mutation: MutationRoot::default(),
+            mutation: MutationRoot {
+                inventory: Arc::new(InventoryRoots::default()),
+                ..MutationRoot::default()
+            },
         }
     }
 
@@ -2610,8 +2615,12 @@ impl FrontendRootResolver {
         let external_url = external_url.into();
         for (field, outcome) in outcomes {
             let mutation = std::mem::take(&mut self.mutation);
-            self.mutation =
-                mutation.with_admin_mutation(viewer_site_admin, external_url.clone(), field, outcome);
+            self.mutation = mutation.with_admin_mutation(
+                viewer_site_admin,
+                external_url.clone(),
+                field,
+                outcome,
+            );
         }
         self
     }
@@ -2669,9 +2678,8 @@ impl FrontendRootResolver {
         self.query.saved_searches = saved_searches.clone();
         self.mutation.saved_searches = saved_searches.clone();
         let nested = Arc::make_mut(&mut self.query.nested);
-        nested.saved_searches = saved_searches.map(
-            crate::saved_searches_graphql::SavedSearchesHandleWrapper,
-        );
+        nested.saved_searches =
+            saved_searches.map(crate::saved_searches_graphql::SavedSearchesHandleWrapper);
         self
     }
 
@@ -2683,9 +2691,8 @@ impl FrontendRootResolver {
         self.query.code_monitors = code_monitors.clone();
         self.mutation.code_monitors = code_monitors.clone();
         let nested = Arc::make_mut(&mut self.query.nested);
-        nested.code_monitors = code_monitors.map(
-            crate::code_monitors_graphql::CodeMonitorsHandleWrapper,
-        );
+        nested.code_monitors =
+            code_monitors.map(crate::code_monitors_graphql::CodeMonitorsHandleWrapper);
         self
     }
 
@@ -2772,6 +2779,13 @@ impl FrontendRootResolver {
         self.query.feature_flags = feature_flags;
         self
     }
+
+    /// Attach the request's prefetched M9.16a inventory roots.
+    pub fn with_inventory(mut self, inventory: Arc<InventoryRoots>) -> Self {
+        self.query.inventory = inventory.clone();
+        self.mutation.inventory = inventory;
+        self
+    }
 }
 
 impl Default for FrontendRootResolver {
@@ -2792,8 +2806,112 @@ impl RootResolver for FrontendRootResolver {
     }
 }
 
+/// Prefetched M9.16a inventory roots. `Option`/map absence is the "no ported
+/// resolver" state; the production wiring is M9.16c's.
+#[derive(Debug, Clone, Default)]
+pub struct InventoryRoots {
+    /// `Query.outOfBandMigrations`.
+    pub out_of_band_migrations:
+        Option<Result<Vec<crate::out_of_band_migrations_graphql::MigrationData>, String>>,
+    /// `Query.surveyResponses`.
+    pub survey_responses: Option<crate::survey_responses::SurveyResponsesPrefetch>,
+    /// `Query.phabricatorRepo` keyed by the raw (non-lowercased) argument.
+    pub phabricator:
+        HashMap<String, Result<crate::phabricator_graphql::PhabricatorRepoData, String>>,
+    /// `Query.codeHostSyncDue` keyed by `(relay ids, seconds)`.
+    pub code_host_sync_due: HashMap<(Vec<String>, i32), Result<bool, String>>,
+    /// `Query.packageRepoFilters` keyed by `(behaviour, kind)`.
+    pub package_repo_filters:
+        HashMap<String, Result<Vec<crate::package_repo_filters::PackageRepoFilterData>, String>>,
+    /// The evaluated feature-flag business surface.
+    pub feature_flags: crate::feature_flags_graphql::FeatureFlagBusinessRoots,
+    /// `Mutation.setMigrationDirection` outcome.
+    pub migration_direction: Option<Result<(), String>>,
+    /// `submitSurvey` / `submitHappinessFeedback`.
+    pub survey_mutations: HashMap<String, crate::survey_responses::SurveyMutationOutcome>,
+    /// `setUser*Quota` / `setAutoUpgrade`.
+    pub admin_mutations:
+        HashMap<String, crate::repository_metadata_graphql::InventoryMutationOutcome>,
+}
+
+impl InventoryRoots {
+    /// One inventory root, defaulting to "no ported resolver".
+    pub fn empty() -> Self {
+        Self::default()
+    }
+}
+
+/// `Query.codeHostSyncDue` (`graphqlbackend.go:1026`,
+/// `external_services.go:1595-1629`). Empty id lists error before any DB
+/// access; unmarshal failures collapse to `unable to unmarshal id`.
+pub async fn prefetch_code_host_sync_due(
+    pool: &sqlx::PgPool,
+    fields: &[RootField],
+) -> HashMap<(Vec<String>, i32), Result<bool, String>> {
+    let mut lookups = HashMap::new();
+    for field in fields {
+        if field.name != "codeHostSyncDue" {
+            continue;
+        }
+        let raw_ids: Vec<String> = match field.arguments.get("ids") {
+            Some(InputValue::List(items)) => items
+                .iter()
+                .filter_map(|item| item.as_str().map(str::to_owned))
+                .collect(),
+            _ => Vec::new(),
+        };
+        let seconds = field.arguments.i64("seconds").unwrap_or(0) as i32;
+        let key = (raw_ids.clone(), seconds);
+        if lookups.contains_key(&key) {
+            continue;
+        }
+        if raw_ids.is_empty() {
+            lookups.insert(key, Err("no ids supplied".to_owned()));
+            continue;
+        }
+        let mut ids = Vec::with_capacity(raw_ids.len());
+        let mut invalid = false;
+        for raw in &raw_ids {
+            // `UnmarshalExternalServiceID` rejects any other relay kind.
+            let kind_ok = matches!(relay_kind(raw).as_deref(), Some("ExternalService"));
+            match unmarshal_relay_id(raw) {
+                Ok(id) if kind_ok => ids.push(i64::from(id)),
+                _ => {
+                    invalid = true;
+                    break;
+                }
+            }
+        }
+        if invalid {
+            lookups.insert(key, Err("unable to unmarshal id".to_owned()));
+            continue;
+        }
+        let deadline =
+            time::OffsetDateTime::now_utc() + time::Duration::seconds(i64::from(seconds));
+        let result = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS( \
+                 SELECT 1 FROM external_services \
+                 WHERE id = ANY($1) AND (next_sync_at IS NULL OR next_sync_at <= $2) \
+             ) OR EXISTS( \
+                 SELECT 1 FROM external_service_sync_jobs \
+                 WHERE external_service_id = ANY($1) AND state IN ('queued', 'processing') \
+             )",
+        )
+        .bind(&ids)
+        .bind(deadline)
+        .fetch_one(pool)
+        .await
+        .map_err(|error| error.to_string());
+        lookups.insert(key, result);
+    }
+    lookups
+}
+
 /// `schemaResolver` (`cmd/frontend/graphqlbackend/graphqlbackend.go:674`).
+#[derive(Clone)]
 struct QueryRoot {
+    /// M9.16a business roots (see [`InventoryRoots`]).
+    inventory: Arc<InventoryRoots>,
     /// `None` when the actor is anonymous, the row is gone, or no lookup is
     /// available. The `Actor` decides which case applies.
     user: Option<UserObject>,
@@ -2895,6 +3013,8 @@ struct QueryRoot {
 /// plus the optional search contexts mutations (M9.8hz).
 #[derive(Default)]
 pub struct MutationRoot {
+    /// M9.16a business mutations (see [`InventoryRoots`]).
+    inventory: Arc<InventoryRoots>,
     settings: crate::settings_mutation::MutationRoot,
     search_contexts: Option<SearchContextsDatabaseHandle>,
     /// Prefetched `Mutation.bumpDerivativeGraphKey` /
@@ -2952,10 +3072,7 @@ impl MutationRoot {
                 },
             )))),
             Outcome::User(user) => Ok(Some(FieldValue::Object(Arc::new(
-                UserObject::from_data_as_viewer(
-                    user.user_data(),
-                    self.admin_viewer_site_admin,
-                ),
+                UserObject::from_data_as_viewer(user.user_data(), self.admin_viewer_site_admin),
             )))),
             Outcome::Org {
                 org,
@@ -2972,14 +3089,14 @@ impl MutationRoot {
                     created: created.clone(),
                 },
             )))),
-            Outcome::ExternalService { row, warning } => Ok(Some(FieldValue::Object(
-                Arc::new(crate::external_services::ExternalServiceObject::from_mutation_row(
+            Outcome::ExternalService { row, warning } => Ok(Some(FieldValue::Object(Arc::new(
+                crate::external_services::ExternalServiceObject::from_mutation_row(
                     row,
                     warning.clone(),
                     self.admin_viewer_site_admin,
                     &self.admin_external_url,
-                )),
-            ))),
+                ),
+            )))),
             Outcome::Empty => Ok(Some(FieldValue::Object(Arc::new(
                 crate::temporary_settings::EmptyResponseObject,
             )))),
@@ -3038,6 +3155,59 @@ impl ObjectValue for MutationRoot {
                         viewer_site_admin: self.executor_secret_viewer_site_admin,
                         nested: self.executor_secret_nested.clone(),
                     },
+                )))),
+                Outcome::Empty => Ok(Some(FieldValue::Object(Arc::new(
+                    crate::temporary_settings::EmptyResponseObject,
+                )))),
+                Outcome::Error(message) => Err(ExecError::new(message.clone())),
+            };
+        }
+        // M9.16a feature-flag override mutations.
+        if let Some(outcome) = self.inventory.feature_flags.mutations.get(field) {
+            use crate::feature_flags_graphql::OverrideMutationOutcome as Outcome;
+            return match outcome {
+                Outcome::Override { data, registry } => Ok(Some(FieldValue::Object(Arc::new(
+                    crate::feature_flags_graphql::OrgOverrideObject {
+                        data: data.clone(),
+                        registry: registry.clone(),
+                    },
+                )))),
+                Outcome::Empty => Ok(Some(FieldValue::Object(Arc::new(
+                    crate::temporary_settings::EmptyResponseObject,
+                )))),
+                Outcome::Error(message) => Err(ExecError::new(message.clone())),
+            };
+        }
+        // M9.16a `setMigrationDirection`.
+        if field == "setMigrationDirection" {
+            if let Some(outcome) = &self.inventory.migration_direction {
+                return match outcome {
+                    Ok(()) => Ok(Some(FieldValue::Object(Arc::new(
+                        crate::temporary_settings::EmptyResponseObject,
+                    )))),
+                    Err(message) => Err(ExecError::new(message.clone())),
+                };
+            }
+        }
+        // M9.16a survey mutations.
+        if let Some(outcome) = self.inventory.survey_mutations.get(field) {
+            use crate::survey_responses::SurveyMutationOutcome as Outcome;
+            return match outcome {
+                Outcome::Empty => Ok(Some(FieldValue::Object(Arc::new(
+                    crate::temporary_settings::EmptyResponseObject,
+                )))),
+                Outcome::Error(message) => Err(ExecError::new(message.clone())),
+            };
+        }
+        // M9.16a quota / auto-upgrade mutations.
+        if let Some(outcome) = self.inventory.admin_mutations.get(field) {
+            use crate::repository_metadata_graphql::InventoryMutationOutcome as Outcome;
+            return match outcome {
+                Outcome::User(data) => Ok(Some(FieldValue::Object(Arc::new(
+                    crate::repository_metadata_graphql::user_object(
+                        data,
+                        self.admin_viewer_site_admin,
+                    ),
                 )))),
                 Outcome::Empty => Ok(Some(FieldValue::Object(Arc::new(
                     crate::temporary_settings::EmptyResponseObject,
@@ -3200,6 +3370,162 @@ impl ObjectValue for QueryRoot {
         actor: Actor,
     ) -> Result<Option<FieldValue>, ExecError> {
         match field {
+            // `schemaResolver.Root` (`graphqlbackend.go:843`) returns the
+            // same resolver; the snapshot is cloneable, so replay the whole
+            // root object.
+            "root" => Ok(Some(FieldValue::Object(Arc::new(self.clone())))),
+            // `Query.outOfBandMigrations` (`oobmigrations.go:38-85`).
+            "outOfBandMigrations" => match &self.inventory.out_of_band_migrations {
+                None => Ok(None),
+                Some(Err(message)) => Err(ExecError::new(message.clone())),
+                Some(Ok(migrations)) => Ok(Some(FieldValue::List {
+                    element_type: Some("OutOfBandMigration"),
+                    items: migrations
+                        .iter()
+                        .cloned()
+                        .map(|migration| {
+                            FieldValue::Object(Arc::new(
+                                crate::out_of_band_migrations_graphql::OutOfBandMigrationObject {
+                                    migration,
+                                },
+                            ))
+                        })
+                        .collect(),
+                })),
+            },
+            // `Query.evaluateFeatureFlag` (`feature_flags.go:145-153`).
+            "evaluateFeatureFlag" => {
+                let Some(name) = arguments.string("flagName") else {
+                    return Ok(None);
+                };
+                match self.inventory.feature_flags.evaluate.get(name) {
+                    None => Ok(None),
+                    Some(Err(message)) => Err(ExecError::new(message.clone())),
+                    Some(Ok(value)) => Ok(Some(crate::feature_flags_graphql::evaluate_nullable(
+                        *value,
+                    ))),
+                }
+            }
+            // `Query.evaluatedFeatureFlags` (`feature_flags.go:155-165`):
+            // reads the Redis evaluation cache, which this slice does not
+            // model, so it renders the empty set.
+            "evaluatedFeatureFlags" => Ok(Some(FieldValue::List {
+                element_type: Some("EvaluatedFeatureFlag"),
+                items: Vec::new(),
+            })),
+            // `Query.organizationFeatureFlagValue` (`feature_flags.go:167-185`).
+            "organizationFeatureFlagValue" => {
+                let Some(org_id) = arguments
+                    .string("orgID")
+                    .and_then(|id| unmarshal_relay_id(id).ok())
+                else {
+                    return Err(ExecError::new("invalid graphql.ID"));
+                };
+                let Some(flag_name) = arguments.string("flagName") else {
+                    return Ok(None);
+                };
+                match self
+                    .inventory
+                    .feature_flags
+                    .org_value
+                    .get(&(org_id, flag_name.to_owned()))
+                {
+                    None => Ok(None),
+                    Some(Err(message)) => Err(ExecError::new(message.clone())),
+                    Some(Ok(value)) => Ok(Some(FieldValue::Json(Json::Bool(*value)))),
+                }
+            }
+            // `Query.organizationFeatureFlagOverrides`
+            // (`feature_flags.go:187-200`).
+            "organizationFeatureFlagOverrides" => match &self.inventory.feature_flags.org_overrides
+            {
+                None => Ok(None),
+                Some(Err(message)) => Err(ExecError::new(message.clone())),
+                Some(Ok(overrides)) => Ok(Some(FieldValue::List {
+                    element_type: Some("FeatureFlagOverride"),
+                    items: overrides
+                        .iter()
+                        .cloned()
+                        .map(|data| {
+                            FieldValue::Object(Arc::new(
+                                crate::feature_flags_graphql::OrgOverrideObject {
+                                    data,
+                                    registry: self
+                                        .inventory
+                                        .feature_flags
+                                        .org_override_registry
+                                        .clone(),
+                                },
+                            ))
+                        })
+                        .collect(),
+                })),
+            },
+            // `Query.surveyResponses` (`survey_responses.go:11-77`).
+            "surveyResponses" => match &self.inventory.survey_responses {
+                None => Ok(None),
+                Some(prefetch) => Ok(Some(FieldValue::Object(Arc::new(
+                    crate::survey_responses::SurveyResponseConnectionObject {
+                        data: prefetch.clone(),
+                    },
+                )))),
+            },
+            // `Query.phabricatorRepo` (`graphqlbackend.go:1003`).
+            "phabricatorRepo" => {
+                let Some(name) = arguments.string("name").or_else(|| arguments.string("uri"))
+                else {
+                    return Ok(None);
+                };
+                match self.inventory.phabricator.get(name) {
+                    None => Ok(None),
+                    Some(Err(message)) => Err(ExecError::new(message.clone())),
+                    Some(Ok(repo)) => Ok(Some(FieldValue::Object(Arc::new(
+                        crate::phabricator_graphql::PhabricatorRepoObject { repo: repo.clone() },
+                    )))),
+                }
+            }
+            // `Query.packageRepoFilters` (`package_repo_filters.go:215-250`).
+            "packageRepoFilters" => {
+                let key = format!(
+                    "{:?}:{:?}",
+                    arguments.string("behaviour"),
+                    arguments.string("kind")
+                );
+                match self.inventory.package_repo_filters.get(&key) {
+                    None => Ok(None),
+                    Some(Err(message)) => Err(ExecError::new(message.clone())),
+                    Some(Ok(filters)) => Ok(Some(FieldValue::List {
+                        element_type: Some("PackageFilter"),
+                        items: filters
+                            .iter()
+                            .cloned()
+                            .map(|filter| {
+                                FieldValue::Object(Arc::new(
+                                    crate::package_repo_filters::PackageRepoFilterObject { filter },
+                                ))
+                            })
+                            .collect(),
+                    })),
+                }
+            }
+            // `Query.codeHostSyncDue` (`graphqlbackend.go:1026`).
+            "codeHostSyncDue" => {
+                let raw_ids: Vec<String> = match arguments.get("ids") {
+                    Some(InputValue::List(items)) => items
+                        .iter()
+                        .filter_map(|item| item.as_str().map(str::to_owned))
+                        .collect(),
+                    _ => Vec::new(),
+                };
+                let seconds = arguments.i64("seconds").unwrap_or(0) as i32;
+                match self.inventory.code_host_sync_due.get(&(raw_ids, seconds)) {
+                    None => Ok(None),
+                    Some(Err(message)) => Err(ExecError::new(message.clone())),
+                    Some(Ok(value)) => Ok(Some(FieldValue::Json(Json::Bool(*value)))),
+                }
+            }
+            // `Query.outboundRequests`: unported seam (see
+            // `crate::outbound_requests_graphql`).
             // `schemaResolver.Site` (`site.go:74-76`): no arguments and no
             // access check; `Site.configuration` re-checks admin itself.
             "site" => Ok(Some(FieldValue::Object(Arc::new(SiteObject {
@@ -3366,8 +3692,8 @@ impl ObjectValue for QueryRoot {
                     match self.repositories.get(&RepoKey::CloneUrl(clone_url)) {
                         Some(RepoLookup::Found(data)) => Ok(Some(FieldValue::Object(Arc::new(
                             RepositoryObject::from_data(data.clone())
-                            .with_git(self.git.clone())
-                            .with_embeddings(self.nested.repo_embeddings.clone()),
+                                .with_git(self.git.clone())
+                                .with_embeddings(self.nested.repo_embeddings.clone()),
                         )))),
                         Some(RepoLookup::NotFound) => Ok(Some(FieldValue::Null)),
                         Some(RepoLookup::Blocked { name, reason }) => Err(ExecError::new(format!(
@@ -3407,8 +3733,8 @@ impl ObjectValue for QueryRoot {
                     {
                         Some(RepoLookup::Found(data)) => Ok(Some(FieldValue::Object(Arc::new(
                             RepositoryObject::from_data(data.clone())
-                            .with_git(self.git.clone())
-                            .with_embeddings(self.nested.repo_embeddings.clone()),
+                                .with_git(self.git.clone())
+                                .with_embeddings(self.nested.repo_embeddings.clone()),
                         )))),
                         Some(RepoLookup::NotFound) => Ok(Some(FieldValue::Null)),
                         Some(RepoLookup::Blocked { name, reason }) => Err(ExecError::new(format!(
@@ -3963,7 +4289,9 @@ impl ObjectValue for QueryRoot {
                 && crate::saved_searches_graphql::is_root_field(field) =>
             {
                 crate::saved_searches_graphql::root_field(
-                    self.saved_searches.as_ref().expect("checked saved searches"),
+                    self.saved_searches
+                        .as_ref()
+                        .expect("checked saved searches"),
                     field,
                     arguments,
                     actor,
@@ -4158,12 +4486,13 @@ impl ObjectValue for UserObject {
             ),
             // `UserResolver.ExecutorSecrets` (M9.13b).
             "executorSecrets" => {
-                let args = match crate::executor_secrets_graphql::ExecutorSecretsArgs::from_arguments(
-                    arguments,
-                ) {
-                    Ok(args) => args,
-                    Err(message) => return Err(ExecError::new(message)),
-                };
+                let args =
+                    match crate::executor_secrets_graphql::ExecutorSecretsArgs::from_arguments(
+                        arguments,
+                    ) {
+                        Ok(args) => args,
+                        Err(message) => return Err(ExecError::new(message)),
+                    };
                 match self
                     .nested
                     .user_executor_secrets
@@ -5033,12 +5362,13 @@ impl ObjectValue for OrgObject {
             }
             // `OrgResolver.ExecutorSecrets` (M9.13b).
             "executorSecrets" => {
-                let args = match crate::executor_secrets_graphql::ExecutorSecretsArgs::from_arguments(
-                    arguments,
-                ) {
-                    Ok(args) => args,
-                    Err(message) => return Err(ExecError::new(message)),
-                };
+                let args =
+                    match crate::executor_secrets_graphql::ExecutorSecretsArgs::from_arguments(
+                        arguments,
+                    ) {
+                        Ok(args) => args,
+                        Err(message) => return Err(ExecError::new(message)),
+                    };
                 match self
                     .nested
                     .org_executor_secrets
@@ -5736,6 +6066,48 @@ pub trait FeatureFlagStore: Send + Sync {
         kind: FeatureFlagKind,
     ) -> Result<FeatureFlag, String>;
     async fn delete_feature_flag(&self, name: &str) -> Result<(), String>;
+
+    /// `GetUserFlags` (`internal/database/feature_flags.go:490-576`).
+    async fn get_user_flags(
+        &self,
+        user_id: i32,
+    ) -> Result<std::collections::HashMap<String, bool>, String>;
+    /// `GetGlobalFeatureFlags` (`internal/database/feature_flags.go:592-604`).
+    async fn get_global_flags(&self) -> Result<std::collections::HashMap<String, bool>, String>;
+    /// `GetOrgOverrideForFlag` (`internal/database/feature_flags.go:441-462`).
+    async fn get_org_override_for_flag(
+        &self,
+        org_id: i32,
+        flag_name: &str,
+    ) -> Result<Option<FeatureFlagOverride>, String>;
+    /// `GetOrgOverridesForUser` (`internal/database/feature_flags.go:416-438`).
+    async fn get_org_overrides_for_user(
+        &self,
+        user_id: i32,
+    ) -> Result<Vec<FeatureFlagOverride>, String>;
+    /// `CreateOverride` (`internal/database/feature_flags.go:278-314`).
+    async fn create_override(
+        &self,
+        user_id: Option<i32>,
+        org_id: Option<i32>,
+        flag_name: &str,
+        value: bool,
+    ) -> Result<FeatureFlagOverride, String>;
+    /// `UpdateOverride` (`internal/database/feature_flags.go:340-370`).
+    async fn update_override(
+        &self,
+        user_id: Option<i32>,
+        org_id: Option<i32>,
+        flag_name: &str,
+        value: bool,
+    ) -> Result<FeatureFlagOverride, String>;
+    /// `DeleteOverride` (`internal/database/feature_flags.go:316-338`).
+    async fn delete_override(
+        &self,
+        user_id: Option<i32>,
+        org_id: Option<i32>,
+        flag_name: &str,
+    ) -> Result<(), String>;
 }
 
 /// One `FeatureFlagOverride` plus the prefetched `namespace` lookup
@@ -5961,7 +6333,7 @@ pub(crate) async fn feature_flag_data(
 /// `relay.MarshalID("FeatureFlagOverride", overrideSpec{...})`
 /// (`feature_flags.go:110-130`): Go's `json.Marshal` field order is `UserID`,
 /// `OrgID`, `FlagName`; nil pointers are `null`.
-fn marshal_feature_flag_override_id(
+pub(crate) fn marshal_feature_flag_override_id(
     user_id: Option<i32>,
     org_id: Option<i32>,
     flag_name: &str,

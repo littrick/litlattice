@@ -799,10 +799,7 @@ impl SchemaGraphqlDeps {
     }
 
     /// Wire the admin/account write seams (M9.12b).
-    pub fn with_admin_mutations(
-        mut self,
-        deps: crate::admin_mutations::AdminMutationDeps,
-    ) -> Self {
+    pub fn with_admin_mutations(mut self, deps: crate::admin_mutations::AdminMutationDeps) -> Self {
         self.admin_mutations = Some(deps);
         self
     }
@@ -932,10 +929,7 @@ impl SchemaGraphqlDeps {
     }
 
     /// Attach the read-only diagnostic `Site` seams (M9.14c).
-    pub fn with_diagnostics(
-        mut self,
-        deps: crate::diagnostics_graphql::DiagnosticsDeps,
-    ) -> Self {
+    pub fn with_diagnostics(mut self, deps: crate::diagnostics_graphql::DiagnosticsDeps) -> Self {
         self.diagnostics = Some(deps);
         self
     }
@@ -1513,6 +1507,109 @@ impl GraphqlDeps for SchemaGraphqlDeps {
             }
             _ => crate::graphql_resolvers::FeatureFlagRoots::default(),
         };
+        // M9.16a inventory roots. Each prefetch is skipped when the operation
+        // did not select the field; `None` keeps the field unported.
+        let inventory = match &self.pool {
+            Some(pool) => {
+                let mut inventory = crate::graphql_resolvers::InventoryRoots {
+                    out_of_band_migrations:
+                        crate::out_of_band_migrations_graphql::prefetch_out_of_band_migrations(
+                            pool,
+                            &fields,
+                            request.actor,
+                            site_admin,
+                        )
+                        .await,
+                    survey_responses: crate::survey_responses::prefetch_survey_responses(
+                        pool,
+                        self.users.as_ref().map(|users| {
+                            users.as_ref() as &dyn crate::graphql_resolvers::UserLookupStore
+                        }),
+                        &fields,
+                        request.actor,
+                        site_admin,
+                    )
+                    .await,
+                    phabricator: crate::phabricator_graphql::prefetch_phabricator_repos(
+                        pool, &fields,
+                    )
+                    .await,
+                    code_host_sync_due: crate::graphql_resolvers::prefetch_code_host_sync_due(
+                        pool, &fields,
+                    )
+                    .await,
+                    package_repo_filters:
+                        crate::package_repo_filters::prefetch_package_repo_filters(pool, &fields)
+                            .await,
+                    ..crate::graphql_resolvers::InventoryRoots::default()
+                };
+                inventory.feature_flags = match (&self.feature_flags, &self.org_memberships) {
+                    (Some(store), Some(namespaces)) => {
+                        crate::feature_flags_graphql::prefetch_feature_flag_business(
+                            store.as_ref(),
+                            namespaces.as_ref(),
+                            &fields,
+                            request.actor,
+                            site_admin,
+                        )
+                        .await
+                    }
+                    _ => Default::default(),
+                };
+                if is_mutation {
+                    inventory.migration_direction =
+                        crate::out_of_band_migrations_graphql::prefetch_set_migration_direction(
+                            pool,
+                            &fields,
+                            request.actor,
+                            site_admin,
+                        )
+                        .await;
+                    if let (Some(store), Some(namespaces)) =
+                        (&self.feature_flags, &self.org_memberships)
+                    {
+                        for (field, outcome) in
+                            crate::feature_flags_graphql::prefetch_feature_flag_override_mutations(
+                                store.as_ref(),
+                                namespaces.as_ref(),
+                                &fields,
+                                request.actor,
+                                site_admin,
+                            )
+                            .await
+                        {
+                            inventory.feature_flags.mutations.insert(field, outcome);
+                        }
+                    }
+                    for (field, outcome) in crate::survey_responses::prefetch_survey_mutations(
+                        pool,
+                        &fields,
+                        request.actor,
+                    )
+                    .await
+                    {
+                        inventory.survey_mutations.insert(field, outcome);
+                    }
+                    for (field, outcome) in
+                        crate::repository_metadata_graphql::prefetch_inventory_admin_mutations(
+                            pool,
+                            self.users.as_ref().map(|users| {
+                                users.as_ref() as &dyn crate::graphql_resolvers::UserLookupStore
+                            }),
+                            &fields,
+                            request.actor,
+                            site_admin,
+                        )
+                        .await
+                    {
+                        inventory.admin_mutations.insert(field, outcome);
+                    }
+                }
+                inventory
+            }
+            None => crate::graphql_resolvers::InventoryRoots::default(),
+        };
+        let inventory = std::sync::Arc::new(inventory);
         let mut nested = match (
             &self.user_organizations,
             &self.org_members,
@@ -1620,15 +1717,18 @@ impl GraphqlDeps for SchemaGraphqlDeps {
             crate::executor_secrets_graphql::ExecutorSecretRoots::default();
         let mut executor_secret_mutations = Vec::new();
         if let Some(store) = &self.executor_secrets {
-            executor_secret_roots = crate::executor_secrets_graphql::prefetch_executor_secret_roots(
-                store.as_ref(),
+            executor_secret_roots =
+                crate::executor_secrets_graphql::prefetch_executor_secret_roots(
+                    store.as_ref(),
+                    &fields,
+                    request.actor,
+                    site_admin,
+                )
+                .await;
+            let mut selected = crate::executor_secrets_graphql::selected_from_roots(
+                &executor_secret_roots,
                 &fields,
-                request.actor,
-                site_admin,
-            )
-            .await;
-            let mut selected =
-                crate::executor_secrets_graphql::selected_from_roots(&executor_secret_roots, &fields);
+            );
             let mut nested_selected =
                 crate::executor_secrets_graphql::prefetch_executor_secret_nested(
                     store.as_ref(),
@@ -1644,7 +1744,9 @@ impl GraphqlDeps for SchemaGraphqlDeps {
                 )
                 .await;
             selected.secrets.append(&mut nested_selected.secrets);
-            selected.access_logs.append(&mut nested_selected.access_logs);
+            selected
+                .access_logs
+                .append(&mut nested_selected.access_logs);
             let (secret_nodes, mut node_selected) =
                 crate::executor_secrets_graphql::prefetch_executor_secret_nodes(
                     store.as_ref(),
@@ -1676,16 +1778,18 @@ impl GraphqlDeps for SchemaGraphqlDeps {
                         &fields,
                     );
                 selected.secrets.append(&mut mutation_selected.secrets);
-                selected.access_logs.append(&mut mutation_selected.access_logs);
+                selected
+                    .access_logs
+                    .append(&mut mutation_selected.access_logs);
             }
             crate::executor_secrets_graphql::prefetch_selected_secrets(
                 store.as_ref(),
-                self.users.as_ref().map(|users| {
-                    users.as_ref() as &dyn crate::graphql_resolvers::UserLookupStore
-                }),
-                self.org_memberships
+                self.users
                     .as_ref()
-                    .map(|store| store.as_ref() as &dyn crate::graphql_resolvers::OrgMembershipsStore),
+                    .map(|users| users.as_ref() as &dyn crate::graphql_resolvers::UserLookupStore),
+                self.org_memberships.as_ref().map(|store| {
+                    store.as_ref() as &dyn crate::graphql_resolvers::OrgMembershipsStore
+                }),
                 &selected,
                 request.actor.uid().unwrap_or(0),
                 site_admin,
@@ -1777,7 +1881,10 @@ impl GraphqlDeps for SchemaGraphqlDeps {
             Some(store) => {
                 let force_allow = std::env::var("SRC_INTERNAL_EMBEDDINGS_ALLOWED")
                     .map(|value| {
-                        matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "t" | "true")
+                        matches!(
+                            value.trim().to_ascii_lowercase().as_str(),
+                            "1" | "t" | "true"
+                        )
                     })
                     .unwrap_or(false);
                 let enabled = self.auth_providers.as_ref().is_some_and(|live| {
@@ -1979,6 +2086,7 @@ impl GraphqlDeps for SchemaGraphqlDeps {
             .with_repository_redirects(repository_redirects)
             .with_temporary_settings(temporary_settings)
             .with_feature_flags(feature_flags)
+            .with_inventory(inventory)
             .with_external_services(external_services)
             .with_webhook_logs(webhook_logs)
             .with_repositories_connections(repositories_connections)
@@ -1994,11 +2102,8 @@ impl GraphqlDeps for SchemaGraphqlDeps {
             .with_site(site)
             .with_settings_subject_site_configuration(settings_subject_site);
         if !admin_mutation_outcomes.is_empty() {
-            roots = roots.with_admin_mutations(
-                site_admin,
-                admin_external_url,
-                admin_mutation_outcomes,
-            );
+            roots =
+                roots.with_admin_mutations(site_admin, admin_external_url, admin_mutation_outcomes);
         }
         if !executor_secret_mutations.is_empty() {
             roots = roots.with_executor_secret_mutations(
