@@ -470,14 +470,276 @@ fn format_appended_errors(errs: &[String]) -> String {
     }
 }
 
-/// `stepsForRepo` ([workspace_resolver.go:819](../../../origin/repo/internal/batches/service/workspace_resolver.go#L819)).
+/// `template.StepContext`'s ahead-of-execution values (`lib/batches/template/templating.go`).
+#[derive(Debug, Clone, Default)]
+pub struct StepContext {
+    pub repository_name: String,
+    pub repository_branch: String,
+    pub repository_file_matches: Vec<String>,
+    pub batch_change_name: String,
+    pub batch_change_description: String,
+}
+
+impl StepContext {
+    /// `evalNode`'s `ChainNode` subset: only `repository.name` is static
+    /// (`search_result_paths` is deliberately not evaluated, like the
+    /// baseline).
+    fn repository(&self) -> BTreeMap<&'static str, String> {
+        BTreeMap::from([("name", self.repository_name.clone())])
+    }
+
+    fn batch_change(&self) -> BTreeMap<&'static str, String> {
+        BTreeMap::from([
+            ("name", self.batch_change_name.clone()),
+            ("description", self.batch_change_description.clone()),
+        ])
+    }
+}
+
+/// A partially evaluated template value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TemplateValue {
+    Str(String),
+    Bool(bool),
+}
+
+impl TemplateValue {
+    /// `fmt.Fprint` of the value (only `bool` and `string` can be static).
+    fn render(&self) -> String {
+        match self {
+            Self::Str(value) => value.clone(),
+            Self::Bool(value) => value.to_string(),
+        }
+    }
+
+    /// `isTrue`: non-empty strings are true.
+    fn truthy(&self) -> Result<bool, String> {
+        match self {
+            Self::Bool(value) => Ok(*value),
+            Self::Str(value) => Ok(!value.is_empty()),
+        }
+    }
+}
+
+/// `template.startDelim` / `template.endDelim`.
+const TEMPLATE_START: &str = "${{";
+const TEMPLATE_END: &str = "}}";
+
+/// `template.isTrueOutput`.
+fn is_true_output(output: &str) -> bool {
+    output.trim() == "true"
+}
+
+fn tokenize_action(action: &str) -> Result<Vec<String>, String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut chars = action.chars().peekable();
+    let mut in_string = false;
+    while let Some(ch) = chars.next() {
+        match ch {
+            '"' => {
+                in_string = !in_string;
+                current.push(ch);
+            }
+            '(' | ')' if !in_string => {
+                if !current.is_empty() {
+                    tokens.push(std::mem::take(&mut current));
+                }
+                tokens.push(ch.to_string());
+            }
+            whitespace if whitespace.is_whitespace() && !in_string => {
+                if !current.is_empty() {
+                    tokens.push(std::mem::take(&mut current));
+                }
+            }
+            _ => current.push(ch),
+        }
+    }
+    if in_string {
+        return Err("unterminated string in template action".to_owned());
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    Ok(tokens)
+}
+
+fn unquote(token: &str) -> Result<String, String> {
+    if token.len() >= 2 && token.starts_with('"') && token.ends_with('"') {
+        let inner = &token[1..token.len() - 1];
+        let mut out = String::new();
+        let mut chars = inner.chars();
+        while let Some(ch) = chars.next() {
+            if ch == '\\' {
+                match chars.next() {
+                    Some('n') => out.push('\n'),
+                    Some('t') => out.push('\t'),
+                    Some('r') => out.push('\r'),
+                    Some('"') => out.push('"'),
+                    Some('\\') => out.push('\\'),
+                    Some(other) => out.push(other),
+                    None => return Err("unterminated escape".to_owned()),
+                }
+            } else {
+                out.push(ch);
+            }
+        }
+        return Ok(out);
+    }
+    Err(format!("not a string literal: {token}"))
+}
+
+/// Evaluate one argument: string literal, boolean, or a context path.
+fn eval_argument(token: &str, ctx: &StepContext) -> Result<TemplateValue, String> {
+    if token.starts_with('"') {
+        return unquote(token).map(TemplateValue::Str);
+    }
+    match token {
+        "true" => return Ok(TemplateValue::Bool(true)),
+        "false" => return Ok(TemplateValue::Bool(false)),
+        _ => {}
+    }
+    let path = token.trim_start_matches('.');
+    let mut parts = path.split('.');
+    let root = parts.next().unwrap_or_default();
+    let field = parts.next();
+    if parts.next().is_some() {
+        return Err(format!("unsupported template path {token:?}"));
+    }
+    let map = match root.to_ascii_lowercase().as_str() {
+        "repository" => ctx.repository(),
+        "batch_change" | "batchchange" => ctx.batch_change(),
+        _ => return Err(format!("unknown template root {root:?}")),
+    };
+    match field {
+        Some(field) => map
+            .get(field)
+            .cloned()
+            .map(TemplateValue::Str)
+            .ok_or_else(|| format!("unknown template field {token:?}")),
+        None => Err(format!("unsupported template path {token:?}")),
+    }
+}
+
+/// Evaluate an action expression. Returns `None` when only dynamic values are
+/// involved (the caller then treats the template as non-static).
+fn eval_action(action: &str, ctx: &StepContext) -> Result<Option<TemplateValue>, String> {
+    let tokens = tokenize_action(action)?;
+    if tokens.is_empty() {
+        return Ok(Some(TemplateValue::Str(String::new())));
+    }
+    // Pipelines and declarations are outside the static subset.
+    if tokens.iter().any(|token| token == "|" || token.starts_with('$')) {
+        return Ok(None);
+    }
+    if tokens.len() == 1 && !matches!(tokens[0].as_str(), "(" | ")") {
+        return match eval_argument(&tokens[0], ctx) {
+            Ok(value) => Ok(Some(value)),
+            Err(_) => Ok(None),
+        };
+    }
+
+    // Function call: name (args...).
+    let name = tokens[0].as_str();
+    if name == "(" {
+        return Ok(None);
+    }
+    let mut args = Vec::new();
+    let mut depth = 0usize;
+    for token in &tokens[1..] {
+        match token.as_str() {
+            "(" => depth += 1,
+            ")" => {
+                if depth == 0 {
+                    return Err("unbalanced parentheses in template action".to_owned());
+                }
+                depth -= 1;
+            }
+            _ if depth == 0 => args.push(token.clone()),
+            _ => return Err("nested function calls are not static".to_owned()),
+        }
+    }
+    if depth != 0 {
+        return Err("unbalanced parentheses in template action".to_owned());
+    }
+
+    let mut values = Vec::with_capacity(args.len());
+    for arg in &args {
+        match eval_argument(arg, ctx) {
+            Ok(value) => values.push(value),
+            Err(_) => return Ok(None),
+        }
+    }
+
+    let result = match name {
+        "eq" => {
+            if values.len() != 2 {
+                return Err("eq requires two arguments".to_owned());
+            }
+            TemplateValue::Bool(values[0] == values[1])
+        }
+        "ne" => {
+            if values.len() != 2 {
+                return Err("ne requires two arguments".to_owned());
+            }
+            TemplateValue::Bool(values[0] != values[1])
+        }
+        "not" => {
+            if values.len() != 1 {
+                return Err("not requires one argument".to_owned());
+            }
+            TemplateValue::Bool(!values[0].truthy()?)
+        }
+        // `and`/`or`, `repository.search_result_paths`, `join`, `matches` and
+        // friends are outside `partial_eval`'s supported subset; degrade to
+        // dynamic.
+        _ => return Ok(None),
+    };
+    Ok(Some(result))
+}
+
+/// `template.IsStaticBool`: returns `(is_static, bool_value)`.
 ///
-/// Seam: `template.IsStaticBool` is not ported. A non-empty condition is
-/// treated as dynamic (the step is kept), which matches every case except a
-/// statically-false condition.
+/// Static evaluation is all-or-nothing per action node, like the baseline:
+/// an action outside the supported subset leaves the whole template dynamic.
+pub fn is_static_bool(
+    input: &str,
+    ctx: &StepContext,
+) -> Result<(bool, bool), String> {
+    let mut output = String::new();
+    let mut rest = input;
+    let mut all_static = true;
+    while let Some(start) = rest.find(TEMPLATE_START) {
+        output.push_str(&rest[..start]);
+        let after_start = &rest[start + TEMPLATE_START.len()..];
+        let Some(end) = after_start.find(TEMPLATE_END) else {
+            return Err("unclosed template action".to_owned());
+        };
+        let action = &after_start[..end];
+        match eval_action(action.trim(), ctx)? {
+            Some(value) => output.push_str(&value.render()),
+            None => {
+                all_static = false;
+                output.push_str(TEMPLATE_START);
+                output.push_str(action);
+                output.push_str(TEMPLATE_END);
+            }
+        }
+        rest = &after_start[end + TEMPLATE_END.len()..];
+    }
+    output.push_str(rest);
+    if !all_static {
+        return Ok((false, false));
+    }
+    Ok((true, is_true_output(&output)))
+}
+
+/// `stepsForRepo` ([workspace_resolver.go:741](../../../origin/repo/internal/batches/service/workspace_resolver.go#L741)).
+///
+/// Static-false conditions drop the step; dynamic conditions keep it.
 pub fn steps_for_repo<'a>(
     spec: &'a BatchSpec,
-    _repo: &RepoRevision,
+    repo: &RepoRevision,
 ) -> Result<Vec<&'a Step>, String> {
     let mut task_steps: Vec<&Step> = Vec::with_capacity(spec.steps.len());
     for step in &spec.steps {
@@ -485,8 +747,17 @@ pub fn steps_for_repo<'a>(
             task_steps.push(step);
             continue;
         }
-        // Dynamic condition (or an unsupported static evaluation): keep it.
-        task_steps.push(step);
+        let ctx = StepContext {
+            repository_name: repo.repo_name.clone(),
+            repository_branch: repo.branch.clone(),
+            repository_file_matches: repo.file_matches.clone(),
+            batch_change_name: spec.name.clone(),
+            batch_change_description: spec.description.clone(),
+        };
+        let (is_static, value) = is_static_bool(step.if_condition(), &ctx)?;
+        if !is_static || value {
+            task_steps.push(step);
+        }
     }
     Ok(task_steps)
 }

@@ -387,6 +387,121 @@ impl ChangesetSyncFn for StoreSyncFn {
     }
 }
 
+/// A `ChangesetEvent` as the syncer persists it (`kind` + `key`; metadata is
+/// the code-host payload).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SyncedEvent {
+    pub kind: String,
+    pub key: String,
+    pub metadata: serde_json::Value,
+}
+
+/// The result of `source.LoadChangeset`:
+///
+/// * `Loaded` — metadata refreshed (possibly with an error the syncer must
+///   record before returning it);
+/// * `NotFound` — `ChangesetNotFoundError`, the changeset is marked deleted.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct LoadedChangeset {
+    /// `c.Events()` after the load; deduplicated.
+    pub events: Vec<SyncedEvent>,
+    /// `SyncErrorMessage` to store; the caller returns the error afterwards.
+    pub sync_error: Option<String>,
+    /// `c.IsDeleted()` should be set (`ChangesetNotFoundError`).
+    pub deleted: bool,
+}
+
+/// Source-side of `syncer.SyncChangeset`: loads the changeset and returns its
+/// derived events. Production implements this over `sg-extsvc` +
+/// gitserver; the DB writes stay in [`ChangesetSyncBackend`].
+#[async_trait]
+pub trait ChangesetSourceLoader: Send + Sync {
+    async fn load_changeset(&self, changeset_id: i64) -> Result<LoadedChangeset, String>;
+}
+
+/// Persistence side of `syncer.SyncChangeset`.
+#[async_trait]
+pub trait ChangesetSyncBackend: Send + Sync {
+    /// `UpdateChangesetCodeHostState`.
+    async fn update_changeset_code_host_state(
+        &self,
+        changeset_id: i64,
+        sync_error: Option<&str>,
+        deleted: bool,
+    ) -> Result<(), String>;
+    /// `UpsertChangesetEvents`.
+    async fn upsert_changeset_events(
+        &self,
+        changeset_id: i64,
+        events: &[SyncedEvent],
+    ) -> Result<(), String>;
+}
+
+/// `syncer.SyncChangeset`'s ordering (`syncer.go:516-554`), with the
+/// changeset load and persistence injected.
+///
+/// * load error that is not `ChangesetNotFoundError`: record the error, then
+///   return it;
+/// * not found: mark deleted (when not already deleted);
+/// * success: clear the error, update code-host state, upsert events. A
+///   `SetDerivedState` error is a seam (gitserver).
+pub async fn sync_changeset(
+    loader: &dyn ChangesetSourceLoader,
+    backend: &dyn ChangesetSyncBackend,
+    changeset_id: i64,
+) -> Result<(), String> {
+    let loaded = match loader.load_changeset(changeset_id).await {
+        Ok(loaded) => loaded,
+        Err(err) => {
+            backend
+                .update_changeset_code_host_state(changeset_id, Some(&err), false)
+                .await?;
+            return Err(err);
+        }
+    };
+
+    // Reset the syncer error message.
+    backend
+        .update_changeset_code_host_state(changeset_id, None, loaded.deleted)
+        .await?;
+    backend
+        .upsert_changeset_events(changeset_id, &loaded.events)
+        .await?;
+    Ok(())
+}
+
+/// [`ChangesetSyncFn`] wired to an injected code-host loader/backend.
+pub struct SourceSyncFn {
+    store: Arc<dyn ChangesetSyncStore>,
+    loader: Arc<dyn ChangesetSourceLoader>,
+    backend: Arc<dyn ChangesetSyncBackend>,
+}
+
+impl SourceSyncFn {
+    pub fn new(
+        store: Arc<dyn ChangesetSyncStore>,
+        loader: Arc<dyn ChangesetSourceLoader>,
+        backend: Arc<dyn ChangesetSyncBackend>,
+    ) -> Self {
+        Self {
+            store,
+            loader,
+            backend,
+        }
+    }
+}
+
+#[async_trait]
+impl ChangesetSyncFn for SourceSyncFn {
+    async fn sync(&self, id: i64) -> Result<(), String> {
+        // `GetChangeset` precondition: `ErrNoResults` is a no-op.
+        if self.store.get_changeset_for_sync(id).await?.is_none() {
+            return Ok(());
+        }
+        sync_changeset(self.loader.as_ref(), self.backend.as_ref(), id).await
+    }
+}
+
 /// `batches/syncer.SyncRegistry`.
 pub struct SyncRegistry {
     store: Arc<dyn ChangesetSyncStore>,

@@ -10,19 +10,20 @@
 //! previous `changeset_specs`, computes a [`Plan`] and executes it against a
 //! [`ChangesetSource`].
 //!
-//! Code-host API clients (GitHub/GitLab/Bitbucket/AzureDevOps/Perforce/Gerrit)
-//! are **not ported**. The production [`NotPortedSourceFactory`] returns
-//! [`SourceError::not_ported`] only when a source call is actually required;
-//! the differential harness injects a fake source. `state.SetDerivedState`,
-//! `Changeset.Events()` and GitHub App commit signing are likewise seams (the
-//! source is responsible for setting `external_state`), see the slice overview
-//! §4.
+//! Code-host source calls go through the [`ChangesetSourceFactory`] seam.
+//! [`ExtsvcSourceFactory`] builds the real GitHub/GitLab/Bitbucket Server
+//! clients from `sg-extsvc` with an injectable [`sg_extsvc::HttpDoer`], while
+//! [`NotPortedSourceFactory`] remains the default when no credentials/config
+//! are wired. `state.SetDerivedState`, gitserver push
+//! ([`ChangesetSource::push_commit`]), `Changeset.Events()` derivation and
+//! GitHub App commit signing remain explicit seams, see the slice overview §4.
 //!
 //! Handler transaction semantics match `Reconciler.HandlerFunc`: `process`
 //! runs inside a store transaction, `done(err)` commits or rolls back, and the
 //! after-done webhook hook runs regardless of the transaction outcome.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -32,6 +33,7 @@ use sg_db::batches::{
     RECONCILER_STALLED_MAX_AGE_SECONDS, RECONCILER_STORE_NAME, RECONCILER_TABLE, RECONCILER_VIEW,
     RECONCILER_WORKER_DESCRIPTION, RECONCILER_WORKER_NAME,
 };
+use sg_extsvc::batches_sources as extsvc;
 use sg_db::OffsetDateTime;
 use sqlx::postgres::PgPool;
 use tokio_util::sync::CancellationToken;
@@ -870,6 +872,407 @@ impl ChangesetSourceFactory for NotPortedSourceFactory {
         _target_repo: &Repo,
     ) -> Result<Arc<dyn ChangesetSource>, SourceError> {
         Err(SourceError::not_ported())
+    }
+}
+
+/// Resolves the code-host repository object (`repositoryId`, project path,
+/// `slug`) that `types.Repo.Metadata` would carry in the baseline.
+///
+/// The worker's [`Repo`] is reduced to id/name/archived, so production wires a
+/// store-backed implementation; the default derives the minimum from the name.
+#[async_trait]
+pub trait RepoMetadataProvider: Send + Sync {
+    async fn metadata(&self, kind: &str, repo: &Repo) -> Result<serde_json::Value, SourceError>;
+}
+
+/// Default provider: derive the code-host identity from `repo.name`.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NameRepoMetadataProvider;
+
+#[async_trait]
+impl RepoMetadataProvider for NameRepoMetadataProvider {
+    async fn metadata(
+        &self,
+        kind: &str,
+        repo: &Repo,
+    ) -> Result<serde_json::Value, SourceError> {
+        Ok(match kind {
+            "GITHUB" => serde_json::json!({"name_with_owner": repo.name}),
+            "GITLAB" => serde_json::json!({"path_with_namespace": repo.name}),
+            "BITBUCKETSERVER" => {
+                let (project, slug) = repo
+                    .name
+                    .split_once('/')
+                    .map(|(project, slug)| (project.to_owned(), slug.to_owned()))
+                    .unwrap_or_else(|| ("".to_owned(), repo.name.clone()));
+                serde_json::json!({"slug": slug, "project": {"key": project}})
+            }
+            other => {
+                return Err(SourceError::non_retryable(format!(
+                    "building changeset source: unsupported external service kind {other:?}"
+                )))
+            }
+        })
+    }
+}
+
+/// Production [`ChangesetSourceFactory`] backed by `sg-extsvc`'s code-host
+/// clients.
+///
+/// All HTTP goes through the injected [`sg_extsvc::HttpDoer`]; no request is
+/// made unless a source operation is executed. The metadata cache keeps the
+/// code-host metadata across the per-operation factory calls (`load` caches,
+/// a later `update`/`close` reuses it).
+pub struct ExtsvcSourceFactory {
+    kind: String,
+    base_url: url::Url,
+    auth: extsvc::SourceAuth,
+    http: Arc<dyn sg_extsvc::HttpDoer>,
+    repo_metadata: Arc<dyn RepoMetadataProvider>,
+    metadata_cache: Arc<Mutex<HashMap<i64, serde_json::Value>>>,
+    remote_cache: Arc<Mutex<HashMap<i64, extsvc::Repo>>>,
+}
+
+impl ExtsvcSourceFactory {
+    pub fn new(
+        kind: impl Into<String>,
+        base_url: url::Url,
+        auth: extsvc::SourceAuth,
+        http: Arc<dyn sg_extsvc::HttpDoer>,
+        repo_metadata: Arc<dyn RepoMetadataProvider>,
+    ) -> Self {
+        Self {
+            kind: kind.into(),
+            base_url,
+            auth,
+            http,
+            repo_metadata,
+            metadata_cache: Arc::new(Mutex::new(HashMap::new())),
+            remote_cache: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Convenience constructor with the name-derived metadata provider.
+    pub fn with_name_metadata(
+        kind: impl Into<String>,
+        base_url: url::Url,
+        auth: extsvc::SourceAuth,
+        http: Arc<dyn sg_extsvc::HttpDoer>,
+    ) -> Self {
+        Self::new(
+            kind,
+            base_url,
+            auth,
+            http,
+            Arc::new(NameRepoMetadataProvider),
+        )
+    }
+}
+
+fn ext_repo(kind: &str, repo: &Repo, metadata: serde_json::Value) -> extsvc::Repo {
+    extsvc::Repo {
+        id: repo.id,
+        name: repo.name.clone(),
+        metadata,
+        external_repo: extsvc::ExternalRepoSpec {
+            id: String::new(),
+            service_type: extsvc::kind_to_type(kind),
+            service_id: String::new(),
+        },
+        ..Default::default()
+    }
+}
+
+fn ext_spec(spec: &ChangesetSpec) -> extsvc::ChangesetSpec {
+    extsvc::ChangesetSpec {
+        diff: spec.diff.clone(),
+        base_rev: spec.base_rev.clone(),
+        head_ref: spec.head_ref.clone(),
+        commit_message: spec.commit_message.clone(),
+        commit_author_name: spec.commit_author_name.clone(),
+        commit_author_email: spec.commit_author_email.clone(),
+        created_at: String::new(),
+        fork_namespace: None,
+    }
+}
+
+fn map_source_error(err: extsvc::SourceError) -> SourceError {
+    match err.kind {
+        extsvc::SourceErrorKind::NotFound => SourceError::not_found(err.message),
+        extsvc::SourceErrorKind::NonRetryable | extsvc::SourceErrorKind::NotMergeable => {
+            SourceError::non_retryable(err.message)
+        }
+        extsvc::SourceErrorKind::Archived => SourceError::archived(err.message),
+        extsvc::SourceErrorKind::Other => SourceError::other(err.message),
+    }
+}
+
+/// Adapts one `sg-extsvc` source to the reconciler's [`ChangesetSource`].
+struct ExtsvcReconcilerSource {
+    factory: Arc<ExtsvcSourceFactory>,
+    source: Arc<dyn extsvc::ChangesetSource>,
+}
+
+impl ExtsvcReconcilerSource {
+    async fn build_ext_changeset(
+        &self,
+        cs: &SourceChangeset,
+    ) -> Result<extsvc::SourceChangeset, SourceError> {
+        let target_metadata = self
+            .factory
+            .repo_metadata
+            .metadata(&self.factory.kind, &cs.target_repo)
+            .await?;
+        let target_repo = ext_repo(&self.factory.kind, &cs.target_repo, target_metadata);
+
+        let remote_repo = {
+            let cache = self
+                .factory
+                .remote_cache
+                .lock()
+                .map_err(|_| SourceError::other("source metadata cache poisoned"))?;
+            cache.get(&cs.changeset.id).cloned()
+        }
+        .unwrap_or_else(|| target_repo.clone());
+
+        let metadata = {
+            let cache = self
+                .factory
+                .metadata_cache
+                .lock()
+                .map_err(|_| SourceError::other("source metadata cache poisoned"))?;
+            cache
+                .get(&cs.changeset.id)
+                .cloned()
+                .unwrap_or(serde_json::Value::Null)
+        };
+
+        Ok(extsvc::SourceChangeset {
+            title: cs.title.clone(),
+            body: cs.body.clone(),
+            head_ref: cs.head_ref.clone(),
+            base_ref: cs.base_ref.clone(),
+            remote_repo,
+            target_repo,
+            changeset: extsvc::Changeset {
+                id: cs.changeset.id,
+                external_id: cs.changeset.external_id.clone(),
+                external_branch: cs.changeset.external_branch.clone(),
+                external_fork_namespace: String::new(),
+                external_fork_name: String::new(),
+                metadata,
+            },
+        })
+    }
+
+    fn cache_result(&self, changeset_id: i64, cs: &extsvc::SourceChangeset) {
+        if let Ok(mut cache) = self.factory.metadata_cache.lock() {
+            cache.insert(changeset_id, cs.changeset.metadata.clone());
+        }
+    }
+
+    async fn mutate(
+        &self,
+        cs: &mut SourceChangeset,
+        operation: SourceMutation,
+    ) -> Result<(), SourceError> {
+        let mut ext = self.build_ext_changeset(cs).await?;
+        let result = match operation {
+            SourceMutation::Update => self.source.update_changeset(&mut ext).await,
+            SourceMutation::Reopen => self.source.reopen_changeset(&mut ext).await,
+            SourceMutation::Close => self.source.close_changeset(&mut ext).await,
+            SourceMutation::Undraft => self.source.undraft_changeset(&mut ext).await,
+        };
+        result.map_err(map_source_error)?;
+        cs.changeset.external_id = ext.changeset.external_id.clone();
+        self.cache_result(cs.changeset.id, &ext);
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum SourceMutation {
+    Update,
+    Reopen,
+    Close,
+    Undraft,
+}
+
+#[async_trait]
+impl ChangesetSource for ExtsvcReconcilerSource {
+    async fn load_changeset(&self, cs: &mut SourceChangeset) -> Result<(), SourceError> {
+        let mut ext = self.build_ext_changeset(cs).await?;
+        self.source
+            .load_changeset(&mut ext)
+            .await
+            .map_err(map_source_error)?;
+        cs.changeset.external_id = ext.changeset.external_id.clone();
+        self.cache_result(cs.changeset.id, &ext);
+        Ok(())
+    }
+
+    async fn create_changeset(&self, cs: &mut SourceChangeset) -> Result<bool, SourceError> {
+        let mut ext = self.build_ext_changeset(cs).await?;
+        let existed = self
+            .source
+            .create_changeset(&mut ext)
+            .await
+            .map_err(map_source_error)?;
+        cs.changeset.external_id = ext.changeset.external_id.clone();
+        self.cache_result(cs.changeset.id, &ext);
+        Ok(existed)
+    }
+
+    async fn create_draft_changeset(
+        &self,
+        cs: &mut SourceChangeset,
+    ) -> Result<bool, SourceError> {
+        let mut ext = self.build_ext_changeset(cs).await?;
+        let existed = self
+            .source
+            .create_draft_changeset(&mut ext)
+            .await
+            .map_err(map_source_error)?;
+        cs.changeset.external_id = ext.changeset.external_id.clone();
+        self.cache_result(cs.changeset.id, &ext);
+        Ok(existed)
+    }
+
+    async fn update_changeset(&self, cs: &mut SourceChangeset) -> Result<(), SourceError> {
+        self.mutate(cs, SourceMutation::Update).await
+    }
+
+    async fn reopen_changeset(&self, cs: &mut SourceChangeset) -> Result<(), SourceError> {
+        self.mutate(cs, SourceMutation::Reopen).await
+    }
+
+    async fn close_changeset(&self, cs: &mut SourceChangeset) -> Result<(), SourceError> {
+        self.mutate(cs, SourceMutation::Close).await
+    }
+
+    async fn undraft_changeset(&self, cs: &mut SourceChangeset) -> Result<(), SourceError> {
+        self.mutate(cs, SourceMutation::Undraft).await
+    }
+
+    fn supports_draft(&self) -> bool {
+        self.source.supports_draft()
+    }
+
+    async fn is_outdated(&self, cs: &SourceChangeset) -> Result<bool, SourceError> {
+        let metadata = {
+            let cache = self
+                .factory
+                .metadata_cache
+                .lock()
+                .map_err(|_| SourceError::other("source metadata cache poisoned"))?;
+            cache.get(&cs.changeset.id).cloned()
+        };
+        let Some(metadata) = metadata else {
+            // Nothing loaded yet: the baseline's `Changeset.Metadata` would be
+            // decoded from the stored row; without it the changeset is treated
+            // as up-to-date, matching the old shell behaviour.
+            return Ok(false);
+        };
+        let current: extsvc::ChangesetMetadata = serde_json::from_value(metadata)
+            .map_err(|err| SourceError::other(format!("decoding changeset metadata: {err}")))?;
+        let ext = self.build_ext_changeset(cs).await?;
+        Ok(self.source.is_outdated(&current, &ext))
+    }
+
+    async fn remote_repo(
+        &self,
+        target: &Repo,
+        ch: &Changeset,
+        spec: Option<&ChangesetSpec>,
+    ) -> Result<Repo, SourceError> {
+        let target_metadata = self
+            .factory
+            .repo_metadata
+            .metadata(&self.factory.kind, target)
+            .await?;
+        let target_repo = ext_repo(&self.factory.kind, target, target_metadata);
+        let ext_changeset = extsvc::Changeset {
+            id: ch.id,
+            external_id: ch.external_id.clone(),
+            external_branch: ch.external_branch.clone(),
+            external_fork_namespace: String::new(),
+            external_fork_name: String::new(),
+            metadata: serde_json::Value::Null,
+        };
+        let spec = spec.map(ext_spec);
+        let remote = extsvc::get_remote_repo(
+            self.source.as_ref(),
+            &target_repo,
+            &ext_changeset,
+            spec.as_ref(),
+        )
+        .await
+        .map_err(map_source_error)?;
+        if let Ok(mut cache) = self.factory.remote_cache.lock() {
+            cache.insert(ch.id, remote.clone());
+        }
+        Ok(Repo {
+            id: remote.id,
+            name: remote.name,
+            archived: target.archived,
+        })
+    }
+
+    async fn push_commit(
+        &self,
+        _target: &Repo,
+        _ch: &Changeset,
+        _spec: Option<&ChangesetSpec>,
+        _remote: &Repo,
+    ) -> Result<PushResult, SourceError> {
+        // `GitserverPushConfig`/`BuildCommitOpts` are ported in `sg-extsvc`,
+        // but `CreateCommitFromPatch` needs gitserver, which is not part of
+        // this slice.
+        Err(SourceError::not_ported().with_message(
+            "pushing commits requires gitserver, which is not ported",
+        ))
+    }
+}
+
+impl SourceError {
+    fn with_message(self, message: &str) -> Self {
+        Self {
+            message: message.to_owned(),
+            ..self
+        }
+    }
+}
+
+#[async_trait]
+impl ChangesetSourceFactory for ExtsvcSourceFactory {
+    async fn for_changeset(
+        &self,
+        _changeset: &Changeset,
+        _target_repo: &Repo,
+    ) -> Result<Arc<dyn ChangesetSource>, SourceError> {
+        let source = extsvc::new_source(
+            &self.kind,
+            &self.base_url,
+            self.auth.clone(),
+            self.http.clone(),
+        )
+        .map_err(map_source_error)?;
+        // The adapter outlives this call; it shares the factory's caches via
+        // an `Arc`-like handle. `ExtsvcSourceFactory` itself is cheap to clone
+        // only through `Arc`, so keep the per-call state self-contained by
+        // moving the shared caches into the adapter.
+        Ok(Arc::new(ExtsvcReconcilerSource {
+            factory: Arc::new(ExtsvcSourceFactory {
+                kind: self.kind.clone(),
+                base_url: self.base_url.clone(),
+                auth: self.auth.clone(),
+                http: self.http.clone(),
+                repo_metadata: self.repo_metadata.clone(),
+                metadata_cache: Arc::clone(&self.metadata_cache),
+                remote_cache: Arc::clone(&self.remote_cache),
+            }),
+            source,
+        }))
     }
 }
 

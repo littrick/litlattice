@@ -16,18 +16,22 @@
 //!   retryable/non-retryable classification;
 //! * `store/worker_bulk_operations.go` — the `changeset_jobs` dbworker store.
 //!
-//! Code-host API clients are not ported: [`ChangesetSource`] is the injection
-//! seam and [`NotPortedChangesetSource`] is the production implementation.
+//! Code-host API clients are injected through [`ChangesetSource`].
+//! [`ExtsvcChangesetSource`] drives the real GitHub/GitLab/Bitbucket Server
+//! client from `sg-extsvc` (over an injectable [`sg_extsvc::HttpDoer`]);
+//! [`NotPortedChangesetSource`] remains the default when no config is wired.
 //! Webhook payload marshalling (GraphQL + internal doer), `reenqueue`'s
-//! service-level queries and `state.SetDerivedState` (gitserver) are seams as
-//! well; the ordering semantics are reproduced by [`run_bulk_job`].
+//! service-level queries, `Changeset.Events()` metadata decoding and
+//! `state.SetDerivedState` (gitserver) are seams as well; the ordering
+//! semantics are reproduced by [`run_bulk_job`].
 
-use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use serde_json::Value;
 use sg_db::OffsetDateTime;
+use sg_extsvc::batches_sources as extsvc;
 use sqlx::PgPool;
 use tokio_util::sync::CancellationToken;
 
@@ -370,6 +374,294 @@ impl ChangesetSource for NotPortedChangesetSource {
         _changeset: &Changeset,
     ) -> Result<Vec<ChangesetEvent>, BulkError> {
         Err(not_ported("Events"))
+    }
+}
+
+/// `changesets.external_id` and `changesets.metadata` for a job's changeset.
+///
+/// The bulk processor's reduced [`Changeset`] carries neither, so production
+/// wires this to the store (no schema change: both columns already exist).
+#[async_trait]
+pub trait ChangesetMetadataResolver: Send + Sync {
+    async fn external_id(&self, changeset: &Changeset) -> Result<String, BulkError>;
+    async fn metadata(&self, changeset: &Changeset) -> Result<Value, BulkError>;
+}
+
+/// `Changeset.Events()` for a changeset whose code-host metadata was loaded.
+#[async_trait]
+pub trait ChangesetEventProvider: Send + Sync {
+    async fn changeset_events(
+        &self,
+        changeset: &Changeset,
+    ) -> Result<Vec<ChangesetEvent>, BulkError>;
+}
+
+/// `Changeset.Events()`'s deduplication: keep the first event for each
+/// `Kind + Key` pair, in order (`appendEvent` in `changeset.go`).
+pub fn dedupe_changeset_events(events: Vec<ChangesetEvent>) -> Vec<ChangesetEvent> {
+    let mut seen = std::collections::BTreeMap::<(String, String), ()>::new();
+    let mut result = Vec::with_capacity(events.len());
+    for event in events {
+        let key = (event.kind.clone(), event.key.clone());
+        if seen.insert(key, ()).is_none() {
+            result.push(event);
+        }
+    }
+    result
+}
+
+fn kind_from_external_service_type(external_service_type: &str) -> Option<&'static str> {
+    match external_service_type {
+        "github" => Some("GITHUB"),
+        "gitlab" => Some("GITLAB"),
+        "bitbucketserver" => Some("BITBUCKETSERVER"),
+        _ => None,
+    }
+}
+
+fn map_extsvc_error(err: extsvc::SourceError) -> BulkError {
+    match err.kind {
+        extsvc::SourceErrorKind::Other => BulkError::retryable(err.message),
+        extsvc::SourceErrorKind::NotFound
+        | extsvc::SourceErrorKind::NonRetryable
+        | extsvc::SourceErrorKind::NotMergeable
+        | extsvc::SourceErrorKind::Archived => BulkError::non_retryable(err.message),
+    }
+}
+
+fn repo_metadata_for_bulk(kind: &str, repo: &RepoRef) -> Value {
+    match kind {
+        "GITHUB" => serde_json::json!({"name_with_owner": repo.name}),
+        "GITLAB" => serde_json::json!({"path_with_namespace": repo.name}),
+        "BITBUCKETSERVER" => {
+            let (project, slug) = repo
+                .name
+                .split_once('/')
+                .map(|(project, slug)| (project.to_owned(), slug.to_owned()))
+                .unwrap_or_else(|| (String::new(), repo.name.clone()));
+            serde_json::json!({"slug": slug, "project": {"key": project}})
+        }
+        _ => Value::Null,
+    }
+}
+
+fn bulk_ext_repo(kind: &str, repo: &RepoRef) -> extsvc::Repo {
+    extsvc::Repo {
+        id: repo.id,
+        name: repo.name.clone(),
+        external_repo: extsvc::ExternalRepoSpec {
+            id: String::new(),
+            service_type: extsvc::kind_to_type(kind),
+            service_id: repo.external_service_id.clone(),
+        },
+        metadata: repo_metadata_for_bulk(kind, repo),
+        ..Default::default()
+    }
+}
+
+/// Production [`ChangesetSource`] backed by `sg-extsvc`.
+///
+/// `for_user` caches the job's repository (the baseline's `sourcer.ForUser`
+/// also selects credentials per repository); subsequent calls use the injected
+/// metadata resolver to rebuild the full `sources.Changeset`.
+pub struct ExtsvcChangesetSource {
+    kind: &'static str,
+    source: Arc<dyn extsvc::ChangesetSource>,
+    metadata: Arc<dyn ChangesetMetadataResolver>,
+    events: Arc<dyn ChangesetEventProvider>,
+    repo: Mutex<Option<RepoRef>>,
+}
+
+impl ExtsvcChangesetSource {
+    pub fn new(
+        external_service_type: &str,
+        base_url: url::Url,
+        auth: extsvc::SourceAuth,
+        http: Arc<dyn sg_extsvc::HttpDoer>,
+        metadata: Arc<dyn ChangesetMetadataResolver>,
+        events: Arc<dyn ChangesetEventProvider>,
+    ) -> Result<Self, BulkError> {
+        let Some(kind) = kind_from_external_service_type(external_service_type) else {
+            return Err(BulkError::non_retryable(format!(
+                "building changeset source: unsupported external service type {external_service_type:?}"
+            )));
+        };
+        let source = extsvc::new_source(kind, &base_url, auth, http).map_err(map_extsvc_error)?;
+        Ok(Self {
+            kind,
+            source,
+            metadata,
+            events,
+            repo: Mutex::new(None),
+        })
+    }
+
+    fn cached_repo(&self) -> Result<RepoRef, BulkError> {
+        self.repo
+            .lock()
+            .map_err(|_| BulkError::retryable("changeset source repo cache poisoned"))?
+            .clone()
+            .ok_or_else(|| {
+                BulkError::non_retryable(
+                    "changeset source used before ForUser: no repository cached",
+                )
+            })
+    }
+
+    async fn build(
+        &self,
+        changeset: &Changeset,
+        title: &str,
+        body: &str,
+        head_ref: &str,
+        base_ref: &str,
+    ) -> Result<extsvc::SourceChangeset, BulkError> {
+        let repo = self.cached_repo()?;
+        let target_repo = bulk_ext_repo(self.kind, &repo);
+        let external_id = self.metadata.external_id(changeset).await?;
+        let metadata = self.metadata.metadata(changeset).await?;
+        Ok(extsvc::SourceChangeset {
+            title: title.to_owned(),
+            body: body.to_owned(),
+            head_ref: head_ref.to_owned(),
+            base_ref: base_ref.to_owned(),
+            remote_repo: target_repo.clone(),
+            target_repo,
+            changeset: extsvc::Changeset {
+                id: changeset.id,
+                external_id,
+                external_branch: String::new(),
+                external_fork_namespace: String::new(),
+                external_fork_name: String::new(),
+                metadata,
+            },
+        })
+    }
+}
+
+#[async_trait]
+impl ChangesetSource for ExtsvcChangesetSource {
+    async fn for_user(&self, _user_id: i32, repo: &RepoRef) -> Result<(), BulkError> {
+        if kind_from_external_service_type(&repo.external_service_type) != Some(self.kind) {
+            return Err(BulkError::non_retryable(format!(
+                "changeset source kind {:?} does not match repository external service type {:?}",
+                self.kind, repo.external_service_type
+            )));
+        }
+        *self
+            .repo
+            .lock()
+            .map_err(|_| BulkError::retryable("changeset source repo cache poisoned"))? =
+            Some(repo.clone());
+        Ok(())
+    }
+
+    async fn get_remote_repo(
+        &self,
+        repo: &RepoRef,
+        changeset: &Changeset,
+    ) -> Result<(), BulkError> {
+        let target_repo = bulk_ext_repo(self.kind, repo);
+        let external_id = self.metadata.external_id(changeset).await?;
+        let metadata = self.metadata.metadata(changeset).await?;
+        let ch = extsvc::Changeset {
+            id: changeset.id,
+            external_id,
+            external_branch: String::new(),
+            external_fork_namespace: String::new(),
+            external_fork_name: String::new(),
+            metadata,
+        };
+        extsvc::get_remote_repo(self.source.as_ref(), &target_repo, &ch, None)
+            .await
+            .map_err(map_extsvc_error)?;
+        Ok(())
+    }
+
+    async fn create_comment(
+        &self,
+        changeset: &Changeset,
+        message: &str,
+    ) -> Result<(), BulkError> {
+        let cs = self.build(changeset, "", "", "", "").await?;
+        self.source
+            .create_comment(&cs, message)
+            .await
+            .map_err(map_extsvc_error)
+    }
+
+    async fn merge_changeset(
+        &self,
+        changeset: &Changeset,
+        squash: bool,
+    ) -> Result<(), BulkError> {
+        let mut cs = self.build(changeset, "", "", "", "").await?;
+        self.source
+            .merge_changeset(&mut cs, squash)
+            .await
+            .map_err(map_extsvc_error)
+    }
+
+    async fn close_changeset(&self, changeset: &Changeset) -> Result<(), BulkError> {
+        let mut cs = self.build(changeset, "", "", "", "").await?;
+        self.source
+            .close_changeset(&mut cs)
+            .await
+            .map_err(map_extsvc_error)
+    }
+
+    async fn changeset_events(
+        &self,
+        changeset: &Changeset,
+    ) -> Result<Vec<ChangesetEvent>, BulkError> {
+        let events = self.events.changeset_events(changeset).await?;
+        Ok(dedupe_changeset_events(events))
+    }
+}
+
+/// In-memory metadata resolver used by tests/harnesses; production wires the
+/// store-backed one.
+#[derive(Debug, Default, Clone)]
+pub struct StaticChangesetMetadata {
+    pub external_ids: HashMap<i64, String>,
+    pub metadata: HashMap<i64, Value>,
+}
+
+#[async_trait]
+impl ChangesetMetadataResolver for StaticChangesetMetadata {
+    async fn external_id(&self, changeset: &Changeset) -> Result<String, BulkError> {
+        self.external_ids
+            .get(&changeset.id)
+            .cloned()
+            .ok_or_else(|| {
+                BulkError::non_retryable(format!(
+                    "no external ID for changeset {}",
+                    changeset.id
+                ))
+            })
+    }
+
+    async fn metadata(&self, changeset: &Changeset) -> Result<Value, BulkError> {
+        Ok(self
+            .metadata
+            .get(&changeset.id)
+            .cloned()
+            .unwrap_or(Value::Null))
+    }
+}
+
+/// No events without code-host metadata decoding; matches `Events()`'s
+/// requirement for the full timeline payload (see the slice overview §4).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct EmptyChangesetEventProvider;
+
+#[async_trait]
+impl ChangesetEventProvider for EmptyChangesetEventProvider {
+    async fn changeset_events(
+        &self,
+        _changeset: &Changeset,
+    ) -> Result<Vec<ChangesetEvent>, BulkError> {
+        Ok(Vec::new())
     }
 }
 
