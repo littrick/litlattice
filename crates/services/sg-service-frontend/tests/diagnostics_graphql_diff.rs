@@ -34,6 +34,9 @@ use sg_service_frontend::diagnostics_graphql::{
     prefetch_diagnostics, BackgroundJobData, DiagnosticsDeps, DiagnosticsStore, GitserverInfoData,
     RepositoryStatsData, StatusMessageInputs, SyncErrorInput, ZoektStats,
 };
+use sg_service_frontend::external_services::{
+    ConnectionCheckData, ExternalServiceNodeData, SyncJobsData,
+};
 use sg_service_frontend::graphql_resolvers::{FrontendRootResolver, NestedPrefetch, NodeRoots};
 
 const SDL: &str = "
@@ -57,7 +60,8 @@ union StatusMessage =
 type GitUpdatesDisabled { message: String! }
 type NoRepositoriesDetected { message: String! }
 type CloningProgress { message: String! }
-type ExternalServiceSyncError { message: String! }
+type ExternalServiceSyncError { message: String! externalService: ExternalService }
+type ExternalService { id: ID! kind: String! displayName: String! }
 type SyncError { message: String! }
 type IndexingProgress { notIndexed: Int! indexed: Int! }
 type GitserverDiskThresholdReached { message: String! }
@@ -115,6 +119,33 @@ struct Fixture {
     servers: Vec<GitserverInfoData>,
     dotcom: bool,
     disable_auto_updates: bool,
+    /// `GetByID` results for `ExternalServiceSyncError.externalService`.
+    external_services: HashMap<i64, Result<ExternalServiceNodeData, String>>,
+}
+
+fn external_service_node(id: i64) -> ExternalServiceNodeData {
+    ExternalServiceNodeData {
+        id,
+        kind: "GITHUB".to_owned(),
+        display_name: format!("github-{id}"),
+        config: "{}".to_owned(),
+        url: Ok("https://github.com".to_owned()),
+        webhook_url: Ok(None),
+        created_at: time::OffsetDateTime::UNIX_EPOCH,
+        updated_at: time::OffsetDateTime::UNIX_EPOCH,
+        creator: None,
+        last_updater: None,
+        warning: None,
+        last_sync_error: None,
+        repo_count: 0,
+        last_sync_at: None,
+        next_sync_at: None,
+        unrestricted: false,
+        supports_repo_exclusion: true,
+        has_connection_check: true,
+        check_connection: ConnectionCheckData::Unknown,
+        sync_jobs: SyncJobsData::default(),
+    }
 }
 
 fn zoekt(total: i64, indexed: i32, not_indexed: i32) -> Option<ZoektStats> {
@@ -146,7 +177,7 @@ fn fixture(world: &str) -> Fixture {
                     service_id: 7,
                 },
                 SyncErrorInput {
-                    message: String::new(),
+                    message: "db down".to_owned(),
                     service_id: 8,
                 },
             ],
@@ -160,6 +191,12 @@ fn fixture(world: &str) -> Fixture {
             },
             zoekt: zoekt(10, 6, 4),
             servers: vec![GitserverInfoData::with_percent_used("gs1", 10, 100, 95.5)],
+            external_services: [
+                (7, Ok(external_service_node(7))),
+                (8, Err("database unavailable".to_owned())),
+            ]
+            .into_iter()
+            .collect(),
             ..Fixture::default()
         },
         "disk" => Fixture {
@@ -260,6 +297,17 @@ impl DiagnosticsStore for FakeDiagnostics {
 
     async fn gitservers(&self) -> Result<Vec<GitserverInfoData>, String> {
         Ok(self.fixture.servers.clone())
+    }
+
+    async fn external_service_node(
+        &self,
+        id: i64,
+    ) -> Result<Option<ExternalServiceNodeData>, String> {
+        match self.fixture.external_services.get(&id) {
+            Some(Ok(data)) => Ok(Some(data.clone())),
+            Some(Err(error)) => Err(error.clone()),
+            None => Ok(None),
+        }
     }
 }
 

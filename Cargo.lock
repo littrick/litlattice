@@ -3869,11 +3869,17 @@ name = "sg-bin-embeddings"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "md5",
  "serde",
  "serde_json",
+ "sg-config",
  "sg-core",
+ "sg-db",
  "sg-embeddings",
+ "sg-licensing",
  "sg-log",
+ "sg-objectstorage",
+ "sqlx",
  "tokio",
  "tracing",
 ]

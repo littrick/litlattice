@@ -15,9 +15,13 @@
 //! mirrors the baseline `StripPrefix` → `secureHeadersMiddleware` →
 //! `assetHandler` chain.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
+use std::time::{SystemTime, UNIX_EPOCH};
 
+use base64::Engine as _;
 use bytes::Bytes;
+use sha2::{Digest, Sha256};
 use http::header::{self, HeaderName, HeaderValue};
 use http::{Method, Request, Response, StatusCode};
 use http_body_util::Full;
@@ -520,6 +524,16 @@ enum UiAction {
     Search,
     /// `serveEmbed`: the feature flag is off by default → empty 404.
     Embed,
+    /// `servePingFromSelfHosted` (`handlers.go:566-635`): CORS headers from
+    /// the `Referer` host, 204 for OPTIONS and an empty 200 for GET. The
+    /// baseline's HubSpot `SyncUser` call is a no-op here (errata §4.4).
+    PingSelfHosted,
+    /// One `/githubapp/` subroute (`githubapp/httpapi.go:64-68`).
+    GitHubApp(GitHubAppRoute),
+    /// The repository routes (`router.go:244-330`). The DB/gitserver part is
+    /// not available, so the handler keeps the `ui_not_found` fallback; the
+    /// routing (GET-only, `StrictSlash`) still matches the baseline.
+    RepoUnavailable,
     /// `http.Redirect` (`net/http/server.go`). `keep_query` mirrors the
     /// baseline handlers that re-serialize `r.URL` (StrictSlash,
     /// `staticRedirectHandler`, the Sourcegraph.com subdomain routes).
@@ -561,6 +575,9 @@ impl UiCandidate {
                 StatusCode::OK,
             ),
             UiAction::Embed => empty_response(StatusCode::NOT_FOUND),
+            UiAction::PingSelfHosted => serve_ping_from_self_hosted(req, env, config, assets),
+            UiAction::GitHubApp(route) => serve_github_app(req, *route),
+            UiAction::RepoUnavailable => ui_not_found(env, config, assets),
             UiAction::Redirect {
                 location,
                 code,
@@ -722,7 +739,43 @@ fn ui_candidates(path: &str, env: &AppEnv) -> Vec<UiCandidate> {
         })];
     }
 
-    // `/ping-from-self-hosted` and `/githubapp/` are not ported (overview §4).
+    // `/ping-from-self-hosted` (`router.go:116`, `handlers.go:566`).
+    if path == "/ping-from-self-hosted" {
+        return vec![
+            UiCandidate::new(Method::GET, UiAction::PingSelfHosted),
+            UiCandidate::new(Method::OPTIONS, UiAction::PingSelfHosted),
+        ];
+    }
+    if let Some(location) = strict_slash_location(path, "/ping-from-self-hosted") {
+        return vec![UiCandidate::get(UiAction::Redirect {
+            location,
+            code: 301,
+            keep_query: true,
+        })];
+    }
+
+    // `/githubapp/` subrouter (`githubapp/httpapi.go:64-81`). The baseline's
+    // `router.Use(siteAdminMiddleware)` runs *after* the routes are
+    // registered, so gorilla never applies it; each handler's own output is
+    // observable instead (errata §4.4). Routes need Redis/the DB only after
+    // their offline-deterministic validation.
+    if let Some(location) = strict_slash_location(path, "/githubapp") {
+        return vec![UiCandidate::get(UiAction::Redirect {
+            location,
+            code: 301,
+            keep_query: true,
+        })];
+    }
+    if let Some(route) = github_app_route(path) {
+        return vec![UiCandidate::get(UiAction::GitHubApp(route))];
+    }
+    if let Some(location) = github_app_strict_slash(path) {
+        return vec![UiCandidate::get(UiAction::Redirect {
+            location,
+            code: 301,
+            keep_query: true,
+        })];
+    }
 
     // Basic pages with static titles (`router.go:113-162`).
     const STATIC_PAGES: &[(&str, bool, &str, bool)] = &[
@@ -930,18 +983,31 @@ fn ui_candidates(path: &str, env: &AppEnv) -> Vec<UiCandidate> {
         })];
     }
 
-    // The repository route is the last one and is not ported (it needs the DB
-    // and gitserver). `StrictSlash` still redirects `/repo/` to `/repo`.
-    if repo_route_like(path) {
-        if path.ends_with('/') {
-            let location = path.trim_end_matches('/').to_owned();
+    // The repository routes are the last ones (`router.go:244-330`). The
+    // DB/gitserver part is not available, so known repo routes keep the
+    // `ui_not_found` fallback (errata §4.4); the method/StrictSlash routing
+    // still matches the baseline. StrictSlash trims the trailing slash before
+    // matching either the root or one of the `/-/` subroutes.
+    if let Some(base) = path.strip_suffix('/') {
+        if repo_route_like(base) || repo_subroute_kind(base, env).is_some() {
             return vec![UiCandidate::get(UiAction::Redirect {
-                location,
+                location: base.to_owned(),
                 code: 301,
                 keep_query: true,
             })];
         }
-        return candidates;
+    }
+    if repo_route_like(path) {
+        return vec![UiCandidate::get(UiAction::RepoUnavailable)];
+    }
+    if let Some(kind) = repo_subroute_kind(path, env) {
+        return match kind {
+            RepoSubroute::Raw => vec![
+                UiCandidate::new(Method::GET, UiAction::RepoUnavailable),
+                UiCandidate::new(Method::HEAD, UiAction::RepoUnavailable),
+            ],
+            RepoSubroute::Get => vec![UiCandidate::get(UiAction::RepoUnavailable)],
+        };
     }
 
     // Unknown route: the router's NotFoundHandler.
@@ -1064,6 +1130,339 @@ fn repo_route_like(path: &str) -> bool {
             .expect("repo regex")
     });
     repo.is_match(path)
+}
+
+/// One `/githubapp/` subroute (`githubapp/httpapi.go:64-68`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum GitHubAppRoute {
+    State,
+    NewAppState,
+    Redirect,
+    Setup,
+}
+
+fn github_app_route(path: &str) -> Option<GitHubAppRoute> {
+    match path {
+        "/githubapp/state" => Some(GitHubAppRoute::State),
+        "/githubapp/new-app-state" => Some(GitHubAppRoute::NewAppState),
+        "/githubapp/redirect" => Some(GitHubAppRoute::Redirect),
+        "/githubapp/setup" => Some(GitHubAppRoute::Setup),
+        _ => None,
+    }
+}
+
+fn github_app_strict_slash(path: &str) -> Option<String> {
+    for template in [
+        "/githubapp/state",
+        "/githubapp/new-app-state",
+        "/githubapp/redirect",
+        "/githubapp/setup",
+    ] {
+        if let Some(location) = strict_slash_location(path, template) {
+            return Some(location);
+        }
+    }
+    None
+}
+
+/// `servePingFromSelfHosted` (`handlers.go:566-635`): the CORS origin is the
+/// `Referer`'s host (Go's `url.Parse` keeps `host:port`), OPTIONS is an empty
+/// 204 and GET an empty 200. The HubSpot `SyncUser` call has no port and is
+/// skipped (errata §4.4).
+fn serve_ping_from_self_hosted<B>(
+    req: &Request<B>,
+    env: &AppEnv,
+    _config: &AppConfig,
+    _assets: &dyn sg_ui::AssetsProvider,
+) -> Response<BoxBody> {
+    let referer = req
+        .headers()
+        .get(header::REFERER)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+    let host = match go_url_host(referer) {
+        Ok(host) => host,
+        Err(error) => {
+            let shown = env.insecure_dev.then_some(error.as_str());
+            return error_page_response(StatusCode::INTERNAL_SERVER_ERROR, shown);
+        }
+    };
+    let mut headers = http::HeaderMap::new();
+    headers.insert(
+        HeaderName::from_static("access-control-allow-origin"),
+        HeaderValue::from_bytes(host.as_bytes()).unwrap_or_else(|_| HeaderValue::from_static("")),
+    );
+    headers.insert(
+        HeaderName::from_static("access-control-allow-credentials"),
+        HeaderValue::from_static("true"),
+    );
+    if req.method() == Method::OPTIONS {
+        return empty_response_with_headers(StatusCode::NO_CONTENT, headers);
+    }
+    empty_response_with_headers(StatusCode::OK, headers)
+}
+
+/// Go `url.Parse(referer).Host`, including the `host:port` form.
+fn go_url_host(referer: &str) -> Result<String, String> {
+    let bytes = referer.as_bytes();
+    for byte in bytes {
+        if *byte < 0x20 || *byte == 0x7f {
+            return Err("net/url: invalid control character in URL".to_owned());
+        }
+    }
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%'
+            && (index + 2 >= bytes.len()
+                || !bytes[index + 1].is_ascii_hexdigit()
+                || !bytes[index + 2].is_ascii_hexdigit())
+        {
+            let end = (index + 3).min(bytes.len());
+            return Err(format!(
+                "invalid URL escape \"{}\"",
+                &referer[index..end]
+            ));
+        }
+        index += 1;
+    }
+
+    // A scheme is only followed by an authority after `//`; otherwise the URL
+    // is opaque (`u.Host` is empty).
+    let rest = match referer.find("://") {
+        Some(pos) if is_url_scheme(&referer[..pos]) => &referer[pos + 3..],
+        _ => match referer.strip_prefix("//") {
+            Some(rest) => rest,
+            None => return Ok(String::new()),
+        },
+    };
+    let authority_end = rest
+        .find(['/', '?', '#'])
+        .unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
+    let authority = match authority.rfind('@') {
+        Some(pos) => &authority[pos + 1..],
+        None => authority,
+    };
+    Ok(authority.to_owned())
+}
+
+fn is_url_scheme(candidate: &str) -> bool {
+    let mut chars = candidate.chars();
+    match chars.next() {
+        Some(first) if first.is_ascii_alphabetic() => {}
+        _ => return false,
+    }
+    chars.all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '+' | '-' | '.'))
+}
+
+/// `githubapp.httpapi`'s offline-deterministic branches. Redis/DB-backed
+/// success paths are not reachable without those services (errata §4.4).
+fn serve_github_app<B>(req: &Request<B>, route: GitHubAppRoute) -> Response<BoxBody> {
+    let query = req.uri().query();
+    match route {
+        // `stateHandler`: an empty `id` only writes the random state.
+        GitHubAppRoute::State => {
+            let gql_id = app_handlers::query_param(query, "id").unwrap_or_default();
+            if !gql_id.is_empty() {
+                if let Err(error) = unmarshal_github_app_id(&gql_id) {
+                    return http_error(
+                        StatusCode::BAD_REQUEST,
+                        &format!("Unexpected error while unmarshalling App ID: {error}"),
+                        http::HeaderMap::new(),
+                    );
+                }
+            }
+            body_response(
+                StatusCode::OK,
+                text_plain_headers(),
+                random_state().into_bytes(),
+            )
+        }
+        // `newAppStateHandler` without a `webhookURN` only needs a random
+        // state; creating a webhook needs the DB.
+        GitHubAppRoute::NewAppState => {
+            let webhook_urn =
+                app_handlers::query_param(query, "webhookURN").unwrap_or_default();
+            if !webhook_urn.is_empty() {
+                return http_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Unexpected error while setting up webhook endpoint: external service setup is not available",
+                    http::HeaderMap::new(),
+                );
+            }
+            let marshalled_user_id =
+                app_handlers::query_param(query, "userID").unwrap_or_default();
+            if !marshalled_user_id.is_empty() {
+                if let Err(error) = unmarshal_github_app_id(&marshalled_user_id) {
+                    return http_error(
+                        StatusCode::BAD_REQUEST,
+                        &format!("Unexpected error while unmarshalling user ID: {error}"),
+                        http::HeaderMap::new(),
+                    );
+                }
+            }
+            let state = random_state();
+            let body = format!(
+                "{}\n",
+                serde_json::json!({ "state": state })
+            );
+            body_response(
+                StatusCode::OK,
+                text_plain_headers(),
+                body.into_bytes(),
+            )
+        }
+        // `redirectHandler`: every check before the Redis lookup is
+        // deterministic; without a cache the state never matches.
+        GitHubAppRoute::Redirect => {
+            let state = app_handlers::query_param(query, "state").unwrap_or_default();
+            let code = app_handlers::query_param(query, "code").unwrap_or_default();
+            if state.is_empty() || code.is_empty() {
+                return http_error(
+                    StatusCode::BAD_REQUEST,
+                    "Bad request, code and state query params must be present",
+                    http::HeaderMap::new(),
+                );
+            }
+            if state.len() != 64 {
+                return http_error(
+                    StatusCode::BAD_REQUEST,
+                    "Bad request, state query param is wrong length",
+                    http::HeaderMap::new(),
+                );
+            }
+            http_error(
+                StatusCode::BAD_REQUEST,
+                "Bad request, state query param does not match",
+                http::HeaderMap::new(),
+            )
+        }
+        // `setupHandler`: a missing state/installation ID redirects to the
+        // site-admin apps page; a cache miss redirects with the error query.
+        GitHubAppRoute::Setup => {
+            let state = app_handlers::query_param(query, "state").unwrap_or_default();
+            let inst_id = app_handlers::query_param(query, "installation_id").unwrap_or_default();
+            if state.is_empty() || inst_id.is_empty() {
+                return app_handlers::redirect(req, "/site-admin/github-apps", 302);
+            }
+            if state.len() != 64 {
+                return http_error(
+                    StatusCode::BAD_REQUEST,
+                    "Bad request, state query param is wrong length",
+                    http::HeaderMap::new(),
+                );
+            }
+            let location = format!(
+                "/site-admin/github-apps?kind=&success=false&error={}",
+                query_escape("Bad request, state query param does not match")
+            );
+            app_handlers::redirect(req, &location, 302)
+        }
+    }
+}
+
+fn text_plain_headers() -> http::HeaderMap {
+    let mut headers = http::HeaderMap::new();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/plain; charset=utf-8"),
+    );
+    headers
+}
+
+/// `randomState` (`httpapi.go:95-106`): 32 random bytes as 64 lowercase hex
+/// characters. The baseline reads `crypto/rand`; a monotonic counter plus the
+/// clock keeps the port dependency-free and collision-free per process.
+fn random_state() -> String {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let mut hasher = Sha256::new();
+    hasher.update(nanos.to_le_bytes());
+    hasher.update(counter.to_le_bytes());
+    hasher.update(std::process::id().to_le_bytes());
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// `relay.UnmarshalSpec(graphql.ID, &int64)`.
+fn unmarshal_github_app_id(raw: &str) -> Result<i64, String> {
+    let decoded = base64::engine::general_purpose::URL_SAFE
+        .decode(raw)
+        .map_err(|error| error.to_string())?;
+    let text = String::from_utf8(decoded).map_err(|error| error.to_string())?;
+    text.parse::<i64>()
+        .map_err(|_| format!("json: cannot unmarshal {text} into Go value of type int64"))
+}
+
+/// Go's `url.QueryEscape`.
+fn query_escape(value: &str) -> String {
+    let mut escaped = String::new();
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                escaped.push(byte as char)
+            }
+            b' ' => escaped.push('+'),
+            _ => escaped.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    escaped
+}
+
+/// The `/-/` subroutes of the repo route (`router.go:268-320`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RepoSubroute {
+    Raw,
+    Get,
+}
+
+/// `Some` when `path` is `<repo>/-/<known subroute>`. Unknown `/-/` paths do
+/// not match a gorilla route and keep the outer NotFoundHandler.
+fn repo_subroute_kind(path: &str, env: &AppEnv) -> Option<RepoSubroute> {
+    let (repo, rest) = path.split_once("/-/")?;
+    if !repo_route_like(repo) {
+        return None;
+    }
+    if rest == "raw" || rest.starts_with("raw") {
+        return Some(RepoSubroute::Raw);
+    }
+    const GET_PREFIXES: &[&str] = &[
+        "tree",
+        "blob",
+        "batch-changes",
+        "settings",
+        "code-graph",
+        "commits",
+        "commit",
+        "branches",
+        "tags",
+        "compare",
+        "stats",
+        "own",
+    ];
+    if GET_PREFIXES
+        .iter()
+        .any(|prefix| rest.starts_with(prefix))
+    {
+        return Some(RepoSubroute::Get);
+    }
+    if env.dotcom
+        && (rest == "info"
+            || rest.starts_with("info/")
+            || rest.starts_with("def/")
+            || rest.starts_with("refs/")
+            || rest.starts_with("land/"))
+    {
+        return Some(RepoSubroute::Get);
+    }
+    None
 }
 
 /// `gorilla/mux`'s ServeHTTP `cleanPath` redirect: `Location` + 301, no body.

@@ -57,6 +57,34 @@ pub const NOT_ALLOWED_WITH_SITE_CONFIG_FILE: &str =
     "updating site configuration not allowed when using SITE_CONFIG_FILE";
 pub const BLANK_SITE_CONFIGURATION: &str = "blank site configuration is invalid (you can clear the site configuration by entering an empty JSON object: {})";
 
+/// `cloud.SchemaSiteConfig`, reduced to the allowlist behavior. The signed
+/// `SRC_CLOUD_SITE_CONFIG` blob (SSH signature verification) is not parsed in
+/// this port; an operator injects the decoded value instead.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CloudSiteConfig {
+    /// `SourcegraphOperatorAuthProviderEnabled() && len(Paths) > 0`.
+    pub allowlist_enabled: bool,
+    /// `SiteConfigAllowlist.Paths`.
+    pub allowed_paths: Vec<String>,
+    /// `SiteConfigAllowlist.NotAllowedErrorMessage` (a Go text/template with
+    /// the `{{.Paths}}` variable). `None` selects the default text.
+    pub not_allowed_error_message: Option<String>,
+}
+
+impl CloudSiteConfig {
+    /// `SiteConfigAllowlistOnError` for the paths [`allow_edit`] rejected.
+    pub fn allowlist_error(&self, paths: &[String]) -> String {
+        match &self.not_allowed_error_message {
+            None => format!(
+                "Editing [{}] in site configuration is not allowed on Sourcegraph Cloud. Please contact support.",
+                paths.join(", ")
+            ),
+            // The custom template is rendered with `Paths` only.
+            Some(template) => template.replace("{{.Paths}}", &format!("[{}]", paths.join(", "))),
+        }
+    }
+}
+
 /// One `updateSiteConfiguration` root field's outcome: the GraphQL `Boolean!`
 /// return value or the resolver error.
 pub async fn prefetch_update_site_configuration(
@@ -66,20 +94,57 @@ pub async fn prefetch_update_site_configuration(
     actor: Actor,
     viewer_site_admin: bool,
 ) -> Vec<(String, Result<bool, String>)> {
+    // OSS: `cloud.SiteConfig()` is the empty stub, so the allowlist is off.
+    prefetch_update_site_configuration_with_cloud(
+        pool,
+        deps,
+        &CloudSiteConfig::default(),
+        false,
+        fields,
+        actor,
+        viewer_site_admin,
+    )
+    .await
+}
+
+/// The same prefetch with the Cloud allowlist seam and the actor's
+/// `SourcegraphOperator` flag injected.
+#[allow(clippy::too_many_arguments)] // Mirrors the baseline's argument set.
+pub async fn prefetch_update_site_configuration_with_cloud(
+    pool: &PgPool,
+    deps: &SiteConfigurationDeps,
+    cloud: &CloudSiteConfig,
+    sourcegraph_operator: bool,
+    fields: &[RootField],
+    actor: Actor,
+    viewer_site_admin: bool,
+) -> Vec<(String, Result<bool, String>)> {
     let mut outcomes = Vec::new();
     for field in fields {
         if field.name != "updateSiteConfiguration" {
             continue;
         }
-        let outcome = update_site_configuration(pool, deps, field, actor, viewer_site_admin).await;
+        let outcome = update_site_configuration(
+            pool,
+            deps,
+            cloud,
+            sourcegraph_operator,
+            field,
+            actor,
+            viewer_site_admin,
+        )
+        .await;
         outcomes.push((field.name.clone(), outcome));
     }
     outcomes
 }
 
+#[allow(clippy::too_many_arguments)] // Mirrors the baseline's argument set.
 async fn update_site_configuration(
     pool: &PgPool,
     deps: &SiteConfigurationDeps,
+    cloud: &CloudSiteConfig,
+    sourcegraph_operator: bool,
     field: &RootField,
     actor: Actor,
     viewer_site_admin: bool,
@@ -120,9 +185,15 @@ async fn update_site_configuration(
     let unredacted = unredact_secrets(input, &prev)
         .map_err(|err| format!("error unredacting secrets: {err}"))?;
 
-    // `cloud.SiteConfig().SiteConfigAllowlistEnabled()` is always false in the
-    // OSS build (`cloud.SiteConfig` returns the empty `SchemaSiteConfig`), so
-    // the allowlist check is not ported (overview §4.3).
+    // `cloud.SiteConfig().SiteConfigAllowlistEnabled()`; the OSS default is
+    // disabled. The actor check mirrors `!actor.SourcegraphOperator`.
+    if cloud.allowlist_enabled && !sourcegraph_operator {
+        let (not_allowed, ok) = allow_edit(&prev.site, &unredacted, &cloud.allowed_paths);
+        if !ok {
+            return Err(cloud.allowlist_error(&not_allowed));
+        }
+    }
+
     prev.site = unredacted;
 
     let author_user_id = actor.uid().unwrap_or(0);
@@ -161,6 +232,95 @@ async fn update_site_configuration(
     }
 
     Ok(deps.server.need_server_restart())
+}
+
+/// `conf.Diff`'s top-level field names (`internal/conf/diff.go`), including
+/// the `experimentalFeatures::` expansion, followed by `allowEdit`
+/// (`site.go:670-681`).
+pub fn allow_edit(before: &str, after: &str, allowlist: &[String]) -> (Vec<String>, bool) {
+    let changes = changed_site_fields(before, after);
+    let mut not_allowed = Vec::new();
+    for key in changes {
+        for allowed in allowlist {
+            if &key != allowed {
+                not_allowed.push(key.clone());
+            }
+        }
+    }
+    let ok = not_allowed.is_empty();
+    (not_allowed, ok)
+}
+
+/// The changed top-level keys of the parsed configs. A missing/zero scalar
+/// compares equal to its Go zero value; slices/maps stay distinct from
+/// `null` (Go's `reflect.DeepEqual(nil, []T{})` is false).
+fn changed_site_fields(before: &str, after: &str) -> Vec<String> {
+    let Ok(before) = sg_config::SiteConfiguration::parse(before) else {
+        return Vec::new();
+    };
+    let Ok(after) = sg_config::SiteConfiguration::parse(after) else {
+        return Vec::new();
+    };
+    let before = before.raw().as_object();
+    let after = after.raw().as_object();
+
+    let mut keys: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    if let Some(object) = before {
+        keys.extend(object.keys().map(String::as_str));
+    }
+    if let Some(object) = after {
+        keys.extend(object.keys().map(String::as_str));
+    }
+
+    let mut changed = Vec::new();
+    for key in keys {
+        if key == "experimentalFeatures" {
+            // `getJSONFields` expands `*schema.ExperimentalFeatures` instead
+            // of recording the pointer itself.
+            let before_features = before
+                .and_then(|object| object.get(key))
+                .and_then(serde_json::Value::as_object);
+            let after_features = after
+                .and_then(|object| object.get(key))
+                .and_then(serde_json::Value::as_object);
+            let mut feature_keys: std::collections::BTreeSet<&str> =
+                std::collections::BTreeSet::new();
+            if let Some(object) = before_features {
+                feature_keys.extend(object.keys().map(String::as_str));
+            }
+            if let Some(object) = after_features {
+                feature_keys.extend(object.keys().map(String::as_str));
+            }
+            for feature in feature_keys {
+                let before_value = before_features.and_then(|object| object.get(feature));
+                let after_value = after_features.and_then(|object| object.get(feature));
+                if normalize_site_value(before_value) != normalize_site_value(after_value) {
+                    changed.push(format!("experimentalFeatures::{feature}"));
+                }
+            }
+            continue;
+        }
+
+        let before_value = before.and_then(|object| object.get(key));
+        let after_value = after.and_then(|object| object.get(key));
+        if normalize_site_value(before_value) != normalize_site_value(after_value) {
+            changed.push(key.to_owned());
+        }
+    }
+    changed
+}
+
+/// Map absent/`null`/zero scalars to one value so that an omitted field and
+/// its Go zero value compare equal.
+fn normalize_site_value(value: Option<&serde_json::Value>) -> Option<serde_json::Value> {
+    use serde_json::Value;
+    match value {
+        None | Some(Value::Null) => None,
+        Some(Value::String(text)) if text.is_empty() => None,
+        Some(Value::Bool(false)) => None,
+        Some(Value::Number(number)) if number.as_f64() == Some(0.0) => None,
+        Some(value) => Some(value.clone()),
+    }
 }
 
 /// `canUpdateSiteConfiguration` (`site.go:354-356`).

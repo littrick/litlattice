@@ -83,18 +83,26 @@ struct FakeBackend {
     repos: HashMap<String, RepoSpec>,
 }
 
+#[async_trait::async_trait]
 impl EmbeddingBackend for FakeBackend {
-    fn get_query_embedding(&self, _query: &str) -> Result<(Vec<f32>, String), EmbeddingError> {
+    async fn get_query_embedding(
+        &self,
+        _query: &str,
+    ) -> Result<(Vec<f32>, String), EmbeddingError> {
         if let Some(error) = &self.query {
             return Err(error.to_error());
         }
         Ok((Vec::new(), self.query_model.clone()))
     }
 
-    fn get_repo_embedding_index(
+    async fn get_repo_embedding_index(
         &self,
         _repo_id: i32,
         repo_name: &str,
+        _query_embedding: &[f32],
+        _code_results_count: i64,
+        _text_results_count: i64,
+        _use_document_ranks: bool,
     ) -> Result<RepoEmbeddingIndex, EmbeddingError> {
         let Some(repo) = self.repos.get(repo_name) else {
             return Err(EmbeddingError::other(format!("no fake repo {repo_name:?}")));
@@ -110,8 +118,8 @@ impl EmbeddingBackend for FakeBackend {
     }
 }
 
-#[test]
-fn embeddings_bin_diff() {
+#[tokio::test]
+async fn embeddings_bin_diff() {
     if std::env::var("SG_M917C_EMBEDDINGS_DIFF").as_deref() != Ok("1") {
         return;
     }
@@ -145,18 +153,17 @@ fn embeddings_bin_diff() {
         });
         let handler = Handler::new(backend);
 
-        let responses: Vec<Value> = case
-            .requests
-            .iter()
-            .map(|request| {
-                let response = handler.handle(&request.path, &request.method, request.body.as_bytes());
-                json!({
-                    "status": response.status,
-                    "content_type": response.content_type,
-                    "body": String::from_utf8_lossy(&response.body),
-                })
-            })
-            .collect();
+        let mut responses: Vec<Value> = Vec::new();
+        for request in &case.requests {
+            let response = handler
+                .handle(&request.path, &request.method, request.body.as_bytes())
+                .await;
+            responses.push(json!({
+                "status": response.status,
+                "content_type": response.content_type,
+                "body": String::from_utf8_lossy(&response.body),
+            }));
+        }
 
         let line = json!({
             "kind": "case",

@@ -20,10 +20,10 @@
 //! and the indexed-stats seam. When [`RepositoryStatsData::indexed`] is `None`
 //! (no seam injected), `indexed`/`indexedLinesCount` keep resolving `Ok(None)`.
 //!
-//! Explicitly not ported (see the slice overview §5):
-//!
-//! * `ExternalServiceSyncError.externalService`: needs the external-service
-//!   row plus the resolver's URL transformation.
+//! `ExternalServiceSyncError.externalService`
+//! (`status_messages.go:91-100`) is prefetched through
+//! [`DiagnosticsStore::external_service_node`], whose default keeps the
+//! pre-slice `null` when no seam is injected.
 //!
 //! The executor is synchronous; everything here is prefetched per request and
 //! replayed from [`DiagnosticsPrefetch`].
@@ -75,6 +75,19 @@ pub trait DiagnosticsStore: Send + Sync {
 
     /// `gitserverClient.SystemsInfo`.
     async fn gitservers(&self) -> Result<Vec<GitserverInfoData>, String>;
+
+    /// `statusMessageResolver.ExternalService`'s
+    /// `db.ExternalServices().GetByID` plus the resolver's URL transformation.
+    ///
+    /// The default keeps the unported-resolver behaviour (`null`) for stores
+    /// that do not have an external-service lookup (production wiring lives in
+    /// `diagnostics_adapters`, outside this slice's file set; see the errata).
+    async fn external_service_node(
+        &self,
+        _id: i64,
+    ) -> Result<Option<crate::external_services::ExternalServiceNodeData>, String> {
+        Ok(None)
+    }
 }
 
 /// Static inputs of one request's diagnostic fields. `dotcom` mirrors
@@ -288,6 +301,10 @@ pub enum StatusMessageData {
     ExternalServiceSyncError {
         message: String,
         external_service_id: i64,
+        /// `statusMessageResolver.ExternalService`'s `GetByID` result,
+        /// prefetched by [`prefetch_diagnostics`]. `None` keeps the
+        /// unported-resolver `null` (no store seam injected).
+        external_service: Option<Result<crate::external_services::ExternalServiceNodeData, String>>,
     },
     SyncError {
         message: String,
@@ -339,6 +356,7 @@ pub fn compose_status_messages(
             messages.push(StatusMessageData::ExternalServiceSyncError {
                 message: sync_error.message.clone(),
                 external_service_id: sync_error.service_id,
+                external_service: None,
             });
         }
     }
@@ -460,12 +478,40 @@ pub async fn prefetch_diagnostics(
                             }
                         }
                     };
-                    Ok(compose_status_messages(
+                    let mut messages = compose_status_messages(
                         disable_auto_git_updates,
                         disk_usage_threshold,
                         &inputs,
                         &servers,
-                    ))
+                    );
+                    // `statusMessageResolver.ExternalService` resolves the
+                    // service row lazily in the baseline; the synchronous
+                    // executor needs it up front. Each sync-error message
+                    // keeps its own outcome so the GraphQL field fails with
+                    // `GetByID`'s error while `message` still resolves.
+                    for message in &mut messages {
+                        if let StatusMessageData::ExternalServiceSyncError {
+                            external_service_id,
+                            external_service,
+                            ..
+                        } = message
+                        {
+                            // `Ok(None)` keeps the field `null`; a store
+                            // that does have the lookup reports a missing row
+                            // as `Err("external service not found: <id>")`
+                            // like `externalServiceStore.GetByID`.
+                            *external_service =
+                                match deps.store
+                                    .external_service_node(*external_service_id)
+                                    .await
+                                {
+                                    Ok(Some(data)) => Some(Ok(data)),
+                                    Ok(None) => None,
+                                    Err(err) => Some(Err(err)),
+                                };
+                        }
+                    }
+                    Ok(messages)
                 }
             },
         });
@@ -618,9 +664,26 @@ impl ObjectValue for StatusMessageObject {
                 }
                 _ => Ok(None),
             },
-            // `statusMessageResolver.ExternalService`: not ported (needs the
-            // `external_services` row lookup and URL transformation).
-            "externalService" => Ok(None),
+            // `statusMessageResolver.ExternalService` (`status_messages.go:91-100`):
+            // the prefetched `GetByID` result.
+            "externalService" => match &self.message {
+                StatusMessageData::ExternalServiceSyncError {
+                    external_service, ..
+                } => match external_service {
+                    None => Ok(None),
+                    Some(Ok(data)) => Ok(Some(FieldValue::Object(Arc::new(
+                        crate::external_services::ExternalServiceObject::from_data(
+                            data.clone(),
+                            true,
+                            Arc::new(
+                                crate::graphql_resolvers::NestedPrefetch::default(),
+                            ),
+                        ),
+                    )))),
+                    Some(Err(message)) => Err(ExecError::new(message.clone())),
+                },
+                _ => Ok(None),
+            },
             _ => Ok(None),
         }
     }
@@ -1072,7 +1135,8 @@ mod tests {
                 },
                 StatusMessageData::ExternalServiceSyncError {
                     message: "boom".into(),
-                    external_service_id: 7
+                    external_service_id: 7,
+                    external_service: None,
                 },
                 StatusMessageData::SyncError {
                     message: "1 repository failed last attempt to sync content from code host"

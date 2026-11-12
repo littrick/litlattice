@@ -11,11 +11,13 @@
 //! embeddings/zoekt replicas to talk to, which DSNs back the three schemas,
 //! and how long to cache Zoekt's indexed-repository list.
 //!
-//! Errata (also recorded in the M9.8eh report):
-//! * Kubernetes service discovery (`k8s+` URL specs) is not ported. Such a
-//!   spec yields no endpoints, which matches the baseline outside a cluster
-//!   (discovery fails and `Endpoints()` returns an error; the caller logs it
-//!   and keeps a nil list).
+//! Errata (also recorded in the M9.8eh and M9.19c reports):
+//! * Kubernetes service discovery (`k8s+` URL specs) is ported behind the
+//!   [`K8sDiscoverer`] seam (M9.19c): URL parsing, Endpoints/StatefulSet
+//!   address formatting and the non-cluster error text match
+//!   `internal/endpoint`. [`NotInClusterDiscoverer`] is the production
+//!   default (client-go's "unable to load in-cluster configuration…" error);
+//!   [`StaticK8sDiscoverer`] backs the offline differential.
 //! * The `go test` executable-name special case in `gitserverAddr` is not
 //!   ported; unset `SRC_GIT_SERVERS` always falls through to the
 //!   `k8s+rpc://gitserver:3178?kind=sts` default.
@@ -475,12 +477,196 @@ pub fn zoekt_addr(getenv: Getenv<'_>) -> Result<String, String> {
     Ok("k8s+rpc://indexed-search:6070?kind=sts".to_string())
 }
 
-/// `endpoint.New(urlspec).Endpoints()` for the non-Kubernetes branch:
-/// whitespace-separated static endpoints in input order. `k8s+` specs are
-/// reported as unsupported (see the module errata).
+/// One `corev1.EndpointAddress` (only the fields `k8sEndpoints` reads).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct K8sAddress {
+    pub hostname: String,
+    pub ip: String,
+}
+
+/// One `corev1.EndpointSubset`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct K8sSubset {
+    pub addresses: Vec<K8sAddress>,
+}
+
+/// The Kubernetes resource `k8sEndpoints` consumes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum K8sResource {
+    /// `corev1.Endpoints`.
+    Endpoints { subsets: Vec<K8sSubset> },
+    /// `appsv1.StatefulSet` (`kind=sts`/`statefulset`).
+    StatefulSet {
+        name: String,
+        service_name: String,
+        /// `spec.replicas`; `None` is the baseline's `nil` (one replica).
+        replicas: Option<i32>,
+    },
+}
+
+/// `endpoint.k8sURL`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct K8sUrl {
+    /// The parsed URL after the `k8s+` prefix (kept verbatim for
+    /// `endpointURL`'s copy-and-rehost behavior).
+    pub url: url::Url,
+    pub service: String,
+    pub namespace: String,
+    /// `strings.ToLower(u.Query().Get("kind"))`.
+    pub kind: String,
+}
+
+/// `endpoint.parseURL`.
+pub fn parse_k8s_url(raw: &str) -> Result<K8sUrl, String> {
+    let stripped = raw.strip_prefix("k8s+").unwrap_or(raw);
+    let url = url::Url::parse(stripped).map_err(|error| error.to_string())?;
+    let host = url
+        .host_str()
+        .ok_or_else(|| format!("invalid k8s url. expected k8s+http://service.namespace:port/path?kind=$kind, got {raw}"))?;
+    let parts: Vec<&str> = host.split('.').collect();
+    let (service, namespace) = match parts.as_slice() {
+        [service] => ((*service).to_owned(), String::new()),
+        [service, namespace] => ((*service).to_owned(), (*namespace).to_owned()),
+        _ => {
+            return Err(format!(
+                "invalid k8s url. expected k8s+http://service.namespace:port/path?kind=$kind, got {raw}"
+            ))
+        }
+    };
+    let kind = url
+        .query_pairs()
+        .find(|(key, _)| key == "kind")
+        .map(|(_, value)| value.to_lowercase())
+        .unwrap_or_default();
+    Ok(K8sUrl {
+        url,
+        service,
+        namespace,
+        kind,
+    })
+}
+
+impl K8sUrl {
+    /// `k8sURL.endpointURL`: replace the host, drop the scheme/path for
+    /// `rpc://` specs, otherwise keep the URL's path and query.
+    pub fn endpoint_url(&self, endpoint: &str) -> String {
+        let host = match self.url.port() {
+            Some(port) => format!("{endpoint}:{port}"),
+            None => endpoint.to_owned(),
+        };
+        if self.url.scheme() == "rpc" {
+            return host;
+        }
+        // Go's `url.URL.String` omits an empty path (the `url` crate always
+        // reports `/` for special schemes), so build it by hand.
+        let mut out = format!("{}://{host}", self.url.scheme());
+        let path = self.url.path();
+        if path != "/" && !path.is_empty() {
+            out.push_str(path);
+        }
+        if let Some(query) = self.url.query() {
+            out.push('?');
+            out.push_str(query);
+        }
+        if let Some(fragment) = self.url.fragment() {
+            out.push('#');
+            out.push_str(fragment);
+        }
+        out
+    }
+}
+
+/// `endpoint.k8sEndpoints`.
+pub fn k8s_endpoints(url: &K8sUrl, resource: &K8sResource) -> Vec<String> {
+    let mut endpoints = Vec::new();
+    match resource {
+        K8sResource::Endpoints { subsets } => {
+            for subset in subsets {
+                for address in &subset.addresses {
+                    let endpoint = if !address.hostname.is_empty() {
+                        url.endpoint_url(&format!("{}.{}", address.hostname, url.service))
+                    } else if !address.ip.is_empty() {
+                        url.endpoint_url(&address.ip)
+                    } else {
+                        String::new()
+                    };
+                    endpoints.push(endpoint);
+                }
+            }
+        }
+        K8sResource::StatefulSet {
+            name,
+            service_name,
+            replicas,
+        } => {
+            let replicas = replicas.unwrap_or(1);
+            for ordinal in 0..replicas {
+                // `$(statefulset name)-$(ordinal).$(serviceName)`.
+                endpoints.push(url.endpoint_url(&format!("{name}-{ordinal}.{service_name}")));
+            }
+        }
+    }
+    endpoints
+}
+
+/// The Kubernetes discovery seam (`endpoint.k8sDiscovery`'s informer).
+pub trait K8sDiscoverer: Send + Sync {
+    fn endpoints(&self, url: &K8sUrl) -> Result<Vec<String>, String>;
+}
+
+/// The production default: `rest.InClusterConfig` outside a pod returns
+/// [`IN_CLUSTER_CONFIG_ERROR`] (client-go `rest.ErrNotInCluster`).
+#[derive(Debug, Default)]
+pub struct NotInClusterDiscoverer;
+
+/// `rest.ErrNotInCluster`.
+pub const IN_CLUSTER_CONFIG_ERROR: &str = "unable to load in-cluster configuration, KUBERNETES_SERVICE_HOST and KUBERNETES_SERVICE_PORT must be defined";
+
+impl K8sDiscoverer for NotInClusterDiscoverer {
+    fn endpoints(&self, _url: &K8sUrl) -> Result<Vec<String>, String> {
+        Err(IN_CLUSTER_CONFIG_ERROR.to_owned())
+    }
+}
+
+/// A discoverer over injected Kubernetes resources, keyed by service name.
+#[derive(Debug, Default)]
+pub struct StaticK8sDiscoverer {
+    pub resources: BTreeMap<String, K8sResource>,
+}
+
+impl K8sDiscoverer for StaticK8sDiscoverer {
+    fn endpoints(&self, url: &K8sUrl) -> Result<Vec<String>, String> {
+        let resource = self
+            .resources
+            .get(&url.service)
+            .ok_or_else(|| format!("no resources for {}", url.service))?;
+        Ok(k8s_endpoints(url, resource))
+    }
+}
+
+/// `endpoint.New(urlspec).Endpoints()` for `k8s+` specs: parse, discover, and
+/// turn an empty result into the baseline's "no endpoints" error.
+pub fn k8s_discover_with(
+    discoverer: &dyn K8sDiscoverer,
+    urlspec: &str,
+) -> Result<Vec<String>, String> {
+    let url = parse_k8s_url(urlspec)?;
+    let endpoints = discoverer.endpoints(&url)?;
+    if endpoints.is_empty() {
+        return Err(format!(
+            "no {} endpoints could be found (this may indicate more {} replicas are needed, contact support@sourcegraph.com for assistance)",
+            url.service, url.service
+        ));
+    }
+    Ok(endpoints)
+}
+
+/// `endpoint.New(urlspec).Endpoints()` for the static branch:
+/// whitespace-separated endpoints in input order. `k8s+` specs go through
+/// [`k8s_discover_with`] with the production (not-in-cluster) discoverer.
 pub fn static_endpoints(urlspec: &str) -> Result<Vec<String>, String> {
     if urlspec.starts_with("k8s+") {
-        return Err(format!("k8s service discovery is not ported: {urlspec}"));
+        return k8s_discover_with(&NotInClusterDiscoverer, urlspec);
     }
     Ok(urlspec
         .split_whitespace()
