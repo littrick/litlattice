@@ -9,9 +9,12 @@
 //! not ported yet; `docs/overviews/m9_8dx_frontend_skeleton_overview.md`
 //! records what each missing layer is supposed to do.
 
+pub mod access_tokens_graphql;
 pub mod actor_chain;
 pub mod actor_chain_adapters;
 pub mod actor_middleware;
+pub mod admin_mutations;
+pub mod admin_store;
 pub mod app_handlers;
 pub mod app_handlers_more;
 pub mod app_router;
@@ -35,6 +38,7 @@ pub mod debug;
 pub mod deploy_defaults;
 pub mod external_accounts_graphql;
 pub mod external_api;
+pub mod external_service_mutations;
 pub mod external_services;
 pub mod extsvc_config_file;
 pub mod feature_flag_mutations;
@@ -62,6 +66,7 @@ pub mod oauth_routes;
 pub mod oauth_wiring;
 pub mod oidc_login;
 pub mod oidc_middleware;
+pub mod org_admin_graphql;
 pub mod org_store;
 pub mod otlp_wire;
 pub mod parse_search_query;
@@ -69,6 +74,7 @@ pub mod ranking_graphql;
 pub mod ranking_store;
 pub mod rate_limit;
 pub mod repositories;
+pub mod repository_mutations;
 pub mod repository_store;
 pub mod saml_auth;
 pub mod saml_wiring;
@@ -117,6 +123,8 @@ pub mod tenant;
 pub mod trace_headers;
 pub mod trace_policy;
 pub mod ui_assets;
+pub mod user_admin_graphql;
+pub mod user_emails_graphql;
 pub mod user_provisioning;
 pub mod user_store;
 pub mod userpasswd;
