@@ -181,6 +181,7 @@ impl EndpointSource for FakeSource {
                     })
                     .collect(),
                 crashes: 0,
+                stats: Default::default(),
             }),
             Script::Rollout => Err(Error::Transport(
                 "dial tcp 127.0.0.1:6070: connect: connection refused".to_owned(),

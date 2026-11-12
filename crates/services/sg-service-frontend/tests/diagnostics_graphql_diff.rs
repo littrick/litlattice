@@ -246,6 +246,7 @@ impl DiagnosticsStore for FakeDiagnostics {
             stats: Ok(self.fixture.stats.clone()),
             git_dir_bytes: Ok(self.fixture.git_dir_bytes),
             embedded: Ok(3),
+            indexed: None,
         }
     }
 
@@ -320,6 +321,7 @@ async fn diagnostics_graphql_diff_harness() {
             dotcom: fixture.dotcom,
             disable_auto_git_updates: fixture.disable_auto_updates,
             disk_usage_threshold: Some(90),
+            live: None,
         };
         let diagnostics = Arc::new(prefetch_diagnostics(&deps, &fields, actor, site_admin).await);
 

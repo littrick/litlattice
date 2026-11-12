@@ -125,6 +125,40 @@ pub async fn update_index_statuses(
     Ok(())
 }
 
+/// `database.ZoektRepoStatistics` (`internal/database/zoekt_repos.go`).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ZoektRepoStatistics {
+    pub total: i64,
+    pub indexed: i64,
+    pub not_indexed: i64,
+}
+
+/// `zoektReposStore.GetStatistics`: summary of `zoekt_repos` joined to live
+/// (not soft-deleted, not blocked) repositories.
+pub async fn get_statistics(pool: &PgPool) -> Result<ZoektRepoStatistics, sqlx::Error> {
+    sqlx::query_as::<_, (i64, i64, i64)>(GET_STATISTICS_QUERY)
+        .fetch_one(pool)
+        .await
+        .map(|(total, indexed, not_indexed)| ZoektRepoStatistics {
+            total,
+            indexed,
+            not_indexed,
+        })
+}
+
+const GET_STATISTICS_QUERY: &str = r#"
+SELECT
+	COUNT(*) AS total,
+	COUNT(*) FILTER(WHERE index_status = 'indexed') AS indexed,
+	COUNT(*) FILTER(WHERE index_status = 'not_indexed') AS not_indexed
+FROM zoekt_repos zr
+JOIN repo ON repo.id = zr.repo_id
+WHERE
+	repo.deleted_at is NULL
+AND
+	repo.blocked IS NULL
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;

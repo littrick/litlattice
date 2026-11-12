@@ -270,6 +270,17 @@ impl SiteConfiguration {
         self.bool_field("disableAutoGitUpdates")
     }
 
+    /// `siteConfig.GitserverDiskUsageWarningThreshold`
+    /// (`"gitserver.diskUsageWarningThreshold"`): the percentage at which
+    /// `Query.statusMessages` reports a gitserver disk warning. `None` means
+    /// unset (the caller defaults to 90).
+    pub fn gitserver_disk_usage_warning_threshold(&self) -> Option<i32> {
+        self.raw
+            .get("gitserver.diskUsageWarningThreshold")
+            .and_then(serde_json::Value::as_i64)
+            .map(|value| value as i32)
+    }
+
     /// `conf.Get().ExperimentalFeatures.RateLimitAnonymous`
     /// (`schema.ExperimentalFeatures.rateLimitAnonymous`): hourly anonymous
     /// GraphQL rate limit; `0` disables the limiter. The baseline unmarshals

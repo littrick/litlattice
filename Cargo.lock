@@ -4334,6 +4334,7 @@ dependencies = [
  "sg-licensing",
  "sg-metrics",
  "sg-proto",
+ "sg-rcache",
  "sg-redis",
  "sg-search-query",
  "sg-service-gitserver",

@@ -239,6 +239,7 @@ fn make_client(behavior: Behavior, state: Arc<State>) -> FakeClient {
             .map(|id| (*id, Default::default()))
             .collect(),
         crashes: behavior.crashes,
+        stats: Default::default(),
     };
 
     let error = if !behavior.rollout.is_empty() {

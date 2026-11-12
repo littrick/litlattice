@@ -57,6 +57,79 @@ async fn ranking_tables_available(pool: &sqlx::PgPool) -> bool {
     .unwrap_or(false)
 }
 
+/// M9.15b: assemble the production adapters behind the read-only diagnostic
+/// seams.
+///
+/// The baseline's `recorder.GetCache()` wraps the shared `redispool.Cache`;
+/// here a failed connect disables only the background-jobs reader. An absent
+/// zoekt endpoint list yields the baseline's zero `ListAllIndexed` result, and
+/// an endpoint list that cannot be parsed fails `List` per request like the
+/// baseline's lazy dialer.
+async fn diagnostics_deps(
+    pool: sqlx::PgPool,
+    live: Arc<sg_config::LiveConfig>,
+) -> crate::diagnostics_graphql::DiagnosticsDeps {
+    let recorder: Arc<dyn crate::diagnostics_adapters::RecorderSource> =
+        match sg_redis::KeyValue::connect(&sg_redis::cache_endpoint()).await {
+            Ok(kv) => {
+                Arc::new(crate::diagnostics_adapters::RedisRecorderSource::from_key_value(kv))
+            }
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "background-jobs reader disabled: Redis is unreachable"
+                );
+                Arc::new(crate::diagnostics_adapters::UnavailableRecorderSource::new(
+                    format!("Redis cache unavailable: {error}"),
+                ))
+            }
+        };
+
+    let indexed: Arc<dyn crate::diagnostics_adapters::IndexedStatsSource> =
+        match crate::service_connections::service_connections() {
+            Ok(connections) if connections.zoekts.is_empty() => {
+                Arc::new(crate::diagnostics_adapters::EmptyIndexedStatsSource)
+            }
+            Ok(connections) => {
+                match crate::search_env::IndexedJobStreamer::from_connections(&connections) {
+                    Ok(streamer) => {
+                        Arc::new(crate::diagnostics_adapters::ZoektIndexedStatsSource::new(
+                            Arc::new(streamer),
+                        ))
+                    }
+                    Err(error) => Arc::new(
+                        crate::diagnostics_adapters::ErrorIndexedStatsSource::new(
+                            error.to_string(),
+                        ),
+                    ),
+                }
+            }
+            Err(error) => {
+                Arc::new(crate::diagnostics_adapters::ErrorIndexedStatsSource::new(error))
+            }
+        };
+
+    let store = Arc::new(crate::diagnostics_adapters::ProductionDiagnosticsStore::new(
+        pool,
+        recorder,
+        Arc::new(crate::diagnostics_adapters::LiveGitserverDiskInfoSource::new(
+            Arc::clone(&live),
+        )),
+        Some(indexed),
+    ));
+
+    crate::diagnostics_graphql::DiagnosticsDeps {
+        store,
+        dotcom: crate::service_connections::sourcegraph_dotcom_mode(&|key: &str| {
+            std::env::var(key).ok()
+        }),
+        // Overridden per request by `live`; kept for the seam's tests.
+        disable_auto_git_updates: false,
+        disk_usage_threshold: None,
+        live: Some(live),
+    }
+}
+
 /// The frontend service. Only the transport skeleton is implemented; the
 /// GraphQL API, UI and enterprise setup land in later waves.
 pub struct FrontendService {
@@ -518,7 +591,17 @@ impl Service for FrontendService {
                     crate::embeddings_graphql::PgRepositoryEmbeddingsStore::new(
                         session_pool.clone(),
                     ),
-                ));
+                ))
+                // M9.15b: production adapters behind the M9.14c diagnostic
+                // seams. Background jobs read the existing
+                // `background-job-logger` Redis keys (read-only), gitserver
+                // disk info reuses the live shard list, and `indexed` lists
+                // zoekt through the same endpoint stack as the search runtime.
+                .with_diagnostics(diagnostics_deps(
+                    session_pool.clone(),
+                    Arc::clone(wiring.live()),
+                )
+                .await);
         // M9.8jf/M9.8jj: `Query.slowRequests` reads the FIFO list whose
         // capacity is `observability.captureSlowGraphQLRequestsLimit`
         // (`conf.Get()` per request in the baseline; here from the current

@@ -16,11 +16,12 @@
 //! | `Query.backgroundJobs` | `cmd/frontend/graphqlbackend/background_jobs.go`, `internal/goroutine/recorder` |
 //! | `Query.gitservers` | `cmd/frontend/graphqlbackend/gitserver.go` |
 //!
+//! Since M9.15b [`crate::diagnostics_adapters`] supplies the production store
+//! and the indexed-stats seam. When [`RepositoryStatsData::indexed`] is `None`
+//! (no seam injected), `indexed`/`indexedLinesCount` keep resolving `Ok(None)`.
+//!
 //! Explicitly not ported (see the slice overview §5):
 //!
-//! * `RepositoryStats.indexed` / `indexedLinesCount`: the baseline uses the
-//!   process-global `search.Indexed()` zoekt streamer, which has no injectable
-//!   seam. Both fields resolve as `Ok(None)`.
 //! * `ExternalServiceSyncError.externalService`: needs the external-service
 //!   row plus the resolver's URL transformation.
 //!
@@ -83,9 +84,31 @@ pub trait DiagnosticsStore: Send + Sync {
 pub struct DiagnosticsDeps {
     pub store: Arc<dyn DiagnosticsStore>,
     pub dotcom: bool,
+    /// Static fallback used when [`Self::live`] is `None` (tests/differentials).
     pub disable_auto_git_updates: bool,
     /// `SiteConfig().GitserverDiskUsageWarningThreshold` (`None` -> 90).
+    /// Static fallback used when [`Self::live`] is `None`.
     pub disk_usage_threshold: Option<i32>,
+    /// Production live config; when set, the two values above are read per
+    /// request from `conf.Get()`, matching the baseline.
+    pub live: Option<Arc<sg_config::LiveConfig>>,
+}
+
+impl DiagnosticsDeps {
+    /// `conf.Get().DisableAutoGitUpdates` and
+    /// `conf.Get().SiteConfig().GitserverDiskUsageWarningThreshold`.
+    fn request_config(&self) -> (bool, Option<i32>) {
+        match &self.live {
+            Some(live) => {
+                let unified = live.current();
+                (
+                    unified.site.disable_auto_git_updates(),
+                    unified.site.gitserver_disk_usage_warning_threshold(),
+                )
+            }
+            None => (self.disable_auto_git_updates, self.disk_usage_threshold),
+        }
+    }
 }
 
 /// Raw `FetchStatusMessages` inputs.
@@ -142,12 +165,15 @@ impl GitserverInfoData {
     }
 }
 
-/// `repositoryStatsResolver`'s three lazily-computed halves.
+/// `repositoryStatsResolver`'s lazily-computed halves.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RepositoryStatsData {
     pub stats: Result<RepoStatistics, String>,
     pub git_dir_bytes: Result<i64, String>,
     pub embedded: Result<i32, String>,
+    /// `computeIndexedStats`: `None` means no zoekt seam was injected and the
+    /// two indexed fields stay unported (`Ok(None)`).
+    pub indexed: Option<Result<crate::diagnostics_adapters::IndexedStats, String>>,
 }
 
 /// One `recorder.JobInfo`.
@@ -399,6 +425,7 @@ pub async fn prefetch_diagnostics(
     let mut prefetch = DiagnosticsPrefetch::default();
     let admin = crate::admin_store::check_current_user_is_site_admin(actor, viewer_site_admin);
     let mut gitservers_lookup: Option<Result<Vec<GitserverInfoData>, String>> = None;
+    let (disable_auto_git_updates, disk_usage_threshold) = deps.request_config();
 
     if field_selected(fields, "gitservers") {
         prefetch.gitservers = Some(match &admin {
@@ -421,7 +448,10 @@ pub async fn prefetch_diagnostics(
                             Ok(servers) => servers,
                             Err(message) => {
                                 return finish_diagnostics(
-                                    prefetch_with_error(prefetch, message),
+                                    prefetch_with_error(
+                                        prefetch,
+                                        format!("fetching gitserver disk info: {message}"),
+                                    ),
                                     &admin,
                                     deps,
                                     fields,
@@ -431,8 +461,8 @@ pub async fn prefetch_diagnostics(
                         }
                     };
                     Ok(compose_status_messages(
-                        deps.disable_auto_git_updates,
-                        deps.disk_usage_threshold,
+                        disable_auto_git_updates,
+                        disk_usage_threshold,
                         &inputs,
                         &servers,
                     ))
@@ -464,6 +494,7 @@ async fn finish_diagnostics(
                 stats: Err(message.clone()),
                 git_dir_bytes: Err(message.clone()),
                 embedded: Err(message.clone()),
+                indexed: Some(Err(message.clone())),
             },
             Ok(()) => deps.store.repository_stats().await,
         });
@@ -628,9 +659,28 @@ impl ObjectValue for RepositoryStatsObject {
             "failedFetch" => int_field(self.data.stats.clone().map(|stats| stats.failed_fetch)),
             "corrupted" => int_field(self.data.stats.clone().map(|stats| stats.corrupted)),
             "embedded" => int_field(self.data.embedded.clone().map(i64::from)),
-            // `indexed` / `indexedLinesCount`: requires the global zoekt
-            // streamer, not ported (overview §5.2).
-            "indexed" | "indexedLinesCount" => Ok(None),
+            // `computeIndexedStats` first, then `Total` for `indexed` (Go
+            // `min(indexedRepos, total)` after `int32` conversions).
+            "indexed" => match &self.data.indexed {
+                None => Ok(None),
+                Some(Err(message)) => Err(ExecError::new(message.clone())),
+                Some(Ok(indexed)) => match &self.data.stats {
+                    Err(message) => Err(ExecError::new(message.clone())),
+                    Ok(stats) => Ok(Some(FieldValue::Json(Json::Int(i64::from(
+                        (indexed.repos as i32).min(stats.total as i32),
+                    ))))),
+                },
+            },
+            // `IndexedLinesCount` only calls `computeIndexedStats`. It is a
+            // `BigInt`, which `BigInt.MarshalJSON` serializes as a decimal
+            // string (`bigint.go`).
+            "indexedLinesCount" => match &self.data.indexed {
+                None => Ok(None),
+                Some(Err(message)) => Err(ExecError::new(message.clone())),
+                Some(Ok(indexed)) => Ok(Some(FieldValue::Json(Json::Str(
+                    indexed.lines.to_string(),
+                )))),
+            },
             _ => Ok(None),
         }
     }
@@ -1163,6 +1213,7 @@ mod tests {
                 }),
                 git_dir_bytes: Ok(1_234_567_890_123),
                 embedded: Ok(3),
+                indexed: None,
             },
         };
         assert!(matches!(

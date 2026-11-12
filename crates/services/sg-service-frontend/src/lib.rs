@@ -51,6 +51,7 @@ pub mod git_comparison_graphql;
 pub mod git_graphql;
 pub mod git_tree_entry_graphql;
 pub mod gitlab_oauth;
+pub mod diagnostics_adapters;
 pub mod diagnostics_graphql;
 pub mod embeddings_graphql;
 pub mod executor_secrets_graphql;

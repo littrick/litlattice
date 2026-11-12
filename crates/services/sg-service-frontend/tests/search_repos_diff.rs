@@ -386,6 +386,7 @@ impl ResolverZoektLister for FakeZoekt {
                 repos: Vec::new(),
                 repos_map: BTreeMap::new(),
                 crashes: 0,
+                stats: Default::default(),
             });
         *index += 1;
         Ok(response)
@@ -594,6 +595,7 @@ fn build_fakes(case: &Case) -> (Arc<FakeDb>, Arc<FakeGitserver>, Arc<FakeZoekt>,
                 repos: Vec::new(),
                 repos_map,
                 crashes: response.crashes,
+                stats: Default::default(),
             }
         })
         .collect();

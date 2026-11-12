@@ -237,6 +237,7 @@ impl Upstream {
                 .map(|id| (id, MinimalRepoListEntry::default()))
                 .collect(),
             crashes: self.crashes,
+            stats: Default::default(),
         })
     }
 }

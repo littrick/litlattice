@@ -520,6 +520,7 @@ mod tests {
             repos: vec![Default::default()],
             repos_map: [(7, Default::default())].into_iter().collect(),
             crashes: 2,
+            stats: Default::default(),
         };
         let fields = list_done_fields(Some(&list), "200");
         assert_eq!(

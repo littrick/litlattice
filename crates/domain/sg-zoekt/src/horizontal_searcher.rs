@@ -250,12 +250,11 @@ impl<C: Client> HorizontalSearcher<C> {
 
     /// `(*HorizontalSearcher).List`.
     ///
-    /// Aggregates `Repos`, `Crashes` and `ReposMap` across every client. A
-    /// rollout error counts as a crash and continues; any other error is
-    /// returned. The baseline then sets `Stats.Repos = len(Repos) +
-    /// len(ReposMap)`; [`crate::types::ListResponse`] has no `Stats` field, so
-    /// callers derive that count from the returned lengths (the intermediate
-    /// `RepoStats.Add` is not observable in the final result).
+    /// Aggregates `Repos`, `Crashes`, `ReposMap` and `Stats` across every
+    /// client. A rollout error counts as a crash and continues; any other
+    /// error is returned. Like the baseline, the final `Stats.Repos` is
+    /// overwritten with `len(Repos) + len(ReposMap)` (only one of the two
+    /// fields is populated, and `ReposMap` is not deduplicated).
     pub async fn list(
         &self,
         query: &Query,
@@ -280,10 +279,13 @@ impl<C: Client> HorizontalSearcher<C> {
                 Ok(list) => {
                     aggregate.repos.extend(list.repos);
                     aggregate.crashes += list.crashes;
+                    aggregate.stats.add(&list.stats);
                     aggregate.repos_map.extend(list.repos_map);
                 }
             }
         }
+        aggregate.stats.repos =
+            (aggregate.repos.len() + aggregate.repos_map.len()) as i64;
         Ok(aggregate)
     }
 
