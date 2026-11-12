@@ -1078,6 +1078,9 @@ pub struct NestedPrefetch {
     pub saved_searches: Option<crate::saved_searches_graphql::SavedSearchesHandleWrapper>,
     /// `User.monitors` surface (M9.13a).
     pub code_monitors: Option<crate::code_monitors_graphql::CodeMonitorsHandleWrapper>,
+    /// `User.emails` / `primaryEmail` / `accessTokens` / `session` /
+    /// `hasVerifiedEmail` per-user account data (M9.18a).
+    pub user_accounts: HashMap<i32, crate::graphql_inventory_c::UserAccountsData>,
 }
 
 /// The database seam for `User.organizations` (`db.Orgs().GetByUserID` plus
@@ -2836,6 +2839,10 @@ pub struct InventoryRoots {
     /// `packageRepoReferencesMatchingFilter`, `indexedSearchInstances`,
     /// `outboundRequests`, `invitationByToken` and the batch-B mutations).
     pub business_b: crate::graphql_inventory_b::InventoryBRoots,
+    /// M9.18a batch-C business roots (`externalServiceNamespaces`,
+    /// `externalServiceRepositories`, `renderMarkdown`, `highlightCode`,
+    /// `webhooks` and the batch-C mutations).
+    pub business_c: crate::graphql_inventory_c::InventoryCRoots,
 }
 
 impl InventoryRoots {
@@ -3019,6 +3026,11 @@ struct QueryRoot {
 pub struct MutationRoot {
     /// M9.16a business mutations (see [`InventoryRoots`]).
     inventory: Arc<InventoryRoots>,
+    /// Viewer `site_admin` for the M9.18a batch-C mutation responses.
+    business_c_viewer_site_admin: bool,
+    /// Nested prefetch attached to the users/webhooks batch-C mutations
+    /// return.
+    business_c_nested: Arc<NestedPrefetch>,
     settings: crate::settings_mutation::MutationRoot,
     search_contexts: Option<SearchContextsDatabaseHandle>,
     /// Prefetched `Mutation.bumpDerivativeGraphKey` /
@@ -3223,6 +3235,14 @@ impl ObjectValue for MutationRoot {
         if let Some(outcome) = self.inventory.business_b.mutations.get(field) {
             return crate::graphql_inventory_b::InventoryBRoots::mutation_value(outcome);
         }
+        // M9.18a batch-C mutations.
+        if let Some(outcome) = self.inventory.business_c.mutations.get(field) {
+            return crate::graphql_inventory_c::InventoryCRoots::mutation_value(
+                outcome,
+                self.business_c_viewer_site_admin,
+                &self.business_c_nested,
+            );
+        }
         if let Some(saved_searches) = &self.saved_searches {
             if crate::saved_searches_graphql::is_root_field(field) {
                 return crate::saved_searches_graphql::root_field(
@@ -3250,7 +3270,15 @@ impl ObjectValue for MutationRoot {
 impl FrontendRootResolver {
     /// Attach the request's nested prefetch data.
     pub fn with_nested(mut self, nested: Arc<NestedPrefetch>) -> Self {
+        self.mutation.business_c_nested = Arc::clone(&nested);
         self.query.nested = nested;
+        self
+    }
+
+    /// Attach the viewer `site_admin` flag for the M9.18a batch-C mutation
+    /// responses.
+    pub fn with_inventory_c_viewer(mut self, viewer_site_admin: bool) -> Self {
+        self.mutation.business_c_viewer_site_admin = viewer_site_admin;
         self
     }
 
@@ -3601,6 +3629,75 @@ impl ObjectValue for QueryRoot {
                 )))),
                 Some(Ok(None)) => Ok(Some(FieldValue::Null)),
             },
+            // `Query.webhooks` (`internal/repos/webhooks/resolvers/resolver.go`).
+            "webhooks" => {
+                let key = crate::graphql_inventory_c::webhooks_key(arguments);
+                match self.inventory.business_c.webhooks.get(&key) {
+                    None => Ok(None),
+                    Some(Err(message)) => Err(ExecError::new(message.clone())),
+                    Some(Ok(data)) => Ok(Some(FieldValue::Object(Arc::new(
+                        crate::graphql_inventory_c::WebhookConnectionObject {
+                            data: data.clone(),
+                            viewer_site_admin: self.viewer_site_admin,
+                            nested: self.nested.clone(),
+                        },
+                    )))),
+                }
+            }
+            // `Query.externalServiceNamespaces` (`external_services.go:535-590`).
+            "externalServiceNamespaces" => {
+                let key = crate::graphql_inventory_c::external_namespaces_key(arguments);
+                match self
+                    .inventory
+                    .business_c
+                    .external_namespaces
+                    .get(&key)
+                {
+                    None => Ok(None),
+                    Some(Err(message)) => Err(ExecError::new(message.clone())),
+                    Some(Ok(nodes)) => Ok(Some(FieldValue::Object(Arc::new(
+                        crate::graphql_inventory_c::ExternalServiceNamespaceConnectionObject {
+                            nodes: nodes.clone(),
+                        },
+                    )))),
+                }
+            }
+            // `Query.externalServiceRepositories` (`external_services.go:597-660`).
+            "externalServiceRepositories" => {
+                let key = crate::graphql_inventory_c::external_repositories_key(arguments);
+                match self
+                    .inventory
+                    .business_c
+                    .external_repositories
+                    .get(&key)
+                {
+                    None => Ok(None),
+                    Some(Err(message)) => Err(ExecError::new(message.clone())),
+                    Some(Ok(nodes)) => Ok(Some(FieldValue::Object(Arc::new(
+                        crate::graphql_inventory_c::ExternalServiceRepositoryConnectionObject {
+                            nodes: nodes.clone(),
+                        },
+                    )))),
+                }
+            }
+            // `Query.renderMarkdown` (`file.go:48-52`).
+            "renderMarkdown" => {
+                let key = crate::graphql_inventory_c::markdown_key(arguments);
+                match self.inventory.business_c.markdown.get(&key) {
+                    None => Ok(None),
+                    Some(Err(message)) => Err(ExecError::new(message.clone())),
+                    Some(Ok(html)) => Ok(Some(FieldValue::Json(Json::Str(html.clone())))),
+                }
+            }
+            // `Query.highlightCode` (`file.go:55-80`).
+            "highlightCode" => {
+                let key = crate::graphql_inventory_c::highlight_key(arguments);
+                match self.inventory.business_c.highlight.get(&key) {
+                    None => Ok(None),
+                    Some(Err(message)) => Err(ExecError::new(message.clone())),
+                    Some(Ok(html)) => Ok(Some(FieldValue::Json(Json::Str(html.clone())))),
+                }
+            }
             // `schemaResolver.Site` (`site.go:74-76`): no arguments and no
             // access check; `Site.configuration` re-checks admin itself.
             "site" => Ok(Some(FieldValue::Object(Arc::new(SiteObject {
@@ -4683,6 +4780,80 @@ impl ObjectValue for UserObject {
                 )
                 .map(Some),
                 None => Ok(None),
+            },
+            // `UserResolver.Emails` / `PrimaryEmail` / `AccessTokens` /
+            // `Session` / `HasVerifiedEmail` (M9.18a; prefetched per user).
+            "emails" => match self.nested.user_accounts.get(&self.data.id) {
+                None => Ok(None),
+                Some(account) => match &account.emails {
+                    Err(message) => Err(ExecError::new(message.clone())),
+                    Ok(emails) => Ok(Some(FieldValue::List {
+                        element_type: Some("UserEmail"),
+                        items: emails
+                            .iter()
+                            .cloned()
+                            .map(|data| {
+                                FieldValue::Object(Arc::new(
+                                    crate::graphql_inventory_c::UserEmailObject {
+                                        data,
+                                        user: self.clone(),
+                                        viewer_site_admin: self.viewer_site_admin,
+                                    },
+                                ))
+                            })
+                            .collect(),
+                    })),
+                },
+            },
+            "primaryEmail" => match self.nested.user_accounts.get(&self.data.id) {
+                None => Ok(None),
+                Some(account) => match &account.primary_email {
+                    Err(message) => Err(ExecError::new(message.clone())),
+                    Ok(found) => Ok(Some(match found {
+                        Some(data) => FieldValue::Object(Arc::new(
+                            crate::graphql_inventory_c::UserEmailObject {
+                                data: data.clone(),
+                                user: self.clone(),
+                                viewer_site_admin: self.viewer_site_admin,
+                            },
+                        )),
+                        None => FieldValue::Null,
+                    })),
+                },
+            },
+            "accessTokens" => match self.nested.user_accounts.get(&self.data.id) {
+                None => Ok(None),
+                Some(account) => match &account.access_tokens {
+                    Err(message) => Err(ExecError::new(message.clone())),
+                    Ok(full) => Ok(Some(FieldValue::Object(Arc::new(
+                        crate::graphql_inventory_c::AccessTokenConnectionObject {
+                            full: full.clone(),
+                            first: arguments
+                                .i64("first")
+                                .and_then(|first| i32::try_from(first).ok()),
+                            viewer_site_admin: self.viewer_site_admin,
+                            nested: self.nested.clone(),
+                        },
+                    )))),
+                },
+            },
+            "session" => match self.nested.user_accounts.get(&self.data.id) {
+                None => Ok(None),
+                Some(account) => match &account.session_can_sign_out {
+                    Err(message) => Err(ExecError::new(message.clone())),
+                    Ok(can_sign_out) => Ok(Some(FieldValue::Object(Arc::new(
+                        crate::graphql_inventory_c::SessionObject {
+                            can_sign_out: *can_sign_out,
+                        },
+                    )))),
+                },
+            },
+            "hasVerifiedEmail" => match self.nested.user_accounts.get(&self.data.id) {
+                None => Ok(None),
+                Some(account) => match &account.has_verified_email {
+                    Err(message) => Err(ExecError::new(message.clone())),
+                    Ok(verified) => Ok(Some(FieldValue::Json(Json::Bool(*verified)))),
+                },
             },
             _ => Ok(None),
         }

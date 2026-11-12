@@ -493,6 +493,10 @@ pub struct SchemaGraphqlDeps {
     /// `invitationByToken` errors with `SIGNING_KEY_VALIDATE` and invitation
     /// URLs use the legacy relative form.
     org_invitation_config: Option<crate::graphql_inventory_b::OrgInvitationConfig>,
+    /// M9.18a batch-C seams/config (`externalServiceNamespaces`,
+    /// `renderMarkdown`, `highlightCode`, `webhooks` and the batch-C
+    /// mutations). `None` keeps those fields unported.
+    inventory_c: Option<crate::graphql_inventory_c::InventoryCDeps>,
 }
 
 /// Seams for the external-account GraphQL surface (M9.8ka): the
@@ -554,6 +558,7 @@ impl SchemaGraphqlDeps {
             embeddings: None,
             diagnostics: None,
             org_invitation_config: None,
+            inventory_c: None,
         }
     }
 
@@ -620,6 +625,7 @@ impl SchemaGraphqlDeps {
             embeddings: None,
             diagnostics: None,
             org_invitation_config: None,
+            inventory_c: Some(crate::graphql_inventory_c::InventoryCDeps::default()),
         }
     }
 
@@ -952,6 +958,18 @@ impl SchemaGraphqlDeps {
         self
     }
 
+    /// Inject the M9.18a batch-C seams/config. The default for
+    /// `with_session` is the honest production subset (SQL-backed mutations and
+    /// markdown/highlighting; external discovery, SMTP, gitserver mirror checks
+    /// and repoupdater fail with the baseline error text).
+    pub fn with_inventory_c_deps(
+        mut self,
+        deps: crate::graphql_inventory_c::InventoryCDeps,
+    ) -> Self {
+        self.inventory_c = Some(deps);
+        self
+    }
+
     /// Enable the ranking GraphQL surface (M9.8ic): append
     /// `codeintel.ranking.graphql` to the assembled schema and hand the root
     /// resolver to the executor.
@@ -1120,6 +1138,7 @@ impl SchemaGraphqlDeps {
             embeddings: None,
             diagnostics: None,
             org_invitation_config: None,
+            inventory_c: None,
         }
     }
 }
@@ -1589,6 +1608,20 @@ impl GraphqlDeps for SchemaGraphqlDeps {
                     None,
                 )
                 .await;
+                // M9.18a batch C.
+                inventory.business_c = match &self.inventory_c {
+                    Some(deps) => {
+                        crate::graphql_inventory_c::prefetch_inventory_c(
+                            pool,
+                            &fields,
+                            request.actor,
+                            site_admin,
+                            deps,
+                        )
+                        .await
+                    }
+                    None => Default::default(),
+                };
                 if is_mutation {
                     inventory.migration_direction =
                         crate::out_of_band_migrations_graphql::prefetch_set_migration_direction(
@@ -1667,6 +1700,80 @@ impl GraphqlDeps for SchemaGraphqlDeps {
             ),
             _ => Arc::new(crate::graphql_resolvers::NestedPrefetch::default()),
         };
+        // M9.18a `User.emails` / `primaryEmail` / `accessTokens` / `session` /
+        // `hasVerifiedEmail`: prefetch the account data for every user the
+        // operation can reach.
+        if let (Some(pool), Some(deps)) = (&self.pool, &self.inventory_c) {
+            if crate::graphql_inventory_c::selects_user_accounts(&fields) {
+                let mut uids: Vec<i32> = Vec::new();
+                if let Some(user) = &current_user {
+                    uids.push(user.id);
+                }
+                for lookup in users.values() {
+                    if let crate::graphql_resolvers::UserLookup::Found(user) = lookup {
+                        uids.push(user.id);
+                    }
+                }
+                for lookup in users_connections.values() {
+                    if let crate::graphql_resolvers::UsersConnectionLookup::Found(data) = lookup {
+                        uids.extend(data.users.iter().map(|user| user.id));
+                    }
+                }
+                for lookup in nodes.users.values() {
+                    if let crate::graphql_resolvers::UserByIdLookup::Found(user) = lookup {
+                        uids.push(user.id);
+                    }
+                }
+                for connection in inventory.business_c.webhooks.values() {
+                    if let Ok(connection) = connection {
+                        for node in &connection.nodes {
+                            if let crate::graphql_inventory_c::UserByIdLookupOrMissing::Found(user) =
+                                &node.created_by
+                            {
+                                uids.push(user.id);
+                            }
+                            if let crate::graphql_inventory_c::UserByIdLookupOrMissing::Found(user) =
+                                &node.updated_by
+                            {
+                                uids.push(user.id);
+                            }
+                        }
+                    }
+                }
+                for outcome in inventory.business_c.mutations.values() {
+                    match outcome {
+                        crate::graphql_inventory_c::InventoryCOutcome::User(user) => {
+                            uids.push(user.id);
+                        }
+                        crate::graphql_inventory_c::InventoryCOutcome::Webhook(webhook) => {
+                            if let crate::graphql_inventory_c::UserByIdLookupOrMissing::Found(user) =
+                                &webhook.created_by
+                            {
+                                uids.push(user.id);
+                            }
+                            if let crate::graphql_inventory_c::UserByIdLookupOrMissing::Found(user) =
+                                &webhook.updated_by
+                            {
+                                uids.push(user.id);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                let accounts = crate::graphql_inventory_c::prefetch_user_accounts(
+                    pool,
+                    &uids,
+                    request.actor,
+                    site_admin,
+                    deps.dotcom,
+                    deps.email_verification_required,
+                )
+                .await;
+                if !accounts.is_empty() {
+                    Arc::make_mut(&mut nested).user_accounts = accounts;
+                }
+            }
+        }
         // `User.externalAccounts` (M9.8ka): prefetch every selected connection
         // and the `CodySubscription` inputs the node objects replay.
         if let (Some(deps), Some(registry)) = (&self.external_accounts, &external_accounts_registry)
@@ -2114,6 +2221,7 @@ impl GraphqlDeps for SchemaGraphqlDeps {
                 site_admin,
             )
             .with_nested(nested)
+            .with_inventory_c_viewer(site_admin)
             .with_nodes(nodes)
             .with_namespaces(namespaces)
             .with_repository_redirects(repository_redirects)
