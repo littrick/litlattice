@@ -591,11 +591,26 @@ pub async fn prefetch_repositories_connections(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RepositoriesConnectionObject {
     data: RepositoriesConnectionData,
+    /// The request's embeddings snapshot (M9.14c), replayed by each node's
+    /// `embeddingExists`. `None` keeps the field unported.
+    embeddings: Option<Arc<crate::embeddings_graphql::EmbeddingsPrefetch>>,
 }
 
 impl RepositoriesConnectionObject {
     pub fn from_data(data: RepositoriesConnectionData) -> Self {
-        Self { data }
+        Self {
+            data,
+            embeddings: None,
+        }
+    }
+
+    /// Attach the request's prefetched embeddings data (M9.14c).
+    pub fn with_embeddings(
+        mut self,
+        embeddings: Option<Arc<crate::embeddings_graphql::EmbeddingsPrefetch>>,
+    ) -> Self {
+        self.embeddings = embeddings;
+        self
     }
 }
 
@@ -618,7 +633,12 @@ impl ObjectValue for RepositoriesConnectionObject {
                         .nodes
                         .iter()
                         .cloned()
-                        .map(|data| FieldValue::Object(Arc::new(RepositoryObject::from_data(data))))
+                        .map(|data| {
+                            FieldValue::Object(Arc::new(
+                                RepositoryObject::from_data(data)
+                                    .with_embeddings(self.embeddings.clone()),
+                            ))
+                        })
                         .collect(),
                 })),
                 Err(message) => Err(ExecError::new(message.clone())),

@@ -1055,6 +1055,13 @@ pub struct NestedPrefetch {
         (i32, crate::executor_secrets_graphql::ExecutorSecretsArgs),
         Result<crate::executor_secrets_graphql::ExecutorSecretConnectionData, String>,
     >,
+    /// `Repository.embeddingExists` lookups (M9.14c). `None` keeps the field
+    /// unported when no embeddings seam was injected.
+    pub repo_embeddings: Option<Arc<crate::embeddings_graphql::EmbeddingsPrefetch>>,
+    /// `Query.statusMessages` / `repositoryStats` / `backgroundJobs` /
+    /// `gitservers` snapshots (M9.14c). `None` keeps all four unported when no
+    /// diagnostics seam was injected.
+    pub diagnostics: Option<Arc<crate::diagnostics_graphql::DiagnosticsPrefetch>>,
     /// `ExecutorSecret.accessLogs` connections keyed by secret id and the
     /// argument set (M9.13b).
     pub executor_secret_access_logs: HashMap<
@@ -3164,7 +3171,9 @@ impl QueryRoot {
                 let node_id = unmarshal_relay_id(id).map_err(ExecError::new)?;
                 match self.nodes.repositories.get(&node_id) {
                     Some(RepoLookup::Found(data)) => Ok(Some(FieldValue::Object(Arc::new(
-                        RepositoryObject::from_data(data.clone()).with_git(self.git.clone()),
+                        RepositoryObject::from_data(data.clone())
+                            .with_git(self.git.clone())
+                            .with_embeddings(self.nested.repo_embeddings.clone()),
                     )))),
                     Some(RepoLookup::NotFound) => Ok(Some(FieldValue::Null)),
                     Some(RepoLookup::Blocked { name, reason }) => Err(ExecError::new(format!(
@@ -3199,6 +3208,76 @@ impl ObjectValue for QueryRoot {
                 site: self.site.clone(),
                 auth_providers: self.auth_providers.clone(),
             })))),
+            // `schemaResolver.StatusMessages` / `RepositoryStats` /
+            // `BackgroundJobs` / `Gitservers` (`status_messages.go`,
+            // `repository_stats.go`, `background_jobs.go`, `gitserver.go`):
+            // these are `Query` fields in the schema, site-admin gated, and
+            // prefetched (M9.14c). `None` keeps the pre-slice unported
+            // behaviour.
+            "statusMessages" => match self
+                .nested
+                .diagnostics
+                .as_ref()
+                .and_then(|diagnostics| diagnostics.status_messages.as_ref())
+            {
+                None => Ok(None),
+                Some(Err(message)) => Err(ExecError::new(message.clone())),
+                Some(Ok(messages)) => Ok(Some(FieldValue::List {
+                    element_type: Some("StatusMessage"),
+                    items: messages
+                        .iter()
+                        .cloned()
+                        .map(|message| {
+                            FieldValue::Object(Arc::new(
+                                crate::diagnostics_graphql::StatusMessageObject { message },
+                            ))
+                        })
+                        .collect(),
+                })),
+            },
+            "repositoryStats" => match self
+                .nested
+                .diagnostics
+                .as_ref()
+                .and_then(|diagnostics| diagnostics.repository_stats.clone())
+            {
+                None => Ok(None),
+                Some(data) => Ok(Some(FieldValue::Object(Arc::new(
+                    crate::diagnostics_graphql::RepositoryStatsObject { data },
+                )))),
+            },
+            "backgroundJobs" => {
+                let args =
+                    crate::diagnostics_graphql::BackgroundJobsArgs::from_arguments(arguments);
+                match self
+                    .nested
+                    .diagnostics
+                    .as_ref()
+                    .and_then(|diagnostics| diagnostics.background_jobs.get(&args))
+                {
+                    None => Ok(None),
+                    Some(Err(message)) => Err(ExecError::new(message.clone())),
+                    Some(Ok(data)) => Ok(Some(FieldValue::Object(Arc::new(
+                        crate::diagnostics_graphql::BackgroundJobConnectionObject {
+                            data: data.clone(),
+                        },
+                    )))),
+                }
+            }
+            "gitservers" => match self
+                .nested
+                .diagnostics
+                .as_ref()
+                .and_then(|diagnostics| diagnostics.gitservers.as_ref())
+            {
+                None => Ok(None),
+                Some(Err(message)) => Err(ExecError::new(message.clone())),
+                Some(Ok(servers)) => Ok(Some(FieldValue::Object(Arc::new(
+                    crate::diagnostics_graphql::GitserverInstanceConnectionObject {
+                        servers: servers.clone(),
+                    },
+                )))),
+            },
             // `schemaResolver.SettingsSubject` (`settings_subject.go:16-23`):
             // `nodeByID` dispatch + `settingsSubjectForNodeAndCheckAccess`;
             // User/Org access failures are reported here.
@@ -3270,7 +3349,9 @@ impl ObjectValue for QueryRoot {
             "repository" => match repository_arg(arguments) {
                 RepositoryArg::Key(key) => match self.repositories.get(&key) {
                     Some(RepoLookup::Found(data)) => Ok(Some(FieldValue::Object(Arc::new(
-                        RepositoryObject::from_data(data.clone()).with_git(self.git.clone()),
+                        RepositoryObject::from_data(data.clone())
+                            .with_git(self.git.clone())
+                            .with_embeddings(self.nested.repo_embeddings.clone()),
                     )))),
                     Some(RepoLookup::NotFound) => Ok(Some(FieldValue::Null)),
                     Some(RepoLookup::Blocked { name, reason }) => Err(ExecError::new(format!(
@@ -3284,7 +3365,9 @@ impl ObjectValue for QueryRoot {
                 RepositoryArg::CloneUrl(clone_url) => {
                     match self.repositories.get(&RepoKey::CloneUrl(clone_url)) {
                         Some(RepoLookup::Found(data)) => Ok(Some(FieldValue::Object(Arc::new(
-                            RepositoryObject::from_data(data.clone()).with_git(self.git.clone()),
+                            RepositoryObject::from_data(data.clone())
+                            .with_git(self.git.clone())
+                            .with_embeddings(self.nested.repo_embeddings.clone()),
                         )))),
                         Some(RepoLookup::NotFound) => Ok(Some(FieldValue::Null)),
                         Some(RepoLookup::Blocked { name, reason }) => Err(ExecError::new(format!(
@@ -3305,7 +3388,9 @@ impl ObjectValue for QueryRoot {
             "repositoryRedirect" => match repository_redirect_arg(arguments) {
                 RepositoryRedirectArg::Key(key) => match self.repository_redirects.get(&key) {
                     Some(RepoLookup::Found(data)) => Ok(Some(FieldValue::Object(Arc::new(
-                        RepositoryObject::from_data(data.clone()).with_git(self.git.clone()),
+                        RepositoryObject::from_data(data.clone())
+                            .with_git(self.git.clone())
+                            .with_embeddings(self.nested.repo_embeddings.clone()),
                     )))),
                     Some(RepoLookup::NotFound) => Ok(Some(FieldValue::Null)),
                     Some(RepoLookup::Blocked { name, reason }) => Err(ExecError::new(format!(
@@ -3321,7 +3406,9 @@ impl ObjectValue for QueryRoot {
                         .get(&RepositoryRedirectKey::CloneUrl(clone_url))
                     {
                         Some(RepoLookup::Found(data)) => Ok(Some(FieldValue::Object(Arc::new(
-                            RepositoryObject::from_data(data.clone()).with_git(self.git.clone()),
+                            RepositoryObject::from_data(data.clone())
+                            .with_git(self.git.clone())
+                            .with_embeddings(self.nested.repo_embeddings.clone()),
                         )))),
                         Some(RepoLookup::NotFound) => Ok(Some(FieldValue::Null)),
                         Some(RepoLookup::Blocked { name, reason }) => Err(ExecError::new(format!(
@@ -3345,7 +3432,8 @@ impl ObjectValue for QueryRoot {
                         Ok(Some(FieldValue::Object(Arc::new(
                             crate::repositories::RepositoriesConnectionObject::from_data(
                                 data.clone(),
-                            ),
+                            )
+                            .with_embeddings(self.nested.repo_embeddings.clone()),
                         ))))
                     }
                     Some(crate::repositories::RepositoriesConnectionLookup::Error(message)) => {
@@ -5393,16 +5481,32 @@ pub struct RepositoryObject {
     /// The request's git prefetch data (M9.8ix); `None` leaves `commit` and
     /// `GitRef.target` unported, matching a transport-only resolver.
     git: Option<Arc<crate::git_graphql::GitPrefetch>>,
+    /// The request's embeddings snapshot (M9.14c); `None` leaves
+    /// `embeddingExists` unported.
+    embeddings: Option<Arc<crate::embeddings_graphql::EmbeddingsPrefetch>>,
 }
 
 impl RepositoryObject {
     pub fn from_data(data: RepositoryData) -> Self {
-        Self { data, git: None }
+        Self {
+            data,
+            git: None,
+            embeddings: None,
+        }
     }
 
     /// Attach the request's prefetched git data (M9.8ix).
     pub fn with_git(mut self, git: Option<Arc<crate::git_graphql::GitPrefetch>>) -> Self {
         self.git = git;
+        self
+    }
+
+    /// Attach the request's prefetched embeddings data (M9.14c).
+    pub fn with_embeddings(
+        mut self,
+        embeddings: Option<Arc<crate::embeddings_graphql::EmbeddingsPrefetch>>,
+    ) -> Self {
+        self.embeddings = embeddings;
         self
     }
 
@@ -5433,6 +5537,23 @@ impl ObjectValue for RepositoryObject {
         _actor: Actor,
     ) -> Result<Option<FieldValue>, ExecError> {
         match field {
+            // `RepositoryResolver.EmbeddingExists` (`repository.go:116-122`):
+            // the gate and the per-repo lookup are prefetched (M9.14c).
+            "embeddingExists" => {
+                let Some(embeddings) = &self.embeddings else {
+                    return Ok(None);
+                };
+                if !embeddings.enabled {
+                    return Ok(Some(FieldValue::Json(Json::Bool(false))));
+                }
+                match embeddings.exists.get(&self.data.id) {
+                    Some(Ok(exists)) => Ok(Some(FieldValue::Json(Json::Bool(*exists)))),
+                    Some(Err(message)) => Err(ExecError::new(message.clone())),
+                    // Not prefetched for this object (e.g. a repo reached only
+                    // through a git object); report the field as unported.
+                    None => Ok(None),
+                }
+            }
             // `RepositoryResolver.Commit` (`repository.go:296-310`): the rev is
             // resolved with `ResolveRev`; a missing revision is `null`.
             "commit" => {

@@ -511,7 +511,14 @@ impl Service for FrontendService {
                 ))
                 .with_rbac_store(Arc::new(crate::rbac_graphql::PgRbacStore::new(
                     session_pool.clone(),
-                )));
+                )))
+                // M9.14c: `Repository.embeddingExists` reads
+                // `repo_embedding_jobs.state = 'completed'` (no schema change).
+                .with_embeddings(Arc::new(
+                    crate::embeddings_graphql::PgRepositoryEmbeddingsStore::new(
+                        session_pool.clone(),
+                    ),
+                ));
         // M9.8jf/M9.8jj: `Query.slowRequests` reads the FIFO list whose
         // capacity is `observability.captureSlowGraphQLRequestsLimit`
         // (`conf.Get()` per request in the baseline; here from the current

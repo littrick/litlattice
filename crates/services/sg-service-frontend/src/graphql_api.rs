@@ -481,6 +481,12 @@ pub struct SchemaGraphqlDeps {
     /// `CodeMonitorsResolver`'s resolver (M9.13a); `None` reproduces an absent
     /// optional resolver.
     code_monitors: Option<Arc<crate::code_monitors_graphql::CodeMonitorsResolver>>,
+    /// `Repository.embeddingExists`'s database seam (M9.14c); `None` keeps the
+    /// field unported.
+    embeddings: Option<Arc<dyn crate::embeddings_graphql::RepositoryEmbeddingsStore>>,
+    /// Read-only diagnostic `Query` fields (M9.14c); `None` keeps all four
+    /// unported.
+    diagnostics: Option<crate::diagnostics_graphql::DiagnosticsDeps>,
 }
 
 /// Seams for the external-account GraphQL surface (M9.8ka): the
@@ -539,6 +545,8 @@ impl SchemaGraphqlDeps {
             rbac: None,
             saved_searches: None,
             code_monitors: None,
+            embeddings: None,
+            diagnostics: None,
         }
     }
 
@@ -602,6 +610,8 @@ impl SchemaGraphqlDeps {
             rbac: None,
             saved_searches: None,
             code_monitors: None,
+            embeddings: None,
+            diagnostics: None,
         }
     }
 
@@ -912,6 +922,24 @@ impl SchemaGraphqlDeps {
         Ok(self)
     }
 
+    /// Attach the `Repository.embeddingExists` database seam (M9.14c).
+    pub fn with_embeddings(
+        mut self,
+        store: Arc<dyn crate::embeddings_graphql::RepositoryEmbeddingsStore>,
+    ) -> Self {
+        self.embeddings = Some(store);
+        self
+    }
+
+    /// Attach the read-only diagnostic `Site` seams (M9.14c).
+    pub fn with_diagnostics(
+        mut self,
+        deps: crate::diagnostics_graphql::DiagnosticsDeps,
+    ) -> Self {
+        self.diagnostics = Some(deps);
+        self
+    }
+
     /// Enable the ranking GraphQL surface (M9.8ic): append
     /// `codeintel.ranking.graphql` to the assembled schema and hand the root
     /// resolver to the executor.
@@ -1077,6 +1105,8 @@ impl SchemaGraphqlDeps {
             rbac: None,
             saved_searches: None,
             code_monitors: None,
+            embeddings: None,
+            diagnostics: None,
         }
     }
 }
@@ -1739,6 +1769,71 @@ impl GraphqlDeps for SchemaGraphqlDeps {
             }
             None => std::collections::HashMap::new(),
         };
+        // `Repository.embeddingExists` (M9.14c): the gate mirrors
+        // `conf.EmbeddingsEnabled()`; each selected repository is looked up
+        // once. `None` keeps the field unported.
+        let embeddings_prefetch = match &self.embeddings {
+            None => None,
+            Some(store) => {
+                let force_allow = std::env::var("SRC_INTERNAL_EMBEDDINGS_ALLOWED")
+                    .map(|value| {
+                        matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "t" | "true")
+                    })
+                    .unwrap_or(false);
+                let enabled = self.auth_providers.as_ref().is_some_and(|live| {
+                    crate::embeddings_graphql::embeddings_enabled(
+                        live.current().site.raw(),
+                        force_allow,
+                    )
+                });
+                let mut repo_ids: Vec<i32> = Vec::new();
+                for lookup in repositories.values() {
+                    if let crate::graphql_resolvers::RepoLookup::Found(data) = lookup {
+                        repo_ids.push(data.id);
+                    }
+                }
+                for lookup in repository_redirects.values() {
+                    if let crate::graphql_resolvers::RepoLookup::Found(data) = lookup {
+                        repo_ids.push(data.id);
+                    }
+                }
+                for lookup in nodes.repositories.values() {
+                    if let crate::graphql_resolvers::RepoLookup::Found(data) = lookup {
+                        repo_ids.push(data.id);
+                    }
+                }
+                for lookup in repositories_connections.values() {
+                    if let crate::repositories::RepositoriesConnectionLookup::Found(data) = lookup {
+                        if let Ok(page) = &data.page {
+                            repo_ids.extend(page.nodes.iter().map(|node| node.id));
+                        }
+                    }
+                }
+                Some(Arc::new(
+                    crate::embeddings_graphql::prefetch_embeddings(
+                        store.as_ref(),
+                        &fields,
+                        repo_ids,
+                        enabled,
+                    )
+                    .await,
+                ))
+            }
+        };
+        // `Query.statusMessages` / `repositoryStats` / `backgroundJobs` /
+        // `gitservers` (M9.14c): site-admin gated; `None` keeps them unported.
+        let diagnostics_prefetch = match &self.diagnostics {
+            None => None,
+            Some(deps) => Some(Arc::new(
+                crate::diagnostics_graphql::prefetch_diagnostics(
+                    deps,
+                    &fields,
+                    request.actor,
+                    site_admin,
+                )
+                .await,
+            )),
+        };
         // `ExternalService.webhookLogs` is a nested connection; prefetch it
         // wherever an `ExternalService` selection set includes it. The field
         // is not part of the OSS SDL in this snapshot (overview §0), so this
@@ -1865,6 +1960,8 @@ impl GraphqlDeps for SchemaGraphqlDeps {
             ))
         });
         Arc::make_mut(&mut nested).auth_providers = auth_providers_root.clone();
+        Arc::make_mut(&mut nested).repo_embeddings = embeddings_prefetch;
+        Arc::make_mut(&mut nested).diagnostics = diagnostics_prefetch;
         let executor_secret_nested = Arc::clone(&nested);
         let mut roots =
             crate::graphql_resolvers::FrontendRootResolver::with_prefetched_organizations(
