@@ -24,11 +24,13 @@
 //! deterministic: the baseline's `conc/pool` results are indexed by input
 //! position, and this port executes sequentially in the same order.
 //!
-//! Not ported (see `docs/overviews/m9_10a_search_repos_resolver_overview.md`
-//! §4): `RevAtTime` (no `sg-git` RPC and no timestamp in the modeled
-//! `RevisionSpecifier`), `computeExcludedRepos`, and the baseline's
-//! exact/LIKE SQL optimization (the regexp path is semantically equivalent
-//! except for `%`/`_` literals inside exact patterns).
+//! `RevAtTime` is wired through [`ResolverGitserver::rev_at_time`] (M9.18b);
+//! the production adapter in [`crate::search_runtime`] speaks the gitserver
+//! `RevAtTime` RPC. Not ported (see
+//! `docs/overviews/m9_10a_search_repos_resolver_overview.md` §4):
+//! `computeExcludedRepos`, and the baseline's exact/LIKE SQL optimization (the
+//! regexp path is semantically equivalent except for `%`/`_` literals inside
+//! exact patterns).
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -400,9 +402,18 @@ pub trait ResolverGitserver: Send + Sync {
         rev: &str,
         after: OffsetDateTime,
     ) -> Result<usize, GitserverError>;
-    /// `RevAtTime`. `sg-git` has no such RPC; the default is an explicit
-    /// not-ported failure.
-    fn rev_at_time(&self, _repo: &str, _rev: &str) -> Result<Option<String>, GitserverError> {
+    /// `RevAtTime(repo, spec, date)` (`internal/gitserver/commands.go:631`):
+    /// the OID of the nearest ancestor of `rev` with a committer time before
+    /// `timestamp`, or `None` when the backend found no such commit.
+    ///
+    /// The default keeps older fakes compiling; the production adapter in
+    /// [`crate::search_runtime`] overrides it with the real RPC.
+    fn rev_at_time(
+        &self,
+        _repo: &str,
+        _rev: &str,
+        _timestamp: OffsetDateTime,
+    ) -> Result<Option<String>, GitserverError> {
         Err(GitserverError::Fatal(
             "gitserver RevAtTime is not ported yet".to_owned(),
         ))
@@ -771,6 +782,17 @@ impl Resolver {
         let mut revs = Vec::with_capacity(repo_rev.revs.len());
         let mut globs = Vec::new();
         for rev in &repo_rev.revs {
+            // Parsed `rat=` filters carry the full payload; cross-crate
+            // constructors (worker) only carry the encoded text in
+            // `rev_spec`, for which the baseline passes the parsed timestamp
+            // along. The epoch keeps the call shape for that legacy path.
+            let rev_at_time = rev
+                .rev_at_time_value()
+                .map(|value| (value.rev_spec.clone(), value.timestamp))
+                .or_else(|| {
+                    rev.rev_at_time
+                        .then(|| (rev.rev_spec.clone(), OffsetDateTime::UNIX_EPOCH))
+                });
             if !rev.ref_glob.is_empty() {
                 globs.push(RefGlob {
                     include: rev.ref_glob.clone(),
@@ -781,8 +803,11 @@ impl Resolver {
                     include: String::new(),
                     exclude: rev.exclude_ref_glob.clone(),
                 });
-            } else if rev.rev_at_time {
-                match self.gitserver.rev_at_time(&repo_rev.repo.name, &rev.rev_spec) {
+            } else if let Some((rev_spec, timestamp)) = rev_at_time {
+                match self
+                    .gitserver
+                    .rev_at_time(&repo_rev.repo.name, &rev_spec, timestamp)
+                {
                     Ok(Some(commit)) => revs.push(commit),
                     Ok(None) => {}
                     Err(GitserverError::Missing) => missing.push(RepoRevSpecs {
@@ -1162,16 +1187,22 @@ pub fn get_revs_for_matched_repo(
         );
     }
 
+    // Go's map key is the struct itself, so `*RevAtTime` participates by
+    // pointer identity (`repos.go:1150`). The `Arc` address reproduces that.
     let key = |rev: &RevisionSpecifier| {
         (
             rev.rev_spec.clone(),
             rev.ref_glob.clone(),
             rev.exclude_ref_glob.clone(),
-            rev.rev_at_time,
+            rev.rev_at_time_payload
+                .as_ref()
+                .map(|rev_at_time| std::sync::Arc::as_ptr(rev_at_time) as usize),
         )
     };
-    let mut rev_counts: BTreeMap<(String, String, String, bool), (RevisionSpecifier, usize)> =
-        BTreeMap::new();
+    let mut rev_counts: BTreeMap<
+        (String, String, String, Option<usize>),
+        (RevisionSpecifier, usize),
+    > = BTreeMap::new();
     let mut alive_count = 0usize;
     for (i, rev_list) in rev_lists.iter().enumerate() {
         alive_count = 0;
@@ -1203,10 +1234,16 @@ pub fn get_revs_for_matched_repo(
 }
 
 fn compare_revision_specifiers(a: &RevisionSpecifier, b: &RevisionSpecifier) -> std::cmp::Ordering {
+    // `query.RevisionSpecifier.Compare` (`repo_revs.go:55-70`) compares
+    // `RevAtTime.String()` (the nil pointer renders as `rat=bnVsbA==`).
+    use crate::search_contexts::revision_specifier_rev_at_time_string;
     a.rev_spec
         .cmp(&b.rev_spec)
         .then_with(|| a.ref_glob.cmp(&b.ref_glob))
-        .then_with(|| a.rev_at_time.cmp(&b.rev_at_time))
+        .then_with(|| {
+            revision_specifier_rev_at_time_string(a)
+                .cmp(&revision_specifier_rev_at_time_string(b))
+        })
         .then_with(|| a.exclude_ref_glob.cmp(&b.exclude_ref_glob))
 }
 

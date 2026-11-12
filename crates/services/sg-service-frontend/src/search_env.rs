@@ -670,11 +670,12 @@ impl IndexedJobStreamer {
     ///
     /// Endpoint parsing is validated eagerly (the baseline's dial is
     /// infallible because it stores the parse error in `dialErr`; the streamer
-    /// still defers connection failures to the first RPC).
+    /// still defers connection failures to the first RPC). An empty endpoint
+    /// list is **not** an error: the baseline `endpoint.ConfBased` map is
+    /// always present and `HorizontalSearcher` simply runs zero clients
+    /// (`internal/search/backend/horizontal.go:45-90`), yielding an empty
+    /// result.
     pub fn new(endpoints: &[String], ttl: Duration) -> Result<Self, IndexedError> {
-        if endpoints.is_empty() {
-            return Err(IndexedError::MissingZoekt);
-        }
         for endpoint in endpoints {
             ZoektClient::connect_lazy(endpoint)
                 .map_err(|error| IndexedError::Endpoint(error.to_string()))?;

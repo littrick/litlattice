@@ -278,7 +278,10 @@ fn serialize_repo_options(options: &jb::RepoOptions) -> Value {
                             Value::String(rev.exclude_ref_glob.clone()),
                         ),
                         ("ref_glob", Value::String(rev.ref_glob.clone())),
-                        ("rev_at_time", Value::Bool(rev.rev_at_time)),
+                        (
+                            "rev_at_time",
+                            Value::Bool(rev.rev_at_time || rev.rev_at_time_payload.is_some()),
+                        ),
                         ("rev_spec", Value::String(rev.rev_spec.clone())),
                     ])
                 })

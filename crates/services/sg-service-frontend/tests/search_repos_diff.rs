@@ -11,7 +11,7 @@
 //!
 //! Env: `SG_M10A_DIFF=1`, `M10A_CORPUS`, `M10A_OUT`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
 use serde::Deserialize;
@@ -21,7 +21,7 @@ use sg_db::repos::{RepoChangelistIDs, RepoListItem, RepoListOptions};
 use sg_search_query::basic::RepoHasFileContentArgs;
 use sg_search_query::validate::YesNoOnly;
 use sg_service_frontend::search_contexts::{
-    ParsedRepoFilter, RepoVisibility, RequestContext, RevisionSpecifier, SearchContext,
+    ParsedRepoFilter, RepoVisibility, RequestContext, RevAtTime, RevisionSpecifier, SearchContext,
     SearchContextRepositoryRevisions,
 };
 use sg_service_frontend::search_job::JobError;
@@ -64,6 +64,16 @@ struct Case {
     searcher: BTreeMap<String, bool>,
     #[serde(default)]
     changelists: BTreeMap<String, BTreeMap<String, String>>,
+    #[serde(default)]
+    minimal_repos_by_ids: MinimalReposByIDsIn,
+}
+
+#[derive(Default, Deserialize)]
+struct MinimalReposByIDsIn {
+    #[serde(default)]
+    ids: Vec<i32>,
+    #[serde(default)]
+    repos: Vec<DbRepoIn>,
 }
 
 #[derive(Default, Deserialize)]
@@ -100,7 +110,14 @@ struct RevIn {
     rev_spec: Option<String>,
     ref_glob: Option<String>,
     exclude_ref_glob: Option<String>,
-    rev_at_time: Option<bool>,
+    rev_at_time: Option<RevAtTimeIn>,
+}
+
+/// `query.RevAtTime` payload (`{"RevSpec","Timestamp"}`, RFC3339 timestamp).
+#[derive(Default, Deserialize)]
+struct RevAtTimeIn {
+    rev_spec: Option<String>,
+    timestamp: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -155,6 +172,10 @@ struct GitserverIn {
     refs: BTreeMap<String, Vec<String>>,
     #[serde(default)]
     commits_after: BTreeMap<String, usize>,
+    /// `repo@rev` → resolved commit. An empty value means "not found"; a
+    /// missing key is a revision-not-found error.
+    #[serde(default)]
+    rev_at_time: BTreeMap<String, String>,
 }
 
 #[derive(Default, Deserialize)]
@@ -183,7 +204,22 @@ fn rev(rev: &RevIn) -> RevisionSpecifier {
         rev_spec: rev.rev_spec.clone().unwrap_or_default(),
         ref_glob: rev.ref_glob.clone().unwrap_or_default(),
         exclude_ref_glob: rev.exclude_ref_glob.clone().unwrap_or_default(),
-        rev_at_time: rev.rev_at_time.unwrap_or(false),
+        rev_at_time: rev.rev_at_time.is_some(),
+        rev_at_time_payload: rev.rev_at_time.as_ref().map(|rev_at_time| {
+            let timestamp = rev_at_time
+                .timestamp
+                .as_deref()
+                .unwrap_or("1970-01-01T00:00:00Z");
+            let timestamp = time::OffsetDateTime::parse(
+                timestamp,
+                &time::format_description::well_known::Rfc3339,
+            )
+            .expect("RFC3339 timestamp");
+            std::sync::Arc::new(RevAtTime::new(
+                rev_at_time.rev_spec.clone().unwrap_or_default(),
+                timestamp,
+            ))
+        }),
     }
 }
 
@@ -273,6 +309,8 @@ struct FakeDb {
     options: Mutex<Vec<Value>>,
     changelists: BTreeMap<u32, BTreeMap<i64, String>>,
     changelist_calls: Mutex<Vec<Value>>,
+    by_ids_repos: Vec<RepoListItem>,
+    by_ids_calls: Mutex<Vec<Vec<i32>>>,
 }
 
 impl RepoResolverDb for FakeDb {
@@ -323,12 +361,24 @@ impl RepoResolverDb for FakeDb {
         }
         Ok(self.changelists.clone())
     }
+
+    fn list_minimal_repos_by_ids(&self, ids: &[i32]) -> Result<Vec<RepoListItem>, JobError> {
+        self.by_ids_calls.lock().unwrap().push(ids.to_vec());
+        let wanted: BTreeSet<i32> = ids.iter().copied().collect();
+        Ok(self
+            .by_ids_repos
+            .iter()
+            .filter(|repo| wanted.contains(&repo.id))
+            .cloned()
+            .collect())
+    }
 }
 
 struct FakeGitserver {
     resolve: BTreeMap<String, String>,
     refs: BTreeMap<String, Vec<String>>,
     commits_after: BTreeMap<String, usize>,
+    rev_at_time: BTreeMap<String, String>,
     calls: Mutex<Vec<String>>,
 }
 
@@ -365,6 +415,21 @@ impl ResolverGitserver for FakeGitserver {
             .get(&key)
             .copied()
             .ok_or(GitserverError::Missing)
+    }
+
+    fn rev_at_time(
+        &self,
+        repo: &str,
+        rev: &str,
+        _timestamp: OffsetDateTime,
+    ) -> Result<Option<String>, GitserverError> {
+        let key = format!("{repo}@{rev}");
+        self.record(format!("rev_at_time:{key}"));
+        match self.rev_at_time.get(&key) {
+            Some(commit) if commit.is_empty() => Ok(None),
+            Some(commit) => Ok(Some(commit.clone())),
+            None => Err(GitserverError::Missing),
+        }
     }
 }
 
@@ -491,7 +556,7 @@ fn spec_json(spec: &RevisionSpecifier) -> Value {
         "rev_spec": spec.rev_spec,
         "ref_glob": spec.ref_glob,
         "exclude_ref_glob": spec.exclude_ref_glob,
-        "rev_at_time": spec.rev_at_time,
+        "rev_at_time": spec.rev_at_time || spec.rev_at_time_payload.is_some(),
     })
 }
 
@@ -599,6 +664,19 @@ fn build_fakes(case: &Case) -> (Arc<FakeDb>, Arc<FakeGitserver>, Arc<FakeZoekt>,
             }
         })
         .collect();
+    let by_ids_repos = case
+        .minimal_repos_by_ids
+        .repos
+        .iter()
+        .map(|repo| RepoListItem {
+            id: repo.id,
+            name: repo.name.clone(),
+            stars: repo.stars,
+            external_id: String::new(),
+            external_service_type: repo.external_service_type.clone(),
+            external_service_id: String::new(),
+        })
+        .collect();
     (
         Arc::new(FakeDb {
             pages,
@@ -606,11 +684,14 @@ fn build_fakes(case: &Case) -> (Arc<FakeDb>, Arc<FakeGitserver>, Arc<FakeZoekt>,
             options: Mutex::new(Vec::new()),
             changelists,
             changelist_calls: Mutex::new(Vec::new()),
+            by_ids_repos,
+            by_ids_calls: Mutex::new(Vec::new()),
         }),
         Arc::new(FakeGitserver {
             resolve: case.gitserver.resolve.clone(),
             refs: case.gitserver.refs.clone(),
             commits_after: case.gitserver.commits_after.clone(),
+            rev_at_time: case.gitserver.rev_at_time.clone(),
             calls: Mutex::new(Vec::new()),
         }),
         Arc::new(FakeZoekt {
@@ -725,6 +806,45 @@ fn phase_resolve_rev_specs(case: &Case) -> Value {
     })
 }
 
+fn minimal_repos_by_ids_json(repos: &[RepoListItem]) -> Value {
+    Value::Array(
+        repos
+            .iter()
+            .map(|repo| {
+                json!({
+                    "id": repo.id,
+                    "name": repo.name,
+                    "stars": repo.stars,
+                    "external_service_type": repo.external_service_type,
+                })
+            })
+            .collect(),
+    )
+}
+
+/// `Repos.ListMinimalRepos{IDs}` — the query the exhaustive searcher issues per
+/// repo and `Resolver::minimal_repos_by_ids` exposes.
+fn phase_minimal_repos_by_ids(case: &Case) -> Value {
+    let (resolver, db, _gitserver, _zoekt, _searcher) = build_resolver(case);
+    let repos = resolver.minimal_repos_by_ids(&case.minimal_repos_by_ids.ids);
+    let calls = db.by_ids_calls.lock().unwrap().clone();
+    json!({
+        "result": {
+            "repos": match &repos {
+                Ok(repos) => minimal_repos_by_ids_json(repos),
+                Err(_) => Value::Array(Vec::new()),
+            },
+            "error": match &repos {
+                Ok(_) => Value::Null,
+                Err(error) => Value::String(error.0.clone()),
+            },
+        },
+        "calls": {
+            "db_options": calls.iter().map(|ids| json!({"ids": ids})).collect::<Vec<_>>(),
+        },
+    })
+}
+
 #[test]
 fn search_repos_diff() {
     if std::env::var("SG_M10A_DIFF").as_deref() != Ok("1") {
@@ -745,6 +865,7 @@ fn search_repos_diff() {
                 "iterate": phase_iterate(case),
                 "iterate_repo_revs": phase_iterate_repo_revs(case),
                 "resolve_rev_specs": phase_resolve_rev_specs(case),
+                "minimal_repos_by_ids": phase_minimal_repos_by_ids(case),
             })
         })
         .collect::<Vec<_>>();

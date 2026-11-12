@@ -17,6 +17,10 @@
 use std::collections::BTreeMap;
 use std::sync::OnceLock;
 
+use base64::Engine as _;
+use time::format_description::well_known::Rfc3339;
+use time::OffsetDateTime;
+
 use sg_search_query::basic::{plan_to_q, q_string_value};
 use sg_search_query::fields::{
     FIELD_ARCHIVED, FIELD_CASE, FIELD_FILE, FIELD_FORK, FIELD_LANG, FIELD_REPO, FIELD_VISIBILITY,
@@ -139,15 +143,23 @@ pub struct RepoOpts {
     pub rev_specs: Vec<String>,
 }
 
-/// `query.RevisionSpecifier`. `rev_at_time` stands in for the baseline's
-/// `RevAtTime` payload; `rat=` specs never carry a ref glob, which is all the
-/// validation in this file observes.
+/// `query.RevisionSpecifier` (`internal/search/query/repo_revs.go:15-42`).
+///
+/// `rev_at_time_payload` models the baseline's `*RevAtTime`. It is boxed in an
+/// [`Arc`] because the baseline uses `map[query.RevisionSpecifier]int` in
+/// `getRevsForMatchedRepo`, where the pointer identity of `RevAtTime` is part
+/// of the key (`internal/search/repos/repos.go:1150`).
+///
+/// `rev_at_time` stays as a boolean placeholder for cross-crate constructors
+/// (the exhaustive worker) that only carry the encoded payload text; parsed
+/// frontend filters set both fields.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RevisionSpecifier {
     pub rev_spec: String,
     pub ref_glob: String,
     pub exclude_ref_glob: String,
     pub rev_at_time: bool,
+    pub rev_at_time_payload: Option<std::sync::Arc<RevAtTime>>,
 }
 
 impl RevisionSpecifier {
@@ -155,6 +167,130 @@ impl RevisionSpecifier {
     pub fn has_ref_glob(&self) -> bool {
         !self.ref_glob.is_empty() || !self.exclude_ref_glob.is_empty()
     }
+
+    /// The parsed `RevAtTime`, when the specifier came from a `rat=` filter.
+    pub fn rev_at_time_value(&self) -> Option<&RevAtTime> {
+        self.rev_at_time_payload.as_deref()
+    }
+
+    /// `RevisionSpecifier.String()` (`repo_revs.go:42-53`).
+    pub fn spec_string(&self) -> String {
+        if !self.exclude_ref_glob.is_empty() {
+            return format!("*!{}", self.exclude_ref_glob);
+        }
+        if !self.ref_glob.is_empty() {
+            return format!("*{}", self.ref_glob);
+        }
+        if let Some(rev_at_time) = self.rev_at_time_value() {
+            return rev_at_time.to_string();
+        }
+        if self.rev_at_time {
+            // Cross-crate constructors store the already-encoded payload in
+            // `rev_spec`, so `rat=<payload>` round-trips the baseline string.
+            return format!("rat={}", self.rev_spec);
+        }
+        self.rev_spec.clone()
+    }
+}
+
+/// `query.RevAtTime` (`internal/search/query/repo_revs.go:139-187`): the most
+/// recent ancestor of `rev_spec` with a committer timestamp before
+/// `timestamp`.
+///
+/// The baseline serializes the whole struct as JSON and URL-base64 encodes it:
+///
+/// ```text
+/// rat=<base64.URLEncoding({"RevSpec":"…","Timestamp":"…"})>
+/// ```
+///
+/// The timestamp text is kept verbatim so [`Self::to_string`] round-trips the
+/// payload exactly; `timestamp` is the parsed value handed to gitserver.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RevAtTime {
+    pub rev_spec: String,
+    pub timestamp: OffsetDateTime,
+    /// The RFC3339 text from the payload (kept for lossless re-encoding).
+    timestamp_text: String,
+}
+
+impl RevAtTime {
+    /// `ParseRevAtTime`: base64-URL decode, then JSON `{"RevSpec","Timestamp"}`.
+    pub fn parse(input: &str) -> Result<RevAtTime, Error> {
+        let decoded = base64::engine::general_purpose::URL_SAFE
+            .decode(input)
+            .map_err(|error| Error::other(error.to_string()))?;
+        let payload =
+            String::from_utf8(decoded).map_err(|error| Error::other(error.to_string()))?;
+        Self::from_payload(&payload)
+    }
+
+    fn from_payload(payload: &str) -> Result<RevAtTime, Error> {
+        let value: serde_json::Value =
+            serde_json::from_str(payload).map_err(|error| Error::other(error.to_string()))?;
+        let rev_spec = value
+            .get("RevSpec")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| Error::other("missing RevSpec"))?
+            .to_owned();
+        let timestamp_text = value
+            .get("Timestamp")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| Error::other("missing Timestamp"))?
+            .to_owned();
+        let timestamp = OffsetDateTime::parse(&timestamp_text, &Rfc3339)
+            .map_err(|error| Error::other(error.to_string()))?;
+        Ok(RevAtTime {
+            rev_spec,
+            timestamp,
+            timestamp_text,
+        })
+    }
+
+    /// Construct from an already-parsed timestamp (tests and callers that do
+    /// not go through the `rat=` encoding).
+    pub fn new(rev_spec: impl Into<String>, timestamp: OffsetDateTime) -> RevAtTime {
+        let timestamp_text = timestamp
+            .format(&Rfc3339)
+            .expect("RFC3339 formatting cannot fail");
+        RevAtTime {
+            rev_spec: rev_spec.into(),
+            timestamp,
+            timestamp_text,
+        }
+    }
+
+    /// The JSON body `(*RevAtTime).String` base64-encodes.
+    pub fn payload(&self) -> String {
+        // Go marshals the struct with `encoding/json`, fields in declaration
+        // order. `serde_json::to_string` adds the same quoting (ASCII HTML
+        // escaping differs only for `<`, `>`, `&`, which rev specs cannot
+        // contain).
+        let rev_spec = serde_json::to_string(&self.rev_spec).expect("string serialization");
+        let timestamp = serde_json::to_string(&self.timestamp_text).expect("string serialization");
+        format!("{{\"RevSpec\":{rev_spec},\"Timestamp\":{timestamp}}}")
+    }
+}
+
+impl std::fmt::Display for RevAtTime {
+    /// `(*RevAtTime).String` (`repo_revs.go:145-151`), including the nil
+    /// receiver case handled by [`revision_specifier_rev_at_time_string`].
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("rat=")?;
+        formatter.write_str(&base64::engine::general_purpose::URL_SAFE.encode(self.payload()))
+    }
+}
+
+/// `(*query.RevAtTime)(nil).String()`: `json.Marshal(nil)` is `null`, so the
+/// baseline's comparison key for an absent payload is `rat=bnVsbA==`
+/// (`repo_revs.go:46`).
+pub fn revision_specifier_rev_at_time_string(rev: &RevisionSpecifier) -> String {
+    if let Some(rev_at_time) = rev.rev_at_time_value() {
+        return rev_at_time.to_string();
+    }
+    if rev.rev_at_time {
+        return format!("rat={}", rev.rev_spec);
+    }
+    "rat=bnVsbA==".to_owned()
 }
 
 /// `query.ParsedRepoFilter` (without the compiled case-insensitive regex).
@@ -862,7 +998,7 @@ pub fn parse_repository_revisions(repo_and_optional_rev: &str) -> Result<ParsedR
                 if part.is_empty() {
                     continue;
                 }
-                revs.push(parse_revision_specifier(part));
+                revs.push(parse_revision_specifier(part)?);
             }
             if revs.is_empty() {
                 // Default branch.
@@ -878,28 +1014,30 @@ pub fn parse_repository_revisions(repo_and_optional_rev: &str) -> Result<ParsedR
     Ok(ParsedRepoFilter { repo, revs })
 }
 
-/// `query.ParseRevisionSpecifier`.
-pub fn parse_revision_specifier(spec: &str) -> RevisionSpecifier {
+/// `query.ParseRevisionSpecifier` (`repo_revs.go:120-137`).
+pub fn parse_revision_specifier(spec: &str) -> Result<RevisionSpecifier, Error> {
     if let Some(glob) = spec.strip_prefix("*!") {
-        RevisionSpecifier {
+        Ok(RevisionSpecifier {
             exclude_ref_glob: glob.to_owned(),
             ..RevisionSpecifier::default()
-        }
+        })
     } else if let Some(glob) = spec.strip_prefix('*') {
-        RevisionSpecifier {
+        Ok(RevisionSpecifier {
             ref_glob: glob.to_owned(),
             ..RevisionSpecifier::default()
-        }
-    } else if spec.starts_with("rat=") {
-        RevisionSpecifier {
+        })
+    } else if let Some(encoded) = spec.strip_prefix("rat=") {
+        let rev_at_time = RevAtTime::parse(encoded)?;
+        Ok(RevisionSpecifier {
             rev_at_time: true,
+            rev_at_time_payload: Some(std::sync::Arc::new(rev_at_time)),
             ..RevisionSpecifier::default()
-        }
+        })
     } else {
-        RevisionSpecifier {
+        Ok(RevisionSpecifier {
             rev_spec: spec.to_owned(),
             ..RevisionSpecifier::default()
-        }
+        })
     }
 }
 

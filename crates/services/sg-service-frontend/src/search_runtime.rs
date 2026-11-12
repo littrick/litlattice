@@ -16,12 +16,12 @@
 //! * `max_repos`: `limits.SearchLimits(conf).MaxRepos`.
 //!
 //! [`assemble`] returns a [`TreeRuntimeClients`] bundle that
-//! `TreeJobRunner::with_clients` consumes. Missing zoekt endpoints are
-//! reported as [`RuntimeConfigError::MissingZoekt`]; `service.rs` then keeps
-//! `TreeJobRunner::unconfigured()`, whose not-ported error is byte-for-byte
-//! unchanged. Searcher and commit clients are optional: when their endpoints
-//! are absent the corresponding tree leaves keep their existing not-ported
-//! errors.
+//! `TreeJobRunner::with_clients` consumes. Every client is wired
+//! unconditionally, mirroring the baseline's always-present
+//! `endpoint.ConfBased` maps and `gitserver.DefaultClient`: an empty endpoint
+//! list only surfaces at RPC time (e.g. `endpoint.Map(conf-based) is empty` for
+//! searcher/symbols, empty results for zoekt), never as the not-ported
+//! fallback. The only assembly error left is an unparsable zoekt endpoint.
 //!
 //! Tests and differential harnesses can construct the same bundle directly
 //! ([`SearcherRuntimeClients`] / [`CommitRuntimeClientsOwned`] fields are
@@ -57,13 +57,15 @@ use crate::search_searcher_client::{
     SymbolsParameters, SymbolsResponse, NOT_PORTED_MESSAGE,
 };
 use crate::search_stream::{RepoPagerRuntimeClients, TreeRuntimeClients};
-use crate::symbols_client::default_symbols_client;
+use crate::symbols_client::GrpcSymbolsClient;
 
-/// Failure to assemble the production runtime. The only mandatory endpoint is
-/// zoekt; the caller falls back to `TreeJobRunner::unconfigured()`.
+/// Failure to assemble the production runtime. Empty endpoint lists are not
+/// failures (the baseline maps are always present); only an unparsable zoekt
+/// endpoint prevents assembly.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RuntimeConfigError {
-    /// `ServiceConnections.Zoekts` is empty: indexed search cannot run.
+    /// Historical variant kept for API compatibility; empty zoekt endpoint
+    /// lists now assemble successfully and yield empty indexed results.
     MissingZoekt,
     /// A zoekt endpoint could not be turned into a lazy client.
     ZoektEndpoint(String),
@@ -168,16 +170,57 @@ pub fn assemble_with_repo_pager(
     assemble_inner(pool, connections, site, repo_pager)
 }
 
+/// Build `job.RuntimeClients.Searcher`: `searcher.SearcherURLs()` and
+/// `symbols.DefaultClient` are always-present `endpoint.ConfBased` maps, so an
+/// empty configuration only surfaces at RPC time (`endpoint.Map(conf-based) is
+/// empty`), never as the not-ported fallback.
+///
+/// The process-wide cache (`search.SearcherGRPCConnectionCache()`) is stored on
+/// the bundle so later job-tree paths (repos resolver, alert observer,
+/// filter-file-contains) can share it like the baseline `job.RuntimeClients`.
+fn assemble_searcher_clients(
+    connections: &ServiceConnections,
+    gitserver: &Arc<GitClient>,
+) -> Arc<SearcherRuntimeClients> {
+    let searcher_connection_cache = Arc::new(SearcherGrpcConnectionCache::new());
+    let searcher_client: Arc<dyn SearcherClient + Send + Sync> =
+        match grpc_client_from_endpoints(connections.searchers.clone()) {
+            Some(client) => {
+                Arc::new(client.with_connection_cache(Arc::clone(&searcher_connection_cache)))
+            }
+            None => Arc::from(default_searcher_client(Vec::new())),
+        };
+    Arc::new(SearcherRuntimeClients {
+        client: searcher_client,
+        limiter: Arc::new(NoopSearcherLimiter),
+        gitserver: Arc::new(GitSearcherGitserver {
+            client: Arc::clone(gitserver),
+        }),
+        // `symbols.DefaultClient` is likewise always present. The client
+        // creates its own cache instance (`symbolsConnectionCache`).
+        symbols: Arc::new(GrpcSymbolsClient::new(connections.symbols.clone())),
+        searcher_connection_cache,
+    })
+}
+
+/// Build `job.RuntimeClients.Commit`: the baseline always wires `db.Users` /
+/// `db.UserEmails` + `gitserver.DefaultClient`; a missing git server list
+/// surfaces as an RPC error rather than a not-ported leaf.
+fn assemble_commit_clients(pool: &PgPool, gitserver: &Arc<GitClient>) -> Arc<CommitRuntimeClientsOwned> {
+    Arc::new(CommitRuntimeClientsOwned {
+        db: Arc::new(PgCommitUserDB::new(pool.clone())),
+        gitserver: Arc::new(GitCommitGitserver {
+            client: Arc::clone(gitserver),
+        }),
+    })
+}
+
 fn assemble_inner(
     pool: &PgPool,
     connections: &ServiceConnections,
     site: &SiteConfiguration,
     explicit_repo_pager: Option<Arc<RepoPagerRuntimeClients>>,
 ) -> Result<TreeRuntimeClients, RuntimeConfigError> {
-    if connections.zoekts.is_empty() {
-        return Err(RuntimeConfigError::MissingZoekt);
-    }
-
     let max_repos = max_repos_from_site(site);
     let zoekt = Arc::new(
         IndexedJobStreamer::from_connections(connections).map_err(|error| match error {
@@ -188,49 +231,9 @@ fn assemble_inner(
     let db = Arc::new(PgPrivateRepoLister::new(pool.clone()));
 
     let gitserver = Arc::new(GitClient::new(connections.git_servers.clone()));
-
-    let searcher = if connections.searchers.is_empty() {
-        None
-    } else {
-        // The process-wide cache (`search.SearcherGRPCConnectionCache()`);
-        // stored on the bundle so later job-tree paths (repos resolver, alert
-        // observer, filter-file-contains) can share it like the baseline
-        // `job.RuntimeClients`.
-        let searcher_connection_cache = Arc::new(SearcherGrpcConnectionCache::new());
-        let searcher_client: Arc<dyn SearcherClient + Send + Sync> =
-            match grpc_client_from_endpoints(connections.searchers.clone()) {
-                Some(client) => {
-                    Arc::new(client.with_connection_cache(Arc::clone(&searcher_connection_cache)))
-                }
-                None => Arc::from(default_searcher_client(Vec::new())),
-            };
-        Some(Arc::new(SearcherRuntimeClients {
-            client: searcher_client,
-            limiter: Arc::new(NoopSearcherLimiter),
-            gitserver: Arc::new(GitSearcherGitserver {
-                client: Arc::clone(&gitserver),
-            }),
-            // Production symbols gRPC client when endpoints are configured;
-            // otherwise the explicit not-ported error is unchanged. The client
-            // creates its own cache instance (`symbolsConnectionCache`).
-            symbols: match default_symbols_client(connections.symbols.clone()) {
-                Some(client) => Arc::from(client),
-                None => Arc::new(NotPortedSymbols),
-            },
-            searcher_connection_cache,
-        }))
-    };
-
-    let commit = if connections.git_servers.is_empty() {
-        None
-    } else {
-        Some(Arc::new(CommitRuntimeClientsOwned {
-            db: Arc::new(PgCommitUserDB::new(pool.clone())),
-            gitserver: Arc::new(GitCommitGitserver {
-                client: Arc::clone(&gitserver),
-            }),
-        }))
-    };
+    let gitserver_addrs = gitserver_addresses(connections, site);
+    let searcher = Some(assemble_searcher_clients(connections, &gitserver));
+    let commit = Some(assemble_commit_clients(pool, &gitserver));
 
     // `repos.Resolver` (M9.10a). The production resolver shares the zoekt
     // streamer, gitserver client and (when configured) searcher client with
@@ -248,6 +251,7 @@ fn assemble_inner(
                 }),
                 gitserver: Arc::new(GitResolverGitserver {
                     client: Arc::clone(&gitserver),
+                    addresses: Arc::clone(&gitserver_addrs),
                 }),
                 zoekt: resolver_zoekt.clone(),
                 searcher: searcher.as_ref().map(|searcher| {
@@ -300,42 +304,12 @@ pub fn assemble_exhaustive(
     let max_repos = max_repos_from_site(site);
     let db = Arc::new(PgPrivateRepoLister::new(pool.clone()));
     let gitserver = Arc::new(GitClient::new(connections.git_servers.clone()));
+    let gitserver_addrs = gitserver_addresses(connections, site);
 
-    let searcher = if connections.searchers.is_empty() {
-        None
-    } else {
-        let searcher_connection_cache = Arc::new(SearcherGrpcConnectionCache::new());
-        let searcher_client: Arc<dyn SearcherClient + Send + Sync> =
-            match grpc_client_from_endpoints(connections.searchers.clone()) {
-                Some(client) => {
-                    Arc::new(client.with_connection_cache(Arc::clone(&searcher_connection_cache)))
-                }
-                None => Arc::from(default_searcher_client(Vec::new())),
-            };
-        Some(Arc::new(SearcherRuntimeClients {
-            client: searcher_client,
-            limiter: Arc::new(NoopSearcherLimiter),
-            gitserver: Arc::new(GitSearcherGitserver {
-                client: Arc::clone(&gitserver),
-            }),
-            symbols: match default_symbols_client(connections.symbols.clone()) {
-                Some(client) => Arc::from(client),
-                None => Arc::new(NotPortedSymbols),
-            },
-            searcher_connection_cache,
-        }))
-    };
-
-    let commit = if connections.git_servers.is_empty() {
-        None
-    } else {
-        Some(Arc::new(CommitRuntimeClientsOwned {
-            db: Arc::new(PgCommitUserDB::new(pool.clone())),
-            gitserver: Arc::new(GitCommitGitserver {
-                client: Arc::clone(&gitserver),
-            }),
-        }))
-    };
+    // See `assemble_inner`: the baseline always has searcher/symbols/commit
+    // clients, so exhaustive search keeps the same shape.
+    let searcher = Some(assemble_searcher_clients(connections, &gitserver));
+    let commit = Some(assemble_commit_clients(pool, &gitserver));
 
     // Exhaustive queries never touch indexed zoekt (`index:no`); the
     // resolver's zoekt lister only backs `repohasfile` filters, which are not
@@ -348,6 +322,7 @@ pub fn assemble_exhaustive(
         }),
         gitserver: Arc::new(GitResolverGitserver {
             client: Arc::clone(&gitserver),
+            addresses: Arc::clone(&gitserver_addrs),
         }),
         zoekt: resolver_zoekt.clone(),
         searcher: searcher.as_ref().map(|searcher| {
@@ -451,6 +426,21 @@ impl crate::search_repos::RepoResolverDb for PgRepoResolverDb {
 /// `gitserver.Client` methods used by the resolver.
 struct GitResolverGitserver {
     client: Arc<GitClient>,
+    /// `connection.GitserverAddresses`: shard selection for the RPCs `sg-git`
+    /// does not expose (currently only `RevAtTime`).
+    addresses: Arc<sg_git::addresses::GitserverAddresses>,
+}
+
+/// `connection.NewGitserverAddresses(conf.Get())` from the static endpoints and
+/// the `experimentalFeatures.gitServerPinnedRepos` site pin map.
+fn gitserver_addresses(
+    connections: &ServiceConnections,
+    site: &SiteConfiguration,
+) -> Arc<sg_git::addresses::GitserverAddresses> {
+    Arc::new(sg_git::addresses::GitserverAddresses {
+        addresses: connections.git_servers.clone(),
+        pinned_servers: site.git_server_pinned_repos(),
+    })
 }
 
 fn gitserver_error(error: sg_git::Error) -> GitserverError {
@@ -508,6 +498,51 @@ impl ResolverGitserver for GitResolverGitserver {
         run_to_completion(async move { client.commits(&repo, &options).await })
             .map(|commits| commits.len())
             .map_err(gitserver_error)
+    }
+
+    /// `gitserver.Client.RevAtTime` (`internal/gitserver/commands.go:631-655`).
+    ///
+    /// `sg-git` does not expose this RPC, so the shard is resolved through
+    /// [`sg_git::addresses::GitserverAddresses`] (site pins + MD5 sharding) and
+    /// the proto client is dialed directly. An empty `commit_sha` means
+    /// `found=false`; `NotFound` is the baseline's revision-not-found payload,
+    /// which `normalizeRepoRefs` treats as a missing rev.
+    fn rev_at_time(
+        &self,
+        repo: &str,
+        rev: &str,
+        timestamp: time::OffsetDateTime,
+    ) -> Result<Option<String>, GitserverError> {
+        let Some(addr) = self.addresses.addr_for_repo(repo) else {
+            return Err(GitserverError::Fatal(
+                "no gitserver address configured".to_owned(),
+            ));
+        };
+        let addr = addr.to_owned();
+        let repo = repo.to_owned();
+        let rev = rev.to_owned();
+        let time = timestamp_of(timestamp);
+        run_to_completion(async move {
+            let mut client = pb::gitserver_service_client::GitserverServiceClient::connect(
+                format!("http://{addr}"),
+            )
+            .await
+            .map_err(|error| GitserverError::Fatal(error.to_string()))?;
+            let response = client
+                .rev_at_time(pb::RevAtTimeRequest {
+                    repo_name: repo,
+                    rev_spec: rev.into_bytes(),
+                    time: Some(time),
+                })
+                .await
+                .map_err(|status| match status.code() {
+                    // `RevisionNotFound` travels as `codes.NotFound`.
+                    tonic::Code::NotFound => GitserverError::Missing,
+                    _ => GitserverError::Fatal(status.to_string()),
+                })?;
+            let commit_sha = response.into_inner().commit_sha;
+            Ok((!commit_sha.is_empty()).then_some(commit_sha))
+        })
     }
 }
 
@@ -577,13 +612,11 @@ impl JobStreamer for UnconfiguredJobStreamer {
     }
 }
 
-/// Minimal production runtime for commit-only job trees
-/// (`internal/codemonitors.search.go`). Unlike [`assemble`], it does not
-/// require zoekt endpoints: the code-monitor query plan only builds
-/// commit/diff leaves plus the repo pager, so `zoekt` is a placeholder and
-/// `searcher` is `None`. The repo pager stays `None` until the resolver is
-/// ported (M9.8hw); injecting it via [`TreeRuntimeClients::with_repo_pager`]
-/// makes the same runtime executable end-to-end.
+/// Production runtime for commit-only job trees
+/// (`internal/codemonitors.search.go`). Unlike [`assemble`], it does not build
+/// the indexed zoekt stack (code-monitor plans only use commit/diff leaves plus
+/// the repo pager), but the searcher/symbols and commit clients are still
+/// always present, matching `search.RuntimeClients()`.
 pub fn assemble_commit_search(
     pool: &PgPool,
     connections: &ServiceConnections,
@@ -591,20 +624,14 @@ pub fn assemble_commit_search(
 ) -> TreeRuntimeClients {
     let db = Arc::new(PgPrivateRepoLister::new(pool.clone()));
     let gitserver = Arc::new(GitClient::new(connections.git_servers.clone()));
-    let commit = if connections.git_servers.is_empty() {
-        None
-    } else {
-        Some(Arc::new(CommitRuntimeClientsOwned {
-            db: Arc::new(PgCommitUserDB::new(pool.clone())),
-            gitserver: Arc::new(GitCommitGitserver {
-                client: Arc::clone(&gitserver),
-            }),
-        }))
-    };
+    let gitserver_addrs = gitserver_addresses(connections, site);
+    let searcher = assemble_searcher_clients(connections, &gitserver);
+    let commit = Some(assemble_commit_clients(pool, &gitserver));
 
     // Code-monitor plans use `repoPagerJob{skipPartitioning:true}` and only
     // commit leaves, so the resolver's zoekt lister is never called; the
-    // searcher (requires-index `repo:contains.*` filters) is not wired.
+    // searcher client is still wired for `repo:contains.*` filters that need
+    // `index:no` content checks.
     let resolver_zoekt = Arc::new(UnconfiguredResolverZoekt);
     let resolver = Arc::new(Resolver {
         db: Arc::new(PgRepoResolverDb {
@@ -613,9 +640,12 @@ pub fn assemble_commit_search(
         }),
         gitserver: Arc::new(GitResolverGitserver {
             client: Arc::clone(&gitserver),
+            addresses: Arc::clone(&gitserver_addrs),
         }),
         zoekt: resolver_zoekt.clone(),
-        searcher: None,
+        searcher: Some(Arc::new(SearcherResolverSearcher {
+            client: Arc::clone(&searcher.client),
+        }) as Arc<dyn ResolverSearcher>),
         max_repos: max_repos_from_site(site),
     });
     let repo_pager = Arc::new(RepoPagerRuntimeClients::new(
@@ -627,7 +657,7 @@ pub fn assemble_commit_search(
         db,
         zoekt: Arc::new(UnconfiguredJobStreamer),
         max_repos: max_repos_from_site(site),
-        searcher: None,
+        searcher: Some(searcher),
         commit,
         repo_pager: Some(repo_pager),
     }
@@ -970,29 +1000,30 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn missing_zoekt_endpoints_keep_the_unconfigured_error() {
+    async fn empty_endpoints_still_assemble_every_realtime_client() {
         let pool = PgPool::connect_lazy("postgres://localhost/none").expect("lazy pool");
-        let error = match assemble(
+        // The baseline `endpoint.ConfBased` maps are always present, so the
+        // production runtime must be assembled even before service discovery
+        // produced any address; the empty-map error is deferred to RPC time.
+        let runtime = assemble(
             &pool,
             &ServiceConnections::default(),
             &SiteConfiguration::default(),
-        ) {
-            Ok(_) => panic!("zoekt is required"),
-            Err(error) => error,
-        };
-        assert_eq!(error, RuntimeConfigError::MissingZoekt);
+        )
+        .expect("assemble never fails for empty endpoints");
+        assert!(runtime.searcher.is_some(), "searcher client is always wired");
+        assert!(runtime.commit.is_some(), "commit client is always wired");
+        assert!(runtime.repo_pager.is_some(), "repo pager is always wired");
 
-        // The fallback runner still produces the pre-M9.8im error byte-for-byte.
-        let runner = TreeJobRunner::unconfigured();
+        // The tree executes against the produced bundle instead of the
+        // not-ported fallback; an empty tree simply yields no events/errors.
+        let runner = TreeJobRunner::with_clients(runtime);
         let mut tree = JobNode::noop();
         let mut events = Vec::new();
         let output = runner.run(&mut tree, &mut |event| events.push(event));
         assert!(events.is_empty());
         assert!(output.alert.is_none());
-        assert_eq!(
-            output.error.map(|error| error.message).as_deref(),
-            Some("search execution is not ported yet")
-        );
+        assert!(output.error.is_none());
     }
 
     fn recording_lister() -> Arc<RecordingLister> {

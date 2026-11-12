@@ -15,8 +15,11 @@
 //! * [`SymbolsClient`] — `symbols.Client.Search` used by the symbol job.
 //!
 //! [`GrpcSearcherClient`] is the real transport (consistent-hash routing +
-//! gRPC streaming); [`default_searcher_client`] picks it when endpoints are
-//! configured and falls back to [`NotPortedSearcher`] otherwise.
+//! gRPC streaming). Since M9.18b [`default_searcher_client`] always constructs
+//! it, matching Go's `endpoint.ConfBased` map: an empty endpoint list is a
+//! runtime error inside `search()` (`endpoint.Map(conf-based) is empty`), not
+//! an assembly failure. [`NotPortedSearcher`] remains as the explicit
+//! not-ported double for tests that do not inject a transport.
 //!
 //! See `docs/overviews/m9_8hx_searcher_jobs_overview.md` and
 //! `docs/overviews/m9_8il_searcher_grpc_client_overview.md`.
@@ -225,7 +228,11 @@ impl SymbolsClient for NotPortedSearcher {
 }
 
 /// Message used when the gRPC client has no configured endpoints.
-pub const NO_ENDPOINTS_MESSAGE: &str = "searcher: no endpoints configured";
+///
+/// The baseline's searcher endpoints are an `endpoint.ConfBased` map
+/// (`internal/search/env.go:39-45`); `Endpoints()` succeeds with an empty list
+/// and `GetN` only then fails with `endpoint.EmptyError{URLSpec: "conf-based"}`.
+pub const NO_ENDPOINTS_MESSAGE: &str = "endpoint.Map(conf-based) is empty";
 
 /// Connection seam for [`GrpcSearcherClient`]. Tests inject a connector that
 /// returns clients dialing an in-process fake gRPC server; production uses
@@ -573,11 +580,10 @@ impl GrpcSearcherClient {
 
 impl SearcherClient for GrpcSearcherClient {
     fn endpoints(&self) -> Result<Vec<String>, SearcherError> {
-        if self.endpoints.is_empty() {
-            Err(SearcherError::other(NO_ENDPOINTS_MESSAGE))
-        } else {
-            Ok(self.endpoints.clone())
-        }
+        // `endpoint.Map.Endpoints()` never fails for a static/conf map: an
+        // empty configuration yields an empty slice with a nil error
+        // (`internal/endpoint/endpoint.go:177-188`).
+        Ok(self.endpoints.clone())
     }
 
     fn search(
@@ -587,6 +593,7 @@ impl SearcherClient for GrpcSearcherClient {
     ) -> Result<bool, SearcherError> {
         let urls = self.route_order(&request.repo, &request.commit);
         if urls.is_empty() {
+            // `endpoint.Map.GetN` on an empty map (`endpoint.go:126-147`).
             return Err(SearcherError::other(NO_ENDPOINTS_MESSAGE));
         }
         let request = request.to_proto();
@@ -820,8 +827,9 @@ fn read_u32(bytes: &[u8]) -> u32 {
     u32::from_le_bytes(bytes.try_into().expect("4-byte slice"))
 }
 
-/// Production-default constructor: a real gRPC client when endpoints are
-/// configured, otherwise `None` (callers keep [`NotPortedSearcher`]).
+/// Constructor kept for callers that model "is there a configured client?".
+/// The baseline always has a `SearcherURLs` map (`endpoint.ConfBased`), so the
+/// production path uses [`default_searcher_client`] and never [`NotPortedSearcher`].
 pub fn grpc_client_from_endpoints(endpoints: Vec<String>) -> Option<GrpcSearcherClient> {
     if endpoints.is_empty() {
         None
@@ -830,13 +838,11 @@ pub fn grpc_client_from_endpoints(endpoints: Vec<String>) -> Option<GrpcSearcher
     }
 }
 
-/// Boxed production default: gRPC transport with endpoints, `NotPortedSearcher`
-/// without them.
+/// Boxed production default: always the real gRPC transport, even with an empty
+/// endpoint list, which then reports the baseline empty-map error at search
+/// time. `NotPortedSearcher` remains only as the explicit unconfigured double.
 pub fn default_searcher_client(endpoints: Vec<String>) -> Box<dyn SearcherClient + Send + Sync> {
-    match grpc_client_from_endpoints(endpoints) {
-        Some(client) => Box::new(client),
-        None => Box::new(NotPortedSearcher),
-    }
+    Box::new(GrpcSearcherClient::new(endpoints))
 }
 
 #[cfg(test)]
@@ -958,10 +964,12 @@ mod tests {
     }
 
     #[test]
-    fn default_constructor_falls_back_without_endpoints() {
+    fn default_constructor_keeps_a_real_client_without_endpoints() {
         assert!(grpc_client_from_endpoints(Vec::new()).is_none());
         let client = default_searcher_client(Vec::new());
-        assert_eq!(client.endpoints(), Err(SearcherError::not_ported()));
+        // The baseline's conf map is empty but still callable: `Endpoints()`
+        // succeeds, only `GetN`/`Search` reports the empty-map error.
+        assert_eq!(client.endpoints(), Ok(Vec::new()));
 
         let client = grpc_client_from_endpoints(vec!["http://127.0.0.1:1".to_owned()])
             .expect("configured client");
@@ -976,10 +984,7 @@ mod tests {
     fn empty_client_reports_no_endpoints() {
         let client = GrpcSearcherClient::new(Vec::new());
         assert!(!client.is_configured());
-        assert_eq!(
-            client.endpoints(),
-            Err(SearcherError::other(NO_ENDPOINTS_MESSAGE))
-        );
+        assert_eq!(client.endpoints(), Ok(Vec::new()));
         let request = protocol::Request {
             repo: "repo".to_owned(),
             repo_id: 1,

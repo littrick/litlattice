@@ -14,9 +14,11 @@
 //! * the sub-repo permissions seam (`ActorPermissions` in the baseline),
 //!   injected as [`SubRepoPermsChecker`] and disabled by default.
 //!
-//! When no endpoints are configured the runtime keeps
-//! [`crate::search_runtime::NotPortedSymbols`] so the explicit not-ported error
-//! is unchanged. See `docs/overviews/m9_8iq_symbols_client_overview.md`.
+//! Since M9.18b `search_runtime::assemble` always constructs
+//! [`GrpcSymbolsClient`]; with no endpoints the `search` call fails with Go's
+//! `getting symbols server address for repo ...: endpoint.Map(conf-based) is
+//! empty` wrap instead of an assembly-time not-ported error. See
+//! `docs/overviews/m9_8iq_symbols_client_overview.md`.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -33,8 +35,15 @@ use crate::search_searcher_client::{
 };
 use crate::search_stream::convert;
 
-/// Message used when the gRPC symbols client has no configured endpoints.
-pub const NO_SYMBOLS_ENDPOINTS_MESSAGE: &str = "symbols: no endpoints configured";
+/// The baseline empty-map error (`endpoint.EmptyError` with the
+/// `endpoint.ConfBased` URL spec).
+pub const NO_SYMBOLS_ENDPOINTS_MESSAGE: &str = "endpoint.Map(conf-based) is empty";
+
+/// Go `%q` for a string (the subset needed for repo names): JSON quote syntax
+/// is identical for printable ASCII.
+fn go_quote(value: &str) -> String {
+    serde_json::to_string(value).unwrap_or_else(|_| format!("{value:?}"))
+}
 
 /// Sub-repo permission seam standing in for
 /// `authz.SubRepoPermissionChecker`/`authz.ActorPermissions`.
@@ -228,9 +237,17 @@ impl GrpcSymbolsClient {
 
 impl SymbolsClient for GrpcSymbolsClient {
     fn search(&self, params: &SymbolsParameters) -> Result<SymbolsResponse, SearcherError> {
-        let endpoint = self
-            .route(&params.repo)
-            .ok_or_else(|| SearcherError::other(NO_SYMBOLS_ENDPOINTS_MESSAGE))?;
+        let Some(endpoint) = self.route(&params.repo) else {
+            // `symbols.Client.Search` -> `searchGRPC` -> `gRPCClient` ->
+            // `Endpoints.Get`, each wrapping the previous error
+            // (`internal/symbols/client.go:58-104,120-130,229-233`) around
+            // `endpoint.EmptyError{URLSpec: "conf-based"}`.
+            return Err(SearcherError::other(format!(
+                "executing symbols search request: getting gRPC symbols client: \
+                 getting symbols server address for repo {}: {NO_SYMBOLS_ENDPOINTS_MESSAGE}",
+                go_quote(&params.repo)
+            )));
+        };
         let request = to_proto_request(params);
         let connector = Arc::clone(&self.connector);
         let retry = self.retry;
@@ -416,8 +433,7 @@ fn go_code_name(code: tonic::Code) -> &'static str {
     }
 }
 
-/// Production-default constructor: a real gRPC client when endpoints are
-/// configured, otherwise `None`.
+/// Constructor kept for callers that model "is there a configured client?".
 pub fn grpc_symbols_client_from_endpoints(endpoints: Vec<String>) -> Option<GrpcSymbolsClient> {
     if endpoints.is_empty() {
         None
@@ -427,7 +443,10 @@ pub fn grpc_symbols_client_from_endpoints(endpoints: Vec<String>) -> Option<Grpc
 }
 
 /// Boxed production default: gRPC transport with endpoints, `None` without
-/// them so callers keep `NotPortedSymbols`.
+/// them. Callers that must mirror the baseline's always-present
+/// `symbols.DefaultClient` construct [`GrpcSymbolsClient::new`] directly (see
+/// `crate::search_runtime`); an empty map then reports the baseline error at
+/// call time.
 pub fn default_symbols_client(
     endpoints: Vec<String>,
 ) -> Option<Box<dyn SymbolsClient + Send + Sync>> {
@@ -450,11 +469,17 @@ mod tests {
     }
 
     #[test]
-    fn empty_client_reports_no_endpoints() {
+    fn empty_client_reports_the_baseline_empty_map_error() {
         let client = GrpcSymbolsClient::new(Vec::new());
+        let mut params = SymbolsParameters::default();
+        params.repo = "github.com/o/r".to_owned();
         assert_eq!(
-            client.search(&SymbolsParameters::default()),
-            Err(SearcherError::other(NO_SYMBOLS_ENDPOINTS_MESSAGE))
+            client.search(&params),
+            Err(SearcherError::other(
+                "executing symbols search request: getting gRPC symbols client: \
+                 getting symbols server address for repo \"github.com/o/r\": \
+                 endpoint.Map(conf-based) is empty"
+            ))
         );
     }
 

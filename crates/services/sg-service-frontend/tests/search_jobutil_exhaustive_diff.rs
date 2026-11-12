@@ -172,7 +172,7 @@ fn rev_spec_out(rev: &RevisionSpecifier) -> Value {
         "rev_spec": rev.rev_spec,
         "ref_glob": rev.ref_glob,
         "exclude_ref_glob": rev.exclude_ref_glob,
-        "rev_at_time": rev.rev_at_time,
+        "rev_at_time": rev.rev_at_time || rev.rev_at_time_payload.is_some(),
     })
 }
 
@@ -260,7 +260,15 @@ fn rev_spec_from(spec: &RevSpecSpec) -> RevisionSpecifier {
         rev_spec: spec.rev_spec.clone(),
         ref_glob: spec.ref_glob.clone(),
         exclude_ref_glob: spec.exclude_ref_glob.clone(),
+        // The corpus never carries a `rat=` payload; the boolean only records
+        // the baseline placeholder, so an epoch payload keeps the same shape.
         rev_at_time: spec.rev_at_time,
+        rev_at_time_payload: spec.rev_at_time.then(|| {
+            std::sync::Arc::new(sg_service_frontend::search_contexts::RevAtTime::new(
+                spec.rev_spec.clone(),
+                time::OffsetDateTime::UNIX_EPOCH,
+            ))
+        }),
     }
 }
 

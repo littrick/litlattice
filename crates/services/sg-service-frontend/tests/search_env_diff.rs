@@ -25,8 +25,7 @@ use serde::Deserialize;
 use serde_json::{Map, Value};
 
 use sg_service_frontend::search_env::{
-    list_all_indexed, parse_drain_servers, EndpointMapDrain, IndexedError, IndexedJobStreamer,
-    IndexedStreamer,
+    list_all_indexed, parse_drain_servers, EndpointMapDrain, IndexedJobStreamer, IndexedStreamer,
 };
 use sg_zoekt::cached::{CachedStreamer, ManualClock};
 use sg_zoekt::horizontal::RolloutError;
@@ -787,14 +786,9 @@ async fn search_env_diff() {
         eprintln!("SG_M9IR_DIFF not set; skipping");
         return;
     }
-    // Absent endpoints must keep the existing not-ported fallback: the
-    // assembly refuses to build a zoekt bundle and the caller keeps
-    // `TreeJobRunner::unconfigured()` (the `"search execution is not ported
-    // yet"` path covered by `search_runtime`'s unit test).
-    assert!(matches!(
-        IndexedJobStreamer::new(&[], Duration::from_secs(600)),
-        Err(IndexedError::MissingZoekt)
-    ));
+    // Empty endpoints are not an error: the baseline `endpoint.ConfBased` map
+    // is always present and `HorizontalSearcher` simply runs zero clients.
+    assert!(IndexedJobStreamer::new(&[], Duration::from_secs(600)).is_ok());
 
     let corpus_path = std::env::var("M9IR_CORPUS").expect("M9IR_CORPUS must be set");
     let out_path = std::env::var("M9IR_OUT").expect("M9IR_OUT must be set");

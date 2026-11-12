@@ -365,17 +365,9 @@ fn parsed_repo_filters_string(filters: &[ParsedRepoFilter]) -> String {
 }
 
 fn revision_specifier_string(rev: &crate::search_contexts::RevisionSpecifier) -> String {
-    if !rev.exclude_ref_glob.is_empty() {
-        format!("*!{}", rev.exclude_ref_glob)
-    } else if !rev.ref_glob.is_empty() {
-        format!("*{}", rev.ref_glob)
-    } else if rev.rev_at_time {
-        // `RevAtTime.String()` is a base64 JSON blob; not exercised by the
-        // corpus (date parsing is outside this construction slice).
-        "rat=?".to_owned()
-    } else {
-        rev.rev_spec.clone()
-    }
+    // `query.RevisionSpecifier.String()` (`repo_revs.go:42-53`), including the
+    // `rat=` URL-base64 JSON payload.
+    rev.spec_string()
 }
 
 // ---------------------------------------------------------------------------
