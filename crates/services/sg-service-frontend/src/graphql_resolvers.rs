@@ -3388,7 +3388,8 @@ impl QueryRoot {
                     Some(RepoLookup::Found(data)) => Ok(Some(FieldValue::Object(Arc::new(
                         RepositoryObject::from_data(data.clone())
                             .with_git(self.git.clone())
-                            .with_embeddings(self.nested.repo_embeddings.clone()),
+                            .with_embeddings(self.nested.repo_embeddings.clone())
+                            .with_inventory_d(Some(self.inventory.graphql_d.clone())),
                     )))),
                     Some(RepoLookup::NotFound) => Ok(Some(FieldValue::Null)),
                     Some(RepoLookup::Blocked { name, reason }) => Err(ExecError::new(format!(
@@ -3645,13 +3646,23 @@ impl ObjectValue for QueryRoot {
                     None => Ok(None),
                     Some(Err(message)) => Err(ExecError::new(message.clone())),
                     Some(Ok(data)) => Ok(Some(FieldValue::Object(Arc::new(
-                        crate::graphql_inventory_c::WebhookConnectionObject {
+                        crate::graphql_inventory_d::WebhookConnectionObjectD {
                             data: data.clone(),
                             viewer_site_admin: self.viewer_site_admin,
                             nested: self.nested.clone(),
                         },
                     )))),
                 }
+            }
+            // `Query.repoMeta` (`repository_metadata.go:180-185`): always a
+            // resolver (possibly with an empty selection).
+            "repoMeta" => {
+                if !self.inventory.graphql_d.repo_meta_selected {
+                    return Ok(None);
+                }
+                Ok(Some(FieldValue::Object(Arc::new(
+                    crate::graphql_inventory_d::repo_metadata_object(&self.inventory.graphql_d),
+                ))))
             }
             // `Query.externalServiceNamespaces` (`external_services.go:535-590`).
             "externalServiceNamespaces" => {
@@ -3858,7 +3869,8 @@ impl ObjectValue for QueryRoot {
                     Some(RepoLookup::Found(data)) => Ok(Some(FieldValue::Object(Arc::new(
                         RepositoryObject::from_data(data.clone())
                             .with_git(self.git.clone())
-                            .with_embeddings(self.nested.repo_embeddings.clone()),
+                            .with_embeddings(self.nested.repo_embeddings.clone())
+                            .with_inventory_d(Some(self.inventory.graphql_d.clone())),
                     )))),
                     Some(RepoLookup::NotFound) => Ok(Some(FieldValue::Null)),
                     Some(RepoLookup::Blocked { name, reason }) => Err(ExecError::new(format!(
@@ -3874,7 +3886,8 @@ impl ObjectValue for QueryRoot {
                         Some(RepoLookup::Found(data)) => Ok(Some(FieldValue::Object(Arc::new(
                             RepositoryObject::from_data(data.clone())
                                 .with_git(self.git.clone())
-                                .with_embeddings(self.nested.repo_embeddings.clone()),
+                                .with_embeddings(self.nested.repo_embeddings.clone())
+                                .with_inventory_d(Some(self.inventory.graphql_d.clone())),
                         )))),
                         Some(RepoLookup::NotFound) => Ok(Some(FieldValue::Null)),
                         Some(RepoLookup::Blocked { name, reason }) => Err(ExecError::new(format!(
@@ -3897,7 +3910,8 @@ impl ObjectValue for QueryRoot {
                     Some(RepoLookup::Found(data)) => Ok(Some(FieldValue::Object(Arc::new(
                         RepositoryObject::from_data(data.clone())
                             .with_git(self.git.clone())
-                            .with_embeddings(self.nested.repo_embeddings.clone()),
+                            .with_embeddings(self.nested.repo_embeddings.clone())
+                            .with_inventory_d(Some(self.inventory.graphql_d.clone())),
                     )))),
                     Some(RepoLookup::NotFound) => Ok(Some(FieldValue::Null)),
                     Some(RepoLookup::Blocked { name, reason }) => Err(ExecError::new(format!(
@@ -3915,7 +3929,8 @@ impl ObjectValue for QueryRoot {
                         Some(RepoLookup::Found(data)) => Ok(Some(FieldValue::Object(Arc::new(
                             RepositoryObject::from_data(data.clone())
                                 .with_git(self.git.clone())
-                                .with_embeddings(self.nested.repo_embeddings.clone()),
+                                .with_embeddings(self.nested.repo_embeddings.clone())
+                                .with_inventory_d(Some(self.inventory.graphql_d.clone())),
                         )))),
                         Some(RepoLookup::NotFound) => Ok(Some(FieldValue::Null)),
                         Some(RepoLookup::Blocked { name, reason }) => Err(ExecError::new(format!(
@@ -6069,6 +6084,8 @@ pub struct RepositoryObject {
     /// The request's embeddings snapshot (M9.14c); `None` leaves
     /// `embeddingExists` unported.
     embeddings: Option<Arc<crate::embeddings_graphql::EmbeddingsPrefetch>>,
+    /// The request's M9.19a repository object-type snapshot.
+    inventory_d: Option<Arc<crate::graphql_inventory_d::InventoryDRoots>>,
 }
 
 impl RepositoryObject {
@@ -6077,6 +6094,7 @@ impl RepositoryObject {
             data,
             git: None,
             embeddings: None,
+            inventory_d: None,
         }
     }
 
@@ -6092,6 +6110,15 @@ impl RepositoryObject {
         embeddings: Option<Arc<crate::embeddings_graphql::EmbeddingsPrefetch>>,
     ) -> Self {
         self.embeddings = embeddings;
+        self
+    }
+
+    /// Attach the request's prefetched M9.19a object data.
+    pub fn with_inventory_d(
+        mut self,
+        inventory_d: Option<Arc<crate::graphql_inventory_d::InventoryDRoots>>,
+    ) -> Self {
+        self.inventory_d = inventory_d;
         self
     }
 
@@ -6198,6 +6225,103 @@ impl ObjectValue for RepositoryObject {
                     Some(Err(message)) => Err(ExecError::new(message.clone())),
                     None => Err(ExecError::new("comparison is not prefetched")),
                 }
+            }
+            // `Repository.KeyValuePairs`/`Metadata` (`repository.go:533-552`):
+            // both replay the `repo_kvps` rows prefetched into `repo_kvps`.
+            "keyValuePairs" | "metadata" => {
+                let Some(inventory) = &self.inventory_d else {
+                    return Ok(None);
+                };
+                match inventory.repo_kvps.get(&self.data.id) {
+                    Some(Err(message)) => Err(ExecError::new(message.clone())),
+                    Some(Ok(rows)) => Ok(Some(FieldValue::List {
+                        element_type: Some("KeyValuePair"),
+                        items: rows
+                            .iter()
+                            .map(|row| {
+                                FieldValue::Object(Arc::new(
+                                    crate::graphql_inventory_d::KeyValuePairObject {
+                                        data: row.clone(),
+                                    },
+                                ))
+                            })
+                            .collect(),
+                    })),
+                    None => Ok(None),
+                }
+            }
+            // `Repository.ExternalURLs` (`repository.go:501-507`): only the
+            // Phabricator link is available without code-host metadata.
+            "externalURLs" => {
+                let Some(inventory) = &self.inventory_d else {
+                    return Ok(None);
+                };
+                match inventory.repo_external_links.get(&self.data.id) {
+                    Some(Err(message)) => Err(ExecError::new(message.clone())),
+                    Some(Ok(links)) => Ok(Some(FieldValue::List {
+                        element_type: Some("ExternalLink"),
+                        items: links
+                            .iter()
+                            .map(|link| {
+                                FieldValue::Object(Arc::new(
+                                    crate::graphql_inventory_d::ExternalLinkObject {
+                                        data: link.clone(),
+                                    },
+                                ))
+                            })
+                            .collect(),
+                    })),
+                    None => Ok(None),
+                }
+            }
+            // `Repository.GitRefs`/`Branches`/`Tags`
+            // (`repository_git_refs.go:20-74`).
+            "gitRefs" | "branches" | "tags" => {
+                let (heads_only, tags_only) = if field == "gitRefs" {
+                    crate::graphql_inventory_d::refs_type(arguments)
+                } else {
+                    (field == "branches", field == "tags")
+                };
+                let first = arguments
+                    .i64("first")
+                    .and_then(|value| i32::try_from(value).ok());
+                match crate::graphql_inventory_d::git_ref_connection(
+                    self.minimal_repo(),
+                    self.git.clone(),
+                    heads_only,
+                    tags_only,
+                    arguments.string("query"),
+                    first,
+                )? {
+                    Some(connection) => Ok(Some(FieldValue::Object(Arc::new(connection)))),
+                    None => Ok(None),
+                }
+            }
+            // `Repository.Contributors` (`repository_contributors.go:25-51`).
+            "contributors" => {
+                match crate::graphql_inventory_d::contributors_connection(
+                    self.minimal_repo(),
+                    self.git.clone(),
+                    arguments,
+                    self.inventory_d.clone(),
+                )? {
+                    Some(connection) => Ok(Some(FieldValue::Object(Arc::new(connection)))),
+                    None => Ok(None),
+                }
+            }
+            // `Repository.TextSearchIndex` (`repository_text_search_index.go:18-27`).
+            "textSearchIndex" => {
+                let Some(inventory) = &self.inventory_d else {
+                    return Ok(None);
+                };
+                Ok(Some(FieldValue::Object(Arc::new(
+                    crate::graphql_inventory_d::RepositoryTextSearchIndexObject {
+                        repo: self.minimal_repo(),
+                        git: self.git.clone(),
+                        zoekt: Arc::new(inventory.zoekt.clone()),
+                        inventory_d: self.inventory_d.clone(),
+                    },
+                ))))
             }
             "id" => Ok(Some(FieldValue::Json(Json::Str(Self::relay_id(
                 self.data.id,

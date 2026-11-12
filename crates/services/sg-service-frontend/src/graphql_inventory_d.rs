@@ -17,10 +17,10 @@ use async_trait::async_trait;
 use sg_graphql::exec::{Actor, Arguments, ExecError, FieldValue, ObjectValue, RootField};
 use sg_graphql::json::Json;
 use sqlx::{PgPool, Row};
-use time::OffsetDateTime;
+use time::{OffsetDateTime, UtcOffset};
 
 use crate::graphql_resolvers::{
-    datetime_rfc3339, NodeRoots, PageInfoObject, RepoKey, RepoLookup, RepositoryRedirectKey,
+    NodeRoots, PageInfoObject, RepoKey, RepoLookup, RepositoryRedirectKey,
 };
 use crate::search_stream::convert::MinimalRepo;
 
@@ -28,28 +28,63 @@ use crate::search_stream::convert::MinimalRepo;
 // Relay helpers
 // ---------------------------------------------------------------------------
 
-/// `relay.MarshalID(kind, string)`.
+/// `relay.MarshalID(kind, string)`:
+/// `base64.URLEncoding(kind + ":" + json.Marshal(spec))`. Go's `json.Marshal`
+/// of a string escapes `<`, `>`, `&`, U+2028/U+2029 and control characters.
 pub fn marshal_relay_id_str(kind: &str, spec: &str) -> String {
     use base64::Engine as _;
-    base64::engine::general_purpose::URL_SAFE.encode(format!("{kind}:{spec}"))
+    base64::engine::general_purpose::URL_SAFE.encode(format!("{kind}:{}", go_json_quote(spec)))
 }
 
-/// `relay.UnmarshalSpec(id, &string)` (`internal/graphqlbackend/relay.go` in
-/// graph-gophers). `null` leaves the zero value (`""`), matching
-/// `json.Unmarshal`.
+/// Go `encoding/json` string quoting (without the surrounding HTML escaping
+/// deviation: HTML characters *are* escaped).
+pub fn go_json_quote(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('"');
+    for ch in value.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{08}' => out.push_str("\\b"),
+            '\u{0c}' => out.push_str("\\f"),
+            '<' => out.push_str("\\u003c"),
+            '>' => out.push_str("\\u003e"),
+            '&' => out.push_str("\\u0026"),
+            '\u{2028}' => out.push_str("\\u2028"),
+            '\u{2029}' => out.push_str("\\u2029"),
+            ch if (ch as u32) < 0x20 => {
+                out.push_str(&format!("\\u{:04x}", ch as u32));
+            }
+            ch => out.push(ch),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// `relay.UnmarshalSpec(id, &string)` (`graph-gophers/graphql-go/relay`).
+/// `null` leaves the zero value (`""`), matching `json.Unmarshal`.
 pub fn unmarshal_relay_str(raw: &str) -> Result<String, String> {
     use base64::Engine as _;
     let decoded = base64::engine::general_purpose::URL_SAFE
         .decode(raw)
-        .map_err(|error| error.to_string())?;
-    let Ok(text) = String::from_utf8(decoded) else {
+        .map_err(|_| "illegal base64 data at input byte 0".to_owned())?;
+    let Some(index) = decoded.iter().position(|byte| *byte == b':') else {
         return Err("invalid graphql.ID".to_owned());
     };
-    let Some((_, spec)) = text.split_once(':') else {
+    let spec = &decoded[index + 1..];
+    let Ok(text) = std::str::from_utf8(spec) else {
         return Err("invalid graphql.ID".to_owned());
     };
+    let trimmed = text.trim_start();
+    if trimmed.is_empty() {
+        return Err("unexpected end of JSON input".to_owned());
+    }
     let value: serde_json::Value =
-        serde_json::from_str(spec).map_err(|error| error.to_string())?;
+        serde_json::from_str(trimmed).map_err(|error| error.to_string())?;
     match value {
         serde_json::Value::String(value) => Ok(value),
         serde_json::Value::Null => Ok(String::new()),
@@ -63,7 +98,7 @@ pub fn unmarshal_relay_str(raw: &str) -> Result<String, String> {
 fn go_json_kind(value: &serde_json::Value) -> &'static str {
     match value {
         serde_json::Value::Null => "null",
-        serde_json::Value::Bool(_) => "boolean",
+        serde_json::Value::Bool(_) => "bool",
         serde_json::Value::Number(_) => "number",
         serde_json::Value::String(_) => "string",
         serde_json::Value::Array(_) => "array",
@@ -185,17 +220,6 @@ pub struct BidirectionalPageInfoData {
     pub end_cursor: Option<String>,
 }
 
-impl BidirectionalPageInfoData {
-    fn empty() -> Self {
-        Self {
-            has_next_page: false,
-            has_previous_page: false,
-            start_cursor: None,
-            end_cursor: None,
-        }
-    }
-}
-
 impl ObjectValue for BidirectionalPageInfoData {
     fn type_name(&self) -> &'static str {
         "BidirectionalPageInfo"
@@ -224,6 +248,9 @@ impl ObjectValue for BidirectionalPageInfoData {
 }
 
 /// One prefetched `RepoMetadata.keys` / `values` result.
+/// `featureDisabledError` (`repository_metadata.go:29`).
+pub const FEATURE_DISABLED_ERROR: &str = "'repository-metadata' feature flag is not enabled";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RepoMetadataConnectionLookup {
     Found(RepoMetadataConnectionData),
@@ -378,17 +405,35 @@ pub trait RepoMetadataStore: Send + Sync {
     async fn has_repo_metadata_write(&self, user_id: i32) -> Result<bool, String>;
     /// `db.Phabricator().GetByName`'s SQL fallback: `(url, callsign)`.
     async fn phabricator_repo(&self, repo_name: &str) -> Result<Option<(String, String)>, String>;
+    /// `featureflag.FromContext(ctx).GetBoolOr("repository-metadata", true)`.
+    /// Flag-evaluation failures use the middleware's empty-set fallback, so
+    /// this method itself never errors.
+    async fn repository_metadata_enabled(&self, actor: Actor) -> bool;
 }
 
 /// Production adapter over the existing `repo_kvps`, `permissions`,
-/// `role_permissions`, `user_roles`, `users` and `phabricator_repos` tables.
+/// `role_permissions`, `user_roles`, `users`, `feature_flags` and
+/// `phabricator_repos` tables.
 pub struct PgRepoMetadataStore {
     pool: PgPool,
+    feature_flags: Option<Arc<dyn crate::graphql_resolvers::FeatureFlagStore>>,
 }
 
 impl PgRepoMetadataStore {
     pub fn new(pool: PgPool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            feature_flags: None,
+        }
+    }
+
+    /// Attach the request's evaluated feature-flag store (M9.19a).
+    pub fn with_feature_flags(
+        mut self,
+        feature_flags: Option<Arc<dyn crate::graphql_resolvers::FeatureFlagStore>>,
+    ) -> Self {
+        self.feature_flags = feature_flags;
+        self
     }
 }
 
@@ -482,6 +527,19 @@ impl RepoMetadataStore for PgRepoMetadataStore {
                 row.get::<String, _>("callsign"),
             )
         }))
+    }
+
+    async fn repository_metadata_enabled(&self, actor: Actor) -> bool {
+        let Some(flags) = &self.feature_flags else {
+            return true;
+        };
+        let flags = match actor {
+            Actor::User { uid } => flags.get_user_flags(uid).await.ok(),
+            Actor::Anonymous | Actor::Internal => flags.get_global_flags().await.ok(),
+        };
+        flags
+            .and_then(|flags| flags.get("repository-metadata").copied())
+            .unwrap_or(true)
     }
 }
 
@@ -666,18 +724,119 @@ impl ObjectValue for GitRefConnectionObject {
     }
 }
 
+/// `GitRefType` → `(HeadsOnly, TagsOnly)` (`repository_git_refs.go:28-34`):
+/// `null` selects both, `GIT_BRANCH` heads, `GIT_TAG` tags, anything else
+/// neither (the backend then lists all refs).
+pub fn refs_type(arguments: &Arguments) -> (bool, bool) {
+    match arguments.string("type") {
+        None => (true, true),
+        Some("GIT_BRANCH") => (true, false),
+        Some("GIT_TAG") => (false, true),
+        Some(_) => (false, false),
+    }
+}
+
+/// `Repository.gitRefs`/`branches`/`tags`: replay the prefetched `ListRefs`
+/// result (`repository_git_refs.go:35-55`).
+pub fn git_ref_connection(
+    repo: MinimalRepo,
+    git: Option<Arc<crate::git_graphql::GitPrefetch>>,
+    heads_only: bool,
+    tags_only: bool,
+    query: Option<&str>,
+    first: Option<i32>,
+) -> Result<Option<GitRefConnectionObject>, ExecError> {
+    let Some(git) = git else {
+        return Ok(None);
+    };
+    let key = crate::git_graphql::RefsKey {
+        repo_id: repo.id,
+        heads_only,
+        tags_only,
+    };
+    let refs = match git.refs.get(&key) {
+        Some(Ok(refs)) => refs.clone(),
+        Some(Err(message)) => return Err(ExecError::new(message.clone())),
+        None => return Ok(None),
+    };
+    Ok(Some(GitRefConnectionObject {
+        repo,
+        git: Some(git),
+        refs: build_git_refs(&refs, query),
+        first,
+    }))
+}
+
 pub use crate::git_graphql::ContributorCountData;
 
 pub struct RepositoryContributorConnectionObject {
     pub repo: MinimalRepo,
     pub git: Option<Arc<crate::git_graphql::GitPrefetch>>,
     pub data: ContributorsConnectionData,
+    pub inventory_d: Option<Arc<InventoryDRoots>>,
 }
 
+/// `gqlutil.ConnectionResolver` for `Repository.contributors`. A gitserver
+/// failure is reported by `totalCount`/`nodes`/`pageInfo`
+/// (`repository_contributors.go:93-100`); pagination-argument failures are
+/// reported by `nodes`/`pageInfo` only.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContributorsConnectionData {
-    pub total_count: i64,
+    pub total_count: Result<i64, String>,
     pub page: Result<(Vec<(usize, ContributorCountData)>, BidirectionalPageInfoData), String>,
+}
+
+/// `Repository.Contributors` (`repository_contributors.go:25-51`).
+pub fn contributors_connection(
+    repo: MinimalRepo,
+    git: Option<Arc<crate::git_graphql::GitPrefetch>>,
+    arguments: &Arguments,
+    inventory_d: Option<Arc<InventoryDRoots>>,
+) -> Result<Option<RepositoryContributorConnectionObject>, ExecError> {
+    let Some(git) = git else {
+        return Ok(None);
+    };
+    let key = crate::git_graphql::ContributorsKey {
+        repo_id: repo.id,
+        revision_range: arguments.string("revisionRange").map(str::to_owned),
+        after_date: arguments
+            .string("afterDate")
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned),
+        path: arguments.string("path").map(str::to_owned),
+    };
+    let data = match git.contributors.get(&key) {
+        None => return Ok(None),
+        // `errors.Wrap(err, "failed to parse after date")`: the
+        // `contributors` field itself errors.
+        Some(crate::git_graphql::ContributorLookup::InvalidDate(message)) => {
+            return Err(ExecError::new(message.clone()))
+        }
+        Some(crate::git_graphql::ContributorLookup::Counts(Err(message))) => {
+            ContributorsConnectionData {
+                total_count: Err(message.clone()),
+                page: Err(message.clone()),
+            }
+        }
+        Some(crate::git_graphql::ContributorLookup::Counts(Ok(counts))) => {
+            ContributorsConnectionData {
+                total_count: Ok(counts.len() as i64),
+                page: page_contributors(
+                    counts,
+                    arguments.i64("first"),
+                    arguments.i64("last"),
+                    arguments.string("after"),
+                    arguments.string("before"),
+                ),
+            }
+        }
+    };
+    Ok(Some(RepositoryContributorConnectionObject {
+        repo,
+        git: Some(git),
+        data,
+        inventory_d,
+    }))
 }
 
 impl ObjectValue for RepositoryContributorConnectionObject {
@@ -692,7 +851,10 @@ impl ObjectValue for RepositoryContributorConnectionObject {
         _actor: Actor,
     ) -> Result<Option<FieldValue>, ExecError> {
         match field {
-            "totalCount" => Ok(Some(FieldValue::Json(Json::Int(self.data.total_count)))),
+            "totalCount" => match &self.data.total_count {
+                Ok(total) => Ok(Some(FieldValue::Json(Json::Int(*total)))),
+                Err(message) => Err(ExecError::new(message.clone())),
+            },
             "nodes" => match &self.data.page {
                 Ok((nodes, _)) => Ok(Some(FieldValue::List {
                     items: nodes
@@ -702,6 +864,7 @@ impl ObjectValue for RepositoryContributorConnectionObject {
                                 repo: self.repo.clone(),
                                 git: self.git.clone(),
                                 data: contributor.clone(),
+                                inventory_d: self.inventory_d.clone(),
                             }))
                         })
                         .collect(),
@@ -724,6 +887,7 @@ pub struct RepositoryContributorObject {
     pub repo: MinimalRepo,
     pub git: Option<Arc<crate::git_graphql::GitPrefetch>>,
     pub data: ContributorCountData,
+    pub inventory_d: Option<Arc<InventoryDRoots>>,
 }
 
 impl ObjectValue for RepositoryContributorObject {
@@ -738,6 +902,19 @@ impl ObjectValue for RepositoryContributorObject {
         _actor: Actor,
     ) -> Result<Option<FieldValue>, ExecError> {
         match field {
+            // `relay.MarshalID("RepositoryContributor", gitContributorGQLID{...})`
+            // (`repository_contributor.go:17-31`): field order `r`, `e`, `n`.
+            "id" => Ok(Some(FieldValue::Json(Json::Str(marshal_relay_id_str(
+                "RepositoryContributor",
+                &format!(
+                    "{{\"r\":{},\"e\":{},\"n\":{}}}",
+                    go_json_quote(&crate::graphql_resolvers::RepositoryObject::relay_id(
+                        self.repo.id
+                    )),
+                    go_json_quote(&self.data.email),
+                    go_json_quote(&self.data.name),
+                ),
+            ))))),
             "person" => Ok(Some(FieldValue::Object(Arc::new(
                 crate::git_graphql::PersonObject {
                     name: self.data.name.clone(),
@@ -749,7 +926,8 @@ impl ObjectValue for RepositoryContributorObject {
                 crate::graphql_resolvers::RepositoryObject::from_data(
                     crate::git_graphql::repository_data(&self.repo),
                 )
-                .with_git(self.git.clone()),
+                .with_git(self.git.clone())
+                .with_inventory_d(self.inventory_d.clone()),
             )))),
             // `repositoryContributorResolver.Commits` needs a `git log`
             // author search; no such seam exists in this snapshot.
@@ -930,14 +1108,21 @@ impl ZoektIndexSource for EmptyZoektIndexSource {
     }
 }
 
+/// `skippedIndexedResolver` (`repository_text_search_index.go:229-292`): the
+/// query string always uses the raw zoekt branch; only `count` can error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkippedIndexedData {
+    pub branch: String,
+    pub count: Result<i64, String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TextSearchIndexRefData {
     pub name: String,
     pub target: Option<String>,
     pub indexed_commit: String,
     pub current: Result<bool, String>,
-    /// `(raw zoekt branch, skipped count)`.
-    pub skipped: Option<Result<(String, i64), String>>,
+    pub skipped: Option<SkippedIndexedData>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -951,6 +1136,7 @@ pub struct RepositoryTextSearchIndexObject {
     pub repo: MinimalRepo,
     pub git: Option<Arc<crate::git_graphql::GitPrefetch>>,
     pub zoekt: Arc<TextSearchIndexPrefetch>,
+    pub inventory_d: Option<Arc<InventoryDRoots>>,
 }
 
 impl ObjectValue for RepositoryTextSearchIndexObject {
@@ -969,7 +1155,8 @@ impl ObjectValue for RepositoryTextSearchIndexObject {
                 crate::graphql_resolvers::RepositoryObject::from_data(
                     crate::git_graphql::repository_data(&self.repo),
                 )
-                .with_git(self.git.clone()),
+                .with_git(self.git.clone())
+                .with_inventory_d(self.inventory_d.clone()),
             )))),
             "status" => match self.zoekt.entries.get(&self.repo.id) {
                 Some(Ok(Some(entry))) => Ok(Some(FieldValue::Object(Arc::new(
@@ -1025,7 +1212,9 @@ impl ObjectValue for RepositoryTextSearchIndexStatusObject {
     ) -> Result<Option<FieldValue>, ExecError> {
         let int = |value: i32| FieldValue::Json(Json::Int(i64::from(value)));
         match field {
-            "updatedAt" => Ok(Some(FieldValue::Json(Json::Str(datetime_rfc3339(
+            // `gqlutil.DateTime` embeds `time.Time`, so graphql-go marshals it
+            // with `time.RFC3339Nano`.
+            "updatedAt" => Ok(Some(FieldValue::Json(Json::Str(datetime_rfc3339_nano(
                 self.entry.index_time,
             ))))),
             "contentByteSize" => Ok(Some(FieldValue::Json(Json::Int(
@@ -1119,7 +1308,7 @@ impl ObjectValue for RepositoryTextSearchIndexedRefObject {
             }
             "skippedIndexed" => match &self.data.skipped {
                 Some(skipped) => Ok(Some(FieldValue::Object(Arc::new(SkippedIndexedObject {
-                    skipped: skipped.clone(),
+                    data: skipped.clone(),
                     repo_name: self.repo.name.clone(),
                 })))),
                 None => Ok(Some(FieldValue::Null)),
@@ -1130,8 +1319,7 @@ impl ObjectValue for RepositoryTextSearchIndexedRefObject {
 }
 
 pub struct SkippedIndexedObject {
-    /// `(raw zoekt branch, StreamSearch FileCount)`.
-    pub skipped: Result<(String, i64), String>,
+    pub data: SkippedIndexedData,
     pub repo_name: String,
 }
 
@@ -1147,21 +1335,44 @@ impl ObjectValue for SkippedIndexedObject {
         _actor: Actor,
     ) -> Result<Option<FieldValue>, ExecError> {
         match field {
-            "count" => match &self.skipped {
-                Ok((_, count)) => Ok(Some(FieldValue::Json(Json::Int(*count)))),
+            "count" => match &self.data.count {
+                Ok(count) => Ok(Some(FieldValue::Json(Json::Int(*count)))),
                 Err(message) => Err(ExecError::new(message.clone())),
             },
-            "query" => match &self.skipped {
-                Ok((branch, _)) => Ok(Some(FieldValue::Json(Json::Str(format!(
-                    "r:^{}$@{} type:file select:file index:only patternType:regexp ^NOT-INDEXED:",
-                    quote_meta(&self.repo_name),
-                    branch
-                ))))),
-                Err(message) => Err(ExecError::new(message.clone())),
-            },
+            "query" => Ok(Some(FieldValue::Json(Json::Str(format!(
+                "r:^{}$@{} type:file select:file index:only patternType:regexp ^NOT-INDEXED:",
+                quote_meta(&self.repo_name),
+                self.data.branch
+            ))))),
             _ => Ok(None),
         }
     }
+}
+
+/// Go `time.Time.MarshalJSON` (`time.RFC3339Nano`): trailing fractional
+/// second zeros are removed, and the fraction is omitted when zero.
+fn datetime_rfc3339_nano(value: OffsetDateTime) -> String {
+    let value = value.to_offset(UtcOffset::UTC);
+    let mut out = format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}",
+        value.year(),
+        value.month() as u8,
+        value.day(),
+        value.hour(),
+        value.minute(),
+        value.second()
+    );
+    let nanos = value.nanosecond();
+    if nanos != 0 {
+        let mut fraction = format!("{nanos:09}");
+        while fraction.ends_with('0') {
+            fraction.pop();
+        }
+        out.push('.');
+        out.push_str(&fraction);
+    }
+    out.push('Z');
+    out
 }
 
 /// `regexp.QuoteMeta`.
@@ -1333,7 +1544,13 @@ impl ObjectValue for WebhookObjectD {
         if field != "webhookLogs" {
             return self.inner.field(field, arguments, actor);
         }
-        let args = crate::webhook_logs::webhook_logs_args(arguments);
+        let mut args = crate::webhook_logs::webhook_logs_args(arguments);
+        // `webhookResolver.WebhookLogs` copies the args and forces the
+        // webhook id (`resolver.go:337-345`).
+        args.webhook_id = Some(crate::graphql_inventory_c::marshal_relay_int_id(
+            "Webhook",
+            i64::from(self.inner.data.id),
+        ));
         match self
             .nested
             .webhook_webhook_logs
@@ -1411,19 +1628,12 @@ impl ObjectValue for WebhookConnectionObjectD {
 pub struct InventoryDRoots {
     pub repo_kvps: HashMap<i32, RepoKvpsLookup>,
     pub repo_external_links: HashMap<i32, Result<Vec<ExternalLinkData>, String>>,
-    pub repo_git_refs: HashMap<i32, Result<GitRefsData, String>>,
-    pub repo_contributors: HashMap<i32, Result<ContributorsConnectionData, String>>,
     pub zoekt: TextSearchIndexPrefetch,
     pub repo_meta_keys: HashMap<RepoMetadataArgs, RepoMetadataConnectionLookup>,
-    pub repo_meta_values:
-        HashMap<(String, RepoMetadataArgs), RepoMetadataConnectionLookup>,
-}
-
-/// The unpaginated, query-filtered ref list plus the `first` argument.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct GitRefsData {
-    pub refs: Vec<(String, Option<String>)>,
-    pub first: Option<i32>,
+    pub repo_meta_values: HashMap<(String, RepoMetadataArgs), RepoMetadataConnectionLookup>,
+    /// `Query.repoMeta` was selected, so the resolver must return the (possibly
+    /// empty) root object rather than "unported".
+    pub repo_meta_selected: bool,
 }
 
 fn mentions(fields: &[RootField], name: &str) -> bool {
@@ -1445,24 +1655,15 @@ fn collect_repo(out: &mut HashMap<i32, (String, String)>, lookup: &RepoLookup) {
 }
 
 /// Convert one repository `ListRefs` result into the resolver's `refsArgs`
-/// shape (`repository_git_refs.go:28-55`).
-fn build_git_refs(
-    refs: &[sg_git::GitRef],
-    query: Option<&str>,
-    first: Option<i32>,
-) -> GitRefsData {
+/// shape (`repository_git_refs.go:35-55`).
+fn build_git_refs(refs: &[sg_git::GitRef], query: Option<&str>) -> Vec<(String, Option<String>)> {
     let query = query.map(str::to_lowercase).unwrap_or_default();
-    let filtered = refs
-        .iter()
+    refs.iter()
         .filter(|reference| {
             query.is_empty() || reference.short_name.to_lowercase().contains(&query)
         })
         .map(|reference| (reference.name.clone(), Some(reference.target_commit.clone())))
-        .collect();
-    GitRefsData {
-        refs: filtered,
-        first,
-    }
+        .collect()
 }
 
 /// Build the text-search-index ref list (`repository_text_search_index.go:121-176`).
@@ -1487,22 +1688,18 @@ async fn build_text_index_refs(
         skipped: None,
     }];
     if let Some(entry) = entry {
-        let mut skipped_counts: Vec<(String, Result<i64, String>)> = Vec::new();
         for branch in &entry.branches {
-            skipped_counts.push((
-                branch.name.clone(),
-                zoekt.skipped_count(repo.id, &branch.name).await,
-            ));
-            let name = if branch.name == "HEAD" {
+            let raw_branch = branch.name.clone();
+            let name = if raw_branch == "HEAD" {
                 default_name.clone()
             } else {
-                branch.name.clone()
+                raw_branch.clone()
             };
             let canonical = zoekt.canonical_ref(&repo.name, &name).await;
-            let skipped = skipped_counts
-                .last()
-                .cloned()
-                .map(|(raw, count)| count.map(|count| (raw, count)));
+            let skipped = Some(SkippedIndexedData {
+                branch: raw_branch,
+                count: zoekt.skipped_count(repo.id, &branch.name).await,
+            });
             if let Some(existing) = refs.iter_mut().find(|data| data.name == canonical) {
                 existing.indexed_commit = branch.version.clone();
                 existing.skipped = skipped;
@@ -1516,11 +1713,14 @@ async fn build_text_index_refs(
                 });
             }
         }
+        // `Current` resolves the ref target only for indexed refs
+        // (`repository_text_search_index.go:203-213`); the target OID is also
+        // reused for `GitRef.target` without another gitserver round-trip.
         for data in refs.iter_mut() {
-            let target = zoekt
+            match zoekt
                 .ref_target_oid(repo.id, &repo.name, &data.name)
-                .await;
-            match target {
+                .await
+            {
                 Ok(oid) => {
                     if !data.indexed_commit.is_empty() {
                         data.current = Ok(oid == data.indexed_commit);
@@ -1528,7 +1728,9 @@ async fn build_text_index_refs(
                     data.target = Some(oid);
                 }
                 Err(message) => {
-                    data.current = Err(message);
+                    if !data.indexed_commit.is_empty() {
+                        data.current = Err(message);
+                    }
                 }
             }
         }
@@ -1554,30 +1756,10 @@ pub async fn prefetch_repository_inventory_d(
     let selects_kvps = mentions(fields, "metadata") || mentions(fields, "keyValuePairs");
     let selects_links = mentions(fields, "externalURLs");
     let selects_zoekt = mentions(fields, "textSearchIndex");
-    let mut refs_selections: Vec<(bool, bool, Option<String>, Option<i32>)> = Vec::new();
-    let mut contributor_selections: Vec<(
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        Option<i64>,
-        Option<i64>,
-        Option<String>,
-        Option<String>,
-    )> = Vec::new();
-    collect_object_selections(
-        fields,
-        &mut refs_selections,
-        &mut contributor_selections,
-    );
     let selects_repo_meta = fields.iter().any(|field| field.name == "repoMeta");
+    roots.repo_meta_selected = selects_repo_meta;
 
-    if !selects_kvps
-        && !selects_links
-        && !selects_zoekt
-        && refs_selections.is_empty()
-        && contributor_selections.is_empty()
-        && !selects_repo_meta
-    {
+    if !selects_kvps && !selects_links && !selects_zoekt && !selects_repo_meta {
         return roots;
     }
 
@@ -1662,156 +1844,10 @@ pub async fn prefetch_repository_inventory_d(
             roots.zoekt.refs.insert(repo_id, refs);
         }
     }
-    if let Some(git) = git {
-        if !refs_selections.is_empty() {
-            for (repo_id, _) in &repos {
-                let mut entries: Vec<GitRefsData> = Vec::new();
-                for (heads, tags, query, first) in &refs_selections {
-                    let key = crate::git_graphql::RefsKey {
-                        repo_id: *repo_id,
-                        heads_only: *heads,
-                        tags_only: *tags,
-                    };
-                    match git.refs.get(&key) {
-                        Some(Ok(refs)) => entries.push(build_git_refs(
-                            refs,
-                            query.as_deref(),
-                            *first,
-                        )),
-                        Some(Err(message)) => {
-                            roots.repo_git_refs.insert(*repo_id, Err(message.clone()));
-                            entries.clear();
-                            break;
-                        }
-                        None => {
-                            roots.repo_git_refs.insert(
-                                *repo_id,
-                                Err("git refs are not prefetched".to_owned()),
-                            );
-                            entries.clear();
-                            break;
-                        }
-                    }
-                }
-                if roots.repo_git_refs.contains_key(repo_id) {
-                    continue;
-                }
-                if let Some(entry) = entries.into_iter().next() {
-                    roots.repo_git_refs.insert(*repo_id, Ok(entry));
-                }
-            }
-        }
-        if !contributor_selections.is_empty() {
-            for (repo_id, _) in &repos {
-                let mut computed: Option<Result<ContributorsConnectionData, String>> = None;
-                for (revision_range, after_date, path, first, last, after, before) in
-                    &contributor_selections
-                {
-                    let key = crate::git_graphql::ContributorsKey {
-                        repo_id: *repo_id,
-                        revision_range: revision_range.clone(),
-                        after_date: after_date.clone(),
-                        path: path.clone(),
-                    };
-                    let lookup = match git.contributors.get(&key) {
-                        Some(Ok(counts)) => Ok(ContributorsConnectionData {
-                            total_count: counts.len() as i64,
-                            page: page_contributors(
-                                counts,
-                                *first,
-                                *last,
-                                after.as_deref(),
-                                before.as_deref(),
-                            ),
-                        }),
-                        Some(Err(message)) => Err(message.clone()),
-                        None => Err("contributors are not prefetched".to_owned()),
-                    };
-                    if lookup.is_err() {
-                        computed = Some(lookup);
-                        break;
-                    }
-                    computed = Some(lookup);
-                }
-                if let Some(lookup) = computed {
-                    roots.repo_contributors.insert(*repo_id, lookup);
-                }
-            }
-        }
-    }
     if selects_repo_meta {
         prefetch_repo_metadata(store, fields, actor, &mut roots).await;
     }
     roots
-}
-
-/// The ref/contributor argument shapes collected from the selection set.
-#[allow(clippy::type_complexity)]
-fn collect_object_selections(
-    fields: &[RootField],
-    refs: &mut Vec<(bool, bool, Option<String>, Option<i32>)>,
-    contributors: &mut Vec<(
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        Option<i64>,
-        Option<i64>,
-        Option<String>,
-        Option<String>,
-    )>,
-) {
-    for field in fields {
-        match field.name.as_str() {
-            "gitRefs" => {
-                let arguments = &field.arguments;
-                let (heads, tags) = match arguments.string("type") {
-                    None => (true, true),
-                    Some("GIT_BRANCH") => (true, false),
-                    Some("GIT_TAG") => (false, true),
-                    Some(_) => (false, false),
-                };
-                refs.push((
-                    heads,
-                    tags,
-                    arguments.string("query").map(str::to_owned),
-                    arguments
-                        .i64("first")
-                        .and_then(|value| i32::try_from(value).ok()),
-                ));
-            }
-            "branches" | "tags" => {
-                let arguments = &field.arguments;
-                refs.push((
-                    field.name == "branches",
-                    field.name == "tags",
-                    arguments.string("query").map(str::to_owned),
-                    arguments
-                        .i64("first")
-                        .and_then(|value| i32::try_from(value).ok()),
-                ));
-            }
-            "contributors" => {
-                let arguments = &field.arguments;
-                contributors.push((
-                    arguments.string("revisionRange").map(str::to_owned),
-                    arguments
-                        .string("afterDate")
-                        .filter(|value| !value.is_empty())
-                        .map(str::to_owned),
-                    arguments.string("path").map(str::to_owned),
-                    arguments.i64("first"),
-                    arguments.i64("last"),
-                    arguments.string("after").map(str::to_owned),
-                    arguments.string("before").map(str::to_owned),
-                ));
-            }
-            _ => {}
-        }
-        collect_object_selections(&field.selections, refs, contributors);
-        for (_, nested) in &field.type_conditions {
-            collect_object_selections(nested, refs, contributors);
-        }
-    }
 }
 
 async fn prefetch_repo_metadata(
@@ -1832,6 +1868,9 @@ async fn prefetch_repo_metadata(
             }
             let lookup = match check_repo_metadata_write(store, actor).await {
                 Err(message) => RepoMetadataConnectionLookup::Error(message),
+                Ok(()) if !store.repository_metadata_enabled(actor).await => {
+                    RepoMetadataConnectionLookup::Error(FEATURE_DISABLED_ERROR.to_owned())
+                }
                 Ok(()) => match store.list_keys(args.query.as_deref()).await {
                     Err(message) => RepoMetadataConnectionLookup::Found(
                         RepoMetadataConnectionData {
@@ -1867,6 +1906,9 @@ async fn prefetch_repo_metadata(
                 }
                 let lookup = match check_repo_metadata_write(store, actor).await {
                     Err(message) => RepoMetadataConnectionLookup::Error(message),
+                    Ok(()) if !store.repository_metadata_enabled(actor).await => {
+                        RepoMetadataConnectionLookup::Error(FEATURE_DISABLED_ERROR.to_owned())
+                    }
                     Ok(()) => match store.list_values(key, args.query.as_deref()).await {
                         Err(message) => RepoMetadataConnectionLookup::Found(
                             RepoMetadataConnectionData {

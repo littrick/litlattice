@@ -294,6 +294,16 @@ pub struct ContributorsKey {
     pub path: Option<String>,
 }
 
+/// One `Repository.contributors` gitserver lookup. An unparseable
+/// `afterDate` is returned by the `contributors` field itself
+/// (`repository_contributors.go:30-36`); a gitserver failure is reported by
+/// `totalCount`/`nodes`/`pageInfo` (the connection is still constructed).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ContributorLookup {
+    InvalidDate(String),
+    Counts(Result<Vec<ContributorCountData>, String>),
+}
+
 /// `GetDefaultBranch` outcome. `NotFound` is an empty ref name.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DefaultBranchLookup {
@@ -605,7 +615,7 @@ pub struct GitPrefetch {
     /// `gitserver.GetDefaultBranch(repo, false)` results (M9.19a).
     pub default_branches: HashMap<i32, DefaultBranchLookup>,
     /// `gitserver.ContributorCount` results (M9.19a).
-    pub contributors: HashMap<ContributorsKey, Result<Vec<ContributorCountData>, String>>,
+    pub contributors: HashMap<ContributorsKey, ContributorLookup>,
     /// `symbol.DefaultZoektSymbolsClient()` injection point. `GitTreeEntry` /
     /// `GitCommit` `symbols` call the (synchronous) gRPC client here.
     pub symbols: Option<Arc<dyn crate::search_searcher_client::SymbolsClient + Send + Sync>>,
@@ -1167,7 +1177,9 @@ async fn prefetch_repository_inventory_d(
                 }
                 let lookup = match &after_date {
                     Some(value) if crate::search_commit_job::parse_git_date(value).is_none() => {
-                        Err("failed to parse after date: invalid date format".to_owned())
+                        ContributorLookup::InvalidDate(
+                            "failed to parse after date: invalid date format".to_owned(),
+                        )
                     }
                     _ => match source
                         .contributor_count(
@@ -1179,8 +1191,8 @@ async fn prefetch_repository_inventory_d(
                         )
                         .await
                     {
-                        Ok(counts) => Ok(counts),
-                        Err(error) => Err(error.message),
+                        Ok(counts) => ContributorLookup::Counts(Ok(counts)),
+                        Err(error) => ContributorLookup::Counts(Err(error.message)),
                     },
                 };
                 prefetch.contributors.insert(key, lookup);

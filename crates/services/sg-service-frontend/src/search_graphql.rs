@@ -2029,10 +2029,6 @@ impl GitRefObject {
         }
     }
 
-    pub(crate) fn name(&self) -> &str {
-        &self.name
-    }
-
     fn abbrev_name(&self) -> &str {
         let prefix = git_ref_prefix(&self.name);
         self.name.strip_prefix(prefix).unwrap_or(&self.name)
