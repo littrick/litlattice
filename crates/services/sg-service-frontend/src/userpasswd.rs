@@ -2505,8 +2505,9 @@ mod tests {
         assert!(hasher.verify(&hash, "correct horse battery staple"));
         assert!(!hasher.verify(&hash, "wrong"));
 
-        // A hash produced by Go's bcrypt.GenerateFromPassword(..., 10).
-        let go_hash = "$2a$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy";
+        // A hash produced by Go's bcrypt.GenerateFromPassword("password", 10)
+        // with golang.org/x/crypto/bcrypt (CompareHashAndPassword returns nil).
+        let go_hash = "$2a$10$slYWL.EqOUW822T7afMVb.fbCwZCjje2UfQM/oYFy.x52upXa8OGe";
         assert!(hasher.verify(go_hash, "password"));
     }
 
