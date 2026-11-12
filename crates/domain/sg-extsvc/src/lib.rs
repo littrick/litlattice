@@ -13,14 +13,20 @@
 //! in the baseline.
 
 pub mod auth;
+pub mod azuredevops;
+pub mod azuredevops_source;
 pub mod bitbucketcloud;
 pub mod bitbucketcloud_source;
 pub mod exclude;
+pub mod gerrit;
+pub mod gerrit_source;
 pub mod github;
 pub mod github_source;
 pub mod gitlab;
 pub mod gitlab_source;
 pub mod other;
+pub mod perforce;
+pub mod perforce_source;
 pub mod ratelimit;
 pub mod reposource;
 
@@ -35,6 +41,12 @@ pub const KIND_GITHUB: &str = "GITHUB";
 pub const KIND_GITLAB: &str = "GITLAB";
 /// `extsvc.KindBitbucketCloud`.
 pub const KIND_BITBUCKETCLOUD: &str = "BITBUCKETCLOUD";
+/// `extsvc.KindAzureDevOps`.
+pub const KIND_AZUREDEVOPS: &str = "AZUREDEVOPS";
+/// `extsvc.KindGerrit`.
+pub const KIND_GERRIT: &str = "GERRIT";
+/// `extsvc.KindPerforce`.
+pub const KIND_PERFORCE: &str = "PERFORCE";
 /// `extsvc.KindOther`.
 pub const KIND_OTHER: &str = "OTHER";
 /// `extsvc.TypeOther` (lowercase, stored in `repo.external_service_type`).
@@ -327,6 +339,24 @@ pub fn new_source(
             )
         })?;
         Ok(Box::new(gitlab_source::GitLabSource::new(service, doer)?))
+    } else if service.kind.eq_ignore_ascii_case(KIND_AZUREDEVOPS) {
+        let doer = doer.ok_or_else(|| {
+            format!(
+                "cannot create source for kind {:?}: no HTTP transport configured",
+                service.kind
+            )
+        })?;
+        Ok(Box::new(azuredevops_source::AzureDevOpsSource::new(
+            service, doer,
+        )?))
+    } else if service.kind.eq_ignore_ascii_case(KIND_GERRIT) {
+        let doer = doer.ok_or_else(|| {
+            format!(
+                "cannot create source for kind {:?}: no HTTP transport configured",
+                service.kind
+            )
+        })?;
+        Ok(Box::new(gerrit_source::GerritSource::new(service, doer)?))
     } else if service.kind.eq_ignore_ascii_case(KIND_BITBUCKETCLOUD) {
         let doer = doer.ok_or_else(|| {
             format!(
@@ -337,6 +367,11 @@ pub fn new_source(
         Ok(Box::new(bitbucketcloud_source::BitbucketCloudSource::new(
             service, doer,
         )?))
+    } else if service.kind.eq_ignore_ascii_case(KIND_PERFORCE) {
+        // Perforce needs the gitserver, not an HTTP transport. The Rust
+        // gitserver has no Perforce RPCs, so the source reports an explicit
+        // not-ported error when listing repos or checking the connection.
+        Ok(Box::new(perforce_source::PerforceSource::new(service)?))
     } else {
         Err(format!("cannot create source for kind {:?}", service.kind))
     }
