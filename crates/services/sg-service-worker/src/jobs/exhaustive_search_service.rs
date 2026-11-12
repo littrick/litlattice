@@ -30,11 +30,14 @@
 //! The Go service takes a concrete `*store.Store`; this port keeps the same
 //! operations behind the injected [`SearchJobStore`] trait. The production
 //! [`PgSearchJobStore`] forwards to `sg_db::exhaustive_search`, so the SQL and
-//! error strings stay in `sg-db`. Object storage is behind [`UploadStore`];
-//! the default [`NotPortedUploadStore`] fails with an explicit not-ported
-//! error because no real backend is in scope. The Go service reads the actor
-//! from `context.Context`; Rust has no such context, so [`ActorContext`]
-//! supplies it (mirroring the `UserContext` seam in
+//! error strings stay in `sg-db`. Object storage is behind [`UploadStore`].
+//! Production assembles it from the `SEARCH_JOBS_UPLOAD_*` configuration with
+//! [`Service::from_object_storage_config`] (the Go `search.NewObjectStorage` +
+//! `service.New` pair), which wraps the real S3/GCS client in
+//! [`LazyObjectStorage`]; tests inject a fake backend through
+//! [`ObjectStorageConnector`]. The Go service reads the actor from
+//! `context.Context`; Rust has no such context, so [`ActorContext`] supplies it
+//! (mirroring the `UserContext` seam in
 //! [`crate::jobs::exhaustive_search_searcher`]).
 //!
 //! Deviations:
@@ -260,30 +263,6 @@ pub trait UploadStore: Send + Sync {
     async fn list(&self, prefix: &str) -> Result<UploadList, String>;
 }
 
-const NOT_PORTED_UPLOAD_STORE: &str = "not ported: exhaustive search object storage";
-
-/// The default upload store until a real object-storage backend is wired.
-pub struct NotPortedUploadStore;
-
-#[async_trait]
-impl UploadStore for NotPortedUploadStore {
-    async fn get(&self, _key: &str) -> Result<Vec<u8>, String> {
-        Err(NOT_PORTED_UPLOAD_STORE.to_owned())
-    }
-
-    async fn upload(&self, _key: &str, _data: &[u8]) -> Result<i64, String> {
-        Err(NOT_PORTED_UPLOAD_STORE.to_owned())
-    }
-
-    async fn delete(&self, _key: &str) -> Result<(), String> {
-        Err(NOT_PORTED_UPLOAD_STORE.to_owned())
-    }
-
-    async fn list(&self, _prefix: &str) -> Result<UploadList, String> {
-        Err(NOT_PORTED_UPLOAD_STORE.to_owned())
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Service
 // ---------------------------------------------------------------------------
@@ -311,6 +290,48 @@ impl Service {
             new_searcher,
             actor_context,
         }
+    }
+
+    /// `service.New` + `search.NewObjectStorage` (`cmd/frontend/internal/
+    /// search/init.go:41-49`, `cmd/worker/internal/search/job.go:70-82`):
+    /// connect the configured object storage (S3/GCS/blobstore, lazily
+    /// initialised) and use it as the service's upload store. This is the
+    /// production default that replaces the former not-ported placeholder;
+    /// constructor errors match `object.create`.
+    pub async fn from_object_storage_config(
+        store: Arc<dyn SearchJobStore>,
+        config: sg_objectstorage::StorageConfig,
+        new_searcher: Arc<dyn NewSearcher>,
+        actor_context: Arc<dyn ActorContext>,
+    ) -> Result<Service, String> {
+        Service::from_object_storage_config_with_connector(
+            store,
+            config,
+            new_searcher,
+            actor_context,
+            &DefaultObjectStorageConnector,
+        )
+        .await
+    }
+
+    /// Testable half of [`Service::from_object_storage_config`]: the connector
+    /// decides how the backend is built (the production implementation calls
+    /// [`new_object_storage`]; harnesses inject an in-memory backend).
+    pub async fn from_object_storage_config_with_connector(
+        store: Arc<dyn SearchJobStore>,
+        config: sg_objectstorage::StorageConfig,
+        new_searcher: Arc<dyn NewSearcher>,
+        actor_context: Arc<dyn ActorContext>,
+        connector: &dyn ObjectStorageConnector,
+    ) -> Result<Service, String> {
+        let backend = connector.connect(config).await?;
+        let upload_store: Arc<dyn UploadStore> = Arc::new(ObjectStorageUploadStore::new(backend));
+        Ok(Service::new(
+            store,
+            upload_store,
+            new_searcher,
+            actor_context,
+        ))
     }
 
     fn actor(&self) -> Actor {
@@ -966,25 +987,72 @@ impl ObjectStorageBackend for sg_objectstorage::GcsStore {
     }
 }
 
-/// `object.NewFromConfig`: dispatch on `StorageConfig.Backend` to the S3 or GCS
-/// store, wrapped in [`LazyObjectStorage`] like the baseline.
+/// The concrete store `object.create` selects for a backend name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObjectStorageKind {
+    /// `s3` and `blobstore` both construct `object.s3Store`.
+    S3,
+    /// `gcs` constructs `object.gcsStore`.
+    Gcs,
+}
+
+/// `object.create`'s `storeConstructors` lookup (`internal/object/store.go:45,
+/// 64-72`), without constructing a client. The lookup uses the backend string
+/// **before** `normalizeConfig`; the config loaders lowercase it, so uppercase
+/// names are unknown on both sides.
+pub fn select_object_storage_kind(
+    config: &sg_objectstorage::StorageConfig,
+) -> Result<ObjectStorageKind, String> {
+    match config.backend.as_str() {
+        "gcs" => Ok(ObjectStorageKind::Gcs),
+        "s3" | "blobstore" => Ok(ObjectStorageKind::S3),
+        other => Err(format!("unknown upload store backend '{other}'")),
+    }
+}
+
+/// Builds an [`ObjectStorageBackend`] from a [`sg_objectstorage::StorageConfig`].
+///
+/// Production uses [`DefaultObjectStorageConnector`]; differential harnesses
+/// inject an in-memory backend so no S3/GCS client (and no network) is needed.
+#[async_trait]
+pub trait ObjectStorageConnector: Send + Sync {
+    async fn connect(
+        &self,
+        config: sg_objectstorage::StorageConfig,
+    ) -> Result<Arc<dyn ObjectStorageBackend>, String>;
+}
+
+/// The production connector: [`new_object_storage`] over the real S3/GCS
+/// implementations in `sg-objectstorage`.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct DefaultObjectStorageConnector;
+
+#[async_trait]
+impl ObjectStorageConnector for DefaultObjectStorageConnector {
+    async fn connect(
+        &self,
+        config: sg_objectstorage::StorageConfig,
+    ) -> Result<Arc<dyn ObjectStorageBackend>, String> {
+        new_object_storage(config).await
+    }
+}
+
+/// `object.CreateLazyStorage`: dispatch on `StorageConfig.Backend` to the S3 or
+/// GCS store, wrapped in [`LazyObjectStorage`] like the baseline.
 pub async fn new_object_storage(
     config: sg_objectstorage::StorageConfig,
 ) -> Result<Arc<dyn ObjectStorageBackend>, String> {
-    match config.backend.as_str() {
-        "gcs" => {
+    match select_object_storage_kind(&config)? {
+        ObjectStorageKind::Gcs => {
             let store = sg_objectstorage::GcsStore::new(config).map_err(|err| err.to_string())?;
             Ok(Arc::new(LazyObjectStorage::new(Arc::new(store))))
         }
-        "s3" | "blobstore" => {
+        ObjectStorageKind::S3 => {
             let store = sg_objectstorage::ObjectStore::new(config)
                 .await
                 .map_err(|err| err.to_string())?;
             Ok(Arc::new(LazyObjectStorage::new(Arc::new(store))))
         }
-        // `object.create`: the lookup is not normalized (config Load lowercases
-        // the backend) and uses the baseline's exact error text.
-        other => Err(format!("unknown upload store backend '{other}'")),
     }
 }
 
