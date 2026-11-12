@@ -34,14 +34,67 @@ pub struct PerforceConnectionDetails {
 
 /// `repos.composePerforceCloneURL`: `url.URL{Scheme:"perforce", Host:host,
 /// Path:depot}.String()`. Go prefixes a `/` when the host is non-empty and the
-/// path does not already start with one.
+/// path does not already start with one, and percent-encodes the host and path
+/// (`net/url`'s `encodeHost`/`encodePath`).
 pub fn compose_perforce_clone_url(host: &str, depot: &str) -> String {
     let path = if !depot.is_empty() && !depot.starts_with('/') {
         format!("/{depot}")
     } else {
         depot.to_owned()
     };
-    format!("perforce://{host}{path}")
+    format!(
+        "perforce://{}{}",
+        escape(host, Mode::Host),
+        escape(&path, Mode::Path)
+    )
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    Host,
+    Path,
+}
+
+/// `net/url.escape` with Go's uppercase hex digits.
+fn escape(value: &str, mode: Mode) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut out = String::with_capacity(value.len());
+    for &byte in value.as_bytes() {
+        if should_escape(byte, mode) {
+            out.push('%');
+            out.push(HEX[usize::from(byte >> 4)] as char);
+            out.push(HEX[usize::from(byte & 0xf)] as char);
+        } else {
+            // Every non-ASCII byte escapes, so the raw bytes here are ASCII.
+            out.push(byte as char);
+        }
+    }
+    out
+}
+
+/// `net/url.shouldEscape` for `encodeHost`/`encodePath`.
+fn should_escape(byte: u8, mode: Mode) -> bool {
+    if byte.is_ascii_alphanumeric() {
+        return false;
+    }
+    if mode == Mode::Host {
+        match byte {
+            b'!' | b'$' | b'&' | b'\'' | b'(' | b')' | b'*' | b'+' | b',' | b';' | b'='
+            | b':' => return false,
+            b'[' | b']' => return true,
+            _ => {}
+        }
+    }
+    match byte {
+        // URL marks and path-segment-friendly reserved characters.
+        b'-' | b'_' | b'.' | b'~' => false,
+        b'$' | b'&' | b'+' | b',' | b'/' | b':' | b';' | b'=' | b'?' | b'@' => {
+            // `encodePath` only escapes `?`; `encodeHost` escapes all of these
+            // except the ones handled above.
+            mode == Mode::Path && byte == b'?'
+        }
+        _ => true,
+    }
 }
 
 /// The gitserver RPC boundary the Perforce source needs. Implementations are
@@ -81,6 +134,19 @@ mod tests {
         assert_eq!(
             compose_perforce_clone_url("host:1666", ""),
             "perforce://host:1666"
+        );
+        // `URL.String` percent-encodes the path like Go's `encodePath`.
+        assert_eq!(
+            compose_perforce_clone_url("host:1666", "//Depot With Space/Sub"),
+            "perforce://host:1666//Depot%20With%20Space/Sub"
+        );
+        assert_eq!(
+            compose_perforce_clone_url("host:1666", "//A?B#C/"),
+            "perforce://host:1666//A%3FB%23C/"
+        );
+        assert_eq!(
+            compose_perforce_clone_url("host:1666", "//café/"),
+            "perforce://host:1666//caf%C3%A9/"
         );
     }
 

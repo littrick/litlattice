@@ -357,10 +357,17 @@ pub trait Source: Send + Sync {
 }
 
 /// `repos.NewSource` for the kinds implemented so far.
+///
+/// `perforce` and `gitolite` are the gitserver RPC boundaries those sources
+/// need. Production repo-updater supplies a gRPC-backed client for both;
+/// without one, Perforce reports the explicit not-ported error and Gitolite
+/// falls back to running `ssh <host> info` in-process.
 pub fn new_source(
     service: SourceService,
     http: Option<std::sync::Arc<dyn HttpGetter>>,
     doer: Option<std::sync::Arc<dyn HttpDoer>>,
+    perforce: Option<std::sync::Arc<dyn perforce::PerforceGitserver>>,
+    gitolite: Option<std::sync::Arc<dyn gitolite::GitoliteRepoLister>>,
 ) -> Result<Box<dyn Source>, String> {
     if service.kind.eq_ignore_ascii_case(KIND_OTHER) {
         Ok(Box::new(other::OtherSource::new(service, http)?))
@@ -429,11 +436,14 @@ pub fn new_source(
             service, doer,
         )?))
     } else if service.kind.eq_ignore_ascii_case(KIND_GITOLITE) {
-        // Discovery shells out to `ssh <host> info` through the command seam;
-        // production uses the default SSH runner.
+        // Production reaches gitserver's `ListGitolite`; without a client
+        // (tests) fall back to the in-process `ssh <host> info` runner.
+        let lister: std::sync::Arc<dyn gitolite::GitoliteRepoLister> = match gitolite {
+            Some(lister) => lister,
+            None => std::sync::Arc::new(gitolite::SshGitoliteCommand),
+        };
         Ok(Box::new(gitolite_source::GitoliteSource::new(
-            service,
-            std::sync::Arc::new(gitolite::SshGitoliteCommand),
+            service, lister,
         )?))
     } else if service.kind.eq_ignore_ascii_case(KIND_PAGURE) {
         let doer = doer.ok_or_else(|| {
@@ -504,10 +514,16 @@ pub fn new_source(
         // uses coursier from the commented-out `Get`.
         Ok(Box::new(packages::PackagesSource::new_jvm(service)?))
     } else if service.kind.eq_ignore_ascii_case(KIND_PERFORCE) {
-        // Perforce needs the gitserver, not an HTTP transport. The Rust
-        // gitserver has no Perforce RPCs, so the source reports an explicit
-        // not-ported error when listing repos or checking the connection.
-        Ok(Box::new(perforce_source::PerforceSource::new(service)?))
+        // Perforce needs the gitserver, not an HTTP transport. Production
+        // injects a gRPC client; without one (tests) the source reports the
+        // explicit not-ported error when listing repos or checking.
+        let source = match perforce {
+            Some(gitserver) => {
+                perforce_source::PerforceSource::new_with_gitserver(service, gitserver)?
+            }
+            None => perforce_source::PerforceSource::new(service)?,
+        };
+        Ok(Box::new(source))
     } else {
         Err(format!("cannot create source for kind {:?}", service.kind))
     }

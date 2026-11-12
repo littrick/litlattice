@@ -2,10 +2,11 @@
 
 //! `internal/repos/gitolite.go`: the repo-updater Gitolite source.
 //!
-//! Discovery happens through an injectable [`GitoliteCommand`] seam instead of
-//! the baseline's gitserver RPC (`gitserver.Client.ListGitoliteRepos`), which
-//! shells out to `ssh` inside gitserver. The production seam runs the same
-//! `ssh <host> info` command from repo-updater; tests inject fixed output.
+//! Discovery goes through [`GitoliteRepoLister`], mirroring the baseline's
+//! `gitserver.Client.ListGitoliteRepos` (gitserver owns the SSH keys).
+//! Production repo-updater injects a gRPC client; tests inject fixed
+//! repository lists, and [`crate::gitolite::SshGitoliteCommand`] remains as
+//! the offline fallback.
 
 use std::sync::Arc;
 
@@ -13,7 +14,7 @@ use async_trait::async_trait;
 use serde::Deserialize;
 
 use crate::exclude::{ExcludeRule, Excluder};
-use crate::gitolite::{decode_repos, external_repo_spec, service_id, GitoliteCommand};
+use crate::gitolite::{external_repo_spec, service_id, GitoliteRepoLister};
 use crate::reposource::gitolite_repo_name;
 use crate::{Repo, Source, SourceInfo, SourceResult, SourceService};
 
@@ -42,15 +43,15 @@ pub struct GitoliteSource {
     service: SourceService,
     conn: GitoliteConnection,
     excluder: Excluder,
-    command: Arc<dyn GitoliteCommand>,
+    lister: Arc<dyn GitoliteRepoLister>,
 }
 
 impl GitoliteSource {
-    /// `repos.NewGitoliteSource` with the gitserver client replaced by the
-    /// injectable command seam.
+    /// `repos.NewGitoliteSource`: `lister` is the gitserver boundary
+    /// (`gitserver.Client.ListGitoliteRepos`).
     pub fn new(
         service: SourceService,
-        command: Arc<dyn GitoliteCommand>,
+        lister: Arc<dyn GitoliteRepoLister>,
     ) -> Result<Self, String> {
         let decoded = sg_config::strip_jsonc(&service.config);
         let conn: GitoliteConnection = serde_json::from_str(&decoded)
@@ -70,7 +71,7 @@ impl GitoliteSource {
             service,
             conn,
             excluder,
-            command,
+            lister,
         })
     }
 
@@ -123,13 +124,13 @@ impl GitoliteSource {
 #[async_trait]
 impl Source for GitoliteSource {
     async fn list_repos(&self) -> Vec<SourceResult> {
-        let info = match self.command.list_repos(&self.conn.host).await {
-            Ok(info) => info,
+        let repos = match self.lister.list_repos(&self.conn.host).await {
+            Ok(repos) => repos,
             Err(err) => return vec![SourceResult::error(err)],
         };
 
         let mut results = Vec::new();
-        for repo in decode_repos(&self.conn.host, &info) {
+        for repo in repos {
             let mapped = self.make_repo(&repo);
             if !self.excludes(&repo, &mapped.name) {
                 results.push(SourceResult::repo(mapped));
@@ -155,12 +156,12 @@ mod tests {
     use crate::ExternalRepoSpec;
 
     struct FakeCommand {
-        output: Result<String, String>,
+        output: Result<Vec<GitoliteRepo>, String>,
     }
 
     #[async_trait]
-    impl GitoliteCommand for FakeCommand {
-        async fn list_repos(&self, _host: &str) -> Result<String, String> {
+    impl GitoliteRepoLister for FakeCommand {
+        async fn list_repos(&self, _host: &str) -> Result<Vec<GitoliteRepo>, String> {
             self.output.clone()
         }
     }
@@ -184,7 +185,16 @@ mod tests {
             "exclude": [{"name": "secret"}]
         }));
         let command = Arc::new(FakeCommand {
-            output: Ok("R W secret\nR W public\n".to_owned()),
+            output: Ok(vec![
+                GitoliteRepo {
+                    name: "secret".to_owned(),
+                    url: "git@gitolite.example.com:secret".to_owned(),
+                },
+                GitoliteRepo {
+                    name: "public".to_owned(),
+                    url: "git@gitolite.example.com:public".to_owned(),
+                },
+            ]),
         });
         let source = GitoliteSource::new(svc, command).unwrap();
         let results = source.list_repos().await;
@@ -217,7 +227,7 @@ mod tests {
             "host": "ssh://git@host:2222/",
             "prefix": "host/"
         }));
-        let source = GitoliteSource::new(svc, Arc::new(FakeCommand { output: Ok(String::new()) }))
+        let source = GitoliteSource::new(svc, Arc::new(FakeCommand { output: Ok(Vec::new()) }))
             .unwrap();
         let repo = source.make_repo(&GitoliteRepo {
             name: "team/repo@x".to_owned(),
@@ -230,7 +240,7 @@ mod tests {
     #[test]
     fn excludes_invalid_characters() {
         let svc = service(serde_json::json!({"host": "git@host"}));
-        let source = GitoliteSource::new(svc, Arc::new(FakeCommand { output: Ok(String::new()) }))
+        let source = GitoliteSource::new(svc, Arc::new(FakeCommand { output: Ok(Vec::new()) }))
             .unwrap();
         assert!(source.excludes(
             &GitoliteRepo {
@@ -254,7 +264,7 @@ mod tests {
             "prefix": "host/",
             "exclude": [{"name": "secret"}]
         }));
-        let source = GitoliteSource::new(svc, Arc::new(FakeCommand { output: Ok(String::new()) }))
+        let source = GitoliteSource::new(svc, Arc::new(FakeCommand { output: Ok(Vec::new()) }))
             .unwrap();
         assert!(source.excludes(
             &GitoliteRepo {
