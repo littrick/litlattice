@@ -19,7 +19,7 @@ use regex::Regex;
 use serde::Deserialize;
 use url::Url;
 
-use crate::auth::{Authenticator, BasicAuth, OAuthBearerToken};
+use crate::auth::{Authenticator, BasicAuth, OAuthBearerToken, OAuthClient};
 use crate::bitbucketserver::{BitbucketError, Client, PageToken, Repo, TYPE_BITBUCKETSERVER};
 use crate::github::normalize_base_url;
 use crate::reposource::bitbucket_server_repo_name;
@@ -152,8 +152,13 @@ pub struct BitbucketServerSource {
 }
 
 impl BitbucketServerSource {
-    /// `repos.NewBitbucketServerSource` with the transport injected. OAuth 1
-    /// signing is not ported, so such configs fail here.
+    /// `repos.NewBitbucketServerSource` with the transport injected.
+    ///
+    /// Mirrors `bitbucketserver.NewClient`'s authentication selection: OAuth 2
+    /// (or no authorization block) uses a bearer token when configured and
+    /// basic auth otherwise; a non-OAuth-2 authorization block with an
+    /// `oauth` object uses OAuth 1 RSA-SHA1 signing, and with neither leaves
+    /// the client unauthenticated.
     pub fn new(service: SourceService, doer: Arc<dyn HttpDoer>) -> Result<Self, String> {
         let decoded = sg_config::strip_jsonc(&service.config);
         let config: BitbucketServerConnection = serde_json::from_str(&decoded)
@@ -162,32 +167,35 @@ impl BitbucketServerSource {
         let raw_url = Url::parse(&config.url).map_err(|err| err.to_string())?;
         let host = normalize_base_url(&raw_url);
 
-        let auth: Arc<dyn Authenticator> = match &config.authorization {
-            Some(authorization) if !authorization.oauth2 => {
-                if authorization.oauth.is_some() {
-                    return Err(
-                        "bitbucketserver: OAuth 1 authentication is not ported".to_owned()
-                    );
+        let auth: Option<Arc<dyn Authenticator>> = match &config.authorization {
+            Some(authorization) if !authorization.oauth2 => match &authorization.oauth {
+                Some(oauth) => {
+                    let client = OAuthClient::new_rsa_sha1(
+                        oauth.consumer_key.clone(),
+                        &oauth.signing_key,
+                    )
+                    .map_err(|err| format!("authorization.oauth.signingKey: {err}"))?;
+                    Some(Arc::new(client))
                 }
-                return Err("bitbucketserver: no authentication method configured".to_owned());
-            }
+                None => None,
+            },
             _ => {
                 if !config.token.is_empty() {
-                    Arc::new(OAuthBearerToken {
+                    Some(Arc::new(OAuthBearerToken {
                         token: config.token.clone(),
                         ..OAuthBearerToken::default()
-                    })
+                    }))
                 } else {
-                    Arc::new(BasicAuth {
+                    Some(Arc::new(BasicAuth {
                         username: config.username.clone(),
                         password: config.password.clone(),
-                    })
+                    }))
                 }
             }
         };
 
         let excluder = Excluder::new(&config.exclude)?;
-        let client = Client::new(&config.url, Some(auth), doer)?;
+        let client = Client::new(&config.url, auth, doer)?;
 
         Ok(Self {
             service,
@@ -654,7 +662,9 @@ mod tests {
     }
 
     #[test]
-    fn oauth1_configs_are_rejected() {
+    fn oauth1_configs_validate_the_signing_key() {
+        // `SetOAuth` base64-decodes the signing key and parses a PKCS#1 PEM;
+        // an invalid value fails at construction with the baseline's wrap.
         let err = BitbucketServerSource::new(
             service(serde_json::json!({
                 "url": "https://bitbucket.example.com",
@@ -666,6 +676,6 @@ mod tests {
         )
         .err()
         .expect("oauth1 rejected");
-        assert_eq!(err, "bitbucketserver: OAuth 1 authentication is not ported");
+        assert!(err.starts_with("authorization.oauth.signingKey"), "{err}");
     }
 }

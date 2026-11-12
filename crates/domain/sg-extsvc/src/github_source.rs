@@ -23,7 +23,10 @@ use time::format_description::well_known::Rfc3339;
 use time::{Date, OffsetDateTime, PrimitiveDateTime, Time};
 use url::Url;
 
-use crate::auth::{Authenticator, OAuthBearerToken};
+use crate::auth::{
+    Authenticator, GitHubAppAuthenticator, GitHubAppStore, InstallationAuthenticator,
+    OAuthBearerToken,
+};
 use crate::github::{
     api_root, canonicalized_url, is_not_found, normalize_base_url, repository_metadata,
     split_repository_name_with_owner, GithubError, Repository, SearchReposParams, V3Client,
@@ -358,27 +361,30 @@ impl RepoResult {
 }
 
 impl GitHubSource {
-    /// `repos.NewGitHubSource` given the already-decrypted configuration.
-    pub fn new(service: SourceService, doer: Arc<dyn HttpDoer>) -> Result<Self, String> {
+    fn parse_config(service: &SourceService) -> Result<GitHubConnection, String> {
         let decoded = sg_config::strip_jsonc(&service.config);
-        let config: GitHubConnection = serde_json::from_str(&decoded)
-            .map_err(|err| format!("external service id={} config error: {err}", service.id))?;
-        if config.git_hub_app_details.is_some() {
-            return Err(
-                "GitHub App authentication is not ported (gitHubAppDetails is unsupported)"
-                    .to_owned(),
-            );
-        }
+        serde_json::from_str(&decoded)
+            .map_err(|err| format!("external service id={} config error: {err}", service.id))
+    }
 
+    fn build(
+        service: SourceService,
+        config: GitHubConnection,
+        doer: Arc<dyn HttpDoer>,
+        auth: Option<Arc<dyn Authenticator>>,
+    ) -> Result<Self, String> {
         let base_url = Url::parse(&config.url).map_err(|err| err.to_string())?;
         let base_url = normalize_base_url(&base_url);
         let original_hostname = base_url.host_str().unwrap_or_default().to_owned();
         let (api_url, github_dot_com) = api_root(&base_url);
 
-        let auth: Arc<dyn Authenticator> = Arc::new(OAuthBearerToken {
-            token: config.token.clone(),
-            ..OAuthBearerToken::default()
-        });
+        let auth: Arc<dyn Authenticator> = match auth {
+            Some(auth) => auth,
+            None => Arc::new(OAuthBearerToken {
+                token: config.token.clone(),
+                ..OAuthBearerToken::default()
+            }),
+        };
 
         let excluder = GitHubExcluder::new(&config.exclude)?;
         let mark_internal_repos_as_public = config
@@ -404,6 +410,60 @@ impl GitHubSource {
             v4,
             mark_internal_repos_as_public,
         })
+    }
+
+    /// `repos.NewGitHubSource` given the already-decrypted configuration.
+    ///
+    /// `gitHubAppDetails` needs a [`GitHubAppStore`] to resolve the App's
+    /// private key, so it is rejected here; use [`Self::new_with_github_apps`]
+    /// with a store to enable GitHub App authentication.
+    pub fn new(service: SourceService, doer: Arc<dyn HttpDoer>) -> Result<Self, String> {
+        let config = Self::parse_config(&service)?;
+        if config.git_hub_app_details.is_some() {
+            return Err(
+                "GitHub App authentication requires a GitHub App store (gitHubAppDetails is unsupported here)"
+                    .to_owned(),
+            );
+        }
+        Self::build(service, config, doer, None)
+    }
+
+    /// [`Self::new`] with the `GitHubAppsStore` boundary
+    /// (`internal/extsvc/github/auth.FromConnection`). When the connection
+    /// carries `gitHubAppDetails`, the App credentials are resolved and an
+    /// installation access token is fetched before the source is built; a
+    /// non-App connection is identical to [`Self::new`].
+    pub async fn new_with_github_apps(
+        service: SourceService,
+        doer: Arc<dyn HttpDoer>,
+        apps: Option<Arc<dyn GitHubAppStore>>,
+    ) -> Result<Self, String> {
+        let config = Self::parse_config(&service)?;
+        let auth: Option<Arc<dyn Authenticator>> = match &config.git_hub_app_details {
+            None => None,
+            Some(details) => {
+                let store = apps.ok_or_else(|| {
+                    "GitHub App authentication requires a GitHub App store (gitHubAppDetails is unsupported here)"
+                        .to_owned()
+                })?;
+                let credentials = store.get_by_app_id(details.app_id, &config.url).await?;
+                let app = Arc::new(GitHubAppAuthenticator::new(
+                    credentials.app_id,
+                    credentials.private_key,
+                )?);
+                let base_url = Url::parse(&config.url).map_err(|err| err.to_string())?;
+                let mut installation = InstallationAuthenticator::new(
+                    base_url,
+                    details.installation_id,
+                    app,
+                    None,
+                    Arc::clone(&doer),
+                );
+                installation.refresh().await?;
+                Some(Arc::new(installation))
+            }
+        };
+        Self::build(service, config, doer, auth)
     }
 
     /// `GitHubSource.ExternalServices`.

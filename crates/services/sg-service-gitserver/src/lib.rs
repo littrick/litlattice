@@ -212,12 +212,16 @@ impl Service for GitserverService {
         });
         // `Server.IsRepoCloneable` needs the same remote URL lookup plus the
         // repository store for `NewVCSSyncer`'s type dispatch.
-        let cloneable = Arc::new(cloneable::CloneableService::new(
-            config.repos_dir.clone(),
-            repo_store,
-            Arc::clone(&remote_urls) as Arc<dyn update::RemoteUrlSource>,
-            Arc::clone(&live),
-        ));
+        let perforce = Arc::new(perforce::PerforceService::new(config.repos_dir.clone()));
+        let cloneable = Arc::new(
+            cloneable::CloneableService::new(
+                config.repos_dir.clone(),
+                repo_store,
+                Arc::clone(&remote_urls) as Arc<dyn update::RemoteUrlSource>,
+                Arc::clone(&live),
+            )
+            .with_perforce(Arc::clone(&perforce)),
+        );
         // `Server.CreateCommitFromPatch`: the batch-changes write path.
         let patch = Arc::new(patch::PatchService::new(
             config.repos_dir.clone(),
@@ -257,9 +261,7 @@ impl Service for GitserverService {
             fetch: Some(Arc::clone(&fetch)),
             cloneable: Some(cloneable),
             patch: Some(patch),
-            perforce: Some(Arc::new(perforce::PerforceService::new(
-                config.repos_dir.clone(),
-            ))),
+            perforce: Some(Arc::clone(&perforce)),
             // `defaultGitolite`: production runs `ssh <host> info` itself.
             gitolite: Arc::new(gitolite::GitoliteFetcher::with_default_command()),
         };

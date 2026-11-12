@@ -361,13 +361,16 @@ pub trait Source: Send + Sync {
 /// `perforce` and `gitolite` are the gitserver RPC boundaries those sources
 /// need. Production repo-updater supplies a gRPC-backed client for both;
 /// without one, Perforce reports the explicit not-ported error and Gitolite
-/// falls back to running `ssh <host> info` in-process.
-pub fn new_source(
+/// falls back to running `ssh <host> info` in-process. `github_apps` resolves
+/// `gitHubAppDetails` to an installation token; without it such GitHub
+/// connections are rejected by [`github_source::GitHubSource::new`].
+pub async fn new_source(
     service: SourceService,
     http: Option<std::sync::Arc<dyn HttpGetter>>,
     doer: Option<std::sync::Arc<dyn HttpDoer>>,
     perforce: Option<std::sync::Arc<dyn perforce::PerforceGitserver>>,
     gitolite: Option<std::sync::Arc<dyn gitolite::GitoliteRepoLister>>,
+    github_apps: Option<std::sync::Arc<dyn auth::GitHubAppStore>>,
 ) -> Result<Box<dyn Source>, String> {
     if service.kind.eq_ignore_ascii_case(KIND_OTHER) {
         Ok(Box::new(other::OtherSource::new(service, http)?))
@@ -378,7 +381,9 @@ pub fn new_source(
                 service.kind
             )
         })?;
-        Ok(Box::new(github_source::GitHubSource::new(service, doer)?))
+        Ok(Box::new(
+            github_source::GitHubSource::new_with_github_apps(service, doer, github_apps).await?,
+        ))
     } else if service.kind.eq_ignore_ascii_case(KIND_GITLAB) {
         let doer = doer.ok_or_else(|| {
             format!(
