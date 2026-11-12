@@ -95,6 +95,10 @@ pub struct PgVerifyEmailDb {
     actor: Actor,
     permissions_bind_id: String,
     security_event_logs_in_database: bool,
+    /// Live site configuration (`conf.Get()`); when set, both values above are
+    /// derived per call so configuration updates take effect without a
+    /// restart.
+    live: Option<std::sync::Arc<sg_config::LiveConfig>>,
 }
 
 impl PgVerifyEmailDb {
@@ -104,11 +108,13 @@ impl PgVerifyEmailDb {
             actor,
             permissions_bind_id: "email".to_owned(),
             security_event_logs_in_database: false,
+            live: None,
         }
     }
 
     pub fn with_permissions_bind_id(mut self, bind_id: impl Into<String>) -> Self {
         self.permissions_bind_id = bind_id.into();
+        self.live = None;
         self
     }
 
@@ -118,12 +124,39 @@ impl PgVerifyEmailDb {
         self.permissions_bind_id = crate::userpasswd::permissions_user_mapping_bind_id(site);
         self.security_event_logs_in_database =
             sg_db::security_event_logs::security_event_logs_in_database(site.raw());
+        self.live = None;
+        self
+    }
+
+    /// Read the bind id and `security_event_logs` destination from the live
+    /// configuration (`conf.Get()`) on every call.
+    pub fn with_live_configuration(mut self, live: std::sync::Arc<sg_config::LiveConfig>) -> Self {
+        self.live = Some(live);
         self
     }
 
     pub fn with_security_event_logs_in_database(mut self, enabled: bool) -> Self {
         self.security_event_logs_in_database = enabled;
+        self.live = None;
         self
+    }
+
+    fn current_permissions_bind_id(&self) -> String {
+        match &self.live {
+            Some(live) => {
+                crate::userpasswd::permissions_user_mapping_bind_id(&live.current().site)
+            }
+            None => self.permissions_bind_id.clone(),
+        }
+    }
+
+    fn current_security_event_logs_in_database(&self) -> bool {
+        match &self.live {
+            Some(live) => sg_db::security_event_logs::security_event_logs_in_database(
+                live.current().site.raw(),
+            ),
+            None => self.security_event_logs_in_database,
+        }
     }
 }
 
@@ -261,7 +294,7 @@ impl VerifyEmailDb for PgVerifyEmailDb {
     ) -> Result<(), String> {
         // `SecurityEventLogs().InsertList` returns without writing unless the
         // configured location includes the database (`database`/`all`).
-        if !self.security_event_logs_in_database {
+        if !self.current_security_event_logs_in_database() {
             return Ok(());
         }
         sg_db::security_event_logs::insert_security_event(
@@ -283,10 +316,11 @@ impl VerifyEmailDb for PgVerifyEmailDb {
     }
 
     async fn grant_pending_permissions(&self, user_id: i32) -> Result<(), String> {
+        let bind_id = self.current_permissions_bind_id();
         sg_db::authz::grant_pending_permissions(
             &self.pool,
             user_id,
-            &self.permissions_bind_id,
+            &bind_id,
             sqlx::types::time::OffsetDateTime::now_utc(),
         )
         .await

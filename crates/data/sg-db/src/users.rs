@@ -28,6 +28,9 @@ use crate::telemetry_events::{bulk_insert_event_logs, bulk_insert_event_logs_on,
 /// `auth.SourcegraphOperatorProviderType`.
 pub const SOURCEGRAPH_OPERATOR_PROVIDER_TYPE: &str = "sourcegraph-operator";
 
+/// `types.UserSystemRole`.
+pub const USER_ROLE: &str = "USER";
+
 /// `types.SiteAdministratorSystemRole`.
 pub const SITE_ADMINISTRATOR_ROLE: &str = "SITE_ADMINISTRATOR";
 
@@ -1053,9 +1056,71 @@ impl CreateUserError {
     }
 }
 
+/// `userRoleStore.BulkAssignSystemRolesToUser`
+/// (`internal/database/user_roles.go:219-252`): one multi-row
+/// `INSERT INTO user_roles ... ON CONFLICT DO NOTHING` statement resolving the
+/// role id by name. Already-assigned roles are silently skipped.
+pub async fn bulk_assign_system_roles_to_user<'e, E>(
+    executor: E,
+    user_id: i32,
+    roles: &[&str],
+) -> Result<(), sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
+    // Baseline validation (`internal/database/user_roles.go:220-226`).
+    if user_id == 0 {
+        return Err(sqlx::Error::Protocol("user id is required".to_owned()));
+    }
+    if roles.is_empty() {
+        return Err(sqlx::Error::Protocol("roles are required".to_owned()));
+    }
+
+    // One `(uid, (SELECT id FROM roles WHERE name = $n))` tuple per role, all
+    // bound ($1 is the shared user id). Already-assigned roles are skipped by
+    // `ON CONFLICT DO NOTHING`.
+    let tuples: Vec<String> = (0..roles.len())
+        .map(|index| format!("($1, (SELECT id FROM roles WHERE name = ${}))", index + 2))
+        .collect();
+    let sql = format!(
+        "INSERT INTO user_roles (user_id, role_id) VALUES {} ON CONFLICT DO NOTHING",
+        tuples.join(", ")
+    );
+    let mut query = sqlx::query(&sql).bind(user_id);
+    for role in roles {
+        query = query.bind(*role);
+    }
+    query.execute(executor).await?;
+    Ok(())
+}
+
+/// The roles `CreateInTransaction` assigns to a new user
+/// (`internal/database/users.go:432-447`): `USER` for everyone,
+/// `SITE_ADMINISTRATOR` additionally for a site admin. Must run in the same
+/// transaction as the user insert.
+pub async fn assign_new_user_system_roles<'e, E>(
+    executor: E,
+    user_id: i32,
+    site_admin: bool,
+) -> Result<(), sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
+    if site_admin {
+        bulk_assign_system_roles_to_user(
+            executor,
+            user_id,
+            &[USER_ROLE, SITE_ADMINISTRATOR_ROLE],
+        )
+        .await
+    } else {
+        bulk_assign_system_roles_to_user(executor, user_id, &[USER_ROLE]).await
+    }
+}
+
 /// `userStore.CreateWithExternalAccount` for the OAuth login path: inside one
-/// transaction it inserts the `users`, `names`, `user_emails` and
-/// `user_external_accounts` rows.
+/// transaction it inserts the `users`, `names`, `user_emails`,
+/// `user_roles` and `user_external_accounts` rows.
 ///
 /// The initial-site-admin calculation from `CreateInTransaction` is not
 /// reproduced (OAuth signups never create the initial site admin); the
@@ -1074,7 +1139,7 @@ pub async fn create_with_external_account_for_auth(
         r#"
 INSERT INTO users (username, display_name, avatar_url, created_at, updated_at, invalidated_sessions_at, tos_accepted, site_admin)
 VALUES ($1, $2, $3, now(), now(), now(), false, false)
-RETURNING id
+RETURNING id, site_admin
 "#,
     )
     .bind(new_user.username)
@@ -1082,8 +1147,8 @@ RETURNING id
     .bind(avatar_url)
     .fetch_one(&mut *tx)
     .await;
-    let id: i32 = match row {
-        Ok(row) => row.get("id"),
+    let (id, site_admin): (i32, bool) = match row {
+        Ok(row) => (row.get("id"), row.get("site_admin")),
         Err(err) => {
             let username_exists = err
                 .as_database_error()
@@ -1155,6 +1220,13 @@ RETURNING id
             });
         }
     }
+
+    // Assign the system roles in the same transaction as the user insert
+    // (`internal/database/users.go:432-447`); a user without a role would be a
+    // "zombie" visible to the permission checker.
+    assign_new_user_system_roles(&mut *tx, id, site_admin)
+        .await
+        .map_err(CreateUserError::other)?;
 
     sqlx::query(
         r#"
