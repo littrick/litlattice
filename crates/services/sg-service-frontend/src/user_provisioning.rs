@@ -193,6 +193,11 @@ pub trait ProvisionStore: Send + Sync {
         user_id: i32,
         identity: &ExternalIdentity<'_>,
     ) -> Result<(), String>;
+
+    /// `db.Authz().GrantPendingPermissions(ctx, {UserID, Perm: authz.Read,
+    /// Type: authz.PermRepos})` (`internal/database/authz.go:98`). Callers log
+    /// and ignore failures (`cmd/frontend/auth/user.go:184,389`).
+    async fn grant_pending_permissions(&self, user_id: i32) -> Result<(), String>;
 }
 
 /// Injected dependencies of [`get_or_create_user`].
@@ -604,6 +609,9 @@ pub async fn get_or_create_user(
                     .upsert_external_account(user_id, identity)
                     .await
                     .map_err(|message| ProvisionError::new(SAFE_LINK_EXTERNAL_ACCOUNT, message))?;
+                // `db.Authz().GrantPendingPermissions`, best-effort
+                // (`cmd/frontend/auth/user.go:389-400`).
+                let _ = deps.store.grant_pending_permissions(user_id).await;
                 return Ok(ProvisionOutcome::Existing { user_id });
             }
             Ok(None) => {
@@ -648,7 +656,13 @@ pub async fn get_or_create_user(
     };
 
     match created {
-        Ok(user_id) => Ok(ProvisionOutcome::Created { user_id }),
+        Ok(user_id) => {
+            // `db.Authz().GrantPendingPermissions`, best-effort after the
+            // permission-sync scheduling in the baseline
+            // (`cmd/frontend/auth/user.go:184-194`).
+            let _ = deps.store.grant_pending_permissions(user_id).await;
+            Ok(ProvisionOutcome::Created { user_id })
+        }
         Err(CreateUserStoreError::UsernameExists) => Err(ProvisionError::new(
             format!(
                 "Username {:?} already exists, but no verified email matched {:?}",
@@ -715,11 +729,45 @@ async fn update_profile(
 /// Production [`ProvisionStore`] over `sg-db`.
 pub struct PgProvisionStore {
     pool: PgPool,
+    /// `conf.PermissionsUserMapping().BindID`, normalized
+    /// (`userpasswd.rs:141-153`).
+    permissions_bind_id: String,
+    /// `log.securityEventLog.location` is `database`/`all`.
+    security_event_logs_in_database: bool,
 }
 
 impl PgProvisionStore {
     pub fn new(pool: PgPool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            permissions_bind_id: "email".to_owned(),
+            security_event_logs_in_database: false,
+        }
+    }
+
+    /// Set the normalized `permissions.userMapping.bindID`.
+    pub fn with_permissions_bind_id(mut self, bind_id: impl Into<String>) -> Self {
+        let bind_id = bind_id.into();
+        self.permissions_bind_id = match bind_id.as_str() {
+            "email" | "username" => bind_id,
+            _ => "email".to_owned(),
+        };
+        self
+    }
+
+    /// Derive the bind id and `security_event_logs` destination from site
+    /// configuration (`conf.PermissionsUserMapping`, `log.securityEventLog`).
+    pub fn with_site_configuration(mut self, site: &sg_config::SiteConfiguration) -> Self {
+        self.permissions_bind_id = crate::userpasswd::permissions_user_mapping_bind_id(site);
+        self.security_event_logs_in_database =
+            sg_db::security_event_logs::security_event_logs_in_database(site.raw());
+        self
+    }
+
+    /// Set whether `security_event_logs` is a destination.
+    pub fn with_security_event_logs_in_database(mut self, enabled: bool) -> Self {
+        self.security_event_logs_in_database = enabled;
+        self
     }
 }
 
@@ -799,7 +847,7 @@ impl ProvisionStore for PgProvisionStore {
             email: new_user.email,
             email_is_verified: new_user.email_is_verified,
         };
-        users_db::create_with_external_account_for_auth(&self.pool, &user, &spec)
+        let user_id = users_db::create_with_external_account_for_auth(&self.pool, &user, &spec)
             .await
             .map_err(|err| {
                 if err.username_exists {
@@ -809,7 +857,31 @@ impl ProvisionStore for PgProvisionStore {
                 } else {
                     CreateUserStoreError::Other(err.message)
                 }
-            })
+            })?;
+
+        // `logAccountCreatedEvent(ctx, ..., createdUser, acct.ServiceType)`
+        // (`internal/database/users.go:276-286`). The OAuth signup context
+        // carries the provider actor with `UID == 0` (`auth/user.go:150-170`).
+        // Go logs and ignores failures.
+        let ctx = sg_db::users::DeletionEventContext {
+            actor: sg_db::users::BackendActor {
+                uid: 0,
+                sourcegraph_operator: false,
+            },
+            version: sg_metrics::VERSION,
+            now: sqlx::types::time::OffsetDateTime::now_utc(),
+            security_event_logs_in_database: self.security_event_logs_in_database,
+        };
+        let _ = sg_db::users::log_account_created_event(
+            &self.pool,
+            user_id,
+            false,
+            identity.service_type,
+            &ctx,
+        )
+        .await;
+
+        Ok(user_id)
     }
 
     async fn upsert_external_account(
@@ -826,5 +898,16 @@ impl ProvisionStore for PgProvisionStore {
         sg_db::user_external_accounts::upsert_for_auth(&self.pool, user_id, &spec)
             .await
             .map_err(|err: DbError| err.message)
+    }
+
+    async fn grant_pending_permissions(&self, user_id: i32) -> Result<(), String> {
+        sg_db::authz::grant_pending_permissions(
+            &self.pool,
+            user_id,
+            &self.permissions_bind_id,
+            sqlx::types::time::OffsetDateTime::now_utc(),
+        )
+        .await
+        .map_err(|err| err.to_string())
     }
 }

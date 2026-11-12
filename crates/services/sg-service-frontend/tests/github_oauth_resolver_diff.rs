@@ -422,6 +422,11 @@ impl ProvisionStore for InMemoryStore {
             .push(Self::ext_write(identity, user_id, "upsert"));
         Ok(())
     }
+
+    async fn grant_pending_permissions(&self, _user_id: i32) -> Result<(), String> {
+        // Best-effort in the baseline; the oracle does not model authz rows.
+        Ok(())
+    }
 }
 
 fn request_value(request: &GithubHttpRequest) -> Value {

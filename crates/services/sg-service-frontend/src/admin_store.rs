@@ -371,8 +371,30 @@ pub trait AdminStore: Send + Sync {
     async fn get_users_by_ids(&self, ids: &[i32]) -> Result<Vec<UserRow>, String>;
     async fn get_by_verified_email(&self, email: &str) -> Result<Option<UserRow>, String>;
     async fn create_user(&self, new: &NewUser) -> Result<UserRow, String>;
+    /// [`AdminStore::create_user`] with the request actor for the
+    /// `AccountCreated` security event (`users.go:264,284,481-517`).
+    /// In-memory stores keep using [`AdminStore::create_user`].
+    async fn create_user_as(
+        &self,
+        new: &NewUser,
+        _creator_uid: i32,
+    ) -> Result<UserRow, String> {
+        self.create_user(new).await
+    }
     async fn update_user(&self, id: i32, update: &UserUpdate) -> Result<UserRow, String>;
     async fn delete_users(&self, ids: &[i32], hard: bool) -> Result<(), String>;
+    /// [`AdminStore::delete_users`] with the request actor for the
+    /// `AccountDeleted`/`AccountNuked` argument `{"deleter": UID}`
+    /// (`users.go:694,782,787-828`). In-memory stores keep using
+    /// [`AdminStore::delete_users`].
+    async fn delete_users_as(
+        &self,
+        ids: &[i32],
+        hard: bool,
+        _actor_uid: i32,
+    ) -> Result<(), String> {
+        self.delete_users(ids, hard).await
+    }
     async fn revoke_user_permissions(&self, ids: &[i32]) -> Result<(), String>;
     async fn grant_pending_permissions(&self, user_id: i32) -> Result<(), String>;
     async fn external_accounts_for_user(
@@ -405,6 +427,22 @@ pub trait AdminStore: Send + Sync {
         email: &str,
         verified: bool,
     ) -> Result<(), String>;
+    /// `backend.userEmails.SetVerified` (`user_emails.go:223-273`): the email
+    /// write and — when `verified` — `GrantPendingPermissions` share one
+    /// transaction. The grant failure is logged only and does not fail the
+    /// mutation. In-memory stores keep the two calls sequential.
+    async fn set_email_verified_and_grant(
+        &self,
+        user_id: i32,
+        email: &str,
+        verified: bool,
+    ) -> Result<(), String> {
+        self.set_email_verified(user_id, email, verified).await?;
+        if verified {
+            let _ = self.grant_pending_permissions(user_id).await;
+        }
+        Ok(())
+    }
 
     async fn set_last_verification(
         &self,
@@ -573,15 +611,64 @@ pub enum AdminMutationOutcome {
 #[derive(Clone)]
 pub struct PgAdminStore {
     pool: PgPool,
+    /// `conf.PermissionsUserMapping().BindID`, already normalized to
+    /// `email`/`username` (`userpasswd.rs:141-153`).
+    permissions_bind_id: String,
+    /// `log.securityEventLog.location` is `database`/`all`
+    /// (`internal/database/security_event_logs.go:163-240`). The default is
+    /// `auditlog` when unset, so no `security_event_logs` row is written
+    /// unless the caller supplies the parsed site configuration.
+    security_event_logs_in_database: bool,
 }
 
 impl PgAdminStore {
     pub fn new(pool: PgPool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            permissions_bind_id: "email".to_owned(),
+            security_event_logs_in_database: false,
+        }
+    }
+
+    /// Set the normalized `permissions.userMapping.bindID`.
+    pub fn with_permissions_bind_id(mut self, bind_id: impl Into<String>) -> Self {
+        let bind_id = bind_id.into();
+        self.permissions_bind_id = match bind_id.as_str() {
+            "email" | "username" => bind_id,
+            _ => "email".to_owned(),
+        };
+        self
+    }
+
+    /// Derive the bind id and `security_event_logs` destination from site
+    /// configuration (`conf.PermissionsUserMapping`, `log.securityEventLog`).
+    pub fn with_site_configuration(mut self, site: &sg_config::SiteConfiguration) -> Self {
+        self.permissions_bind_id = crate::userpasswd::permissions_user_mapping_bind_id(site);
+        self.security_event_logs_in_database =
+            sg_db::security_event_logs::security_event_logs_in_database(site.raw());
+        self
+    }
+
+    /// Set whether `security_event_logs` is a destination.
+    pub fn with_security_event_logs_in_database(mut self, enabled: bool) -> Self {
+        self.security_event_logs_in_database = enabled;
+        self
     }
 
     pub fn pool(&self) -> &PgPool {
         &self.pool
+    }
+
+    fn account_event_context(&self, actor_uid: i32) -> sg_db::users::DeletionEventContext<'_> {
+        sg_db::users::DeletionEventContext {
+            actor: sg_db::users::BackendActor {
+                uid: actor_uid,
+                sourcegraph_operator: false,
+            },
+            version: sg_metrics::VERSION,
+            now: OffsetDateTime::now_utc(),
+            security_event_logs_in_database: self.security_event_logs_in_database,
+        }
     }
 }
 
@@ -691,16 +778,15 @@ impl AdminStore for PgAdminStore {
     }
 
     async fn create_user(&self, new: &NewUser) -> Result<UserRow, String> {
+        self.create_user_as(new, 0).await
+    }
+
+    async fn create_user_as(
+        &self,
+        new: &NewUser,
+        creator_uid: i32,
+    ) -> Result<UserRow, String> {
         let mut tx = self.pool.begin().await.map_err(|e| e.to_string())?;
-        // `names` reserve: org/user namespace uniqueness.
-        sqlx::query(
-            "INSERT INTO names (name) SELECT $1 \
-             WHERE NOT EXISTS (SELECT 1 FROM names WHERE name=$1)",
-        )
-        .bind(&new.username)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| e.to_string())?;
         let row = sqlx::query(&format!(
             "INSERT INTO users (username, display_name, avatar_url, site_admin, tos_accepted, \
              created_at, updated_at) \
@@ -711,14 +797,39 @@ impl AdminStore for PgAdminStore {
         .bind(&new.username)
         .fetch_one(&mut *tx)
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| {
+            // `internal/database/users.go:355-366`: username constraint
+            // violations become `ErrCannotCreateUser{err_username_exists}`.
+            let constraint = e
+                .as_database_error()
+                .and_then(|db| db.constraint())
+                .unwrap_or_default();
+            if matches!(
+                constraint,
+                "users_username"
+                    | "users_username_max_length"
+                    | "users_username_valid_chars"
+                    | "users_display_name_max_length"
+            ) {
+                "cannot create user: err_username_exists".to_owned()
+            } else {
+                e.to_string()
+            }
+        })?;
         let user = row_to_user(&row)?;
-        sqlx::query("UPDATE names SET user_id=$1 WHERE name=$2 AND user_id IS NULL")
-            .bind(user.id)
+        // Reserve the username in the shared users+orgs namespace
+        // (`internal/database/users.go:375-378`). The row must carry
+        // `user_id` at insert time: `names_check` rejects rows whose
+        // `user_id`, `org_id` and `team_id` are all NULL.
+        if sqlx::query("INSERT INTO names(name, user_id) VALUES($1, $2)")
             .bind(&new.username)
+            .bind(user.id)
             .execute(&mut *tx)
             .await
-            .map_err(|e| e.to_string())?;
+            .is_err()
+        {
+            return Err("cannot create user: err_username_exists".to_owned());
+        }
         if !new.email.is_empty() {
             sqlx::query(
                 "INSERT INTO user_emails (user_id, email, is_primary, verified_at, \
@@ -734,6 +845,17 @@ impl AdminStore for PgAdminStore {
             .map_err(|e| e.to_string())?;
         }
         tx.commit().await.map_err(|e| e.to_string())?;
+        // `logAccountCreatedEvent(ctx, NewDBWith(u), newUser, "")`
+        // (`internal/database/users.go:261-265`); failures are logged only.
+        let ctx = self.account_event_context(creator_uid);
+        let _ = sg_db::users::log_account_created_event(
+            &self.pool,
+            user.id,
+            user.site_admin,
+            "",
+            &ctx,
+        )
+        .await;
         let mut user = user;
         user.primary_email = new.email.clone();
         Ok(user)
@@ -742,15 +864,25 @@ impl AdminStore for PgAdminStore {
     async fn update_user(&self, id: i32, update: &UserUpdate) -> Result<UserRow, String> {
         let mut tx = self.pool.begin().await.map_err(|e| e.to_string())?;
         if let Some(username) = &update.username {
-            // The baseline only touches `names` when the username changes.
-            sqlx::query(
-                "INSERT INTO names (name) SELECT $1 \
-                 WHERE NOT EXISTS (SELECT 1 FROM names WHERE name=$1)",
-            )
-            .bind(username)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| e.to_string())?;
+            // The baseline only touches `names` when the username changes and
+            // renames the existing row (`internal/database/users.go:560-567`);
+            // inserting a NULL-owner row would violate `names_check`.
+            sqlx::query("UPDATE names SET name=$1 WHERE user_id=$2")
+                .bind(username)
+                .bind(id)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| {
+                    let constraint = e
+                        .as_database_error()
+                        .and_then(|db| db.constraint())
+                        .unwrap_or_default();
+                    if constraint == "names_pkey" {
+                        "Username is already in use.".to_owned()
+                    } else {
+                        e.to_string()
+                    }
+                })?;
         }
         let row = sqlx::query(&format!(
             "UPDATE users SET \
@@ -770,37 +902,40 @@ impl AdminStore for PgAdminStore {
         .bind(update.avatar_url.clone().flatten())
         .fetch_optional(&mut *tx)
         .await
-        .map_err(|e| e.to_string())?
+        .map_err(|e| {
+            let constraint = e
+                .as_database_error()
+                .and_then(|db| db.constraint())
+                .unwrap_or_default();
+            if constraint == "users_username" {
+                "cannot create user: err_username_exists".to_owned()
+            } else {
+                e.to_string()
+            }
+        })?
         .ok_or_else(|| format!("user not found: [{id}]"))?;
-        if let Some(username) = &update.username {
-            sqlx::query("UPDATE names SET user_id=$1 WHERE name=$2 AND user_id IS NULL")
-                .bind(id)
-                .bind(username)
-                .execute(&mut *tx)
-                .await
-                .map_err(|e| e.to_string())?;
-        }
         tx.commit().await.map_err(|e| e.to_string())?;
         row_to_user(&row)
     }
 
     async fn delete_users(&self, ids: &[i32], hard: bool) -> Result<(), String> {
+        self.delete_users_as(ids, hard, 0).await
+    }
+
+    async fn delete_users_as(
+        &self,
+        ids: &[i32],
+        hard: bool,
+        actor_uid: i32,
+    ) -> Result<(), String> {
         if ids.is_empty() {
             return Ok(());
         }
+        let ctx = self.account_event_context(actor_uid);
         if hard {
             // Reuse the already-ported hard delete (event-log anonymisation
-            // included). The deletion-event actor is the request actor in the
-            // baseline; it is not part of the GraphQL response here.
-            let ctx = sg_db::users::DeletionEventContext {
-                actor: sg_db::users::BackendActor {
-                    uid: 0,
-                    sourcegraph_operator: false,
-                },
-                version: "",
-                now: OffsetDateTime::now_utc(),
-                security_event_logs_in_database: true,
-            };
+            // and the `AccountNuked` events included) with the request actor
+            // in the event argument.
             return sg_db::users::hard_delete_list(&self.pool, ids, &ctx)
                 .await
                 .map_err(|e| e.message);
@@ -852,7 +987,17 @@ impl AdminStore for PgAdminStore {
             .execute(&mut *tx)
             .await
             .map_err(|e| e.to_string())?;
-        tx.commit().await.map_err(|e| e.to_string())
+        tx.commit().await.map_err(|e| e.to_string())?;
+        // `logUserDeletionEvents(..., SecurityEventNameAccountDeleted)`
+        // (`internal/database/users.go:694,787-828`); log-only in Go.
+        let _ = sg_db::users::log_user_deletion_events(
+            &self.pool,
+            ids,
+            sg_db::users::SECURITY_EVENT_NAME_ACCOUNT_DELETED,
+            &ctx,
+        )
+        .await;
+        Ok(())
     }
 
     async fn revoke_user_permissions(&self, ids: &[i32]) -> Result<(), String> {
@@ -879,20 +1024,18 @@ impl AdminStore for PgAdminStore {
     }
 
     async fn grant_pending_permissions(&self, user_id: i32) -> Result<(), String> {
-        // GrantPendingPermissions is a worker-side operation; the frontend
-        // baseline only logs a failure. The direct-IAM subset moves pending
-        // rows into the permission tables.
-        sqlx::query(
-            "INSERT INTO user_permissions (user_id, permission, object_type, object_ids, updated_at) \
-             SELECT $1, permission, object_type, object_ids, now() FROM (SELECT NULL::text AS permission, \
-             NULL::text AS object_type, NULL::text[] AS object_ids) x WHERE FALSE \
-             ON CONFLICT DO NOTHING",
+        // `db.Authz().GrantPendingPermissions(ctx, {UserID, Perm: authz.Read,
+        // Type: authz.PermRepos})` (`internal/database/authz.go:98`): enumerate
+        // the user's live external accounts plus the configured user-mapping
+        // identity, then grant each pending set in one transaction.
+        sg_db::authz::grant_pending_permissions(
+            &self.pool,
+            user_id,
+            &self.permissions_bind_id,
+            OffsetDateTime::now_utc(),
         )
-        .bind(user_id)
-        .execute(&self.pool)
         .await
-        .map_err(|e| e.to_string())?;
-        Ok(())
+        .map_err(|error| error.to_string())
     }
 
     async fn external_accounts_for_user(
@@ -1075,6 +1218,88 @@ impl AdminStore for PgAdminStore {
         tx.commit().await.map_err(|e| e.to_string())
     }
 
+    async fn set_email_verified_and_grant(
+        &self,
+        user_id: i32,
+        email: &str,
+        verified: bool,
+    ) -> Result<(), String> {
+        // `db.WithTransact`: `tx.UserEmails().SetVerified`, then either the
+        // Perforce cleanup or `tx.Authz().GrantPendingPermissions`
+        // (`cmd/frontend/internal/backend/user_emails.go:233-260`).
+        let mut tx = self.pool.begin().await.map_err(|e| e.to_string())?;
+        let result = if verified {
+            sqlx::query(
+                "UPDATE user_emails SET verification_code=NULL, verified_at=now(), \
+                 is_primary=(NOT EXISTS (SELECT 1 FROM user_emails WHERE user_id=$1 \
+                 AND email != $2 AND is_primary=TRUE)) WHERE user_id=$1 AND email=$2",
+            )
+            .bind(user_id)
+            .bind(email)
+            .execute(&mut *tx)
+            .await
+            .map_err(|_| "could not mark email as verified".to_owned())?
+        } else {
+            sqlx::query(
+                "UPDATE user_emails SET verification_code=NULL, verified_at=NULL \
+                 WHERE user_id=$1 AND email=$2",
+            )
+            .bind(user_id)
+            .bind(email)
+            .execute(&mut *tx)
+            .await
+            .map_err(|_| "could not mark email as unverified".to_owned())?
+        };
+        if result.rows_affected() == 0 {
+            let _ = tx.rollback().await;
+            return Err("user email not found".to_owned());
+        }
+
+        if !verified {
+            // `deleteStalePerforceExternalAccounts`
+            // (`user_emails.go:473-489`): soft-delete the Perforce accounts
+            // keyed by this email, then drop the user's sub-repo permissions.
+            sqlx::query(
+                "UPDATE user_external_accounts SET deleted_at=now() \
+                 WHERE user_id=$1 AND account_id=$2 AND service_type='perforce' \
+                 AND deleted_at IS NULL",
+            )
+            .bind(user_id)
+            .bind(email)
+            .execute(&mut *tx)
+            .await
+            .map_err(|_| {
+                "removing stale perforce external account: deleting stale external account"
+                    .to_owned()
+            })?;
+            sqlx::query("DELETE FROM sub_repo_permissions WHERE user_id=$1")
+                .bind(user_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(|_| {
+                    "removing stale perforce external account: deleting sub-repo permissions"
+                        .to_owned()
+                })?;
+        } else {
+            // The baseline deletes every unverified row sharing this address
+            // and ignores failures.
+            let _ = sqlx::query("DELETE FROM user_emails WHERE verified_at IS NULL AND email=$1")
+                .bind(email)
+                .execute(&mut *tx)
+                .await;
+            // `tx.Authz().GrantPendingPermissions`: failures are logged only,
+            // so the email write still commits.
+            let _ = sg_db::authz::grant_pending_permissions_in_tx(
+                &mut tx,
+                user_id,
+                &self.permissions_bind_id,
+                OffsetDateTime::now_utc(),
+            )
+            .await;
+        }
+        tx.commit().await.map_err(|e| e.to_string())
+    }
+
     async fn set_last_verification(
         &self,
         user_id: i32,
@@ -1128,19 +1353,6 @@ impl AdminStore for PgAdminStore {
 
     async fn create_org(&self, name: &str, display_name: Option<&str>) -> Result<OrgRow, String> {
         let mut tx = self.pool.begin().await.map_err(|e| e.to_string())?;
-        let result = sqlx::query(
-            "INSERT INTO names (name) SELECT $1 WHERE NOT EXISTS (SELECT 1 FROM names WHERE name=$1)",
-        )
-        .bind(name)
-        .execute(&mut *tx)
-        .await;
-        if let Err(e) = result {
-            let message = e.to_string();
-            if message.contains("duplicate key") {
-                return Err("organization with name \u{201c}...\u{201d} already exists".to_owned());
-            }
-            return Err(message);
-        }
         let row = sqlx::query(
             "INSERT INTO orgs (name, display_name, created_at, updated_at) \
              VALUES ($1, $2, now(), now()) \
@@ -1150,14 +1362,33 @@ impl AdminStore for PgAdminStore {
         .bind(display_name)
         .fetch_one(&mut *tx)
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| {
+            // `internal/database/orgs.go:205-217`: `orgs_name` collisions map
+            // to the "already exists" error.
+            let constraint = e
+                .as_database_error()
+                .and_then(|db| db.constraint())
+                .unwrap_or_default();
+            if constraint == "orgs_name" {
+                "organization with name \u{201c}...\u{201d} already exists".to_owned()
+            } else {
+                e.to_string()
+            }
+        })?;
         let org = org_row(&row)?;
-        sqlx::query("UPDATE names SET org_id=$1 WHERE name=$2 AND org_id IS NULL")
-            .bind(org.id)
+        // Reserve the organization name in the shared users+orgs+teams
+        // namespace (`internal/database/orgs.go:218-221`). The row must carry
+        // `org_id` at insert time: `names_check` rejects rows whose `user_id`,
+        // `org_id` and `team_id` are all NULL.
+        if sqlx::query("INSERT INTO names(name, org_id) VALUES($1, $2)")
             .bind(name)
+            .bind(org.id)
             .execute(&mut *tx)
             .await
-            .map_err(|e| e.to_string())?;
+            .is_err()
+        {
+            return Err("organization with name \u{201c}...\u{201d} already exists".to_owned());
+        }
         tx.commit().await.map_err(|e| e.to_string())?;
         Ok(org)
     }
