@@ -1233,8 +1233,9 @@ impl ObjectValue for RepositoryTextSearchIndexStatusObject {
             "updatedAt" => Ok(Some(FieldValue::Json(Json::Str(datetime_rfc3339(
                 self.entry.index_time,
             ))))),
-            "contentByteSize" => Ok(Some(FieldValue::Json(Json::Int(
-                self.entry.content_bytes,
+            // `BigInt` marshals as a decimal string (bigint.go).
+            "contentByteSize" => Ok(Some(FieldValue::Json(Json::Str(
+                self.entry.content_bytes.to_string(),
             )))),
             "contentFilesCount" => Ok(Some(int(self.entry.documents))),
             "indexByteSize" => Ok(Some(int(self.entry.index_bytes))),
@@ -1983,20 +1984,19 @@ pub async fn prefetch_webhook_webhook_logs(
         else {
             continue;
         };
+        // `nodes` selects fields directly on `Webhook`; inline fragments on
+        // `Webhook`/`Node` contribute their own selections.
         let log_selections: Vec<&RootField> = nodes_selection
             .selections
             .iter()
-            .flat_map(|selection| {
-                let mut out: Vec<&RootField> = selection
-                    .selections
+            .chain(
+                nodes_selection
+                    .type_conditions
                     .iter()
-                    .filter(|nested| nested.name == "webhookLogs")
-                    .collect();
-                for (_, nested) in &selection.type_conditions {
-                    out.extend(nested.iter().filter(|nested| nested.name == "webhookLogs"));
-                }
-                out
-            })
+                    .filter(|(condition, _)| condition == "Webhook" || condition == "Node")
+                    .flat_map(|(_, fields)| fields.iter()),
+            )
+            .filter(|selection| selection.name == "webhookLogs")
             .collect();
         if log_selections.is_empty() {
             continue;
