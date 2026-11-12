@@ -1081,6 +1081,12 @@ pub struct NestedPrefetch {
     /// `User.emails` / `primaryEmail` / `accessTokens` / `session` /
     /// `hasVerifiedEmail` per-user account data (M9.18a).
     pub user_accounts: HashMap<i32, crate::graphql_inventory_c::UserAccountsData>,
+    /// `Webhook.webhookLogs` connections keyed by webhook id and argument set
+    /// (M9.19a). Always queried with `WebhookLogsAllExternalServices`.
+    pub webhook_webhook_logs: HashMap<
+        (i32, crate::webhook_logs::WebhookLogsArgs),
+        crate::webhook_logs::WebhookLogsConnectionLookup,
+    >,
 }
 
 /// The database seam for `User.organizations` (`db.Orgs().GetByUserID` plus
@@ -2843,6 +2849,9 @@ pub struct InventoryRoots {
     /// `externalServiceRepositories`, `renderMarkdown`, `highlightCode`,
     /// `webhooks` and the batch-C mutations).
     pub business_c: crate::graphql_inventory_c::InventoryCRoots,
+    /// M9.19a repository object types (`metadata`, `gitRefs`, `contributors`,
+    /// `textSearchIndex`, `externalURLs` and `Query.repoMeta`).
+    pub graphql_d: Arc<crate::graphql_inventory_d::InventoryDRoots>,
 }
 
 impl InventoryRoots {

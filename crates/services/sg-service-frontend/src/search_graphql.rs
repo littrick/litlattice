@@ -1994,6 +1994,9 @@ pub(crate) struct GitRefObject {
     repo: MinimalRepo,
     name: String,
     git: Option<Arc<crate::git_graphql::GitPrefetch>>,
+    /// `GitRefResolver.target`: the target OID when the ref came from
+    /// `ListRefs` (M9.19a). An empty value keeps the lazy `GetObject` path.
+    target: Option<String>,
 }
 
 impl GitRefObject {
@@ -2002,7 +2005,32 @@ impl GitRefObject {
         name: String,
         git: Option<Arc<crate::git_graphql::GitPrefetch>>,
     ) -> Self {
-        Self { repo, name, git }
+        Self {
+            repo,
+            name,
+            git,
+            target: None,
+        }
+    }
+
+    /// `NewGitRefResolver(repo, name, target)` (M9.19a): the target commit is
+    /// known from `ListRefs`, so `target` does not need a gitserver round-trip.
+    pub(crate) fn with_target(
+        repo: MinimalRepo,
+        name: String,
+        target: Option<String>,
+        git: Option<Arc<crate::git_graphql::GitPrefetch>>,
+    ) -> Self {
+        Self {
+            repo,
+            name,
+            git,
+            target,
+        }
+    }
+
+    pub(crate) fn name(&self) -> &str {
+        &self.name
     }
 
     fn abbrev_name(&self) -> &str {
@@ -2043,36 +2071,51 @@ impl ObjectValue for GitRefObject {
             "type" => Ok(Some(FieldValue::Json(Json::Str(
                 git_ref_type(&self.name).to_owned(),
             )))),
-            // `GitRefResolver.Target` (`git_ref.go:100-127`) loads the object
-            // through gitserver; the prefetch phase has already done so.
-            "target" => match &self.git {
-                Some(git) => match git.objects.get(&(self.repo.id, self.name.clone())) {
-                    Some(crate::git_graphql::ObjectLookup::Found(object)) => {
-                        Ok(Some(FieldValue::Object(Arc::new(
-                            crate::git_graphql::GitObjectResolverObject::from_object(
-                                self.repo.clone(),
-                                object.clone(),
-                                Some(git.clone()),
-                            ),
-                        ))))
-                    }
-                    Some(crate::git_graphql::ObjectLookup::Error(message)) => {
-                        Ok(Some(FieldValue::Object(Arc::new(
-                            crate::git_graphql::GitObjectResolverObject::with_error(
-                                self.repo.clone(),
-                                message.clone(),
-                                Some(git.clone()),
-                            ),
-                        ))))
-                    }
+            // `GitRefResolver.Target` (`git_ref.go:100-127`): a `ListRefs`
+            // target is preseeded; otherwise the prefetch phase loaded the
+            // object through gitserver.
+            "target" => {
+                if let Some(oid) = &self.target {
+                    return Ok(Some(FieldValue::Object(Arc::new(
+                        crate::git_graphql::GitObjectResolverObject::from_object(
+                            self.repo.clone(),
+                            sg_git::GitObject {
+                                oid: oid.clone(),
+                                object_type: sg_git::GitObjectType::Commit,
+                            },
+                            self.git.clone(),
+                        ),
+                    ))));
+                }
+                match &self.git {
+                    Some(git) => match git.objects.get(&(self.repo.id, self.name.clone())) {
+                        Some(crate::git_graphql::ObjectLookup::Found(object)) => {
+                            Ok(Some(FieldValue::Object(Arc::new(
+                                crate::git_graphql::GitObjectResolverObject::from_object(
+                                    self.repo.clone(),
+                                    object.clone(),
+                                    Some(git.clone()),
+                                ),
+                            ))))
+                        }
+                        Some(crate::git_graphql::ObjectLookup::Error(message)) => {
+                            Ok(Some(FieldValue::Object(Arc::new(
+                                crate::git_graphql::GitObjectResolverObject::with_error(
+                                    self.repo.clone(),
+                                    message.clone(),
+                                    Some(git.clone()),
+                                ),
+                            ))))
+                        }
+                        None => Err(ExecError::new(
+                            "GitRef.target was not prefetched for this ref revision",
+                        )),
+                    },
                     None => Err(ExecError::new(
-                        "GitRef.target was not prefetched for this ref revision",
+                        "GitRef.target requires the gitserver GitSource (not wired for this request)",
                     )),
-                },
-                None => Err(ExecError::new(
-                    "GitRef.target requires the gitserver GitSource (not wired for this request)",
-                )),
-            },
+                }
+            }
             "repository" => Ok(Some(FieldValue::Object(Arc::new(repository_object(
                 &self.repo,
             ))))),
@@ -2091,11 +2134,11 @@ fn git_ref_list(
         items: refs
             .iter()
             .map(|name| {
-                FieldValue::Object(Arc::new(GitRefObject {
-                    repo: repo.clone(),
-                    name: name.clone(),
-                    git: git.clone(),
-                }))
+                FieldValue::Object(Arc::new(GitRefObject::new(
+                    repo.clone(),
+                    name.clone(),
+                    git.clone(),
+                )))
             })
             .collect(),
         element_type: Some("GitRef"),

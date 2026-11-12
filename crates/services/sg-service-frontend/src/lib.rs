@@ -61,6 +61,7 @@ pub mod goimportpath;
 pub mod graphql_api;
 pub mod graphql_inventory_b;
 pub mod graphql_inventory_c;
+pub mod graphql_inventory_d;
 pub mod graphql_metrics;
 pub mod graphql_resolvers;
 pub mod health;
