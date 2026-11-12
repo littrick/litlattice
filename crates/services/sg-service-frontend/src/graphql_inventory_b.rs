@@ -1064,11 +1064,17 @@ pub struct OutboundRequestItem {
 /// `Query.outboundRequests` (`outbound_requests.go:36-75`): site-admin gated;
 /// the log is read through `sg-httpcli`'s Redis FIFO list (`None` = the
 /// pre-wiring frontend with no source).
+///
+/// M9.22c: `auditlog-expansion` writes `OutboundRequestViewed` after the
+/// site-admin check and the `after` unmarshal, before the log read, with the
+/// GraphQL arguments as the event argument (`outbound_requests.go:66-73`).
 pub async fn prefetch_outbound_requests(
     fields: &[RootField],
     actor: Actor,
     viewer_site_admin: bool,
     log: Option<&dyn crate::outbound_requests_graphql::OutboundRequestLogSource>,
+    pool: &PgPool,
+    auditlog_expansion: bool,
 ) -> Option<Result<Vec<OutboundRequestItem>, String>> {
     let field = fields
         .iter()
@@ -1083,6 +1089,21 @@ pub async fn prefetch_outbound_requests(
         },
         None => String::new(),
     };
+    if auditlog_expansion {
+        if let Some(user_id) = actor.uid() {
+            // `outboundRequestsArgs` (`First *int32`, `After *string`).
+            crate::security_event_logs::write_backend_security_event(
+                pool,
+                crate::security_event_logs::SECURITY_EVENT_OUTBOUND_REQUEST_VIEWED,
+                user_id,
+                serde_json::json!({
+                    "First": field.arguments.i64("first"),
+                    "After": field.arguments.string("after"),
+                }),
+            )
+            .await;
+        }
+    }
     let mut all = match log {
         Some(source) => match source.list(&after).await {
             Ok(items) => items,
@@ -2371,6 +2392,7 @@ impl InventoryBRoots {
 /// `search.Indexers().Map.Endpoints()` and the `httpcli` request log); `None`
 /// reproduces an empty configuration/log. `org_invitation_config` is the
 /// `conf.SiteConfig().OrganizationInvitations` seam (`None` = no signing key).
+#[allow(clippy::too_many_arguments)]
 pub async fn prefetch_inventory_b(
     pool: &PgPool,
     fields: &[RootField],
@@ -2379,6 +2401,7 @@ pub async fn prefetch_inventory_b(
     org_invitation_config: Option<&OrgInvitationConfig>,
     indexed_search_endpoints: Option<&[String]>,
     outbound_request_log: Option<&dyn crate::outbound_requests_graphql::OutboundRequestLogSource>,
+    auditlog_expansion: bool,
 ) -> InventoryBRoots {
     let mut mutations = HashMap::new();
     for (field, outcome) in prefetch_mutations(
@@ -2407,6 +2430,8 @@ pub async fn prefetch_inventory_b(
             actor,
             viewer_site_admin,
             outbound_request_log,
+            pool,
+            auditlog_expansion,
         )
         .await,
         invitation_by_token: prefetch_invitation_by_token(

@@ -63,6 +63,17 @@ pub const SECURITY_EVENT_ACCESS_TOKEN_INVALID: &str = "AccessTokenInvalid";
 pub const SECURITY_EVENT_ACCESS_TOKEN_SUBJECT_NOT_SITE_ADMIN: &str =
     "AccessTokenSubjectNotSiteAdmin";
 
+// M9.22c organization / outbound / quota events
+// (`internal/database/security_event_logs.go:94-103`).
+pub const SECURITY_EVENT_ORGANIZATION_VIEWED: &str = "OrganizationViewed";
+pub const SECURITY_EVENT_ORGANIZATION_LIST_VIEWED: &str = "OrganizationListViewed";
+/// `database.SecurityEventNameOutboundReqViewed`'s value is
+/// `"OutboundRequestViewed"` (not `OutboundReqViewed`).
+pub const SECURITY_EVENT_OUTBOUND_REQUEST_VIEWED: &str = "OutboundRequestViewed";
+pub const SECURITY_EVENT_USER_COMPLETION_QUOTA_UPDATED: &str = "UserCompletionQuotaUpdated";
+pub const SECURITY_EVENT_USER_CODE_COMPLETION_QUOTA_UPDATED: &str =
+    "UserCodeCompletionQuotaUpdated";
+
 /// `event_logs.EventLogsSourcegraphOperatorKey`.
 pub const EVENT_LOGS_SOURCEGRAPH_OPERATOR_KEY: &str = "sourcegraph_operator";
 
@@ -222,6 +233,63 @@ fn argument_to_json_string(argument: &Option<Value>) -> String {
     } else {
         text
     }
+}
+
+/// `featureflag.FromContext(ctx).GetBoolOr("auditlog-expansion", false)`.
+///
+/// Mirror of the private helpers in `config_graphql` / `site_configuration_mutation`
+/// (per-user evaluation, then the global flags on error; anonymous/internal
+/// actors only see the global flags).
+pub async fn auditlog_expansion(pool: &PgPool, actor: sg_graphql::exec::Actor) -> bool {
+    use sg_graphql::exec::Actor;
+    match actor {
+        Actor::User { uid } => match sg_db::feature_flags::get_user_flags(pool, uid).await {
+            Ok(flags) => flags.get("auditlog-expansion").copied().unwrap_or(false),
+            Err(_) => global_auditlog_expansion(pool).await,
+        },
+        Actor::Anonymous | Actor::Internal => global_auditlog_expansion(pool).await,
+    }
+}
+
+async fn global_auditlog_expansion(pool: &PgPool) -> bool {
+    match sg_db::feature_flags::get_global_feature_flags(pool).await {
+        Ok(flags) => flags.get("auditlog-expansion").copied().unwrap_or(false),
+        Err(_) => false,
+    }
+}
+
+/// `LogSecurityEvent`'s `database` sink for the M9.22c call sites.
+///
+/// `argument == Value::Null` becomes `{}` (`argumentToJSONString`), the
+/// `version` is the non-empty `version.Version()` required by the
+/// `security_event_logs_check_version_not_empty` constraint, and errors are
+/// logged by the caller in Go, so they are swallowed here.
+///
+/// The callers only invoke this for the `database`/`all` location (the
+/// differential harness configures `log.securityEventLog.location=database`);
+/// the `auditlog` mirror stays on the existing `prepare_security_events` path.
+pub async fn write_backend_security_event(
+    pool: &PgPool,
+    name: &str,
+    user_id: i32,
+    argument: Value,
+) {
+    let argument = if argument.is_null() {
+        json!({})
+    } else {
+        argument
+    };
+    let event = SecurityEvent {
+        name,
+        url: "",
+        user_id,
+        anonymous_user_id: "",
+        source: "BACKEND",
+        argument,
+        version: crate::actor_chain_adapters::version_string(),
+        timestamp: OffsetDateTime::now_utc(),
+    };
+    let _ = sg_db::security_event_logs::insert_security_event(pool, &event).await;
 }
 
 /// `jsonc.Edit(input, true, "sourcegraph_operator")` with
