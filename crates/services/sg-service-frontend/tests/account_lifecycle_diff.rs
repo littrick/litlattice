@@ -16,6 +16,7 @@ use sg_service_frontend::admin_store::{AdminStore, NewUser, PgAdminStore};
 use sg_service_frontend::user_provisioning::{
     ExternalIdentity, NewUserRow, PgProvisionStore, ProvisionStore,
 };
+use sg_service_frontend::userpasswd::{NewUserData, PgUserpasswdStore, UserpasswdStore};
 use sqlx::postgres::PgPool;
 use sqlx::Row;
 
@@ -177,6 +178,31 @@ async fn account_lifecycle_diff() {
                 };
                 store
                     .create_with_external_account(&new_user, &identity)
+                    .await
+                    .map(|_| ())
+                    .map_err(|error| format!("{error:?}"))
+            }
+            "userpasswd_create" => {
+                // The built-in password sign-up store
+                // (`pgUserpasswdStore.create_user`) is a separate Rust
+                // implementation of Go's `Users().Create`.
+                let store = PgUserpasswdStore::new(pool.clone(), "email")
+                    .with_site_configuration(
+                        &sg_config::SiteConfiguration::parse(
+                            r#"{"permissions.userMapping":{"enabled":true,"bindID":"email"},
+                                "log":{"securityEventLog":{"location":"all"}}}"#,
+                        )
+                        .expect("site configuration"),
+                    );
+                store
+                    .create_user(&NewUserData {
+                        email: case.email.clone(),
+                        username: case.username.clone(),
+                        password_hash: None,
+                        fail_if_not_initial_user: false,
+                        email_is_verified: case.email_verified,
+                        email_verification_code: None,
+                    })
                     .await
                     .map(|_| ())
                     .map_err(|error| format!("{error:?}"))
