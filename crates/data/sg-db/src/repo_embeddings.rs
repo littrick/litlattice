@@ -231,3 +231,38 @@ where
     .await?;
     Ok(row.get("id"))
 }
+
+/// `repoStore.RepoEmbeddingExists` (`internal/database/repos.go`):
+/// `SELECT EXISTS(SELECT 1 FROM repo_embedding_jobs WHERE repo_id = $1 AND
+/// state = 'completed')`.
+pub async fn repo_embedding_exists<'e, E>(
+    executor: E,
+    repo_id: i32,
+) -> Result<bool, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = Postgres>,
+{
+    let row = sqlx::query(
+        r#"
+SELECT EXISTS(SELECT 1 FROM repo_embedding_jobs WHERE repo_id = $1 AND state = 'completed')"#,
+    )
+    .bind(repo_id)
+    .fetch_one(executor)
+    .await?;
+    Ok(row.get("exists"))
+}
+
+/// `repoEmbeddingJobsStore.CountRepoEmbeddings`
+/// (`internal/embeddings/background/repo/store.go`): the number of distinct
+/// repos with a completed embedding job.
+pub async fn count_repo_embeddings<'e, E>(executor: E) -> Result<i64, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = Postgres>,
+{
+    let row = sqlx::query(
+        "SELECT COUNT(DISTINCT repo_id) AS count FROM repo_embedding_jobs WHERE state = 'completed'",
+    )
+    .fetch_one(executor)
+    .await?;
+    Ok(row.get("count"))
+}
