@@ -14,4 +14,9 @@ path = "src/main.rs"
 sg-core = { path = "../../crates/base/sg-core" }
 sg-entry = { path = "../../crates/base/sg-entry" }
 sg-log = { path = "../../crates/base/sg-log" }
+sg-ui = { path = "../../crates/domain/sg-ui" }
 tokio = { workspace = true }
+
+[dev-dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }

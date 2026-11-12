@@ -8,7 +8,8 @@
 //! M9.16c adds the `serve_cmd.go` startup gate: the `versions`-table service
 //! version upsert, the 5s Redis readiness wait, and the out-of-band migration
 //! metadata sync + validation (`SRC_DISABLE_OOBMIGRATION_VALIDATION` skips
-//! it). `tryAutoUpgrade` is explicitly not ported. Enterprise hooks remain
+//! it). `tryAutoUpgrade`'s no-op gate is ported (`try_auto_upgrade`); the
+//! multiversion upgrade machinery behind it is not. Enterprise hooks remain
 //! out of scope.
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -48,8 +49,9 @@ fn search_contexts_enabled() -> bool {
 // ---------------------------------------------------------------------------
 // Startup sequence (`cmd/frontend/internal/cli/serve_cmd.go:74-131`).
 //
-// `tryAutoUpgrade` (serve_cmd.go:99) is not ported: the upgrade binary and the
-// `upgrade_logs` machinery live outside this repository's frontend process.
+// `tryAutoUpgrade` (serve_cmd.go:99) runs first; its no-op gate is ported and
+// a pending upgrade is reported as not ported (the upgrade binary and
+// `upgrade_logs` machinery live outside this repository's frontend process).
 // Everything after it is: `InitDB`'s service-version upsert, `waitForRedis`,
 // and the out-of-band migration metadata sync + validation.
 // ---------------------------------------------------------------------------
@@ -76,6 +78,12 @@ pub enum VersionOrder {
 /// (`internal/oobmigration/version.go:44-96`): the same `^v?(\d+)\.(\d+)
 /// (?:\.(\d+))?(?:-\w*)?(?:\+[\w.]*)?$` shape, including the `+dev` suffix.
 pub fn new_version_from_string(value: &str) -> Option<OobVersion> {
+    new_version_and_patch_from_string(value).map(|(version, _)| version)
+}
+
+/// `oobmigration.NewVersionAndPatchFromString` (`version.go:56-79`): the
+/// major/minor plus the optional patch (`0` when the string omits it).
+pub fn new_version_and_patch_from_string(value: &str) -> Option<(OobVersion, i64)> {
     let mut input = value;
     if let Some(stripped) = input.strip_suffix("+dev") {
         input = stripped;
@@ -91,9 +99,10 @@ pub fn new_version_from_string(value: &str) -> Option<OobVersion> {
     }
     index += 1;
     let minor = take_digits(bytes, &mut index)?;
+    let mut patch = 0;
     if bytes.get(index) == Some(&b'.') {
         index += 1;
-        take_digits(bytes, &mut index)?;
+        patch = take_digits(bytes, &mut index)?.parse().ok()?;
     }
     if bytes.get(index) == Some(&b'-') {
         index += 1;
@@ -115,10 +124,13 @@ pub fn new_version_from_string(value: &str) -> Option<OobVersion> {
     if index != bytes.len() {
         return None;
     }
-    Some(OobVersion {
-        major: major.parse().ok()?,
-        minor: minor.parse().ok()?,
-    })
+    Some((
+        OobVersion {
+            major: major.parse().ok()?,
+            minor: minor.parse().ok()?,
+        },
+        patch,
+    ))
 }
 
 fn take_digits<'a>(bytes: &'a [u8], index: &mut usize) -> Option<&'a str> {
@@ -182,6 +194,157 @@ fn semver_major_minor(raw: &str) -> Option<(u64, u64)> {
 
 fn is_missing_relation(err: &sqlx::Error) -> bool {
     matches!(err, sqlx::Error::Database(db) if db.code().as_deref() == Some("42P01"))
+}
+
+fn postgres_error_code(err: &sqlx::Error) -> Option<String> {
+    match err {
+        sqlx::Error::Database(db) => db.code().map(|code| code.into_owned()),
+        _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// `tryAutoUpgrade` (`cmd/frontend/internal/cli/autoupgrade.go:38-151`).
+//
+// The no-op gate (fresh instance, `auto_upgrade=false` and no
+// `SRC_AUTOUPGRADE`, or already current) is ported; the multiversion upgrade
+// machinery behind the gate is not (the upgrade binary and `upgrade_logs`
+// bookkeeping live outside this repository's frontend process). Reaching the
+// gate with an actual upgrade pending is reported as an explicit startup error
+// instead of silently skipping.
+// ---------------------------------------------------------------------------
+
+/// `appName` in `autoupgrade.go:34`.
+pub const AUTO_UPGRADER_APP_NAME: &str = "frontend-autoupgrader";
+/// `multiversion.EnvShouldAutoUpgrade` (`autoupgrade.go:5-7`).
+pub const AUTO_UPGRADE_ENV: &str = "SRC_AUTOUPGRADE";
+
+/// Why [`auto_upgrade_plan`] is a no-op.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AutoUpgradeSkip {
+    /// `sql.ErrNoRows` / `UndefinedTable`: a fresh instance.
+    FreshInstance,
+    /// `!dbShouldAutoUpgrade && !EnvShouldAutoUpgrade`.
+    Disabled,
+    /// Same major/minor and `currentPatch >= toPatch`.
+    SameVersionOrNewer,
+    /// `version.Version()` does not parse: the baseline logs a warning and
+    /// returns nil.
+    UnexpectedTargetVersion,
+}
+
+/// `tryAutoUpgrade`'s decision after `GetAutoUpgrade`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AutoUpgradePlan {
+    Skip(AutoUpgradeSkip),
+    /// The gate says an upgrade is required; executing it is not ported.
+    Required {
+        current: String,
+        current_version: OobVersion,
+        current_patch: i64,
+        target: String,
+        target_version: OobVersion,
+        target_patch: i64,
+    },
+}
+
+/// `upgradestore.GetAutoUpgrade` (`store.go:155-175`).
+///
+/// Returns `Ok(None)` for the fresh-instance cases (`sql.ErrNoRows` and
+/// `UndefinedTable`). `UndefinedColumn` (a pre-5.1 `versions` table without
+/// `auto_upgrade`) falls back to the version-only query and reports
+/// `auto_upgrade=false`, like the zero value in the baseline.
+pub async fn fetch_auto_upgrade(
+    pool: &sqlx::PgPool,
+) -> Result<Option<(String, bool)>, String> {
+    let primary = sqlx::query_as::<_, (String, bool)>(
+        "SELECT version, auto_upgrade FROM versions WHERE service = 'frontend'",
+    )
+    .fetch_optional(pool)
+    .await;
+
+    match primary {
+        Ok(row) => Ok(row),
+        Err(err) if postgres_error_code(&err).as_deref() == Some("42P01") => Ok(None),
+        Err(err) if postgres_error_code(&err).as_deref() == Some("42703") => {
+            let version = sqlx::query_scalar::<_, String>(
+                "SELECT version FROM versions WHERE service = 'frontend'",
+            )
+            .fetch_optional(pool)
+            .await
+            .map_err(|err| format!("failed to get frontend version from fallback: {err}"))?;
+            Ok(version.map(|version| (version, false)))
+        }
+        Err(err) => Err(format!(
+            "failed to get frontend version and auto_upgrade state: {err}"
+        )),
+    }
+}
+
+/// The pure `tryAutoUpgrade` gate (`autoupgrade.go:55-75`).
+///
+/// `state` is `GetAutoUpgrade`'s result; `Err` is the baseline's error for an
+/// unparseable *current* version string. An unparseable target version is the
+/// baseline's warn-and-skip path.
+pub fn auto_upgrade_plan(
+    state: Option<(String, bool)>,
+    target_version: &str,
+    env_should_auto_upgrade: bool,
+) -> Result<AutoUpgradePlan, String> {
+    let Some((current, db_should_auto_upgrade)) = state else {
+        return Ok(AutoUpgradePlan::Skip(AutoUpgradeSkip::FreshInstance));
+    };
+    if !db_should_auto_upgrade && !env_should_auto_upgrade {
+        return Ok(AutoUpgradePlan::Skip(AutoUpgradeSkip::Disabled));
+    }
+
+    let Some((current_version, current_patch)) =
+        new_version_and_patch_from_string(&current)
+    else {
+        return Err(format!(
+            "unexpected string for desired instance schema version, skipping auto-upgrade ({current})"
+        ));
+    };
+    let Some((target_oob, target_patch)) =
+        new_version_and_patch_from_string(target_version)
+    else {
+        return Ok(AutoUpgradePlan::Skip(
+            AutoUpgradeSkip::UnexpectedTargetVersion,
+        ));
+    };
+
+    if compare_versions(current_version, target_oob) == VersionOrder::Equal
+        && current_patch >= target_patch
+    {
+        return Ok(AutoUpgradePlan::Skip(AutoUpgradeSkip::SameVersionOrNewer));
+    }
+
+    Ok(AutoUpgradePlan::Required {
+        current,
+        current_version,
+        current_patch,
+        target: target_version.to_owned(),
+        target_version: target_oob,
+        target_patch,
+    })
+}
+
+/// `tryAutoUpgrade` (`autoupgrade.go:38-151`) up to the gate. Returns the
+/// baseline error strings; the caller prefixes `frontend.tryAutoUpgrade`.
+pub async fn try_auto_upgrade(
+    pool: &sqlx::PgPool,
+    target_version: &str,
+) -> Result<AutoUpgradePlan, String> {
+    let state = fetch_auto_upgrade(pool).await?;
+    let env_should_auto_upgrade = {
+        let mut env = EnvReader::new();
+        env.get_bool(
+            AUTO_UPGRADE_ENV,
+            false,
+            "If you forgot to set intent to autoupgrade before shutting down the instance, or you're upgrading from pre-5.1, set this env var.",
+        )
+    };
+    auto_upgrade_plan(state, target_version, env_should_auto_upgrade)
 }
 
 /// `upgradestore.GetFirstServiceVersion` (`store.go:44-49`).
@@ -642,10 +805,26 @@ impl Service for FrontendService {
         // global assets provider before any handler observes it.
         sg_ui::init_from_env();
 
+        let startup_version = String::from_utf8_lossy(self.version.as_bytes()).into_owned();
+
+        // `serve_cmd.go:99-101`: `tryAutoUpgrade` runs before `InitDB`'s
+        // service-version upsert. The no-op gate is ported; a pending upgrade
+        // is an explicit not-ported startup failure.
+        let auto_upgrade = try_auto_upgrade(&pool, &startup_version)
+            .await
+            .map_err(|error| ServiceError::new(format!("frontend.tryAutoUpgrade: {error}")))?;
+        if let AutoUpgradePlan::Required {
+            current, target, ..
+        } = &auto_upgrade
+        {
+            return Err(ServiceError::new(format!(
+                "frontend.tryAutoUpgrade: auto-upgrade from {current} to {target} is required, but the multiversion upgrade machinery is not ported"
+            )));
+        }
+
         // `serve_cmd.go:103-131`: service version, Redis readiness, and the
         // out-of-band migration gate. `SRC_DISABLE_OOBMIGRATION_VALIDATION`
         // (non-empty) skips the metadata sync/validation.
-        let startup_version = String::from_utf8_lossy(self.version.as_bytes()).into_owned();
         let startup_redis = sg_redis::KeyValue::connect(&sg_redis::cache_endpoint())
             .await
             .ok();
@@ -1514,6 +1693,79 @@ mod tests {
         .await;
         assert!(up);
         assert_eq!(attempts, 3);
+    }
+
+    #[test]
+    fn version_and_patch_matches_the_baseline() {
+        assert_eq!(
+            new_version_and_patch_from_string("5.1.3"),
+            Some((version(5, 1), 3))
+        );
+        assert_eq!(
+            new_version_and_patch_from_string("v4.5"),
+            Some((version(4, 5), 0))
+        );
+        assert_eq!(
+            new_version_and_patch_from_string("5.2.0+dev"),
+            Some((version(5, 2), 0))
+        );
+        assert_eq!(
+            new_version_and_patch_from_string("5.2.1-rc1"),
+            Some((version(5, 2), 1))
+        );
+        assert_eq!(new_version_and_patch_from_string("dev"), None);
+    }
+
+    fn auto_upgrade_required(plan: AutoUpgradePlan) -> bool {
+        matches!(plan, AutoUpgradePlan::Required { .. })
+    }
+
+    #[test]
+    fn autoupgrade_gate_matches_the_baseline_noop_paths() {
+        // Fresh instance: GetAutoUpgrade returns no row.
+        assert_eq!(
+            auto_upgrade_plan(None, "5.2.0", false),
+            Ok(AutoUpgradePlan::Skip(AutoUpgradeSkip::FreshInstance))
+        );
+        // auto_upgrade=false and no SRC_AUTOUPGRADE.
+        assert_eq!(
+            auto_upgrade_plan(Some(("5.1.0".to_owned(), false)), "5.2.0", false),
+            Ok(AutoUpgradePlan::Skip(AutoUpgradeSkip::Disabled))
+        );
+        // Same major/minor and an equal-or-newer patch.
+        assert_eq!(
+            auto_upgrade_plan(Some(("5.2.3".to_owned(), true)), "5.2.3", false),
+            Ok(AutoUpgradePlan::Skip(AutoUpgradeSkip::SameVersionOrNewer))
+        );
+        // Unparseable target: warn and skip.
+        assert_eq!(
+            auto_upgrade_plan(Some(("5.1.0".to_owned(), true)), "dev", false),
+            Ok(AutoUpgradePlan::Skip(AutoUpgradeSkip::UnexpectedTargetVersion))
+        );
+        // Unparseable current version: baseline error string.
+        assert_eq!(
+            auto_upgrade_plan(Some(("vNext".to_owned(), true)), "5.2.0", false),
+            Err(
+                "unexpected string for desired instance schema version, skipping auto-upgrade (vNext)"
+                    .to_owned()
+            )
+        );
+    }
+
+    #[test]
+    fn autoupgrade_gate_selects_the_upgrade_path_when_required() {
+        // DB intent, older minor version.
+        assert!(auto_upgrade_required(
+            auto_upgrade_plan(Some(("5.1.0".to_owned(), true)), "5.2.0", false).unwrap()
+        ));
+        // Environment intent.
+        assert!(auto_upgrade_required(
+            auto_upgrade_plan(Some(("5.1.0".to_owned(), false)), "5.2.0", true).unwrap()
+        ));
+        // Same minor, older patch.
+        assert!(auto_upgrade_required(
+            auto_upgrade_plan(Some(("5.2.1".to_owned(), true)), "5.2.3", false).unwrap()
+        ));
     }
 
     #[tokio::test]

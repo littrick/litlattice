@@ -410,6 +410,132 @@ impl AssetsProvider for DirProvider {
     }
 }
 
+/// The compile-time asset table standing in for Bazel's
+/// `//client/web/dist:copy_bundle` / `tar_dummy_manifest` packaging
+/// (`client/web/dist/BUILD.bazel`).
+///
+/// The baseline image ships `/assets-dist` on disk and `assets.Init()` always
+/// installs a `DirProvider`. The Rust binaries have no Bazel packaging step, so
+/// the default provider serves this table instead. `web.manifest.json` is the
+/// `genrule(name = "dummy_web_manifest")` body (`{}`), which is what
+/// `tar_dummy_manifest` embeds next to the copied bundle. Additional web
+/// bundles can be added here without changing the provider or HTTP surface.
+pub const EMBEDDED_ASSETS: &[(&str, &[u8])] = &[(WEB_MANIFEST_FILE, b"{}")];
+
+/// The compiled-in variant of `assets.DirProvider`: the same manifest
+/// validation and `http.Dir`-style directory semantics over an in-memory tree.
+#[derive(Clone, Debug)]
+pub struct EmbeddedAssets {
+    root: PathBuf,
+    reader: MemoryAssets,
+}
+
+impl EmbeddedAssets {
+    /// Build a provider from an explicit table (tests and embedders).
+    pub fn from_table(root: impl Into<PathBuf>, files: &[(&str, &[u8])]) -> Self {
+        let reader = MemoryAssets::new(
+            files
+                .iter()
+                .map(|(name, data)| ((*name).to_owned(), data.to_vec()))
+                .collect(),
+            Vec::new(),
+        );
+        Self {
+            root: root.into(),
+            reader,
+        }
+    }
+
+    /// The default compiled-in tree ([`EMBEDDED_ASSETS`]).
+    pub fn new() -> Self {
+        Self::from_table(DEFAULT_ASSET_PATH, EMBEDDED_ASSETS)
+    }
+
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    pub fn load_web_build_manifest(&self) -> Result<WebBuildManifest, ManifestError> {
+        load_web_build_manifest_from_reader(&self.root, &self.reader)
+    }
+
+    pub fn reader(&self) -> &MemoryAssets {
+        &self.reader
+    }
+}
+
+impl Default for EmbeddedAssets {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl AssetReader for EmbeddedAssets {
+    fn open(&self, name: &str) -> Result<AssetEntry, AssetError> {
+        self.reader.open(name)
+    }
+}
+
+/// `loadWebBuildManifest` over an [`AssetReader`]: `os.ReadFile` semantics,
+/// including the `IsNotExist` → [`ManifestError::NotFound`] mapping.
+pub fn load_web_build_manifest_from_reader(
+    root: &Path,
+    reader: &dyn AssetReader,
+) -> Result<WebBuildManifest, ManifestError> {
+    match reader.open(WEB_MANIFEST_FILE) {
+        Ok(entry) if !entry.is_dir => WebBuildManifest::from_json(&entry.data),
+        Ok(_) => Err(ManifestError::Io {
+            root: root.to_path_buf(),
+            message: "is a directory".to_owned(),
+        }),
+        Err(AssetError::NotFound) => Err(ManifestError::NotFound {
+            root: root.to_path_buf(),
+        }),
+        Err(AssetError::PermissionDenied) => Err(ManifestError::Io {
+            root: root.to_path_buf(),
+            message: "permission denied".to_owned(),
+        }),
+        Err(AssetError::Other(message)) => Err(ManifestError::Io {
+            root: root.to_path_buf(),
+            message,
+        }),
+    }
+}
+
+/// `assets.DirProvider`'s compiled-in counterpart.
+#[derive(Clone, Debug, Default)]
+pub struct EmbeddedProvider {
+    assets: EmbeddedAssets,
+}
+
+impl EmbeddedProvider {
+    pub fn new() -> Self {
+        Self {
+            assets: EmbeddedAssets::new(),
+        }
+    }
+
+    pub fn from_table(root: impl Into<PathBuf>, files: &[(&str, &[u8])]) -> Self {
+        Self {
+            assets: EmbeddedAssets::from_table(root, files),
+        }
+    }
+
+    pub fn assets_tree(&self) -> &EmbeddedAssets {
+        &self.assets
+    }
+}
+
+impl AssetsProvider for EmbeddedProvider {
+    fn load_web_build_manifest(&self) -> Result<WebBuildManifest, ManifestError> {
+        self.assets.load_web_build_manifest()
+    }
+
+    fn assets(&self) -> Arc<dyn AssetReader> {
+        Arc::new(self.assets.clone())
+    }
+}
+
 /// `assets.FailingAssetsProvider` (`ui/assets/assets.go:36-47`): the explicit
 /// "not configured" sentinel. The baseline panics from `Assets()`; the Rust
 /// port keeps the error return and makes `open` fail instead.
@@ -463,8 +589,23 @@ pub fn set_provider(provider: Arc<dyn AssetsProvider>) {
 
 /// `assets.Init()` (`ui/assets/assets.go:19-21`, called from
 /// `cmd/frontend/main.go:11`).
+///
+/// The baseline always installs a [`DirProvider`] for [`DEFAULT_ASSET_PATH`]
+/// because Bazel bakes `/assets-dist` into the image. This crate ships the
+/// same tree as [`EMBEDDED_ASSETS`]; a real `/assets-dist` directory (official
+/// container, operator override) still wins, otherwise the compiled-in
+/// provider is installed.
 pub fn init() {
-    use_assets_provider_for_path(DEFAULT_ASSET_PATH);
+    if Path::new(DEFAULT_ASSET_PATH).is_dir() {
+        use_assets_provider_for_path(DEFAULT_ASSET_PATH);
+    } else {
+        use_embedded_assets_provider();
+    }
+}
+
+/// Install the compiled-in provider ([`EMBEDDED_ASSETS`]).
+pub fn use_embedded_assets_provider() {
+    set_provider(Arc::new(EmbeddedProvider::new()));
 }
 
 /// `assets.UseDevAssetsProvider()` (`ui/assets/assets.go:53-56`, called from
@@ -749,6 +890,63 @@ mod tests {
         assert!(assets.open("/img/").unwrap().is_dir);
         assert!(assets.open("/").unwrap().is_dir);
         assert_eq!(assets.open("/missing.js"), Err(AssetError::NotFound));
+    }
+
+    #[test]
+    fn embedded_default_tree_matches_the_dummy_manifest() {
+        let provider = EmbeddedProvider::new();
+        assert_eq!(provider.assets_tree().root(), Path::new(DEFAULT_ASSET_PATH));
+        assert_eq!(
+            provider.assets_tree().reader().open("/web.manifest.json"),
+            Ok(AssetEntry::file(b"{}".to_vec()))
+        );
+        assert_eq!(
+            provider.load_web_build_manifest().expect("manifest"),
+            WebBuildManifest::default()
+        );
+        assert!(provider
+            .assets_tree()
+            .reader()
+            .open("/")
+            .expect("root")
+            .is_dir);
+    }
+
+    #[test]
+    fn embedded_tree_keeps_dir_semantics_and_manifest_validation() {
+        let provider = EmbeddedProvider::from_table(
+            "/assets-dist",
+            &[
+                ("web.manifest.json", br#"{"main.js":"main.abc.js"}"#),
+                ("img/logo.svg", b"<svg/>"),
+            ],
+        );
+        let reader = provider.assets();
+        assert_eq!(reader.open("/main.js"), Err(AssetError::NotFound));
+        assert!(reader.open("/img").expect("dir").is_dir);
+        assert!(reader.open("/img/").expect("dir").is_dir);
+        assert_eq!(reader.open("/img/logo.svg").expect("file").data, b"<svg/>");
+        assert_eq!(reader.open("/../etc/passwd"), Err(AssetError::NotFound));
+        let manifest = provider.load_web_build_manifest().expect("manifest");
+        assert_eq!(manifest.main_js_bundle_path, "main.abc.js");
+
+        let missing = EmbeddedProvider::from_table(
+            "/assets-dist",
+            &[("index.html", b"<!doctype html>")],
+        );
+        assert_eq!(
+            missing.load_web_build_manifest(),
+            Err(ManifestError::NotFound {
+                root: PathBuf::from("/assets-dist")
+            })
+        );
+
+        let invalid =
+            EmbeddedProvider::from_table("/assets-dist", &[(WEB_MANIFEST_FILE, b"{")]);
+        assert!(matches!(
+            invalid.load_web_build_manifest(),
+            Err(ManifestError::Parse { .. })
+        ));
     }
 
     #[test]

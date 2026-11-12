@@ -3942,9 +3942,12 @@ dependencies = [
 name = "sg-bin-server"
 version = "0.1.0"
 dependencies = [
+ "serde",
+ "serde_json",
  "sg-core",
  "sg-entry",
  "sg-log",
+ "sg-ui",
  "tokio",
 ]
 
