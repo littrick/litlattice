@@ -513,7 +513,8 @@ pub struct ExternalAccountsDeps {
     pub dotcom: bool,
     /// `Mutation.addExternalAccount` / `deleteExternalAccount` side-effect
     /// seams (M9.9b). `None` keeps scheduling a no-op, the feature flag false
-    /// and Gerrit not ported.
+    /// and `gerrit.VerifyAccount` unconfigured (Gerrit additions then report a
+    /// not-ported error; the local JSON/spec/upsert path is always active).
     pub perms_sync: Option<Arc<dyn crate::external_accounts_graphql::PermsSyncScheduler>>,
     pub feature_flags:
         Option<Arc<dyn crate::external_accounts_graphql::ExternalAccountFeatureFlags>>,
@@ -1838,12 +1839,18 @@ impl GraphqlDeps for SchemaGraphqlDeps {
             if !lookup.is_empty() {
                 Arc::make_mut(&mut nested).user_external_accounts = lookup;
             }
+            let cody_sams_service_id =
+                crate::external_accounts_graphql::sams_service_id(&deps.live.current().site);
+            let cody_sams_provider_configured =
+                crate::external_accounts_graphql::sams_provider_configured(
+                    &deps.live.current().site,
+                    &cody_sams_service_id,
+                );
             Arc::make_mut(&mut nested).external_account_cody = Some(Arc::new(
                 crate::external_accounts_graphql::CodySubscriptionConfig {
                     dotcom: deps.dotcom,
-                    sams_service_id: crate::external_accounts_graphql::sams_service_id(
-                        &deps.live.current().site,
-                    ),
+                    sams_service_id: cody_sams_service_id,
+                    sams_provider_configured: cody_sams_provider_configured,
                 },
             ));
             // `Site.externalAccounts` (M9.9b): a site-admin-only connection
@@ -2426,6 +2433,37 @@ where
     response
 }
 
+/// `recordAuditLog`'s `actor.FromContext` reduced to the audit actor.
+///
+/// The internal listener's `actor.HTTPMiddleware` (and the external chain's
+/// session/anonymous-UID middlewares) already resolved the actor and inserted
+/// it as [`crate::actor_chain::ChainActor`]; that context actor is authoritative
+/// (in particular its `AnonymousUID` comes from the internal listener's
+/// propagation header only, not the cookie). Direct callers without the chain
+/// fall back to the executor shape plus `AnonymousUIDMiddleware`'s cookie-first
+/// lookup.
+pub fn graphql_audit_actor<B>(
+    req: &Request<B>,
+    executor: Actor,
+) -> crate::audit::AuditActor {
+    if let Some(crate::actor_chain::ChainActor(chain_actor)) =
+        req.extensions().get::<crate::actor_chain::ChainActor>()
+    {
+        return chain_actor.to_audit_actor();
+    }
+    let mut audit_actor = crate::audit::AuditActor::new(
+        executor.uid(),
+        match executor {
+            Actor::User { .. } => String::new(),
+            Actor::Anonymous | Actor::Internal => actor_anonymous_uid(req.headers()),
+        },
+    );
+    // `audit.Log` drops internal actors unless `internalTraffic` auditing is
+    // enabled (`internal/audit/audit.go:29-33`).
+    audit_actor.internal = executor.is_internal();
+    audit_actor
+}
+
 async fn graphql_response_inner<B>(
     req: &mut Request<B>,
     live: &LiveConfig,
@@ -2535,19 +2573,7 @@ where
     // from here on every return path observes the duration and (when enabled)
     // writes the audit log.
     let audit_context = crate::audit::GraphqlAuditContext {
-        actor: {
-            let mut audit_actor = crate::audit::AuditActor::new(
-                actor.uid(),
-                match actor {
-                    Actor::User { .. } => String::new(),
-                    Actor::Anonymous | Actor::Internal => actor_anonymous_uid(req.headers()),
-                },
-            );
-            // `audit.Log` drops internal actors unless `internalTraffic`
-            // auditing is enabled (`internal/audit/audit.go:29-33`).
-            audit_actor.internal = actor.is_internal();
-            audit_actor
-        },
+        actor: graphql_audit_actor(req, actor),
         client: crate::audit::client_info(
             req.headers(),
             req.extensions()

@@ -102,6 +102,19 @@ impl Actor {
         self.uid.to_string()
     }
 
+    /// The `audit.Log` view of this actor (`actor.FromContext` reduced to the
+    /// fields `audit.actorId` and the internal-actor filter read).
+    ///
+    /// `audit.actorId` only honours a **positive** UID (`audit.go:61-69`), so a
+    /// `UID == 0` actor keeps its anonymous UID.
+    pub fn to_audit_actor(&self) -> AuditActor {
+        AuditActor {
+            uid: (self.uid > 0).then_some(self.uid),
+            anonymous_uid: self.anonymous_uid.clone(),
+            internal: self.internal,
+        }
+    }
+
     /// The `sg-graphql` executor's actor. Precedence mirrors Go's
     /// `IsInternal`/`IsAuthenticated`: internal wins, then `uid != 0`, then
     /// anonymous.

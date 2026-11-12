@@ -20,22 +20,29 @@
 //!   `cannot find authorization provider for the external account, service
 //!   type: %s` error. The GraphQL `publicAccountData` field swallows provider
 //!   errors and renders `null`, exactly like `ExternalAccount.PublicAccountData`.
-//! - `CodySubscription`: non-dotcom guard and the service-type/service-id
-//!   mismatch returning `null`; the matching dotcom subscription lookup is an
-//!   explicit not-ported seam (see the overview §4).
+//! - `CodySubscription`: non-dotcom guard, the service-type/service-id
+//!   mismatch returning `null`, the local free-plan branch
+//!   (`consolidateSubscriptionDetails(ctx, user, nil)`), and the exact
+//!   `no SAMS authorization provider configured` error when no matching
+//!   openidconnect provider is configured. Fetching a paid subscription from
+//!   the SSC backend remains a network seam (see the overview §4).
+//! - `Mutation.addExternalAccount(serviceType: "gerrit")`: JSON credential
+//!   parsing, `AccountSpec` construction, unencrypted account/auth-data
+//!   serialization and `Upsert`; only `gerrit.VerifyAccount`'s URL
+//!   normalization and network call remain behind [`GerritAccountService`].
 //!
-//! Not ported: `Site.externalAccounts`, `AddExternalAccount`/
-//! `DeleteExternalAccount`, `ExternalAccount.accountData` (raw decrypted JSON)
-//! and the code-host/OIDC provider `ExternalAccountInfo` parsers. The
-//! production provider registry only registers `saml`, `http-header` and
-//! `builtin`, so other service types report the baseline's unknown-provider
-//! error.
+//! Not ported: `Site.externalAccounts`, `ExternalAccount.accountData` (raw
+//! decrypted JSON) and the code-host/OIDC provider `ExternalAccountInfo`
+//! parsers. The production provider registry only registers `saml`,
+//! `http-header` and `builtin`, so other service types report the baseline's
+//! unknown-provider error.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use base64::Engine as _;
+use serde::{Deserialize, Serialize};
 use sg_config::SiteConfiguration;
 use sg_encryption::Key;
 use sg_graphql::exec::{Actor, Arguments, ExecError, FieldValue, ObjectValue, RootField};
@@ -142,18 +149,39 @@ pub trait ExternalAccountFeatureFlags: Send + Sync {
     ) -> bool;
 }
 
-/// `gerrit/externalaccount.AddGerritExternalAccount`'s network verification
-/// seam (see the overview §4: not ported).
+/// `gerrit.AccountCredentials` (`internal/extsvc/gerrit/account.go:21-24`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GerritAccountCredentials {
+    #[serde(default)]
+    pub username: String,
+    #[serde(default)]
+    pub password: String,
+}
+
+/// `gerrit.Account` (`internal/extsvc/gerrit/types.go:126-132`). Field order
+/// and JSON keys match the Go struct exactly, since both the account data and
+/// the credentials are stored as unencrypted JSON.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GerritAccount {
+    #[serde(rename = "_account_id")]
+    pub id: i32,
+    pub name: String,
+    pub display_name: String,
+    pub email: String,
+    pub username: String,
+}
+
+/// `gerrit.VerifyAccount` (`internal/extsvc/gerrit/account.go:65-75`) plus its
+/// `url.Parse` + `extsvc.NormalizeBaseURL` prelude
+/// (`externalaccount.go:21-25`): the only network/URL-handling part of Gerrit
+/// external account additions that is not locally reproducible.
 #[async_trait]
 pub trait GerritAccountService: Send + Sync {
-    async fn add(
+    async fn verify_account(
         &self,
-        store: &dyn ExternalAccountsStore,
-        user_id: i32,
         service_id: &str,
-        account_details: &str,
-        key: Option<&dyn Key>,
-    ) -> Result<(), String>;
+        credentials: &GerritAccountCredentials,
+    ) -> Result<GerritAccount, String>;
 }
 
 /// `database.ReasonExternalAccountAdded` / `...Deleted`.
@@ -356,7 +384,21 @@ pub enum ExternalAccountNodeLookup {
     Error(String),
 }
 
-/// `CodySubscription`'s observable outcomes in this slice.
+/// `cody.UserSubscription` (`cmd/frontend/internal/cody/subscription.go:21-40`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CodySubscription {
+    /// `ssc.SubscriptionStatus`: `ACTIVE`/`PAST_DUE`/`UNPAID`/`CANCELED`/
+    /// `TRIALING`/`OTHER`.
+    pub status: &'static str,
+    /// `cody.UserSubscriptionPlan`: `FREE`/`PRO`.
+    pub plan: &'static str,
+    pub apply_pro_rate_limits: bool,
+    pub current_period_start_at: OffsetDateTime,
+    pub current_period_end_at: OffsetDateTime,
+    pub cancel_at_period_end: bool,
+}
+
+/// `CodySubscription`'s observable outcomes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CodySubscriptionOutcome {
     /// `!dotcom`: the baseline's `this feature is only available on
@@ -364,8 +406,56 @@ pub enum CodySubscriptionOutcome {
     Unavailable,
     /// Dotcom but not the SAML/openidconnect account: `(nil, nil)`.
     Mismatch,
-    /// The matching dotcom account: subscription lookup not ported.
-    NotPorted,
+    /// `samsAccountID == ""`: the local free-plan branch of
+    /// `consolidateSubscriptionDetails(ctx, user, nil)`.
+    Free(CodySubscription),
+    /// `samsAccountID != ""` and no SAMS OIDC provider is configured:
+    /// `ssc.NewClient`'s exact error.
+    SamsNotConfigured,
+    /// `samsAccountID != ""` and SAMS is configured: the subscription is
+    /// fetched from the SSC backend (network, not ported).
+    SscUnavailable,
+    /// `r.User(ctx)` failed (`UserByIDInt32`); its error is the resolver's.
+    UserLookupError,
+}
+
+/// The GraphQL-facing [`CodySubscription`] object.
+pub struct CodySubscriptionObject {
+    subscription: CodySubscription,
+}
+
+impl ObjectValue for CodySubscriptionObject {
+    fn type_name(&self) -> &'static str {
+        "CodySubscription"
+    }
+
+    fn field(
+        &self,
+        field: &str,
+        _arguments: &Arguments,
+        _actor: Actor,
+    ) -> Result<Option<FieldValue>, ExecError> {
+        let sub = &self.subscription;
+        match field {
+            "status" => Ok(Some(FieldValue::Json(Json::Str(
+                sub.status.to_owned(),
+            )))),
+            "plan" => Ok(Some(FieldValue::Json(Json::Str(sub.plan.to_owned())))),
+            "applyProRateLimits" => Ok(Some(FieldValue::Json(Json::Bool(
+                sub.apply_pro_rate_limits,
+            )))),
+            "currentPeriodStartAt" => Ok(Some(FieldValue::Json(Json::Str(
+                datetime_rfc3339(sub.current_period_start_at),
+            )))),
+            "currentPeriodEndAt" => Ok(Some(FieldValue::Json(Json::Str(
+                datetime_rfc3339(sub.current_period_end_at),
+            )))),
+            "cancelAtPeriodEnd" => Ok(Some(FieldValue::Json(Json::Bool(
+                sub.cancel_at_period_end,
+            )))),
+            _ => Ok(None),
+        }
+    }
 }
 
 /// `dotcom.SourcegraphDotComMode()` plus `ssc.GetSAMSServiceID()`, reduced to
@@ -374,6 +464,10 @@ pub enum CodySubscriptionOutcome {
 pub struct CodySubscriptionConfig {
     pub dotcom: bool,
     pub sams_service_id: String,
+    /// Whether `conf.Get().AuthProviders` contains an `openidconnect` provider
+    /// whose issuer is [`Self::sams_service_id`] (`ssc.NewClient`,
+    /// `ssc.go:171-193`).
+    pub sams_provider_configured: bool,
 }
 
 /// `ssc.GetSAMSServiceID()` (`cmd/frontend/internal/ssc/ssc.go:143-162`).
@@ -394,11 +488,139 @@ pub fn sams_service_id(site: &SiteConfiguration) -> String {
     }
 }
 
-/// `externalAccountResolver.CodySubscription` (`external_account.go:60-79`).
-pub fn cody_subscription_outcome(
+/// `ssc.NewClient`'s provider scan: an `openidconnect` `auth.providers` entry
+/// whose `issuer` equals the SAMS service id.
+pub fn sams_provider_configured(site: &SiteConfiguration, sams_service_id: &str) -> bool {
+    site.raw()
+        .get("auth.providers")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|providers| {
+            providers.iter().any(|provider| {
+                provider.get("type").and_then(serde_json::Value::as_str)
+                    == Some("openidconnect")
+                    && provider.get("issuer").and_then(serde_json::Value::as_str)
+                        == Some(sams_service_id)
+            })
+        })
+}
+
+/// `time.Date(year, month, day, ...)`'s normalization: month outside `1..=12`
+/// rolls the year, and `day` outside the month rolls into adjacent months.
+fn go_date_norm(
+    year: i32,
+    month: i64,
+    day: i64,
+    hour: u8,
+    minute: u8,
+    second: u8,
+    nanosecond: u32,
+) -> OffsetDateTime {
+    let total_months = i64::from(year) * 12 + (month - 1);
+    let norm_year = total_months.div_euclid(12) as i32;
+    let norm_month = (total_months.rem_euclid(12) + 1) as u8;
+    let first = time::Date::from_calendar_date(
+        norm_year,
+        time::Month::try_from(norm_month).expect("normalized month"),
+        1,
+    )
+    .expect("normalized year");
+    let date = first + time::Duration::days(day - 1);
+    let clock =
+        time::Time::from_hms_nano(hour, minute, second, nanosecond).expect("valid clock time");
+    OffsetDateTime::new_utc(date, clock)
+}
+
+/// Go `t.AddDate(0, months, 0)` for the month/day fields the free-period
+/// calculation reads.
+fn go_add_months(date: OffsetDateTime, months: i32) -> OffsetDateTime {
+    go_date_norm(
+        date.year(),
+        i64::from(u8::from(date.month())) + i64::from(months),
+        i64::from(date.day()),
+        0,
+        0,
+        0,
+        0,
+    )
+}
+
+fn days_in_month(year: i32, month: u8) -> u8 {
+    let first = time::Date::from_calendar_date(
+        year,
+        time::Month::try_from(month).expect("month"),
+        1,
+    )
+    .expect("year");
+    let (next_year, next_month) = if month == 12 {
+        (year + 1, 1)
+    } else {
+        (year, month + 1)
+    };
+    let next = time::Date::from_calendar_date(
+        next_year,
+        time::Month::try_from(next_month).expect("month"),
+        1,
+    )
+    .expect("year");
+    (next - first).whole_days() as u8
+}
+
+/// `freeUserCurrentPeriodDateRange` (`cmd/frontend/internal/cody/utils.go:31-74`)
+/// for the `subscription == nil` branch, using UTC `now`.
+pub fn free_user_current_period_date_range(
+    user_created_at: OffsetDateTime,
+    now: OffsetDateTime,
+) -> (OffsetDateTime, OffsetDateTime) {
+    let target_day = i64::from(user_created_at.day());
+    let mut start_day = target_day;
+    let mut end_day = target_day - 1;
+
+    let (start_year, start_month) = if i64::from(now.day()) < target_day {
+        let previous = go_add_months(now, -1);
+        (previous.year(), u8::from(previous.month()))
+    } else {
+        (now.year(), u8::from(now.month()))
+    };
+    let (end_year, end_month) = if i64::from(now.day()) < target_day {
+        (now.year(), u8::from(now.month()))
+    } else {
+        let next = go_add_months(now, 1);
+        (next.year(), u8::from(next.month()))
+    };
+
+    let start_days = i64::from(days_in_month(start_year, start_month));
+    if start_day > start_days {
+        start_day = start_days;
+    }
+    let end_days = i64::from(days_in_month(end_year, end_month));
+    if end_day > end_days {
+        end_day = end_days;
+    }
+
+    (
+        go_date_norm(start_year, i64::from(start_month), start_day, 0, 0, 0, 0),
+        go_date_norm(
+            end_year,
+            i64::from(end_month),
+            end_day,
+            23,
+            59,
+            59,
+            59,
+        ),
+    )
+}
+
+/// `externalAccountResolver.CodySubscription` + `cody.SubscriptionForSAMSAccountID`
+/// (`external_account.go:60-79`, `subscription.go:176-193`), reduced to the
+/// branches that do not require the SSC network backend.
+pub fn cody_subscription(
     config: &CodySubscriptionConfig,
     service_type: &str,
     service_id: &str,
+    account_id: &str,
+    user: Option<&UserData>,
+    now: OffsetDateTime,
 ) -> CodySubscriptionOutcome {
     if !config.dotcom {
         return CodySubscriptionOutcome::Unavailable;
@@ -406,7 +628,28 @@ pub fn cody_subscription_outcome(
     if service_type != "openidconnect" || service_id != config.sams_service_id {
         return CodySubscriptionOutcome::Mismatch;
     }
-    CodySubscriptionOutcome::NotPorted
+    // `r.User(ctx)` (`external_account.go:69-72`).
+    let Some(user) = user else {
+        return CodySubscriptionOutcome::UserLookupError;
+    };
+    if account_id.is_empty() {
+        // `SubscribeForSAMSAccountID(ctx, ..., "")` →
+        // `consolidateSubscriptionDetails(ctx, user, nil)`.
+        let (start, end) = free_user_current_period_date_range(user.created_at, now);
+        return CodySubscriptionOutcome::Free(CodySubscription {
+            status: "ACTIVE",
+            plan: "FREE",
+            apply_pro_rate_limits: false,
+            current_period_start_at: start,
+            current_period_end_at: end,
+            cancel_at_period_end: false,
+        });
+    }
+    if !config.sams_provider_configured {
+        // `SSCClientFromCtx` → `ssc.NewClient`'s exact error.
+        return CodySubscriptionOutcome::SamsNotConfigured;
+    }
+    CodySubscriptionOutcome::SscUnavailable
 }
 
 /// `gqlutil.ConnectionArgs`'s single `first` argument.
@@ -909,6 +1152,49 @@ async fn schedule_perms_sync(
     }
 }
 
+/// `gerrit/externalaccount.AddGerritExternalAccount`
+/// (`internal/extsvc/gerrit/externalaccount/externalaccount.go:14-53`).
+///
+/// The locally reproducible part (JSON parsing, `AccountSpec` construction,
+/// unencrypted account/auth data, `Upsert`) is implemented here; the URL
+/// parsing/normalization and `gerrit.VerifyAccount` network call stay behind
+/// [`GerritAccountService`].
+async fn add_gerrit_external_account(
+    store: &dyn ExternalAccountsStore,
+    gerrit: Option<&dyn GerritAccountService>,
+    user_id: i32,
+    service_id: &str,
+    account_details: &str,
+    key: Option<&dyn Key>,
+) -> Result<(), String> {
+    let credentials: GerritAccountCredentials = serde_json::from_str(account_details)
+        .map_err(|error| error.to_string())?;
+    // `gerrit.VerifyAccount` (network) plus the URL prelude.
+    let Some(gerrit) = gerrit else {
+        return Err(
+            "gerrit external account additions are not ported without a GerritAccountService \
+             (M9.20c: `gerrit.VerifyAccount` network verification)"
+                .to_owned(),
+        );
+    };
+    let account = gerrit.verify_account(service_id, &credentials).await?;
+    let account_data = serde_json::to_string(&account)
+        .map_err(|error| format!("failed to marshal gerrit account: {error}"))?;
+    let auth_data = serde_json::to_string(&credentials)
+        .map_err(|error| format!("failed to marshal gerrit account credentials: {error}"))?;
+    let spec = ExternalAccountSpec {
+        service_type: "gerrit".to_owned(),
+        // The baseline passes the raw `serviceID` argument, not the
+        // normalized URL.
+        service_id: service_id.to_owned(),
+        client_id: String::new(),
+        account_id: account.id.to_string(),
+    };
+    store
+        .upsert_with_data(user_id, &spec, Some(&auth_data), Some(&account_data), key)
+        .await
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn add_external_account(
     store: &dyn ExternalAccountsStore,
@@ -928,16 +1214,17 @@ async fn add_external_account(
     let service_id = field.arguments.string("serviceID").unwrap_or_default();
     let account_details = field.arguments.string("accountDetails").unwrap_or_default();
     match service_type {
-        "gerrit" => match gerrit {
-            Some(gerrit) => {
-                gerrit
-                    .add(store, uid, service_id, account_details, key.as_deref())
-                    .await?;
-            }
-            None => {
-                return Err("gerrit external account additions are not ported (M9.9b)".to_owned())
-            }
-        },
+        "gerrit" => {
+            add_gerrit_external_account(
+                store,
+                gerrit,
+                uid,
+                service_id,
+                account_details,
+                key.as_deref(),
+            )
+            .await?;
+        }
         "sourcegraph-operator" => {
             add_soap_external_account(
                 store,
@@ -1654,14 +1941,36 @@ impl ObjectValue for ExternalAccountObject {
                 let Some(config) = &self.nested.external_account_cody else {
                     return Ok(None);
                 };
-                match cody_subscription_outcome(config, &row.service_type, &row.service_id) {
+                match cody_subscription(
+                    config,
+                    &row.service_type,
+                    &row.service_id,
+                    &row.account_id,
+                    self.data.user.as_ref(),
+                    OffsetDateTime::now_utc(),
+                ) {
                     CodySubscriptionOutcome::Unavailable => Err(ExecError::new(
                         "this feature is only available on sourcegraph.com",
                     )),
                     CodySubscriptionOutcome::Mismatch => Ok(Some(FieldValue::Null)),
-                    CodySubscriptionOutcome::NotPorted => Err(ExecError::new(
-                        "CodySubscription for SAML accounts is not ported (M9.8ka)",
+                    CodySubscriptionOutcome::Free(subscription) => {
+                        Ok(Some(FieldValue::Object(Arc::new(CodySubscriptionObject {
+                            subscription,
+                        }))))
+                    }
+                    CodySubscriptionOutcome::SamsNotConfigured => {
+                        // `ssc.NewClient` (`ssc.go:171-203`) returns this exact
+                        // error when no openidconnect provider matches the SAMS
+                        // service id.
+                        Err(ExecError::new("no SAMS authorization provider configured"))
+                    }
+                    CodySubscriptionOutcome::SscUnavailable => Err(ExecError::new(
+                        "CodySubscription for SAMS accounts requires the SSC backend (M9.20c)",
                     )),
+                    CodySubscriptionOutcome::UserLookupError => Err(ExecError::new(format!(
+                        "user not found: [{}]",
+                        row.user_id
+                    ))),
                 }
             }
             _ => Ok(None),
@@ -1692,5 +2001,159 @@ impl ObjectValue for PublicExternalAccountDataObject {
             "url" => Ok(Some(optional_string_field(&self.data.url))),
             _ => Ok(None),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn date(year: i32, month: u8, day: u8) -> OffsetDateTime {
+        OffsetDateTime::new_utc(
+            time::Date::from_calendar_date(year, time::Month::try_from(month).unwrap(), day)
+                .unwrap(),
+            time::Time::MIDNIGHT,
+        )
+    }
+
+    fn user(created_at: OffsetDateTime) -> UserData {
+        UserData {
+            id: 7,
+            username: "alice".to_owned(),
+            display_name: String::new(),
+            avatar_url: String::new(),
+            created_at,
+            updated_at: created_at,
+            site_admin: false,
+            tos_accepted: false,
+            primary_email: String::new(),
+        }
+    }
+
+    fn config() -> CodySubscriptionConfig {
+        CodySubscriptionConfig {
+            dotcom: true,
+            sams_service_id: "https://accounts.sourcegraph.com".to_owned(),
+            sams_provider_configured: false,
+        }
+    }
+
+    #[test]
+    fn free_period_previous_and_current_month() {
+        let (start, end) =
+            free_user_current_period_date_range(date(2023, 1, 15), date(2023, 3, 10));
+        assert_eq!(datetime_rfc3339(start), "2023-02-15T00:00:00Z");
+        assert_eq!(datetime_rfc3339(end), "2023-03-14T23:59:59Z");
+    }
+
+    #[test]
+    fn free_period_clamps_target_day() {
+        let (start, end) =
+            free_user_current_period_date_range(date(2023, 1, 31), date(2023, 2, 15));
+        assert_eq!(datetime_rfc3339(start), "2023-01-31T00:00:00Z");
+        assert_eq!(datetime_rfc3339(end), "2023-02-28T23:59:59Z");
+    }
+
+    #[test]
+    fn free_period_end_day_zero_is_previous_month_end() {
+        let (start, end) =
+            free_user_current_period_date_range(date(2023, 1, 1), date(2023, 3, 10));
+        assert_eq!(datetime_rfc3339(start), "2023-03-01T00:00:00Z");
+        assert_eq!(datetime_rfc3339(end), "2023-03-31T23:59:59Z");
+    }
+
+    #[test]
+    fn cody_subscription_branches() {
+        let user = user(date(2023, 1, 15));
+        let now = date(2023, 3, 20);
+        assert_eq!(
+            cody_subscription(&config(), "openidconnect", "x", "", Some(&user), now),
+            CodySubscriptionOutcome::Mismatch
+        );
+        assert_eq!(
+            cody_subscription(&config(), "openidconnect", "https://accounts.sourcegraph.com", "", None, now),
+            CodySubscriptionOutcome::UserLookupError
+        );
+        match cody_subscription(
+            &config(),
+            "openidconnect",
+            "https://accounts.sourcegraph.com",
+            "",
+            Some(&user),
+            now,
+        ) {
+            CodySubscriptionOutcome::Free(sub) => {
+                assert_eq!(sub.status, "ACTIVE");
+                assert_eq!(sub.plan, "FREE");
+                assert!(!sub.apply_pro_rate_limits);
+                assert!(!sub.cancel_at_period_end);
+            }
+            other => panic!("expected free plan, got {other:?}"),
+        }
+        assert_eq!(
+            cody_subscription(
+                &config(),
+                "openidconnect",
+                "https://accounts.sourcegraph.com",
+                "sams-id",
+                Some(&user),
+                now,
+            ),
+            CodySubscriptionOutcome::SamsNotConfigured
+        );
+        let mut configured = config();
+        configured.sams_provider_configured = true;
+        assert_eq!(
+            cody_subscription(
+                &configured,
+                "openidconnect",
+                "https://accounts.sourcegraph.com",
+                "sams-id",
+                Some(&user),
+                now,
+            ),
+            CodySubscriptionOutcome::SscUnavailable
+        );
+        let mut not_dotcom = config();
+        not_dotcom.dotcom = false;
+        assert_eq!(
+            cody_subscription(&not_dotcom, "openidconnect", "x", "", Some(&user), now),
+            CodySubscriptionOutcome::Unavailable
+        );
+    }
+
+    #[test]
+    fn gerrit_json_matches_go_encoding() {
+        let account = GerritAccount {
+            id: 42,
+            name: "Jane".to_owned(),
+            display_name: "Jane Doe".to_owned(),
+            email: "jane@example.com".to_owned(),
+            username: "jane".to_owned(),
+        };
+        assert_eq!(
+            serde_json::to_string(&account).unwrap(),
+            r#"{"_account_id":42,"name":"Jane","display_name":"Jane Doe","email":"jane@example.com","username":"jane"}"#
+        );
+        let credentials = GerritAccountCredentials {
+            username: "jane".to_owned(),
+            password: "secret".to_owned(),
+        };
+        assert_eq!(
+            serde_json::to_string(&credentials).unwrap(),
+            r#"{"username":"jane","password":"secret"}"#
+        );
+        // Missing fields default; unknown fields are ignored like
+        // `encoding/json`.
+        assert_eq!(
+            serde_json::from_str::<GerritAccountCredentials>(
+                r#"{"username":"jane","extra":true}"#
+            )
+            .unwrap(),
+            GerritAccountCredentials {
+                username: "jane".to_owned(),
+                password: String::new(),
+            }
+        );
     }
 }
