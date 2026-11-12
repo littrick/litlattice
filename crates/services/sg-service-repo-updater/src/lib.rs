@@ -252,11 +252,20 @@ impl Service for RepoUpdaterService {
             Arc::new(HttpClientGetter(sg_http::HttpClient::new()));
         let doer: Arc<dyn sg_extsvc::HttpDoer> =
             Arc::new(HttpClientDoer(sg_http::HttpClient::new()));
-        let source_factory = Arc::new(ExtsvcSourceFactory::new(
-            Some(http),
-            Some(doer),
-            Arc::clone(&keyring),
-        ));
+        // Perforce and Gitolite reach gitserver through the same address
+        // selection and connection cache as the scheduler/purge clients.
+        let sources = Arc::new(gitserver::GitserverSourcesClient::production(Arc::clone(
+            &gitserver_client,
+        )));
+        let perforce_sources: Arc<dyn sg_extsvc::perforce::PerforceGitserver> =
+            sources.clone();
+        let gitolite_sources: Arc<dyn sg_extsvc::gitolite::GitoliteRepoLister> = sources;
+        let source_factory = Arc::new(
+            ExtsvcSourceFactory::new(Some(http), Some(doer), Arc::clone(&keyring)).with_gitserver(
+                Some(perforce_sources),
+                Some(gitolite_sources),
+            ),
+        );
         // The relay below subscribes before any sync runs, so no diff is
         // dropped. The buffer only matters when the relay lags.
         let (diff_tx, _) = tokio::sync::broadcast::channel(64);

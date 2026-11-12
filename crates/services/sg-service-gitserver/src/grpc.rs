@@ -48,6 +48,9 @@ pub struct Grpc {
     pub patch: Option<Arc<crate::patch::PatchService>>,
     /// `Server`'s Perforce management RPCs; `None` only in unit tests.
     pub perforce: Option<Arc<crate::perforce::PerforceService>>,
+    /// `defaultGitolite`: the `ListGitolite` repository source. Production is
+    /// a [`crate::gitolite::GitoliteFetcher`]; tests inject a fixed lister.
+    pub gitolite: Arc<dyn crate::gitolite::GitoliteRepoLister>,
 }
 
 impl Grpc {
@@ -553,7 +556,9 @@ impl gpb::gitserver_service_server::GitserverService for Grpc {
         request: GrpcRequest<gpb::ListGitoliteRequest>,
     ) -> Result<GrpcResponse<gpb::ListGitoliteResponse>, Status> {
         let host = request.into_inner().gitolite_host;
-        let repos = crate::gitolite::list_repos(&host)
+        let repos = self
+            .gitolite
+            .list_repos(&host)
             .await
             .map_err(Status::internal)?;
         Ok(GrpcResponse::new(gpb::ListGitoliteResponse {
@@ -1557,6 +1562,7 @@ mod tests {
             cloneable: None,
             patch: None,
             perforce: None,
+            gitolite: Arc::new(crate::gitolite::GitoliteFetcher::with_default_command()),
         }
     }
 

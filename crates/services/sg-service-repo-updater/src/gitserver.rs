@@ -94,6 +94,7 @@ pub fn system_time_to_timestamp(time: std::time::SystemTime) -> Timestamp {
 }
 
 type Client = gpb::gitserver_repository_service_client::GitserverRepositoryServiceClient<Channel>;
+type ServiceClient = gpb::gitserver_service_client::GitserverServiceClient<Channel>;
 
 /// Keeps `src_gitserver_client_concurrent_requests` balanced with the
 /// semaphore permit: the baseline's `observedLimiter` increments after
@@ -111,7 +112,9 @@ impl Drop for ObservedPermit<'_> {
 
 pub struct GitserverRepoClient {
     live: Arc<LiveConfig>,
-    clients: Mutex<HashMap<String, Client>>,
+    /// One lazily-connected channel per gitserver address, shared by the
+    /// repository and source-service clients (baseline `GitserverConns`).
+    channels: Mutex<HashMap<String, Channel>>,
     limit: Semaphore,
     metrics: Arc<Metrics>,
 }
@@ -120,7 +123,7 @@ impl GitserverRepoClient {
     pub fn new(live: Arc<LiveConfig>, metrics: Arc<Metrics>) -> Self {
         Self {
             live,
-            clients: Mutex::new(HashMap::new()),
+            channels: Mutex::new(HashMap::new()),
             limit: Semaphore::new(concurrency_limit()),
             metrics,
         }
@@ -143,21 +146,30 @@ impl GitserverRepoClient {
     // `tonic::Status` is the error type `RepoUpdateClient` uses; boxing it
     // here would only move the conversion inside each RPC.
     #[allow(clippy::result_large_err)]
-    async fn client_for(&self, addr: &str) -> Result<Client, tonic::Status> {
-        if let Some(client) = self.clients.lock().await.get(addr) {
-            return Ok(client.clone());
+    async fn channel_for(&self, addr: &str) -> Result<Channel, tonic::Status> {
+        if let Some(channel) = self.channels.lock().await.get(addr) {
+            return Ok(channel.clone());
         }
         let channel = Channel::from_shared(endpoint(addr))
             .map_err(|err| {
                 tonic::Status::unavailable(format!("invalid gitserver address {addr:?}: {err}"))
             })?
             .connect_lazy();
-        let client = Client::new(channel).max_decoding_message_size(128 * 1024 * 1024);
-        self.clients
+        self.channels
             .lock()
             .await
-            .insert(addr.to_owned(), client.clone());
-        Ok(client)
+            .insert(addr.to_owned(), channel.clone());
+        Ok(channel)
+    }
+
+    #[allow(clippy::result_large_err)]
+    async fn client_for(&self, addr: &str) -> Result<Client, tonic::Status> {
+        Ok(Client::new(self.channel_for(addr).await?).max_decoding_message_size(128 * 1024 * 1024))
+    }
+
+    async fn service_client(&self, addr: &str) -> Result<ServiceClient, tonic::Status> {
+        Ok(ServiceClient::new(self.channel_for(addr).await?)
+            .max_decoding_message_size(128 * 1024 * 1024))
     }
 
     async fn observe(&self) -> ObservedPermit<'_> {
@@ -182,6 +194,27 @@ impl GitserverRepoClient {
         };
         self.client_for(&addr).await
     }
+
+    /// Address selection errors are returned as plain text, like the
+    /// baseline's `clientSource.ClientForRepo` errors; RPC errors keep their
+    /// gRPC text (`rpc error: code = ... desc = ...`).
+    async fn service_client_for_repo(&self, repo: &str) -> Result<ServiceClient, String> {
+        let Some(addr) = self.address_for(repo) else {
+            return Err("no gitserver endpoints configured".to_owned());
+        };
+        self.service_client(&addr)
+            .await
+            .map_err(|err| err.to_string())
+    }
+}
+
+/// Go `status.Error(...).Error()` for a tonic status.
+fn status_error_text(status: &tonic::Status) -> String {
+    format!(
+        "rpc error: code = {:?} desc = {}",
+        status.code(),
+        status.message()
+    )
 }
 
 impl GitserverRepoClient {
@@ -254,6 +287,120 @@ impl GitserverRepoClient {
         drop(observed);
         Ok(())
     }
+
+    /// `gitserver.Client.IsPerforcePathCloneable`, observed under `scope`
+    /// (`repos.perforcesource`). `depotPath` is only the consistent-hashing
+    /// key, like the baseline.
+    pub async fn is_perforce_path_cloneable_with_scope(
+        &self,
+        connection: &sg_extsvc::perforce::PerforceConnectionDetails,
+        depot: &str,
+        scope: &str,
+    ) -> Result<(), String> {
+        let started = std::time::Instant::now();
+        let result = self
+            .is_perforce_path_cloneable_inner(connection, depot)
+            .await;
+        self.metrics.observe_gitserver_client(
+            "IsPerforcePathCloneable",
+            scope,
+            started.elapsed().as_secs_f64(),
+            result.is_err(),
+        );
+        result
+    }
+
+    async fn is_perforce_path_cloneable_inner(
+        &self,
+        connection: &sg_extsvc::perforce::PerforceConnectionDetails,
+        depot: &str,
+    ) -> Result<(), String> {
+        let mut client = self.service_client_for_repo(depot).await?;
+        let observed = self.observe().await;
+        // The baseline unwraps proto errors for nicer messages.
+        client
+            .is_perforce_path_cloneable(gpb::IsPerforcePathCloneableRequest {
+                connection_details: Some(perforce_connection_details(connection)),
+                depot_path: depot.to_owned(),
+            })
+            .await
+            .map_err(|err| err.message().to_owned())?;
+        drop(observed);
+        Ok(())
+    }
+
+    /// `gitserver.Client.CheckPerforceCredentials`; `p4port` is the hashing
+    /// key, as in the baseline.
+    pub async fn check_perforce_credentials_with_scope(
+        &self,
+        connection: &sg_extsvc::perforce::PerforceConnectionDetails,
+        scope: &str,
+    ) -> Result<(), String> {
+        let started = std::time::Instant::now();
+        let result = self.check_perforce_credentials_inner(connection).await;
+        self.metrics.observe_gitserver_client(
+            "CheckPerforceCredentials",
+            scope,
+            started.elapsed().as_secs_f64(),
+            result.is_err(),
+        );
+        result
+    }
+
+    async fn check_perforce_credentials_inner(
+        &self,
+        connection: &sg_extsvc::perforce::PerforceConnectionDetails,
+    ) -> Result<(), String> {
+        let mut client = self
+            .service_client_for_repo(&connection.p4_port)
+            .await?;
+        let observed = self.observe().await;
+        client
+            .check_perforce_credentials(gpb::CheckPerforceCredentialsRequest {
+                connection_details: Some(perforce_connection_details(connection)),
+            })
+            .await
+            .map_err(|err| err.message().to_owned())?;
+        drop(observed);
+        Ok(())
+    }
+
+    /// `gitserver.Client.ListGitoliteRepos`: the host is the hashing key; the
+    /// baseline returns RPC errors unchanged (no message unwrapping).
+    pub async fn list_gitolite_repos(
+        &self,
+        host: &str,
+    ) -> Result<Vec<sg_extsvc::gitolite::Repo>, String> {
+        let mut client = self.service_client_for_repo(host).await?;
+        let observed = self.observe().await;
+        let response = client
+            .list_gitolite(gpb::ListGitoliteRequest {
+                gitolite_host: host.to_owned(),
+            })
+            .await
+            .map_err(|err| status_error_text(&err))?;
+        drop(observed);
+        Ok(response
+            .into_inner()
+            .repos
+            .into_iter()
+            .map(|repo| sg_extsvc::gitolite::Repo {
+                name: repo.name,
+                url: repo.url,
+            })
+            .collect())
+    }
+}
+
+/// `protocol.PerforceConnectionDetails.ToProto`.
+fn perforce_connection_details(
+    details: &sg_extsvc::perforce::PerforceConnectionDetails,
+) -> gpb::PerforceConnectionDetails {
+    gpb::PerforceConnectionDetails {
+        p4port: details.p4_port.clone(),
+        p4user: details.p4_user.clone(),
+        p4passwd: details.p4_passwd.clone(),
+    }
 }
 
 /// `gitserver.NewRepositoryServiceClient(scope)`: the baseline builds one
@@ -286,6 +433,60 @@ impl RepoUpdateClient for ScopedGitserverClient {
         self.inner
             .delete_repository_with_scope(repo, self.scope)
             .await
+    }
+}
+
+/// `gitserver.Client` for the repo-updater code-host sources
+/// (`PerforceSource`, `GitoliteSource`), backed by the same address selection
+/// and channel cache as [`GitserverRepoClient`]. Scopes match the baseline
+/// call sites (`repos.perforcesource`, `perforce.connectioncheck`,
+/// `repos.gitolite`).
+pub struct GitserverSourcesClient {
+    inner: Arc<GitserverRepoClient>,
+    perforce_list_scope: &'static str,
+    perforce_check_scope: &'static str,
+}
+
+impl GitserverSourcesClient {
+    /// Production wiring with the baseline's fixed scopes.
+    pub fn production(inner: Arc<GitserverRepoClient>) -> Self {
+        Self {
+            inner,
+            perforce_list_scope: "repos.perforcesource",
+            perforce_check_scope: "perforce.connectioncheck",
+        }
+    }
+}
+
+#[async_trait]
+impl sg_extsvc::perforce::PerforceGitserver for GitserverSourcesClient {
+    async fn is_perforce_path_cloneable(
+        &self,
+        connection: &sg_extsvc::perforce::PerforceConnectionDetails,
+        depot: &str,
+    ) -> Result<(), String> {
+        self.inner
+            .is_perforce_path_cloneable_with_scope(connection, depot, self.perforce_list_scope)
+            .await
+    }
+
+    async fn check_perforce_credentials(
+        &self,
+        connection: &sg_extsvc::perforce::PerforceConnectionDetails,
+    ) -> Result<(), String> {
+        self.inner
+            .check_perforce_credentials_with_scope(connection, self.perforce_check_scope)
+            .await
+    }
+}
+
+#[async_trait]
+impl sg_extsvc::gitolite::GitoliteRepoLister for GitserverSourcesClient {
+    async fn list_repos(
+        &self,
+        host: &str,
+    ) -> Result<Vec<sg_extsvc::gitolite::Repo>, String> {
+        self.inner.list_gitolite_repos(host).await
     }
 }
 

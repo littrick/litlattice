@@ -33,4 +33,5 @@ tonic = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+sg-service-gitserver = { path = "../sg-service-gitserver" }
 time = { workspace = true }

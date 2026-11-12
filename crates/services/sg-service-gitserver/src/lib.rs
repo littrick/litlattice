@@ -260,6 +260,8 @@ impl Service for GitserverService {
             perforce: Some(Arc::new(perforce::PerforceService::new(
                 config.repos_dir.clone(),
             ))),
+            // `defaultGitolite`: production runs `ssh <host> info` itself.
+            gitolite: Arc::new(gitolite::GitoliteFetcher::with_default_command()),
         };
         let repository_service = repositoryservice::RepositoryService {
             repos_dir: Arc::new(config.repos_dir.clone()),

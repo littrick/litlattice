@@ -9,6 +9,9 @@
 //! representation over gRPC, so only the text remains.
 
 use std::process::Stdio;
+use std::sync::Arc;
+
+use async_trait::async_trait;
 
 use crate::security;
 
@@ -21,31 +24,125 @@ pub struct GitoliteRepo {
     pub url: String,
 }
 
-/// `gitoliteFetcher.listRepos`: validate the host, then ask Gitolite for its
-/// repository list.
+/// `gitoliteRepoLister`: the injectable boundary the gRPC handler calls.
+/// Production is [`GitoliteFetcher`]; tests inject fixed repository lists.
+#[async_trait]
+pub trait GitoliteRepoLister: Send + Sync {
+    async fn list_repos(&self, host: &str) -> Result<Vec<GitoliteRepo>, String>;
+}
+
+/// The observable result of `exec.CommandContext(...).Output()`: stdout and,
+/// when the command failed, `err.Error()`.
+#[derive(Debug, Clone, Default)]
+pub struct SshInfoOutput {
+    /// Command stdout, including any partial output captured before a failure.
+    pub stdout: Vec<u8>,
+    /// `err.Error()` when the command could not start or exited non-zero.
+    pub error: Option<String>,
+}
+
+/// Injectable command seam for `ssh <host> info`, so the gitolite path can be
+/// exercised offline. Production is [`TokioSshInfoCommand`].
+#[async_trait]
+pub trait SshInfoCommand: Send + Sync {
+    async fn run(&self, host: &str) -> SshInfoOutput;
+}
+
+/// Production runner: `exec.CommandContext(ctx, "ssh", host, "info")`.
+pub struct TokioSshInfoCommand;
+
+#[async_trait]
+impl SshInfoCommand for TokioSshInfoCommand {
+    async fn run(&self, host: &str) -> SshInfoOutput {
+        let output = tokio::process::Command::new("ssh")
+            .arg(host)
+            .arg("info")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .await;
+        match output {
+            Ok(output) => SshInfoOutput {
+                stdout: output.stdout,
+                error: (!output.status.success()).then(|| exit_status(&output.status)),
+            },
+            Err(err) => SshInfoOutput {
+                stdout: Vec::new(),
+                error: Some(err.to_string()),
+            },
+        }
+    }
+}
+
+/// `gitoliteFetcher`: validate the host, then delegate to the injected
+/// `gitoliteRepoLister` client. Production wraps [`SshGitoliteLister`].
+pub struct GitoliteFetcher {
+    client: Arc<dyn GitoliteRepoLister>,
+}
+
+impl GitoliteFetcher {
+    pub fn new(client: Arc<dyn GitoliteRepoLister>) -> Self {
+        Self { client }
+    }
+
+    /// The production fetcher (`gitoliteFetcher{client: gitoliteClient{}}`),
+    /// with the real `ssh` command.
+    pub fn with_default_command() -> Self {
+        Self::new(Arc::new(SshGitoliteLister::new(Arc::new(
+            TokioSshInfoCommand,
+        ))))
+    }
+}
+
+#[async_trait]
+impl GitoliteRepoLister for GitoliteFetcher {
+    async fn list_repos(&self, host: &str) -> Result<Vec<GitoliteRepo>, String> {
+        // 🚨 SECURITY: a non-empty host must pass hostname validation.
+        if !host.is_empty() && !security::validate_remote_addr(host).await {
+            return Err("invalid gitolite host".to_owned());
+        }
+        self.client.list_repos(host).await
+    }
+}
+
+/// `gitoliteClient`: run `ssh <host> info` through the injected command seam
+/// and decode its output.
+pub struct SshGitoliteLister {
+    command: Arc<dyn SshInfoCommand>,
+}
+
+impl SshGitoliteLister {
+    pub fn new(command: Arc<dyn SshInfoCommand>) -> Self {
+        Self { command }
+    }
+}
+
+#[async_trait]
+impl GitoliteRepoLister for SshGitoliteLister {
+    async fn list_repos(&self, host: &str) -> Result<Vec<GitoliteRepo>, String> {
+        let output = self.command.run(host).await;
+        if let Some(err) = output.error {
+            // `gitolite.Client.ListRepos` logs the stdout as `out` and returns
+            // `maybeUnauthorized(err)`. The unauthorized tag has no gRPC
+            // representation (the handler only uses `err.Error()`).
+            tracing::error!(
+                error = %err,
+                out = %String::from_utf8_lossy(&output.stdout),
+                "listing gitolite failed"
+            );
+            return Err(err);
+        }
+
+        Ok(decode_repos(host, &String::from_utf8_lossy(&output.stdout)))
+    }
+}
+
+/// Convenience wrapper around the production fetcher.
 pub async fn list_repos(host: &str) -> Result<Vec<GitoliteRepo>, String> {
-    // 🚨 SECURITY: a non-empty host must pass hostname validation.
-    if !host.is_empty() && !security::validate_remote_addr(host).await {
-        return Err("invalid gitolite host".to_owned());
-    }
-
-    let output = tokio::process::Command::new("ssh")
-        .arg(host)
-        .arg("info")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
+    GitoliteFetcher::with_default_command()
+        .list_repos(host)
         .await
-        .map_err(|err| format!("{err}"))?;
-
-    if !output.status.success() {
-        // `exec.ExitError.Error()` is `exit status N` (or `signal: ...`); the
-        // command's stderr is only logged by the baseline, not returned.
-        return Err(exit_status(&output.status));
-    }
-
-    Ok(decode_repos(host, &String::from_utf8_lossy(&output.stdout)))
 }
 
 /// Go `exec.ExitError.Error()`.
@@ -68,7 +165,7 @@ fn exit_status(status: &std::process::ExitStatus) -> String {
 /// hosts and an `ssh://` URL with the name as its path for URL hosts; hosts
 /// `net/url` cannot parse are skipped entirely, as are URL hosts with a scheme
 /// other than `ssh` (they keep an empty URL but are still listed).
-fn decode_repos(host: &str, gitolite_info: &str) -> Vec<GitoliteRepo> {
+pub fn decode_repos(host: &str, gitolite_info: &str) -> Vec<GitoliteRepo> {
     let class = classify_host(host);
     let mut repos = Vec::new();
     for line in gitolite_info.split('\n') {
@@ -137,15 +234,57 @@ fn scheme_prefix(host: &str) -> Option<&str> {
     None
 }
 
-/// `URL.String()` after `u.Path = name` for an `ssh://` host: keep the
-/// scheme, userinfo and port, and use the repository name as the path.
+/// `URL.String()` after `u.Path = name` for an `ssh://` host: `url.Parse`
+/// lowercases the scheme; keep the userinfo/port/query/fragment and replace
+/// the path with the repository name. `URL.String` percent-encodes the path
+/// (`encodePath`: everything but unreserved characters, `$&+,/:;=@`, and `/`).
 fn ssh_url_with_path(host: &str, name: &str) -> String {
-    let scheme_end = host.find("://").map(|index| index + 3).unwrap_or(0);
-    let authority_end = host[scheme_end..]
-        .find(['/', '?', '#'])
-        .map(|index| scheme_end + index)
-        .unwrap_or(host.len());
-    format!("{}/{name}", &host[..authority_end])
+    let (scheme, rest) = host.split_once("://").unwrap_or(("", host));
+    let cut = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..cut];
+    let tail = &rest[cut..];
+    let suffix = tail
+        .find(['?', '#'])
+        .map(|index| &tail[index..])
+        .unwrap_or("");
+    let path = if !name.is_empty() && !name.starts_with('/') {
+        format!("/{name}")
+    } else {
+        name.to_owned()
+    };
+    format!(
+        "{}://{}{}{}",
+        scheme.to_ascii_lowercase(),
+        authority,
+        escape_path(&path),
+        suffix
+    )
+}
+
+/// `net/url`'s `encodePath` escaping (`escape(s, encodePath)`).
+fn escape_path(value: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut out = String::with_capacity(value.len());
+    for &byte in value.as_bytes() {
+        let escape = if byte.is_ascii_alphanumeric() {
+            false
+        } else {
+            match byte {
+                b'-' | b'_' | b'.' | b'~' => false,
+                b'$' | b'&' | b'+' | b',' | b'/' | b':' | b';' | b'=' | b'@' => false,
+                // `encodePath` escapes `?` and everything else.
+                _ => true,
+            }
+        };
+        if escape {
+            out.push('%');
+            out.push(HEX[usize::from(byte >> 4)] as char);
+            out.push(HEX[usize::from(byte & 0xf)] as char);
+        } else {
+            out.push(byte as char);
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -197,6 +336,56 @@ mod tests {
     }
 
     #[test]
+    fn escapes_the_url_path_like_go() {
+        assert_eq!(
+            decode_repos("ssh://git@gitolite.example.com:2222/", "R W repo?x"),
+            vec![GitoliteRepo {
+                name: "repo?x".to_owned(),
+                url: "ssh://git@gitolite.example.com:2222/repo%3Fx".to_owned(),
+            }]
+        );
+        assert_eq!(
+            decode_repos(
+                "ssh://git@gitolite.example.com:2222/",
+                "R W repo#y\nR W pct%zz\nR W /leading"
+            ),
+            vec![
+                GitoliteRepo {
+                    name: "repo#y".to_owned(),
+                    url: "ssh://git@gitolite.example.com:2222/repo%23y".to_owned(),
+                },
+                GitoliteRepo {
+                    name: "pct%zz".to_owned(),
+                    url: "ssh://git@gitolite.example.com:2222/pct%25zz".to_owned(),
+                },
+                GitoliteRepo {
+                    name: "/leading".to_owned(),
+                    url: "ssh://git@gitolite.example.com:2222/leading".to_owned(),
+                },
+            ]
+        );
+        // SCP-style hosts concatenate the name without escaping.
+        assert_eq!(
+            decode_repos("git@host", "R W repo?x"),
+            vec![GitoliteRepo {
+                name: "repo?x".to_owned(),
+                url: "git@host:repo?x".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn lowercases_the_url_scheme() {
+        assert_eq!(
+            decode_repos("SSH://git@gitolite.example.com:2222/", "R W repo"),
+            vec![GitoliteRepo {
+                name: "repo".to_owned(),
+                url: "ssh://git@gitolite.example.com:2222/repo".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
     fn handles_empty_and_malformed_output() {
         assert!(decode_repos("git@gitolite.example.com", "").is_empty());
         assert!(decode_repos("git@gitolite.example.com", "hello\n  R\n  W name\n").is_empty());
@@ -223,6 +412,88 @@ mod tests {
                     url: String::new(),
                 },
             ]
+        );
+    }
+
+    struct FakeCommand {
+        output: SshInfoOutput,
+    }
+
+    #[async_trait]
+    impl SshInfoCommand for FakeCommand {
+        async fn run(&self, _host: &str) -> SshInfoOutput {
+            self.output.clone()
+        }
+    }
+
+    fn lister(output: SshInfoOutput) -> SshGitoliteLister {
+        SshGitoliteLister::new(Arc::new(FakeCommand { output }))
+    }
+
+    #[tokio::test]
+    async fn fetch_decodes_injected_output() {
+        let lister = lister(SshInfoOutput {
+            stdout: INFO.as_bytes().to_vec(),
+            error: None,
+        });
+        // An empty host skips `ValidateRemoteAddr` without a DNS lookup.
+        let repos = lister.list_repos("").await.expect("list");
+        assert_eq!(repos.len(), 3);
+        assert_eq!(repos[0].name, "gitolite-admin");
+    }
+
+    #[tokio::test]
+    async fn fetch_rejects_invalid_hosts_before_running_the_command() {
+        struct PanicLister;
+        #[async_trait]
+        impl GitoliteRepoLister for PanicLister {
+            async fn list_repos(&self, _host: &str) -> Result<Vec<GitoliteRepo>, String> {
+                panic!("invalid hosts must not reach the client")
+            }
+        }
+        let fetcher = GitoliteFetcher::new(Arc::new(PanicLister));
+        // Fails validation before any DNS lookup: the username is not
+        // alphanumeric and the port is not an integer.
+        assert_eq!(
+            fetcher.list_repos("git-user@127.0.0.1").await.unwrap_err(),
+            "invalid gitolite host"
+        );
+        assert_eq!(
+            fetcher.list_repos("127.0.0.1:ssh").await.unwrap_err(),
+            "invalid gitolite host"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_delegates_valid_hosts_to_the_client() {
+        struct FixedLister;
+        #[async_trait]
+        impl GitoliteRepoLister for FixedLister {
+            async fn list_repos(&self, host: &str) -> Result<Vec<GitoliteRepo>, String> {
+                Ok(vec![GitoliteRepo {
+                    name: "repo".to_owned(),
+                    url: format!("{host}:repo"),
+                }])
+            }
+        }
+        let repos = GitoliteFetcher::new(Arc::new(FixedLister))
+            .list_repos("127.0.0.1")
+            .await
+            .expect("list");
+        assert_eq!(repos[0].url, "127.0.0.1:repo");
+    }
+
+    #[tokio::test]
+    async fn fetch_reports_and_preserves_command_errors() {
+        // `maybeUnauthorized` only tags permission errors; the RPC handler
+        // reports the unchanged text.
+        let lister = lister(SshInfoOutput {
+            stdout: b"partial".to_vec(),
+            error: Some("exit status 255".to_owned()),
+        });
+        assert_eq!(
+            lister.list_repos("127.0.0.1").await.unwrap_err(),
+            "exit status 255"
         );
     }
 }

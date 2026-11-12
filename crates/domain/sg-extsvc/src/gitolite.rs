@@ -1,13 +1,16 @@
 #![forbid(unsafe_code)]
 
-//! `internal/extsvc/gitolite`: repository discovery for a Gitolite host.
+//! `internal/extsvc/gitolite` + the gitserver boundary the repo-updater
+//! source consumes.
 //!
-//! The baseline `Client.ListRepos` runs `ssh <host> info` from gitserver and
-//! parses the `R <perms> <name>` lines. This port keeps the parsing and the
-//! `ExternalRepoSpec`/clone-URL helpers, and moves the `ssh` invocation behind
-//! the injectable [`GitoliteCommand`] seam. The production [`SshGitoliteCommand`]
-//! runs the same command from the repo-updater process (the baseline runs it
-//! from gitserver); tests inject fixed output and never touch the network.
+//! The baseline source calls `gitserver.Client.ListGitoliteRepos`, which runs
+//! `ssh <host> info` inside gitserver and parses the `R <perms> <name>` lines.
+//! This port keeps the parsing and the `ExternalRepoSpec`/clone-URL helpers and
+//! exposes [`GitoliteRepoLister`] as the injectable boundary. Production
+//! repo-updater wires a gRPC client ([`GitoliteRepoLister`] backed by
+//! `GitserverService.ListGitolite`); [`SshGitoliteCommand`] remains as the
+//! offline fallback that runs the command in-process, and tests inject fixed
+//! repository lists without touching the network.
 
 use std::sync::Arc;
 
@@ -49,20 +52,22 @@ pub fn clone_url(spec: &crate::ExternalRepoSpec) -> String {
     format!("{}:{}", spec.service_id, spec.id)
 }
 
-/// The injectable `ssh <host> info` seam.
+/// `gitserver.Client.ListGitoliteRepos`: the boundary the source consumes.
+/// Production is a gRPC client; tests and the offline differential inject
+/// fixed repository lists.
 #[async_trait]
-pub trait GitoliteCommand: Send + Sync {
-    /// Runs `ssh <host> info` and returns stdout.
-    async fn list_repos(&self, host: &str) -> Result<String, String>;
+pub trait GitoliteRepoLister: Send + Sync {
+    async fn list_repos(&self, host: &str) -> Result<Vec<Repo>, String>;
 }
 
-/// The production command runner: `ssh <host> info` (baseline
-/// `gitolite.Client.ListRepos`).
+/// Offline fallback: run `ssh <host> info` in this process and parse it. The
+/// baseline runs the same command inside gitserver; production repo-updater
+/// reaches gitserver over gRPC instead (see the module docs).
 pub struct SshGitoliteCommand;
 
 #[async_trait]
-impl GitoliteCommand for SshGitoliteCommand {
-    async fn list_repos(&self, host: &str) -> Result<String, String> {
+impl GitoliteRepoLister for SshGitoliteCommand {
+    async fn list_repos(&self, host: &str) -> Result<Vec<Repo>, String> {
         let output = tokio::process::Command::new("ssh")
             .arg(host)
             .arg("info")
@@ -70,55 +75,151 @@ impl GitoliteCommand for SshGitoliteCommand {
             .await
             .map_err(|err| err.to_string())?;
         if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-            return Err(format!("ssh {host} info: {stderr}"));
+            // `maybeUnauthorized` keeps the `exec.ExitError` text; the stderr
+            // is only logged, so the error text stays `exit status N`.
+            return Err(exit_status(&output.status));
         }
-        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+        Ok(decode_repos(host, &String::from_utf8_lossy(&output.stdout)))
     }
 }
 
 /// Convenience alias for the source constructor.
-pub type CommandHandle = Arc<dyn GitoliteCommand>;
+pub type CommandHandle = Arc<dyn GitoliteRepoLister>;
 
-/// `gitolite.decodeRepos`.
+/// Go `exec.ExitError.Error()`.
+fn exit_status(status: &std::process::ExitStatus) -> String {
+    if let Some(code) = status.code() {
+        return format!("exit status {code}");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(signal) = status.signal() {
+            return format!("signal: {signal}");
+        }
+    }
+    "exit status 1".to_owned()
+}
+
+/// `gitolite.decodeRepos`: every `R` line contributes a repository whose name
+/// is the line's last field. The URL is `host + ":" + name` for SCP-style
+/// hosts and an `ssh://` URL with the name as its path for URL hosts; hosts
+/// `net/url` cannot parse are skipped entirely, as are URL hosts with a scheme
+/// other than `ssh` (they keep an empty URL but are still listed).
 pub fn decode_repos(host: &str, gitolite_info: &str) -> Vec<Repo> {
+    let class = classify_host(host);
     let mut repos = Vec::new();
     for line in gitolite_info.split('\n') {
         let fields: Vec<&str> = line.split_whitespace().collect();
         if fields.len() < 2 || fields[0] != "R" {
             continue;
         }
-        let name = fields[fields.len() - 1].to_owned();
-        let mut repo = Repo {
-            name: name.clone(),
-            url: String::new(),
+        let name = fields[fields.len() - 1];
+        let url = match &class {
+            // `url.Parse` failed: the baseline skips the whole line.
+            HostClass::Invalid => continue,
+            HostClass::Path => format!("{host}:{name}"),
+            HostClass::Ssh => ssh_url_with_path(host, name),
+            HostClass::OtherScheme => String::new(),
         };
-
-        // `url.Parse(host)`: an absolute URL only when it carries a scheme.
-        // Go parses scheme-less strings as a path (Scheme == ""), which the
-        // baseline treats as SCP-style and renders as `host:name`.
-        let parsed = url::Url::parse(host);
-        match parsed {
-            Ok(parsed) => {
-                if parsed.scheme().is_empty() {
-                    repo.url = format!("{host}:{name}");
-                } else if parsed.scheme() == "ssh" {
-                    let mut parsed = parsed;
-                    // `u.Path = name` (no leading slash; `URL.String` adds it).
-                    parsed.set_path(&name);
-                    repo.url = parsed.to_string();
-                }
-            }
-            Err(_) if !host.contains("://") => {
-                // Scheme-less host: Go's `url.Parse` succeeds with Scheme "".
-                repo.url = format!("{host}:{name}");
-            }
-            Err(_) => continue,
-        }
-
-        repos.push(repo);
+        repos.push(Repo {
+            name: name.to_owned(),
+            url,
+        });
     }
     repos
+}
+
+enum HostClass {
+    /// No scheme and no colon before the first slash: `url.Parse` returns a
+    /// path.
+    Path,
+    Ssh,
+    /// A parseable non-ssh scheme; the baseline leaves `Repo.URL` empty.
+    OtherScheme,
+    /// `url.Parse` returns an error (first path segment contains a colon).
+    Invalid,
+}
+
+fn classify_host(host: &str) -> HostClass {
+    if let Some(scheme) = scheme_prefix(host) {
+        return if scheme.eq_ignore_ascii_case("ssh") {
+            HostClass::Ssh
+        } else {
+            HostClass::OtherScheme
+        };
+    }
+    let first_segment = host.split('/').next().unwrap_or_default();
+    if first_segment.contains(':') {
+        HostClass::Invalid
+    } else {
+        HostClass::Path
+    }
+}
+
+/// Go `net/url.getScheme`.
+fn scheme_prefix(host: &str) -> Option<&str> {
+    for (index, byte) in host.bytes().enumerate() {
+        match byte {
+            b'a'..=b'z' | b'A'..=b'Z' => {}
+            b'0'..=b'9' | b'+' | b'-' | b'.' if index > 0 => {}
+            b':' => return (index > 0).then(|| &host[..index]),
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// `URL.String()` after `u.Path = name` for an `ssh://` host: `url.Parse`
+/// lowercases the scheme; keep userinfo/port/query/fragment and replace the
+/// path with the repository name. `URL.String` percent-encodes the path
+/// (`encodePath`: everything but unreserved characters, `$&+,/:;=@`, and `/`).
+fn ssh_url_with_path(host: &str, name: &str) -> String {
+    let (scheme, rest) = host.split_once("://").unwrap_or(("", host));
+    let cut = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..cut];
+    let tail = &rest[cut..];
+    let suffix = tail
+        .find(['?', '#'])
+        .map(|index| &tail[index..])
+        .unwrap_or("");
+    let path = if !name.is_empty() && !name.starts_with('/') {
+        format!("/{name}")
+    } else {
+        name.to_owned()
+    };
+    format!(
+        "{}://{}{}{}",
+        scheme.to_ascii_lowercase(),
+        authority,
+        escape_path(&path),
+        suffix
+    )
+}
+
+/// `net/url`'s `encodePath` escaping (`escape(s, encodePath)`).
+fn escape_path(value: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut out = String::with_capacity(value.len());
+    for &byte in value.as_bytes() {
+        let escape = if byte.is_ascii_alphanumeric() {
+            false
+        } else {
+            match byte {
+                b'-' | b'_' | b'.' | b'~' => false,
+                b'$' | b'&' | b'+' | b',' | b'/' | b':' | b';' | b'=' | b'@' => false,
+                _ => true,
+            }
+        };
+        if escape {
+            out.push('%');
+            out.push(HEX[usize::from(byte >> 4)] as char);
+            out.push(HEX[usize::from(byte & 0xf)] as char);
+        } else {
+            out.push(byte as char);
+        }
+    }
+    out
 }
 
 /// `gitolite.maybeUnauthorized`: marks errors mentioning "permission denied".
@@ -175,6 +276,32 @@ mod tests {
         assert_eq!(repos.len(), 1);
         assert_eq!(repos[0].name, "repo");
         assert_eq!(repos[0].url, "ssh://git@gitolite.example.com:2222/repo");
+    }
+
+    #[test]
+    fn decode_escapes_ssh_url_paths_like_go() {
+        let repos = decode_repos("ssh://git@host:2222/", "R W repo?x\nR W repo#y");
+        assert_eq!(
+            repos,
+            vec![
+                Repo {
+                    name: "repo?x".to_owned(),
+                    url: "ssh://git@host:2222/repo%3Fx".to_owned(),
+                },
+                Repo {
+                    name: "repo#y".to_owned(),
+                    url: "ssh://git@host:2222/repo%23y".to_owned(),
+                },
+            ]
+        );
+        // SCP-style hosts concatenate the name without escaping.
+        assert_eq!(
+            decode_repos("git@host", "R W repo?x"),
+            vec![Repo {
+                name: "repo?x".to_owned(),
+                url: "git@host:repo?x".to_owned(),
+            }]
+        );
     }
 
     #[test]

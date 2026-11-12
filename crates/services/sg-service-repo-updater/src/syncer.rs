@@ -93,6 +93,11 @@ pub struct ExtsvcSourceFactory {
     /// `database.ExternalServices.getEncryptionKey()`: the ring is read on
     /// every source construction, so a rebuilt ring applies immediately.
     keyring: Arc<Keyring>,
+    /// The gitserver RPC boundary for Perforce and Gitolite. Production
+    /// passes a client backed by the shared address/connection cache; tests
+    /// leave it unset or inject fakes.
+    perforce: Option<Arc<dyn sg_extsvc::perforce::PerforceGitserver>>,
+    gitolite: Option<Arc<dyn sg_extsvc::gitolite::GitoliteRepoLister>>,
 }
 
 impl ExtsvcSourceFactory {
@@ -105,7 +110,21 @@ impl ExtsvcSourceFactory {
             http,
             doer,
             keyring,
+            perforce: None,
+            gitolite: None,
         }
+    }
+
+    /// Wire the gitserver-backed source client (production). The same client
+    /// can implement both boundaries.
+    pub fn with_gitserver(
+        mut self,
+        perforce: Option<Arc<dyn sg_extsvc::perforce::PerforceGitserver>>,
+        gitolite: Option<Arc<dyn sg_extsvc::gitolite::GitoliteRepoLister>>,
+    ) -> Self {
+        self.perforce = perforce;
+        self.gitolite = gitolite;
+        self
     }
 }
 
@@ -131,7 +150,13 @@ impl SourceFactory for ExtsvcSourceFactory {
             encryption_key_id: service.encryption_key_id.clone(),
             unrestricted: service.unrestricted,
         };
-        sg_extsvc::new_source(source_service, self.http.clone(), self.doer.clone())
+        sg_extsvc::new_source(
+            source_service,
+            self.http.clone(),
+            self.doer.clone(),
+            self.perforce.clone(),
+            self.gitolite.clone(),
+        )
     }
 }
 
