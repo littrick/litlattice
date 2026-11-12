@@ -28,6 +28,9 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
+pub mod backend;
+pub mod index;
+
 /// `shared.Config`'s `defaultEmbeddingsCacheSize`.
 pub const DEFAULT_EMBEDDINGS_CACHE_SIZE: &str = "6GiB";
 
@@ -384,14 +387,23 @@ impl std::fmt::Display for EmbeddingError {
 
 impl std::error::Error for EmbeddingError {}
 
-/// `getQueryEmbedding` + the index download behind `getRepoEmbeddingIndex`.
+/// `getQueryEmbedding` + the index download and similarity search behind
+/// `getRepoEmbeddingIndex`.
+#[async_trait::async_trait]
 pub trait EmbeddingBackend: Send + Sync {
-    fn get_query_embedding(&self, query: &str) -> Result<(Vec<f32>, String), EmbeddingError>;
+    async fn get_query_embedding(
+        &self,
+        query: &str,
+    ) -> Result<(Vec<f32>, String), EmbeddingError>;
 
-    fn get_repo_embedding_index(
+    async fn get_repo_embedding_index(
         &self,
         repo_id: i32,
         repo_name: &str,
+        query_embedding: &[f32],
+        code_results_count: i64,
+        text_results_count: i64,
+        use_document_ranks: bool,
     ) -> Result<RepoEmbeddingIndex, EmbeddingError>;
 }
 
@@ -427,7 +439,7 @@ impl Handler {
 
     /// Serve one request against `/search`. Any other path is a 404 from the
     /// mux, represented by `path != "/search"`.
-    pub fn handle(&self, path: &str, method: &str, body: &[u8]) -> HandlerResponse {
+    pub async fn handle(&self, path: &str, method: &str, body: &[u8]) -> HandlerResponse {
         if path != "/search" {
             return HandlerResponse::http_error(404, "404 page not found");
         }
@@ -445,7 +457,7 @@ impl Handler {
             }
         };
 
-        match self.search(&params) {
+        match self.search(&params).await {
             Ok(results) => HandlerResponse {
                 status: 200,
                 content_type: "application/json".to_owned(),
@@ -465,19 +477,27 @@ impl Handler {
         }
     }
 
-    fn search(
+    async fn search(
         &self,
         params: &EmbeddingsSearchParameters,
     ) -> Result<EmbeddingCombinedSearchResults, EmbeddingError> {
         // `searchRepoEmbeddingIndexes`: the query embedding comes first.
-        let (_float_query, query_model) = self.backend.get_query_embedding(&params.query)?;
+        let (float_query, query_model) = self.backend.get_query_embedding(&params.query).await?;
 
         let mut result = EmbeddingCombinedSearchResults::default();
         for (index, repo_name) in params.repo_names.iter().enumerate() {
             let repo_id = params.repo_ids.get(index).copied().unwrap_or_default();
             let embedding_index = self
                 .backend
-                .get_repo_embedding_index(repo_id, repo_name)
+                .get_repo_embedding_index(
+                    repo_id,
+                    repo_name,
+                    &float_query,
+                    params.code_results_count,
+                    params.text_results_count,
+                    params.use_document_ranks,
+                )
+                .await
                 .map_err(|err| EmbeddingError {
                     // `errors.Wrapf` keeps the not-found/rate-limit cause, so
                     // the handler's status mapping still sees it.

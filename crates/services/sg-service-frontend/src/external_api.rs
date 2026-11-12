@@ -20,15 +20,18 @@
 //!   their enterprise default 404;
 //! - `/.api/src-cli/versions/{rest:.*}` (GET/POST) -> the release cache is
 //!   disabled with the default config, so `http.NotFound`;
-//! - `/.api/src-cli/{rest:.*}` (GET) -> `version` JSON, the six GitHub
-//!   download filenames (302), else `http.NotFound`;
+//! - `/.api/src-cli/{rest:.*}` (GET) -> `srcCliVersionHandler`: `version`
+//!   JSON (10-minute remote cache, air-gapped `5.5.0` fallback) and the six
+//!   GitHub download filenames (302), else `http.NotFound`;
 //! - `/.api/client-config` and `/.api/modelconfig/supported-models.json`
 //!   (GET) -> `401 Unauthorized` without the auth/session middleware;
 //! - `/.api/webhooks/{webhook_uuid}` (POST) -> invalid UUID 400 (`%q`), else
 //!   the empty-table 404 `Could not find webhook with provided UUID.`;
 //! - `/.api/{github,gitlab,bitbucket-server,bitbucket-cloud}-webhooks` (POST)
-//!   -> GitHub: 400 `Error validating payload` with no GitHub external
-//!   services; the others: the OSS empty handler's 200 empty response;
+//!   -> GitHub: `github_webhook_response` with injected external-service and
+//!   dispatch seams (the production default has an empty external-service
+//!   table, so 400 `Error validating payload`); the others: the OSS empty
+//!   handler's 200 empty response;
 //! - `/.api/opencodegraph` (POST) -> the `opencodegraph` feature flag is off,
 //!   so `JsonMiddleware`'s error handler answers 500 with an empty body;
 //! - `/.api/repos/{Repo}/-/shield` (GET) -> `serveRepoShield`'s
@@ -47,10 +50,16 @@
 //! routes (`/scim/v2`, `/registry`) are unaffected; matched template routes
 //! redirect a trailing slash away exactly like `http.Redirect`.
 
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
-use http::{header, HeaderValue, Method, Request, Response, StatusCode};
+use bytes::Bytes;
+use hmac::{Hmac, Mac};
+use http::{header, HeaderName, HeaderValue, Method, Request, Response, StatusCode};
 use regex::Regex;
+use serde::{Deserialize, Serialize};
+use sha1::Sha1;
+use sha2::{Sha256, Sha512};
 use tonic::body::BoxBody;
 use uuid::Uuid;
 
@@ -98,9 +107,9 @@ const LLM_MODELS_PREFIX: &str = "/.api/llm/models/";
 /// without `@`/`/` — i.e. non-empty, no `@`, no `/`, and never exactly `-`.
 const REPO_PATTERN: &str = "(?:(?:[^@/-]|(?:[^/@]{2,}))/)*(?:[^@/-]|(?:[^/@]{2,}))";
 
-/// `srccli.MinimumVersion` (`internal/src-cli/consts.go:9`). The remote
-/// version cache is not ported, so `src_cli_version_handler.Version()`
-/// always takes the air-gapped fallback path.
+/// `srccli.MinimumVersion` (`internal/src-cli/consts.go:9`). This is the
+/// air-gapped fallback of [`SrcCliVersionHandler`] when the 10-minute cache
+/// is cold and the remote fetch fails.
 const SRC_CLI_MINIMUM_VERSION: &str = "5.5.0";
 /// `srcCliDownloadsURL` (`src_cli.go:27`).
 const SRC_CLI_DOWNLOADS_URL: &str = "https://github.com/sourcegraph/src-cli/releases/download";
@@ -402,7 +411,7 @@ fn route_response<B>(req: &Request<B>, route: Route) -> Response<BoxBody> {
         | Route::LlmChatCompletions
         | Route::LlmModels
         | Route::LlmModel { .. } => empty_response(StatusCode::INTERNAL_SERVER_ERROR),
-        Route::Registry => registry_response(),
+        Route::Registry => registry_response(req),
         Route::Scim => enterprise_not_found("SCIM handler"),
         Route::BatchesFile { .. } if req.method() == Method::HEAD => {
             enterprise_not_found("batches file exists handler")
@@ -640,25 +649,451 @@ fn with_suffix<'a>(rest: &'a str, suffix: &str) -> Option<&'a str> {
     single_segment(id)
 }
 
-/// `registry.HandleRegistry`'s non-dotcom branch. Dotcom mode's frozen
-/// extension registry is not ported; the OSS baseline answer is used in both
-/// modes (documented divergence).
-fn registry_response() -> Response<BoxBody> {
-    text_response(
-        StatusCode::NOT_FOUND,
-        "text/plain; charset=utf-8",
-        "no local extension registry exists\n",
-        true,
-    )
+// ---------------------------------------------------------------------------
+// Extension registry seam (`cmd/frontend/internal/registry/http_api.go`)
+// ---------------------------------------------------------------------------
+
+/// `registry.APIVersion`.
+pub const REGISTRY_API_VERSION: &str = "20180621";
+/// `registry.AcceptHeader`.
+pub const REGISTRY_ACCEPT_HEADER: &str =
+    "application/vnd.sourcegraph.api+json;version=20180621";
+/// `registry.MediaType`.
+pub const REGISTRY_MEDIA_TYPE: &str = "sourcegraph.v20180621; format=json";
+
+/// One `registry.Publisher`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RegistryPublisher {
+    pub name: String,
+    #[serde(default)]
+    pub url: String,
 }
 
-/// `srcCliVersionHandler.ServeHTTP` (`src_cli.go:68-82`). The remote
-/// `sourcegraph.com` version cache is not ported: `Version()` always falls
-/// back to `srccli.MinimumVersion`, the same answer as an air-gapped
-/// baseline.
-fn src_cli_response(method: &Method, rest: &str) -> Response<BoxBody> {
+/// One `registry.Extension`. `created_at`/`updated_at`/`published_at` are the
+/// RFC 3339 strings the Go `time.Time` marshaler produces (the frozen data is
+/// copied into the injected seam, not embedded in the binary).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RegistryExtension {
+    pub uuid: String,
+    #[serde(rename = "extensionID")]
+    pub extension_id: String,
+    #[serde(default)]
+    pub publisher: RegistryPublisher,
+    pub name: String,
+    #[serde(default)]
+    pub manifest: Option<String>,
+    #[serde(rename = "createdAt")]
+    pub created_at: String,
+    #[serde(rename = "updatedAt")]
+    pub updated_at: String,
+    #[serde(rename = "publishedAt")]
+    pub published_at: String,
+    #[serde(default)]
+    pub url: String,
+}
+
+/// Go's `json.Encoder` escapes `<`, `>`, `&`, U+2028 and U+2029 (serde_json
+/// does not). The frozen manifests contain these characters.
+fn go_json_escape(body: &str) -> String {
+    let mut escaped = String::with_capacity(body.len());
+    for character in body.chars() {
+        match character {
+            '<' => escaped.push_str("\\u003c"),
+            '>' => escaped.push_str("\\u003e"),
+            '&' => escaped.push_str("\\u0026"),
+            '\u{2028}' => escaped.push_str("\\u2028"),
+            '\u{2029}' => escaped.push_str("\\u2029"),
+            _ => escaped.push(character),
+        }
+    }
+    escaped
+}
+
+/// `dotcom.SourcegraphDotComMode()` plus `getFrozenRegistryData()`. Production
+/// uses [`DefaultRegistrySource`]; the differential harness injects the frozen
+/// data through [`StaticRegistrySource`].
+pub trait ExtensionRegistrySource: Send + Sync {
+    fn dotcom(&self) -> bool;
+    fn extensions(&self) -> Vec<RegistryExtension>;
+}
+
+/// The non-dotcom default: the frozen legacy extension data is not shipped in
+/// this port (see the M9.19c overview errata), so dotcom mode also answers
+/// the non-dotcom 404.
+#[derive(Debug, Default)]
+pub struct DefaultRegistrySource;
+
+impl ExtensionRegistrySource for DefaultRegistrySource {
+    fn dotcom(&self) -> bool {
+        matches!(
+            std::env::var("SOURCEGRAPHDOTCOM_MODE").as_deref(),
+            Ok("1") | Ok("true") | Ok("TRUE") | Ok("True")
+        )
+    }
+
+    fn extensions(&self) -> Vec<RegistryExtension> {
+        Vec::new()
+    }
+}
+
+/// A registry source over injected frozen data.
+pub struct StaticRegistrySource {
+    pub dotcom: bool,
+    pub extensions: Vec<RegistryExtension>,
+}
+
+impl ExtensionRegistrySource for StaticRegistrySource {
+    fn dotcom(&self) -> bool {
+        self.dotcom
+    }
+
+    fn extensions(&self) -> Vec<RegistryExtension> {
+        self.extensions.clone()
+    }
+}
+
+/// `filterRegistryExtensions`: an empty query returns every extension; else
+/// a case-insensitive substring match on `extensionID` (input order kept).
+fn filter_registry_extensions(
+    extensions: Vec<RegistryExtension>,
+    query: &str,
+) -> Vec<RegistryExtension> {
+    if query.is_empty() {
+        return extensions;
+    }
+    let query = query.to_lowercase();
+    extensions
+        .into_iter()
+        .filter(|extension| extension.extension_id.to_lowercase().contains(&query))
+        .collect()
+}
+
+/// `findRegistryExtension`.
+fn find_registry_extension(
+    extensions: &[RegistryExtension],
+    uuid: Option<&str>,
+    extension_id: Option<&str>,
+) -> Option<RegistryExtension> {
+    extensions
+        .iter()
+        .find(|extension| {
+            uuid.is_some_and(|uuid| extension.uuid == uuid)
+                || extension_id.is_some_and(|id| extension.extension_id == id)
+        })
+        .cloned()
+}
+
+/// `json.NewEncoder(w).Encode` for the registry responses: net/http sniffs
+/// the JSON body as `text/plain; charset=utf-8`.
+fn json_response(status: StatusCode, body: String) -> Response<BoxBody> {
+    let mut response = text_response(status, "text/plain; charset=utf-8", &body, false);
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("max-age=120, private"),
+    );
+    response
+}
+
+/// `w.WriteHeader(404)` with no body or content type.
+fn empty_not_found() -> Response<BoxBody> {
+    let mut response = Response::new(tonic::body::boxed(http_body_util::Full::new(
+        Bytes::new(),
+    )));
+    *response.status_mut() = StatusCode::NOT_FOUND;
+    response
+}
+
+/// `registry.HandleRegistry`, with the frozen data injected.
+pub fn registry_response_with<B>(
+    req: &Request<B>,
+    source: &dyn ExtensionRegistrySource,
+) -> Response<BoxBody> {
+    if !source.dotcom() {
+        return text_response(
+            StatusCode::NOT_FOUND,
+            "text/plain; charset=utf-8",
+            "no local extension registry exists\n",
+            true,
+        );
+    }
+
+    let accept = req
+        .headers()
+        .get(header::ACCEPT)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+    let path = req.uri().path();
+    let decoded = decode_path(path);
+    let url_path = decoded.strip_prefix("/.api").unwrap_or(&decoded);
+    let extensions = source.extensions();
+
+    // The handler sets these before validating the Accept header.
+    let mut response = if accept != REGISTRY_ACCEPT_HEADER {
+        text_response(
+            StatusCode::BAD_REQUEST,
+            "text/plain; charset=utf-8",
+            &format!("invalid Accept header: expected \"{REGISTRY_ACCEPT_HEADER}\"\n"),
+            true,
+        )
+    } else {
+        const EXTENSIONS_PATH: &str = "/registry/extensions";
+        if url_path == EXTENSIONS_PATH {
+            let query = req
+                .uri()
+                .query()
+                .map(|query| {
+                    url::form_urlencoded::parse(query.as_bytes())
+                        .find(|(key, _)| key == "q")
+                        .map(|(_, value)| value.into_owned())
+                        .unwrap_or_default()
+                })
+                .unwrap_or_default();
+            let filtered = filter_registry_extensions(extensions.clone(), &query);
+            // An empty (nil) Go slice marshals as `null`, not `[]`.
+            let body = if filtered.is_empty() {
+                Ok("null".to_owned())
+            } else {
+                serde_json::to_string(&filtered).map(|body| go_json_escape(&body))
+            };
+            match body {
+                Ok(body) => json_response(StatusCode::OK, format!("{body}\n")),
+                Err(error) => text_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "text/plain; charset=utf-8",
+                    &format!("{error}\n"),
+                    true,
+                ),
+            }
+        } else if url_path == format!("{EXTENSIONS_PATH}/featured") {
+            json_response(StatusCode::OK, "[]\n".to_owned())
+        } else if let Some(spec) = url_path.strip_prefix(&format!("{EXTENSIONS_PATH}/")) {
+            let found = if let Some(uuid) = spec.strip_prefix("uuid/") {
+                find_registry_extension(&extensions, Some(uuid), None)
+            } else if let Some(id) = spec.strip_prefix("extension-id/") {
+                find_registry_extension(&extensions, None, Some(id))
+            } else {
+                None
+            };
+            match found {
+                Some(extension) => match serde_json::to_string(&extension) {
+                    Ok(body) => json_response(
+                        StatusCode::OK,
+                        format!("{}\n", go_json_escape(&body)),
+                    ),
+                    Err(error) => text_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "text/plain; charset=utf-8",
+                        &format!("{error}\n"),
+                        true,
+                    ),
+                },
+                // `w.WriteHeader(404)` for an unrecognized spec has an empty
+                // body; a missing uuid/extension-id uses `http.Error`.
+                None if !spec.starts_with("uuid/") && !spec.starts_with("extension-id/") => {
+                    empty_not_found()
+                }
+                None => {
+                    let mut response = text_response(
+                        StatusCode::NOT_FOUND,
+                        "text/plain; charset=utf-8",
+                        "extension not found\n",
+                        true,
+                    );
+                    response.headers_mut().insert(
+                        header::CACHE_CONTROL,
+                        HeaderValue::from_static("max-age=5, private"),
+                    );
+                    response
+                }
+            }
+        } else {
+            empty_not_found()
+        }
+    };
+
+    // The baseline sets these before the route switch, even for empty 404s.
+    response.headers_mut().insert(
+        HeaderName::from_static("x-sourcegraph-media-type"),
+        HeaderValue::from_static(REGISTRY_MEDIA_TYPE),
+    );
+    response.headers_mut().insert(
+        header::VARY,
+        HeaderValue::from_static("Accept, User-Agent"),
+    );
+    response
+}
+
+/// The production registry source (no frozen data; non-dotcom answer).
+fn registry_response<B>(req: &Request<B>) -> Response<BoxBody> {
+    registry_response_with(req, &DefaultRegistrySource)
+}
+
+// ---------------------------------------------------------------------------
+// src-cli version cache seam (`cmd/frontend/internal/httpapi/src_cli.go`)
+// ---------------------------------------------------------------------------
+
+/// `time.Now`; the differential harness injects a fake clock.
+pub trait Clock: Send + Sync {
+    fn now(&self) -> Instant;
+}
+
+/// `glock.NewRealClock()`.
+#[derive(Debug, Default)]
+pub struct SystemClock;
+
+impl Clock for SystemClock {
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+}
+
+/// `httpcli.ExternalClient` + the `sourcegraph.com` version endpoint.
+pub trait SrcCliVersionSource: Send + Sync {
+    /// Fetch the recommended version, mirroring `updateCachedVersion`'s
+    /// errors.
+    fn version(&self) -> Result<String, String>;
+}
+
+/// The production source: `GET https://sourcegraph.com/.api/src-cli/versions/
+/// {major}.{minor}` and JSON-decode a string.
+#[derive(Debug, Default)]
+pub struct RemoteSrcCliVersionSource;
+
+impl SrcCliVersionSource for RemoteSrcCliVersionSource {
+    fn version(&self) -> Result<String, String> {
+        use crate::external_api::SRC_CLI_MINIMUM_VERSION;
+        let mut parts = SRC_CLI_MINIMUM_VERSION.split('.');
+        let major = parts.next().unwrap_or("0");
+        let minor = parts.next().unwrap_or("0");
+        let url = format!("https://sourcegraph.com/.api/src-cli/versions/{major}.{minor}");
+        let fetch = async move {
+            let client = reqwest::Client::builder()
+                .timeout(Duration::from_secs(10))
+                .build()
+                .map_err(|error| format!("building request: {error}"))?;
+            let response = client
+                .get(&url)
+                .send()
+                .await
+                .map_err(|error| format!("getting version from Sourcegraph: {error}"))?;
+            let status = response.status();
+            if !status.is_success() {
+                return Err(format!("unexpected status code: {}", status.as_u16()));
+            }
+            response
+                .json::<String>()
+                .await
+                .map_err(|error| format!("reading version from response payload: {error}"))
+        };
+        // `Version()` is synchronous. When called from a multi-thread runtime
+        // (the HTTP server), run the fetch on a scratch runtime; otherwise
+        // drive a current-thread runtime directly.
+        let join = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|error| error.to_string())?;
+            runtime.block_on(fetch)
+        });
+        join.join().unwrap_or_else(|_| {
+            Err("getting version from Sourcegraph: request thread panicked".to_owned())
+        })
+    }
+}
+
+/// `srcCliVersionHandler`'s 10-minute lazy cache.
+pub struct SrcCliVersionHandler {
+    max_stale: Duration,
+    source: Arc<dyn SrcCliVersionSource>,
+    clock: Arc<dyn Clock>,
+    state: Mutex<VersionCacheState>,
+}
+
+#[derive(Debug, Default)]
+struct VersionCacheState {
+    last_update: Option<Instant>,
+    version: String,
+}
+
+impl SrcCliVersionHandler {
+    /// `newSrcCliVersionHandler` (`srcCliCacheLifetime`).
+    pub fn new(source: Arc<dyn SrcCliVersionSource>, clock: Arc<dyn Clock>) -> Self {
+        Self::with_max_stale(source, clock, Duration::from_secs(600))
+    }
+
+    pub fn with_max_stale(
+        source: Arc<dyn SrcCliVersionSource>,
+        clock: Arc<dyn Clock>,
+        max_stale: Duration,
+    ) -> Self {
+        Self {
+            max_stale,
+            source,
+            clock,
+            state: Mutex::new(VersionCacheState::default()),
+        }
+    }
+
+    /// `cachedVersion`: a zero `lastUpdate` is alway stale, so `None`.
+    fn cached_version(&self) -> Option<String> {
+        let state = self.state.lock().expect("src-cli cache lock");
+        let last_update = state.last_update?;
+        if self.clock.now().duration_since(last_update) > self.max_stale {
+            return None;
+        }
+        if state.version.is_empty() {
+            None
+        } else {
+            Some(state.version.clone())
+        }
+    }
+
+    /// `Version()`: cached, else fetch; a fetch error falls back to
+    /// `srccli.MinimumVersion`.
+    pub fn version(&self) -> String {
+        if let Some(version) = self.cached_version() {
+            return version;
+        }
+        match self.source.version() {
+            Ok(version) => {
+                let mut state = self.state.lock().expect("src-cli cache lock");
+                state.last_update = Some(self.clock.now());
+                state.version = version.clone();
+                version
+            }
+            Err(_) => SRC_CLI_MINIMUM_VERSION.to_owned(),
+        }
+    }
+}
+
+/// The process-wide handler, so the cache survives across requests. The
+/// production route keeps Go's lazy 10-minute fetch; an air-gapped instance
+/// falls back to [`SRC_CLI_MINIMUM_VERSION`].
+pub fn production_src_cli_handler() -> Arc<SrcCliVersionHandler> {
+    static HANDLER: OnceLock<Arc<SrcCliVersionHandler>> = OnceLock::new();
+    HANDLER
+        .get_or_init(|| {
+            Arc::new(SrcCliVersionHandler::new(
+                Arc::new(RemoteSrcCliVersionSource),
+                Arc::new(SystemClock),
+            ))
+        })
+        .clone()
+}
+
+/// `srcCliVersionHandler.ServeHTTP` (`src_cli.go:68-82`) with the version
+/// cache injected.
+pub fn src_cli_response_with(
+    method: &Method,
+    rest: &str,
+    handler: &SrcCliVersionHandler,
+) -> Response<BoxBody> {
     if rest == "version" {
-        let body = format!("{{\"version\":\"{SRC_CLI_MINIMUM_VERSION}\"}}\n");
+        // `writeJSON` uses `json.Encoder`, which emits the JSON string with
+        // Go's HTML escaping (`<`, `>`, `&`, U+2028/2029).
+        let encoded = serde_json::to_string(&handler.version())
+            .unwrap_or_else(|_| "\"\"".to_owned());
+        let body = format!("{{\"version\":{}}}\n", go_json_escape(&encoded));
         return text_response(
             StatusCode::OK,
             "application/json; charset=utf-8",
@@ -667,10 +1102,284 @@ fn src_cli_response(method: &Method, rest: &str) -> Response<BoxBody> {
         );
     }
     if SRC_CLI_FILENAMES.contains(&rest) {
-        let location = format!("{SRC_CLI_DOWNLOADS_URL}/{SRC_CLI_MINIMUM_VERSION}/{rest}");
+        let location = format!(
+            "{SRC_CLI_DOWNLOADS_URL}/{}/{rest}",
+            handler.version()
+        );
         return http_redirect(method, StatusCode::FOUND, location);
     }
     page_not_found()
+}
+
+fn src_cli_response(method: &Method, rest: &str) -> Response<BoxBody> {
+    src_cli_response_with(method, rest, &production_src_cli_handler())
+}
+
+// ---------------------------------------------------------------------------
+// GitHub webhook seam (`cmd/frontend/internal/webhooks/github_webhooks.go`)
+// ---------------------------------------------------------------------------
+
+/// One configured GitHub webhook secret (`schema.GitHubWebhook.Secret`).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct GitHubWebhookConfig {
+    pub secret: String,
+}
+
+/// The subset of a GitHub external service's config the webhook path reads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitHubExternalService {
+    pub id: i64,
+    /// `schema.GitHubConnection.Url`.
+    pub url: String,
+    pub webhooks: Vec<GitHubWebhookConfig>,
+}
+
+/// A dispatch failure mapped to the status the baseline uses.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WebhookDispatchError {
+    NotFound(String),
+    Internal(String),
+}
+
+/// The DB/dispatch seam. The production default has no database connection
+/// (the frontend's `service.rs` wiring is outside this slice): it reports an
+/// empty `external_services` table, which is the same answer as the previous
+/// fixed 400.
+pub trait GitHubWebhookDeps: Send + Sync {
+    fn get_external_service(&self, id: i64) -> Result<Option<GitHubExternalService>, String>;
+
+    fn list_github_external_services(&self) -> Result<Vec<GitHubExternalService>, String>;
+
+    fn dispatch(
+        &self,
+        event: &str,
+        code_host_url: &str,
+        body: &[u8],
+    ) -> Result<(), WebhookDispatchError>;
+}
+
+/// The empty-table default.
+#[derive(Debug, Default)]
+pub struct EmptyGitHubWebhookDeps;
+
+impl GitHubWebhookDeps for EmptyGitHubWebhookDeps {
+    fn get_external_service(&self, _id: i64) -> Result<Option<GitHubExternalService>, String> {
+        Ok(None)
+    }
+
+    fn list_github_external_services(&self) -> Result<Vec<GitHubExternalService>, String> {
+        Ok(Vec::new())
+    }
+
+    fn dispatch(
+        &self,
+        _event: &str,
+        _code_host_url: &str,
+        _body: &[u8],
+    ) -> Result<(), WebhookDispatchError> {
+        Ok(())
+    }
+}
+
+/// `github.ValidateSignature` (go-github `messages.go`): `sha1=`/`sha256=`/
+/// `sha512=` hex HMAC over the raw body.
+fn validate_github_signature(signature: &str, body: &[u8], secret: &[u8]) -> Result<(), String> {
+    if signature.is_empty() {
+        return Err("missing signature".to_owned());
+    }
+    let (prefix, hex_tag) = signature
+        .split_once('=')
+        .ok_or_else(|| format!("error parsing signature \"{signature}\""))?;
+    let tag =
+        hex_decode(hex_tag).ok_or_else(|| format!("error decoding signature \"{signature}\""))?;
+    let valid = match prefix {
+        "sha1" => {
+            let mut mac = Hmac::<Sha1>::new_from_slice(secret).map_err(|_| "invalid key")?;
+            mac.update(body);
+            mac.verify_slice(&tag).is_ok()
+        }
+        "sha256" => {
+            let mut mac = Hmac::<Sha256>::new_from_slice(secret).map_err(|_| "invalid key")?;
+            mac.update(body);
+            mac.verify_slice(&tag).is_ok()
+        }
+        "sha512" => {
+            let mut mac = Hmac::<Sha512>::new_from_slice(secret).map_err(|_| "invalid key")?;
+            mac.update(body);
+            mac.verify_slice(&tag).is_ok()
+        }
+        other => return Err(format!("unknown hash type prefix: \"{other}\"")),
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err("unable to validate webhook signature".to_owned())
+    }
+}
+
+fn hex_decode(value: &str) -> Option<Vec<u8>> {
+    if value.len() % 2 != 0 {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(value.len() / 2);
+    let chars: Vec<char> = value.chars().collect();
+    for pair in chars.chunks(2) {
+        let high = pair[0].to_digit(16)?;
+        let low = pair[1].to_digit(16)?;
+        bytes.push((high * 16 + low) as u8);
+    }
+    Some(bytes)
+}
+
+/// `validateAnyConfiguredSecret`.
+fn validate_any_configured_secret(
+    service: &GitHubExternalService,
+    signature: &str,
+    body: &[u8],
+) -> Result<(), String> {
+    if signature.is_empty() {
+        return Ok(());
+    }
+    if service.webhooks.is_empty() {
+        return Err("no webhooks defined".to_owned());
+    }
+    for hook in &service.webhooks {
+        if hook.secret.is_empty() {
+            continue;
+        }
+        if validate_github_signature(signature, body, hook.secret.as_bytes()).is_ok() {
+            return Ok(());
+        }
+    }
+    Err("unable to validate webhook signature".to_owned())
+}
+
+fn webhook_error(status: StatusCode, message: &str) -> Response<BoxBody> {
+    text_response(
+        status,
+        "text/plain; charset=utf-8",
+        &format!("{message}\n"),
+        true,
+    )
+}
+
+/// `GitHubWebhook.getExternalService`: the `externalServiceID` form parameter
+/// (legacy fallback when absent), then secret validation.
+fn github_webhook_external_service(
+    deps: &dyn GitHubWebhookDeps,
+    query_pairs: &[(String, String)],
+    signature: &str,
+    body: &[u8],
+) -> Result<GitHubExternalService, Response<BoxBody>> {
+    // `r.FormValue` returns the first value for the key.
+    let raw_id = query_pairs
+        .iter()
+        .find(|(key, _)| key == "externalServiceID")
+        .map(|(_, value)| value.clone())
+        .unwrap_or_default();
+
+    if raw_id.is_empty() {
+        // Legacy path: try every configured GitHub external service.
+        // `findAndValidateExternalService`'s error is not a NotFound error, so
+        // `ServeHTTP` answers the constant `Error validating payload`.
+        let services = deps.list_github_external_services().map_err(|_| {
+            webhook_error(StatusCode::BAD_REQUEST, "Error validating payload")
+        })?;
+        for service in services {
+            if validate_any_configured_secret(&service, signature, body).is_ok() {
+                return Ok(service);
+            }
+        }
+        return Err(webhook_error(
+            StatusCode::BAD_REQUEST,
+            "Error validating payload",
+        ));
+    }
+
+    let Ok(id) = raw_id.parse::<i64>() else {
+        return Err(webhook_error(
+            StatusCode::BAD_REQUEST,
+            "Error validating payload",
+        ));
+    };
+    // `ServeHTTP` only surfaces a NotFound error as-is; every other
+    // `getExternalService` failure (DB error, non-GitHub config, config
+    // decode error, signature failure) answers `Error validating payload`.
+    let service = deps
+        .get_external_service(id)
+        .map_err(|_| webhook_error(StatusCode::BAD_REQUEST, "Error validating payload"))?;
+    let Some(service) = service else {
+        return Err(webhook_error(
+            StatusCode::NOT_FOUND,
+            "External service not found",
+        ));
+    };
+    // The wrapped signature error is not a NotFound error either, so the
+    // response is the same constant.
+    validate_any_configured_secret(&service, signature, body)
+        .map_err(|_| webhook_error(StatusCode::BAD_REQUEST, "Error validating payload"))?;
+    Ok(service)
+}
+
+/// `GitHubWebhook.ServeHTTP`, with the DB/dispatch seam injected.
+pub async fn github_webhook_response<B>(
+    req: &mut Request<B>,
+    deps: &dyn GitHubWebhookDeps,
+) -> Response<BoxBody>
+where
+    B: hyper::body::Body<Data = bytes::Bytes> + Unpin + Send,
+    B::Error: std::fmt::Display,
+{
+    use http_body_util::BodyExt;
+
+    let body = match req.body_mut().collect().await {
+        Ok(collected) => collected.to_bytes(),
+        Err(error) => return webhook_error(StatusCode::BAD_REQUEST, &error.to_string()),
+    };
+    let body = body.to_vec();
+
+    let signature = req
+        .headers()
+        .get("x-hub-signature")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("")
+        .to_owned();
+    // `ServeHTTP` reads the body into `body` before calling `getExternalService`,
+    // so the later `r.FormValue` only sees the URL query: an urlencoded form
+    // body is already exhausted and contributes no `externalServiceID`.
+    let pairs: Vec<(String, String)> = req
+        .uri()
+        .query()
+        .map(|query| {
+            url::form_urlencoded::parse(query.as_bytes())
+                .map(|(key, value)| (key.into_owned(), value.into_owned()))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let service = match github_webhook_external_service(deps, &pairs, &signature, &body) {
+        Ok(service) => service,
+        Err(response) => return response,
+    };
+    if url::Url::parse(&service.url).is_err() {
+        return webhook_error(StatusCode::INTERNAL_SERVER_ERROR, "Invalid code host URL");
+    }
+
+    let event = req
+        .headers()
+        .get("x-github-event")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("")
+        .to_owned();
+    match deps.dispatch(&event, &service.url, &body) {
+        Ok(()) => empty_response(StatusCode::OK),
+        Err(WebhookDispatchError::NotFound(message)) => {
+            webhook_error(StatusCode::NOT_FOUND, &message)
+        }
+        Err(WebhookDispatchError::Internal(message)) => {
+            webhook_error(StatusCode::INTERNAL_SERVER_ERROR, &message)
+        }
+    }
 }
 
 /// `clientconfig.GetClientConfigHandler` / `modelconfig.GetSupportedModelsHandler`
@@ -688,8 +1397,10 @@ fn unauthorized_response() -> Response<BoxBody> {
 /// `webhooks.GitHubWebhook.ServeHTTP` with no GitHub external services
 /// configured (`github_webhooks.go:26-50`): the legacy lookup returns a plain
 /// (non-NotFound) error, so the handler answers
-/// `http.Error(..., "Error validating payload", 400)`. Signature validation
-/// against configured external services and event dispatch are not ported.
+/// `http.Error(..., "Error validating payload", 400)`. This is the answer of
+/// the synchronous [`api_response`] using [`EmptyGitHubWebhookDeps`]; the
+/// full signature validation and event dispatch live in
+/// [`github_webhook_response`].
 fn webhook_validation_error() -> Response<BoxBody> {
     text_response(
         StatusCode::BAD_REQUEST,

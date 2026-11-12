@@ -339,6 +339,10 @@ struct ShellCase {
     branding_has_theme: bool,
     #[serde(default)]
     manifest_mode: String,
+    #[serde(default)]
+    referer: String,
+    #[serde(default)]
+    capture_body: bool,
 }
 
 #[derive(Deserialize)]
@@ -363,6 +367,10 @@ struct ShellResult {
     css_href: String,
     js_src: String,
     preloads: Vec<Preload>,
+    content_type: String,
+    access_control_allow_origin: String,
+    access_control_allow_credentials: String,
+    body: String,
 }
 
 fn capture(re: &regex::Regex, body: &str) -> String {
@@ -433,11 +441,13 @@ async fn ui_shell_diff() {
             ui_assets: Some(Arc::new(UiAssets::for_path(&dir))),
             ..AppDeps::default()
         };
-        let mut req = Request::builder()
+        let mut builder = Request::builder()
             .method(Method::from_bytes(case.method.as_bytes()).expect("method"))
-            .uri(case.target.as_str())
-            .body(())
-            .expect("request");
+            .uri(case.target.as_str());
+        if !case.referer.is_empty() {
+            builder = builder.header(http::header::REFERER, case.referer.as_str());
+        }
+        let mut req = builder.body(()).expect("request");
         let response = app_router::dispatch_async(&mut req, &env, &config, &deps).await;
         let status = response.status().as_u16();
         let headers = response.headers().clone();
@@ -464,6 +474,20 @@ async fn ui_shell_diff() {
             css_href: capture(&css_re, &body),
             js_src: capture(&js_re, &body),
             preloads,
+            content_type: if case.capture_body {
+                header(&headers, "content-type")
+            } else {
+                String::new()
+            },
+            access_control_allow_origin: header(
+                &headers,
+                "access-control-allow-origin",
+            ),
+            access_control_allow_credentials: header(
+                &headers,
+                "access-control-allow-credentials",
+            ),
+            body: if case.capture_body { body } else { String::new() },
         });
     }
 

@@ -7,39 +7,40 @@
 //! frontend DB, builds the object-storage index downloader, and serves the
 //! legacy `POST /search` API on `:9991`.
 //!
-//! The DB-backed index download and the site-configured embeddings provider
-//! are not ported (M9.17c): the binary starts the same listener and routes,
-//! but the injected backend reports the missing pieces per request. The
-//! configuration/validation/handler surface is shared with the differential
-//! harness in `src/lib.rs`.
+//! The production backend follows `shared.Main`: the frontend PG
+//! `repo_embedding_jobs` store feeds the cache, the `EMBEDDINGS_UPLOAD_*`
+//! object storage downloads indexes, and the site configuration builds the
+//! query client. Each system is injectable through `src/backend.rs` for the
+//! differential harness.
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use sg_bin_embeddings::{Config, EmbeddingBackend, EmbeddingError, Handler, RepoEmbeddingIndex};
+use sg_bin_embeddings::backend::{
+    live_query_embedding, object_storage_config, postgres_dsn, CachedEmbeddingIndexGetter,
+    EmbeddingIndexDownloader, EmbeddingJobsStore, ObjectStorageDownloader,
+    ObjectStorageIndexStore, PgEmbeddingJobsStore, ProductionBackend,
+};
+use sg_bin_embeddings::{Config, EmbeddingError, Handler};
 use sg_core::{ConfigError, EnvReader, Service, ServiceContext, ServiceError};
+use sg_db::OffsetDateTime;
 
 /// `shared.addr`.
 const ADDR: &str = ":9991";
 
-/// The production backend until the DB/object-storage/provider wiring lands.
-struct NotPortedBackend;
+/// Used when the process has no frontend DB connection configured; the
+/// search request reports the standard job-store error instead of panicking.
+struct UnavailableJobsStore {
+    reason: String,
+}
 
-impl EmbeddingBackend for NotPortedBackend {
-    fn get_query_embedding(&self, _query: &str) -> Result<(Vec<f32>, String), EmbeddingError> {
-        Err(EmbeddingError::other(
-            "not ported: embeddings query client",
-        ))
-    }
-
-    fn get_repo_embedding_index(
-        &self,
-        _repo_id: i32,
-        _repo_name: &str,
-    ) -> Result<RepoEmbeddingIndex, EmbeddingError> {
-        Err(EmbeddingError::other(
-            "not ported: embeddings repo index download",
-        ))
+#[async_trait]
+impl EmbeddingJobsStore for UnavailableJobsStore {
+    async fn get_last_completed(&self, _repo_id: i32) -> Result<OffsetDateTime, EmbeddingError> {
+        Err(EmbeddingError::other(format!(
+            "repo embedding job store unavailable: {}",
+            self.reason
+        )))
     }
 }
 
@@ -97,6 +98,34 @@ impl Service for EmbeddingsService {
     }
 
     async fn start(self: Box<Self>, ctx: ServiceContext) -> Result<(), ServiceError> {
+        let config = self.config.clone().unwrap_or_default();
+        let getenv = |key: &str| std::env::var(key).ok();
+        let jobs: Arc<dyn EmbeddingJobsStore> = match postgres_dsn(&getenv) {
+            Ok(dsn) => {
+                let pool = sg_db::connect(&dsn, 10).await.map_err(|err| {
+                    ServiceError::new(format!("failed to connect to database: {err}"))
+                })?;
+                Arc::new(PgEmbeddingJobsStore::new(pool))
+            }
+            Err(reason) => {
+                tracing::warn!(%reason, "frontend DB is not configured");
+                Arc::new(UnavailableJobsStore { reason })
+            }
+        };
+        let store: Arc<dyn sg_bin_embeddings::backend::IndexObjectStore> =
+            Arc::new(ObjectStorageIndexStore::new(object_storage_config(&config)));
+        let downloader: Arc<dyn EmbeddingIndexDownloader> =
+            Arc::new(ObjectStorageDownloader::new(store));
+        let index_getter = Arc::new(CachedEmbeddingIndexGetter::new(
+            jobs,
+            downloader,
+            config.embeddings_cache_size,
+        ));
+        let backend = Arc::new(ProductionBackend::new(
+            live_query_embedding(sg_bin_embeddings::backend::site_configuration()),
+            index_getter,
+        ));
+
         // Go's `net.Listen("tcp", ":9991")` binds the IPv4 wildcard.
         let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", &ADDR[1..]))
             .await
@@ -104,7 +133,7 @@ impl Service for EmbeddingsService {
         ctx.ready.mark_ready();
         tracing::info!(service = "embeddings", addr = ADDR, "embeddings server listening");
 
-        let handler = Arc::new(Handler::new(Arc::new(NotPortedBackend)));
+        let handler = Arc::new(Handler::new(backend));
         loop {
             tokio::select! {
                 _ = ctx.shutdown.cancelled() => break,
@@ -168,7 +197,7 @@ async fn serve_connection(
     }
     let body = buffer[body_start..].to_vec();
 
-    let response = handler.handle(&path, &method, &body);
+    let response = handler.handle(&path, &method, &body).await;
     let status_text = match response.status {
         200 => "OK",
         400 => "Bad Request",

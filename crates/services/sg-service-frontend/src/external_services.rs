@@ -119,6 +119,70 @@ pub trait ExternalServiceConnectionStore: Send + Sync {
     /// `db.ExternalServices().GetByID` (`ExternalService.webhookLogs` and
     /// `WebhookLog.externalService` need a single live service).
     async fn get_by_id(&self, id: i64) -> Result<ExternalServiceListRecord, String>;
+
+    /// `ExternalService.CheckConnection` (`external_service.go:302-343`). The
+    /// default seam reproduces the unsupported-kind result and, for supported
+    /// kinds, the source-construction failure path; deployments inject a
+    /// code-host prober here.
+    async fn check_connection(
+        &self,
+        _id: i64,
+        kind: &str,
+        _config: &str,
+    ) -> Result<ConnectionCheckData, String> {
+        if !has_connection_check(kind) {
+            return Ok(ConnectionCheckData::Unknown);
+        }
+        Ok(ConnectionCheckData::Unavailable {
+            suspected_reason:
+                "failed to create source: external service connection check is not configured"
+                    .to_owned(),
+        })
+    }
+
+    /// `ExternalService.SyncJobs` (`external_service.go:391-459`). The default
+    /// seam has no job store and returns an empty connection.
+    async fn sync_jobs(&self, _id: i64) -> Result<SyncJobsData, String> {
+        Ok(SyncJobsData::default())
+    }
+}
+
+/// `externalServiceAvailabilityStateResolver`'s union member.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConnectionCheckData {
+    Available {
+        last_checked_at: time::OffsetDateTime,
+    },
+    Unavailable {
+        suspected_reason: String,
+    },
+    Unknown,
+}
+
+/// `types.ExternalServiceSyncJob`, reduced to the fields the resolver reads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyncJobData {
+    pub id: i64,
+    pub state: String,
+    pub cancel: bool,
+    pub failure_message: String,
+    pub queued_at: time::OffsetDateTime,
+    pub started_at: Option<time::OffsetDateTime>,
+    pub finished_at: Option<time::OffsetDateTime>,
+    pub repos_synced: i32,
+    pub repo_sync_errors: i32,
+    pub repos_added: i32,
+    pub repos_deleted: i32,
+    pub repos_modified: i32,
+    pub repos_unmodified: i32,
+}
+
+/// `externalServiceSyncJobConnectionResolver`'s computed value.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SyncJobsData {
+    /// `GetSyncJobs(ExternalServiceID)` ordered by `started_at DESC`.
+    pub jobs: Vec<SyncJobData>,
+    pub total_count: i64,
 }
 
 /// Production adapter over [`sg_db::external_services::ExternalServiceStore`].
@@ -203,6 +267,11 @@ pub struct ExternalServiceNodeData {
     pub supports_repo_exclusion: bool,
     /// `availabilityCheck[kind]` (`ExternalService.hasConnectionCheck`).
     pub has_connection_check: bool,
+    /// `ExternalService.checkConnection` prefetched for the node.
+    pub check_connection: ConnectionCheckData,
+    /// `ExternalService.syncJobs` prefetched for the node (all jobs; the field
+    /// applies `first` and computes `PageInfo` like the baseline).
+    pub sync_jobs: SyncJobsData,
 }
 
 /// An `ExternalServiceConnection` page.
@@ -379,6 +448,10 @@ async fn node_data_from_record(
     let last_sync_error = store.last_sync_error(record.id).await?;
     let creator = lookup_user(users, user_cache, record.creator_id).await?;
     let last_updater = lookup_user(users, user_cache, record.last_updater_id).await?;
+    let check_connection = store
+        .check_connection(record.id, &record.kind, &raw)
+        .await?;
+    let sync_jobs = store.sync_jobs(record.id).await?;
     Ok(ExternalServiceNodeData {
         id: record.id,
         supports_repo_exclusion: supports_repo_exclusion(&record.kind),
@@ -398,6 +471,8 @@ async fn node_data_from_record(
         last_sync_at: record.last_sync_at,
         next_sync_at: record.next_sync_at,
         unrestricted: record.unrestricted,
+        check_connection,
+        sync_jobs,
     })
 }
 
@@ -1044,6 +1119,8 @@ impl ExternalServiceObject {
                 unrestricted: row.unrestricted,
                 supports_repo_exclusion: supports_repo_exclusion(&row.kind),
                 has_connection_check: has_connection_check(&row.kind),
+                check_connection: ConnectionCheckData::Unknown,
+                sync_jobs: SyncJobsData::default(),
             },
             viewer_site_admin,
             nested: Arc::new(crate::graphql_resolvers::NestedPrefetch::default()),
@@ -1153,11 +1230,192 @@ impl ObjectValue for ExternalServiceObject {
                     None => Ok(None),
                 }
             }
-            // Explicit "not ported" rather than the executor's generic
-            // missing-resolver error.
-            "checkConnection" | "syncJobs" => Err(ExecError::new(format!(
-                "ExternalService.{field} is not ported (M9.8gk)"
-            ))),
+            // `ExternalService.CheckConnection` (`external_service.go:302-343`).
+            "checkConnection" => Ok(Some(FieldValue::Object(Arc::new(
+                ConnectionCheckObject {
+                    data: self.data.check_connection.clone(),
+                },
+            )))),
+            // `ExternalService.SyncJobs` (`external_service.go:291-293`).
+            "syncJobs" => {
+                let first = arguments
+                    .i64("first")
+                    .and_then(|value| i32::try_from(value).ok());
+                Ok(Some(FieldValue::Object(Arc::new(
+                    SyncJobsConnectionObject::new(self.data.sync_jobs.clone(), first),
+                ))))
+            }
+            _ => Ok(None),
+        }
+    }
+}
+
+/// `externalServiceAvailabilityStateResolver`.
+struct ConnectionCheckObject {
+    data: ConnectionCheckData,
+}
+
+impl ObjectValue for ConnectionCheckObject {
+    fn type_name(&self) -> &'static str {
+        match self.data {
+            ConnectionCheckData::Available { .. } => "ExternalServiceAvailable",
+            ConnectionCheckData::Unavailable { .. } => "ExternalServiceUnavailable",
+            ConnectionCheckData::Unknown => "ExternalServiceAvailabilityUnknown",
+        }
+    }
+
+    fn field(
+        &self,
+        field: &str,
+        _arguments: &Arguments,
+        _actor: Actor,
+    ) -> Result<Option<FieldValue>, ExecError> {
+        match field {
+            "lastCheckedAt" => Ok(Some(match self.data {
+                ConnectionCheckData::Available { last_checked_at } => {
+                    FieldValue::Json(Json::Str(datetime_rfc3339(last_checked_at)))
+                }
+                _ => FieldValue::Null,
+            })),
+            "suspectedReason" => Ok(Some(match &self.data {
+                ConnectionCheckData::Unavailable { suspected_reason } => {
+                    FieldValue::Json(Json::Str(suspected_reason.clone()))
+                }
+                _ => FieldValue::Null,
+            })),
+            "implementationNote" => Ok(Some(FieldValue::Json(Json::Str(
+                "not implemented".to_owned(),
+            )))),
+            _ => Ok(None),
+        }
+    }
+}
+
+/// `marshalExternalServiceSyncJobID`.
+pub fn marshal_external_service_sync_job_id(id: i64) -> String {
+    base64::engine::general_purpose::URL_SAFE
+        .encode(format!("ExternalServiceSyncJob:{id}"))
+}
+
+/// `externalServiceSyncJobConnectionResolver`.
+struct SyncJobsConnectionObject {
+    data: SyncJobsData,
+    first: Option<i32>,
+}
+
+impl SyncJobsConnectionObject {
+    fn new(data: SyncJobsData, first: Option<i32>) -> Self {
+        Self { data, first }
+    }
+
+    /// `externalServiceSyncJobConnectionResolver.compute`: `first` limits the
+    /// nodes, while `TotalCount` counts all jobs for the service.
+    fn selected_jobs(&self) -> &[SyncJobData] {
+        match self.first {
+            Some(first) => {
+                let limit = first.max(0) as usize;
+                &self.data.jobs[..self.data.jobs.len().min(limit)]
+            }
+            None => &self.data.jobs,
+        }
+    }
+}
+
+impl ObjectValue for SyncJobsConnectionObject {
+    fn type_name(&self) -> &'static str {
+        "ExternalServiceSyncJobConnection"
+    }
+
+    fn field(
+        &self,
+        field: &str,
+        _arguments: &Arguments,
+        _actor: Actor,
+    ) -> Result<Option<FieldValue>, ExecError> {
+        match field {
+            "nodes" => {
+                let jobs = self.selected_jobs();
+                Ok(Some(FieldValue::List {
+                    items: jobs
+                        .iter()
+                        .map(|job| FieldValue::Object(Arc::new(SyncJobObject { job: job.clone() })))
+                        .collect(),
+                    element_type: Some("ExternalServiceSyncJob"),
+                }))
+            }
+            "totalCount" => Ok(Some(FieldValue::Json(Json::Int(self.data.total_count)))),
+            "pageInfo" => {
+                let has_next_page = self.selected_jobs().len() as i64 != self.data.total_count;
+                Ok(Some(FieldValue::Object(Arc::new(PageInfoObject::new(
+                    has_next_page,
+                    None,
+                )))))
+            }
+            _ => Ok(None),
+        }
+    }
+}
+
+/// `externalServiceSyncJobResolver`.
+struct SyncJobObject {
+    job: SyncJobData,
+}
+
+impl ObjectValue for SyncJobObject {
+    fn type_name(&self) -> &'static str {
+        "ExternalServiceSyncJob"
+    }
+
+    fn field(
+        &self,
+        field: &str,
+        _arguments: &Arguments,
+        _actor: Actor,
+    ) -> Result<Option<FieldValue>, ExecError> {
+        match field {
+            "id" => Ok(Some(FieldValue::Json(Json::Str(
+                marshal_external_service_sync_job_id(self.job.id),
+            )))),
+            "state" => {
+                let state = if self.job.cancel && self.job.state == "processing" {
+                    "CANCELING".to_owned()
+                } else {
+                    self.job.state.to_uppercase()
+                };
+                Ok(Some(FieldValue::Json(Json::Str(state))))
+            }
+            "failureMessage" => {
+                if self.job.failure_message.is_empty() || self.job.cancel {
+                    Ok(Some(FieldValue::Null))
+                } else {
+                    Ok(Some(FieldValue::Json(Json::Str(
+                        self.job.failure_message.clone(),
+                    ))))
+                }
+            }
+            "queuedAt" => Ok(Some(FieldValue::Json(Json::Str(datetime_rfc3339(
+                self.job.queued_at,
+            ))))),
+            "startedAt" => Ok(Some(optional_datetime(self.job.started_at))),
+            "finishedAt" => Ok(Some(optional_datetime(self.job.finished_at))),
+            "reposSynced" => Ok(Some(FieldValue::Json(Json::Int(i64::from(
+                self.job.repos_synced,
+            ))))),
+            "repoSyncErrors" => Ok(Some(FieldValue::Json(Json::Int(i64::from(
+                self.job.repo_sync_errors,
+            ))))),
+            "reposAdded" => Ok(Some(FieldValue::Json(Json::Int(i64::from(
+                self.job.repos_added,
+            ))))),
+            "reposDeleted" => Ok(Some(FieldValue::Json(Json::Int(i64::from(
+                self.job.repos_deleted,
+            ))))),
+            "reposModified" => Ok(Some(FieldValue::Json(Json::Int(i64::from(
+                self.job.repos_modified,
+            ))))),
+            "reposUnmodified" => Ok(Some(FieldValue::Json(Json::Int(i64::from(
+                self.job.repos_unmodified,
+            ))))),
             _ => Ok(None),
         }
     }
