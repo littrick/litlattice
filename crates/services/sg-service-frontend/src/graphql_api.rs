@@ -466,6 +466,9 @@ pub struct SchemaGraphqlDeps {
     /// `User.externalAccounts` / `Query.node(ExternalAccount)` seams (M9.8ka).
     /// `None` keeps both surfaces unported.
     external_accounts: Option<ExternalAccountsDeps>,
+    /// Admin/account write seams (M9.12b); `None` keeps the mutation fields
+    /// unported in transport-only tests.
+    admin_mutations: Option<crate::admin_mutations::AdminMutationDeps>,
 }
 
 /// Seams for the external-account GraphQL surface (M9.8ka): the
@@ -519,6 +522,7 @@ impl SchemaGraphqlDeps {
             slow_requests: None,
             auth_providers: None,
             external_accounts: None,
+            admin_mutations: None,
         }
     }
 
@@ -560,7 +564,7 @@ impl SchemaGraphqlDeps {
             site_configuration: None,
             config_graphql: None,
             repositories_connections: Some(Arc::new(
-                crate::repositories::PgRepositoriesConnectionStore::new(pool),
+                crate::repositories::PgRepositoriesConnectionStore::new(pool.clone()),
             )),
             search_contexts: None,
             ranking: None,
@@ -571,6 +575,13 @@ impl SchemaGraphqlDeps {
             slow_requests: None,
             auth_providers: None,
             external_accounts: None,
+            admin_mutations: Some(crate::admin_mutations::AdminMutationDeps::new(
+                Arc::new(crate::admin_store::PgAdminStore::new(pool.clone())),
+                Arc::new(crate::admin_store::PgAdminEffects::new(
+                    pool.clone(),
+                    crate::admin_store::AdminConfig::default(),
+                )),
+            )),
         }
     }
 
@@ -737,6 +748,15 @@ impl SchemaGraphqlDeps {
             feature_flags: None,
             gerrit: None,
         });
+        self
+    }
+
+    /// Wire the admin/account write seams (M9.12b).
+    pub fn with_admin_mutations(
+        mut self,
+        deps: crate::admin_mutations::AdminMutationDeps,
+    ) -> Self {
+        self.admin_mutations = Some(deps);
         self
     }
 
@@ -982,6 +1002,7 @@ impl SchemaGraphqlDeps {
             slow_requests: None,
             auth_providers: None,
             external_accounts: None,
+            admin_mutations: None,
         }
     }
 }
@@ -1240,6 +1261,22 @@ impl GraphqlDeps for SchemaGraphqlDeps {
                 for (field, outcome) in outcomes {
                     mutation = mutation.with_site_configuration(field, outcome);
                 }
+            }
+        }
+        // `Mutation.createUser` / org / access-token / e-mail / external-service
+        // / repository admin writes (M9.12b).
+        let mut admin_mutation_outcomes = Vec::new();
+        let mut admin_external_url = String::new();
+        if let Some(deps) = &self.admin_mutations {
+            if is_mutation {
+                admin_external_url = deps.external_url.clone();
+                admin_mutation_outcomes = crate::admin_mutations::prefetch_admin_mutations(
+                    deps,
+                    &fields,
+                    request.actor,
+                    site_admin,
+                )
+                .await;
             }
         }
         let mut nodes = match (&self.org_memberships, &self.repositories) {
@@ -1665,6 +1702,13 @@ impl GraphqlDeps for SchemaGraphqlDeps {
             .with_git(git)
             .with_site(site)
             .with_settings_subject_site_configuration(settings_subject_site);
+        if !admin_mutation_outcomes.is_empty() {
+            roots = roots.with_admin_mutations(
+                site_admin,
+                admin_external_url,
+                admin_mutation_outcomes,
+            );
+        }
         if let Some(auth_providers_root) = auth_providers_root {
             roots = roots.with_auth_providers(Some(auth_providers_root));
         }

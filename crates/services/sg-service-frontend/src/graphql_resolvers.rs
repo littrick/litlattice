@@ -2536,6 +2536,22 @@ impl FrontendRootResolver {
         self
     }
 
+    /// Attach the prefetched M9.12b admin/account write outcomes.
+    pub fn with_admin_mutations(
+        mut self,
+        viewer_site_admin: bool,
+        external_url: impl Into<String>,
+        outcomes: Vec<(String, crate::admin_store::AdminMutationOutcome)>,
+    ) -> Self {
+        let external_url = external_url.into();
+        for (field, outcome) in outcomes {
+            let mutation = std::mem::take(&mut self.mutation);
+            self.mutation =
+                mutation.with_admin_mutation(viewer_site_admin, external_url.clone(), field, outcome);
+        }
+        self
+    }
+
     /// Attach the optional search contexts database (M9.8hz). `None` keeps the
     /// search contexts surface absent, matching a nil
     /// `OptionalResolver.SearchContextsResolver`.
@@ -2750,6 +2766,82 @@ pub struct MutationRoot {
     /// Prefetched `Mutation.bumpDerivativeGraphKey` /
     /// `Mutation.deleteRankingProgress` outcomes (M9.8ic).
     ranking_mutations: HashMap<String, Result<(), String>>,
+    /// Prefetched admin/account write outcomes (M9.12b).
+    admin_mutations: HashMap<String, crate::admin_store::AdminMutationOutcome>,
+    /// The viewer's `site_admin` flag for the objects the writes return.
+    admin_viewer_site_admin: bool,
+    /// `ExternalService.webhookURL` in mutation responses.
+    admin_external_url: String,
+}
+
+impl MutationRoot {
+    /// Attach one prefetched M9.12b admin/account write outcome.
+    pub fn with_admin_mutation(
+        mut self,
+        viewer_site_admin: bool,
+        external_url: impl Into<String>,
+        field: impl Into<String>,
+        outcome: crate::admin_store::AdminMutationOutcome,
+    ) -> Self {
+        self.admin_viewer_site_admin = viewer_site_admin;
+        self.admin_external_url = external_url.into();
+        self.admin_mutations.insert(field.into(), outcome);
+        self
+    }
+
+    /// Render one prefetched admin mutation outcome.
+    fn admin_mutation_value(
+        &self,
+        outcome: &crate::admin_store::AdminMutationOutcome,
+    ) -> Result<Option<FieldValue>, ExecError> {
+        use crate::admin_store::AdminMutationOutcome as Outcome;
+        match outcome {
+            Outcome::CreateUser {
+                user,
+                reset_password_url,
+            } => Ok(Some(FieldValue::Object(Arc::new(
+                crate::admin_mutations::CreateUserResultObject {
+                    user: user.clone(),
+                    reset_password_url: reset_password_url.clone(),
+                    viewer_site_admin: self.admin_viewer_site_admin,
+                },
+            )))),
+            Outcome::User(user) => Ok(Some(FieldValue::Object(Arc::new(
+                UserObject::from_data_as_viewer(
+                    user.user_data(),
+                    self.admin_viewer_site_admin,
+                ),
+            )))),
+            Outcome::Org {
+                org,
+                viewer_can_administer,
+                viewer_is_member,
+            } => Ok(Some(FieldValue::Object(Arc::new(
+                OrgObject::from_data_as_viewer(
+                    org.org_data(*viewer_can_administer, *viewer_is_member),
+                    self.admin_viewer_site_admin,
+                ),
+            )))),
+            Outcome::AccessToken(created) => Ok(Some(FieldValue::Object(Arc::new(
+                crate::admin_mutations::CreateAccessTokenResultObject {
+                    created: created.clone(),
+                },
+            )))),
+            Outcome::ExternalService { row, warning } => Ok(Some(FieldValue::Object(
+                Arc::new(crate::external_services::ExternalServiceObject::from_mutation_row(
+                    row,
+                    warning.clone(),
+                    self.admin_viewer_site_admin,
+                    &self.admin_external_url,
+                )),
+            ))),
+            Outcome::Empty => Ok(Some(FieldValue::Object(Arc::new(
+                crate::temporary_settings::EmptyResponseObject,
+            )))),
+            Outcome::Null => Ok(Some(FieldValue::Null)),
+            Outcome::Error(message) => Err(ExecError::new(message.clone())),
+        }
+    }
 }
 
 impl ObjectValue for MutationRoot {
@@ -2788,6 +2880,9 @@ impl ObjectValue for MutationRoot {
                 )))),
                 Err(message) => Err(ExecError::new(message.clone())),
             };
+        }
+        if let Some(outcome) = self.admin_mutations.get(field) {
+            return self.admin_mutation_value(outcome);
         }
         self.settings.field(field, arguments, actor)
     }

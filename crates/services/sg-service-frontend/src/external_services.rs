@@ -757,7 +757,7 @@ fn webhook_url(
 
 /// Replace the kind's secret properties in the raw JSONC document, keeping
 /// its formatting (`jsonx.ComputePropertyEdit` + `ApplyEdits`).
-fn redact_config(kind: &str, raw: &str) -> Result<String, String> {
+pub(crate) fn redact_config(kind: &str, raw: &str) -> Result<String, String> {
     let (value, errors) = parse(
         raw,
         ParseOptions {
@@ -1008,6 +1008,48 @@ pub struct ExternalServiceObject {
 }
 
 impl ExternalServiceObject {
+    /// Build the `AddExternalService` / `UpdateExternalService` response from
+    /// the written row. Relation counts and the creator/updater users are not
+    /// eagerly prefetched for the mutation response (the baseline resolves
+    /// them lazily); the fields the write path itself returns are computed the
+    /// same way as the read path.
+    pub fn from_mutation_row(
+        row: &crate::admin_store::ExternalServiceRow,
+        warning: Option<String>,
+        viewer_site_admin: bool,
+        external_url: &str,
+    ) -> Self {
+        let config = if row.config.is_empty() {
+            row.config.clone()
+        } else {
+            redact_config(&row.kind, &row.config).unwrap_or_else(|_| row.config.clone())
+        };
+        Self {
+            data: ExternalServiceNodeData {
+                id: row.id,
+                kind: row.kind.clone(),
+                display_name: row.display_name.clone(),
+                config,
+                url: unique_code_host_identifier(&row.kind, &row.config),
+                webhook_url: webhook_url(&row.kind, row.id, &row.config, external_url),
+                created_at: row.created_at,
+                updated_at: row.updated_at,
+                creator: None,
+                last_updater: None,
+                warning,
+                last_sync_error: None,
+                repo_count: 0,
+                last_sync_at: None,
+                next_sync_at: None,
+                unrestricted: row.unrestricted,
+                supports_repo_exclusion: supports_repo_exclusion(&row.kind),
+                has_connection_check: has_connection_check(&row.kind),
+            },
+            viewer_site_admin,
+            nested: Arc::new(crate::graphql_resolvers::NestedPrefetch::default()),
+        }
+    }
+
     /// Build the node object from pre-fetched data (used by
     /// `WebhookLog.externalService`).
     pub fn from_data(
