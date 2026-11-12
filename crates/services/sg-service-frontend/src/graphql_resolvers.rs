@@ -543,6 +543,16 @@ pub struct NodeRoots {
     /// `externalAccountByID` results keyed by the raw id (M9.8ka).
     pub external_accounts:
         HashMap<i32, crate::external_accounts_graphql::ExternalAccountNodeLookup>,
+    /// `roleByID` / `permissionByID` results keyed by the raw Relay id
+    /// (M9.13b).
+    pub rbac_nodes: HashMap<String, crate::rbac_graphql::RbacNodeLookup>,
+    /// `executorSecretByID` results keyed by the raw Relay id (M9.13b).
+    pub executor_secrets:
+        HashMap<String, crate::executor_secrets_graphql::ExecutorSecretNodeLookup>,
+    /// `executorSecretAccessLogByID` results keyed by the raw Relay id
+    /// (M9.13b).
+    pub executor_secret_access_logs:
+        HashMap<String, crate::executor_secrets_graphql::ExecutorSecretAccessLogNodeLookup>,
 }
 
 /// `relay.UnmarshalKind`: URL-safe base64 decode and take the prefix before
@@ -1018,6 +1028,45 @@ pub struct NestedPrefetch {
         crate::external_accounts_graphql::SiteExternalAccountsArgs,
         crate::external_accounts_graphql::SiteExternalAccountsLookup,
     >,
+    /// `User.roles` connections keyed by user id and the argument set
+    /// (M9.13b).
+    pub user_roles: HashMap<
+        (i32, crate::rbac_graphql::RoleConnectionArgs),
+        Result<crate::rbac_graphql::RoleConnectionData, String>,
+    >,
+    /// `User.permissions` connections keyed by user id (M9.13b).
+    pub user_permissions:
+        HashMap<i32, Result<crate::rbac_graphql::PermissionConnectionData, String>>,
+    /// `Role.permissions` connections keyed by role id and the argument set
+    /// (M9.13b).
+    pub role_permissions: HashMap<
+        (i32, crate::rbac_graphql::RoleConnectionArgs),
+        Result<crate::rbac_graphql::PermissionConnectionData, String>,
+    >,
+    /// `User.executorSecrets` connections keyed by user id and the argument
+    /// set (M9.13b).
+    pub user_executor_secrets: HashMap<
+        (i32, crate::executor_secrets_graphql::ExecutorSecretsArgs),
+        Result<crate::executor_secrets_graphql::ExecutorSecretConnectionData, String>,
+    >,
+    /// `Org.executorSecrets` connections keyed by org id and the argument set
+    /// (M9.13b).
+    pub org_executor_secrets: HashMap<
+        (i32, crate::executor_secrets_graphql::ExecutorSecretsArgs),
+        Result<crate::executor_secrets_graphql::ExecutorSecretConnectionData, String>,
+    >,
+    /// `ExecutorSecret.accessLogs` connections keyed by secret id and the
+    /// argument set (M9.13b).
+    pub executor_secret_access_logs: HashMap<
+        (
+            i64,
+            crate::executor_secrets_graphql::ExecutorSecretAccessLogsArgs,
+        ),
+        Result<crate::executor_secrets_graphql::ExecutorSecretAccessLogsConnectionData, String>,
+    >,
+    /// `ExecutorSecretAccessLog.user` nodes keyed by user id (M9.13b).
+    pub executor_secret_access_log_users:
+        HashMap<i32, crate::executor_secrets_graphql::AccessLogUserLookup>,
 }
 
 /// The database seam for `User.organizations` (`db.Orgs().GetByUserID` plus
@@ -2503,6 +2552,8 @@ impl FrontendRootResolver {
                 site: None,
                 settings_subject_site: None,
                 auth_providers: None,
+                rbac: crate::rbac_graphql::RbacRoots::default(),
+                executor_secret_roots: crate::executor_secrets_graphql::ExecutorSecretRoots::default(),
             },
             mutation: MutationRoot::default(),
         }
@@ -2549,6 +2600,39 @@ impl FrontendRootResolver {
             self.mutation =
                 mutation.with_admin_mutation(viewer_site_admin, external_url.clone(), field, outcome);
         }
+        self
+    }
+
+    /// Attach the prefetched `Query.roles` / `Query.permissions` roots
+    /// (M9.13b).
+    pub fn with_rbac_roots(mut self, roots: crate::rbac_graphql::RbacRoots) -> Self {
+        self.query.rbac = roots;
+        self
+    }
+
+    /// Attach the prefetched `Query.executorSecrets` roots (M9.13b).
+    pub fn with_executor_secret_roots(
+        mut self,
+        roots: crate::executor_secrets_graphql::ExecutorSecretRoots,
+    ) -> Self {
+        self.query.executor_secret_roots = roots;
+        self
+    }
+
+    /// Attach the prefetched `create/update/deleteExecutorSecret` outcomes
+    /// (M9.13b).
+    pub fn with_executor_secret_mutations(
+        mut self,
+        viewer_site_admin: bool,
+        nested: Arc<NestedPrefetch>,
+        outcomes: Vec<(
+            String,
+            crate::executor_secrets_graphql::ExecutorSecretMutationOutcome,
+        )>,
+    ) -> Self {
+        self.mutation.executor_secret_viewer_site_admin = viewer_site_admin;
+        self.mutation.executor_secret_nested = nested;
+        self.mutation.executor_secret_mutations = outcomes.into_iter().collect();
         self
     }
 
@@ -2754,6 +2838,10 @@ struct QueryRoot {
     /// `Site.authProviders` derived from the live `auth.providers`
     /// configuration (M9.8jg); `None` when the directory was not injected.
     auth_providers: Option<Arc<crate::auth_providers_graphql::AuthProvidersRoot>>,
+    /// Prefetched `Query.roles` / `Query.permissions` (M9.13b).
+    rbac: crate::rbac_graphql::RbacRoots,
+    /// Prefetched `Query.executorSecrets` (M9.13b).
+    executor_secret_roots: crate::executor_secrets_graphql::ExecutorSecretRoots,
 }
 
 /// `Mutation` root: `settingsMutation`/log events/temporary settings/feature
@@ -2772,6 +2860,13 @@ pub struct MutationRoot {
     admin_viewer_site_admin: bool,
     /// `ExternalService.webhookURL` in mutation responses.
     admin_external_url: String,
+    /// Prefetched `create/update/deleteExecutorSecret` outcomes (M9.13b).
+    executor_secret_mutations:
+        HashMap<String, crate::executor_secrets_graphql::ExecutorSecretMutationOutcome>,
+    /// The viewer's `site_admin` and nested data for the secrets returned by
+    /// those mutations.
+    executor_secret_viewer_site_admin: bool,
+    executor_secret_nested: Arc<NestedPrefetch>,
 }
 
 impl MutationRoot {
@@ -2883,6 +2978,22 @@ impl ObjectValue for MutationRoot {
         }
         if let Some(outcome) = self.admin_mutations.get(field) {
             return self.admin_mutation_value(outcome);
+        }
+        if let Some(outcome) = self.executor_secret_mutations.get(field) {
+            use crate::executor_secrets_graphql::ExecutorSecretMutationOutcome as Outcome;
+            return match outcome {
+                Outcome::Secret(secret) => Ok(Some(FieldValue::Object(Arc::new(
+                    crate::executor_secrets_graphql::ExecutorSecretObject {
+                        secret: secret.clone(),
+                        viewer_site_admin: self.executor_secret_viewer_site_admin,
+                        nested: self.executor_secret_nested.clone(),
+                    },
+                )))),
+                Outcome::Empty => Ok(Some(FieldValue::Object(Arc::new(
+                    crate::temporary_settings::EmptyResponseObject,
+                )))),
+                Outcome::Error(message) => Err(ExecError::new(message.clone())),
+            };
         }
         self.settings.field(field, arguments, actor)
     }
@@ -3250,6 +3361,42 @@ impl ObjectValue for QueryRoot {
                     None => Ok(None),
                 }
             }
+            // `schemaResolver.Roles` / `Permissions` (M9.13b; site-admin gated
+            // at prefetch time).
+            "roles" => crate::rbac_graphql::root_role_connection(
+                &self.rbac,
+                &crate::rbac_graphql::role_connection_args(arguments),
+                self.viewer_site_admin,
+                self.nested.clone(),
+            ),
+            "permissions" => crate::rbac_graphql::root_permission_connection(
+                &self.rbac,
+                &crate::rbac_graphql::role_connection_args(arguments),
+                self.viewer_site_admin,
+                self.nested.clone(),
+            ),
+            // `schemaResolver.ExecutorSecrets` (M9.13b).
+            "executorSecrets" => {
+                let args =
+                    crate::executor_secrets_graphql::ExecutorSecretsArgs::from_arguments(arguments);
+                match args {
+                    Ok(args) => match self.executor_secret_roots.global.get(&args) {
+                        Some(Ok(data)) => Ok(Some(
+                            crate::executor_secrets_graphql::executor_secret_connection_value(
+                                data,
+                                args.scope,
+                                self.viewer_site_admin,
+                                self.nested.clone(),
+                            ),
+                        )),
+                        Some(Err(message)) => Err(ExecError::new(message.clone())),
+                        None => Ok(None),
+                    },
+                    // The baseline validates the cursor inside the resolver;
+                    // a malformed `after` is surfaced as an error.
+                    Err(message) => Err(ExecError::new(message)),
+                }
+            }
             // `schemaResolver.Node` (`node.go:21-39`): dispatch on the Relay
             // kind. Ported kinds: User/Org/Repository/ExternalService/
             // WebhookLog; unknown kinds are `invalid id` (the baseline only
@@ -3413,6 +3560,31 @@ impl ObjectValue for QueryRoot {
                             ) => Err(ExecError::new(message.clone())),
                             None => Ok(None),
                         }
+                    }
+                    // `NodeResolvers()["Role"]` / `["Permission"]` (M9.13b).
+                    "Role" | "Permission" => crate::rbac_graphql::rbac_node_value(
+                        &self.nodes.rbac_nodes,
+                        id,
+                        self.viewer_site_admin,
+                        self.nested.clone(),
+                    ),
+                    // `NodeResolvers()["ExecutorSecret"]` (M9.13b).
+                    "ExecutorSecret" => {
+                        crate::executor_secrets_graphql::executor_secret_node_value(
+                            &self.nodes.executor_secrets,
+                            id,
+                            self.viewer_site_admin,
+                            self.nested.clone(),
+                        )
+                    }
+                    // `NodeResolvers()["ExecutorSecretAccessLog"]` (M9.13b).
+                    "ExecutorSecretAccessLog" => {
+                        crate::executor_secrets_graphql::executor_secret_access_log_node_value(
+                            &self.nodes.executor_secret_access_logs,
+                            id,
+                            self.viewer_site_admin,
+                            self.nested.clone(),
+                        )
                     }
                     _ => self.node_int32(kind.as_str(), id),
                 }
@@ -3772,6 +3944,44 @@ impl ObjectValue for UserObject {
                     Some(UserOrganizationsLookup::Error(message)) => {
                         Err(ExecError::new(message.clone()))
                     }
+                    None => Ok(None),
+                }
+            }
+            // `UserResolver.Roles` / `Permissions` (M9.13b; the authorization
+            // results are prefetched per viewer).
+            "roles" => crate::rbac_graphql::user_role_connection(
+                &self.nested,
+                self.data.id,
+                &crate::rbac_graphql::role_connection_args(arguments),
+                self.viewer_site_admin,
+            ),
+            "permissions" => crate::rbac_graphql::user_permission_connection(
+                &self.nested,
+                self.data.id,
+                self.viewer_site_admin,
+            ),
+            // `UserResolver.ExecutorSecrets` (M9.13b).
+            "executorSecrets" => {
+                let args = match crate::executor_secrets_graphql::ExecutorSecretsArgs::from_arguments(
+                    arguments,
+                ) {
+                    Ok(args) => args,
+                    Err(message) => return Err(ExecError::new(message)),
+                };
+                match self
+                    .nested
+                    .user_executor_secrets
+                    .get(&(self.data.id, args.clone()))
+                {
+                    Some(Ok(data)) => Ok(Some(
+                        crate::executor_secrets_graphql::executor_secret_connection_value(
+                            data,
+                            args.scope,
+                            self.viewer_site_admin,
+                            self.nested.clone(),
+                        ),
+                    )),
+                    Some(Err(message)) => Err(ExecError::new(message.clone())),
                     None => Ok(None),
                 }
             }
@@ -4608,6 +4818,31 @@ impl ObjectValue for OrgObject {
                             self.nested.clone(),
                         )),
                     ))),
+                    None => Ok(None),
+                }
+            }
+            // `OrgResolver.ExecutorSecrets` (M9.13b).
+            "executorSecrets" => {
+                let args = match crate::executor_secrets_graphql::ExecutorSecretsArgs::from_arguments(
+                    arguments,
+                ) {
+                    Ok(args) => args,
+                    Err(message) => return Err(ExecError::new(message)),
+                };
+                match self
+                    .nested
+                    .org_executor_secrets
+                    .get(&(self.data.id, args.clone()))
+                {
+                    Some(Ok(data)) => Ok(Some(
+                        crate::executor_secrets_graphql::executor_secret_connection_value(
+                            data,
+                            args.scope,
+                            self.viewer_site_admin,
+                            self.nested.clone(),
+                        ),
+                    )),
+                    Some(Err(message)) => Err(ExecError::new(message.clone())),
                     None => Ok(None),
                 }
             }

@@ -469,6 +469,12 @@ pub struct SchemaGraphqlDeps {
     /// Admin/account write seams (M9.12b); `None` keeps the mutation fields
     /// unported in transport-only tests.
     admin_mutations: Option<crate::admin_mutations::AdminMutationDeps>,
+    /// `executorSecrets` / `ExecutorSecret` / create/update/delete seams
+    /// (M9.13b). `None` keeps the whole surface unported.
+    executor_secrets: Option<Arc<dyn crate::executor_secrets_graphql::ExecutorSecretsStore>>,
+    /// `roles` / `permissions` read seams (M9.13b). `None` keeps the RBAC
+    /// surface unported.
+    rbac: Option<Arc<dyn crate::rbac_graphql::RbacStore>>,
 }
 
 /// Seams for the external-account GraphQL surface (M9.8ka): the
@@ -523,6 +529,8 @@ impl SchemaGraphqlDeps {
             auth_providers: None,
             external_accounts: None,
             admin_mutations: None,
+            executor_secrets: None,
+            rbac: None,
         }
     }
 
@@ -582,6 +590,8 @@ impl SchemaGraphqlDeps {
                     crate::admin_store::AdminConfig::default(),
                 )),
             )),
+            executor_secrets: None,
+            rbac: None,
         }
     }
 
@@ -612,6 +622,23 @@ impl SchemaGraphqlDeps {
         store: Arc<dyn crate::graphql_resolvers::OrgMembershipsStore>,
     ) -> Self {
         self.org_memberships = Some(store);
+        self
+    }
+
+    /// Enable the executor-secret GraphQL surface (M9.13b): the existing
+    /// `executor_secrets` tables plus the keyring's `ExecutorSecretKey`.
+    pub fn with_executor_secrets(
+        mut self,
+        store: Arc<dyn crate::executor_secrets_graphql::ExecutorSecretsStore>,
+    ) -> Self {
+        self.executor_secrets = Some(store);
+        self
+    }
+
+    /// Enable the RBAC read surface (M9.13b): the existing `roles`,
+    /// `permissions`, `role_permissions` and `user_roles` tables.
+    pub fn with_rbac_store(mut self, store: Arc<dyn crate::rbac_graphql::RbacStore>) -> Self {
+        self.rbac = Some(store);
         self
     }
 
@@ -1003,6 +1030,8 @@ impl SchemaGraphqlDeps {
             auth_providers: None,
             external_accounts: None,
             admin_mutations: None,
+            executor_secrets: None,
+            rbac: None,
         }
     }
 }
@@ -1479,7 +1508,122 @@ impl GraphqlDeps for SchemaGraphqlDeps {
                 Arc::make_mut(&mut nested).site_external_accounts = site_lookups;
             }
         }
-        let user = current_user.map(crate::graphql_resolvers::UserObject::from_data);
+        // M9.13b: RBAC read surface (`roles`/`permissions` roots, `User.roles`
+        // / `User.permissions` and `Role.permissions`). The dotcom switch only
+        // affects `User.roles`'s unauthenticated-site-admin gate.
+        let dotcom = self
+            .external_accounts
+            .as_ref()
+            .is_some_and(|deps| deps.dotcom);
+        let mut rbac_roots = crate::rbac_graphql::RbacRoots::default();
+        if let Some(store) = &self.rbac {
+            rbac_roots = crate::rbac_graphql::prefetch_rbac_roots(
+                store.as_ref(),
+                &fields,
+                request.actor,
+                site_admin,
+            )
+            .await;
+            crate::rbac_graphql::prefetch_rbac_nested(
+                store.as_ref(),
+                &fields,
+                current_user.as_ref(),
+                &users,
+                &users_connections,
+                &nodes,
+                request.actor,
+                site_admin,
+                dotcom,
+                Arc::make_mut(&mut nested),
+            )
+            .await;
+        }
+        // M9.13b: executor secrets — root/nested connections, node lookups and
+        // the three mutations, then the related `namespace`/`creator`/`user`
+        // objects and `accessLogs` connections.
+        let mut executor_secret_roots =
+            crate::executor_secrets_graphql::ExecutorSecretRoots::default();
+        let mut executor_secret_mutations = Vec::new();
+        if let Some(store) = &self.executor_secrets {
+            executor_secret_roots = crate::executor_secrets_graphql::prefetch_executor_secret_roots(
+                store.as_ref(),
+                &fields,
+                request.actor,
+                site_admin,
+            )
+            .await;
+            let mut selected =
+                crate::executor_secrets_graphql::selected_from_roots(&executor_secret_roots, &fields);
+            let mut nested_selected =
+                crate::executor_secrets_graphql::prefetch_executor_secret_nested(
+                    store.as_ref(),
+                    &fields,
+                    current_user.as_ref(),
+                    &users,
+                    &users_connections,
+                    &organizations,
+                    &nodes,
+                    request.actor,
+                    site_admin,
+                    Arc::make_mut(&mut nested),
+                )
+                .await;
+            selected.secrets.append(&mut nested_selected.secrets);
+            selected.access_logs.append(&mut nested_selected.access_logs);
+            let (secret_nodes, mut node_selected) =
+                crate::executor_secrets_graphql::prefetch_executor_secret_nodes(
+                    store.as_ref(),
+                    &fields,
+                    request.actor,
+                    site_admin,
+                )
+                .await;
+            selected.secrets.append(&mut node_selected.secrets);
+            selected.access_logs.append(&mut node_selected.access_logs);
+            if !secret_nodes.secrets.is_empty() {
+                nodes.executor_secrets = secret_nodes.secrets;
+            }
+            if !secret_nodes.access_logs.is_empty() {
+                nodes.executor_secret_access_logs = secret_nodes.access_logs;
+            }
+            if is_mutation {
+                executor_secret_mutations =
+                    crate::executor_secrets_graphql::prefetch_executor_secret_mutations(
+                        store.as_ref(),
+                        &fields,
+                        request.actor,
+                        site_admin,
+                    )
+                    .await;
+                let mut mutation_selected =
+                    crate::executor_secrets_graphql::selected_from_mutations(
+                        &executor_secret_mutations,
+                        &fields,
+                    );
+                selected.secrets.append(&mut mutation_selected.secrets);
+                selected.access_logs.append(&mut mutation_selected.access_logs);
+            }
+            crate::executor_secrets_graphql::prefetch_selected_secrets(
+                store.as_ref(),
+                self.users.as_ref().map(|users| {
+                    users.as_ref() as &dyn crate::graphql_resolvers::UserLookupStore
+                }),
+                self.org_memberships
+                    .as_ref()
+                    .map(|store| store.as_ref() as &dyn crate::graphql_resolvers::OrgMembershipsStore),
+                &selected,
+                request.actor.uid().unwrap_or(0),
+                site_admin,
+                Arc::make_mut(&mut nested),
+            )
+            .await;
+        }
+        // The current user carries the request's viewer context: Go's
+        // `UserResolver` authorizes each field against the live session, so
+        // `currentUser.roles -> Role.permissions` must see `site_admin`.
+        let user = current_user.map(|data| {
+            crate::graphql_resolvers::UserObject::from_data_as_viewer(data, site_admin)
+        });
         // `Query.clientConfiguration` reads `external_services` and the
         // site configuration's `parentSourcegraph`; prefetch only when the
         // operation selects it (the baseline resolves fields lazily).
@@ -1676,6 +1820,7 @@ impl GraphqlDeps for SchemaGraphqlDeps {
             ))
         });
         Arc::make_mut(&mut nested).auth_providers = auth_providers_root.clone();
+        let executor_secret_nested = Arc::clone(&nested);
         let mut roots =
             crate::graphql_resolvers::FrontendRootResolver::with_prefetched_organizations(
                 user,
@@ -1696,6 +1841,8 @@ impl GraphqlDeps for SchemaGraphqlDeps {
             .with_webhook_logs(webhook_logs)
             .with_repositories_connections(repositories_connections)
             .with_mutation(mutation)
+            .with_rbac_roots(rbac_roots)
+            .with_executor_secret_roots(executor_secret_roots)
             .with_search_contexts(self.search_contexts.clone())
             .with_ranking_roots(ranking_roots)
             .with_search_roots(search_root)
@@ -1707,6 +1854,13 @@ impl GraphqlDeps for SchemaGraphqlDeps {
                 site_admin,
                 admin_external_url,
                 admin_mutation_outcomes,
+            );
+        }
+        if !executor_secret_mutations.is_empty() {
+            roots = roots.with_executor_secret_mutations(
+                site_admin,
+                executor_secret_nested,
+                executor_secret_mutations,
             );
         }
         if let Some(auth_providers_root) = auth_providers_root {
