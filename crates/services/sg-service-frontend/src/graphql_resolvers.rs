@@ -2832,6 +2832,10 @@ pub struct InventoryRoots {
     /// `setUser*Quota` / `setAutoUpgrade`.
     pub admin_mutations:
         HashMap<String, crate::repository_metadata_graphql::InventoryMutationOutcome>,
+    /// M9.17a batch-B business roots (`packageRepoReferences`,
+    /// `packageRepoReferencesMatchingFilter`, `indexedSearchInstances`,
+    /// `outboundRequests`, `invitationByToken` and the batch-B mutations).
+    pub business_b: crate::graphql_inventory_b::InventoryBRoots,
 }
 
 impl InventoryRoots {
@@ -3215,6 +3219,10 @@ impl ObjectValue for MutationRoot {
                 Outcome::Error(message) => Err(ExecError::new(message.clone())),
             };
         }
+        // M9.17a batch-B mutations.
+        if let Some(outcome) = self.inventory.business_b.mutations.get(field) {
+            return crate::graphql_inventory_b::InventoryBRoots::mutation_value(outcome);
+        }
         if let Some(saved_searches) = &self.saved_searches {
             if crate::saved_searches_graphql::is_root_field(field) {
                 return crate::saved_searches_graphql::root_field(
@@ -3524,8 +3532,75 @@ impl ObjectValue for QueryRoot {
                     Some(Ok(value)) => Ok(Some(FieldValue::Json(Json::Bool(*value)))),
                 }
             }
-            // `Query.outboundRequests`: unported seam (see
-            // `crate::outbound_requests_graphql`).
+            // `Query.packageRepoReferences` (`package_repos.go:47-80`).
+            "packageRepoReferences" => {
+                let args = crate::graphql_inventory_b::package_refs_args(arguments);
+                match self.inventory.business_b.package_references.get(&args.key) {
+                    None => Ok(None),
+                    Some(Err(message)) => Err(ExecError::new(message.clone())),
+                    Some(Ok(data)) => Ok(Some(FieldValue::Object(Arc::new(
+                        crate::graphql_inventory_b::PackageRepoReferenceConnectionObject {
+                            data: data.clone(),
+                        },
+                    )))),
+                }
+            }
+            // `Query.packageRepoReferencesMatchingFilter`
+            // (`package_repo_filters.go:40-94`).
+            "packageRepoReferencesMatchingFilter" => {
+                let args = crate::graphql_inventory_b::matching_filter_args(arguments);
+                match self.inventory.business_b.matching_filter.get(&args.key) {
+                    None => Ok(None),
+                    Some(Err(message)) => Err(ExecError::new(message.clone())),
+                    Some(Ok(crate::graphql_inventory_b::MatchingFilterResult::Packages(data))) => {
+                        Ok(Some(FieldValue::Object(Arc::new(
+                            crate::graphql_inventory_b::PackageRepoReferenceConnectionObject {
+                                data: data.clone(),
+                            },
+                        ))))
+                    }
+                    Some(Ok(crate::graphql_inventory_b::MatchingFilterResult::Versions(data))) => {
+                        Ok(Some(FieldValue::Object(Arc::new(
+                            crate::graphql_inventory_b::PackageRepoReferenceVersionConnectionObject {
+                                data: data.clone(),
+                            },
+                        ))))
+                    }
+                }
+            }
+            // `Query.indexedSearchInstances` (`search.go:109-130`).
+            "indexedSearchInstances" => match &self.inventory.business_b.indexed_search_instances {
+                None => Ok(None),
+                Some(Err(message)) => Err(ExecError::new(message.clone())),
+                Some(Ok(addresses)) => Ok(Some(FieldValue::Object(Arc::new(
+                    crate::graphql_inventory_b::IndexedSearchInstanceConnectionObject {
+                        addresses: addresses.clone(),
+                    },
+                )))),
+            },
+            // `Query.outboundRequests` (`outbound_requests.go:50-78`).
+            "outboundRequests" => match &self.inventory.business_b.outbound_requests {
+                None => Ok(None),
+                Some(Err(message)) => Err(ExecError::new(message.clone())),
+                Some(Ok(items)) => Ok(Some(FieldValue::Object(Arc::new(
+                    crate::graphql_inventory_b::OutboundRequestConnectionObject {
+                        items: items.clone(),
+                        first: arguments.i64("first"),
+                    },
+                )))),
+            },
+            // `Query.invitationByToken` (`org_invitations.go:125-164`).
+            "invitationByToken" => match &self.inventory.business_b.invitation_by_token {
+                None => Ok(None),
+                Some(Err(message)) => Err(ExecError::new(message.clone())),
+                Some(Ok(Some(data))) => Ok(Some(FieldValue::Object(Arc::new(
+                    crate::graphql_inventory_b::OrganizationInvitationObject {
+                        data: data.clone(),
+                        config: self.inventory.business_b.org_invitation_config.clone(),
+                    },
+                )))),
+                Some(Ok(None)) => Ok(Some(FieldValue::Null)),
+            },
             // `schemaResolver.Site` (`site.go:74-76`): no arguments and no
             // access check; `Site.configuration` re-checks admin itself.
             "site" => Ok(Some(FieldValue::Object(Arc::new(SiteObject {
