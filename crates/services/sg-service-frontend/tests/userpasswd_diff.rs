@@ -283,6 +283,12 @@ impl UserpasswdStore for FakeStore {
         ))
     }
 
+    async fn username_by_id(&self, _user_id: i32) -> Result<Option<String>, StoreError> {
+        // The Go oracle's `Users().GetByID` hook returns `c.user()`
+        // unconditionally and records no effect.
+        Ok(Some(self.case.user().username))
+    }
+
     async fn set_password(
         &self,
         user_id: i32,
@@ -447,8 +453,10 @@ struct FakeEmail {
 
 #[async_trait]
 impl EmailSender for FakeEmail {
-    async fn send(&self, _kind: &str, to: &str) -> Result<(), String> {
-        effect(&self.effects, format!("email:{to}"));
+    async fn send(&self, _source: &str, message: sg_txemail::Message) -> Result<(), String> {
+        // Matches the oracle's `txemail.MockSend`:
+        // `effects.add("email:%s", strings.Join(message.To, ","))`.
+        effect(&self.effects, format!("email:{}", message.to.join(",")));
         if self.case.email_error {
             return Err("email boom".to_owned());
         }
@@ -545,6 +553,7 @@ fn build_deps(case: &Case, effects: &Effects) -> UserpasswdDeps {
     let site = SiteConfiguration::parse(&case.site.to_string()).expect("site config");
     UserpasswdDeps {
         site,
+        external_url: "https://example.com".to_owned(),
         dotcom: case.dotcom,
         store: Arc::new(FakeStore {
             case: case.clone(),

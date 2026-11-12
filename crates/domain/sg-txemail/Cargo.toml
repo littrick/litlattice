@@ -21,3 +21,7 @@ thiserror = { workspace = true }
 # `Email::bytes` formats the `Date` header in local time like Go's
 # `time.Now().Format(time.RFC1123Z)`.
 time = { workspace = true, features = ["local-offset"] }
+
+[dev-dependencies]
+# `tests/txemail_send_diff.rs` deserializes the M9.20a corpus.
+serde = { workspace = true }
