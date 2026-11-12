@@ -487,6 +487,12 @@ pub struct SchemaGraphqlDeps {
     /// Read-only diagnostic `Query` fields (M9.14c); `None` keeps all four
     /// unported.
     diagnostics: Option<crate::diagnostics_graphql::DiagnosticsDeps>,
+    /// `conf.SiteConfig().OrganizationInvitations` (M9.17a): the HMAC signing
+    /// key for invitation JWTs and the `ExternalURL` issuer. `None` (the
+    /// default) reproduces a site without a configured signing key, where
+    /// `invitationByToken` errors with `SIGNING_KEY_VALIDATE` and invitation
+    /// URLs use the legacy relative form.
+    org_invitation_config: Option<crate::graphql_inventory_b::OrgInvitationConfig>,
 }
 
 /// Seams for the external-account GraphQL surface (M9.8ka): the
@@ -547,6 +553,7 @@ impl SchemaGraphqlDeps {
             code_monitors: None,
             embeddings: None,
             diagnostics: None,
+            org_invitation_config: None,
         }
     }
 
@@ -612,6 +619,7 @@ impl SchemaGraphqlDeps {
             code_monitors: None,
             embeddings: None,
             diagnostics: None,
+            org_invitation_config: None,
         }
     }
 
@@ -934,6 +942,16 @@ impl SchemaGraphqlDeps {
         self
     }
 
+    /// Inject `conf.SiteConfig().OrganizationInvitations` (M9.17a). The
+    /// default is `None`, which reproduces a site without a signing key.
+    pub fn with_org_invitation_config(
+        mut self,
+        config: crate::graphql_inventory_b::OrgInvitationConfig,
+    ) -> Self {
+        self.org_invitation_config = Some(config);
+        self
+    }
+
     /// Enable the ranking GraphQL surface (M9.8ic): append
     /// `codeintel.ranking.graphql` to the assembled schema and hand the root
     /// resolver to the executor.
@@ -1101,6 +1119,7 @@ impl SchemaGraphqlDeps {
             code_monitors: None,
             embeddings: None,
             diagnostics: None,
+            org_invitation_config: None,
         }
     }
 }
@@ -1556,6 +1575,20 @@ impl GraphqlDeps for SchemaGraphqlDeps {
                     }
                     _ => Default::default(),
                 };
+                // M9.17a batch B. The indexed-search endpoint list and the
+                // outbound-request log are process-local seams that this
+                // frontend does not populate, so both default to empty (the
+                // baseline with no zoekt endpoints and no recorded requests).
+                inventory.business_b = crate::graphql_inventory_b::prefetch_inventory_b(
+                    pool,
+                    &fields,
+                    request.actor,
+                    site_admin,
+                    self.org_invitation_config.as_ref(),
+                    None,
+                    None,
+                )
+                .await;
                 if is_mutation {
                     inventory.migration_direction =
                         crate::out_of_band_migrations_graphql::prefetch_set_migration_direction(
