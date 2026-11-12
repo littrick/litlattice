@@ -401,6 +401,16 @@ pub fn gerrit_repo_name(repository_path_pattern: &str, host: &str, name: &str) -
     replace_pattern(pattern, &[("{host}", host), ("{name}", name)])
 }
 
+/// `reposource.PerforceRepoName`: the default pattern is `{depot}`.
+pub fn perforce_repo_name(repository_path_pattern: &str, depot: &str) -> String {
+    let pattern = if repository_path_pattern.is_empty() {
+        "{depot}"
+    } else {
+        repository_path_pattern
+    };
+    replace_pattern(pattern, &[("{depot}", depot)])
+}
+
 /// `reposource.AWSRepoName`.
 pub fn aws_repo_name(repository_path_pattern: &str, name: &str) -> String {
     let pattern = if repository_path_pattern.is_empty() {
