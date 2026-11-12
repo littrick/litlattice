@@ -61,8 +61,9 @@ impl sg_extsvc::HttpGetter for HttpClientGetter {
     }
 }
 
-/// `httpcli.Doer` adapter for the code-host clients (`GITHUB`). The GitHub
-/// source only issues `GET` and `POST` requests.
+/// `httpcli.Doer` adapter for the code-host clients (`GITHUB`, `GITLAB`,
+/// `BITBUCKETCLOUD`). The GitHub source issues `GET` and `POST`; the GitLab
+/// and Bitbucket Cloud sources only issue `GET`.
 struct HttpClientDoer(sg_http::HttpClient);
 
 #[async_trait]

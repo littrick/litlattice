@@ -13,9 +13,13 @@
 //! in the baseline.
 
 pub mod auth;
+pub mod bitbucketcloud;
+pub mod bitbucketcloud_source;
 pub mod exclude;
 pub mod github;
 pub mod github_source;
+pub mod gitlab;
+pub mod gitlab_source;
 pub mod other;
 pub mod ratelimit;
 pub mod reposource;
@@ -27,6 +31,10 @@ use serde::{Deserialize, Serialize};
 
 /// `extsvc.KindGitHub`.
 pub const KIND_GITHUB: &str = "GITHUB";
+/// `extsvc.KindGitLab`.
+pub const KIND_GITLAB: &str = "GITLAB";
+/// `extsvc.KindBitbucketCloud`.
+pub const KIND_BITBUCKETCLOUD: &str = "BITBUCKETCLOUD";
 /// `extsvc.KindOther`.
 pub const KIND_OTHER: &str = "OTHER";
 /// `extsvc.TypeOther` (lowercase, stored in `repo.external_service_type`).
@@ -311,6 +319,24 @@ pub fn new_source(
             )
         })?;
         Ok(Box::new(github_source::GitHubSource::new(service, doer)?))
+    } else if service.kind.eq_ignore_ascii_case(KIND_GITLAB) {
+        let doer = doer.ok_or_else(|| {
+            format!(
+                "cannot create source for kind {:?}: no HTTP transport configured",
+                service.kind
+            )
+        })?;
+        Ok(Box::new(gitlab_source::GitLabSource::new(service, doer)?))
+    } else if service.kind.eq_ignore_ascii_case(KIND_BITBUCKETCLOUD) {
+        let doer = doer.ok_or_else(|| {
+            format!(
+                "cannot create source for kind {:?}: no HTTP transport configured",
+                service.kind
+            )
+        })?;
+        Ok(Box::new(bitbucketcloud_source::BitbucketCloudSource::new(
+            service, doer,
+        )?))
     } else {
         Err(format!("cannot create source for kind {:?}", service.kind))
     }

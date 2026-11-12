@@ -82,7 +82,7 @@ pub trait SourceFactory: Send + Sync {
 }
 
 /// `repos.NewSource` for the kinds `sg-extsvc` implements (`OTHER`,
-/// `GITHUB`).
+/// `GITHUB`, `GITLAB`, `BITBUCKETCLOUD`).
 pub struct ExtsvcSourceFactory {
     http: Option<Arc<dyn HttpGetter>>,
     /// The code-host transport (`httpcli.Doer`). Production passes an
