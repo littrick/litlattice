@@ -1108,6 +1108,22 @@ impl ZoektIndexSource for EmptyZoektIndexSource {
     }
 }
 
+/// Seams for the M9.19a repository-inventory surface. The default (an empty
+/// zoekt index source) reproduces a frontend with no indexed-search endpoints,
+/// where `Repository.textSearchIndex` reports `null` for the entry and the
+/// default-branch ref only.
+pub struct InventoryDDeps {
+    pub zoekt: Arc<dyn ZoektIndexSource>,
+}
+
+impl Default for InventoryDDeps {
+    fn default() -> Self {
+        Self {
+            zoekt: Arc::new(EmptyZoektIndexSource),
+        }
+    }
+}
+
 /// `skippedIndexedResolver` (`repository_text_search_index.go:229-292`): the
 /// query string always uses the raw zoekt branch; only `count` can error.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1212,9 +1228,9 @@ impl ObjectValue for RepositoryTextSearchIndexStatusObject {
     ) -> Result<Option<FieldValue>, ExecError> {
         let int = |value: i32| FieldValue::Json(Json::Int(i64::from(value)));
         match field {
-            // `gqlutil.DateTime` embeds `time.Time`, so graphql-go marshals it
-            // with `time.RFC3339Nano`.
-            "updatedAt" => Ok(Some(FieldValue::Json(Json::Str(datetime_rfc3339_nano(
+            // `gqlutil.DateTime` (`internal/gqlutil/datetime.go:29-31`) is
+            // `time.RFC3339`: whole seconds, no fractional part.
+            "updatedAt" => Ok(Some(FieldValue::Json(Json::Str(datetime_rfc3339(
                 self.entry.index_time,
             ))))),
             "contentByteSize" => Ok(Some(FieldValue::Json(Json::Int(
@@ -1349,30 +1365,13 @@ impl ObjectValue for SkippedIndexedObject {
     }
 }
 
-/// Go `time.Time.MarshalJSON` (`time.RFC3339Nano`): trailing fractional
-/// second zeros are removed, and the fraction is omitted when zero.
-fn datetime_rfc3339_nano(value: OffsetDateTime) -> String {
+/// `gqlutil.DateTime.MarshalJSON` (`internal/gqlutil/datetime.go:29-31`):
+/// `Time.UTC().Format(time.RFC3339)` — whole seconds, no fractional part.
+fn datetime_rfc3339(value: OffsetDateTime) -> String {
     let value = value.to_offset(UtcOffset::UTC);
-    let mut out = format!(
-        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}",
-        value.year(),
-        value.month() as u8,
-        value.day(),
-        value.hour(),
-        value.minute(),
-        value.second()
-    );
-    let nanos = value.nanosecond();
-    if nanos != 0 {
-        let mut fraction = format!("{nanos:09}");
-        while fraction.ends_with('0') {
-            fraction.pop();
-        }
-        out.push('.');
-        out.push_str(&fraction);
-    }
-    out.push('Z');
-    out
+    value
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_else(|_| value.to_string())
 }
 
 /// `regexp.QuoteMeta`.

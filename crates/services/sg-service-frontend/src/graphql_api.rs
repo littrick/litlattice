@@ -497,6 +497,9 @@ pub struct SchemaGraphqlDeps {
     /// `renderMarkdown`, `highlightCode`, `webhooks` and the batch-C
     /// mutations). `None` keeps those fields unported.
     inventory_c: Option<crate::graphql_inventory_c::InventoryCDeps>,
+    /// M9.19a repository-inventory seams (the zoekt index source). `None`
+    /// reproduces a deployment with no indexed-search endpoints.
+    inventory_d: Option<crate::graphql_inventory_d::InventoryDDeps>,
 }
 
 /// Seams for the external-account GraphQL surface (M9.8ka): the
@@ -559,6 +562,7 @@ impl SchemaGraphqlDeps {
             diagnostics: None,
             org_invitation_config: None,
             inventory_c: None,
+            inventory_d: None,
         }
     }
 
@@ -626,6 +630,7 @@ impl SchemaGraphqlDeps {
             diagnostics: None,
             org_invitation_config: None,
             inventory_c: Some(crate::graphql_inventory_c::InventoryCDeps::default()),
+            inventory_d: Some(crate::graphql_inventory_d::InventoryDDeps::default()),
         }
     }
 
@@ -970,6 +975,16 @@ impl SchemaGraphqlDeps {
         self
     }
 
+    /// Inject the M9.19a repository-inventory seams. The default (no zoekt
+    /// index source) reproduces a deployment with no indexed-search endpoints.
+    pub fn with_inventory_d_deps(
+        mut self,
+        deps: crate::graphql_inventory_d::InventoryDDeps,
+    ) -> Self {
+        self.inventory_d = Some(deps);
+        self
+    }
+
     /// Enable the ranking GraphQL surface (M9.8ic): append
     /// `codeintel.ranking.graphql` to the assembled schema and hand the root
     /// resolver to the executor.
@@ -1139,6 +1154,7 @@ impl SchemaGraphqlDeps {
             diagnostics: None,
             org_invitation_config: None,
             inventory_c: None,
+            inventory_d: None,
         }
     }
 }
@@ -1625,16 +1641,22 @@ impl GraphqlDeps for SchemaGraphqlDeps {
                 // M9.19a repository inventory: `Repository.metadata` /
                 // `keyValuePairs` (`repo_kvps`), `externalURLs` (Phabricator
                 // linker) and `textSearchIndex`, plus the `Query.repoMeta`
-                // connection. The zoekt index seam is not wired in this
-                // frontend, matching a deployment with no indexed-search
-                // endpoints.
+                // connection. Without an injected zoekt source this reproduces
+                // a deployment with no indexed-search endpoints.
                 let repo_metadata_store =
                     crate::graphql_inventory_d::PgRepoMetadataStore::new(pool.clone())
                         .with_feature_flags(self.feature_flags.clone());
+                let zoekt_source: Arc<dyn crate::graphql_inventory_d::ZoektIndexSource> = self
+                    .inventory_d
+                    .as_ref()
+                    .map(|deps| deps.zoekt.clone())
+                    .unwrap_or_else(|| {
+                        Arc::new(crate::graphql_inventory_d::EmptyZoektIndexSource)
+                    });
                 inventory.graphql_d = Arc::new(
                     crate::graphql_inventory_d::prefetch_repository_inventory_d(
                         &repo_metadata_store,
-                        &crate::graphql_inventory_d::EmptyZoektIndexSource,
+                        zoekt_source.as_ref(),
                         git.as_deref(),
                         &repositories,
                         &repository_redirects,
