@@ -1322,6 +1322,38 @@ impl GraphqlDeps for SchemaGraphqlDeps {
             }
             None => std::collections::HashMap::new(),
         };
+        // M9.22c: `auditlog-expansion` gates the organization/outbound/quota
+        // security events. Evaluate it once per request, only when one of the
+        // relevant root fields is selected (`featureflag.FromContext` is lazy
+        // in the baseline too).
+        let needs_auditlog_expansion = fields.iter().any(|field| {
+            matches!(
+                field.name.as_str(),
+                "organization"
+                    | "organizations"
+                    | "outboundRequests"
+                    | "setUserCompletionsQuota"
+                    | "setUserCodeCompletionsQuota"
+            )
+        });
+        let auditlog_expansion = match &self.pool {
+            Some(pool) if needs_auditlog_expansion => {
+                crate::security_event_logs::auditlog_expansion(pool, request.actor).await
+            }
+            _ => false,
+        };
+        if let Some(pool) = &self.pool {
+            crate::graphql_resolvers::write_org_security_events(
+                pool,
+                &fields,
+                &organizations,
+                &organizations_connections,
+                request.actor,
+                site_admin,
+                auditlog_expansion,
+            )
+            .await;
+        }
         // `Mutation.settingsMutation` / `Mutation.logEvent(s)`: the executor
         // resolves fields synchronously, so run the (async) write paths now.
         // Only mutation operations perform side effects.
@@ -1663,6 +1695,7 @@ impl GraphqlDeps for SchemaGraphqlDeps {
                     self.org_invitation_config.as_ref(),
                     None,
                     self.outbound_request_log.as_deref(),
+                    auditlog_expansion,
                 )
                 .await;
                 // M9.18a batch C.
@@ -1750,6 +1783,7 @@ impl GraphqlDeps for SchemaGraphqlDeps {
                             &fields,
                             request.actor,
                             site_admin,
+                            auditlog_expansion,
                         )
                         .await
                     {

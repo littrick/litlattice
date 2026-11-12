@@ -1354,6 +1354,101 @@ pub async fn prefetch_organizations_connections(
     connections
 }
 
+/// True when `name` is selected directly, or through an inline fragment /
+/// fragment spread (`RootField::type_conditions`).
+fn selects_field(selections: &[RootField], name: &str) -> bool {
+    selections.iter().any(|selection| selection.name == name)
+        || selections.iter().any(|selection| {
+            selection
+                .type_conditions
+                .iter()
+                .any(|(_, nested)| selects_field(nested, name))
+        })
+}
+
+/// `auth.CheckCurrentUserIsSiteAdmin` as a predicate over the already-resolved
+/// request actor (`OrgConnectionObject::check_site_admin`).
+fn actor_is_site_admin(actor: Actor, viewer_site_admin: bool) -> bool {
+    match actor {
+        Actor::Internal => true,
+        Actor::Anonymous => false,
+        Actor::User { .. } => viewer_site_admin,
+    }
+}
+
+/// M9.22c: write the organization read-path security events after the
+/// prefetches have resolved.
+///
+/// * `Query.organization` (`org.go:30-36`): `OrganizationViewed` on a
+///   successful lookup (any actor).
+/// * `Query.organizations` (`orgs.go:50-58`): `OrganizationListViewed` only
+///   when the connection's `nodes` field is selected — the Go event lives in
+///   `Nodes()`, after the site-admin check and `Orgs().List`; `TotalCount()`
+///   does not log.
+///
+/// `auditlog_expansion` is `featureflag.FromContext(ctx).GetBoolOr(...)`.
+/// Anonymous/internal actors are skipped: Go writes `user_id=0`/empty
+/// anonymous UID, which the `security_event_logs_check_has_user` constraint
+/// rejects (internal actors are also skipped by `InsertList` unless
+/// `internalTraffic` is enabled).
+pub async fn write_org_security_events(
+    pool: &sqlx::PgPool,
+    fields: &[RootField],
+    organizations: &HashMap<String, OrganizationLookup>,
+    organizations_connections: &HashMap<OrganizationsArgs, OrganizationsConnectionLookup>,
+    actor: Actor,
+    viewer_site_admin: bool,
+    auditlog_expansion: bool,
+) {
+    if !auditlog_expansion {
+        return;
+    }
+    let Some(user_id) = actor.uid() else {
+        return;
+    };
+    for field in fields {
+        match field.name.as_str() {
+            "organization" => {
+                let Some(name) = field.arguments.string("name") else {
+                    continue;
+                };
+                if !matches!(organizations.get(name), Some(OrganizationLookup::Found(_))) {
+                    continue;
+                }
+                crate::security_event_logs::write_backend_security_event(
+                    pool,
+                    crate::security_event_logs::SECURITY_EVENT_ORGANIZATION_VIEWED,
+                    user_id,
+                    serde_json::json!({ "Name": name }),
+                )
+                .await;
+            }
+            "organizations" => {
+                if !selects_field(&field.selections, "nodes")
+                    || !actor_is_site_admin(actor, viewer_site_admin)
+                {
+                    continue;
+                }
+                let args = organizations_args(&field.arguments);
+                if !matches!(
+                    organizations_connections.get(&args),
+                    Some(OrganizationsConnectionLookup::Found(_))
+                ) {
+                    continue;
+                }
+                crate::security_event_logs::write_backend_security_event(
+                    pool,
+                    crate::security_event_logs::SECURITY_EVENT_ORGANIZATION_LIST_VIEWED,
+                    user_id,
+                    serde_json::json!({}),
+                )
+                .await;
+            }
+            _ => {}
+        }
+    }
+}
+
 /// One `User` object waiting for its `organizations`/
 /// `organizationMemberships` fields to be prefetched.
 struct UserJob {

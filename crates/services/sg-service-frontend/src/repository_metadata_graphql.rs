@@ -35,15 +35,34 @@ pub async fn prefetch_inventory_admin_mutations(
     fields: &[RootField],
     actor: Actor,
     viewer_site_admin: bool,
+    auditlog_expansion: bool,
 ) -> Vec<(String, InventoryMutationOutcome)> {
     let mut outcomes = Vec::new();
     for field in fields {
         let outcome = match field.name.as_str() {
             "setUserCompletionsQuota" => {
-                set_quota(pool, users, field, actor, viewer_site_admin, true).await
+                set_quota(
+                    pool,
+                    users,
+                    field,
+                    actor,
+                    viewer_site_admin,
+                    true,
+                    auditlog_expansion,
+                )
+                .await
             }
             "setUserCodeCompletionsQuota" => {
-                set_quota(pool, users, field, actor, viewer_site_admin, false).await
+                set_quota(
+                    pool,
+                    users,
+                    field,
+                    actor,
+                    viewer_site_admin,
+                    false,
+                    auditlog_expansion,
+                )
+                .await
             }
             "setAutoUpgrade" => set_auto_upgrade(pool, field, actor, viewer_site_admin).await,
             _ => continue,
@@ -53,6 +72,7 @@ pub async fn prefetch_inventory_admin_mutations(
     outcomes
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn set_quota(
     pool: &PgPool,
     users: Option<&dyn crate::graphql_resolvers::UserLookupStore>,
@@ -60,6 +80,7 @@ async fn set_quota(
     actor: Actor,
     viewer_site_admin: bool,
     chat: bool,
+    auditlog_expansion: bool,
 ) -> InventoryMutationOutcome {
     if let Err(message) = check_current_user_is_site_admin(actor, viewer_site_admin) {
         return InventoryMutationOutcome::Error(message);
@@ -110,6 +131,26 @@ async fn set_quota(
         .await
     {
         return InventoryMutationOutcome::Error(error.to_string());
+    }
+    // `auditlog-expansion` gates both quota events (`user.go:878,923`);
+    // `argument = SetUser{Code,}CompletionsQuotaArgs{User, Quota}` and
+    // `user_id` is the target user, not the requesting actor.
+    if auditlog_expansion {
+        let name = if chat {
+            crate::security_event_logs::SECURITY_EVENT_USER_COMPLETION_QUOTA_UPDATED
+        } else {
+            crate::security_event_logs::SECURITY_EVENT_USER_CODE_COMPLETION_QUOTA_UPDATED
+        };
+        crate::security_event_logs::write_backend_security_event(
+            pool,
+            name,
+            user_id,
+            serde_json::json!({
+                "User": field.arguments.string("user"),
+                "Quota": quota,
+            }),
+        )
+        .await;
     }
     // `UserByIDInt32` reloads the row (with the primary email).
     match users {
