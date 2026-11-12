@@ -27,7 +27,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 use sg_config::LiveConfig;
 use sg_db::external_services::{ExternalService, ExternalServiceStore};
-use sg_extsvc::ratelimit::{get_limit_from_config, Variant};
+use sg_extsvc::ratelimit::{get_limit_from_config, Variant, RATE_INF};
 use sg_extsvc::urn;
 use sg_keyring::Keyring;
 use sg_redis::KeyValue;
@@ -374,7 +374,7 @@ pub async fn sync_services(
         let rate_limiter = new_rate_limiter(urn(&service.kind, service.id));
         // `rate.Inf` is stored as -1; configured limits are per hour.
         let mut lim: i32 = -1;
-        if limit != f64::INFINITY {
+        if limit != RATE_INF {
             lim = (limit * 3600.0) as i32;
         }
         if let Err(err) = rate_limiter
