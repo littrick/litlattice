@@ -1062,12 +1062,13 @@ pub struct OutboundRequestItem {
 }
 
 /// `Query.outboundRequests` (`outbound_requests.go:36-75`): site-admin gated;
-/// the in-process `httpcli` log is a seam (`None` = no entries).
+/// the log is read through `sg-httpcli`'s Redis FIFO list (`None` = the
+/// pre-wiring frontend with no source).
 pub async fn prefetch_outbound_requests(
     fields: &[RootField],
     actor: Actor,
     viewer_site_admin: bool,
-    items: Option<&[OutboundRequestItem]>,
+    log: Option<&dyn crate::outbound_requests_graphql::OutboundRequestLogSource>,
 ) -> Option<Result<Vec<OutboundRequestItem>, String>> {
     let field = fields
         .iter()
@@ -1082,9 +1083,13 @@ pub async fn prefetch_outbound_requests(
         },
         None => String::new(),
     };
-    let mut all = items
-        .map(<[OutboundRequestItem]>::to_vec)
-        .unwrap_or_default();
+    let mut all = match log {
+        Some(source) => match source.list(&after).await {
+            Ok(items) => items,
+            Err(message) => return Some(Err(message)),
+        },
+        None => Vec::new(),
+    };
     if !after.is_empty() {
         all.retain(|item| item.id > after);
     }
@@ -2373,7 +2378,7 @@ pub async fn prefetch_inventory_b(
     viewer_site_admin: bool,
     org_invitation_config: Option<&OrgInvitationConfig>,
     indexed_search_endpoints: Option<&[String]>,
-    outbound_request_log: Option<&[OutboundRequestItem]>,
+    outbound_request_log: Option<&dyn crate::outbound_requests_graphql::OutboundRequestLogSource>,
 ) -> InventoryBRoots {
     let mut mutations = HashMap::new();
     for (field, outcome) in prefetch_mutations(

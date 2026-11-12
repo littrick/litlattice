@@ -1179,7 +1179,16 @@ impl Service for FrontendService {
                     session_pool.clone(),
                     Arc::clone(wiring.live()),
                 )
-                .await);
+                .await)
+                // M9.21b: `Query.outboundRequests` reads the same Redis FIFO
+                // list the Go `redisLoggerMiddleware` writes
+                // (`v2:outbound-requests`); the limit comes from the live site
+                // config per request (0 disables the log).
+                .with_outbound_request_log(Arc::new(
+                    crate::outbound_requests_graphql::RedisOutboundRequestLogStore::from_env(
+                        Arc::clone(wiring.live()),
+                    ),
+                ));
         // M9.8jf/M9.8jj: `Query.slowRequests` reads the FIFO list whose
         // capacity is `observability.captureSlowGraphQLRequestsLimit`
         // (`conf.Get()` per request in the baseline; here from the current

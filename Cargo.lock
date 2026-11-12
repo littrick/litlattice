@@ -4190,6 +4190,15 @@ dependencies = [
 [[package]]
 name = "sg-httpcli"
 version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "serde",
+ "serde_json",
+ "sg-rcache",
+ "sg-redis",
+ "time",
+ "tokio",
+]
 
 [[package]]
 name = "sg-insights"
@@ -4365,6 +4374,7 @@ dependencies = [
  "sg-git",
  "sg-graphql",
  "sg-http",
+ "sg-httpcli",
  "sg-jsonx",
  "sg-keyring",
  "sg-licensing",
