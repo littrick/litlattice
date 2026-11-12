@@ -589,6 +589,7 @@ async fn graphql_production_wiring_harness() {
                     operation_name: "",
                     variables: &variables,
                     actor: actor(case),
+                    anonymous_uid: "",
                 })
                 .await;
             responses.push(normalized_response(&response));

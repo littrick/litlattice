@@ -819,6 +819,7 @@ async fn git_graphql_wiring_harness() {
             operation_name: "",
             variables: &variables,
             actor: sg_graphql::exec::Actor::Anonymous,
+            anonymous_uid: "",
         };
         let response = deps.exec(request).await;
         let body = response.to_json().expect("json");

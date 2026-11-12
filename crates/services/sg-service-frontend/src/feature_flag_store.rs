@@ -89,6 +89,22 @@ impl FeatureFlagStore for PgFeatureFlagStore {
             .map_err(error_text)
     }
 
+    /// `GetAnonymousUserFlags` (`internal/database/feature_flags.go:578-591`):
+    /// every flag evaluated against the anonymous UID.
+    async fn get_anonymous_flags(
+        &self,
+        anonymous_uid: &str,
+    ) -> Result<std::collections::HashMap<String, bool>, String> {
+        let flags = get_feature_flags(&self.pool).await.map_err(error_text)?;
+        Ok(flags
+            .into_iter()
+            .map(|flag| {
+                let value = flag.evaluate_for_anonymous_user(anonymous_uid);
+                (flag.name, value)
+            })
+            .collect())
+    }
+
     async fn get_global_flags(&self) -> Result<std::collections::HashMap<String, bool>, String> {
         sg_db::feature_flags::get_global_feature_flags(&self.pool)
             .await

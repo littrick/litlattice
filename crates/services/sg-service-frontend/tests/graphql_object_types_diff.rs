@@ -449,6 +449,7 @@ async fn graphql_object_types_harness() {
                 operation_name: "",
                 variables: &case.variables,
                 actor,
+                anonymous_uid: "",
             })
             .await;
 
