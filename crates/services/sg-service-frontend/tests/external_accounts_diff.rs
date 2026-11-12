@@ -800,6 +800,7 @@ async fn external_accounts_graphql_harness() {
     let cody_config = Arc::new(CodySubscriptionConfig {
         dotcom: false,
         sams_service_id: "https://accounts.sourcegraph.com".to_owned(),
+        sams_provider_configured: false,
     });
 
     for case in &corpus.cases {

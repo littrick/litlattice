@@ -117,10 +117,10 @@ pub fn client_info(headers: &HeaderMap, remote_addr: Option<&str>) -> Option<Cli
 pub struct AuditActor {
     pub uid: Option<i32>,
     pub anonymous_uid: String,
-    /// `actor.Actor.Internal`: only internal service actors set it. The
-    /// internal HTTP listener's actor middleware is not ported, so production
-    /// requests are never internal; the field keeps the baseline filter
-    /// testable.
+    /// `actor.Actor.Internal`: set by the internal HTTP listener's actor
+    /// middleware (`actor.HTTPMiddleware`) for `X-Sourcegraph-Actor-UID:
+    /// internal`. The resolved `ChainActor` is fed through
+    /// `Actor::to_audit_actor`, so production internal requests carry it.
     pub internal: bool,
 }
 
