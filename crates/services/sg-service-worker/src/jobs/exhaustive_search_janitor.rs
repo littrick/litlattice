@@ -573,13 +573,9 @@ impl JobConfig for SearchJobsObjectStorageConfig {
 pub(crate) fn storage_config(
     config: &SearchJobsObjectStorageConfig,
 ) -> Result<StorageConfig, String> {
-    let config = config
+    config
         .storage()
-        .ok_or_else(|| "search jobs object storage config was not loaded".to_owned())?;
-    match config.backend.as_str() {
-        "s3" | "blobstore" | "gcs" => Ok(config),
-        other => Err(format!("unsupported object storage backend {other:?}")),
-    }
+        .ok_or_else(|| "search jobs object storage config was not loaded".to_owned())
 }
 
 /// `BaseConfig.GetBool` with `strconv.ParseBool` spellings.

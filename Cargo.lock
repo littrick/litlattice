@@ -3865,6 +3865,20 @@ name = "sg-auth"
 version = "0.1.0"
 
 [[package]]
+name = "sg-bin-embeddings"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "serde",
+ "serde_json",
+ "sg-core",
+ "sg-embeddings",
+ "sg-log",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "sg-bin-frontend"
 version = "0.1.0"
 dependencies = [
@@ -3882,6 +3896,16 @@ dependencies = [
  "sg-log",
  "sg-service-gitserver",
  "tokio",
+]
+
+[[package]]
+name = "sg-bin-migrator"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sg-core",
+ "sg-log",
 ]
 
 [[package]]

@@ -982,7 +982,9 @@ pub async fn new_object_storage(
                 .map_err(|err| err.to_string())?;
             Ok(Arc::new(LazyObjectStorage::new(Arc::new(store))))
         }
-        other => Err(format!("unsupported object storage backend {other:?}")),
+        // `object.create`: the lookup is not normalized (config Load lowercases
+        // the backend) and uses the baseline's exact error text.
+        other => Err(format!("unknown upload store backend '{other}'")),
     }
 }
 

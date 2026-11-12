@@ -14,9 +14,10 @@
 //! * The `SignatureDoesNotMatch`/`RepositoryDoesNotExistException` error
 //!   classification (`IsUnauthorized`/`IsNotFound`).
 //!
-//! The Redis repository cache in `internal/extsvc/awscodecommit` is not ported
-//! (no Redis in this slice); it only affects metadata freshness, not the
-//! repositories a source yields.
+//! The Redis repository cache is modelled by the [`RepoCache`] trait with the
+//! same key layout (`sha256(accessKeyID:secretAccessKey:sessionToken):arn`,
+//! written lower-cased) and 60-second TTL; [`InMemoryRepoCache`] is the
+//! Redis-free backing used here, so no new Redis keys are introduced.
 
 use std::sync::Arc;
 
@@ -228,6 +229,100 @@ impl std::fmt::Display for AwsError {
 
 impl std::error::Error for AwsError {}
 
+/// `rcache.Cache` narrowed to the two methods the CodeCommit client uses.
+pub trait RepoCache: Send + Sync {
+    /// `Cache.Get`: `None` on a cache miss.
+    fn get(&self, key: &str) -> Option<Vec<u8>>;
+
+    /// `Cache.Set`.
+    fn set(&self, key: &str, value: Vec<u8>);
+}
+
+/// The `redis`-backed cache isn't available in this domain crate; this is the
+/// same namespaced key/TTL behaviour (`rcache.NewWithTTL(redispool.Cache,
+/// "cc_repo:", 60)`) over an in-process map, used by tests and single-process
+/// deployments. It stores the full key produced by
+/// [`Client::repository_cache_key`] (which already includes
+/// `v2:cc_repo:<credentials-hash>:` semantics once wrapped), so callers that
+/// need the Redis key layout wrap it with `sg_rcache::cache_redis_key`.
+pub struct InMemoryRepoCache {
+    ttl_seconds: u64,
+    entries: std::sync::Mutex<std::collections::HashMap<String, (Vec<u8>, u64)>>,
+    now: Box<dyn Fn() -> u64 + Send + Sync>,
+}
+
+impl InMemoryRepoCache {
+    /// `rcache.NewWithTTL(_, "cc_repo:", 60 /* seconds */)`.
+    pub fn new() -> Self {
+        Self::with_ttl(60)
+    }
+
+    pub fn with_ttl(ttl_seconds: u64) -> Self {
+        Self {
+            ttl_seconds,
+            entries: std::sync::Mutex::new(std::collections::HashMap::new()),
+            now: Box::new(|| {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|duration| duration.as_secs())
+                    .unwrap_or_default()
+            }),
+        }
+    }
+
+    /// Test hook: replace the wall clock.
+    pub fn with_clock<F>(mut self, now: F) -> Self
+    where
+        F: Fn() -> u64 + Send + Sync + 'static,
+    {
+        self.now = Box::new(now);
+        self
+    }
+
+    pub fn ttl_seconds(&self) -> u64 {
+        self.ttl_seconds
+    }
+}
+
+impl Default for InMemoryRepoCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RepoCache for InMemoryRepoCache {
+    fn get(&self, key: &str) -> Option<Vec<u8>> {
+        let now = (self.now)();
+        let mut entries = self.entries.lock().expect("repo cache");
+        match entries.get(key) {
+            Some((value, expires_at)) if now < *expires_at => Some(value.clone()),
+            Some(_) => {
+                entries.remove(key);
+                None
+            }
+            None => None,
+        }
+    }
+
+    fn set(&self, key: &str, value: Vec<u8>) {
+        let expires_at = (self.now)().saturating_add(self.ttl_seconds);
+        self.entries
+            .lock()
+            .expect("repo cache")
+            .insert(key.to_owned(), (value, expires_at));
+    }
+}
+
+/// `awscodecommit.cachedRepo`: the embedded `Repository` fields are promoted
+/// to the top level plus the `NotFound` flag, like Go's JSON encoding.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CachedRepo {
+    #[serde(flatten)]
+    pub repository: Repository,
+    #[serde(rename = "NotFound", default)]
+    pub not_found: bool,
+}
+
 /// `awscodecommit.Client`.
 #[derive(Clone)]
 pub struct Client {
@@ -236,10 +331,12 @@ pub struct Client {
     partition: &'static str,
     endpoint: String,
     http: Arc<dyn HttpDoer>,
+    repo_cache: Option<Arc<dyn RepoCache>>,
 }
 
 impl Client {
-    /// `awscodecommit.NewClient` (repository cache omitted).
+    /// `awscodecommit.NewClient` (the Redis repository cache is optional here;
+    /// use [`Self::with_repo_cache`] to enable it).
     pub fn new(
         credentials: Credentials,
         region: &str,
@@ -253,7 +350,15 @@ impl Client {
             partition,
             endpoint,
             http,
+            repo_cache: None,
         }
+    }
+
+    /// Attach the repository-metadata cache. `NewClient` always creates one in
+    /// the baseline; keeping it explicit lets callers choose a backend.
+    pub fn with_repo_cache(mut self, cache: Arc<dyn RepoCache>) -> Self {
+        self.repo_cache = Some(cache);
+        self
     }
 
     pub fn partition(&self) -> &'static str {
@@ -262,6 +367,104 @@ impl Client {
 
     pub fn region(&self) -> &str {
         &self.region
+    }
+
+    /// `Client.cacheKeyPrefix`: sha256 hex of
+    /// `accessKeyID:secretAccessKey:sessionToken`, so cached data is never
+    /// shared across credentials.
+    pub fn cache_key_prefix(&self) -> String {
+        let session_token = self.credentials.session_token.clone().unwrap_or_default();
+        let key = format!(
+            "{}:{}:{}",
+            self.credentials.access_key_id, self.credentials.secret_access_key, session_token
+        );
+        hex(&Sha256::digest(key.as_bytes()))
+    }
+
+    /// `Client.repositoryCacheKey`.
+    pub fn repository_cache_key(&self, arn: &str) -> String {
+        format!("{}:{}", self.cache_key_prefix(), arn)
+    }
+
+    /// `Client.GetRepository`: cached metadata lookup, falling back to the
+    /// `GetRepository` API. Not-found responses are cached too.
+    pub async fn get_repository(&self, arn: &str) -> Result<Repository, AwsError> {
+        self.cached_get_repository(arn).await
+    }
+
+    async fn cached_get_repository(&self, arn: &str) -> Result<Repository, AwsError> {
+        if self.repo_cache.is_none() {
+            return self.get_repository_from_api(arn).await;
+        }
+        let key = self.repository_cache_key(arn);
+        if let Some(cached) = self.get_repository_from_cache(&key) {
+            if cached.not_found {
+                return Err(AwsError::NotFound);
+            }
+            return Ok(cached.repository);
+        }
+
+        match self.get_repository_from_api(arn).await {
+            Ok(repository) => {
+                self.add_repository_to_cache(
+                    &key,
+                    &CachedRepo {
+                        repository: repository.clone(),
+                        not_found: false,
+                    },
+                );
+                Ok(repository)
+            }
+            Err(err) if err.is_not_found() => {
+                // Before we do anything, ensure we cache NotFound responses.
+                self.add_repository_to_cache(
+                    &key,
+                    &CachedRepo {
+                        repository: Repository::default(),
+                        not_found: true,
+                    },
+                );
+                Err(err)
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    /// `Client.getRepositoryFromCache`.
+    pub fn get_repository_from_cache(&self, key: &str) -> Option<CachedRepo> {
+        let cache = self.repo_cache.as_ref()?;
+        let bytes = cache.get(key)?;
+        serde_json::from_slice(&bytes).ok()
+    }
+
+    /// `Client.addRepositoryToCache`: the key is lowercased before writing.
+    pub fn add_repository_to_cache(&self, key: &str, repo: &CachedRepo) {
+        let Some(cache) = self.repo_cache.as_ref() else {
+            return;
+        };
+        let Ok(bytes) = serde_json::to_vec(repo) else {
+            return;
+        };
+        cache.set(&key.to_ascii_lowercase(), bytes);
+    }
+
+    /// `Client.getRepositoryFromAPI`: `GetRepository` with the repository name
+    /// derived from the ARN's last `:` segment.
+    pub async fn get_repository_from_api(&self, arn: &str) -> Result<Repository, AwsError> {
+        let repo_name = arn.rsplit(':').next().unwrap_or_default();
+        let mut body = serde_json::Map::new();
+        body.insert(
+            "repositoryName".to_owned(),
+            Value::String(repo_name.to_owned()),
+        );
+        let response = self.call("GetRepository", Value::Object(body)).await?;
+        let metadata = response
+            .get("repositoryMetadata")
+            .cloned()
+            .ok_or_else(|| AwsError::Json("missing repositoryMetadata".to_owned()))?;
+        let metadata: RepoMetadata =
+            serde_json::from_value(metadata).map_err(|err| AwsError::Json(err.to_string()))?;
+        Ok(metadata.into_repository())
     }
 
     /// `Client.ListRepositories` one page: list, then batch-get metadata.
@@ -318,7 +521,20 @@ impl Client {
                 for item in items {
                     let metadata: RepoMetadata = serde_json::from_value(item.clone())
                         .map_err(|err| AwsError::Json(err.to_string()))?;
-                    repos.push(metadata.into_repository());
+                    let repository = metadata.into_repository();
+                    // `Client.getRepositories` writes each batch result through
+                    // to the repository cache using the repository's ARN.
+                    if self.repo_cache.is_some() {
+                        let key = self.repository_cache_key(&repository.arn);
+                        self.add_repository_to_cache(
+                            &key,
+                            &CachedRepo {
+                                repository: repository.clone(),
+                                not_found: false,
+                            },
+                        );
+                    }
+                    repos.push(repository);
                 }
             }
         }
@@ -653,5 +869,167 @@ mod tests {
     fn error_classification() {
         assert!(AwsError::NotFound.is_not_found());
         assert!(AwsError::Unauthorized("x".to_owned()).is_unauthorized());
+    }
+
+    struct NoHttp;
+
+    #[async_trait::async_trait]
+    impl HttpDoer for NoHttp {
+        async fn do_request(&self, _request: HttpRequest) -> Result<crate::HttpResponse, String> {
+            Err("no network in unit tests".to_owned())
+        }
+    }
+
+    fn cache_client(cache: Arc<dyn RepoCache>) -> Client {
+        Client::new(
+            Credentials {
+                access_key_id: "AKID".to_owned(),
+                secret_access_key: "SECRET".to_owned(),
+                session_token: Some("TOKEN".to_owned()),
+            },
+            "us-west-2",
+            "aws",
+            "https://codecommit.us-west-2.amazonaws.com/".to_owned(),
+            Arc::new(NoHttp),
+        )
+        .with_repo_cache(cache)
+    }
+
+    #[test]
+    fn cache_key_matches_go_sha256_layout() {
+        let client = cache_client(Arc::new(InMemoryRepoCache::new()));
+        let prefix = hex(&Sha256::digest(b"AKID:SECRET:TOKEN"));
+        assert_eq!(client.cache_key_prefix(), prefix);
+        assert_eq!(
+            client.repository_cache_key("arn:aws:codecommit:us-west-2:1:Repo"),
+            format!("{prefix}:arn:aws:codecommit:us-west-2:1:Repo")
+        );
+    }
+
+    #[test]
+    fn in_memory_cache_honours_ttl() {
+        let now = Arc::new(std::sync::atomic::AtomicU64::new(100));
+        let clock = Arc::clone(&now);
+        let cache = InMemoryRepoCache::new().with_clock(move || {
+            clock.load(std::sync::atomic::Ordering::SeqCst)
+        });
+        assert_eq!(cache.ttl_seconds(), 60);
+        cache.set("k", b"v".to_vec());
+        assert_eq!(cache.get("k"), Some(b"v".to_vec()));
+        now.store(159, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(cache.get("k"), Some(b"v".to_vec()));
+        now.store(160, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(cache.get("k"), None);
+    }
+
+    #[test]
+    fn repository_cache_round_trip_and_not_found_flag() {
+        let cache = Arc::new(InMemoryRepoCache::new());
+        let client = cache_client(cache.clone());
+        let repository = Repository {
+            id: "id".to_owned(),
+            name: "Repo".to_owned(),
+            ..Repository::default()
+        };
+        // `addRepositoryToCache` writes the lower-cased key, like the baseline.
+        client.add_repository_to_cache(
+            "preFIX:arn:aws:codecommit:us-west-2:1:Repo",
+            &CachedRepo {
+                repository: repository.clone(),
+                not_found: false,
+            },
+        );
+        let cached = client
+            .get_repository_from_cache("prefix:arn:aws:codecommit:us-west-2:1:repo")
+            .expect("cached entry");
+        assert_eq!(cached.repository, repository);
+        assert!(!cached.not_found);
+        // The baseline reads with the un-lower-cased key, so a mixed-case ARN
+        // is a miss even though the write lower-cased it.
+        assert!(client
+            .get_repository_from_cache("preFIX:arn:aws:codecommit:us-west-2:1:Repo")
+            .is_none());
+
+        client.add_repository_to_cache(
+            "k",
+            &CachedRepo {
+                repository: Repository::default(),
+                not_found: true,
+            },
+        );
+        let cached = client.get_repository_from_cache("k").expect("cached miss");
+        assert!(cached.not_found);
+        let value = serde_json::to_value(&cached).unwrap();
+        assert_eq!(value["NotFound"], true);
+        assert!(value.get("Repository").is_none());
+    }
+
+    struct ScriptedHttp;
+
+    #[async_trait::async_trait]
+    impl HttpDoer for ScriptedHttp {
+        async fn do_request(&self, request: HttpRequest) -> Result<crate::HttpResponse, String> {
+            let target = request
+                .headers
+                .iter()
+                .find(|(name, _)| name == "X-Amz-Target")
+                .map(|(_, value)| value.as_str())
+                .unwrap_or_default();
+            let body = if target.ends_with("ListRepositories") {
+                serde_json::json!({
+                    "repositories": [{"repositoryName": "Repo"}],
+                    "nextToken": "next",
+                })
+            } else if target.ends_with("BatchGetRepositories") {
+                serde_json::json!({
+                    "repositories": [{
+                        "Arn": "arn:aws:codecommit:us-west-2:1:Repo",
+                        "accountId": "1",
+                        "repositoryId": "id",
+                        "repositoryName": "Repo",
+                        "cloneUrlHttp": "https://example/v1/repos/Repo",
+                    }],
+                })
+            } else {
+                return Err(format!("unexpected target {target}"));
+            };
+            Ok(crate::HttpResponse {
+                status: 200,
+                headers: Vec::new(),
+                body: body.to_string().into_bytes(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn list_repositories_writes_batch_results_through_to_cache() {
+        let cache = Arc::new(InMemoryRepoCache::new());
+        let client = Client::new(
+            Credentials {
+                access_key_id: "AKID".to_owned(),
+                secret_access_key: "SECRET".to_owned(),
+                session_token: Some("TOKEN".to_owned()),
+            },
+            "us-west-2",
+            "aws",
+            "https://codecommit.us-west-2.amazonaws.com/".to_owned(),
+            Arc::new(ScriptedHttp),
+        )
+        .with_repo_cache(cache);
+
+        let (repos, next) = client.list_repositories("").await.expect("list");
+        assert_eq!(next, "next");
+        assert_eq!(repos.len(), 1);
+        assert_eq!(repos[0].arn, "arn:aws:codecommit:us-west-2:1:Repo");
+        // `getRepositories` writes each batch result through with the ARN key
+        // (lower-cased on write, like `addRepositoryToCache`).
+        let key = client
+            .repository_cache_key("arn:aws:codecommit:us-west-2:1:Repo")
+            .to_ascii_lowercase();
+        let cached = client
+            .get_repository_from_cache(&key)
+            .expect("write-through entry");
+        assert_eq!(cached.repository, repos[0]);
+        assert!(!cached.not_found);
     }
 }
