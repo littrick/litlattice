@@ -98,6 +98,9 @@ pub struct ExtsvcSourceFactory {
     /// leave it unset or inject fakes.
     perforce: Option<Arc<dyn sg_extsvc::perforce::PerforceGitserver>>,
     gitolite: Option<Arc<dyn sg_extsvc::gitolite::GitoliteRepoLister>>,
+    /// `db.GitHubApps()`: resolves `gitHubAppDetails` to an App private key.
+    /// Production wiring is optional; without it App connections are rejected.
+    github_apps: Option<Arc<dyn sg_extsvc::auth::GitHubAppStore>>,
 }
 
 impl ExtsvcSourceFactory {
@@ -112,7 +115,18 @@ impl ExtsvcSourceFactory {
             keyring,
             perforce: None,
             gitolite: None,
+            github_apps: None,
         }
+    }
+
+    /// Wire the GitHub App store (production). Without it, GitHub connections
+    /// with `gitHubAppDetails` are rejected.
+    pub fn with_github_apps(
+        mut self,
+        github_apps: Option<Arc<dyn sg_extsvc::auth::GitHubAppStore>>,
+    ) -> Self {
+        self.github_apps = github_apps;
+        self
     }
 
     /// Wire the gitserver-backed source client (production). The same client
@@ -156,7 +170,9 @@ impl SourceFactory for ExtsvcSourceFactory {
             self.doer.clone(),
             self.perforce.clone(),
             self.gitolite.clone(),
+            self.github_apps.clone(),
         )
+        .await
     }
 }
 

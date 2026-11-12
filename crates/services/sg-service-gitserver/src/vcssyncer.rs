@@ -12,7 +12,7 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Output, Stdio};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use regex::Regex;
 use tokio::process::Command;
@@ -610,6 +610,798 @@ pub fn clone_tmp_path(tmp_dir: &Path) -> PathBuf {
     tmp_dir.join(".git")
 }
 
+// ---------------------------------------------------------------------------
+// Non-git syncer: `cmd/gitserver/internal/vcssyncer/packages_syncer.go` and
+// the package-manager sources. JVM/coursier is intentionally not ported.
+// ---------------------------------------------------------------------------
+
+/// `stableGitCommitDate`: every synthetic commit uses the same timestamp.
+pub const STABLE_GIT_COMMIT_DATE: &str = "2000-01-01T00:00:00Z";
+
+/// The package ecosystem a [`PackageSyncer`] serves.
+pub use sg_extsvc::reposource_packages::PackageKind;
+
+/// `reposource.VersionedPackage` for a package name and version.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VersionedPackage {
+    pub kind: PackageKind,
+    pub package: String,
+    pub version: String,
+}
+
+impl VersionedPackage {
+    /// `packagesSource.ParseVersionedPackageFromNameAndVersion`.
+    pub fn from_name_and_version(
+        kind: PackageKind,
+        name: &str,
+        version: &str,
+    ) -> Result<Self, String> {
+        let dependency = match kind {
+            PackageKind::Python => format!("{name}=={version}"),
+            _ => format!("{name}@{version}"),
+        };
+        Self::from_configuration(kind, &dependency)
+    }
+
+    /// `packagesSource.ParseVersionedPackageFromConfiguration`.
+    pub fn from_configuration(kind: PackageKind, dependency: &str) -> Result<Self, String> {
+        let info = sg_extsvc::reposource_packages::parse_versioned_package(kind, dependency)?;
+        Ok(Self {
+            kind,
+            package: info.syntax,
+            version: info.version,
+        })
+    }
+
+    /// `VersionedPackageSyntax`: the syntax a package manager accepts.
+    pub fn versioned_package_syntax(&self) -> String {
+        if self.version.is_empty() {
+            return self.package.clone();
+        }
+        match self.kind {
+            PackageKind::Python => format!("{}=={}", self.package, self.version),
+            _ => format!("{}@{}", self.package, self.version),
+        }
+    }
+
+    /// `GitTagFromVersion`.
+    pub fn git_tag(&self) -> String {
+        match self.kind {
+            PackageKind::Go => self.version.clone(),
+            _ => format!("v{}", self.version.trim_start_matches('v')),
+        }
+    }
+
+    /// `VersionedPackage.Less`: descending order, so the latest version sorts
+    /// first. Different packages sort by package name descending.
+    pub fn less(&self, other: &Self) -> bool {
+        if self.package == other.package {
+            return version_greater_than(&self.version, &other.version);
+        }
+        self.package > other.package
+    }
+}
+
+/// `reposource.versionGreaterThan` (internal/conf/reposource/package_version.go).
+pub fn version_greater_than(version1: &str, version2: &str) -> bool {
+    let a = version1.as_bytes();
+    let b = version2.as_bytes();
+    let mut index = 0;
+    let end = a.len().min(b.len());
+    while index < end {
+        if a[index].is_ascii_digit() && b[index].is_ascii_digit() {
+            let int1 = version_parse_int(index, a);
+            let int2 = version_parse_int(index, b);
+            if int1 == int2 {
+                index = version_next_non_digit_offset(index, a);
+            } else {
+                return int1 > int2;
+            }
+        } else if a[index] == b[index] {
+            index += 1;
+        } else {
+            return a[index] > b[index];
+        }
+    }
+    a.len() < b.len()
+}
+
+fn version_parse_int(index: usize, version: &[u8]) -> i64 {
+    let end = version_next_non_digit_offset(index, version);
+    std::str::from_utf8(&version[index..end])
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or_default()
+}
+
+fn version_next_non_digit_offset(index: usize, version: &[u8]) -> usize {
+    let mut offset = index;
+    while offset < version.len() && version[offset].is_ascii_digit() {
+        offset += 1;
+    }
+    offset
+}
+
+/// `packagesSource`: download the package and parse names/versions. The HTTP
+/// and unpacking details live behind this seam so the syncer is testable
+/// offline.
+#[async_trait::async_trait]
+pub trait PackageSource: Send + Sync {
+    async fn download(&self, dir: &Path, dependency: &VersionedPackage) -> Result<(), String>;
+    fn parse_versioned_package_from_name_and_version(
+        &self,
+        name: &str,
+        version: &str,
+    ) -> Result<VersionedPackage, String>;
+    fn parse_versioned_package_from_configuration(
+        &self,
+        dependency: &str,
+    ) -> Result<VersionedPackage, String>;
+    fn parse_package_from_repo_name(&self, repo_name: &str) -> Result<String, String>;
+}
+
+/// A [`PackageSource`] that uses the shared `reposource` parsers and has no
+/// downloader (tests or a future HTTP-backed source supply the download).
+#[derive(Debug, Clone, Copy)]
+pub struct ParsingPackageSource {
+    pub kind: PackageKind,
+}
+
+#[async_trait::async_trait]
+impl PackageSource for ParsingPackageSource {
+    async fn download(&self, _dir: &Path, _dependency: &VersionedPackage) -> Result<(), String> {
+        Err("package download is not configured".to_owned())
+    }
+    fn parse_versioned_package_from_name_and_version(
+        &self,
+        name: &str,
+        version: &str,
+    ) -> Result<VersionedPackage, String> {
+        VersionedPackage::from_name_and_version(self.kind, name, version)
+    }
+    fn parse_versioned_package_from_configuration(
+        &self,
+        dependency: &str,
+    ) -> Result<VersionedPackage, String> {
+        VersionedPackage::from_configuration(self.kind, dependency)
+    }
+    fn parse_package_from_repo_name(&self, repo_name: &str) -> Result<String, String> {
+        Ok(sg_extsvc::reposource_packages::parse_package_from_repo_name(
+            self.kind, repo_name,
+        )?
+        .syntax)
+    }
+}
+
+/// `dependenciesService.ListPackageRepoRefs` for one exact package name.
+#[async_trait::async_trait]
+pub trait PackageVersionLister: Send + Sync {
+    async fn versions(&self, scheme: &str, package: &str) -> Result<Vec<String>, String>;
+}
+
+/// A lister with no configured package-repo rows.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct EmptyPackageVersionLister;
+
+#[async_trait::async_trait]
+impl PackageVersionLister for EmptyPackageVersionLister {
+    async fn versions(&self, _scheme: &str, _package: &str) -> Result<Vec<String>, String> {
+        Ok(Vec::new())
+    }
+}
+
+/// The injectable command runner (`exec.Cmd` + `CombinedOutput` in
+/// `runCommandInDirectory`).
+#[async_trait::async_trait]
+pub trait PackageGitRunner: Send + Sync {
+    /// Run `args` (including the program) in `dir`, with the baseline's stable
+    /// author/committer environment, returning combined stdout+stderr.
+    async fn combined_output(
+        &self,
+        dir: &Path,
+        args: &[String],
+        dependency: &VersionedPackage,
+    ) -> Result<String, String>;
+}
+
+/// The production runner: inherits the environment and appends the baseline's
+/// `EMAIL`/`GIT_*` variables.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ProcessGitRunner;
+
+#[async_trait::async_trait]
+impl PackageGitRunner for ProcessGitRunner {
+    async fn combined_output(
+        &self,
+        dir: &Path,
+        args: &[String],
+        dependency: &VersionedPackage,
+    ) -> Result<String, String> {
+        let Some(program) = args.first() else {
+            return Err("empty command".to_owned());
+        };
+        let git_name = format!("{} authors", dependency.versioned_package_syntax());
+        let git_email = "code-intel@sourcegraph.com";
+        let mut command = Command::new(program);
+        command
+            .args(&args[1..])
+            .current_dir(dir)
+            .kill_on_drop(true)
+            .env("EMAIL", git_email)
+            .env("GIT_AUTHOR_NAME", &git_name)
+            .env("GIT_AUTHOR_EMAIL", git_email)
+            .env("GIT_AUTHOR_DATE", STABLE_GIT_COMMIT_DATE)
+            .env("GIT_COMMITTER_NAME", &git_name)
+            .env("GIT_COMMITTER_EMAIL", git_email)
+            .env("GIT_COMMITTER_DATE", STABLE_GIT_COMMIT_DATE)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let output = command
+            .output()
+            .await
+            .map_err(|err| format!("command {args:?} failed with output : {err}"))?;
+        let combined = String::from_utf8_lossy(&output.stdout).into_owned()
+            + &String::from_utf8_lossy(&output.stderr);
+        if !output.status.success() {
+            return Err(format!("command {args:?} failed with output {combined}"));
+        }
+        Ok(combined)
+    }
+}
+
+/// `vcsPackagesSyncer`: one synthetic git tag per requested package version.
+pub struct PackageSyncer {
+    pub kind: PackageKind,
+    pub placeholder: VersionedPackage,
+    pub config_deps: Vec<String>,
+    pub source: Arc<dyn PackageSource>,
+    pub version_lister: Arc<dyn PackageVersionLister>,
+    pub git: Arc<dyn PackageGitRunner>,
+    /// Where per-version work directories are created (`fs.TempDir`).
+    pub temp_root: Option<PathBuf>,
+}
+
+impl PackageSyncer {
+    pub fn new(
+        kind: PackageKind,
+        placeholder: VersionedPackage,
+        config_deps: Vec<String>,
+        source: Arc<dyn PackageSource>,
+        version_lister: Arc<dyn PackageVersionLister>,
+        git: Arc<dyn PackageGitRunner>,
+    ) -> Self {
+        Self {
+            kind,
+            placeholder,
+            config_deps,
+            source,
+            version_lister,
+            git,
+            temp_root: None,
+        }
+    }
+
+    /// `VCSSyncer.Type`: `npm_packages`, `go_modules`, ...
+    pub fn type_name(&self) -> &'static str {
+        match self.kind {
+            PackageKind::Npm => "npm_packages",
+            PackageKind::Go => "go_modules",
+            PackageKind::Python => "python_packages",
+            PackageKind::Rust => "rust_packages",
+            PackageKind::Ruby => "ruby_packages",
+            PackageKind::Jvm => "jvm_packages",
+        }
+    }
+
+    /// `vcsPackagesSyncer.IsCloneable` always succeeds.
+    pub fn is_cloneable(&self) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// `versions`: configured dependencies first, then the database rows.
+    pub async fn versions(&self, package_name: &str) -> Result<Vec<String>, String> {
+        let mut combined = Vec::new();
+        for dependency in &self.config_deps {
+            match self
+                .source
+                .parse_versioned_package_from_configuration(dependency)
+            {
+                Ok(dep) => {
+                    if dep.package == package_name {
+                        combined.push(dep.version);
+                    }
+                }
+                // The baseline logs and skips malformed config dependencies.
+                Err(_) => continue,
+            }
+        }
+        let listed = self
+            .version_lister
+            .versions(self.kind.scheme(), package_name)
+            .await
+            .map_err(|err| format!("failed to list dependencies from db: {err}"))?;
+        combined.extend(listed);
+        Ok(combined)
+    }
+
+    /// `vcsPackagesSyncer.Fetch` after the remote URL was resolved: parse the
+    /// package from the repo name, read its versions, then sync them.
+    pub async fn fetch(
+        &self,
+        dir: &Path,
+        repo_name: &str,
+        on_progress: &mut (dyn FnMut(&[u8]) + Send),
+    ) -> Result<(), String> {
+        emit(on_progress, "Fetching package revisions\n");
+        let package = self.source.parse_package_from_repo_name(repo_name)?;
+        let versions = self.versions(&package).await?;
+        self.fetch_versions(dir, &package, versions).await
+    }
+
+    /// `fetchVersions`: parse, sort descending, skip existing tags, push the
+    /// rest, point `latest` at the newest success and prune stale tags.
+    pub async fn fetch_versions(
+        &self,
+        dir: &Path,
+        package_name: &str,
+        versions: Vec<String>,
+    ) -> Result<(), String> {
+        let mut errors = Vec::new();
+        let mut cloneable = Vec::with_capacity(versions.len());
+        for version in versions {
+            match self
+                .source
+                .parse_versioned_package_from_name_and_version(package_name, &version)
+            {
+                Ok(dependency) => cloneable.push(dependency),
+                Err(err) => errors.push(err),
+            }
+        }
+        if !errors.is_empty() {
+            return Err(errors.join("\n"));
+        }
+
+        cloneable.sort_by(|a, b| {
+            if a.less(b) {
+                std::cmp::Ordering::Less
+            } else if b.less(a) {
+                std::cmp::Ordering::Greater
+            } else {
+                std::cmp::Ordering::Equal
+            }
+        });
+
+        let output = self
+            .git
+            .combined_output(dir, &["git".to_owned(), "tag".to_owned()], &self.placeholder)
+            .await?;
+        let tags: std::collections::HashSet<&str> = output
+            .split('\n')
+            .filter(|line| !line.is_empty())
+            .collect();
+
+        let mut cloned = Vec::new();
+        for dependency in &cloneable {
+            if tags.contains(dependency.git_tag().as_str()) {
+                cloned.push(dependency.clone());
+                continue;
+            }
+            match self.git_push_dependency_tag(dir, dependency).await {
+                Ok(()) => cloned.push(dependency.clone()),
+                Err(err) => errors.push(format!("error pushing dependency {dependency:?}: {err}")),
+            }
+        }
+
+        if let Some(latest) = cloned.first() {
+            self.git
+                .combined_output(
+                    dir,
+                    &[
+                        "git".to_owned(),
+                        "branch".to_owned(),
+                        "--force".to_owned(),
+                        "latest".to_owned(),
+                        latest.git_tag(),
+                    ],
+                    latest,
+                )
+                .await?;
+        }
+
+        if !errors.is_empty() {
+            return Err(errors.join("\n"));
+        }
+
+        let dependency_tags: std::collections::HashSet<String> =
+            cloneable.iter().map(VersionedPackage::git_tag).collect();
+        for tag in tags {
+            if !dependency_tags.contains(tag) {
+                // Deleting a stale tag is best-effort; log and continue.
+                let _ = self
+                    .git
+                    .combined_output(
+                        dir,
+                        &[
+                            "git".to_owned(),
+                            "tag".to_owned(),
+                            "-d".to_owned(),
+                            tag.to_owned(),
+                        ],
+                        &self.placeholder,
+                    )
+                    .await;
+            }
+        }
+
+        if cloneable.is_empty() {
+            let _ = self
+                .git
+                .combined_output(
+                    dir,
+                    &[
+                        "git".to_owned(),
+                        "branch".to_owned(),
+                        "--force".to_owned(),
+                        "-D".to_owned(),
+                        "latest".to_owned(),
+                    ],
+                    &self.placeholder,
+                )
+                .await;
+        }
+
+        Ok(())
+    }
+
+    /// `gitPushDependencyTag`: download into a temp directory, commit it on a
+    /// synthetic history and force-push the tag into `bare_git_directory`.
+    pub async fn git_push_dependency_tag(
+        &self,
+        bare_git_directory: &Path,
+        dependency: &VersionedPackage,
+    ) -> Result<(), String> {
+        let temp_root = self
+            .temp_root
+            .clone()
+            .unwrap_or_else(std::env::temp_dir);
+        let work_dir = tempfile::Builder::new()
+            .prefix(self.type_name())
+            .tempdir_in(temp_root)
+            .map_err(|err| format!("failed to create temp dir: {err}"))?;
+        let work_dir_path = work_dir.path();
+
+        self.source.download(work_dir_path, dependency).await?;
+
+        for args in [
+            vec!["git".to_owned(), "init".to_owned()],
+            vec!["git".to_owned(), "add".to_owned(), ".".to_owned()],
+        ] {
+            self.git
+                .combined_output(work_dir_path, &args, dependency)
+                .await?;
+        }
+
+        // Use --no-verify for security reasons (baseline PR #23399).
+        self.git
+            .combined_output(
+                work_dir_path,
+                &[
+                    "git".to_owned(),
+                    "commit".to_owned(),
+                    "--no-verify".to_owned(),
+                    "-m".to_owned(),
+                    dependency.versioned_package_syntax(),
+                    "--date".to_owned(),
+                    STABLE_GIT_COMMIT_DATE.to_owned(),
+                ],
+                dependency,
+            )
+            .await?;
+
+        self.git
+            .combined_output(
+                work_dir_path,
+                &[
+                    "git".to_owned(),
+                    "tag".to_owned(),
+                    "-m".to_owned(),
+                    dependency.versioned_package_syntax(),
+                    dependency.git_tag(),
+                ],
+                dependency,
+            )
+            .await?;
+
+        self.git
+            .combined_output(
+                work_dir_path,
+                &[
+                    "git".to_owned(),
+                    "remote".to_owned(),
+                    "add".to_owned(),
+                    "origin".to_owned(),
+                    bare_git_directory.to_string_lossy().into_owned(),
+                ],
+                dependency,
+            )
+            .await?;
+
+        self.git
+            .combined_output(
+                work_dir_path,
+                &[
+                    "git".to_owned(),
+                    "push".to_owned(),
+                    "--no-verify".to_owned(),
+                    "--force".to_owned(),
+                    "origin".to_owned(),
+                    "--tags".to_owned(),
+                ],
+                dependency,
+            )
+            .await?;
+
+        Ok(())
+    }
+}
+
+/// `isPotentiallyMaliciousFilepathInArchive`.
+pub fn is_potentially_malicious_filepath_in_archive(path: &str, destination: &str) -> bool {
+    if path.ends_with('/') || path.starts_with('/') {
+        return true;
+    }
+    if path.split(std::path::MAIN_SEPARATOR).any(|part| part == ".git") {
+        return true;
+    }
+    let cleaned = path_clean(&Path::new(destination).join(path));
+    !cleaned.starts_with(Path::new(destination))
+}
+
+/// Lexical `path.Join`/`path.Clean` equivalent.
+fn path_clean(path: &Path) -> PathBuf {
+    let mut cleaned = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                cleaned.pop();
+            }
+            other => cleaned.push(other.as_os_str()),
+        }
+    }
+    cleaned
+}
+
+/// `stripSingleOutermostDirectory`.
+pub fn strip_single_outermost_directory(dir: &Path) -> Result<(), String> {
+    let entries: Vec<_> = std::fs::read_dir(dir)
+        .map_err(|err| err.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|err| err.to_string())?;
+    if entries.len() != 1 || !entries[0].file_type().map_err(|err| err.to_string())?.is_dir() {
+        return Ok(());
+    }
+    let outermost = entries[0].file_name();
+    let tmp = PathBuf::from(format!("{}.tmp", dir.display()));
+    std::fs::rename(dir, &tmp).map_err(|err| err.to_string())?;
+    std::fs::rename(tmp.join(&outermost), dir).map_err(|err| err.to_string())?;
+    Ok(())
+}
+
+const ARCHIVE_SIZE_LIMIT: u64 = 15 * 1024 * 1024;
+
+/// `unpack.Opts{SkipInvalid: true, SkipDuplicates: true}` plus the package
+/// filter: skip entries at/over 15 MiB and potentially malicious paths.
+pub fn unpack_tgz(contents: &[u8], destination: &Path) -> Result<(), String> {
+    // `unpack.Tgz` treats a non-gzip stream as a plain tar archive.
+    if contents.len() >= 2 && contents[0] == 0x1f && contents[1] == 0x8b {
+        let decoder = flate2::read::GzDecoder::new(contents);
+        unpack_tar(decoder, destination)
+    } else {
+        unpack_tar(contents, destination)
+    }
+}
+
+/// `unpack.Tar` with the package filter, `SkipInvalid` and `SkipDuplicates`.
+pub fn unpack_tar(reader: impl std::io::Read, destination: &Path) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::create_dir_all(destination).map_err(|err| err.to_string())?;
+    let mut archive = tar::Archive::new(reader);
+    for entry in archive.entries().map_err(|err| err.to_string())? {
+        let mut entry = entry.map_err(|err| err.to_string())?;
+        let size = entry.header().size().map_err(|err| err.to_string())? as u64;
+        let name = String::from_utf8_lossy(&entry.path_bytes()).into_owned();
+        if size >= ARCHIVE_SIZE_LIMIT
+            || is_potentially_malicious_filepath_in_archive(&name, &destination.to_string_lossy())
+        {
+            continue;
+        }
+        let Some(target) = sanitize_archive_path(&name, destination) else {
+            continue;
+        };
+        let entry_type = entry.header().entry_type();
+        if entry_type.is_dir() {
+            let mode = entry.header().mode().unwrap_or(0o755) | 0o700;
+            if std::fs::create_dir_all(&target).is_ok() {
+                let _ = std::fs::set_permissions(&target, std::fs::Permissions::from_mode(mode));
+            }
+            continue;
+        }
+        if let Some(parent) = target.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        match entry_type {
+            tar::EntryType::Regular | tar::EntryType::Continuous | tar::EntryType::GNUSparse => {
+                let mode = entry.header().mode().unwrap_or(0o644) | 0o600;
+                match std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&target)
+                {
+                    Ok(mut file) => {
+                        std::io::copy(&mut entry, &mut file).map_err(|err| err.to_string())?;
+                        let _ =
+                            std::fs::set_permissions(&target, std::fs::Permissions::from_mode(mode));
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(err) => return Err(err.to_string()),
+                }
+            }
+            tar::EntryType::Symlink => {
+                if let Ok(Some(link)) = entry.link_name() {
+                    let _ = std::os::unix::fs::symlink(link, &target);
+                }
+            }
+            _ => continue,
+        }
+    }
+    Ok(())
+}
+
+/// `unpack.Zip` with the package filter.
+pub fn unpack_zip(contents: &[u8], destination: &Path) -> Result<(), String> {
+    use std::io::Read;
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::create_dir_all(destination).map_err(|err| err.to_string())?;
+    let cursor = std::io::Cursor::new(contents);
+    let mut archive = zip::ZipArchive::new(cursor).map_err(|err| err.to_string())?;
+    for index in 0..archive.len() {
+        let mut file = archive.by_index(index).map_err(|err| err.to_string())?;
+        let name = file.name().to_owned();
+        if file.size() >= ARCHIVE_SIZE_LIMIT
+            || is_potentially_malicious_filepath_in_archive(&name, &destination.to_string_lossy())
+        {
+            continue;
+        }
+        let Some(target) = sanitize_archive_path(&name, destination) else {
+            continue;
+        };
+        if file.is_dir() {
+            let mode = file.unix_mode().unwrap_or(0o755) | 0o700;
+            if std::fs::create_dir_all(&target).is_ok() {
+                let _ = std::fs::set_permissions(&target, std::fs::Permissions::from_mode(mode));
+            }
+            continue;
+        }
+        if let Some(parent) = target.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let mode = file.unix_mode().unwrap_or(0o644) | 0o600;
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&target)
+        {
+            Ok(mut out) => {
+                let mut buffer = Vec::new();
+                file.read_to_end(&mut buffer).map_err(|err| err.to_string())?;
+                std::io::Write::write_all(&mut out, &buffer).map_err(|err| err.to_string())?;
+                let _ = std::fs::set_permissions(&target, std::fs::Permissions::from_mode(mode));
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(err.to_string()),
+        }
+    }
+    Ok(())
+}
+
+/// `sanitizeTarPath`/`sanitizeZipPath`: reject paths that escape `dir`.
+fn sanitize_archive_path(name: &str, dir: &Path) -> Option<PathBuf> {
+    let path = Path::new(name);
+    if path.is_absolute() {
+        return None;
+    }
+    let target = path_clean(&dir.join(path));
+    if target.starts_with(dir) {
+        Some(target)
+    } else {
+        None
+    }
+}
+
+/// `decompressTgz` (npm): unpack then strip the tarball's package directory.
+pub fn decompress_tgz(contents: &[u8], destination: &Path) -> Result<(), String> {
+    unpack_tgz(contents, destination)?;
+    strip_single_outermost_directory(destination)
+}
+
+/// `unpackRustPackage`.
+pub fn unpack_rust_package(contents: &[u8], work_dir: &Path) -> Result<(), String> {
+    unpack_tgz(contents, work_dir)?;
+    strip_single_outermost_directory(work_dir)
+}
+
+/// `unpackPythonPackage`: dispatch on the package URL's file extension.
+pub fn unpack_python_package(
+    contents: &[u8],
+    package_url: &str,
+    work_dir: &Path,
+) -> Result<(), String> {
+    // `path.Base(u.Path)` without pulling in the URL crate.
+    let path_part = package_url
+        .split(['?', '#'])
+        .next()
+        .unwrap_or(package_url)
+        .trim_end_matches('/');
+    let filename = path_part.rsplit('/').next().unwrap_or_default().to_owned();
+    if filename.ends_with(".tar.gz") || filename.ends_with(".tgz") {
+        unpack_tgz(contents, work_dir)?;
+    } else if filename.ends_with(".whl") || filename.ends_with(".zip") {
+        unpack_zip(contents, work_dir)?;
+    } else if filename.ends_with(".tar") {
+        unpack_tar(contents, work_dir)?;
+    } else {
+        return Err(format!("unsupported python package type {filename:?}"));
+    }
+    strip_single_outermost_directory(work_dir)
+}
+
+/// `unpackRubyPackage`: the outer tar holds `data.tar.gz` and `metadata.gz`.
+pub fn unpack_ruby_package(contents: &[u8], work_dir: &Path) -> Result<(), String> {
+    let mut data_tar_gz: Option<Vec<u8>> = None;
+    let mut metadata_gz: Option<Vec<u8>> = None;
+    let mut archive = tar::Archive::new(contents);
+    for entry in archive.entries().map_err(|err| err.to_string())? {
+        let mut entry = entry.map_err(|err| err.to_string())?;
+        let name = String::from_utf8_lossy(&entry.path_bytes()).into_owned();
+        if name != "data.tar.gz" && name != "metadata.gz" {
+            continue;
+        }
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut entry, &mut bytes).map_err(|err| err.to_string())?;
+        if name == "data.tar.gz" {
+            data_tar_gz = Some(bytes);
+        } else {
+            metadata_gz = Some(bytes);
+        }
+    }
+    let data = data_tar_gz.ok_or_else(|| "failed to read data archive file \"data.tar.gz\"".to_owned())?;
+    unpack_tgz(&data, work_dir)?;
+    strip_single_outermost_directory(work_dir)?;
+
+    let metadata = metadata_gz.ok_or_else(|| "failed to read metadata.gz".to_owned())?;
+    let mut metadata_reader = flate2::read::GzDecoder::new(metadata.as_slice());
+    let mut metadata_bytes = Vec::new();
+    std::io::Read::read_to_end(&mut metadata_reader, &mut metadata_bytes)
+        .map_err(|err| err.to_string())?;
+    std::fs::write(work_dir.join("rubygems-metadata.yml"), metadata_bytes)
+        .map_err(|err| err.to_string())
+}
+
+/// `perforce.DecomposePerforceRemoteURL`.
+pub fn decompose_perforce_remote_url(remote: &VcsUrl) -> Result<(String, String, String, String), String> {
+    if remote.scheme() != "perforce" {
+        return Err("scheme is not \"perforce\"".to_owned());
+    }
+    Ok((
+        remote.username().to_owned(),
+        remote.password().unwrap_or_default().to_owned(),
+        remote.host().to_owned(),
+        remote.path().to_owned(),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -960,5 +1752,317 @@ mod tests {
         // The bare repo and its progress output were still produced.
         assert!(git_dir.join("HEAD").exists());
         assert!(String::from_utf8_lossy(&progress).contains("Creating bare repo\n"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Package syncers (`packages_syncer.go`)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn compares_versions_like_reposource() {
+        assert!(version_greater_than("11.0x", "11.0a"));
+        // The baseline returns `len(version1) < len(version2)` after exhausting
+        // the common prefix, so the shorter version compares greater.
+        assert!(!version_greater_than("11.0a", "11.0"));
+        assert!(version_greater_than("11.0", "11.0a"));
+        assert!(version_greater_than("11.0", "8.0"));
+        assert!(version_greater_than("1.10", "1.9"));
+        assert!(!version_greater_than("1.9", "1.10"));
+        assert!(!version_greater_than("1.0", "1.0"));
+        // Prefix ordering: the shorter version is "greater" here, matching the
+        // baseline's `len(version1) < len(version2)` return.
+        assert!(!version_greater_than("1.0.1", "1.0"));
+        assert!(version_greater_than("1.0", "1.0.1"));
+    }
+
+    #[test]
+    fn builds_git_tags_per_ecosystem() {
+        let cases = [
+            (PackageKind::Npm, "pkg", "1.2.3", "v1.2.3"),
+            (PackageKind::Go, "example.com/m", "v1.2.3", "v1.2.3"),
+            (PackageKind::Python, "requests", "v2.0", "v2.0"),
+            (PackageKind::Rust, "serde", "1.0", "v1.0"),
+            (PackageKind::Ruby, "rails", "7", "v7"),
+        ];
+        for (kind, package, version, tag) in cases {
+            let dependency = VersionedPackage {
+                kind,
+                package: package.to_owned(),
+                version: version.to_owned(),
+            };
+            assert_eq!(dependency.git_tag(), tag, "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn parses_versioned_packages_and_repo_names() {
+        let npm = VersionedPackage::from_configuration(PackageKind::Npm, "@scope/pkg@1.2.3")
+            .expect("npm");
+        assert_eq!(npm.package, "@scope/pkg");
+        assert_eq!(npm.version, "1.2.3");
+        assert_eq!(npm.versioned_package_syntax(), "@scope/pkg@1.2.3");
+        assert_eq!(npm.git_tag(), "v1.2.3");
+
+        let go = VersionedPackage::from_configuration(PackageKind::Go, "example.com/m@v1.2.3")
+            .expect("go");
+        assert_eq!(go.versioned_package_syntax(), "example.com/m@v1.2.3");
+
+        let python =
+            VersionedPackage::from_configuration(PackageKind::Python, "requests==2.0").expect("py");
+        assert_eq!(python.versioned_package_syntax(), "requests==2.0");
+
+        let rust =
+            VersionedPackage::from_configuration(PackageKind::Rust, "serde@1.0").expect("rust");
+        assert_eq!(rust.versioned_package_syntax(), "serde@1.0");
+
+        let ruby =
+            VersionedPackage::from_configuration(PackageKind::Ruby, "rails@7").expect("ruby");
+        assert_eq!(ruby.package, "rails");
+
+        let source = ParsingPackageSource {
+            kind: PackageKind::Npm,
+        };
+        assert_eq!(
+            source
+                .parse_package_from_repo_name("npm/scope/pkg")
+                .expect("repo name"),
+            "@scope/pkg"
+        );
+    }
+
+    struct FakeGit {
+        calls: std::sync::Mutex<Vec<(PathBuf, Vec<String>)>>,
+        tags: std::sync::Mutex<String>,
+    }
+
+    #[async_trait::async_trait]
+    impl PackageGitRunner for FakeGit {
+        async fn combined_output(
+            &self,
+            dir: &Path,
+            args: &[String],
+            _dependency: &VersionedPackage,
+        ) -> Result<String, String> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((dir.to_path_buf(), args.to_vec()));
+            if args.len() == 2 && args[0] == "git" && args[1] == "tag" {
+                return Ok(self.tags.lock().unwrap().clone());
+            }
+            Ok(String::new())
+        }
+    }
+
+    struct FakeSource {
+        downloads: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl PackageSource for FakeSource {
+        async fn download(
+            &self,
+            dir: &Path,
+            dependency: &VersionedPackage,
+        ) -> Result<(), String> {
+            self.downloads
+                .lock()
+                .unwrap()
+                .push(dependency.versioned_package_syntax());
+            std::fs::write(dir.join("file.txt"), b"contents").map_err(|err| err.to_string())
+        }
+        fn parse_versioned_package_from_name_and_version(
+            &self,
+            name: &str,
+            version: &str,
+        ) -> Result<VersionedPackage, String> {
+            VersionedPackage::from_name_and_version(PackageKind::Npm, name, version)
+        }
+        fn parse_versioned_package_from_configuration(
+            &self,
+            dependency: &str,
+        ) -> Result<VersionedPackage, String> {
+            VersionedPackage::from_configuration(PackageKind::Npm, dependency)
+        }
+        fn parse_package_from_repo_name(&self, repo_name: &str) -> Result<String, String> {
+            Ok(repo_name.trim_start_matches("npm/").to_owned())
+        }
+    }
+
+    #[tokio::test]
+    async fn fetches_versions_in_descending_order_and_sets_latest() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let git = Arc::new(FakeGit {
+            calls: std::sync::Mutex::new(Vec::new()),
+            tags: std::sync::Mutex::new(String::new()),
+        });
+        let source = Arc::new(FakeSource {
+            downloads: std::sync::Mutex::new(Vec::new()),
+        });
+        let mut syncer = PackageSyncer::new(
+            PackageKind::Npm,
+            VersionedPackage::from_configuration(PackageKind::Npm, "@sourcegraph/placeholder@1.0.0")
+                .unwrap(),
+            Vec::new(),
+            source.clone(),
+            Arc::new(EmptyPackageVersionLister),
+            git.clone(),
+        );
+        syncer.temp_root = Some(tmp.path().to_path_buf());
+
+        let dir = tmp.path().join("bare");
+        std::fs::create_dir_all(&dir).unwrap();
+        syncer
+            .fetch_versions(
+                &dir,
+                "pkg",
+                vec!["1.2.3".to_owned(), "1.10.0".to_owned(), "2.0.0".to_owned()],
+            )
+            .await
+            .expect("fetch versions");
+
+        // 2.0.0 > 1.10.0 > 1.2.3: the newest is tagged last and wins `latest`.
+        assert_eq!(
+            *source.downloads.lock().unwrap(),
+            vec!["pkg@2.0.0", "pkg@1.10.0", "pkg@1.2.3"]
+        );
+        let calls = git.calls.lock().unwrap();
+        let latest = calls
+            .iter()
+            .find(|(_, args)| args.starts_with(&["git".to_owned(), "branch".to_owned()]))
+            .expect("branch call");
+        assert_eq!(
+            latest.1,
+            vec!["git", "branch", "--force", "latest", "v2.0.0"]
+        );
+        let push = calls
+            .iter()
+            .find(|(_, args)| args.starts_with(&["git".to_owned(), "push".to_owned()]))
+            .expect("push call");
+        assert!(push.1.contains(&"--tags".to_owned()));
+        // Release the call log before the second run, which locks it again.
+        drop(calls);
+
+        // A second run sees the tags and does not download again.
+        *git.tags.lock().unwrap() = "v1.2.3\nv1.10.0\nv2.0.0\n".to_owned();
+        syncer
+            .fetch_versions(
+                &dir,
+                "pkg",
+                vec!["2.0.0".to_owned(), "1.10.0".to_owned(), "1.2.3".to_owned()],
+            )
+            .await
+            .expect("second fetch");
+        assert_eq!(source.downloads.lock().unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn fetch_reports_package_progress() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let git = Arc::new(FakeGit {
+            calls: std::sync::Mutex::new(Vec::new()),
+            tags: std::sync::Mutex::new(String::new()),
+        });
+        let source = Arc::new(FakeSource {
+            downloads: std::sync::Mutex::new(Vec::new()),
+        });
+        let mut syncer = PackageSyncer::new(
+            PackageKind::Npm,
+            VersionedPackage::from_configuration(PackageKind::Npm, "@sourcegraph/placeholder@1.0.0")
+                .unwrap(),
+            vec!["pkg@1.0.0".to_owned(), "other@2.0.0".to_owned()],
+            source,
+            Arc::new(EmptyPackageVersionLister),
+            git,
+        );
+        syncer.temp_root = Some(tmp.path().to_path_buf());
+        let dir = tmp.path().join("bare");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut progress = Vec::new();
+        let mut on_progress = |line: &[u8]| progress.extend_from_slice(line);
+        syncer
+            .fetch(&dir, "npm/pkg", &mut on_progress)
+            .await
+            .expect("fetch");
+        assert_eq!(
+            String::from_utf8_lossy(&progress),
+            "Fetching package revisions\n"
+        );
+    }
+
+    #[test]
+    fn unpacks_archives_without_escaping_the_destination() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+
+        // Build a tgz with one file plus a traversal attempt. The tar builder
+        // rejects `..` paths, so write the raw header name for the malicious
+        // entry (the reader/unpacker must still filter it).
+        let raw_header = |name: &[u8], size: u64| {
+            let mut header = tar::Header::new_gnu();
+            header.as_mut_bytes()[..name.len()].copy_from_slice(name);
+            header.set_size(size);
+            header.set_mode(0o644);
+            header.set_cksum();
+            header
+        };
+        let mut tar_bytes = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut tar_bytes);
+            builder
+                .append(&raw_header(b"pkg/file.txt", 5), &b"hello"[..])
+                .unwrap();
+            builder
+                .append(&raw_header(b"../escape.txt", 3), &b"bad"[..])
+                .unwrap();
+            builder.finish().unwrap();
+        }
+        let mut gz = Vec::new();
+        {
+            use std::io::Write;
+            let mut encoder =
+                flate2::write::GzEncoder::new(&mut gz, flate2::Compression::default());
+            encoder.write_all(&tar_bytes).unwrap();
+            encoder.finish().unwrap();
+        }
+        let out = tmp.path().join("out");
+        decompress_tgz(&gz, &out).expect("unpack");
+        // The single outermost `pkg/` directory is stripped.
+        assert_eq!(std::fs::read(out.join("file.txt")).unwrap(), b"hello");
+        assert!(!tmp.path().join("escape.txt").exists());
+
+        assert!(is_potentially_malicious_filepath_in_archive(
+            ".git/config",
+            &out.to_string_lossy()
+        ));
+        assert!(is_potentially_malicious_filepath_in_archive(
+            "/abs",
+            &out.to_string_lossy()
+        ));
+        assert!(is_potentially_malicious_filepath_in_archive(
+            "dir/",
+            &out.to_string_lossy()
+        ));
+        assert!(!is_potentially_malicious_filepath_in_archive(
+            "dir/file",
+            &out.to_string_lossy()
+        ));
+    }
+
+    #[test]
+    fn decomposes_a_perforce_remote_url() {
+        let remote =
+            VcsUrl::parse("perforce://admin:password@ssl:10.0.0.1:1666//Sourcegraph/")
+                .expect("parse");
+        assert_eq!(
+            decompose_perforce_remote_url(&remote).expect("decompose"),
+            (
+                "admin".to_owned(),
+                "password".to_owned(),
+                "ssl:10.0.0.1:1666".to_owned(),
+                "//Sourcegraph/".to_owned()
+            )
+        );
+        let https = VcsUrl::parse("https://example.com").unwrap();
+        assert!(decompose_perforce_remote_url(&https).is_err());
     }
 }

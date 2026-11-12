@@ -23,10 +23,20 @@ use crate::update::RemoteUrlSource;
 use crate::vcssyncer;
 use crate::vcsurl::VcsUrl;
 
-/// `extsvc` service types that `NewVCSSyncer` maps to a non-git syncer.
+/// `extsvc` service types that `NewVCSSyncer` maps to a non-git syncer. The
+/// package-manager syncers are implemented; JVM/coursier is intentionally out
+/// of scope and stays `UNIMPLEMENTED`.
 const NON_GIT_TYPES: [&str; 7] = [
     "perforce",
     "jvmPackages",
+    "npmPackages",
+    "goModules",
+    "pythonPackages",
+    "rustPackages",
+    "rubyPackages",
+];
+
+const PACKAGE_TYPES: [&str; 5] = [
     "npmPackages",
     "goModules",
     "pythonPackages",
@@ -42,6 +52,8 @@ pub struct CloneableService {
     /// `cloneurl.ForEncryptableConfig`.
     pub remote_urls: Arc<dyn RemoteUrlSource>,
     pub live: Arc<LiveConfig>,
+    /// `NewPerforceDepotSyncer`'s Perforce client, used by `IsCloneable`.
+    pub perforce: Option<Arc<crate::perforce::PerforceService>>,
     /// `conf.Cached` for `executil.tlsExternal`, keyed by configuration
     /// generation so the CA bundle is written once per revision.
     tls_cache: Mutex<Option<(u64, crate::tlsexternal::TlsConfig)>>,
@@ -59,8 +71,15 @@ impl CloneableService {
             repos,
             remote_urls,
             live,
+            perforce: None,
             tls_cache: Mutex::new(None),
         }
+    }
+
+    /// Wire the Perforce client used by `IsRepoCloneable` for Perforce repos.
+    pub fn with_perforce(mut self, perforce: Arc<crate::perforce::PerforceService>) -> Self {
+        self.perforce = Some(perforce);
+        self
     }
 
     fn tls_config(&self) -> crate::tlsexternal::TlsConfig {
@@ -108,8 +127,17 @@ impl CloneableService {
                 stored.name, reason
             )));
         }
-        if let Some(service_type) = stored.external_service_type.as_deref() {
-            if NON_GIT_TYPES.contains(&service_type) {
+        let service_type = stored.external_service_type.clone();
+        if let Some(service_type) = service_type.as_deref() {
+            if service_type == "jvmPackages" {
+                return Err(Status::unimplemented(format!(
+                    "GetVCSSyncer: {service_type} repositories are not implemented by the Rust gitserver yet"
+                )));
+            }
+            if NON_GIT_TYPES.contains(&service_type)
+                && !PACKAGE_TYPES.contains(&service_type)
+                && service_type != "perforce"
+            {
                 return Err(Status::unimplemented(format!(
                     "GetVCSSyncer: {service_type} repositories are not implemented by the Rust gitserver yet"
                 )));
@@ -129,7 +157,12 @@ impl CloneableService {
         // The instrumented syncer times the whole `IsCloneable` call,
         // including the remote URL lookup.
         let started = Instant::now();
-        let result = self.probe(repo).await;
+        let result = match service_type.as_deref() {
+            // `vcsPackagesSyncer.IsCloneable` always returns nil.
+            Some(service_type) if PACKAGE_TYPES.contains(&service_type) => Ok(()),
+            Some("perforce") => self.probe_perforce(repo).await,
+            _ => self.probe(repo).await,
+        };
         let cloneable = result.is_ok();
         crate::metrics::is_cloneable_observed(cloneable, started.elapsed().as_secs_f64());
 
@@ -158,6 +191,34 @@ impl CloneableService {
             .map_err(|err| format!("failed to get remote URL for {repo}: {}", err.message()))?;
         let tls = self.tls_config();
         vcssyncer::check_cloneable(&remote, &tls)
+            .await
+            .map_err(|err| err.message().to_owned())
+    }
+
+    /// `perforceDepotSyncer.IsCloneable`, reusing the M9.15a Perforce client.
+    async fn probe_perforce(&self, repo: &str) -> Result<(), String> {
+        let Some(perforce) = self.perforce.as_deref() else {
+            return Err("perforce syncer is not configured".to_owned());
+        };
+        let raw = self
+            .remote_urls
+            .remote_url(repo)
+            .await
+            .map_err(|err| format!("getting remote URL source: {}", err.message()))?;
+        let remote = VcsUrl::parse(&raw)
+            .map_err(|err| format!("getting remote URL: {}", err.message()))?;
+        let (username, password, host, depot) =
+            vcssyncer::decompose_perforce_remote_url(&remote)
+                .map_err(|err| format!("invalid perforce remote URL: {err}"))?;
+        perforce
+            .is_depot_path_cloneable(
+                &crate::perforce::ConnectionDetails {
+                    p4port: host,
+                    p4user: username,
+                    p4passwd: password,
+                },
+                &depot,
+            )
             .await
             .map_err(|err| err.message().to_owned())
     }

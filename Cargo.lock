@@ -4091,10 +4091,13 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
+ "hmac 0.12.1",
  "regex",
+ "rsa",
  "serde",
  "serde_json",
  "sg-config",
+ "sha1 0.10.7",
  "sha2 0.10.9",
  "thiserror 1.0.69",
  "time",
@@ -4381,6 +4384,7 @@ dependencies = [
  "sg-core",
  "sg-db",
  "sg-encryption",
+ "sg-extsvc",
  "sg-git",
  "sg-http",
  "sg-keyring",
@@ -4388,12 +4392,14 @@ dependencies = [
  "sg-proto",
  "sha2 0.10.9",
  "sqlx",
+ "tar",
  "tempfile",
  "tokio",
  "tokio-stream",
  "tokio-util",
  "tonic 0.12.3",
  "tracing",
+ "zip",
 ]
 
 [[package]]
@@ -6329,8 +6335,10 @@ dependencies = [
  "arbitrary",
  "crc32fast",
  "crossbeam-utils",
+ "flate2",
  "indexmap 2.14.2",
  "memchr",
+ "zopfli",
 ]
 
 [[package]]
@@ -6344,3 +6352,15 @@ name = "zmij"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
+
+[[package]]
+name = "zopfli"
+version = "0.8.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aaf7fc5d30c28483d93805c4a5e12b05bbb52407fa67c5f8bd552374cd01fb11"
+dependencies = [
+ "bumpalo",
+ "crc32fast",
+ "log",
+ "simd-adler32",
+]

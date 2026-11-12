@@ -10,11 +10,14 @@ publish.workspace = true
 sg-config = { path = "../sg-config" }
 async-trait = { workspace = true }
 base64 = { workspace = true }
+hmac = { workspace = true }
 regex = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-sha2 = { workspace = true }
+sha2 = { workspace = true, features = ["oid"] }
 thiserror = { workspace = true }
+rsa = { version = "0.9", features = ["pem"] }
+sha1 = { version = "0.10", features = ["oid"] }
 time = { workspace = true, features = ["parsing", "formatting", "macros"] }
 tokio = { workspace = true }
 tracing = { workspace = true }

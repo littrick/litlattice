@@ -54,6 +54,7 @@ pub mod gitlab_oauth;
 pub mod diagnostics_adapters;
 pub mod diagnostics_graphql;
 pub mod embeddings_graphql;
+pub mod webhooks;
 pub mod executor_secrets_graphql;
 pub mod goimportpath;
 pub mod graphql_api;
