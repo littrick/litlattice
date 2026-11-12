@@ -15,6 +15,7 @@
 pub mod auth;
 pub mod awscodecommit;
 pub mod batches_sources;
+pub mod batches_state;
 pub mod awscodecommit_source;
 pub mod azuredevops;
 pub mod azuredevops_source;

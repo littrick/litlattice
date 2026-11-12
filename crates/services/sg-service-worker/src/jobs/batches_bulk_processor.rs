@@ -26,6 +26,12 @@
 //! `state.SetDerivedState` (gitserver) are seams; the ordering semantics are
 //! reproduced by [`run_bulk_job`], and `reenqueue` performs the
 //! `service.ReenqueueChangeset` store update.
+//!
+//! Derived state itself is no longer an unimplemented port: the pure logic
+//! lives in [`sg_extsvc::batches_state`] and
+//! [`BulkProcessorStore::set_derived_state`] is its seam. It stays a no-op
+//! here because the loaded row does not carry code-host metadata/events (no
+//! schema changes in this slice).
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
@@ -1475,8 +1481,13 @@ impl BulkProcessorStore for PgBulkProcessorStore {
     }
 
     async fn set_derived_state(&self, _changeset: &Changeset) -> Result<(), BulkError> {
-        // state.SetDerivedState needs gitserver; merge/close never reach it
-        // until the code-host source is ported.
+        // The shared implementation is
+        // `sg_extsvc::batches_state::set_derived_state`; it needs the
+        // changeset's code-host metadata, the refreshed events and the repo,
+        // none of which this row carries yet (adding them would change the
+        // `changesets` schema, which this slice must not do). Keep the seam as
+        // a no-op until the metadata loader is wired; merge/close ordering is
+        // already reproduced by `run_bulk_job`.
         Ok(())
     }
 

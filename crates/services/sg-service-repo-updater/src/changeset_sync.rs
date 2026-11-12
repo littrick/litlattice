@@ -435,6 +435,19 @@ pub trait ChangesetSyncBackend: Send + Sync {
         changeset_id: i64,
         events: &[SyncedEvent],
     ) -> Result<(), String>;
+    /// `state.SetDerivedState`, run in the same store transaction after the
+    /// events are upserted (`syncer.go:538`). The shared implementation is
+    /// [`sg_extsvc::batches_state::set_derived_state`]; a backend needs the
+    /// changeset's code-host metadata plus its repo to call it. The default is
+    /// a no-op so pure-persistence backends keep the previous behaviour; like
+    /// the baseline, errors are logged rather than propagated.
+    async fn set_derived_state(
+        &self,
+        _changeset_id: i64,
+        _events: &[SyncedEvent],
+    ) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 /// `syncer.SyncChangeset`'s ordering (`syncer.go:516-554`), with the
@@ -443,8 +456,10 @@ pub trait ChangesetSyncBackend: Send + Sync {
 /// * load error that is not `ChangesetNotFoundError`: record the error, then
 ///   return it;
 /// * not found: mark deleted (when not already deleted);
-/// * success: clear the error, update code-host state, upsert events. A
-///   `SetDerivedState` error is a seam (gitserver).
+/// * success: clear the error, update code-host state, upsert events, then
+///   recompute derived state ([`ChangesetSyncBackend::set_derived_state`],
+///   whose default is a no-op). As in the baseline, a derived-state failure is
+///   logged and does not fail the sync.
 pub async fn sync_changeset(
     loader: &dyn ChangesetSourceLoader,
     backend: &dyn ChangesetSyncBackend,
@@ -467,6 +482,10 @@ pub async fn sync_changeset(
     backend
         .upsert_changeset_events(changeset_id, &loaded.events)
         .await?;
+    // `state.SetDerivedState` logs its own errors and never fails the sync.
+    let _ = backend
+        .set_derived_state(changeset_id, &loaded.events)
+        .await;
     Ok(())
 }
 

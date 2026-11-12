@@ -16,9 +16,13 @@
 //! production wires [`ConfigSourceFactory`] over
 //! [`PgSourceConfigProvider`] (decrypted `external_services` configs), while
 //! [`NotPortedSourceFactory`] remains the test/injection fallback.
-//! `state.SetDerivedState`, gitserver push
-//! ([`ChangesetSource::push_commit`]), `Changeset.Events()` derivation and
-//! GitHub App commit signing remain explicit seams, see the slice overview §4.
+//! gitserver push ([`ChangesetSource::push_commit`]), `Changeset.Events()`
+//! derivation and GitHub App commit signing remain explicit seams, see the
+//! slice overview §4. `state.SetDerivedState` is now the
+//! [`SetDerivedStateFn`] hook: its pure logic lives in
+//! [`sg_extsvc::batches_state`], and the default is a no-op because the
+//! dequeued row does not yet carry code-host metadata/events (no schema
+//! changes in this slice).
 //!
 //! Handler transaction semantics match `Reconciler.HandlerFunc`: `process`
 //! runs inside a store transaction, `done(err)` commits or rolls back, and the
@@ -2435,11 +2439,33 @@ impl DbRecord for ChangesetRecord {
     }
 }
 
+/// `state.SetDerivedState` hook, invoked by the reconciler after the executor
+/// finishes (`executor.go:148`).
+///
+/// A production implementation maps this reduced [`Changeset`] plus its
+/// events and repo onto [`sg_extsvc::batches_state::set_derived_state`]. The
+/// dequeued row here does not carry code-host metadata or events (adding them
+/// would be a schema change), so the default no-op preserves the executor's
+/// current observable behaviour.
+#[async_trait]
+pub trait SetDerivedStateFn: Send + Sync {
+    async fn set_derived_state(&self, changeset: &Changeset);
+}
+
+/// Default [`SetDerivedStateFn`]: does nothing.
+pub struct NoopSetDerivedState;
+
+#[async_trait]
+impl SetDerivedStateFn for NoopSetDerivedState {
+    async fn set_derived_state(&self, _changeset: &Changeset) {}
+}
+
 /// `(*Reconciler).HandlerFunc`.
 pub struct ReconcilerHandler {
     store_factory: Arc<dyn ReconcilerStoreFactory>,
     source_factory: Arc<dyn ChangesetSourceFactory>,
     no_sleep_before_sync: bool,
+    set_derived_state: Arc<dyn SetDerivedStateFn>,
 }
 
 impl ReconcilerHandler {
@@ -2452,7 +2478,14 @@ impl ReconcilerHandler {
             store_factory,
             source_factory,
             no_sleep_before_sync,
+            set_derived_state: Arc::new(NoopSetDerivedState),
         }
+    }
+
+    /// Override the `state.SetDerivedState` hook (default [`NoopSetDerivedState`]).
+    pub fn with_set_derived_state(mut self, f: Arc<dyn SetDerivedStateFn>) -> Self {
+        self.set_derived_state = f;
+        self
     }
 
     /// `process`.
@@ -2495,6 +2528,11 @@ impl ReconcilerHandler {
             &plan,
         )
         .await;
+        // `state.SetDerivedState(ctx, ..., &c, events)` after the ops run and
+        // before the changeset is persisted.
+        self.set_derived_state
+            .set_derived_state(&outcome.changeset)
+            .await;
         (outcome.after_done, outcome.result, outcome.changeset)
     }
 }
