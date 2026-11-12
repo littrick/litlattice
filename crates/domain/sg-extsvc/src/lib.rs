@@ -13,10 +13,14 @@
 //! in the baseline.
 
 pub mod auth;
+pub mod awscodecommit;
+pub mod awscodecommit_source;
 pub mod azuredevops;
 pub mod azuredevops_source;
 pub mod bitbucketcloud;
 pub mod bitbucketcloud_source;
+pub mod bitbucketserver;
+pub mod bitbucketserver_source;
 pub mod exclude;
 pub mod gerrit;
 pub mod gerrit_source;
@@ -24,9 +28,15 @@ pub mod github;
 pub mod github_source;
 pub mod gitlab;
 pub mod gitlab_source;
+pub mod gitolite;
+pub mod gitolite_source;
 pub mod other;
+pub mod pagure;
+pub mod pagure_source;
 pub mod perforce;
 pub mod perforce_source;
+pub mod phabricator;
+pub mod phabricator_source;
 pub mod ratelimit;
 pub mod reposource;
 
@@ -47,6 +57,16 @@ pub const KIND_AZUREDEVOPS: &str = "AZUREDEVOPS";
 pub const KIND_GERRIT: &str = "GERRIT";
 /// `extsvc.KindPerforce`.
 pub const KIND_PERFORCE: &str = "PERFORCE";
+/// `extsvc.KindAWSCodeCommit`.
+pub const KIND_AWSCODECOMMIT: &str = "AWSCODECOMMIT";
+/// `extsvc.KindBitbucketServer`.
+pub const KIND_BITBUCKETSERVER: &str = "BITBUCKETSERVER";
+/// `extsvc.KindGitolite`.
+pub const KIND_GITOLITE: &str = "GITOLITE";
+/// `extsvc.KindPagure`.
+pub const KIND_PAGURE: &str = "PAGURE";
+/// `extsvc.KindPhabricator`.
+pub const KIND_PHABRICATOR: &str = "PHABRICATOR";
 /// `extsvc.KindOther`.
 pub const KIND_OTHER: &str = "OTHER";
 /// `extsvc.TypeOther` (lowercase, stored in `repo.external_service_type`).
@@ -365,6 +385,51 @@ pub fn new_source(
             )
         })?;
         Ok(Box::new(bitbucketcloud_source::BitbucketCloudSource::new(
+            service, doer,
+        )?))
+    } else if service.kind.eq_ignore_ascii_case(KIND_AWSCODECOMMIT) {
+        let doer = doer.ok_or_else(|| {
+            format!(
+                "cannot create source for kind {:?}: no HTTP transport configured",
+                service.kind
+            )
+        })?;
+        Ok(Box::new(awscodecommit_source::AWSCodeCommitSource::new(
+            service, doer,
+        )?))
+    } else if service.kind.eq_ignore_ascii_case(KIND_BITBUCKETSERVER) {
+        let doer = doer.ok_or_else(|| {
+            format!(
+                "cannot create source for kind {:?}: no HTTP transport configured",
+                service.kind
+            )
+        })?;
+        Ok(Box::new(bitbucketserver_source::BitbucketServerSource::new(
+            service, doer,
+        )?))
+    } else if service.kind.eq_ignore_ascii_case(KIND_GITOLITE) {
+        // Discovery shells out to `ssh <host> info` through the command seam;
+        // production uses the default SSH runner.
+        Ok(Box::new(gitolite_source::GitoliteSource::new(
+            service,
+            std::sync::Arc::new(gitolite::SshGitoliteCommand),
+        )?))
+    } else if service.kind.eq_ignore_ascii_case(KIND_PAGURE) {
+        let doer = doer.ok_or_else(|| {
+            format!(
+                "cannot create source for kind {:?}: no HTTP transport configured",
+                service.kind
+            )
+        })?;
+        Ok(Box::new(pagure_source::PagureSource::new(service, doer)?))
+    } else if service.kind.eq_ignore_ascii_case(KIND_PHABRICATOR) {
+        let doer = doer.ok_or_else(|| {
+            format!(
+                "cannot create source for kind {:?}: no HTTP transport configured",
+                service.kind
+            )
+        })?;
+        Ok(Box::new(phabricator_source::PhabricatorSource::new(
             service, doer,
         )?))
     } else if service.kind.eq_ignore_ascii_case(KIND_PERFORCE) {
