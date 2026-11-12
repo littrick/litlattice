@@ -213,6 +213,19 @@ pub trait PasswordResetUrlProvider: Send + Sync {
     async fn make_password_reset_url(&self, user_id: i32, email: &str) -> Result<String, String>;
 }
 
+/// `sendPasswordResetURLToPrimaryEmail` (`users_randomize_password.go:35-58`),
+/// only reachable when `conf.CanSendEmail()` is true. The production frontend
+/// has no SMTP transport in this build, so the default fails with the same
+/// error `txemail` reports.
+#[async_trait::async_trait]
+pub trait PasswordResetEmailSender: Send + Sync {
+    async fn send_reset_password_email(
+        &self,
+        user_id: i32,
+        reset_url: &str,
+    ) -> Result<(), String>;
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PhabricatorDiffInfo {
     pub author_name: String,
@@ -399,6 +412,20 @@ impl PasswordResetUrlProvider for UnconfiguredPasswordResetUrl {
     }
 }
 
+#[derive(Debug, Default, Clone, Copy)]
+pub struct UnconfiguredPasswordResetEmail;
+
+#[async_trait::async_trait]
+impl PasswordResetEmailSender for UnconfiguredPasswordResetEmail {
+    async fn send_reset_password_email(
+        &self,
+        _user_id: i32,
+        _reset_url: &str,
+    ) -> Result<(), String> {
+        Err("email sending is not configured".to_owned())
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Data types
 // ---------------------------------------------------------------------------
@@ -525,6 +552,7 @@ pub struct InventoryCDeps {
     pub phabricator_client: Option<Arc<dyn PhabricatorClient>>,
     pub phabricator_git: Arc<dyn PhabricatorGit>,
     pub password_reset_url: Arc<dyn PasswordResetUrlProvider>,
+    pub password_reset_email: Arc<dyn PasswordResetEmailSender>,
     /// `userpasswd.ResetPasswordEnabled()`.
     pub reset_password_enabled: bool,
     /// `dotcom.SourcegraphDotComMode()`.
@@ -569,6 +597,7 @@ impl Default for InventoryCDeps {
             phabricator_client: None,
             phabricator_git: Arc::new(UnconfiguredPhabricatorGit),
             password_reset_url: Arc::new(UnconfiguredPasswordResetUrl),
+            password_reset_email: Arc::new(UnconfiguredPasswordResetEmail),
             reset_password_enabled: false,
             dotcom: false,
             can_send_email: false,
@@ -670,6 +699,10 @@ pub enum InventoryCOutcome {
     PhabricatorCommit { oid: String },
     /// Plain string (`String!` from `sendTestEmail`).
     Text(String),
+    /// A resolver that succeeded while returning a nil pointer: the baseline
+    /// `AddPhabricatorRepo` returns `(nil, nil)`, so the nullable GraphQL field
+    /// is `null`.
+    Null,
     Error(String),
 }
 
@@ -1311,6 +1344,11 @@ fn webhook_from_row(
     updated_by: UserByIdLookupOrMissing,
 ) -> WebhookData {
     let uuid: String = row.get("uuid");
+    // `scanWebhook` re-parses the stored URL through
+    // `extsvc.NewCodeHostBaseURL` (`internal/database/webhooks.go:427-431`),
+    // which lowercases the host and ensures a trailing slash.
+    let stored_urn: String = row.get("code_host_urn");
+    let code_host_urn = normalize_code_host_url(&stored_urn).unwrap_or(stored_urn);
     WebhookData {
         id: row.get("id"),
         uuid: uuid.clone(),
@@ -1321,7 +1359,7 @@ fn webhook_from_row(
             .flatten()
             .unwrap_or_default(),
         code_host_kind: row.get("code_host_kind"),
-        code_host_urn: row.get("code_host_urn"),
+        code_host_urn,
         secret: webhook_row_secret(row),
         created_at: row.get("created_at"),
         updated_at: row.get("updated_at"),
@@ -1888,6 +1926,15 @@ fn bool_arg(field: &RootField, name: &str) -> bool {
     field.arguments.bool(name).unwrap_or(false)
 }
 
+/// `dbutil.NullInt32Column`: a zero actor UID is stored as NULL.
+fn null_int32(uid: i32) -> Option<i32> {
+    if uid == 0 {
+        None
+    } else {
+        Some(uid)
+    }
+}
+
 fn required_string(field: &RootField, name: &str) -> Result<String, InventoryCOutcome> {
     field
         .arguments
@@ -1957,7 +2004,7 @@ async fn change_cody_plan(
 fn validate_code_host_kind_and_secret(kind: &str, secret: Option<&str>) -> Result<(), String> {
     match kind {
         "GITHUB" | "GITLAB" | "BITBUCKETSERVER" | "BITBUCKETCLOUD" => Ok(()),
-        "AZURE_DEVOPS" => {
+        "AZUREDEVOPS" => {
             if secret.is_some() {
                 Err(format!(
                     "webhooks do not support secrets for code host kind {kind}"
@@ -2019,6 +2066,12 @@ async fn create_webhook(
         Ok(urn) => urn,
         Err(message) => return InventoryCOutcome::Error(message),
     };
+    // `webhookStore.Create` fails when a provided secret encrypts to the empty
+    // string without a key (`internal/database/webhooks.go:80`); this build has
+    // no keyring key, so an empty secret hits that branch.
+    if matches!(secret.as_deref(), Some("")) {
+        return InventoryCOutcome::Error("empty secret and key provided".to_owned());
+    }
     let actor_uid = actor.uid().unwrap_or(0);
     let row = sqlx::query(
         "INSERT INTO webhooks \
@@ -2029,7 +2082,7 @@ async fn create_webhook(
     .bind(&kind)
     .bind(&urn)
     .bind(secret.as_deref())
-    .bind(actor_uid)
+    .bind(null_int32(actor_uid))
     .fetch_one(pool)
     .await;
     let id: i32 = match row {
@@ -2121,6 +2174,13 @@ async fn update_webhook(
         }
         None => current_secret,
     };
+    // `webhookStore.Update` rejects a secret that encrypts to the empty string
+    // with no key (`internal/database/webhooks.go:264`).
+    if matches!(secret.as_deref(), Some("")) {
+        return InventoryCOutcome::Error(
+            "update webhook: empty secret and key provided".to_owned(),
+        );
+    }
     let actor_uid = actor.uid().unwrap_or(0);
     if let Err(error) = sqlx::query(
         "UPDATE webhooks SET name = $1, code_host_urn = $2, code_host_kind = $3, \
@@ -2132,7 +2192,7 @@ async fn update_webhook(
     .bind(&urn)
     .bind(&kind)
     .bind(secret.as_deref())
-    .bind(actor_uid)
+    .bind(null_int32(actor_uid))
     .bind(id)
     .execute(pool)
     .await
@@ -2293,15 +2353,29 @@ async fn randomize_user_password(
         Ok(url) => url,
         Err(message) => return InventoryCOutcome::Error(message),
     };
+    // If email is enabled, the reset URL is also sent to the user's primary
+    // email (`users_randomize_password.go:99-112`). A failed send is not a hard
+    // error off dotcom.
     let mut email_sent = false;
+    let mut email_send_err: Option<String> = None;
     if deps.can_send_email {
-        // `sendPasswordResetURLToPrimaryEmail` requires the SMTP transport,
-        // which is not wired in this slice; a failed send is non-fatal.
-        email_sent = false;
+        match deps
+            .password_reset_email
+            .send_reset_password_email(user_id, &reset_url)
+            .await
+        {
+            Ok(()) => email_sent = true,
+            Err(message) => email_send_err = Some(message),
+        }
     }
     let reset_url = if deps.dotcom {
-        // On dotcom the reset URL is never returned; an email failure would be
-        // surfaced here. Email sending is required by the earlier check.
+        // On dotcom the reset URL is never returned; since we cannot offer the
+        // URL, an email failure must be surfaced (`users_randomize_password.go:114-123`).
+        if let Some(message) = email_send_err {
+            return InventoryCOutcome::Error(format!(
+                "failed to send password reset URL: {message}"
+            ));
+        }
         None
     } else {
         Some(resolve_reference(&external_url_parsed(&deps.external_url), &reset_url))
@@ -2386,7 +2460,9 @@ async fn add_phabricator_repo(
         .fetch_all(pool)
         .await;
     match existing {
-        Ok(rows) if rows.len() == 1 => return InventoryCOutcome::Empty,
+        // `AddPhabricatorRepo` returns `nil, nil` on success, so the nullable
+        // `EmptyResponse` field resolves to null.
+        Ok(rows) if rows.len() == 1 => return InventoryCOutcome::Null,
         Ok(_) => {}
         Err(error) => return InventoryCOutcome::Error(error.to_string()),
     }
@@ -2399,7 +2475,7 @@ async fn add_phabricator_repo(
     .fetch_one(pool)
     .await
     {
-        Ok(_) => InventoryCOutcome::Empty,
+        Ok(_) => InventoryCOutcome::Null,
         Err(error) => InventoryCOutcome::Error(error.to_string()),
     }
 }
@@ -2487,17 +2563,17 @@ async fn resolve_phabricator_diff(
     let needs_client_info = field.arguments.string("authorEmail").is_none()
         || field.arguments.string("authorName").is_none()
         || field.arguments.string("date").is_none();
-    let info = if needs_client_info {
-        match &deps.phabricator_client {
-            Some(client) => match client.get_diff_info(diff_id).await {
-                Ok(info) => info,
-                Err(message) => return InventoryCOutcome::Error(message),
-            },
-            None => {
-                return InventoryCOutcome::Error(format!(
-                    "no phabricator was configured for: {origin}"
-                ))
-            }
+    // The baseline only consults the client when one exists
+    // (`repository.go:689`); without a configured instance it falls back to the
+    // supplied arguments (and panics if `date` was omitted).
+    let info = if deps.phabricator_client.is_some() && needs_client_info {
+        let client = deps
+            .phabricator_client
+            .as_ref()
+            .expect("checked is_some above");
+        match client.get_diff_info(diff_id).await {
+            Ok(info) => info,
+            Err(message) => return InventoryCOutcome::Error(message),
         }
     } else {
         let date = match field.arguments.string("date") {
@@ -2847,7 +2923,7 @@ async fn add_package_repo_filter(
     let matcher = package_matcher_json(&name_filter, &version_filter);
     match sqlx::query(
         "INSERT INTO package_repo_filters (behaviour, scheme, matcher) \
-         VALUES ($1, $2, $3) \
+         VALUES ($1, $2, $3::jsonb) \
          ON CONFLICT (scheme, matcher) DO UPDATE \
              SET deleted_at = NULL, updated_at = now(), behaviour = EXCLUDED.behaviour \
          RETURNING id",
@@ -2899,7 +2975,7 @@ async fn update_package_repo_filter(
     let result = sqlx::query(
         "WITH delete_conflicting_deleted AS ( \
              DELETE FROM package_repo_filters \
-             WHERE scheme = $1 AND matcher = $2 AND deleted_at IS NOT NULL \
+             WHERE scheme = $1 AND matcher = $2::jsonb AND deleted_at IS NOT NULL \
              RETURNING $3::integer AS id \
          ), \
          always_id AS ( \
@@ -2907,7 +2983,7 @@ async fn update_package_repo_filter(
              UNION SELECT $4::integer AS id \
          ) \
          UPDATE package_repo_filters prv \
-         SET behaviour = $5, scheme = $6, matcher = $7 \
+         SET behaviour = $5, scheme = $6, matcher = $7::jsonb \
          FROM always_id \
          WHERE prv.id = $8 AND prv.id = always_id.id",
     )
@@ -3156,6 +3232,7 @@ impl InventoryCRoots {
             InventoryCOutcome::Text(text) => {
                 Ok(Some(FieldValue::Json(Json::Str(text.clone()))))
             }
+            InventoryCOutcome::Null => Ok(Some(FieldValue::Null)),
             InventoryCOutcome::Error(message) => Err(ExecError::new(message.clone())),
         }
     }
