@@ -819,7 +819,31 @@ pub async fn grant_pending_permissions(
     now: OffsetDateTime,
 ) -> Result<bool, sqlx::Error> {
     let mut tx = pool.begin().await?;
+    let granted = grant_pending_permissions_tx(
+        &mut tx,
+        user,
+        service_type,
+        service_id,
+        bind_id,
+        now,
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(granted)
+}
 
+/// [`grant_pending_permissions`] inside the caller's transaction. The
+/// `AuthzStore` adapter grants every permission row of one user in a single
+/// transaction (`internal/database/authz.go:164-175`), so a failure rolls back
+/// all of them.
+pub async fn grant_pending_permissions_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    user: UserIdWithExternalAccountId,
+    service_type: &str,
+    service_id: &str,
+    bind_id: &str,
+    now: OffsetDateTime,
+) -> Result<bool, sqlx::Error> {
     let pending = sqlx::query(
         r#"
 SELECT id, object_ids_ints, updated_at
@@ -837,7 +861,7 @@ FOR UPDATE
     .bind(PERM_READ)
     .bind(PERM_OBJECT_REPOS)
     .bind(bind_id)
-    .fetch_optional(&mut *tx)
+    .fetch_optional(&mut **tx)
     .await?;
     let pending: UserPendingPermissions = match pending {
         Some(row) => UserPendingPermissions {
@@ -846,7 +870,6 @@ FOR UPDATE
             updated_at: row.try_get("updated_at")?,
         },
         None => {
-            tx.commit().await?;
             return Ok(false);
         }
     };
@@ -864,10 +887,9 @@ FOR UPDATE
             repo_id: *repo_id,
         })
         .collect();
-    upsert_user_repo_permissions(&mut tx, &permissions, now, SOURCE_USER_SYNC).await?;
+    upsert_user_repo_permissions(tx, &permissions, now, SOURCE_USER_SYNC).await?;
 
     if repo_ids.is_empty() {
-        tx.commit().await?;
         return Ok(true);
     }
 
@@ -889,7 +911,7 @@ DO UPDATE SET
     .bind(PERM_READ)
     .bind(vec![user.user_id])
     .bind(now)
-    .execute(&mut *tx)
+    .execute(&mut **tx)
     .await?;
 
     // `upsertUserPermissionsBatchQuery` with only "added" rows.
@@ -910,7 +932,7 @@ DO UPDATE SET
     .bind(PERM_OBJECT_REPOS)
     .bind(repo_ids)
     .bind(now)
-    .execute(&mut *tx)
+    .execute(&mut **tx)
     .await?;
 
     // The pending row is deleted, which invalidates `repo_pending_permissions`
@@ -930,10 +952,9 @@ AND bind_id = $5
     .bind(PERM_READ)
     .bind(PERM_OBJECT_REPOS)
     .bind(bind_id)
-    .execute(&mut *tx)
+    .execute(&mut **tx)
     .await?;
 
-    tx.commit().await?;
     Ok(true)
 }
 
