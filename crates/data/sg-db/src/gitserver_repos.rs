@@ -666,6 +666,27 @@ WHERE locked_data.repo_id = gr.repo_id",
     }
 }
 
+/// `gitserverRepoStore.GetGitserverGitDirSize`: the total size of every
+/// cloned repository's git directory. `SUM` over no rows is `NULL`, which the
+/// baseline's `ScanFirstNullInt64` turns into 0.
+pub async fn get_gitserver_git_dir_size(pool: &PgPool) -> Result<i64, sqlx::Error> {
+    sqlx::query_scalar::<_, Option<i64>>(GET_GIT_DIR_SIZE_QUERY)
+        .fetch_one(pool)
+        .await
+        .map(Option::unwrap_or_default)
+}
+
+const GET_GIT_DIR_SIZE_QUERY: &str = r#"
+SELECT
+	-- `SUM(bigint)` is NUMERIC; the Go baseline scans it into an int64 via
+	-- pgx, so cast back for sqlx.
+	SUM(gitserver_repos.repo_size_bytes)::bigint
+FROM
+	gitserver_repos
+WHERE
+	gitserver_repos.clone_status = 'cloned'
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;

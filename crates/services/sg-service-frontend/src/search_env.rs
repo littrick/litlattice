@@ -716,8 +716,8 @@ impl JobStreamer for IndexedJobStreamer {
 
 // ---------------------------------------------------------------- indexed listing
 
-/// `ZoektAllIndexed.Stats` (`zoekt.RepoStats`). [`ListResponse`] carries no
-/// upstream stats, so only the derived `repos` count is populated.
+/// `ZoektAllIndexed.Stats` (`zoekt.RepoStats`), including the line counts the
+/// `RepositoryStats.indexedLinesCount` resolver sums.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RepoStats {
     pub repos: usize,
@@ -725,6 +725,26 @@ pub struct RepoStats {
     pub documents: i64,
     pub index_bytes: i64,
     pub content_bytes: i64,
+    pub new_lines_count: u64,
+    pub default_branch_new_lines_count: u64,
+    pub other_branches_new_lines_count: u64,
+}
+
+impl RepoStats {
+    /// Copy the upstream `zoekt.RepoStats` fields (`Repos` included; the
+    /// horizontal searcher already set it to `len(Repos)+len(ReposMap)`).
+    pub fn from_zoekt(stats: &sg_zoekt::types::RepoStats) -> Self {
+        Self {
+            repos: usize::try_from(stats.repos).unwrap_or(0),
+            shards: stats.shards,
+            documents: stats.documents,
+            index_bytes: stats.index_bytes,
+            content_bytes: stats.content_bytes,
+            new_lines_count: stats.new_lines_count,
+            default_branch_new_lines_count: stats.default_branch_new_lines_count,
+            other_branches_new_lines_count: stats.other_branches_new_lines_count,
+        }
+    }
 }
 
 /// `search.ZoektAllIndexed`.
@@ -746,14 +766,10 @@ pub async fn list_all_indexed<S: Streamer>(zs: &S) -> Result<ZoektAllIndexed, S:
             }),
         )
         .await?;
-    let repos = list.repos.len() + list.repos_map.len();
     Ok(ZoektAllIndexed {
         repos_map: list.repos_map,
         crashes: list.crashes,
-        stats: RepoStats {
-            repos,
-            ..RepoStats::default()
-        },
+        stats: RepoStats::from_zoekt(&list.stats),
     })
 }
 

@@ -414,6 +414,23 @@ impl GitserverClient {
         }
     }
 
+    /// The configured shard addresses (`ClientSource.Addresses`), used by
+    /// `SystemsInfo` to fan out `DiskInfo` calls.
+    pub fn addresses(&self) -> &[String] {
+        &self.addrs
+    }
+
+    /// `gitserver.Client.SystemsInfo`'s per-address `DiskInfo` RPC. The client
+    /// for `addr` comes from the same lazy cache repository operations use.
+    pub async fn disk_info(&self, addr: &str) -> Result<pb::DiskInfoResponse, Error> {
+        let mut client = self.client(addr).await?;
+        client
+            .disk_info(pb::DiskInfoRequest {})
+            .await
+            .map(|response| response.into_inner())
+            .map_err(|error| Error::Message(error.to_string()))
+    }
+
     fn addr_for(&self, repo: &str) -> Option<&str> {
         // `connection.AddrForRepo` without the site-config pins: the callers
         // of this client receive the shard list, not the unified config.

@@ -178,12 +178,60 @@ pub struct Repository {
     pub tombstone: bool,
 }
 
+/// `zoekt.RepoStats`: aggregate statistics of a collection of repositories.
+///
+/// `Repos` is not accumulated by [`Self::add`] (one repo may have several
+/// shards); the horizontal searcher overwrites it with
+/// `len(Repos) + len(ReposMap)` like `internal/search/backend/horizontal.go`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RepoStats {
+    pub repos: i64,
+    pub shards: i64,
+    pub documents: i64,
+    pub index_bytes: i64,
+    pub content_bytes: i64,
+    pub new_lines_count: u64,
+    pub default_branch_new_lines_count: u64,
+    pub other_branches_new_lines_count: u64,
+}
+
+impl RepoStats {
+    /// `RepoStats` proto conversion (`zoekt.RepoStatsFromProto`).
+    pub fn from_proto(stats: Option<proto::RepoStats>) -> Self {
+        let Some(stats) = stats else {
+            return Self::default();
+        };
+        Self {
+            repos: stats.repos,
+            shards: stats.shards,
+            documents: stats.documents,
+            index_bytes: stats.index_bytes,
+            content_bytes: stats.content_bytes,
+            new_lines_count: stats.new_lines_count,
+            default_branch_new_lines_count: stats.default_branch_new_lines_count,
+            other_branches_new_lines_count: stats.other_branches_new_lines_count,
+        }
+    }
+
+    /// `(*zoekt.RepoStats).Add`: `Repos` is deliberately not accumulated.
+    pub fn add(&mut self, other: &RepoStats) {
+        self.shards += other.shards;
+        self.documents += other.documents;
+        self.index_bytes += other.index_bytes;
+        self.content_bytes += other.content_bytes;
+        self.new_lines_count += other.new_lines_count;
+        self.default_branch_new_lines_count += other.default_branch_new_lines_count;
+        self.other_branches_new_lines_count += other.other_branches_new_lines_count;
+    }
+}
+
 /// `zoekt.ListResponse`.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ListResponse {
     pub repos: Vec<RepoListEntry>,
     pub repos_map: BTreeMap<u32, MinimalRepoListEntry>,
     pub crashes: i64,
+    pub stats: RepoStats,
 }
 
 impl ListResponse {
@@ -241,6 +289,7 @@ impl ListResponse {
                 })
                 .collect(),
             crashes: response.crashes,
+            stats: RepoStats::from_proto(response.stats),
         }
     }
 }

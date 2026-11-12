@@ -309,6 +309,7 @@ impl HorizontalClient for FakeClient {
                     .map(|id| (*id as u32, MinimalRepoListEntry::default()))
                     .collect(),
                 crashes: self.behavior.crashes,
+                stats: Default::default(),
             })
         })
     }
@@ -645,6 +646,7 @@ impl Streamer for FakeCacheStreamer {
                 .map(|id| (*id as u32, MinimalRepoListEntry::default()))
                 .collect(),
             crashes: response.crashes,
+            stats: Default::default(),
         })
     }
 

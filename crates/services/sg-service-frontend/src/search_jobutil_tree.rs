@@ -3448,6 +3448,7 @@ mod pager_tests {
                 repos: Vec::new(),
                 repos_map: std::collections::BTreeMap::new(),
                 crashes: 0,
+                stats: Default::default(),
             })
         }
     }

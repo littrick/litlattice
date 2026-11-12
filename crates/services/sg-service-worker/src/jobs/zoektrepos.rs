@@ -328,6 +328,7 @@ mod tests {
                 })
                 .collect(),
             crashes: 0,
+            stats: Default::default(),
         })
     }
 

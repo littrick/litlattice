@@ -691,6 +691,44 @@ fn service_from_row(row: sqlx::postgres::PgRow) -> Result<ExternalService, Exter
     })
 }
 
+/// `database.SyncError` (`internal/database/external_services.go`).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SyncError {
+    pub service_id: i64,
+    /// The latest sync job's `failure_message`; `''` when it was `NULL` or the
+    /// service has no finished sync job.
+    pub message: String,
+}
+
+/// `externalServiceStore.GetLatestSyncErrors`: the most recent finished sync
+/// job's failure message per non-deleted external service.
+pub async fn get_latest_sync_errors(pool: &PgPool) -> Result<Vec<SyncError>, sqlx::Error> {
+    let rows = sqlx::query(GET_LATEST_SYNC_ERRORS_QUERY)
+        .fetch_all(pool)
+        .await?;
+    rows.into_iter()
+        .map(|row| {
+            Ok(SyncError {
+                service_id: row.try_get("id")?,
+                message: row
+                    .try_get::<Option<String>, _>("failure_message")?
+                    .unwrap_or_default(),
+            })
+        })
+        .collect()
+}
+
+const GET_LATEST_SYNC_ERRORS_QUERY: &str = r#"
+SELECT DISTINCT ON (es.id) es.id, essj.failure_message
+FROM external_services es
+         LEFT JOIN external_service_sync_jobs essj
+                   ON es.id = essj.external_service_id
+                       AND essj.state IN ('completed', 'errored', 'failed')
+                       AND essj.finished_at IS NOT NULL
+WHERE es.deleted_at IS NULL
+ORDER BY es.id, essj.finished_at DESC
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;

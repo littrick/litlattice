@@ -215,6 +215,7 @@ impl ResolverZoektLister for FakeZoekt {
             repos: Vec::new(),
             repos_map: BTreeMap::new(),
             crashes: 0,
+            stats: Default::default(),
         })
     }
 }
