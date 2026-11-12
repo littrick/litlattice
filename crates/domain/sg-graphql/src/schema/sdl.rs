@@ -16,3 +16,12 @@ pub const OUTBOUND_WEBHOOKS_SCHEMA: &str = include_str!("sdl/outbound_webhooks.g
 /// `//go:embed viewer.graphql` — `extend type Query` viewer fields and the
 /// `Viewer` interface.
 pub const VIEWER_SCHEMA: &str = include_str!("sdl/viewer.graphql");
+
+/// `//go:embed code_monitors.graphql` — `OptionalResolver.CodeMonitorsResolver`
+/// SDL. `NewSchema` appends it before the saved-searches document when both
+/// resolvers are present.
+pub const CODE_MONITORS_SCHEMA: &str = include_str!("sdl/code_monitors.graphql");
+
+/// `//go:embed saved_searches.graphql` — `OptionalResolver.SavedSearchesResolver`
+/// SDL, appended directly after the code-monitors document.
+pub const SAVED_SEARCHES_SCHEMA: &str = include_str!("sdl/saved_searches.graphql");

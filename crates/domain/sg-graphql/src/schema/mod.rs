@@ -43,8 +43,13 @@ use graphql_parser::schema as gql;
 
 pub mod sdl;
 
-/// The three OSS schema documents, in `NewSchema` order.
-pub use sdl::{MAIN_SCHEMA, OUTBOUND_WEBHOOKS_SCHEMA, VIEWER_SCHEMA};
+/// The three OSS schema documents, in `NewSchema` order, plus the two
+/// optional M9.13a documents (`code_monitors.graphql` then
+/// `saved_searches.graphql`, the order `NewSchema` appends them in).
+pub use sdl::{
+    CODE_MONITORS_SCHEMA, MAIN_SCHEMA, OUTBOUND_WEBHOOKS_SCHEMA, SAVED_SEARCHES_SCHEMA,
+    VIEWER_SCHEMA,
+};
 
 /// Built-in scalars provided by the GraphQL runtime (graph-gophers preloads
 /// them into the type map before parsing user SDL).

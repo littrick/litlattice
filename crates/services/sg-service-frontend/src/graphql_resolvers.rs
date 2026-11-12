@@ -1067,6 +1067,10 @@ pub struct NestedPrefetch {
     /// `ExecutorSecretAccessLog.user` nodes keyed by user id (M9.13b).
     pub executor_secret_access_log_users:
         HashMap<i32, crate::executor_secrets_graphql::AccessLogUserLookup>,
+    /// `Query.savedSearches` surface (M9.13a).
+    pub saved_searches: Option<crate::saved_searches_graphql::SavedSearchesHandleWrapper>,
+    /// `User.monitors` surface (M9.13a).
+    pub code_monitors: Option<crate::code_monitors_graphql::CodeMonitorsHandleWrapper>,
 }
 
 /// The database seam for `User.organizations` (`db.Orgs().GetByUserID` plus
@@ -2554,6 +2558,8 @@ impl FrontendRootResolver {
                 auth_providers: None,
                 rbac: crate::rbac_graphql::RbacRoots::default(),
                 executor_secret_roots: crate::executor_secrets_graphql::ExecutorSecretRoots::default(),
+                saved_searches: None,
+                code_monitors: None,
             },
             mutation: MutationRoot::default(),
         }
@@ -2645,6 +2651,34 @@ impl FrontendRootResolver {
     ) -> Self {
         self.query.search_contexts = search_contexts.clone();
         self.mutation.search_contexts = search_contexts;
+        self
+    }
+
+    /// Attach the optional saved-searches surface (M9.13a).
+    pub fn with_saved_searches(
+        mut self,
+        saved_searches: Option<crate::saved_searches_graphql::SavedSearchesHandle>,
+    ) -> Self {
+        self.query.saved_searches = saved_searches.clone();
+        self.mutation.saved_searches = saved_searches.clone();
+        let nested = Arc::make_mut(&mut self.query.nested);
+        nested.saved_searches = saved_searches.map(
+            crate::saved_searches_graphql::SavedSearchesHandleWrapper,
+        );
+        self
+    }
+
+    /// Attach the optional code-monitor resolver (M9.13a).
+    pub fn with_code_monitors(
+        mut self,
+        code_monitors: Option<Arc<crate::code_monitors_graphql::CodeMonitorsResolver>>,
+    ) -> Self {
+        self.query.code_monitors = code_monitors.clone();
+        self.mutation.code_monitors = code_monitors.clone();
+        let nested = Arc::make_mut(&mut self.query.nested);
+        nested.code_monitors = code_monitors.map(
+            crate::code_monitors_graphql::CodeMonitorsHandleWrapper,
+        );
         self
     }
 
@@ -2842,6 +2876,11 @@ struct QueryRoot {
     rbac: crate::rbac_graphql::RbacRoots,
     /// Prefetched `Query.executorSecrets` (M9.13b).
     executor_secret_roots: crate::executor_secrets_graphql::ExecutorSecretRoots,
+    /// Optional saved-searches database (M9.13a). `None` means the SDL was not
+    /// appended and the root field is absent.
+    saved_searches: Option<crate::saved_searches_graphql::SavedSearchesHandle>,
+    /// Optional code-monitor resolver (M9.13a).
+    code_monitors: Option<Arc<crate::code_monitors_graphql::CodeMonitorsResolver>>,
 }
 
 /// `Mutation` root: `settingsMutation`/log events/temporary settings/feature
@@ -2867,6 +2906,10 @@ pub struct MutationRoot {
     /// those mutations.
     executor_secret_viewer_site_admin: bool,
     executor_secret_nested: Arc<NestedPrefetch>,
+    /// Optional saved-searches database (M9.13a).
+    saved_searches: Option<crate::saved_searches_graphql::SavedSearchesHandle>,
+    /// Optional code-monitor resolver (M9.13a).
+    code_monitors: Option<Arc<crate::code_monitors_graphql::CodeMonitorsResolver>>,
 }
 
 impl MutationRoot {
@@ -2994,6 +3037,26 @@ impl ObjectValue for MutationRoot {
                 )))),
                 Outcome::Error(message) => Err(ExecError::new(message.clone())),
             };
+        }
+        if let Some(saved_searches) = &self.saved_searches {
+            if crate::saved_searches_graphql::is_root_field(field) {
+                return crate::saved_searches_graphql::root_field(
+                    saved_searches,
+                    field,
+                    arguments,
+                    actor,
+                );
+            }
+        }
+        if let Some(code_monitors) = &self.code_monitors {
+            if crate::code_monitors_graphql::is_root_field(field) {
+                return crate::code_monitors_graphql::root_field(
+                    code_monitors,
+                    field,
+                    arguments,
+                    actor,
+                );
+            }
         }
         self.settings.field(field, arguments, actor)
     }
@@ -3586,6 +3649,28 @@ impl ObjectValue for QueryRoot {
                             self.nested.clone(),
                         )
                     }
+                    // `NodeResolvers()["SavedSearch"]` (M9.13a): registered
+                    // only when the optional resolver is present.
+                    "SavedSearch" if self.saved_searches.is_some() => {
+                        crate::saved_searches_graphql::saved_search_node(
+                            self.saved_searches
+                                .as_ref()
+                                .expect("checked saved searches"),
+                            id,
+                            actor,
+                        )
+                    }
+                    // `NodeResolvers()["CodeMonitor"]` (M9.13a).
+                    "CodeMonitor" if self.code_monitors.is_some() => {
+                        crate::code_monitors_graphql::monitor_node(
+                            self.code_monitors
+                                .as_ref()
+                                .expect("checked code monitors")
+                                .as_ref(),
+                            actor,
+                            id,
+                        )
+                    }
                     _ => self.node_int32(kind.as_str(), id),
                 }
             }
@@ -3784,6 +3869,29 @@ impl ObjectValue for QueryRoot {
                 arguments,
                 actor,
             ),
+            // `SavedSearchesResolver` root fields (M9.13a): only present when
+            // the optional resolver was registered.
+            _ if self.saved_searches.is_some()
+                && crate::saved_searches_graphql::is_root_field(field) =>
+            {
+                crate::saved_searches_graphql::root_field(
+                    self.saved_searches.as_ref().expect("checked saved searches"),
+                    field,
+                    arguments,
+                    actor,
+                )
+            }
+            // `CodeMonitorsResolver` root fields (`Query.monitors`, M9.13a).
+            _ if self.code_monitors.is_some()
+                && crate::code_monitors_graphql::is_root_field(field) =>
+            {
+                crate::code_monitors_graphql::root_field(
+                    self.code_monitors.as_ref().expect("checked code monitors"),
+                    field,
+                    arguments,
+                    actor,
+                )
+            }
             _ => Ok(None),
         }
     }
@@ -4070,6 +4178,20 @@ impl ObjectValue for UserObject {
                     field == "configurationCascade",
                 )
             }
+            // `UserResolver.Monitors` (`code_monitors.go:24-29`, M9.13a):
+            // only present when the optional code-monitor resolver was
+            // registered; `auth.CheckSameUserFromActor` then lists the user's
+            // monitors.
+            "monitors" => match &self.nested.code_monitors {
+                Some(handle) => crate::code_monitors_graphql::user_monitors(
+                    handle.0.as_ref(),
+                    actor,
+                    self.data.id,
+                    arguments,
+                )
+                .map(Some),
+                None => Ok(None),
+            },
             _ => Ok(None),
         }
     }

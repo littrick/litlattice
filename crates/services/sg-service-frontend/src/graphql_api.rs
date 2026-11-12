@@ -475,6 +475,12 @@ pub struct SchemaGraphqlDeps {
     /// `roles` / `permissions` read seams (M9.13b). `None` keeps the RBAC
     /// surface unported.
     rbac: Option<Arc<dyn crate::rbac_graphql::RbacStore>>,
+    /// `SavedSearchesResolver`'s database seam (M9.13a); `None` reproduces an
+    /// absent optional resolver (SDL not appended, root fields/types absent).
+    saved_searches: Option<crate::saved_searches_graphql::SavedSearchesHandle>,
+    /// `CodeMonitorsResolver`'s resolver (M9.13a); `None` reproduces an absent
+    /// optional resolver.
+    code_monitors: Option<Arc<crate::code_monitors_graphql::CodeMonitorsResolver>>,
 }
 
 /// Seams for the external-account GraphQL surface (M9.8ka): the
@@ -531,6 +537,8 @@ impl SchemaGraphqlDeps {
             admin_mutations: None,
             executor_secrets: None,
             rbac: None,
+            saved_searches: None,
+            code_monitors: None,
         }
     }
 
@@ -592,6 +600,8 @@ impl SchemaGraphqlDeps {
             )),
             executor_secrets: None,
             rbac: None,
+            saved_searches: None,
+            code_monitors: None,
         }
     }
 
@@ -869,6 +879,39 @@ impl SchemaGraphqlDeps {
         Ok(self)
     }
 
+    /// Enable the code-monitor GraphQL surface (M9.13a): append
+    /// `code_monitors.graphql` (as `NewSchema` does for a non-nil
+    /// `CodeMonitorsResolver`) and hand the resolver to the executor.
+    ///
+    /// Production calls this before [`Self::with_saved_searches`] so the two
+    /// documents are appended in `NewSchema` order (code monitors, then saved
+    /// searches).
+    pub fn with_code_monitors(
+        mut self,
+        resolver: Arc<crate::code_monitors_graphql::CodeMonitorsResolver>,
+    ) -> Result<Self, sg_graphql::schema::SchemaError> {
+        self.schema = Arc::new(sg_graphql::schema::assemble(&[
+            self.schema.schema_string.as_str(),
+            sg_graphql::schema::CODE_MONITORS_SCHEMA,
+        ])?);
+        self.code_monitors = Some(resolver);
+        Ok(self)
+    }
+
+    /// Enable the saved-searches GraphQL surface (M9.13a): append
+    /// `saved_searches.graphql` and hand the database seam to the executor.
+    pub fn with_saved_searches(
+        mut self,
+        db: crate::saved_searches_graphql::SavedSearchesHandle,
+    ) -> Result<Self, sg_graphql::schema::SchemaError> {
+        self.schema = Arc::new(sg_graphql::schema::assemble(&[
+            self.schema.schema_string.as_str(),
+            sg_graphql::schema::SAVED_SEARCHES_SCHEMA,
+        ])?);
+        self.saved_searches = Some(db);
+        Ok(self)
+    }
+
     /// Enable the ranking GraphQL surface (M9.8ic): append
     /// `codeintel.ranking.graphql` to the assembled schema and hand the root
     /// resolver to the executor.
@@ -1032,6 +1075,8 @@ impl SchemaGraphqlDeps {
             admin_mutations: None,
             executor_secrets: None,
             rbac: None,
+            saved_searches: None,
+            code_monitors: None,
         }
     }
 }
@@ -1844,6 +1889,8 @@ impl GraphqlDeps for SchemaGraphqlDeps {
             .with_rbac_roots(rbac_roots)
             .with_executor_secret_roots(executor_secret_roots)
             .with_search_contexts(self.search_contexts.clone())
+            .with_saved_searches(self.saved_searches.clone())
+            .with_code_monitors(self.code_monitors.clone())
             .with_ranking_roots(ranking_roots)
             .with_search_roots(search_root)
             .with_git(git)
