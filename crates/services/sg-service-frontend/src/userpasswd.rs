@@ -23,7 +23,7 @@
 //! cost 10 and the `$2a$` version prefix. `bcrypt::verify` accepts every Go
 //! hash variant.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
 use base64::Engine as _;
@@ -38,7 +38,9 @@ use time::OffsetDateTime;
 use tonic::body::BoxBody;
 
 use sg_config::SiteConfiguration;
+use sg_metrics::prometheus::{IntCounterVec, Opts};
 use sg_session::write::{SessionManager, SetCookie, WriteOptions};
+use sg_txemail::{Header, Message as TxEmailMessage, SendConfig, SmtpConfig, Templates};
 use sg_session::{Actor, GoTime, OsSessionIdSource, SessionIdSource, SessionStore, COOKIE_NAME};
 use sg_session::SIGN_OUT_COOKIE;
 
@@ -561,6 +563,9 @@ pub trait UserpasswdStore: Send + Sync {
     ) -> Result<(), StoreError>;
     /// `UserEmails().GetPrimaryEmail`: `(email, verified)`.
     async fn primary_email(&self, user_id: i32) -> Result<(String, bool), StoreError>;
+    /// `Users().GetByID`, reduced to the username the account-update e-mail
+    /// needs (`SendUserEmailOnFieldUpdate`).
+    async fn username_by_id(&self, user_id: i32) -> Result<Option<String>, StoreError>;
     /// `Users().SetPassword`: `Ok(false)` when the reset code is invalid or
     /// expired.
     async fn set_password(
@@ -614,10 +619,13 @@ pub trait PasswordHasher: Send + Sync {
     fn verify(&self, hash: &str, password: &str) -> bool;
 }
 
-/// `txemail.Send`'s ported surface: the message kind and recipient.
+/// `txemail.Send`'s ported surface: the metric source and the rendered
+/// message. Callers build the template and data exactly like the Go callers
+/// (`backend.SendUserEmailVerificationEmail`, `userpasswd.SendResetPasswordURLEmail`,
+/// …); the implementation only adds configuration, delivery and metrics.
 #[async_trait]
 pub trait EmailSender: Send + Sync {
-    async fn send(&self, kind: &str, to: &str) -> Result<(), String>;
+    async fn send(&self, source: &str, message: TxEmailMessage) -> Result<(), String>;
 }
 
 /// `SecurityEventLogs().LogSecurityEvent` (and the legacy event's name).
@@ -681,6 +689,8 @@ pub struct SessionDeps {
 #[derive(Clone)]
 pub struct UserpasswdDeps {
     pub site: SiteConfiguration,
+    /// `conf.ExternalURLParsed()`: absolute links in transactional e-mails.
+    pub external_url: String,
     pub dotcom: bool,
     pub store: Arc<dyn UserpasswdStore>,
     pub lockout: Arc<dyn LockoutStore>,
@@ -714,7 +724,7 @@ impl UserpasswdDeps {
         let cookie_key = std::env::var("SRC_SESSION_COOKIE_KEY")
             .unwrap_or_default()
             .into_bytes();
-        let email: Arc<dyn EmailSender> = Arc::new(UnportedEmailSender);
+        let email: Arc<dyn EmailSender> = Arc::new(TxEmailSender::new(site));
         let store: Arc<dyn UserpasswdStore> = Arc::new(PgUserpasswdStore::new(pool));
         let lockout: Arc<dyn LockoutStore> = match cache {
             Some(cache) => Arc::new(RedisLockoutStore::from_env(
@@ -727,6 +737,7 @@ impl UserpasswdDeps {
         };
         Self {
             site: site.clone(),
+            external_url: external_url.to_owned(),
             dotcom,
             store,
             lockout,
@@ -746,16 +757,351 @@ impl UserpasswdDeps {
     }
 }
 
-/// The production e-mail seam: the Rust frontend has no `txemail` transport
-/// wired yet, so sends are logged and reported as successful (the baseline
-/// only logs send failures too).
-pub struct UnportedEmailSender;
+/// `src_email_send{success,email_source}` (`internal/txemail/txemail.go:27`).
+fn email_send_metric() -> &'static IntCounterVec {
+    static METRIC: OnceLock<IntCounterVec> = OnceLock::new();
+    METRIC.get_or_init(|| {
+        let metric = IntCounterVec::new(
+            Opts::new("src_email_send", "Number of emails sent."),
+            &["success", "email_source"],
+        )
+        .expect("valid email send metric");
+        let _ = sg_metrics::registry().register(Box::new(metric.clone()));
+        metric
+    })
+}
+
+/// `conf.Get()`'s e-mail settings as an [`sg_txemail::SendConfig`].
+///
+/// Ported from `sg-service-worker`'s `code_monitor_email::send_config_from_site`
+/// (the worker cannot be a dependency of the frontend). Site configuration
+/// stores these under flat keys (`"email.address"`, `"email.smtp"`, …), so the
+/// raw JSON object is read directly.
+pub fn send_config_from_site(site: &SiteConfiguration) -> SendConfig {
+    let raw = site.raw();
+    SendConfig {
+        email_address: config_string(raw, "email.address"),
+        sender_name: config_string(raw, "email.senderName"),
+        smtp: raw
+            .get("email.smtp")
+            .filter(|smtp| smtp.is_object())
+            .map(|smtp| SmtpConfig {
+                host: config_string(smtp, "host"),
+                port: smtp
+                    .get("port")
+                    .and_then(Value::as_u64)
+                    .and_then(|value| u16::try_from(value).ok())
+                    .unwrap_or(0),
+                username: config_string(smtp, "username"),
+                password: config_string(smtp, "password"),
+                authentication: config_string(smtp, "authentication"),
+                domain: config_string(smtp, "domain"),
+                no_verify_tls: smtp
+                    .get("noVerifyTLS")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                additional_headers: smtp
+                    .get("additionalHeaders")
+                    .and_then(Value::as_array)
+                    .map(|headers| {
+                        headers
+                            .iter()
+                            .filter(|header| header.is_object())
+                            .map(|header| Header {
+                                key: config_string(header, "key"),
+                                value: config_string(header, "value"),
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+            }),
+    }
+}
+
+fn config_string(object: &Value, key: &str) -> String {
+    object
+        .get(key)
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned()
+}
+
+/// `conf.ExternalURLParsed().ResolveReference(reference).String()`.
+pub fn resolve_external_url(external_url: &str, reference: &str) -> String {
+    match url::Url::parse(external_url) {
+        Ok(base) => base
+            .join(reference)
+            .map(|url| url.to_string())
+            .unwrap_or_else(|_| reference.to_owned()),
+        Err(_) => reference.to_owned(),
+    }
+}
+
+/// `conf.ExternalURLParsed().Host` (includes the port, like Go's `URL.Host`).
+pub fn external_host(external_url: &str) -> String {
+    match url::Url::parse(external_url) {
+        Ok(url) => {
+            let host = url.host_str().unwrap_or_default();
+            match url.port() {
+                Some(port) => format!("{host}:{port}"),
+                None => host.to_owned(),
+            }
+        }
+        Err(_) => String::new(),
+    }
+}
+
+/// `userpasswd.formatExpiryTime` (`lockout.go:158`).
+fn format_expiry_time(ttl: i64) -> String {
+    let minutes = ttl / 60;
+    if minutes < 1 {
+        format!("{ttl} seconds")
+    } else {
+        format!("{minutes} minutes")
+    }
+}
+
+/// `router.Router().Get(router.VerifyEmail).URLPath()` is `/-/verify-email`;
+/// the query is `url.Values{code,email}.Encode()` (`code` sorts first).
+pub fn verify_email_url(external_url: &str, email: &str, code: &str) -> String {
+    let query = format!(
+        "code={}&email={}",
+        url_query_encode(code),
+        url_query_encode(email)
+    );
+    resolve_external_url(external_url, &format!("/-/verify-email?{query}"))
+}
+
+/// `txemail.FromSiteConfigTemplateWithDefault`: an invalid or incomplete
+/// `email.templates.{name}` falls back to the default (the validation error is
+/// surfaced by site-config problems, not by sending).
+pub fn site_email_template(site: &SiteConfiguration, name: &str) -> Option<Templates> {
+    let template = site.raw().get("email.templates")?.get(name)?;
+    let subject = template.get("subject")?.as_str()?;
+    let html = template.get("html")?.as_str()?;
+    if subject.is_empty() || html.is_empty() {
+        return None;
+    }
+    let templates = Templates {
+        subject: subject.to_owned(),
+        html: html.to_owned(),
+        text: template
+            .get("text")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+    };
+    sg_txemail::parse_template(&templates).ok().map(|_| templates)
+}
+
+/// `backend.verifyEmailTemplates` (`internal/backend/user_emails.go:583`).
+pub fn verify_email_templates() -> Templates {
+    Templates {
+        subject: "Verify your email on Sourcegraph ({{.Host}})".to_owned(),
+        text: r#"Hi {{.Username}},
+
+Please verify your email address on Sourcegraph ({{.Host}}) by clicking this link:
+
+{{.URL}}
+"#
+        .to_owned(),
+        html: r#"<p>Hi <a>{{.Username}},</a></p>
+
+<p>Please verify your email address on Sourcegraph ({{.Host}}) by clicking this link:</p>
+
+<p><strong><a href="{{.URL}}">Verify email address</a></p>
+"#
+        .to_owned(),
+    }
+}
+
+/// `userpasswd.defaultResetPasswordEmailTemplates` (`template.go:32`), with
+/// `email.templates.resetPassword` overriding when valid.
+pub fn reset_password_templates(site: &SiteConfiguration) -> Templates {
+    site_email_template(site, "resetPassword").unwrap_or_else(default_reset_password_templates)
+}
+
+fn default_reset_password_templates() -> Templates {
+    Templates {
+        subject: "Reset your Sourcegraph password ({{.Host}})".to_owned(),
+        text: r#"
+Somebody (likely you) requested a password reset for the user {{.Username}} on Sourcegraph ({{.Host}}).
+
+To reset the password for {{.Username}} on Sourcegraph, follow this link:
+
+  {{.URL}}
+"#
+        .to_owned(),
+        html: r#"
+<p>
+  Somebody (likely you) requested a password reset for <strong>{{.Username}}</strong>
+  on Sourcegraph ({{.Host}}).
+</p>
+
+<p><strong><a href="{{.URL}}">Reset password for {{.Username}}</a></strong></p>
+"#
+        .to_owned(),
+    }
+}
+
+/// `userpasswd.defaultSetPasswordEmailTemplate` (`template.go:14`), with
+/// `email.templates.setPassword` overriding when valid. The Rust port has no
+/// set-password handler yet; the template is ready for it.
+pub fn set_password_templates(site: &SiteConfiguration) -> Templates {
+    site_email_template(site, "setPassword").unwrap_or_else(default_set_password_template)
+}
+
+fn default_set_password_template() -> Templates {
+    Templates {
+        subject: "Set your Sourcegraph password ({{.Host}})".to_owned(),
+        text: r#"
+Your administrator created an account for you on Sourcegraph ({{.Host}}).
+
+To set the password for {{.Username}} on Sourcegraph, follow this link:
+
+  {{.URL}}
+"#
+        .to_owned(),
+        html: r#"
+<p>
+  Your administrator created an account for you on Sourcegraph ({{.Host}}).
+</p>
+
+<p><strong><a href="{{.URL}}">Set password for {{.Username}}</a></strong></p>
+"#
+        .to_owned(),
+    }
+}
+
+/// `backend.updateAccountEmailTemplate` (`user_emails.go:392`).
+pub fn account_update_templates() -> Templates {
+    Templates {
+        subject: "Update to your Sourcegraph account ({{.Host}})".to_owned(),
+        text: r#"
+Hi there! Somebody (likely you) {{.Change}} for the user {{.Username}} on Sourcegraph ({{.Host}}).
+
+If this was you, carry on, and thanks for using Sourcegraph! Otherwise, please change your password immediately.
+"#
+        .to_owned(),
+        html: r#"
+<p>
+Hi there! Somebody (likely you) {{.Change}} for the user {{.Username}} on Sourcegraph ({{.Host}}).
+</p>
+
+<p>If this was you, carry on, and thanks for using Sourcegraph! Otherwise, please change your password immediately.</p>
+"#
+        .to_owned(),
+    }
+}
+
+/// `userpasswd.emailTemplates` (`lockout.go:243`).
+pub fn unlock_account_templates() -> Templates {
+    Templates {
+        subject: "Unlock your Sourcegraph Cloud account".to_owned(),
+        text: r#"
+You are receiving this email because your Sourcegraph account got locked after too many sign in attempts.
+
+Please, visit this link in your browser to unlock the account and try to sign in again: {{.UnlockAccountUrl}}
+
+This link will expire in {{.ExpiryTime}}.
+
+To see our Terms of Service, please visit this link: https://sourcegraph.com/terms
+To see our Privacy Policy, please visit this link: https://sourcegraph.com/privacy
+
+Sourcegraph, 981 Mission St, San Francisco, CA 94103, USA
+"#
+        .to_owned(),
+        html: r#"
+<html>
+<head>
+  <meta name="color-scheme" content="light">
+  <meta name="supported-color-schemes" content="light">
+  <style>
+    body { color: #343a4d; background: #fff; padding: 20px; font-size: 16px; font-family: -apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica Neue,Arial,Noto Sans,sans-serif,Apple Color Emoji,Segoe UI Emoji,Segoe UI Symbol,Noto Color Emoji; }
+    .logo { height: 34px; margin-bottom: 15px; }
+    a { color: #0b70db; text-decoration: none; background-color: transparent; }
+    a:hover { color: #0c7bf0; text-decoration: underline; }
+    a.btn { display: inline-block; color: #fff; background-color: #0b70db; padding: 8px 16px; border-radius: 3px; font-weight: 600; }
+    a.btn:hover { color: #fff; background-color: #0864c6; text-decoration:none; }
+    .smaller { font-size: 14px; }
+    small { color: #5e6e8c; font-size: 12px; }
+    .mtm { margin-top: 10px; }
+    .mtl { margin-top: 20px; }
+    .mtxl { margin-top: 30px; }
+  </style>
+</head>
+<body style="font-family: -apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica Neue,Arial,Noto Sans,sans-serif,Apple Color Emoji,Segoe UI Emoji,Segoe UI Symbol,Noto Color Emoji;">
+  <img class="logo" src="https://storage.googleapis.com/sourcegraph-assets/sourcegraph-logo-light-small.png" alt="Sourcegraph logo">
+  <p>
+  	You are receiving this email because your Sourcegraph account got locked after too many sign in attempts..
+  </p>
+  <p class="mtxl">
+    Please, follow this link in your browser to unlock your account and try to sign in again: <a class="btn mtm" href="{{.UnlockAccountUrl}}">Unlock your Account</a>
+  </p>
+  <p class="smaller">Or visit this link in your browser: <a href="{{.UnlockAccountUrl}}">{{.UnlockAccountUrl}}</a></p>
+  <small>
+  <p class="mtl">
+    This link will expire in {{.ExpiryTime}}.
+  </p>
+  <p class="mtl">
+    <a href="https://sourcegraph.com/terms">Terms</a>&nbsp;&#8226;&nbsp;
+    <a href="https://sourcegraph.com/privacy">Privacy</a>
+  </p>
+  <p>Sourcegraph, 981 Mission St, San Francisco, CA 94103, USA</p>
+  </small>
+</body>
+</html>
+"#
+        .to_owned(),
+    }
+}
+
+/// The production [`EmailSender`]: reads `email.address` / `email.senderName` /
+/// `email.smtp` from the site configuration this generation was built with and
+/// runs the blocking [`sg_txemail::send`] on `spawn_blocking`, like
+/// `txemail.Send`'s `conf.Get()` read at call time.
+pub struct TxEmailSender {
+    site: SiteConfiguration,
+}
+
+impl TxEmailSender {
+    pub fn new(site: &SiteConfiguration) -> Self {
+        Self { site: site.clone() }
+    }
+}
 
 #[async_trait]
-impl EmailSender for UnportedEmailSender {
-    async fn send(&self, kind: &str, to: &str) -> Result<(), String> {
-        tracing::info!(kind, to, "userpasswd email (transport not ported)");
-        Ok(())
+impl EmailSender for TxEmailSender {
+    async fn send(&self, source: &str, message: TxEmailMessage) -> Result<(), String> {
+        let config = send_config_from_site(&self.site);
+        // `txemail.Send` returns these two configuration errors before the
+        // metric's deferred increment, so they are not counted.
+        if config.email_address.is_empty() {
+            return Err("no \"From\" email address configured (in email.address)".to_owned());
+        }
+        if config.smtp.is_none() {
+            return Err("no SMTP server configured (in email.smtp)".to_owned());
+        }
+
+        let outcome = tokio::task::spawn_blocking(move || sg_txemail::send(&config, &message)).await;
+        let error = match outcome {
+            Ok(Ok(())) => None,
+            Ok(Err(error)) => Some(error.to_string()),
+            // A panic in the blocking task is not a delivery error the
+            // baseline can produce; surface it through the same channel.
+            Err(error) => Some(error.to_string()),
+        };
+
+        // `strconv.FormatBool(err == nil)` for the `success` label.
+        let success = if error.is_none() { "true" } else { "false" };
+        email_send_metric()
+            .with_label_values(&[success, source])
+            .inc();
+
+        match error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 }
 
@@ -1125,14 +1471,38 @@ async fn handle_sign_up_common<B>(
 
     if can_send_email(&deps.site) && !email_is_verified {
         if let Some(code) = verification_code.as_deref() {
-            if deps.email.send("user_email_verification", &creds.email).await.is_ok()
-                && deps
-                    .store
-                    .set_last_verification(user.id, &creds.email, code)
-                    .await
-                    .is_err()
-            {
-                tracing::error!(user_id = user.id, "failed to set email last verification sent at");
+            // `backend.SendUserEmailVerificationEmail`.
+            let message = TxEmailMessage {
+                to: vec![creds.email.clone()],
+                reply_to: None,
+                message_id: None,
+                references: Vec::new(),
+                template: verify_email_templates(),
+                data: serde_json::json!({
+                    "Username": creds.username,
+                    "URL": verify_email_url(&deps.external_url, &creds.email, code),
+                    "Host": external_host(&deps.external_url),
+                }),
+            };
+            match deps.email.send("user_email_verification", message).await {
+                Ok(()) => {
+                    if deps
+                        .store
+                        .set_last_verification(user.id, &creds.email, code)
+                        .await
+                        .is_err()
+                    {
+                        tracing::error!(
+                            user_id = user.id,
+                            "failed to set email last verification sent at"
+                        );
+                    }
+                }
+                Err(error) => tracing::error!(
+                    error = %error,
+                    email = %creds.email,
+                    "failed to send email verification (continuing, user's email will be unverified)"
+                ),
             }
         }
     }
@@ -1467,7 +1837,21 @@ pub async fn handle_reset_password_init<B>(
         }
         Err(_) => return http_error(StatusCode::BAD_REQUEST, "Could not reset password"),
     };
-    if deps.email.send("password_reset", &email).await.is_err() {
+    // `userpasswd.SendResetPasswordURLEmail`.
+    let message = TxEmailMessage {
+        to: vec![email.clone()],
+        reply_to: None,
+        message_id: None,
+        references: Vec::new(),
+        template: reset_password_templates(&deps.site),
+        data: serde_json::json!({
+            "Username": user.username.clone(),
+            "URL": resolve_external_url(&deps.external_url, &reset_url),
+            "Host": external_host(&deps.external_url),
+        }),
+    };
+    if let Err(error) = deps.email.send("password_reset", message).await {
+        tracing::error!(error = %error, "Could not send reset password email");
         return http_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "Could not send reset password email",
@@ -1478,7 +1862,6 @@ pub async fn handle_reset_password_init<B>(
     deps.events
         .security_event("PasswordResetRequested", req.uri().path(), user.id, "")
         .await;
-    let _ = reset_url;
     empty_response(StatusCode::OK)
 }
 
@@ -1558,12 +1941,38 @@ pub async fn handle_reset_password_code<B>(
     }
 
     if can_send_email(&deps.site) {
-        // `SendUserEmailOnFieldUpdate` only sends to a verified primary
-        // address (`loadUserForEmail`).
+        // `backend.SendUserEmailOnFieldUpdate` only sends to a verified
+        // primary address (`loadUserForEmail`).
         if let Ok((primary, verified)) = deps.store.primary_email(user_id).await {
             if verified {
-                if let Err(error) = deps.email.send("password_changed", &primary).await {
-                    tracing::warn!(error = %error, "Failed to send email to inform user of password reset");
+                match deps.store.username_by_id(user_id).await {
+                    Ok(Some(username)) => {
+                        let message = TxEmailMessage {
+                            to: vec![primary.clone()],
+                            reply_to: None,
+                            message_id: None,
+                            references: Vec::new(),
+                            template: account_update_templates(),
+                            data: serde_json::json!({
+                                "Email": primary,
+                                "Change": "reset the password",
+                                "Username": username,
+                                "Host": external_host(&deps.external_url),
+                            }),
+                        };
+                        if let Err(error) =
+                            deps.email.send("user_account_update", message).await
+                        {
+                            tracing::warn!(error = %error, "Failed to send email to inform user of password reset");
+                        }
+                    }
+                    Ok(None) => tracing::warn!(
+                        "Failed to send email to inform user of password reset: user not found"
+                    ),
+                    Err(error) => tracing::warn!(
+                        error = ?error,
+                        "Failed to send email to inform user of password reset"
+                    ),
                 }
             }
         }
@@ -1866,11 +2275,17 @@ impl UserpasswdStore for PgUserpasswdStore {
     }
 
     async fn grant_pending_permissions(&self, user_id: i32) -> Result<(), StoreError> {
-        // `Authz().GrantPendingPermissions(Read, PermRepos)` walks the user's
-        // external accounts and re-grants each account's pending repo IDs.
-        // The frontend has no wired authz adapter yet (the same seam in
-        // `app_handlers_more::VerifyEmailDb` is unwired), so this is a logged
-        // no-op; the baseline ignores the error too.
+        // Go: `db.Authz().GrantPendingPermissions(ctx, {UserID, Perm: authz.Read,
+        // Type: authz.PermRepos})` (`database/authz.go:98`). It enumerates the
+        // user's external accounts and, via `permissions.userMapping`, verified
+        // emails / username, then calls `PermsStore.GrantPendingPermissions`
+        // for each. The frontend has no `AuthzStore` adapter: only the
+        // low-level `sg_db::perms_store::grant_pending_permissions` statement
+        // exists, and the user-mapping helper + `sourcegraph` service
+        // constants live in the worker crate. There is also no
+        // `permssync.SchedulePermsSync`. Wiring this would mean inventing a new
+        // authz subsystem, so it stays a logged no-op; the baseline ignores the
+        // error and continues (see `docs/overviews/m9_20a_mail_wiring_overview.md` §4).
         tracing::info!(user_id, "grant pending permissions not ported (no-op)");
         Ok(())
     }
@@ -1904,6 +2319,12 @@ impl UserpasswdStore for PgUserpasswdStore {
         .await
         .map_err(db_error)?;
         row.ok_or(StoreError::NotFound)
+    }
+
+    async fn username_by_id(&self, user_id: i32) -> Result<Option<String>, StoreError> {
+        sg_db::users::get_username_by_id(&self.pool, user_id)
+            .await
+            .map_err(db_error)
     }
 
     async fn set_password(
@@ -2315,8 +2736,19 @@ impl LockoutStore for RedisLockoutStore {
             return Ok(());
         }
         let effective_ttl = self.effective_ttl(ttl);
-        let (_, _) = self.generate_unlock_account_url(user_id).await?;
-        self.email.send("account_unlock", recipient).await?;
+        let (unlock_url, _) = self.generate_unlock_account_url(user_id).await?;
+        let message = TxEmailMessage {
+            to: vec![recipient.to_owned()],
+            reply_to: None,
+            message_id: None,
+            references: Vec::new(),
+            template: unlock_account_templates(),
+            data: serde_json::json!({
+                "UnlockAccountUrl": unlock_url,
+                "ExpiryTime": format_expiry_time(effective_ttl),
+            }),
+        };
+        self.email.send("account_unlock", message).await?;
         let _ = self
             .unlock_email_sent
             .set_ex(&key, effective_ttl, "sent")
