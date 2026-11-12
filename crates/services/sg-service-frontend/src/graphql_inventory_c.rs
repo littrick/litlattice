@@ -488,7 +488,9 @@ pub struct AccessTokenConnectionFull {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UserAccountsData {
     pub emails: Result<Vec<UserEmailData>, String>,
-    pub primary_email: Option<UserEmailData>,
+    /// `UserResolver.PrimaryEmail`: the verified primary email, `None` when
+    /// there is none (or when dotcom hides it), or the `ListByUser` error.
+    pub primary_email: Result<Option<UserEmailData>, String>,
     pub access_tokens: Result<AccessTokenConnectionFull, String>,
     pub has_verified_email: Result<bool, String>,
     pub session_can_sign_out: Result<bool, String>,
@@ -1577,7 +1579,9 @@ async fn prefetch_external_repositories(
             .string("query")
             .unwrap_or_default()
             .to_owned();
-        let first = field.arguments.i64("first").unwrap_or(100) as i32;
+        // `externalServices.DiscoverRepos` clamps the requested page size to
+        // 100 (`external_services.go:224-226`).
+        let first = (field.arguments.i64("first").unwrap_or(100) as i32).min(100);
         let exclude: Vec<String> = match field.arguments.get("excludeRepos") {
             Some(InputValue::List(items)) => items
                 .iter()
@@ -1730,11 +1734,11 @@ pub async fn prefetch_user_accounts(
         };
 
         let primary_email = if dotcom && !can_administer {
-            None
+            Ok(None)
         } else {
             match load_emails(pool, uid, true, email_verification_required).await {
-                Ok(emails) => emails.into_iter().find(|email| email.is_primary),
-                Err(_) => None,
+                Ok(emails) => Ok(emails.into_iter().find(|email| email.is_primary)),
+                Err(message) => Err(message),
             }
         };
 

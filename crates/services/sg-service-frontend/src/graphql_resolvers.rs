@@ -4807,16 +4807,19 @@ impl ObjectValue for UserObject {
             },
             "primaryEmail" => match self.nested.user_accounts.get(&self.data.id) {
                 None => Ok(None),
-                Some(account) => Ok(Some(match &account.primary_email {
-                    Some(data) => FieldValue::Object(Arc::new(
-                        crate::graphql_inventory_c::UserEmailObject {
-                            data: data.clone(),
-                            user: self.clone(),
-                            viewer_site_admin: self.viewer_site_admin,
-                        },
-                    )),
-                    None => FieldValue::Null,
-                })),
+                Some(account) => match &account.primary_email {
+                    Err(message) => Err(ExecError::new(message.clone())),
+                    Ok(found) => Ok(Some(match found {
+                        Some(data) => FieldValue::Object(Arc::new(
+                            crate::graphql_inventory_c::UserEmailObject {
+                                data: data.clone(),
+                                user: self.clone(),
+                                viewer_site_admin: self.viewer_site_admin,
+                            },
+                        )),
+                        None => FieldValue::Null,
+                    })),
+                },
             },
             "accessTokens" => match self.nested.user_accounts.get(&self.data.id) {
                 None => Ok(None),
