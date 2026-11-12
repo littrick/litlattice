@@ -23,7 +23,7 @@ use sqlx::postgres::PgConnection;
 use sqlx::types::time::{Date, OffsetDateTime};
 use sqlx::{PgPool, QueryBuilder, Row};
 
-use crate::telemetry_events::{bulk_insert_event_logs_on, EventLogRow};
+use crate::telemetry_events::{bulk_insert_event_logs, bulk_insert_event_logs_on, EventLogRow};
 
 /// `auth.SourcegraphOperatorProviderType`.
 pub const SOURCEGRAPH_OPERATOR_PROVIDER_TYPE: &str = "sourcegraph-operator";
@@ -33,6 +33,12 @@ pub const SITE_ADMINISTRATOR_ROLE: &str = "SITE_ADMINISTRATOR";
 
 /// `entities.SecurityEventNameAccountNuked`.
 pub const SECURITY_EVENT_NAME_ACCOUNT_NUKED: &str = "AccountNuked";
+
+/// `database.SecurityEventNameAccountCreated`.
+pub const SECURITY_EVENT_NAME_ACCOUNT_CREATED: &str = "AccountCreated";
+
+/// `database.SecurityEventNameAccountDeleted`.
+pub const SECURITY_EVENT_NAME_ACCOUNT_DELETED: &str = "AccountDeleted";
 
 /// `database.EventLogsSourcegraphOperatorKey`.
 pub const EVENT_LOGS_SOURCEGRAPH_OPERATOR_KEY: &str = "sourcegraph_operator";
@@ -229,7 +235,7 @@ pub async fn hard_delete_list(
         });
     }
 
-    log_user_deletion_events(&mut tx, ids, ctx)
+    log_user_deletion_events_in_tx(&mut tx, ids, SECURITY_EVENT_NAME_ACCOUNT_NUKED, ctx)
         .await
         .map_err(DbError::database)?;
 
@@ -237,11 +243,14 @@ pub async fn hard_delete_list(
     Ok(())
 }
 
-/// `logUserDeletionEvents`: one security event and one analytics event per
-/// deleted user, inside the deletion transaction.
-async fn log_user_deletion_events(
+/// `logUserDeletionEvents` inside an existing transaction
+/// (`internal/database/users.go:787-828`): one security event and one
+/// analytics event per deleted user. `name` is `AccountDeleted` for
+/// `DeleteList` and `AccountNuked` for `HardDeleteList`.
+pub(crate) async fn log_user_deletion_events_in_tx(
     tx: &mut PgConnection,
     ids: &[i32],
+    name: &str,
     ctx: &DeletionEventContext<'_>,
 ) -> Result<(), sqlx::Error> {
     if ctx.security_event_logs_in_database {
@@ -251,7 +260,7 @@ async fn log_user_deletion_events(
         );
         builder.push_values(ids, |mut builder, id| {
             builder
-                .push_bind(SECURITY_EVENT_NAME_ACCOUNT_NUKED)
+                .push_bind(name)
                 .push_bind("")
                 .push_bind(*id)
                 .push_bind("")
@@ -265,9 +274,109 @@ async fn log_user_deletion_events(
 
     let rows: Vec<EventLogRow> = ids
         .iter()
-        .map(|id| deletion_event_log_row(*id, ctx))
+        .map(|id| deletion_event_log_row(*id, name, ctx))
         .collect();
     bulk_insert_event_logs_on(&mut *tx, &rows).await
+}
+
+/// [`log_user_deletion_events_in_tx`] on the pool.
+///
+/// Go's `DeleteList` / `HardDeleteList` invoke `logUserDeletionEvents` with
+/// the non-transactional store while their transaction is still open
+/// (`internal/database/users.go:694,782`); using the pool after commit yields
+/// the same rows.
+pub async fn log_user_deletion_events(
+    pool: &PgPool,
+    ids: &[i32],
+    name: &str,
+    ctx: &DeletionEventContext<'_>,
+) -> Result<(), sqlx::Error> {
+    if ctx.security_event_logs_in_database && !ids.is_empty() {
+        let mut builder: QueryBuilder<'_, sqlx::Postgres> = QueryBuilder::new(
+            "INSERT INTO security_event_logs(name, url, user_id, anonymous_user_id, \
+             source, argument, version, timestamp) ",
+        );
+        builder.push_values(ids, |mut builder, id| {
+            builder
+                .push_bind(name)
+                .push_bind("")
+                .push_bind(*id)
+                .push_bind("")
+                .push_bind("BACKEND")
+                .push_bind(security_event_argument(ctx.actor))
+                .push_bind(ctx.version)
+                .push_bind(ctx.now);
+        });
+        builder.build().execute(pool).await?;
+    }
+
+    let rows: Vec<EventLogRow> = ids
+        .iter()
+        .map(|id| deletion_event_log_row(*id, name, ctx))
+        .collect();
+    bulk_insert_event_logs(pool, &rows).await
+}
+
+/// `logAccountCreatedEvent` (`internal/database/users.go:481-517`): the
+/// unconditional `AccountCreated` security event plus its legacy analytics
+/// row. `creator` is the actor UID; `service_type` is empty for a plain
+/// `Users().Create` and the external account's provider for
+/// `CreateWithExternalAccount`.
+pub async fn log_account_created_event(
+    pool: &PgPool,
+    user_id: i32,
+    site_admin: bool,
+    service_type: &str,
+    ctx: &DeletionEventContext<'_>,
+) -> Result<(), sqlx::Error> {
+    let creator = ctx.actor.uid;
+    if ctx.security_event_logs_in_database {
+        let argument = json!({
+            "creator": creator,
+            "site_admin": site_admin,
+            "service_type": service_type,
+        });
+        sqlx::query(
+            "INSERT INTO security_event_logs(name, url, user_id, anonymous_user_id, \
+             source, argument, version, timestamp) \
+             VALUES ($1, '', $2, '', 'BACKEND', $3, $4, $5)",
+        )
+        .bind(SECURITY_EVENT_NAME_ACCOUNT_CREATED)
+        .bind(user_id)
+        .bind(argument)
+        .bind(ctx.version)
+        .bind(ctx.now)
+        .execute(pool)
+        .await?;
+    }
+
+    let row = EventLogRow {
+        name: SECURITY_EVENT_NAME_ACCOUNT_CREATED.to_owned(),
+        url: String::new(),
+        user_id: 0,
+        anonymous_user_id: "backend".to_owned(),
+        source: "BACKEND".to_owned(),
+        argument: json!({
+            "creator": creator,
+            "created": user_id,
+            "site_admin": site_admin,
+            "service_type": service_type,
+        }),
+        public_argument: argument_object(&json!({}), ctx.actor),
+        version: ctx.version.to_owned(),
+        timestamp: ctx.now,
+        feature_flags: Value::Null,
+        cohort_id: None,
+        first_source_url: None,
+        last_source_url: None,
+        referrer: None,
+        device_id: uuid::Uuid::new_v4().to_string(),
+        insert_id: uuid::Uuid::new_v4().to_string(),
+        client: None,
+        billing_product_category: None,
+        billing_event_id: None,
+    };
+    bulk_insert_event_logs(pool, &[row]).await
 }
 
 /// `argument` for the account-deletion security event, including the
@@ -276,9 +385,9 @@ fn security_event_argument(actor: BackendActor) -> Value {
     argument_object(&json!({ "deleter": actor.uid }), actor)
 }
 
-fn deletion_event_log_row(id: i32, ctx: &DeletionEventContext<'_>) -> EventLogRow {
+fn deletion_event_log_row(id: i32, name: &str, ctx: &DeletionEventContext<'_>) -> EventLogRow {
     EventLogRow {
-        name: SECURITY_EVENT_NAME_ACCOUNT_NUKED.to_owned(),
+        name: name.to_owned(),
         url: String::new(),
         user_id: 0,
         anonymous_user_id: "backend".to_owned(),

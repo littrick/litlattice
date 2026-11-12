@@ -218,18 +218,14 @@ async fn set_email_verified(
         return AdminMutationOutcome::Error("missing verified argument".to_owned());
     };
 
-    if let Err(error) = store.set_email_verified(user_id, &email, verified).await {
+    // `backend.NewUserEmailsService(db).SetVerified`: the email write and the
+    // `verified` grant (or the Perforce cleanup) share one transaction
+    // (`user_emails.go:223-273`). Grant failures are logged only.
+    if let Err(error) = store
+        .set_email_verified_and_grant(user_id, &email, verified)
+        .await
+    {
         return AdminMutationOutcome::Error(error);
-    }
-    if !verified {
-        if let Err(error) = effects.delete_stale_perforce(user_id, &email).await {
-            return AdminMutationOutcome::Error(format!(
-                "removing stale perforce external account: {error}"
-            ));
-        }
-    } else {
-        // Failure is logged only.
-        let _ = store.grant_pending_permissions(user_id).await;
     }
     if effects.auditlog_expansion() {
         let arguments = serde_json::json!({"email": email, "verified": verified});

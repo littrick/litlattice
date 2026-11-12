@@ -89,7 +89,7 @@ async fn create_user(
         email_is_verified: !needs_email_verification,
         email_verification_code: email_verification_code.clone(),
     };
-    let user = match store.create_user(&new).await {
+    let user = match store.create_user_as(&new, actor.uid().unwrap_or(0)).await {
         Ok(user) => user,
         Err(error) => return AdminMutationOutcome::Error(format!("failed to create user: {error}")),
     };
@@ -315,7 +315,10 @@ async fn delete_users(
     }
 
     let hard = field.arguments.bool("hard").unwrap_or(false);
-    if let Err(error) = store.delete_users(&ids, hard).await {
+    if let Err(error) = store
+        .delete_users_as(&ids, hard, actor.uid().unwrap_or(0))
+        .await
+    {
         return AdminMutationOutcome::Error(error);
     }
     // The baseline builds one revoke argument per *existing* user (ids that

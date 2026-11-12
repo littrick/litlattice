@@ -18,6 +18,7 @@ use http::header::{self, HeaderValue};
 use http::{Request, Response, StatusCode};
 use http_body_util::Full;
 use serde::Deserialize;
+use sqlx::Row;
 use tonic::body::BoxBody;
 
 use sg_graphql::exec::Actor;
@@ -79,6 +80,230 @@ pub trait VerifyEmailDb: Send + Sync {
     ) -> Result<(), String>;
     /// `db.Authz().GrantPendingPermissions(...)`; failures are ignored.
     async fn grant_pending_permissions(&self, user_id: i32) -> Result<(), String>;
+}
+
+/// Production [`VerifyEmailDb`] backed by the shared PostgreSQL pool.
+///
+/// `VerifyEmailDb` is constructed per request from the session actor (the
+/// handlers in this module do not receive one), so the actor is captured at
+/// construction time. `permissions_bind_id` mirrors
+/// `permissions_user_mapping_bind_id`; `security_event_logs_in_database`
+/// mirrors `log.securityEventLog.location` being `database`/`all`
+/// (`audit.SecurityEventLocation`).
+pub struct PgVerifyEmailDb {
+    pool: sqlx::PgPool,
+    actor: Actor,
+    permissions_bind_id: String,
+    security_event_logs_in_database: bool,
+}
+
+impl PgVerifyEmailDb {
+    pub fn new(pool: sqlx::PgPool, actor: Actor) -> Self {
+        Self {
+            pool,
+            actor,
+            permissions_bind_id: "email".to_owned(),
+            security_event_logs_in_database: false,
+        }
+    }
+
+    pub fn with_permissions_bind_id(mut self, bind_id: impl Into<String>) -> Self {
+        self.permissions_bind_id = bind_id.into();
+        self
+    }
+
+    /// Derive the bind id and `security_event_logs` destination from site
+    /// configuration (`conf.PermissionsUserMapping`, `log.securityEventLog`).
+    pub fn with_site_configuration(mut self, site: &sg_config::SiteConfiguration) -> Self {
+        self.permissions_bind_id = crate::userpasswd::permissions_user_mapping_bind_id(site);
+        self.security_event_logs_in_database =
+            sg_db::security_event_logs::security_event_logs_in_database(site.raw());
+        self
+    }
+
+    pub fn with_security_event_logs_in_database(mut self, enabled: bool) -> Self {
+        self.security_event_logs_in_database = enabled;
+        self
+    }
+}
+
+#[async_trait]
+impl VerifyEmailDb for PgVerifyEmailDb {
+    async fn current_user(&self) -> Result<CurrentUser, String> {
+        // `db.Users().GetByCurrentAuthUser`: an anonymous/internal actor matches
+        // no user (`ErrNoCurrentUser`), which the handler maps to 401.
+        let Actor::User { uid } = self.actor else {
+            return Err("no current user".to_owned());
+        };
+        sqlx::query_scalar::<_, i32>(
+            "SELECT id FROM users WHERE id = $1 AND deleted_at IS NULL",
+        )
+        .bind(uid)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|error| error.to_string())?
+        .map(|id| CurrentUser { id })
+        .ok_or_else(|| "no current user".to_owned())
+    }
+
+    async fn get_email(&self, user_id: i32, email: &str) -> Result<(String, bool), String> {
+        let row = sqlx::query(
+            "SELECT email, verified_at IS NOT NULL AS verified \
+             FROM user_emails WHERE user_id = $1 AND email = $2",
+        )
+        .bind(user_id)
+        .bind(email)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|error| error.to_string())?;
+        let Some(row) = row else {
+            return Err(format!("user email not found: userID {user_id} email {email:?}"));
+        };
+        let canonical: String = row.try_get("email").map_err(|error| error.to_string())?;
+        let verified: bool = row.try_get("verified").map_err(|error| error.to_string())?;
+        Ok((canonical, verified))
+    }
+
+    async fn verify(&self, user_id: i32, email: &str, code: &str) -> Result<bool, String> {
+        let stored: Option<String> = sqlx::query_scalar(
+            "SELECT verification_code FROM user_emails WHERE user_id = $1 AND email = $2",
+        )
+        .bind(user_id)
+        .bind(email)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|error| error.to_string())?
+        .flatten();
+        let Some(stored) = stored else {
+            // The Go query scans into `sql.NullString` and only errors when the
+            // row is missing; a NULL code means the email was already verified.
+            let exists: Option<String> = sqlx::query_scalar(
+                "SELECT email FROM user_emails WHERE user_id = $1 AND email = $2",
+            )
+            .bind(user_id)
+            .bind(email)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|error| error.to_string())?;
+            if exists.is_none() {
+                return Err("email not found".to_owned());
+            }
+            return Err("email already verified".to_owned());
+        };
+        // 🚨 SECURITY: constant-time compare (length first, like the baseline).
+        if stored.len() != code.len() || !constant_time_eq(stored.as_bytes(), code.as_bytes()) {
+            return Ok(false);
+        }
+        sqlx::query(
+            "UPDATE user_emails SET verification_code = null, verified_at = now() \
+             WHERE user_id = $1 AND email = $2",
+        )
+        .bind(user_id)
+        .bind(email)
+        .execute(&self.pool)
+        .await
+        .map_err(|error| error.to_string())?;
+        Ok(true)
+    }
+
+    async fn get_primary_email(&self, user_id: i32) -> Result<(String, bool), String> {
+        let row = sqlx::query(
+            "SELECT email, verified_at IS NOT NULL AS verified \
+             FROM user_emails WHERE user_id = $1 AND is_primary",
+        )
+        .bind(user_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|error| error.to_string())?;
+        let Some(row) = row else {
+            return Err(format!("user email not found: id {user_id}"));
+        };
+        let email: String = row.try_get("email").map_err(|error| error.to_string())?;
+        let verified: bool = row.try_get("verified").map_err(|error| error.to_string())?;
+        Ok((email, verified))
+    }
+
+    async fn set_primary_email(&self, user_id: i32, email: &str) -> Result<(), String> {
+        let mut tx = self.pool.begin().await.map_err(|error| error.to_string())?;
+        let verified: Option<bool> = sqlx::query_scalar(
+            "SELECT verified_at IS NOT NULL FROM user_emails WHERE user_id = $1 AND email = $2",
+        )
+        .bind(user_id)
+        .bind(email)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|error| error.to_string())?;
+        let Some(verified) = verified else {
+            return Err("sql: no rows in result set".to_owned());
+        };
+        if !verified {
+            return Err("primary email must be verified".to_owned());
+        }
+        sqlx::query("UPDATE user_emails SET is_primary = false WHERE user_id = $1")
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|error| error.to_string())?;
+        sqlx::query("UPDATE user_emails SET is_primary = true WHERE user_id = $1 AND email = $2")
+            .bind(user_id)
+            .bind(email)
+            .execute(&mut *tx)
+            .await
+            .map_err(|error| error.to_string())?;
+        tx.commit().await.map_err(|error| error.to_string())
+    }
+
+    async fn log_security_event(
+        &self,
+        user_id: i32,
+        url_path: &str,
+        email: &str,
+    ) -> Result<(), String> {
+        // `SecurityEventLogs().InsertList` returns without writing unless the
+        // configured location includes the database (`database`/`all`).
+        if !self.security_event_logs_in_database {
+            return Ok(());
+        }
+        sg_db::security_event_logs::insert_security_event(
+            &self.pool,
+            &sg_db::security_event_logs::SecurityEvent {
+                name: "EmailVerified",
+                url: url_path,
+                user_id,
+                anonymous_user_id: "",
+                source: "BACKEND",
+                argument: serde_json::Value::String(email.to_owned()),
+                // `security_event_logs_check_version_not_empty`.
+                version: sg_metrics::VERSION,
+                timestamp: sqlx::types::time::OffsetDateTime::now_utc(),
+            },
+        )
+        .await
+        .map_err(|error| error.to_string())
+    }
+
+    async fn grant_pending_permissions(&self, user_id: i32) -> Result<(), String> {
+        sg_db::authz::grant_pending_permissions(
+            &self.pool,
+            user_id,
+            &self.permissions_bind_id,
+            sqlx::types::time::OffsetDateTime::now_utc(),
+        )
+        .await
+        .map_err(|error| error.to_string())
+    }
+}
+
+/// `subtle.ConstantTimeCompare(a, b) == 1` for equal-length slices.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 /// `usagestats.GetArchive` (`internal/usagestats/usage_stats.go:24-109`).
