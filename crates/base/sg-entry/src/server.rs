@@ -747,6 +747,14 @@ fn local_postgres_line(data_dir: &Path) -> String {
     )
 }
 
+/// Exit code for every `shared.Main` assembly failure (`log.Fatalf` and the
+/// `copySSH`/`copyConfigs` fatal paths).
+pub const EXIT_ASSEMBLY_FAILURE: i32 = 1;
+
+/// `runPostgresReindex`: printed when the 5.1 reindex is required but
+/// `SOURCEGRAPH_5_1_DB_MIGRATION` is not `"true"` (`os.Exit(101)`).
+pub const EXIT_MIGRATION_REQUIRED: i32 = 101;
+
 /// `shouldPostgresReindex` (`cmd/server/shared/shared.go:293-315`).
 pub fn should_postgres_reindex(env: &EnvMap) -> bool {
     let marker = reindex_marker_file(env);
@@ -952,7 +960,7 @@ fn print_reindex_required() {
 fn run_postgres_reindex(env: &EnvMap) -> Option<i32> {
     if env.value("SOURCEGRAPH_5_1_DB_MIGRATION") != "true" {
         print_reindex_required();
-        return Some(101);
+        return Some(EXIT_MIGRATION_REQUIRED);
     }
     println!("Starting Postgres reindex process");
     let marker = reindex_marker_file(env);
@@ -967,17 +975,19 @@ fn run_postgres_reindex(env: &EnvMap) -> Option<i32> {
         Ok(status) if status.success() => None,
         Ok(status) => {
             println!("Error running database migration: {status}");
-            Some(1)
+            Some(EXIT_ASSEMBLY_FAILURE)
         }
         Err(error) => {
             println!("Error running database migration: {error}");
-            Some(1)
+            Some(EXIT_ASSEMBLY_FAILURE)
         }
     }
 }
 
-/// Full `cmd/server` entry point (excluding `assets.Init`, which is not
-/// ported). Returns the process exit code.
+/// Full `cmd/server` entry point after `assets.Init`/`sanitycheck.Pass`
+/// (`bins/server/src/main.rs`). Returns the process exit code
+/// ([`EXIT_ASSEMBLY_FAILURE`] or [`EXIT_MIGRATION_REQUIRED`] on the early
+/// failure paths).
 pub async fn run_from_env() -> i32 {
     let mut env = EnvMap::from_process();
     let base_prof_services = default_prof_services();
@@ -987,25 +997,25 @@ pub async fn run_from_env() -> i32 {
         Ok(applied) => applied,
         Err(error) => {
             eprintln!("{error}");
-            return 1;
+            return EXIT_ASSEMBLY_FAILURE;
         }
     };
 
     if let Err(error) = copy_ssh(&env) {
         eprintln!("Failed to setup SSH authorization: {error}");
         eprintln!("SSH authorization required for cloning from your codehost. Please see README.");
-        return 1;
+        return EXIT_ASSEMBLY_FAILURE;
     }
     if let Err(error) = copy_configs(&env) {
         eprintln!("Failed to copy configs: {error}");
-        return 1;
+        return EXIT_ASSEMBLY_FAILURE;
     }
 
     let plan = match build_plan(&mut env, &applied, &extras) {
         Ok(plan) => plan,
         Err(error) => {
             eprintln!("{error}");
-            return 1;
+            return EXIT_ASSEMBLY_FAILURE;
         }
     };
 
