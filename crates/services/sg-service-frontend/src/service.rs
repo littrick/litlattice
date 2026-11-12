@@ -565,6 +565,38 @@ impl Service for FrontendService {
             }
             Err(_) => graphql_deps,
         };
+        // M9.13a: the saved-search and code-monitor optional resolvers.
+        // `NewSchema` appends `code_monitors.graphql` before
+        // `saved_searches.graphql`, so the builders are called in that order.
+        // `codemonitors.IsEnabled()` parses `DISABLE_CODE_MONITORS` with Go's
+        // permissive bool syntax (`strconv.ParseBool`); parse errors count as
+        // "not disabled".
+        let saved_searches: crate::saved_searches_graphql::SavedSearchesHandle = Arc::new(
+            crate::saved_searches_store::PgSavedSearchesGraphqlStore::new(session_pool.clone()),
+        );
+        let code_monitors_enabled = !matches!(
+            std::env::var("DISABLE_CODE_MONITORS").as_deref(),
+            Ok("1" | "t" | "T" | "TRUE" | "true" | "True")
+        );
+        let code_monitors = Arc::new(crate::code_monitors_graphql::CodeMonitorsResolver::new(
+            Arc::new(crate::code_monitors_graphql_store::PgCodeMonitorsGraphqlStore::new(
+                session_pool.clone(),
+            )),
+            Arc::new(crate::code_monitors_graphql::UnavailableSnapshot),
+            Arc::new(crate::code_monitors_graphql::UnavailableTestSender),
+            code_monitors_enabled,
+            crate::service_connections::sourcegraph_dotcom_mode(&|key: &str| {
+                std::env::var(key).ok()
+            }),
+        ));
+        let graphql_deps = graphql_deps
+            .with_code_monitors(code_monitors)
+            .and_then(|deps| deps.with_saved_searches(saved_searches))
+            .map_err(|err| {
+                ServiceError::new(format!(
+                    "failed to register saved-search/code-monitor GraphQL surfaces: {err}"
+                ))
+            })?;
         let graphql_deps = graphql_deps
             .with_production_surfaces(
                 Some(search_contexts),
