@@ -209,6 +209,125 @@ pub trait GitObjectSource: Send + Sync {
             "GitObjectSource::read_file is not implemented",
         ))
     }
+
+    /// `gitserver.Client.ListRefs` (M9.19a, `repository_git_refs.go`).
+    async fn list_refs(
+        &self,
+        _repo_id: i32,
+        _repo_name: &str,
+        _heads_only: bool,
+        _tags_only: bool,
+    ) -> Result<Vec<sg_git::GitRef>, GitSourceError> {
+        Err(GitSourceError::new(
+            "GitObjectSource::list_refs is not implemented",
+        ))
+    }
+
+    /// `gitserver.Client.GetDefaultBranch(repo, false)` (M9.19a). `Ok(None)`
+    /// is the empty default branch (`refName == ""`).
+    async fn default_branch(
+        &self,
+        _repo_id: i32,
+        _repo_name: &str,
+    ) -> Result<Option<String>, GitSourceError> {
+        Err(GitSourceError::new(
+            "GitObjectSource::default_branch is not implemented",
+        ))
+    }
+
+    /// `gitserver.Client.ContributorCount` (M9.19a). `after_date` is the raw
+    /// `afterDate` argument; `sg_git` has no contributor API yet, so only the
+    /// injected harness source implements this.
+    async fn contributor_count(
+        &self,
+        _repo_id: i32,
+        _repo_name: &str,
+        _revision_range: Option<&str>,
+        _after_date: Option<&str>,
+        _path: Option<&str>,
+    ) -> Result<Vec<ContributorCountData>, GitSourceError> {
+        Err(GitSourceError::new(
+            "GitObjectSource::contributor_count is not implemented",
+        ))
+    }
+
+    /// `gitserver.Client.StreamBlameFile` (M9.19a, `git_blob.go:18-56`).
+    async fn blame(
+        &self,
+        _repo_id: i32,
+        _repo_name: &str,
+        _oid: &str,
+        _path: &str,
+        _start_line: Option<i32>,
+        _end_line: Option<i32>,
+        _ignore_whitespace: bool,
+    ) -> Result<Vec<sg_git::BlameHunk>, GitSourceError> {
+        Err(GitSourceError::new(
+            "GitObjectSource::blame is not implemented",
+        ))
+    }
+}
+
+/// `gitdomain.ContributorCount` (`repository_contributors.go`).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ContributorCountData {
+    pub name: String,
+    pub email: String,
+    pub count: i32,
+}
+
+/// `Repository.gitRefs` / `branches` / `tags` cache key (M9.19a).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct RefsKey {
+    pub repo_id: i32,
+    pub heads_only: bool,
+    pub tags_only: bool,
+}
+
+/// `Repository.contributors` cache key: only the arguments that reach
+/// `gitserver.ContributorCount` (pagination is applied at replay time).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ContributorsKey {
+    pub repo_id: i32,
+    pub revision_range: Option<String>,
+    pub after_date: Option<String>,
+    pub path: Option<String>,
+}
+
+/// One `Repository.contributors` gitserver lookup. An unparseable
+/// `afterDate` is returned by the `contributors` field itself
+/// (`repository_contributors.go:30-36`); a gitserver failure is reported by
+/// `totalCount`/`nodes`/`pageInfo` (the connection is still constructed).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ContributorLookup {
+    InvalidDate(String),
+    Counts(Result<Vec<ContributorCountData>, String>),
+}
+
+/// `GetDefaultBranch` outcome. `NotFound` is an empty ref name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DefaultBranchLookup {
+    Found(String),
+    NotFound,
+    Error(String),
+}
+
+/// One `StreamBlameFile` result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BlameLookup {
+    Found(Vec<sg_git::BlameHunk>),
+    Error(String),
+}
+
+/// Cache key for `GitBlob.blame`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct BlameKey {
+    pub repo_id: i32,
+    pub oid: String,
+    pub path: String,
+    pub start_line: Option<i32>,
+    pub end_line: Option<i32>,
+    pub ignore_whitespace: bool,
 }
 
 /// Production [`GitObjectSource`] over the live site configuration's
@@ -348,6 +467,65 @@ impl GitObjectSource for GitserverGitObjects {
             .await
             .map_err(GitSourceError::from)
     }
+
+    async fn list_refs(
+        &self,
+        _repo_id: i32,
+        repo_name: &str,
+        heads_only: bool,
+        tags_only: bool,
+    ) -> Result<Vec<sg_git::GitRef>, GitSourceError> {
+        let (client, _addr) = self.client_for(repo_name).await?;
+        client
+            .list_refs(repo_name, heads_only, tags_only, &[], None)
+            .await
+            .map_err(GitSourceError::from)
+    }
+
+    async fn default_branch(
+        &self,
+        _repo_id: i32,
+        repo_name: &str,
+    ) -> Result<Option<String>, GitSourceError> {
+        let (client, _addr) = self.client_for(repo_name).await?;
+        let (name, _) = client
+            .default_branch_commit(repo_name)
+            .await
+            .map_err(GitSourceError::from)?;
+        Ok(if name.is_empty() { None } else { Some(name) })
+    }
+
+    async fn blame(
+        &self,
+        _repo_id: i32,
+        repo_name: &str,
+        oid: &str,
+        path: &str,
+        start_line: Option<i32>,
+        end_line: Option<i32>,
+        ignore_whitespace: bool,
+    ) -> Result<Vec<sg_git::BlameHunk>, GitSourceError> {
+        use tokio_stream::StreamExt as _;
+        let (client, addr) = self.client_for(repo_name).await?;
+        // `sg_git`'s `StreamBlameFile` hardcodes `range: None` and
+        // `ignore_whitespace: false`; the requested range is applied to the
+        // returned hunks below (production approximation, M9.19a).
+        let mut stream = client
+            .stream_blame_file_at(&addr, repo_name, path, oid)
+            .await
+            .map_err(GitSourceError::from)?;
+        let mut hunks = Vec::new();
+        while let Some(hunk) = stream.next().await {
+            hunks.push(hunk.map_err(GitSourceError::from)?);
+        }
+        let _ = ignore_whitespace;
+        if let (Some(start), Some(end)) = (start_line, end_line) {
+            let start = u32::try_from(start.max(0)).unwrap_or(0);
+            let end = u32::try_from(end.max(0)).unwrap_or(0);
+            hunks.retain(|hunk| hunk.start_line <= end && hunk.end_line >= start);
+        }
+        Ok(hunks)
+    }
 }
 
 /// The production [`GitObjectSource`] the frontend installs on
@@ -430,6 +608,14 @@ pub struct GitPrefetch {
     /// same string. `None` records a failed/unresolvable lookup, matching the
     /// baseline's empty `url.URL{}`.
     pub submodule_repo_names: HashMap<String, Option<String>>,
+    /// `GitBlob.blame` results (M9.19a), keyed by commit/path/arguments.
+    pub blame: HashMap<BlameKey, BlameLookup>,
+    /// `gitserver.ListRefs` results (M9.19a).
+    pub refs: HashMap<RefsKey, Result<Vec<sg_git::GitRef>, String>>,
+    /// `gitserver.GetDefaultBranch(repo, false)` results (M9.19a).
+    pub default_branches: HashMap<i32, DefaultBranchLookup>,
+    /// `gitserver.ContributorCount` results (M9.19a).
+    pub contributors: HashMap<ContributorsKey, ContributorLookup>,
     /// `symbol.DefaultZoektSymbolsClient()` injection point. `GitTreeEntry` /
     /// `GitCommit` `symbols` call the (synchronous) gRPC client here.
     pub symbols: Option<Arc<dyn crate::search_searcher_client::SymbolsClient + Send + Sync>>,
@@ -448,6 +634,10 @@ impl Clone for GitPrefetch {
             dirs: self.dirs.clone(),
             submodule_urls: self.submodule_urls.clone(),
             submodule_repo_names: self.submodule_repo_names.clone(),
+            blame: self.blame.clone(),
+            refs: self.refs.clone(),
+            default_branches: self.default_branches.clone(),
+            contributors: self.contributors.clone(),
             symbols: self.symbols.clone(),
         }
     }
@@ -466,6 +656,10 @@ impl std::fmt::Debug for GitPrefetch {
             .field("dirs", &self.dirs)
             .field("submodule_urls", &self.submodule_urls)
             .field("submodule_repo_names", &self.submodule_repo_names)
+            .field("blame", &self.blame)
+            .field("refs", &self.refs)
+            .field("default_branches", &self.default_branches)
+            .field("contributors", &self.contributors)
             .field(
                 "symbols",
                 &self.symbols.as_ref().map(|_| "<symbols client>"),
@@ -513,6 +707,11 @@ impl GitPrefetch {
             Some(CommitLookup::Error(message)) => (None, Some(message.clone())),
             None => (None, None),
         }
+    }
+
+    /// The prefetched blame for one blob/argument set (M9.19a).
+    pub fn blame(&self, key: &BlameKey) -> Option<&BlameLookup> {
+        self.blame.get(key)
     }
 }
 
@@ -743,6 +942,7 @@ async fn prefetch_commit_fields(
         source, prefetch, repo, oid, selections, depth,
     )
     .await;
+    prefetch_blame(source, prefetch, repo, oid, selections, depth).await;
     if !commit_needs_data(selections) {
         return;
     }
@@ -768,6 +968,103 @@ async fn prefetch_commit_fields(
     }
 }
 
+/// `GitTreeEntryResolver.Blame` (`git_blob.go:18-56`) for the
+/// `tree`/`blob`/`file`/`path` fields whose selection set asks for `blame`.
+///
+/// Only non-directory entries expose it (`ToGitBlob` returns
+/// `!r.IsDirectory()`); the baseline validates `startLine`/`endLine` at resolve
+/// time, so a mismatched pair is not fetched here.
+async fn prefetch_blame(
+    source: &dyn GitObjectSource,
+    prefetch: &mut GitPrefetch,
+    repo: &MinimalRepo,
+    oid: &str,
+    selections: &[RootField],
+    depth: usize,
+) {
+    if depth > MAX_COMMIT_DEPTH {
+        return;
+    }
+    for field in selections
+        .iter()
+        .filter(|field| matches!(field.name.as_str(), "tree" | "blob" | "file" | "path"))
+    {
+        let nested: Vec<&RootField> = field
+            .selections
+            .iter()
+            .chain(field.type_conditions.iter().flat_map(|(_, nested)| nested.iter()))
+            .collect();
+        let Some(blame) = nested.iter().find(|selection| selection.name == "blame") else {
+            continue;
+        };
+        let path = field.arguments.string("path").unwrap_or("");
+        let key = (repo.id, oid.to_owned(), path.to_owned());
+        let is_blob = matches!(
+            prefetch.tree_entries.get(&key),
+            Some(TreeEntryLookup::Found(stat)) if !stat.is_dir()
+        );
+        if !is_blob {
+            continue;
+        }
+        let start_line = blame.arguments.i64("startLine").map(|line| line as i32);
+        let end_line = blame.arguments.i64("endLine").map(|line| line as i32);
+        if start_line.is_some() != end_line.is_some() {
+            continue;
+        }
+        let ignore_whitespace = blame.arguments.bool("ignoreWhitespace").unwrap_or(false);
+        let blame_key = BlameKey {
+            repo_id: repo.id,
+            oid: oid.to_owned(),
+            path: path.to_owned(),
+            start_line,
+            end_line,
+            ignore_whitespace,
+        };
+        if !prefetch.blame.contains_key(&blame_key) {
+            let lookup = match source
+                .blame(
+                    repo.id,
+                    &repo.name,
+                    oid,
+                    path,
+                    start_line,
+                    end_line,
+                    ignore_whitespace,
+                )
+                .await
+            {
+                Ok(hunks) => BlameLookup::Found(hunks),
+                Err(error) => BlameLookup::Error(error.message),
+            };
+            prefetch.blame.insert(blame_key.clone(), lookup);
+        }
+        let Some(BlameLookup::Found(hunks)) = prefetch.blame.get(&blame_key).cloned() else {
+            continue;
+        };
+        if let Some(commit) = nested
+            .iter()
+            .find(|selection| selection.name == "commit")
+            .copied()
+        {
+            let mut seen: HashSet<String> = HashSet::new();
+            for hunk in hunks {
+                if !seen.insert(hunk.commit_id.clone()) {
+                    continue;
+                }
+                Box::pin(prefetch_commit_data(
+                    source,
+                    prefetch,
+                    repo,
+                    &hunk.commit_id,
+                    &commit.selections,
+                    depth + 1,
+                ))
+                .await;
+            }
+        }
+    }
+}
+
 /// `Repository.Commit(rev:)` / `GitObject.Commit()`: resolve the revspec, then
 /// prefetch the commit data the selection set needs.
 async fn prefetch_commit_rev(
@@ -782,6 +1079,132 @@ async fn prefetch_commit_rev(
     }
 }
 
+/// `gitserver.GetDefaultBranch`, cached per repository.
+pub(crate) async fn load_default_branch(
+    source: &dyn GitObjectSource,
+    prefetch: &mut GitPrefetch,
+    repo: &MinimalRepo,
+) -> DefaultBranchLookup {
+    if let Some(lookup) = prefetch.default_branches.get(&repo.id) {
+        return lookup.clone();
+    }
+    let lookup = match source.default_branch(repo.id, &repo.name).await {
+        Ok(None) => DefaultBranchLookup::NotFound,
+        Ok(Some(name)) => DefaultBranchLookup::Found(name),
+        Err(error) => DefaultBranchLookup::Error(error.message),
+    };
+    prefetch.default_branches.insert(repo.id, lookup.clone());
+    lookup
+}
+
+/// `GitRefType`: `GIT_BRANCH` → heads only, `GIT_TAG` → tags only, `null` →
+/// both, anything else → neither (`repository_git_refs.go:28-34`).
+fn refs_type(arguments: &Arguments) -> (bool, bool) {
+    match arguments.string("type") {
+        None => (true, true),
+        Some("GIT_BRANCH") => (true, false),
+        Some("GIT_TAG") => (false, true),
+        Some(_) => (false, false),
+    }
+}
+
+/// The M9.19a gitserver reads used by repository object fields: default
+/// branch, `ListRefs` and `ContributorCount`.
+async fn prefetch_repository_inventory_d(
+    source: &dyn GitObjectSource,
+    prefetch: &mut GitPrefetch,
+    repo: &MinimalRepo,
+    selections: &[RootField],
+) {
+    let mut needs_default_branch = false;
+    for field in selections {
+        match field.name.as_str() {
+            "externalURLs" | "textSearchIndex" | "defaultBranch" => {
+                needs_default_branch = true;
+            }
+            "gitRefs" => {
+                let (heads, tags) = refs_type(&field.arguments);
+                let key = RefsKey {
+                    repo_id: repo.id,
+                    heads_only: heads,
+                    tags_only: tags,
+                };
+                if !prefetch.refs.contains_key(&key) {
+                    let lookup = match source
+                        .list_refs(repo.id, &repo.name, heads, tags)
+                        .await
+                    {
+                        Ok(refs) => Ok(refs),
+                        Err(error) => Err(error.message),
+                    };
+                    prefetch.refs.insert(key, lookup);
+                }
+            }
+            "branches" | "tags" => {
+                let key = RefsKey {
+                    repo_id: repo.id,
+                    heads_only: field.name == "branches",
+                    tags_only: field.name == "tags",
+                };
+                if !prefetch.refs.contains_key(&key) {
+                    let lookup = match source
+                        .list_refs(repo.id, &repo.name, key.heads_only, key.tags_only)
+                        .await
+                    {
+                        Ok(refs) => Ok(refs),
+                        Err(error) => Err(error.message),
+                    };
+                    prefetch.refs.insert(key, lookup);
+                }
+            }
+            "contributors" => {
+                let after_date = field
+                    .arguments
+                    .string("afterDate")
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_owned);
+                let key = ContributorsKey {
+                    repo_id: repo.id,
+                    revision_range: field
+                        .arguments
+                        .string("revisionRange")
+                        .map(str::to_owned),
+                    after_date: after_date.clone(),
+                    path: field.arguments.string("path").map(str::to_owned),
+                };
+                if prefetch.contributors.contains_key(&key) {
+                    continue;
+                }
+                let lookup = match &after_date {
+                    Some(value) if crate::search_commit_job::parse_git_date(value).is_none() => {
+                        ContributorLookup::InvalidDate(
+                            "failed to parse after date: invalid date format".to_owned(),
+                        )
+                    }
+                    _ => match source
+                        .contributor_count(
+                            repo.id,
+                            &repo.name,
+                            key.revision_range.as_deref(),
+                            key.after_date.as_deref(),
+                            key.path.as_deref(),
+                        )
+                        .await
+                    {
+                        Ok(counts) => ContributorLookup::Counts(Ok(counts)),
+                        Err(error) => ContributorLookup::Counts(Err(error.message)),
+                    },
+                };
+                prefetch.contributors.insert(key, lookup);
+            }
+            _ => {}
+        }
+    }
+    if needs_default_branch {
+        load_default_branch(source, prefetch, repo).await;
+    }
+}
+
 /// The `commit(rev:)` field of a repository-shaped selection set.
 async fn prefetch_repository_selections(
     source: &dyn GitObjectSource,
@@ -793,6 +1216,7 @@ async fn prefetch_repository_selections(
         let rev = commit.arguments.string("rev").unwrap_or_default();
         prefetch_commit_rev(source, prefetch, repo, rev, &commit.selections).await;
     }
+    prefetch_repository_inventory_d(source, prefetch, repo, selections).await;
     crate::git_comparison_graphql::prefetch_repository_comparison(
         source, prefetch, repo, selections,
     )
@@ -1117,7 +1541,7 @@ pub(crate) fn repository_data(repo: &MinimalRepo) -> crate::graphql_resolvers::R
     }
 }
 
-fn signature_date(date: Option<&prost_types::Timestamp>) -> String {
+pub(crate) fn signature_date(date: Option<&prost_types::Timestamp>) -> String {
     let seconds = date.map(|timestamp| timestamp.seconds).unwrap_or(0);
     let datetime =
         OffsetDateTime::from_unix_timestamp(seconds).unwrap_or(OffsetDateTime::UNIX_EPOCH);
@@ -1409,7 +1833,22 @@ impl ObjectValue for GitCommitResolverObject {
             // M9.8iy: `GitCommitResolver.Tree`/`Blob`/`File`/`Path`
             // (`git_commit.go:240-308`).
             "tree" | "blob" | "file" | "path" => {
-                crate::git_tree_entry_graphql::commit_tree_entry_field(self, field, arguments)
+                let value = crate::git_tree_entry_graphql::commit_tree_entry_field(
+                    self, field, arguments,
+                )?;
+                // M9.19a: a file entry is a `GitBlob`, which exposes `blame`.
+                Ok(value.map(|value| match value {
+                    FieldValue::Object(inner) if inner.type_name() == "GitBlob" => {
+                        FieldValue::Object(Arc::new(crate::graphql_inventory_d::GitBlobD {
+                            inner,
+                            repo: self.repo.clone(),
+                            oid: self.oid.clone(),
+                            path: arguments.string("path").unwrap_or("").to_owned(),
+                            git: self.git.clone(),
+                        }))
+                    }
+                    other => other,
+                }))
             }
             // `GitCommitResolver.Symbols` (`symbols.go:59-76`).
             "symbols" => crate::git_tree_entry_graphql::commit_symbols_field(self, arguments),
