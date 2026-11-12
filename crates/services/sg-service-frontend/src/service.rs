@@ -4,14 +4,16 @@
 //! internal listeners plus the debug server.
 //!
 //! The configuration path is ported (M9.8el): `overrideSiteConfig`, the DB
-//! configuration service and a live, generation-cached middleware config. The
-//! rest of the baseline startup sequence (Redis wait, migrations, out-of-band
-//! migration validation, GraphQL schema, enterprise hooks) is not ported yet.
-//! This slice binds the listeners, answers the health/version surface, marks
-//! ready and shuts down all servers and the configuration tasks together.
+//! configuration service and a live, generation-cached middleware config.
+//! M9.16c adds the `serve_cmd.go` startup gate: the `versions`-table service
+//! version upsert, the 5s Redis readiness wait, and the out-of-band migration
+//! metadata sync + validation (`SRC_DISABLE_OOBMIGRATION_VALIDATION` skips
+//! it). `tryAutoUpgrade` is explicitly not ported. Enterprise hooks remain
+//! out of scope.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use sg_core::{ConfigError, EnvReader, Service, ServiceContext, ServiceError};
@@ -40,6 +42,381 @@ fn search_contexts_enabled() -> bool {
     match std::env::var("DISABLE_SEARCH_CONTEXTS") {
         Ok(value) => !matches!(value.as_str(), "1" | "t" | "T" | "TRUE" | "true" | "True"),
         Err(_) => true,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Startup sequence (`cmd/frontend/internal/cli/serve_cmd.go:74-131`).
+//
+// `tryAutoUpgrade` (serve_cmd.go:99) is not ported: the upgrade binary and the
+// `upgrade_logs` machinery live outside this repository's frontend process.
+// Everything after it is: `InitDB`'s service-version upsert, `waitForRedis`,
+// and the out-of-band migration metadata sync + validation.
+// ---------------------------------------------------------------------------
+
+/// `version.devVersion` (`internal/version/version.go:13`).
+pub const DEV_VERSION: &str = "0.0.0+dev";
+
+/// `oobmigration.Version`'s comparable half (`internal/oobmigration/version.go`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OobVersion {
+    pub major: i32,
+    pub minor: i32,
+}
+
+/// `oobmigration.VersionOrder`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VersionOrder {
+    Before,
+    Equal,
+    After,
+}
+
+/// `oobmigration.NewVersionFromString`
+/// (`internal/oobmigration/version.go:44-96`): the same `^v?(\d+)\.(\d+)
+/// (?:\.(\d+))?(?:-\w*)?(?:\+[\w.]*)?$` shape, including the `+dev` suffix.
+pub fn new_version_from_string(value: &str) -> Option<OobVersion> {
+    let mut input = value;
+    if let Some(stripped) = input.strip_suffix("+dev") {
+        input = stripped;
+    }
+    let bytes = input.as_bytes();
+    let mut index = 0;
+    if bytes.get(index) == Some(&b'v') {
+        index += 1;
+    }
+    let major = take_digits(bytes, &mut index)?;
+    if bytes.get(index) != Some(&b'.') {
+        return None;
+    }
+    index += 1;
+    let minor = take_digits(bytes, &mut index)?;
+    if bytes.get(index) == Some(&b'.') {
+        index += 1;
+        take_digits(bytes, &mut index)?;
+    }
+    if bytes.get(index) == Some(&b'-') {
+        index += 1;
+        while index < bytes.len() && (bytes[index].is_ascii_alphanumeric() || bytes[index] == b'_')
+        {
+            index += 1;
+        }
+    }
+    if bytes.get(index) == Some(&b'+') {
+        index += 1;
+        while index < bytes.len()
+            && (bytes[index].is_ascii_alphanumeric()
+                || bytes[index] == b'_'
+                || bytes[index] == b'.')
+        {
+            index += 1;
+        }
+    }
+    if index != bytes.len() {
+        return None;
+    }
+    Some(OobVersion {
+        major: major.parse().ok()?,
+        minor: minor.parse().ok()?,
+    })
+}
+
+fn take_digits<'a>(bytes: &'a [u8], index: &mut usize) -> Option<&'a str> {
+    let start = *index;
+    while *index < bytes.len() && bytes[*index].is_ascii_digit() {
+        *index += 1;
+    }
+    if *index == start {
+        None
+    } else {
+        Some(std::str::from_utf8(&bytes[start..*index]).ok()?)
+    }
+}
+
+/// `oobmigration.CompareVersions` (`version.go:134-148`).
+pub fn compare_versions(a: OobVersion, b: OobVersion) -> VersionOrder {
+    for (left, right) in [(a.major, b.major), (a.minor, b.minor)] {
+        if left < right {
+            return VersionOrder::Before;
+        }
+        if left > right {
+            return VersionOrder::After;
+        }
+    }
+    VersionOrder::Equal
+}
+
+/// `version.IsDev` (`internal/version/version.go:48-50`).
+pub fn is_dev_version(raw: &str) -> bool {
+    raw == DEV_VERSION
+}
+
+/// `upgradestore.IsValidUpgrade` (`internal/version/upgradestore/upgrade.go:11-25`).
+/// A version string that does not parse is the baseline's `nil` semver, which
+/// always permits the upgrade.
+pub fn is_valid_upgrade(previous: Option<&str>, latest: &str) -> bool {
+    let (Some((prev_major, prev_minor)), Some((latest_major, latest_minor))) = (
+        previous.and_then(semver_major_minor),
+        semver_major_minor(latest),
+    ) else {
+        return true;
+    };
+    match prev_major.cmp(&latest_major) {
+        std::cmp::Ordering::Greater => true,
+        std::cmp::Ordering::Equal => {
+            prev_minor >= latest_minor || prev_minor + 1 == latest_minor
+        }
+        std::cmp::Ordering::Less if prev_major + 1 == latest_major => latest_minor == 0,
+        std::cmp::Ordering::Less => false,
+    }
+}
+
+/// `semver.NewVersion`'s major/minor, `None` when the string is not
+/// semver-shaped (`IsValidUpgrade` then treats it as the nil version).
+fn semver_major_minor(raw: &str) -> Option<(u64, u64)> {
+    let trimmed = raw.trim();
+    let trimmed = trimmed.strip_prefix('v').unwrap_or(trimmed);
+    let mut parts = trimmed.split(['.', '-', '+']);
+    Some((parts.next()?.parse().ok()?, parts.next()?.parse().ok()?))
+}
+
+fn is_missing_relation(err: &sqlx::Error) -> bool {
+    matches!(err, sqlx::Error::Database(db) if db.code().as_deref() == Some("42P01"))
+}
+
+/// `upgradestore.GetFirstServiceVersion` (`store.go:44-49`).
+pub async fn get_first_service_version(pool: &sqlx::PgPool) -> Result<Option<String>, String> {
+    let result =
+        sqlx::query_scalar::<_, String>("SELECT first_version FROM versions WHERE service = $1")
+            .bind("frontend")
+            .fetch_optional(pool)
+            .await;
+    match result {
+        Ok(value) => Ok(value),
+        Err(err) if is_missing_relation(&err) => Ok(None),
+        Err(err) => Err(err.to_string()),
+    }
+}
+
+/// `upgradestore.UpdateServiceVersion` (`store.go:86-118`): the upgrade-policy
+/// gate plus the upsert that stamps `updated_at` on success. The `ON CONFLICT`
+/// clause keeps the previous-version compare-and-swap of the baseline.
+pub async fn update_service_version(pool: &sqlx::PgPool, version: &str) -> Result<(), String> {
+    let previous =
+        sqlx::query_scalar::<_, String>("SELECT version FROM versions WHERE service = $1")
+            .bind("frontend")
+            .fetch_optional(pool)
+            .await
+            .map_err(|err| err.to_string())?;
+
+    if !is_valid_upgrade(previous.as_deref(), version) {
+        return Err(format!(
+            "upgrading \"frontend\" from {:?} to {:?} is not allowed",
+            previous.as_deref().unwrap_or(""),
+            version
+        ));
+    }
+
+    sqlx::query(
+        "INSERT INTO versions (service, version, updated_at) VALUES ($1, $2, $3) \
+         ON CONFLICT (service) DO UPDATE SET (version, updated_at) = \
+         (excluded.version, excluded.updated_at) WHERE versions.version = $4",
+    )
+    .bind("frontend")
+    .bind(version)
+    .bind(time::OffsetDateTime::now_utc())
+    .bind(previous)
+    .execute(pool)
+    .await
+    .map_err(|err| err.to_string())?;
+
+    Ok(())
+}
+
+/// `Runner.SynchronizeMetadata` (`runner.go:75-77`).
+pub async fn synchronize_out_of_band_migrations(pool: &sqlx::PgPool) -> Result<(), String> {
+    sg_db::out_of_band_migrations::synchronize_metadata(pool).await
+}
+
+/// `migrationStatusError.Error` (`runner.go:113-115`).
+fn migration_status_error(id: i32, expected: f64, actual: f64) -> String {
+    format!(
+        "migration {id} expected to be at {:.2}% (at {:.2}%)",
+        expected * 100.0,
+        actual * 100.0
+    )
+}
+
+fn wrap_migration_errors(errors: &[String]) -> Result<(), String> {
+    if errors.is_empty() {
+        return Ok(());
+    }
+    let mut descriptions: Vec<String> = errors
+        .iter()
+        .map(|error| format!("  - {error}\n"))
+        .collect();
+    descriptions.sort();
+    Err(format!(
+        "Unfinished migrations. Please revert Sourcegraph to the previous version and wait for the following migrations to complete.\n\n{}\n",
+        descriptions.join("\n")
+    ))
+}
+
+/// One `oobmigration.Migration`'s validation-relevant fields.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct OobMigration {
+    pub id: i32,
+    pub introduced: OobVersion,
+    pub deprecated: Option<OobVersion>,
+    pub progress: f64,
+}
+
+/// `Runner.Validate` (`runner.go:128-160`), independent of the store.
+pub fn validate_migrations(
+    current: OobVersion,
+    first: OobVersion,
+    migrations: &[OobMigration],
+) -> Result<(), String> {
+    let mut errors = Vec::new();
+    for migration in migrations {
+        if compare_versions(current, migration.introduced) == VersionOrder::Before
+            && migration.progress != 0.0
+        {
+            errors.push(migration_status_error(migration.id, 0.0, migration.progress));
+        }
+        let Some(deprecated) = migration.deprecated else {
+            continue;
+        };
+        if compare_versions(first, deprecated) != VersionOrder::Before {
+            continue;
+        }
+        if compare_versions(current, deprecated) != VersionOrder::Before && migration.progress != 1.0
+        {
+            errors.push(migration_status_error(migration.id, 1.0, migration.progress));
+        }
+    }
+    wrap_migration_errors(&errors)
+}
+
+/// `Runner.Validate` (`runner.go:128-180`) over the database store.
+pub async fn validate_out_of_band_migrations_against(
+    pool: &sqlx::PgPool,
+    current: OobVersion,
+    first: OobVersion,
+) -> Result<(), String> {
+    let migrations: Vec<OobMigration> = sg_db::out_of_band_migrations::list(pool)
+        .await?
+        .into_iter()
+        .map(|migration| OobMigration {
+            id: migration.id,
+            introduced: OobVersion {
+                major: migration.introduced_major,
+                minor: migration.introduced_minor,
+            },
+            deprecated: match (migration.deprecated_major, migration.deprecated_minor) {
+                (Some(major), Some(minor)) => Some(OobVersion { major, minor }),
+                _ => None,
+            },
+            progress: migration.progress,
+        })
+        .collect();
+    validate_migrations(current, first, &migrations)
+}
+
+/// `ValidateOutOfBandMigrationRunner` (`validate.go:18-64`).
+pub async fn validate_out_of_band_migrations(
+    pool: &sqlx::PgPool,
+    current_raw: &str,
+) -> Result<(), String> {
+    if is_dev_version(current_raw) {
+        return Ok(());
+    }
+    let Some(current) = new_version_from_string(current_raw) else {
+        // `runner.logger.Warn("Skipping out-of-band migrations check", ...)`.
+        return Ok(());
+    };
+    let Some(first_raw) = get_first_service_version(pool)
+        .await
+        .map_err(|err| format!("failed to retrieve first instance version: {err}"))?
+    else {
+        return Ok(());
+    };
+    let Some(first) = new_version_from_string(&first_raw) else {
+        return Ok(());
+    };
+    validate_out_of_band_migrations_against(pool, current, first).await
+}
+
+/// The `serve_cmd.go:103-131` startup block, in order: the service-version
+/// upsert (`InitDB`), `waitForRedis`, then the env skip / metadata sync /
+/// validation branch.
+pub async fn run_startup_migrations(
+    pool: &sqlx::PgPool,
+    version: &str,
+    disable_oob_validation: bool,
+    redis: Option<&sg_redis::KeyValue>,
+) -> Result<(), ServiceError> {
+    update_service_version(pool, version)
+        .await
+        .map_err(|err| ServiceError::new(format!("failed to update service version: {err}")))?;
+
+    if let Some(kv) = redis {
+        wait_for_redis(kv).await;
+    }
+
+    if disable_oob_validation {
+        tracing::warn!("Skipping out-of-band migrations check");
+        return Ok(());
+    }
+
+    synchronize_out_of_band_migrations(pool)
+        .await
+        .map_err(|err| {
+            ServiceError::new(format!(
+                "failed to synchronize out of band migration metadata: {err}"
+            ))
+        })?;
+    validate_out_of_band_migrations(pool, version)
+        .await
+        .map_err(|err| {
+            ServiceError::new(format!("failed to validate out of band migrations: {err}"))
+        })?;
+    Ok(())
+}
+
+/// `waitForRedis` (`serve_cmd.go:453-470`): ping every 150ms for up to 5s,
+/// then continue anyway with a warning. Returns whether Redis came up.
+pub async fn wait_for_redis(kv: &sg_redis::KeyValue) -> bool {
+    wait_for_redis_with(Duration::from_secs(5), Duration::from_millis(150), || async {
+        kv.ping().await.map_err(|err| err.to_string())
+    })
+    .await
+}
+
+/// The injectable body of [`wait_for_redis`] (used by the unit test with a
+/// paused `tokio` clock).
+pub async fn wait_for_redis_with<F, Fut>(
+    timeout: Duration,
+    interval: Duration,
+    mut ping: F,
+) -> bool
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<(), String>>,
+{
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        tokio::time::sleep(interval).await;
+        if ping().await.is_ok() {
+            return true;
+        }
+        if tokio::time::Instant::now() > deadline {
+            tracing::warn!(
+                timeout_ms = timeout.as_millis() as u64,
+                "Redis (used for session store) failed to become reachable. Will continue trying to establish connection in background."
+            );
+            return false;
+        }
     }
 }
 
@@ -260,6 +637,28 @@ impl Service for FrontendService {
         let pool = configuration_server::FrontendConfigurationServer::connect_frontend_pool()
             .await
             .map_err(ServiceError::new)?;
+
+        // `cmd/frontend/main.go:11` + `shared/service.go:24-26`: install the
+        // global assets provider before any handler observes it.
+        sg_ui::init_from_env();
+
+        // `serve_cmd.go:103-131`: service version, Redis readiness, and the
+        // out-of-band migration gate. `SRC_DISABLE_OOBMIGRATION_VALIDATION`
+        // (non-empty) skips the metadata sync/validation.
+        let startup_version = String::from_utf8_lossy(self.version.as_bytes()).into_owned();
+        let startup_redis = sg_redis::KeyValue::connect(&sg_redis::cache_endpoint())
+            .await
+            .ok();
+        run_startup_migrations(
+            &pool,
+            &startup_version,
+            std::env::var("SRC_DISABLE_OOBMIGRATION_VALIDATION")
+                .map(|value| !value.is_empty())
+                .unwrap_or(false),
+            startup_redis.as_ref(),
+        )
+        .await?;
+
         let blame_pool = pool.clone();
         let search_pool = blame_pool.clone();
         let session_pool = pool.clone();
@@ -999,5 +1398,132 @@ mod tests {
         let config = service.config().expect("config");
         assert_eq!(config.external_bind_address(), "127.0.0.1:0");
         assert_eq!(config.internal_bind_address(), None);
+    }
+
+    fn version(major: i32, minor: i32) -> OobVersion {
+        OobVersion { major, minor }
+    }
+
+    #[test]
+    fn new_version_from_string_matches_the_baseline_regex() {
+        // `^v?(\d+)\.(\d+)(?:\.(\d+))?(?:-\w*)?(?:\+[\w.]*)?$`.
+        assert_eq!(new_version_from_string("3.42"), Some(version(3, 42)));
+        assert_eq!(new_version_from_string("v3.42.0"), Some(version(3, 42)));
+        assert_eq!(new_version_from_string("3.42.9"), Some(version(3, 42)));
+        assert_eq!(new_version_from_string("3.42.0-rc1"), Some(version(3, 42)));
+        assert_eq!(new_version_from_string("3.42.0-rc_1"), Some(version(3, 42)));
+        assert_eq!(new_version_from_string("3.42.0+dev"), Some(version(3, 42)));
+        assert_eq!(new_version_from_string("3.42+dev"), Some(version(3, 42)));
+        assert_eq!(new_version_from_string("3.42.0+meta.1"), Some(version(3, 42)));
+
+        assert_eq!(new_version_from_string(""), None);
+        assert_eq!(new_version_from_string("3"), None);
+        assert_eq!(new_version_from_string("3."), None);
+        assert_eq!(new_version_from_string(".42"), None);
+        assert_eq!(new_version_from_string("dev"), None);
+        assert_eq!(new_version_from_string("3.42.0.1"), None);
+        // `-\w*` permits an empty pre-release, exactly like the baseline regex.
+        assert_eq!(new_version_from_string("3.42.0-"), Some(version(3, 42)));
+        assert_eq!(new_version_from_string("v"), None);
+    }
+
+    #[test]
+    fn compare_versions_ignores_patch_and_orders_by_major_then_minor() {
+        assert_eq!(compare_versions(version(3, 42), version(3, 42)), VersionOrder::Equal);
+        assert_eq!(compare_versions(version(3, 42), version(3, 43)), VersionOrder::Before);
+        assert_eq!(compare_versions(version(3, 43), version(3, 42)), VersionOrder::After);
+        assert_eq!(compare_versions(version(3, 99), version(4, 0)), VersionOrder::Before);
+        assert_eq!(compare_versions(version(4, 0), version(3, 99)), VersionOrder::After);
+    }
+
+    #[test]
+    fn is_valid_upgrade_follows_the_baseline_rules() {
+        // No previous version (or an unparseable one) permits any upgrade.
+        assert!(is_valid_upgrade(None, "3.42.0"));
+        assert!(is_valid_upgrade(Some("not-semver"), "3.42.0"));
+        assert!(is_valid_upgrade(Some("3.42.0"), "not-semver"));
+        // Same major: forward by at most one minor, or any downgrade.
+        assert!(is_valid_upgrade(Some("3.42.0"), "3.42.0"));
+        assert!(is_valid_upgrade(Some("3.42.0"), "3.43.0"));
+        assert!(!is_valid_upgrade(Some("3.42.0"), "3.44.0"));
+        assert!(is_valid_upgrade(Some("3.42.0"), "3.41.0"));
+        // Next major: only x.0 is a valid jump.
+        assert!(is_valid_upgrade(Some("3.42.0"), "4.0.0"));
+        assert!(!is_valid_upgrade(Some("3.42.0"), "4.1.0"));
+        // A major-version downgrade is always a valid "upgrade".
+        assert!(is_valid_upgrade(Some("4.0.0"), "3.42.0"));
+    }
+
+    #[test]
+    fn validate_migrations_reports_unfinished_migrations_in_sorted_order() {
+        assert_eq!(validate_migrations(version(3, 42), version(3, 0), &[]), Ok(()));
+
+        let migrations = [
+            // Introduced after the running version but already partially
+            // rolled back: it must be at 0%.
+            OobMigration {
+                id: 12,
+                introduced: version(4, 0),
+                deprecated: None,
+                progress: 0.5,
+            },
+            // Deprecated before the first instance version: ignore entirely.
+            OobMigration {
+                id: 3,
+                introduced: version(3, 0),
+                deprecated: Some(version(2, 0)),
+                progress: 0.5,
+            },
+            // Deprecated in this version: it must be complete.
+            OobMigration {
+                id: 8,
+                introduced: version(3, 0),
+                deprecated: Some(version(3, 42)),
+                progress: 0.25,
+            },
+            // Complete deprecation is fine.
+            OobMigration {
+                id: 9,
+                introduced: version(3, 0),
+                deprecated: Some(version(3, 42)),
+                progress: 1.0,
+            },
+        ];
+        let error = validate_migrations(version(3, 42), version(3, 0), &migrations)
+            .expect_err("unfinished migrations must be rejected");
+        assert_eq!(
+            error,
+            "Unfinished migrations. Please revert Sourcegraph to the previous version and wait for the following migrations to complete.\n\n  - migration 12 expected to be at 0.00% (at 50.00%)\n\n  - migration 8 expected to be at 100.00% (at 25.00%)\n\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_for_redis_with_returns_once_the_ping_succeeds() {
+        let mut attempts = 0;
+        let up = wait_for_redis_with(Duration::from_secs(5), Duration::from_millis(1), || {
+            attempts += 1;
+            let attempt = attempts;
+            async move {
+                if attempt < 3 {
+                    Err("connection refused".to_owned())
+                } else {
+                    Ok(())
+                }
+            }
+        })
+        .await;
+        assert!(up);
+        assert_eq!(attempts, 3);
+    }
+
+    #[tokio::test]
+    async fn wait_for_redis_with_gives_up_at_the_timeout_without_failing_startup() {
+        let up = wait_for_redis_with(
+            Duration::from_millis(20),
+            Duration::from_millis(1),
+            || async { Err("connection refused".to_owned()) },
+        )
+        .await;
+        assert!(!up);
     }
 }

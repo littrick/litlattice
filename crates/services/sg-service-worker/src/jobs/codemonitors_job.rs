@@ -3,11 +3,16 @@
 //! `codemonitors-job` assembly (`cmd/worker/internal/codemonitors` +
 //! `internal/codemonitors/background`), M9.8ip.
 //!
+//! M9.16c production seam: the trigger searcher is the live frontend search
+//! client and the action runner's e-mail sink is `super::code_monitor_email`
+//! over `sg_txemail`; `run_worker_codemonitor_diff.sh` pins both the trigger
+//! search and the action/e-mail path against the Go oracles.
+//!
 //! The two periodic routines (trigger enqueuer and trigger-job log deleter)
 //! live in [`super::code_monitors`]; the dbworker stores and worker options in
 //! [`super::code_monitor_workers`]; the action payloads and HTTP delivery in
 //! [`super::code_monitor_actions`]; the e-mail transport in
-//! [`super::code_monitor_email`]. This module adds the two handlers the
+//! `super::code_monitor_email`. This module adds the two handlers the
 //! baseline's worker constructors close over ([`QueryTriggerHandler`],
 //! [`ActionRunnerHandler`]), the metrics and resetter wiring, and the
 //! six-routine assembly registered as `codemonitors-job`.

@@ -268,6 +268,7 @@ async fn ui_assets_diff() {
                     sg_ui::ManifestError::NotFound { .. } => "notfound",
                     sg_ui::ManifestError::Parse { .. } => "parse",
                     sg_ui::ManifestError::Io { .. } => "io",
+                    sg_ui::ManifestError::NotConfigured => "notconfigured",
                 }
                 .to_owned();
             }

@@ -87,6 +87,10 @@ const BITBUCKET_CLOUD_WEBHOOKS_PATH: &str = "/.api/bitbucket-cloud-webhooks";
 const OPENCODEGRAPH_PATH: &str = "/.api/opencodegraph";
 /// `httpapi.go:172`: `m.Path("/search/stream").Methods("GET")`.
 const SEARCH_STREAM_PATH: &str = "/.api/search/stream";
+/// `httpapi.go:325`: `llm := m.PathPrefix("/llm/").Subrouter()`.
+const LLM_CHAT_COMPLETIONS_PATH: &str = "/.api/llm/chat/completions";
+const LLM_MODELS_PATH: &str = "/.api/llm/models";
+const LLM_MODELS_PREFIX: &str = "/.api/llm/models/";
 
 /// `routevar.RepoPattern` (`routevar/repo.go:30-35`) after
 /// `namedToNonCapturingGroups`: the gorilla `{Repo:...}` template body. A
@@ -157,6 +161,14 @@ pub(crate) enum Route {
     RepoShield {
         repo: String,
     },
+    RepoRefresh {
+        repo: String,
+    },
+    LlmChatCompletions,
+    LlmModels,
+    LlmModel {
+        id: String,
+    },
     SearchStream,
     BlameStream {
         repo: String,
@@ -192,6 +204,9 @@ impl Route {
             Route::RepoShield { .. } | Route::BlameStream { .. } | Route::SearchStream => {
                 method == Method::GET
             }
+            Route::RepoRefresh { .. } => method == Method::POST,
+            Route::LlmChatCompletions => method == Method::POST,
+            Route::LlmModels | Route::LlmModel { .. } => method == Method::GET,
             Route::Graphql => method == Method::POST,
             Route::WebhookUuid { .. }
             | Route::GitHubWebhooks
@@ -207,6 +222,53 @@ impl Route {
     fn is_prefix(&self) -> bool {
         matches!(self, Route::Registry | Route::Scim)
     }
+
+    /// Stable route name for the cross-check with the Go gorilla oracle.
+    #[doc(hidden)]
+    pub fn diff_name(&self) -> &'static str {
+        match self {
+            Route::RepoRefresh { .. } => "repo-refresh",
+            Route::LlmChatCompletions => "llm-chat-completions",
+            Route::LlmModels => "llm-models",
+            Route::LlmModel { .. } => "llm-model",
+            other => other.variant_name(),
+        }
+    }
+
+    fn variant_name(&self) -> &'static str {
+        match self {
+            Route::Registry => "registry",
+            Route::Scim => "scim",
+            Route::BatchesFile { .. } => "batches-file",
+            Route::BatchesFileUpload { .. } => "batches-file-upload",
+            Route::LsifUpload => "lsif-upload",
+            Route::ScipUpload => "scip-upload",
+            Route::ComputeStream => "compute-stream",
+            Route::InsightsExport { .. } => "insights-export",
+            Route::SearchExportJsonl { .. } => "search-export-jsonl",
+            Route::SearchExportLog { .. } => "search-export-log",
+            Route::ChatCompletionsStream => "chat-completions-stream",
+            Route::CodeCompletions => "code-completions",
+            Route::SrcCliVersions => "src-cli-versions",
+            Route::SrcCli { .. } => "src-cli",
+            Route::ClientConfig => "client-config",
+            Route::ModelConfig => "model-config",
+            Route::WebhookUuid { .. } => "webhook-uuid",
+            Route::GitHubWebhooks => "github-webhooks",
+            Route::GitLabWebhooks => "gitlab-webhooks",
+            Route::BitbucketServerWebhooks => "bitbucket-server-webhooks",
+            Route::BitbucketCloudWebhooks => "bitbucket-cloud-webhooks",
+            Route::OpenCodeGraph => "opencodegraph",
+            Route::Graphql => "graphql",
+            Route::RepoShield { .. } => "repo-shield",
+            Route::RepoRefresh { .. } => "repo-refresh",
+            Route::LlmChatCompletions => "llm-chat-completions",
+            Route::LlmModels => "llm-models",
+            Route::LlmModel { .. } => "llm-model",
+            Route::SearchStream => "search-stream",
+            Route::BlameStream { .. } => "blame-stream",
+        }
+    }
 }
 
 /// The subrouter's `ServeHTTP` + the registered handlers.
@@ -218,14 +280,19 @@ pub fn api_response<B>(req: &Request<B>, _live: &LiveConfig) -> Response<BoxBody
 }
 
 /// The async variant used by the external listener: `/.api/blame/...` needs
-/// the database and gitserver (via [`BlameDeps`]) and streams its response.
-/// Every other route is the same synchronous dispatch as [`api_response`].
+/// the database and gitserver (via [`BlameDeps`]) and streams its response,
+/// the LLM routes need their model-config/forwarding seams, and
+/// `POST /.api/repos/{Repo}/-/refresh` needs the repo updater. Every other
+/// route is the same synchronous dispatch as [`api_response`].
+#[allow(clippy::too_many_arguments)] // One argument per async subsystem seam.
 pub async fn api_response_with_deps<B>(
     req: &mut Request<B>,
     live: &LiveConfig,
     deps: Arc<dyn BlameDeps>,
     search_deps: Arc<dyn crate::search_stream::SearchDeps>,
     graphql_deps: Arc<dyn GraphqlDeps>,
+    repo_refresh_deps: Arc<dyn crate::repo_refresh::RepoRefreshDeps>,
+    llm_deps: Arc<crate::llm_api::LlmDeps>,
 ) -> Response<BoxBody>
 where
     B: hyper::body::Body<Data = bytes::Bytes> + Unpin + Send,
@@ -238,7 +305,40 @@ where
         }
         Ok(Route::SearchStream) => crate::search_stream::search_response(req, search_deps).await,
         Ok(Route::Graphql) => graphql_api::graphql_response(req, live, false, graphql_deps).await,
+        Ok(Route::RepoRefresh { repo }) => {
+            crate::repo_refresh::repo_refresh_response(&*req, &repo, repo_refresh_deps.as_ref())
+                .await
+        }
+        Ok(Route::LlmChatCompletions) => {
+            crate::llm_api::chat_completions_response(req, &llm_deps).await
+        }
+        Ok(Route::LlmModels) => crate::llm_api::models_response(llm_deps.config.as_ref()),
+        Ok(Route::LlmModel { id }) => {
+            crate::llm_api::model_response(llm_deps.config.as_ref(), &id)
+        }
         Ok(route) => route_response(req, route),
+    }
+}
+
+/// The differential seam for `run_http_routes_inventory_diff.sh`: reduce
+/// gorilla's observable answer to one line (`matched:<name>`,
+/// `status:<code>`, `redirect:<location>` or `not_found`). Only the routes
+/// added by M9.16c need names; the rest still classify deterministically.
+#[doc(hidden)]
+pub fn route_classification<B>(req: &Request<B>) -> String {
+    match route_request(req) {
+        Ok(route) => format!("matched:{}", route.diff_name()),
+        Err(response) => match response.status() {
+            StatusCode::MOVED_PERMANENTLY | StatusCode::PERMANENT_REDIRECT => response
+                .headers()
+                .get(header::LOCATION)
+                .and_then(|value| value.to_str().ok())
+                .map(|location| format!("redirect:{location}"))
+                .unwrap_or_else(|| format!("status:{}", response.status().as_u16())),
+            StatusCode::METHOD_NOT_ALLOWED => "status:405".to_owned(),
+            StatusCode::NOT_FOUND => "not_found".to_owned(),
+            status => format!("status:{}", status.as_u16()),
+        },
     }
 }
 
@@ -293,9 +393,15 @@ fn route_response<B>(req: &Request<B>, route: Route) -> Response<BoxBody> {
         // Served by `api_response_with_deps`; the synchronous entry point
         // never has the dependencies and must not be used for blame or
         // search.
-        Route::BlameStream { .. } | Route::SearchStream | Route::Graphql => {
-            empty_response(StatusCode::INTERNAL_SERVER_ERROR)
-        }
+        // Served by `api_response_with_deps`; the synchronous entry point
+        // never has the dependencies and must not be used for these routes.
+        Route::BlameStream { .. }
+        | Route::SearchStream
+        | Route::Graphql
+        | Route::RepoRefresh { .. }
+        | Route::LlmChatCompletions
+        | Route::LlmModels
+        | Route::LlmModel { .. } => empty_response(StatusCode::INTERNAL_SERVER_ERROR),
         Route::Registry => registry_response(),
         Route::Scim => enterprise_not_found("SCIM handler"),
         Route::BatchesFile { .. } if req.method() == Method::HEAD => {
@@ -423,8 +529,28 @@ fn match_route(path: &str) -> Option<Route> {
     if path == SEARCH_STREAM_PATH {
         return Some(Route::SearchStream);
     }
+    // `llm := m.PathPrefix("/llm/").Subrouter()` (`httpapi.go:325-326`) with
+    // `Path("/chat/completions")`, `Path("/models")` and
+    // `Path("/models/{modelId}")`. The subrouter consumes the whole prefix, so
+    // an unknown `/.api/llm/...` path is a plain 404.
+    if path == LLM_CHAT_COMPLETIONS_PATH {
+        return Some(Route::LlmChatCompletions);
+    }
+    if path == LLM_MODELS_PATH {
+        return Some(Route::LlmModels);
+    }
+    if let Some(rest) = path.strip_prefix(LLM_MODELS_PREFIX) {
+        if let Some(id) = single_segment(rest) {
+            return Some(Route::LlmModel { id: id.to_owned() });
+        }
+    }
     if let Some(caps) = repo_shield_regex().captures(path) {
         return Some(Route::RepoShield {
+            repo: caps["Repo"].to_owned(),
+        });
+    }
+    if let Some(caps) = repo_refresh_regex().captures(path) {
+        return Some(Route::RepoRefresh {
             repo: caps["Repo"].to_owned(),
         });
     }
@@ -459,6 +585,19 @@ fn repo_shield_regex() -> &'static Regex {
             r"^/\.api/repos/(?P<Repo>{REPO_PATTERN})/-/shield$"
         ))
         .expect("repo shield route regexp")
+    })
+}
+
+/// `repo.Path("/refresh")` under the same `/.api/repos/{Repo}/-/`
+/// subrouter (`httpapi.go:323`), i.e.
+/// `^/\.api/repos/(?P<Repo>...)/-/refresh$`.
+fn repo_refresh_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| {
+        Regex::new(&format!(
+            r"^/\.api/repos/(?P<Repo>{REPO_PATTERN})/-/refresh$"
+        ))
+        .expect("repo refresh route regexp")
     })
 }
 
