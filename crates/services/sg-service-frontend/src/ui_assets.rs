@@ -25,7 +25,7 @@ use regex::Regex;
 use tonic::body::BoxBody;
 
 use sg_ui::{
-    asset_url, AssetEntry, AssetError, AssetReader, BundleField, UiAssets, WebBuildManifest,
+    asset_url, AssetEntry, AssetError, AssetReader, BundleField, WebBuildManifest,
 };
 
 use crate::app_handlers::{self, AppConfig, AppDeps, AppEnv};
@@ -544,7 +544,7 @@ impl UiCandidate {
         req: &Request<B>,
         env: &AppEnv,
         config: &AppConfig,
-        assets: &UiAssets,
+        assets: &dyn sg_ui::AssetsProvider,
     ) -> Response<BoxBody> {
         match &self.action {
             UiAction::Home => serve_home(req, env, config, assets),
@@ -581,7 +581,7 @@ fn serve_home<B>(
     req: &Request<B>,
     env: &AppEnv,
     config: &AppConfig,
-    assets: &UiAssets,
+    assets: &dyn sg_ui::AssetsProvider,
 ) -> Response<BoxBody> {
     // `newCommon` runs first, so a missing manifest is a 500 even for HEAD.
     let _manifest = match assets.load_web_build_manifest() {
@@ -603,7 +603,7 @@ fn serve_home<B>(
 fn shell_with_manifest(
     env: &AppEnv,
     config: &AppConfig,
-    assets: &UiAssets,
+    assets: &dyn sg_ui::AssetsProvider,
     title: String,
     indexed: bool,
     status: StatusCode,
@@ -628,7 +628,11 @@ fn manifest_error_response(
 
 /// The unknown-route `NotFoundHandler` → `serveError(..., 404)` path: the
 /// fancy `app.html` error page when the manifest loads, `error.html` otherwise.
-fn ui_not_found(env: &AppEnv, config: &AppConfig, assets: &UiAssets) -> Response<BoxBody> {
+fn ui_not_found(
+    env: &AppEnv,
+    config: &AppConfig,
+    assets: &dyn sg_ui::AssetsProvider,
+) -> Response<BoxBody> {
     match assets.load_web_build_manifest() {
         Ok(manifest) => {
             let title = format!("404 Not Found - {}", config.brand_name);
@@ -1111,7 +1115,7 @@ fn escape_html(value: &str) -> String {
 mod tests {
     use super::*;
     use http_body_util::BodyExt;
-    use sg_ui::MemoryAssets;
+    use sg_ui::{MemoryAssets, UiAssets};
     use std::sync::Arc;
 
     fn assets(files: &[(&str, &[u8])]) -> MemoryAssets {
@@ -1145,7 +1149,7 @@ mod tests {
         .unwrap();
         let assets = UiAssets::new(dir.path(), Arc::new(assets(files)));
         let deps = AppDeps {
-            ui_assets: Some(Arc::new(assets)),
+            ui_assets: Some(Arc::new(assets) as Arc<dyn sg_ui::AssetsProvider>),
             ..AppDeps::default()
         };
         (AppEnv::default(), AppConfig::default(), deps, dir)

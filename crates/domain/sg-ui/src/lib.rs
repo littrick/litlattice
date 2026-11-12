@@ -22,7 +22,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock, RwLock};
 
 /// The skeleton crate name kept for the M6 layering check.
 pub const CRATE_NAME: &str = "sg-ui";
@@ -60,11 +60,18 @@ pub enum ManifestError {
     Io { root: PathBuf, message: String },
     /// `json.Unmarshal` failed.
     Parse { message: String },
+    /// `FailingAssetsProvider`: `assets.Init()` was never called
+    /// (`ui/assets/assets.go:36-47`).
+    NotConfigured,
 }
 
 impl fmt::Display for ManifestError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            ManifestError::NotConfigured => write!(
+                f,
+                "assets are not configured for this binary, please see ui/assets/doc.go"
+            ),
             ManifestError::NotFound { root } | ManifestError::Io { root, .. } => write!(
                 f,
                 "failed loading web build manifest file from disk at {:?}: {}",
@@ -72,7 +79,7 @@ impl fmt::Display for ManifestError {
                 match self {
                     ManifestError::NotFound { .. } => "no such file or directory".to_owned(),
                     ManifestError::Io { message, .. } => message.clone(),
-                    ManifestError::Parse { .. } => unreachable!(),
+                    ManifestError::Parse { .. } | ManifestError::NotConfigured => unreachable!(),
                 }
             ),
             ManifestError::Parse { message } => write!(f, "parsing manifest json: {message}"),
@@ -359,6 +366,125 @@ impl UiAssets {
 
     pub fn load_web_build_manifest(&self) -> Result<WebBuildManifest, ManifestError> {
         load_web_build_manifest(&self.root)
+    }
+}
+
+/// `assets.AssetsProvider` (`ui/assets/assets.go:27-31`).
+pub trait AssetsProvider: Send + Sync {
+    fn load_web_build_manifest(&self) -> Result<WebBuildManifest, ManifestError>;
+    fn assets(&self) -> Arc<dyn AssetReader>;
+}
+
+impl AssetsProvider for UiAssets {
+    fn load_web_build_manifest(&self) -> Result<WebBuildManifest, ManifestError> {
+        UiAssets::load_web_build_manifest(self)
+    }
+
+    fn assets(&self) -> Arc<dyn AssetReader> {
+        self.readonly()
+    }
+}
+
+/// `assets.DirProvider` (`ui/assets/assets.go:60-73`): assets read from a
+/// directory on disk.
+#[derive(Clone, Debug)]
+pub struct DirProvider {
+    assets: UiAssets,
+}
+
+impl DirProvider {
+    pub fn new(root: impl Into<PathBuf>) -> Self {
+        Self {
+            assets: UiAssets::for_path(root),
+        }
+    }
+}
+
+impl AssetsProvider for DirProvider {
+    fn load_web_build_manifest(&self) -> Result<WebBuildManifest, ManifestError> {
+        self.assets.load_web_build_manifest()
+    }
+
+    fn assets(&self) -> Arc<dyn AssetReader> {
+        self.assets.readonly()
+    }
+}
+
+/// `assets.FailingAssetsProvider` (`ui/assets/assets.go:36-47`): the explicit
+/// "not configured" sentinel. The baseline panics from `Assets()`; the Rust
+/// port keeps the error return and makes `open` fail instead.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FailingAssetsProvider;
+
+impl AssetsProvider for FailingAssetsProvider {
+    fn load_web_build_manifest(&self) -> Result<WebBuildManifest, ManifestError> {
+        Err(ManifestError::NotConfigured)
+    }
+
+    fn assets(&self) -> Arc<dyn AssetReader> {
+        Arc::new(FailingAssetReader)
+    }
+}
+
+/// The [`AssetReader`] behind [`FailingAssetsProvider`].
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FailingAssetReader;
+
+impl AssetReader for FailingAssetReader {
+    fn open(&self, _name: &str) -> Result<AssetEntry, AssetError> {
+        Err(AssetError::Other(
+            "assets are not configured for this binary, please see ui/assets/doc.go".to_owned(),
+        ))
+    }
+}
+
+static PROVIDER: OnceLock<RwLock<Arc<dyn AssetsProvider>>> = OnceLock::new();
+static CONFIGURED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn provider_cell() -> &'static RwLock<Arc<dyn AssetsProvider>> {
+    PROVIDER.get_or_init(|| RwLock::new(Arc::new(FailingAssetsProvider)))
+}
+
+/// `assets.Provider` (`ui/assets/assets.go:33`): the process-wide provider.
+pub fn provider() -> Arc<dyn AssetsProvider> {
+    Arc::clone(&provider_cell().read().expect("assets provider lock"))
+}
+
+/// Whether `Init`/`Use*Provider` (or an explicit [`set_provider`]) has run.
+pub fn is_configured() -> bool {
+    CONFIGURED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Install a provider (tests and alternative embedders).
+pub fn set_provider(provider: Arc<dyn AssetsProvider>) {
+    *provider_cell().write().expect("assets provider lock") = provider;
+    CONFIGURED.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// `assets.Init()` (`ui/assets/assets.go:19-21`, called from
+/// `cmd/frontend/main.go:11`).
+pub fn init() {
+    use_assets_provider_for_path(DEFAULT_ASSET_PATH);
+}
+
+/// `assets.UseDevAssetsProvider()` (`ui/assets/assets.go:53-56`, called from
+/// `cmd/frontend/shared/service.go:24-26` when `WEB_BUILDER_DEV_SERVER=1`).
+pub fn use_dev_assets_provider() {
+    use_assets_provider_for_path(DEV_ASSETS_PATH);
+}
+
+/// `assets.UseAssetsProviderForPath` (`ui/assets/assets.go:58-61`).
+pub fn use_assets_provider_for_path(path: impl Into<PathBuf>) {
+    set_provider(Arc::new(DirProvider::new(path)));
+}
+
+/// The shared `cmd/frontend/shared/service.go:24-26` choice: dev assets when
+/// `WEB_BUILDER_DEV_SERVER=1`, otherwise the binary's default path.
+pub fn init_from_env() {
+    if std::env::var("WEB_BUILDER_DEV_SERVER").as_deref() == Ok("1") {
+        use_dev_assets_provider();
+    } else {
+        init();
     }
 }
 

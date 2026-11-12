@@ -4,6 +4,12 @@
 //! the constructed providers plus the validation problems, warnings and
 //! invalid connections the baseline returns.
 //!
+//! M9.16c production seam: the worker registers this function through
+//! `super::perms_syncer::ProviderRegistry` (`ConfigAuthzProviders`) on every
+//! permission sync; `run_worker_authz_diff.sh` pins the all-kinds provider
+//! fetch against the Go harness, while the registry's ACL-license gate is
+//! covered by this crate's own test assertions.
+//!
 //! Ported kind: GitHub (`internal/authz/providers/github/authz.go`). The
 //! discovery loop lists the same seven external service kinds, parses and
 //! decrypts each configuration and constructs a GitHub authz provider exactly

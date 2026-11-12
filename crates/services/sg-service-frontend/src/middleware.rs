@@ -278,7 +278,7 @@ pub fn external_handler(
                                             request,
                                             &path,
                                             &app_config.cors_origin,
-                                            assets.readonly().as_ref(),
+                                            assets.assets().as_ref(),
                                         ),
                                         None => {
                                             mux::not_found_dispatch(mux::Route::Assets { path })
@@ -458,6 +458,11 @@ pub fn external_handler_with_live(
     chain_deps: Arc<ChainDeps>,
 ) -> sg_http::HttpHandler {
     let api_live = Arc::clone(&live);
+    // The a/b slices' async seams. Repo refresh stays a placeholder until the
+    // repoupdater client lands; the LLM surface is fully wired here.
+    let repo_refresh_deps: Arc<dyn crate::repo_refresh::RepoRefreshDeps> =
+        Arc::new(crate::repo_refresh::UnavailableRepoRefreshDeps);
+    let llm_deps = Arc::new(crate::llm_api::LlmDeps::production(Arc::clone(&api_live)));
     let app_env = Arc::new(AppEnv::from_env());
     let app_deps = Arc::new(AppDeps::production());
     let middleware = Arc::new(LiveMiddleware::new(
@@ -477,6 +482,8 @@ pub fn external_handler_with_live(
         let search_deps = Arc::clone(&search_deps);
         let graphql_deps = Arc::clone(&graphql_deps);
         let chain_deps = Arc::clone(&chain_deps);
+        let repo_refresh_deps = Arc::clone(&repo_refresh_deps);
+        let llm_deps = Arc::clone(&llm_deps);
         let version = version.clone();
         Box::pin(async move {
             let derived = middleware.current();
@@ -501,6 +508,8 @@ pub fn external_handler_with_live(
                     let search_deps = Arc::clone(&search_deps);
                     let graphql_deps = Arc::clone(&graphql_deps);
                     let chain_deps = Arc::clone(&chain_deps);
+                    let repo_refresh_deps = Arc::clone(&repo_refresh_deps);
+                    let llm_deps = Arc::clone(&llm_deps);
                     Box::pin(async move {
                         mux::route_async(req, &security, |route, request| {
                             let app_env = Arc::clone(&app_env);
@@ -512,6 +521,8 @@ pub fn external_handler_with_live(
                             let graphql_deps = Arc::clone(&graphql_deps);
                             let chain_config = chain_config.clone();
                             let chain_deps = Arc::clone(&chain_deps);
+                            let repo_refresh_deps = Arc::clone(&repo_refresh_deps);
+                            let llm_deps = Arc::clone(&llm_deps);
                             let oauth_config = oauth_config.clone();
                             let oauth = oauth.clone();
                             let saml = saml.clone();
@@ -665,6 +676,8 @@ pub fn external_handler_with_live(
                                                             blame_deps,
                                                             search_deps,
                                                             graphql_deps,
+                                                            repo_refresh_deps,
+                                                            llm_deps,
                                                         )
                                                         .await
                                                     }
@@ -696,7 +709,7 @@ pub fn external_handler_with_live(
                                                 request,
                                                 path,
                                                 &app_config.cors_origin,
-                                                assets.readonly().as_ref(),
+                                                assets.assets().as_ref(),
                                             ),
                                             None => mux::not_found_dispatch(route.clone()),
                                         }

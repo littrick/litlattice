@@ -226,7 +226,16 @@ async fn graphql_http_harness() {
             internal_response_with_deps(&mut request, &live, deps, search).await
         } else {
             let blame: Arc<dyn BlameDeps> = Arc::new(NoBlame);
-            api_response_with_deps(&mut request, &live, blame, search, deps).await
+            api_response_with_deps(
+                &mut request,
+                &live,
+                blame,
+                search,
+                deps,
+                Arc::new(sg_service_frontend::repo_refresh::UnavailableRepoRefreshDeps),
+                Arc::new(sg_service_frontend::llm_api::LlmDeps::unavailable()),
+            )
+            .await
         };
 
         let status = response.status().as_u16();

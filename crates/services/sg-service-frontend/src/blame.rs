@@ -751,6 +751,8 @@ mod tests {
             deps,
             search_deps,
             graphql_deps,
+            Arc::new(crate::repo_refresh::UnavailableRepoRefreshDeps),
+            Arc::new(crate::llm_api::LlmDeps::unavailable()),
         )
         .await;
         let status = response.status();

@@ -388,25 +388,27 @@ pub struct AppDeps {
     /// The UI asset provider (`ui/assets.Provider`): the web build manifest and
     /// the hashed bundles it names. `None` keeps the UI route at the mux 404
     /// that M9.8iu measured.
-    pub ui_assets: Option<Arc<sg_ui::UiAssets>>,
+    pub ui_assets: Option<Arc<dyn sg_ui::AssetsProvider>>,
 }
 
 impl AppDeps {
     /// Production wiring (the internal API client is created lazily by the
     /// caller through [`GoImportersCounter::with_doer`]).
     pub fn production() -> Self {
-        // `cmd/frontend/shared/service.go:24-26`.
-        let root = if std::env::var("WEB_BUILDER_DEV_SERVER").as_deref() == Ok("1") {
-            sg_ui::DEV_ASSETS_PATH
-        } else {
-            sg_ui::DEFAULT_ASSET_PATH
-        };
+        // `assets.Init()` runs in `cmd/frontend/main.go:11`; the
+        // `WEB_BUILDER_DEV_SERVER` switch is `shared/service.go:24-26`.
+        if !sg_ui::is_configured() {
+            // The process never called `sg_ui::init()` (tests, embedders):
+            // keep the historical path-based default rather than failing the
+            // UI route outright.
+            sg_ui::init_from_env();
+        }
         Self {
             go_importers: GoImportersCounter::with_doer(Arc::new(SgHttpDoer::new())),
             sign_out: None,
             userpasswd: None,
             more: crate::app_handlers_more::MoreDeps::default(),
-            ui_assets: Some(Arc::new(sg_ui::UiAssets::for_path(root))),
+            ui_assets: Some(sg_ui::provider()),
         }
     }
 
@@ -429,7 +431,7 @@ impl AppDeps {
 
     /// Attach a UI asset provider (hashed bundle manifest + file reader).
     pub fn with_ui_assets(mut self, assets: Arc<sg_ui::UiAssets>) -> Self {
-        self.ui_assets = Some(assets);
+        self.ui_assets = Some(assets as Arc<dyn sg_ui::AssetsProvider>);
         self
     }
 

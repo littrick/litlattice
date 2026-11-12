@@ -238,6 +238,8 @@ async fn run(deps: &Arc<FakeDeps>, name: &str, method: &str, target: &str) {
         Arc::clone(deps) as Arc<dyn BlameDeps>,
         search_deps,
         graphql_deps,
+        Arc::new(sg_service_frontend::repo_refresh::UnavailableRepoRefreshDeps),
+        Arc::new(sg_service_frontend::llm_api::LlmDeps::unavailable()),
     )
     .await;
     let status = response.status().as_u16();
