@@ -500,6 +500,10 @@ pub struct SchemaGraphqlDeps {
     /// M9.19a repository-inventory seams (the zoekt index source). `None`
     /// reproduces a deployment with no indexed-search endpoints.
     inventory_d: Option<crate::graphql_inventory_d::InventoryDDeps>,
+    /// M9.21b `Query.outboundRequests` log source (the `httpcli` Redis FIFO
+    /// list). `None` reproduces the pre-wiring frontend (no entries).
+    outbound_request_log:
+        Option<Arc<dyn crate::outbound_requests_graphql::OutboundRequestLogSource>>,
 }
 
 /// Seams for the external-account GraphQL surface (M9.8ka): the
@@ -564,6 +568,7 @@ impl SchemaGraphqlDeps {
             org_invitation_config: None,
             inventory_c: None,
             inventory_d: None,
+            outbound_request_log: None,
         }
     }
 
@@ -632,6 +637,7 @@ impl SchemaGraphqlDeps {
             org_invitation_config: None,
             inventory_c: Some(crate::graphql_inventory_c::InventoryCDeps::default()),
             inventory_d: Some(crate::graphql_inventory_d::InventoryDDeps::default()),
+            outbound_request_log: None,
         }
     }
 
@@ -964,6 +970,16 @@ impl SchemaGraphqlDeps {
         self
     }
 
+    /// Enable `Query.outboundRequests`'s Redis log source (M9.21b). Without
+    /// it the field reproduces the pre-wiring frontend (no entries).
+    pub fn with_outbound_request_log(
+        mut self,
+        source: Arc<dyn crate::outbound_requests_graphql::OutboundRequestLogSource>,
+    ) -> Self {
+        self.outbound_request_log = Some(source);
+        self
+    }
+
     /// Inject the M9.18a batch-C seams/config. The default for
     /// `with_session` is the honest production subset (SQL-backed mutations and
     /// markdown/highlighting; external discovery, SMTP, gitserver mirror checks
@@ -1156,6 +1172,7 @@ impl SchemaGraphqlDeps {
             org_invitation_config: None,
             inventory_c: None,
             inventory_d: None,
+            outbound_request_log: None,
         }
     }
 }
@@ -1611,10 +1628,10 @@ impl GraphqlDeps for SchemaGraphqlDeps {
                     }
                     _ => Default::default(),
                 };
-                // M9.17a batch B. The indexed-search endpoint list and the
-                // outbound-request log are process-local seams that this
-                // frontend does not populate, so both default to empty (the
-                // baseline with no zoekt endpoints and no recorded requests).
+                // M9.17a batch B. The indexed-search endpoint list is a
+                // process-local seam that this frontend does not populate (the
+                // baseline with no zoekt endpoints). The outbound-request log
+                // is read from Redis when a source is wired (M9.21b).
                 inventory.business_b = crate::graphql_inventory_b::prefetch_inventory_b(
                     pool,
                     &fields,
@@ -1622,7 +1639,7 @@ impl GraphqlDeps for SchemaGraphqlDeps {
                     site_admin,
                     self.org_invitation_config.as_ref(),
                     None,
-                    None,
+                    self.outbound_request_log.as_deref(),
                 )
                 .await;
                 // M9.18a batch C.
