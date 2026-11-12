@@ -82,8 +82,9 @@ pub trait SourceFactory: Send + Sync {
 }
 
 /// `repos.NewSource` for the kinds `sg-extsvc` implements (`OTHER`,
-/// `GITHUB`, `GITLAB`, `BITBUCKETCLOUD`, `AZUREDEVOPS`, `GERRIT`, `PERFORCE`).
-/// Unknown kinds stay deny-by-default.
+/// `GITHUB`, `GITLAB`, `BITBUCKETCLOUD`, `AZUREDEVOPS`, `GERRIT`, `PERFORCE`,
+/// `NPMPACKAGES`, `PYTHONPACKAGES`, `RUBYPACKAGES`, `RUSTPACKAGES`,
+/// `GOMODULES`, `JVMPACKAGES`). Unknown kinds stay deny-by-default.
 pub struct ExtsvcSourceFactory {
     http: Option<Arc<dyn HttpGetter>>,
     /// The code-host transport (`httpcli.Doer`). Production passes an

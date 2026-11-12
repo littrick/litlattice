@@ -24,11 +24,20 @@ pub mod github;
 pub mod github_source;
 pub mod gitlab;
 pub mod gitlab_source;
+pub mod go_modules;
+pub mod go_packages;
+pub mod jvm_packages;
+pub mod npm_packages;
 pub mod other;
+pub mod packages;
 pub mod perforce;
 pub mod perforce_source;
+pub mod python_packages;
 pub mod ratelimit;
 pub mod reposource;
+pub mod reposource_packages;
+pub mod ruby_packages;
+pub mod rust_packages;
 
 use std::collections::BTreeMap;
 
@@ -47,6 +56,18 @@ pub const KIND_AZUREDEVOPS: &str = "AZUREDEVOPS";
 pub const KIND_GERRIT: &str = "GERRIT";
 /// `extsvc.KindPerforce`.
 pub const KIND_PERFORCE: &str = "PERFORCE";
+/// `extsvc.KindNpmPackages`.
+pub const KIND_NPMPACKAGES: &str = "NPMPACKAGES";
+/// `extsvc.KindPythonPackages`.
+pub const KIND_PYTHONPACKAGES: &str = "PYTHONPACKAGES";
+/// `extsvc.KindRubyPackages`.
+pub const KIND_RUBYPACKAGES: &str = "RUBYPACKAGES";
+/// `extsvc.KindRustPackages`.
+pub const KIND_RUSTPACKAGES: &str = "RUSTPACKAGES";
+/// `extsvc.KindGoPackages`.
+pub const KIND_GOMODULES: &str = "GOMODULES";
+/// `extsvc.KindJVMPackages`.
+pub const KIND_JVMPACKAGES: &str = "JVMPACKAGES";
 /// `extsvc.KindOther`.
 pub const KIND_OTHER: &str = "OTHER";
 /// `extsvc.TypeOther` (lowercase, stored in `repo.external_service_type`).
@@ -367,6 +388,56 @@ pub fn new_source(
         Ok(Box::new(bitbucketcloud_source::BitbucketCloudSource::new(
             service, doer,
         )?))
+    } else if service.kind.eq_ignore_ascii_case(KIND_NPMPACKAGES) {
+        let doer = doer.ok_or_else(|| {
+            format!(
+                "cannot create source for kind {:?}: no HTTP transport configured",
+                service.kind
+            )
+        })?;
+        Ok(Box::new(packages::PackagesSource::new_npm(service, doer)?))
+    } else if service.kind.eq_ignore_ascii_case(KIND_PYTHONPACKAGES) {
+        let doer = doer.ok_or_else(|| {
+            format!(
+                "cannot create source for kind {:?}: no HTTP transport configured",
+                service.kind
+            )
+        })?;
+        Ok(Box::new(packages::PackagesSource::new_python(
+            service, doer,
+        )?))
+    } else if service.kind.eq_ignore_ascii_case(KIND_RUBYPACKAGES) {
+        let doer = doer.ok_or_else(|| {
+            format!(
+                "cannot create source for kind {:?}: no HTTP transport configured",
+                service.kind
+            )
+        })?;
+        Ok(Box::new(packages::PackagesSource::new_ruby(
+            service, doer,
+        )?))
+    } else if service.kind.eq_ignore_ascii_case(KIND_RUSTPACKAGES) {
+        let doer = doer.ok_or_else(|| {
+            format!(
+                "cannot create source for kind {:?}: no HTTP transport configured",
+                service.kind
+            )
+        })?;
+        Ok(Box::new(packages::PackagesSource::new_rust(
+            service, doer,
+        )?))
+    } else if service.kind.eq_ignore_ascii_case(KIND_GOMODULES) {
+        let doer = doer.ok_or_else(|| {
+            format!(
+                "cannot create source for kind {:?}: no HTTP transport configured",
+                service.kind
+            )
+        })?;
+        Ok(Box::new(packages::PackagesSource::new_go(service, doer)?))
+    } else if service.kind.eq_ignore_ascii_case(KIND_JVMPACKAGES) {
+        // `NewJVMPackagesSource` takes no client factory: the baseline only
+        // uses coursier from the commented-out `Get`.
+        Ok(Box::new(packages::PackagesSource::new_jvm(service)?))
     } else if service.kind.eq_ignore_ascii_case(KIND_PERFORCE) {
         // Perforce needs the gitserver, not an HTTP transport. The Rust
         // gitserver has no Perforce RPCs, so the source reports an explicit
