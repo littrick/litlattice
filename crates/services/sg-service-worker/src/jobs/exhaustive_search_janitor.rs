@@ -454,13 +454,14 @@ impl JobConfig for SearchJobsObjectStorageConfig {
     fn load(&self, env: &mut EnvReader) {
         let mut errs = Vec::new();
 
-        let backend = env
-            .get(
-                "SEARCH_JOBS_UPLOAD_BACKEND",
-                "blobstore",
-                "The target file service for search jobs. S3, GCS, and Blobstore are supported.",
-            )
-            .to_lowercase();
+        let backend = get_required(
+            env,
+            "SEARCH_JOBS_UPLOAD_BACKEND",
+            "blobstore",
+            "The target file service for search jobs. S3, GCS, and Blobstore are supported.",
+            &mut errs,
+        )
+        .to_lowercase();
         let manage_bucket = get_bool(
             env,
             "SEARCH_JOBS_UPLOAD_MANAGE_BUCKET",
@@ -468,10 +469,12 @@ impl JobConfig for SearchJobsObjectStorageConfig {
             "Whether or not the client should manage the target bucket configuration.",
             &mut errs,
         );
-        let bucket = env.get(
+        let bucket = get_required(
+            env,
             "SEARCH_JOBS_UPLOAD_BUCKET",
             "search-jobs",
             "The name of the bucket to store search job results in.",
+            &mut errs,
         );
 
         if !matches!(backend.as_str(), "blobstore" | "s3" | "gcs") {
@@ -483,15 +486,19 @@ impl JobConfig for SearchJobsObjectStorageConfig {
         let mut s3 = S3Config::default();
         let mut gcs = GcsConfig::default();
         if matches!(backend.as_str(), "blobstore" | "s3") {
-            s3.region = env.get(
+            s3.region = get_required(
+                env,
                 "SEARCH_JOBS_UPLOAD_AWS_REGION",
                 "us-east-1",
                 "The target AWS region.",
+                &mut errs,
             );
-            s3.endpoint = env.get(
+            s3.endpoint = get_required(
+                env,
                 "SEARCH_JOBS_UPLOAD_AWS_ENDPOINT",
                 &sg_codeintel::lsifuploadstore::blobstore_default_endpoint(),
                 "The target AWS endpoint.",
+                &mut errs,
             );
             s3.use_path_style = get_bool(
                 env,
@@ -509,15 +516,19 @@ impl JobConfig for SearchJobsObjectStorageConfig {
             );
 
             if !ec2_role_credentials {
-                s3.access_key_id = env.get(
+                s3.access_key_id = get_required(
+                    env,
                     "SEARCH_JOBS_UPLOAD_AWS_ACCESS_KEY_ID",
                     "AKIAIOSFODNN7EXAMPLE",
                     "An AWS access key associated with a user with access to S3.",
+                    &mut errs,
                 );
-                s3.secret_access_key = env.get(
+                s3.secret_access_key = get_required(
+                    env,
                     "SEARCH_JOBS_UPLOAD_AWS_SECRET_ACCESS_KEY",
                     "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
                     "An AWS secret key associated with a user with access to S3.",
+                    &mut errs,
                 );
                 s3.session_token = env.get(
                     "SEARCH_JOBS_UPLOAD_AWS_SESSION_TOKEN",
@@ -526,10 +537,12 @@ impl JobConfig for SearchJobsObjectStorageConfig {
                 );
             }
         } else if backend == "gcs" {
-            gcs.project_id = env.get(
+            gcs.project_id = get_required(
+                env,
                 "SEARCH_JOBS_UPLOAD_GCP_PROJECT_ID",
                 "",
                 "The project containing the GCS bucket.",
+                &mut errs,
             );
             gcs.credentials_file = env.get(
                 "SEARCH_JOBS_UPLOAD_GOOGLE_APPLICATION_CREDENTIALS_FILE",
@@ -576,6 +589,25 @@ pub(crate) fn storage_config(
     config
         .storage()
         .ok_or_else(|| "search jobs object storage config was not loaded".to_owned())
+}
+
+/// `env.BaseConfig.Get` (`internal/env/baseconfig.go:75-86`): an empty value
+/// (explicitly empty or defaulted to empty) records
+/// `invalid value "": no value supplied` and yields `""`.
+fn get_required(
+    env: &mut EnvReader,
+    name: &str,
+    default: &str,
+    description: &str,
+    errors: &mut Vec<String>,
+) -> String {
+    let value = env.get(name, default, description);
+    if value.is_empty() {
+        errors.push(format!(
+            "invalid value {value:?} for {name}: no value supplied"
+        ));
+    }
+    value
 }
 
 /// `BaseConfig.GetBool` with `strconv.ParseBool` spellings.

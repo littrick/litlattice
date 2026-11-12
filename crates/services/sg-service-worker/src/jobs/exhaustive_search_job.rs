@@ -56,7 +56,7 @@ use crate::jobs::exhaustive_search_janitor::{
 };
 use crate::jobs::exhaustive_search_searcher::{FromSearchClient, JobClients};
 use crate::jobs::exhaustive_search_service::{
-    new_object_storage, ObjectStorageBackend, ObjectStorageLogBlobStore,
+    DefaultObjectStorageConnector, ObjectStorageConnector, ObjectStorageLogBlobStore,
     ObjectStorageMatchWriterFactory, ObjectStorageUploadStore, UploadStore,
 };
 use crate::jobs::exhaustive_search_workers::{
@@ -562,6 +562,28 @@ pub struct SearchJob {
     /// `Some` when a test/harness overrode `newSearcherFactory`; `None` uses
     /// the live-config production runtime.
     new_searcher_factory: Option<NewSearcherFactory>,
+    /// `search.NewObjectStorage`'s constructor. Production uses the real
+    /// S3/GCS client; tests inject a fake through
+    /// [`SearchJob::with_storage_connector`].
+    storage_connector: Arc<dyn ObjectStorageConnector>,
+}
+
+/// `cmd/worker/internal/search/job.go:70-78`: build the one object storage the
+/// group shares, then adapt it for the revision worker's JSON writer
+/// ([`UploadStore`]) and the janitor's log blob store.
+///
+/// The connector is the only non-production seam: config → backend is exactly
+/// [`ObjectStorageConnector::connect`], which defaults to
+/// [`crate::jobs::exhaustive_search_service::new_object_storage`].
+pub async fn assemble_object_storage(
+    connector: &dyn ObjectStorageConnector,
+    config: &SearchJobsObjectStorageConfig,
+) -> Result<(Arc<dyn UploadStore>, Arc<dyn JobLogsBlobStore>), String> {
+    let backend = connector.connect(storage_config(config)?).await?;
+    let uploads: Arc<dyn UploadStore> =
+        Arc::new(ObjectStorageUploadStore::new(Arc::clone(&backend)));
+    let blobs: Arc<dyn JobLogsBlobStore> = Arc::new(ObjectStorageLogBlobStore::new(backend));
+    Ok((uploads, blobs))
 }
 
 impl SearchJob {
@@ -569,6 +591,7 @@ impl SearchJob {
         Self {
             config: Arc::new(SearchJobsObjectStorageConfig::default()),
             new_searcher_factory: None,
+            storage_connector: Arc::new(DefaultObjectStorageConnector),
         }
     }
 
@@ -578,7 +601,14 @@ impl SearchJob {
         Self {
             config: Arc::new(SearchJobsObjectStorageConfig::default()),
             new_searcher_factory: Some(factory),
+            storage_connector: Arc::new(DefaultObjectStorageConnector),
         }
+    }
+
+    /// Replace the production object-storage constructor (tests/harnesses).
+    pub fn with_storage_connector(mut self, connector: Arc<dyn ObjectStorageConnector>) -> Self {
+        self.storage_connector = connector;
+        self
     }
 
     /// `newSearcherFactory` (`job.go:76-79`): the production adapter bundle
@@ -621,14 +651,10 @@ impl SearchJob {
             });
         }
 
-        let backend: Arc<dyn ObjectStorageBackend> =
-            new_object_storage(storage_config(&self.config)?).await?;
-        let uploads: Arc<dyn UploadStore> =
-            Arc::new(ObjectStorageUploadStore::new(Arc::clone(&backend)));
+        let (uploads, blob_store) =
+            assemble_object_storage(self.storage_connector.as_ref(), &self.config).await?;
         let writer_factory: Arc<dyn MatchWriterFactory> =
             Arc::new(ObjectStorageMatchWriterFactory::new(uploads));
-        let blob_store: Arc<dyn JobLogsBlobStore> =
-            Arc::new(ObjectStorageLogBlobStore::new(backend));
         let new_searcher = match &self.new_searcher_factory {
             Some(factory) => factory(),
             None => Self::production_searcher(&deps.frontend, &deps.live_config),
