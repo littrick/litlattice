@@ -322,6 +322,7 @@ async fn ranking_graphql_exec_harness() {
                     operation_name: "",
                     variables: &variables,
                     actor,
+                    anonymous_uid: "",
                 })
                 .await;
             responses.push(normalized_response(&response));

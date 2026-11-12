@@ -249,6 +249,10 @@ pub struct GraphqlExecRequest<'a> {
     pub operation_name: &'a str,
     pub variables: &'a Map<String, Value>,
     pub actor: Actor,
+    /// The request's resolved `AnonymousUID` (`AnonymousUIDMiddleware`): the
+    /// cookie value, else the actor propagation header. Feature-flag cache
+    /// reads/writes key on it for unauthenticated actors.
+    pub anonymous_uid: &'a str,
 }
 
 /// `graphqlbackend.LimiterArgs` (`rate_limit.go:395-403`).
@@ -427,6 +431,9 @@ pub struct SchemaGraphqlDeps {
     /// `Query.featureFlags` / `Query.featureFlag`'s database seam; `None` in
     /// transport-only tests.
     feature_flags: Option<Arc<dyn crate::graphql_resolvers::FeatureFlagStore>>,
+    /// `internal/featureflag`'s Redis evaluation cache; `None` keeps
+    /// `evaluatedFeatureFlags` empty (transport-only tests).
+    feature_flag_cache: Option<Arc<dyn crate::feature_flag_cache::EvaluatedFlagCache>>,
     /// `Mutation.updateSiteConfiguration`'s configuration store/server seams;
     /// `None` in transport-only tests.
     site_configuration: Option<crate::site_configuration_mutation::SiteConfigurationDeps>,
@@ -542,6 +549,7 @@ impl SchemaGraphqlDeps {
             clone_urls: None,
             log_events: None,
             feature_flags: None,
+            feature_flag_cache: None,
             site_configuration: None,
             config_graphql: None,
             repositories_connections: None,
@@ -602,6 +610,7 @@ impl SchemaGraphqlDeps {
             feature_flags: Some(Arc::new(
                 crate::feature_flag_store::PgFeatureFlagStore::new(pool.clone()),
             )),
+            feature_flag_cache: None,
             site_configuration: None,
             config_graphql: None,
             repositories_connections: Some(Arc::new(
@@ -691,6 +700,17 @@ impl SchemaGraphqlDeps {
         live: Arc<LiveConfig>,
     ) -> Self {
         self.rate_limit = Some(RateLimitDeps { watcher, live });
+        self
+    }
+
+    /// `internal/featureflag`'s Redis evaluation cache (`redispool.Store`):
+    /// enables `Query.evaluatedFeatureFlags` and the cache writes performed by
+    /// `evaluateFeatureFlag`.
+    pub fn with_feature_flag_cache(
+        mut self,
+        cache: Arc<dyn crate::feature_flag_cache::EvaluatedFlagCache>,
+    ) -> Self {
+        self.feature_flag_cache = Some(cache);
         self
     }
 
@@ -1134,6 +1154,7 @@ impl SchemaGraphqlDeps {
             clone_urls: None,
             log_events: None,
             feature_flags: None,
+            feature_flag_cache: None,
             site_configuration: None,
             config_graphql: None,
             repositories_connections: None,
@@ -1605,7 +1626,9 @@ impl GraphqlDeps for SchemaGraphqlDeps {
                             namespaces.as_ref(),
                             &fields,
                             request.actor,
+                            request.anonymous_uid,
                             site_admin,
+                            self.feature_flag_cache.as_deref(),
                         )
                         .await
                     }
@@ -2483,21 +2506,28 @@ where
 
     // The external chain (`session.CookieMiddlewareWithCSRFSafety`) and the
     // internal actor middleware both insert the resolved actor. Direct callers
-    // (tests) fall back to the session lookup / anonymous actor.
-    let actor = if let Some(crate::actor_chain::ChainActor(chain_actor)) =
+    // (tests) fall back to the session lookup / anonymous actor. The
+    // feature-flag cache also needs `AnonymousUID`, which the executor's three
+    // actor shapes do not carry: take it from the resolved chain actor, or
+    // (`AnonymousUIDMiddleware`) from the cookie/header for direct callers.
+    let (actor, anonymous_uid) = if let Some(crate::actor_chain::ChainActor(chain_actor)) =
         req.extensions().get::<crate::actor_chain::ChainActor>()
     {
         // An internal actor keeps its distinct executor shape; Go's
         // `IsAuthenticated` is `UID != 0`, so an internal actor (UID 0) would
         // otherwise be indistinguishable from anonymous.
-        chain_actor.to_graphql()
+        (
+            chain_actor.to_graphql(),
+            chain_actor.anonymous_uid.clone(),
+        )
     } else if internal {
-        Actor::Anonymous
+        (Actor::Anonymous, String::new())
     } else {
-        match session_actor(req.headers(), live, deps.as_ref()).await {
+        let resolved = match session_actor(req.headers(), live, deps.as_ref()).await {
             Ok(actor) => actor,
             Err(()) => return session_store_error(),
-        }
+        };
+        (resolved, actor_anonymous_uid(req.headers()))
     };
 
     // `graphql.go:116-119`: the raw query string names the request; an empty
@@ -2661,6 +2691,7 @@ where
             operation_name: &params.operation_name,
             variables: &params.variables,
             actor,
+            anonymous_uid: &anonymous_uid,
         })
         .await;
     let slow_duration_ns =

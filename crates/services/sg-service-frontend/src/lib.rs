@@ -43,6 +43,7 @@ pub mod external_api;
 pub mod external_service_mutations;
 pub mod external_services;
 pub mod extsvc_config_file;
+pub mod feature_flag_cache;
 pub mod feature_flag_mutations;
 pub mod feature_flag_store;
 pub mod feature_flags_graphql;

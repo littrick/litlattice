@@ -3453,12 +3453,30 @@ impl ObjectValue for QueryRoot {
                 }
             }
             // `Query.evaluatedFeatureFlags` (`feature_flags.go:155-165`):
-            // reads the Redis evaluation cache, which this slice does not
-            // model, so it renders the empty set.
-            "evaluatedFeatureFlags" => Ok(Some(FieldValue::List {
-                element_type: Some("EvaluatedFeatureFlag"),
-                items: Vec::new(),
-            })),
+            // the values earlier evaluations recorded in the Redis cache for
+            // this request actor (`internal/featureflag/cache.go:16-32`).
+            "evaluatedFeatureFlags" => {
+                let items = self
+                    .inventory
+                    .feature_flags
+                    .evaluated_flags
+                    .as_deref()
+                    .unwrap_or(&[])
+                    .iter()
+                    .map(|(name, value)| {
+                        FieldValue::Object(Arc::new(
+                            crate::feature_flags_graphql::EvaluatedFeatureFlagObject {
+                                name: name.clone(),
+                                value: *value,
+                            },
+                        ))
+                    })
+                    .collect();
+                Ok(Some(FieldValue::List {
+                    element_type: Some("EvaluatedFeatureFlag"),
+                    items,
+                }))
+            }
             // `Query.organizationFeatureFlagValue` (`feature_flags.go:167-185`).
             "organizationFeatureFlagValue" => {
                 let Some(org_id) = arguments
@@ -6450,6 +6468,11 @@ pub trait FeatureFlagStore: Send + Sync {
     async fn get_user_flags(
         &self,
         user_id: i32,
+    ) -> Result<std::collections::HashMap<String, bool>, String>;
+    /// `GetAnonymousUserFlags` (`internal/database/feature_flags.go:578-591`).
+    async fn get_anonymous_flags(
+        &self,
+        anonymous_uid: &str,
     ) -> Result<std::collections::HashMap<String, bool>, String>;
     /// `GetGlobalFeatureFlags` (`internal/database/feature_flags.go:592-604`).
     async fn get_global_flags(&self) -> Result<std::collections::HashMap<String, bool>, String>;

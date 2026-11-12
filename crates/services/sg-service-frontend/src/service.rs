@@ -1079,6 +1079,12 @@ impl Service for FrontendService {
         });
         let graphql_deps =
             SchemaGraphqlDeps::with_session(Arc::clone(&graphql_schema), session_pool.clone())
+                // M9.21c: `internal/featureflag`'s evaluated-flag cache uses
+                // `redispool.Store` (lazily dialed, so startup does not depend
+                // on Redis).
+                .with_feature_flag_cache(Arc::new(
+                    crate::feature_flag_cache::RedisEvaluatedFlagCache::from_env(),
+                ))
                 // M9.8jh: the read-only `Query.site.configuration` /
                 // `settingsSubject(site).configuration` surface shares the same
                 // `ConfigStore` the update loop writes, so a write is visible to

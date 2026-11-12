@@ -151,6 +151,7 @@ async fn graphql_inventory_c_harness() {
                 operation_name: "",
                 variables: &case.variables,
                 actor,
+                anonymous_uid: "",
             })
             .await;
 

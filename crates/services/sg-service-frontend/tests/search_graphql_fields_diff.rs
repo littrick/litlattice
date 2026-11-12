@@ -279,6 +279,7 @@ async fn run_query(
             operation_name: "",
             variables: &variables,
             actor: Actor::Anonymous,
+            anonymous_uid: "",
         })
         .await;
     normalized_response(&response)
