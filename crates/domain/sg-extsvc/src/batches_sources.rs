@@ -1945,6 +1945,140 @@ pub fn new_source(
     }
 }
 
+/// The connection a `sources.New<Kind>Source` constructor resolves before it
+/// builds its client: the external-service kind, the base URL the constructor
+/// uses, and the authenticator it installs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceConnection {
+    /// The canonical external-service kind (`GITHUB`, `GITLAB`,
+    /// `BITBUCKETSERVER`), i.e. the key [`new_source`] dispatches on.
+    pub kind: String,
+    /// The web base URL handed to the source constructor. GitHub and GitLab are
+    /// normalized with `extsvc.NormalizeBaseURL`; Bitbucket Server keeps the
+    /// raw parsed URL like `bitbucketserver.NewClient`.
+    pub base_url: Url,
+    /// The authenticator derived from the connection config.
+    pub auth: SourceAuth,
+}
+
+/// Resolve the plaintext external-service configuration exactly like the
+/// code-host source constructors do before their first request:
+///
+/// * `github.go:35-79` (`ghauth.FromConnection` → `OAuthBearerToken`),
+/// * `gitlab.go:37-82` (`token.type == "oauth"` → OAuth bearer, otherwise
+///   `gitlab.SudoableToken`; no token → no authenticator),
+/// * `gitbucketserver/client.go:66-92` (`token` → OAuth bearer, otherwise
+///   `BasicAuth` with `username`/`password`; OAuth 1 is a seam).
+///
+/// GitHub App connections and Bitbucket Server OAuth 1 are not ported and are
+/// reported as non-retryable errors (see the slice overview §4).
+pub fn source_connection_from_config(
+    external_service_kind: &str,
+    config: &Value,
+) -> Result<SourceConnection, SourceError> {
+    let Some(source_kind) = SourceKind::from_external_service_kind(external_service_kind) else {
+        return Err(if is_batches_source_kind(external_service_kind) {
+            SourceError::non_retryable(format!(
+                "building changeset source: code-host source for kind {external_service_kind} is not ported"
+            ))
+        } else {
+            unsupported_source_kind(external_service_kind)
+        });
+    };
+
+    let raw_url = config
+        .get("url")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let parsed = Url::parse(raw_url)
+        .map_err(|err| SourceError::other(format!("parsing external service url: {err}")))?;
+
+    let (base_url, auth) = match source_kind {
+        SourceKind::GitHub => {
+            if config
+                .get("gitHubAppDetails")
+                .map(|details| !details.is_null())
+                .unwrap_or(false)
+            {
+                return Err(SourceError::non_retryable(
+                    "building changeset source: GitHub App authentication is not ported",
+                ));
+            }
+            let token = config
+                .get("token")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            (
+                github::normalize_base_url(&parsed),
+                SourceAuth::OAuthToken(token.to_owned()),
+            )
+        }
+        SourceKind::GitLab => {
+            let token = config
+                .get("token")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let auth = if token.is_empty() {
+                SourceAuth::None
+            } else if config.get("token.type").and_then(Value::as_str) == Some("oauth") {
+                SourceAuth::OAuthToken(token.to_owned())
+            } else {
+                SourceAuth::GitLabPrivateToken(token.to_owned())
+            };
+            (github::normalize_base_url(&parsed), auth)
+        }
+        SourceKind::BitbucketServer => {
+            let authorization = config.get("authorization").filter(|value| !value.is_null());
+            let oauth2 = authorization
+                .and_then(|value| value.get("oauth2"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let has_oauth1 = authorization
+                .and_then(|value| value.get("oauth"))
+                .map(|value| !value.is_null())
+                .unwrap_or(false);
+            let auth = if authorization.is_none() || oauth2 {
+                let token = config
+                    .get("token")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                if token.is_empty() {
+                    SourceAuth::Basic {
+                        username: config
+                            .get("username")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_owned(),
+                        password: config
+                            .get("password")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_owned(),
+                    }
+                } else {
+                    SourceAuth::BearerToken(token.to_owned())
+                }
+            } else if has_oauth1 {
+                return Err(SourceError::non_retryable(
+                    "building changeset source: Bitbucket Server OAuth 1 authentication is not ported",
+                ));
+            } else {
+                // `bitbucketserver.NewClient` leaves `Auth` nil when
+                // `authorization.oauth2` is false and no OAuth 1 block exists.
+                SourceAuth::None
+            };
+            // `newClient` parses `config.Url` without `NormalizeBaseURL`.
+            (parsed, auth)
+        }
+    };
+
+    Ok(SourceConnection {
+        kind: external_service_kind.to_owned(),
+        base_url,
+        auth,
+    })
+}
+
 /// Exposed for the differential harness: merge-request probe used by
 /// `loadChangeset` returning the normalized metadata for a fixture.
 pub async fn probe_load(

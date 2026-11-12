@@ -18,12 +18,14 @@
 //!
 //! Code-host API clients are injected through [`ChangesetSource`].
 //! [`ExtsvcChangesetSource`] drives the real GitHub/GitLab/Bitbucket Server
-//! client from `sg-extsvc` (over an injectable [`sg_extsvc::HttpDoer`]);
-//! [`NotPortedChangesetSource`] remains the default when no config is wired.
-//! Webhook payload marshalling (GraphQL + internal doer), `reenqueue`'s
-//! service-level queries, `Changeset.Events()` metadata decoding and
-//! `state.SetDerivedState` (gitserver) are seams as well; the ordering
-//! semantics are reproduced by [`run_bulk_job`].
+//! client from `sg-extsvc` (over an injectable [`sg_extsvc::HttpDoer`]).
+//! Production wires [`ConfigChangesetSourceProvider`] (per-job repository +
+//! external-service resolution); [`NotPortedChangesetSource`] remains for
+//! tests. Webhook payload marshalling (GraphQL + internal doer),
+//! `Changeset.Events()` metadata decoding, `UpdateChangesetCodeHostState` and
+//! `state.SetDerivedState` (gitserver) are seams; the ordering semantics are
+//! reproduced by [`run_bulk_job`], and `reenqueue` performs the
+//! `service.ReenqueueChangeset` store update.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
@@ -32,10 +34,13 @@ use async_trait::async_trait;
 use serde_json::Value;
 use sg_db::OffsetDateTime;
 use sg_extsvc::batches_sources as extsvc;
-use sqlx::PgPool;
+use sqlx::{PgPool, Row};
 use tokio_util::sync::CancellationToken;
 
 use super::batches::batches_enabled;
+use super::batches_reconciler::{
+    PgSourceConfigProvider, ReqwestHttpDoer, SourceConfigProvider,
+};
 use super::{Job, JobDeps};
 use crate::framework::dbworker::{
     default_hostname, DbRecord, DbWorkerHandler, DbWorkerStore, WorkerOptions, WorkerRoutine,
@@ -302,6 +307,17 @@ pub trait BulkProcessorStore: Send + Sync {
         event_type: &str,
         changeset_id: i64,
     ) -> Result<(), BulkError>;
+}
+
+/// Builds the code-host source for one bulk job.
+///
+/// `sourcer.ForUser` selects the external service per repository, so a single
+/// fixed [`ChangesetSource`] cannot serve every job. Production wires
+/// [`ConfigChangesetSourceProvider`]; tests keep the fixed-source
+/// [`BulkProcessorHandler::new`].
+#[async_trait]
+pub trait ChangesetSourceProvider: Send + Sync {
+    async fn source_for(&self, changeset_id: i64) -> Result<Arc<dyn ChangesetSource>, BulkError>;
 }
 
 /// `sources.Sourcer` + `sources.ChangesetSource` (code-host clients are not
@@ -662,6 +678,134 @@ impl ChangesetEventProvider for EmptyChangesetEventProvider {
         _changeset: &Changeset,
     ) -> Result<Vec<ChangesetEvent>, BulkError> {
         Ok(Vec::new())
+    }
+}
+
+/// Production [`ChangesetMetadataResolver`]: reads the columns
+/// `GetChangeset` already returns (`changesets.external_id`/`metadata`). No
+/// schema change.
+pub struct PgChangesetMetadataResolver {
+    pool: PgPool,
+}
+
+impl PgChangesetMetadataResolver {
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
+}
+
+#[async_trait]
+impl ChangesetMetadataResolver for PgChangesetMetadataResolver {
+    async fn external_id(&self, changeset: &Changeset) -> Result<String, BulkError> {
+        let row = sqlx::query("SELECT external_id FROM changesets WHERE id = $1")
+            .bind(changeset.id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(db_error)?
+            .ok_or_else(|| {
+                BulkError::retryable(format!("loading changeset {}: not found", changeset.id))
+            })?;
+        Ok(row.get("external_id"))
+    }
+
+    async fn metadata(&self, changeset: &Changeset) -> Result<Value, BulkError> {
+        let row = sqlx::query("SELECT metadata FROM changesets WHERE id = $1")
+            .bind(changeset.id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(db_error)?
+            .ok_or_else(|| {
+                BulkError::retryable(format!("loading changeset {}: not found", changeset.id))
+            })?;
+        let metadata: Option<Value> = row.get("metadata");
+        Ok(metadata.unwrap_or(Value::Null))
+    }
+}
+
+/// Production [`ChangesetSourceProvider`]: resolves the job's repository and
+/// external-service config, then builds one [`ExtsvcChangesetSource`].
+///
+/// This is `sourcer.ForUser`'s external-service selection without the
+/// user/site credential lookups (overview §4).
+pub struct ConfigChangesetSourceProvider {
+    pool: PgPool,
+    configs: Arc<dyn SourceConfigProvider>,
+    http: Arc<dyn sg_extsvc::HttpDoer>,
+    metadata: Arc<dyn ChangesetMetadataResolver>,
+    events: Arc<dyn ChangesetEventProvider>,
+}
+
+impl ConfigChangesetSourceProvider {
+    pub fn new(
+        pool: PgPool,
+        configs: Arc<dyn SourceConfigProvider>,
+        http: Arc<dyn sg_extsvc::HttpDoer>,
+        metadata: Arc<dyn ChangesetMetadataResolver>,
+        events: Arc<dyn ChangesetEventProvider>,
+    ) -> Self {
+        Self {
+            pool,
+            configs,
+            http,
+            metadata,
+            events,
+        }
+    }
+
+    /// Convenience wiring from the job dependencies.
+    pub fn from_deps(pool: PgPool, keyring: Arc<sg_keyring::Keyring>) -> Self {
+        Self::new(
+            pool.clone(),
+            Arc::new(PgSourceConfigProvider::new(pool.clone(), keyring)),
+            Arc::new(ReqwestHttpDoer::new()),
+            Arc::new(PgChangesetMetadataResolver::new(pool)),
+            Arc::new(EmptyChangesetEventProvider),
+        )
+    }
+}
+
+fn config_error_to_bulk(err: crate::jobs::batches_reconciler::SourceError) -> BulkError {
+    if err.non_retryable {
+        BulkError::non_retryable(err.message)
+    } else {
+        BulkError::retryable(err.message)
+    }
+}
+
+#[async_trait]
+impl ChangesetSourceProvider for ConfigChangesetSourceProvider {
+    async fn source_for(&self, changeset_id: i64) -> Result<Arc<dyn ChangesetSource>, BulkError> {
+        let mut conn = self
+            .pool
+            .acquire()
+            .await
+            .map_err(|err| BulkError::retryable(format!("acquiring connection: {err}")))?;
+        let changeset = sg_db::batches::get_changeset_for_bulk_job(&mut conn, changeset_id)
+            .await
+            .map_err(db_error)?
+            .ok_or_else(|| {
+                BulkError::retryable(format!("changeset {changeset_id} not found"))
+            })?;
+        let repo = sg_db::batches::get_repo_for_bulk_job(&mut conn, changeset.repo_id)
+            .await
+            .map_err(db_error)?
+            .ok_or_else(|| BulkError::retryable("loading changeset repo: not found"))?;
+        drop(conn);
+
+        let connection = self
+            .configs
+            .config_for(&repo.external_service_type, &repo.name)
+            .await
+            .map_err(config_error_to_bulk)?;
+        let source = ExtsvcChangesetSource::new(
+            &repo.external_service_type,
+            connection.base_url,
+            connection.auth,
+            Arc::clone(&self.http),
+            Arc::clone(&self.metadata),
+            Arc::clone(&self.events),
+        )?;
+        Ok(Arc::new(source))
     }
 }
 
@@ -1061,14 +1205,45 @@ pub async fn run_bulk_job_observed(
 }
 
 /// Production handler: one `changeset_jobs` record per invocation.
+///
+/// Either a fixed [`ChangesetSource`] (tests) or a
+/// [`ChangesetSourceProvider`] (production, per-repository resolution) is
+/// configured.
 pub struct BulkProcessorHandler {
     pool: PgPool,
-    source: Arc<dyn ChangesetSource>,
+    source: Option<Arc<dyn ChangesetSource>>,
+    provider: Option<Arc<dyn ChangesetSourceProvider>>,
 }
 
 impl BulkProcessorHandler {
     pub fn new(pool: PgPool, source: Arc<dyn ChangesetSource>) -> Self {
-        Self { pool, source }
+        Self {
+            pool,
+            source: Some(source),
+            provider: None,
+        }
+    }
+
+    pub fn with_provider(pool: PgPool, provider: Arc<dyn ChangesetSourceProvider>) -> Self {
+        Self {
+            pool,
+            source: None,
+            provider: Some(provider),
+        }
+    }
+
+    async fn resolve_source(&self, record: &ChangesetJob) -> Result<Arc<dyn ChangesetSource>, String> {
+        if let Some(source) = &self.source {
+            return Ok(Arc::clone(source));
+        }
+        let provider = self
+            .provider
+            .as_ref()
+            .ok_or_else(|| "no changeset source configured".to_owned())?;
+        provider
+            .source_for(record.changeset_id)
+            .await
+            .map_err(|err| err.message)
     }
 }
 
@@ -1083,11 +1258,15 @@ pub fn is_non_retryable_message(message: &str) -> bool {
         || message.starts_with("no changeset spec for changeset ")
         || message
             == "cannot publish a changeset that has a published value set in its changesetTemplate"
+        || message == "upserting changeset events is not ported"
 }
 
 #[async_trait]
 impl DbWorkerHandler<BulkStore> for BulkProcessorHandler {
     async fn handle(&self, _ctx: CancellationToken, record: &ChangesetJob) -> Result<(), String> {
+        // `sourcer.ForUser` runs before the job-type switch; resolve the source
+        // first so a missing external service does not open a transaction.
+        let source = self.resolve_source(record).await?;
         // `store.Transact` returns a per-call transaction handle; `NumHandlers`
         // handlers run concurrently, so each invocation owns its own
         // `PgBulkProcessorStore` (and therefore its own transaction slot).
@@ -1096,7 +1275,7 @@ impl DbWorkerHandler<BulkStore> for BulkProcessorHandler {
             return Err(err.message);
         }
         let tx: &dyn BulkTransaction = &store;
-        let outcome = run_bulk_job_observed(&store, self.source.as_ref(), Ok(tx), record).await;
+        let outcome = run_bulk_job_observed(&store, source.as_ref(), Ok(tx), record).await;
         match outcome.handler_error {
             Some(err) => Err(err.message),
             None => Ok(()),
@@ -1273,10 +1452,26 @@ impl BulkProcessorStore for PgBulkProcessorStore {
         Ok(())
     }
 
-    async fn reenqueue_changeset(&self, _changeset_id: i64) -> Result<(), BulkError> {
-        Err(BulkError::retryable(
-            "service.ReenqueueChangeset is not ported (M9.9h)",
-        ))
+    async fn reenqueue_changeset(&self, changeset_id: i64) -> Result<(), BulkError> {
+        // `service.ReenqueueChangeset` → `store.EnqueueChangeset(cs,
+        // DefaultReconcilerEnqueueState(), ReconcilerStateFailed)`
+        // (`service.go:1174-1218`, `store/changesets.go:786-808`).
+        let mut guard = self.tx.lock().await;
+        let tx = guard.as_mut().ok_or_else(no_active_transaction)?;
+        let updated = sg_db::batches::enqueue_changeset(
+            &mut *tx,
+            changeset_id,
+            default_reconciler_enqueue_state(),
+            Some("failed"),
+        )
+        .await
+        .map_err(db_error)?;
+        if !updated {
+            return Err(BulkError::retryable(
+                "cannot re-enqueue changeset not in failed state",
+            ));
+        }
+        Ok(())
     }
 
     async fn set_derived_state(&self, _changeset: &Changeset) -> Result<(), BulkError> {
@@ -1288,10 +1483,15 @@ impl BulkProcessorStore for PgBulkProcessorStore {
     async fn upsert_changeset_events(
         &self,
         _changeset_id: i64,
-        _events: &[ChangesetEvent],
+        events: &[ChangesetEvent],
     ) -> Result<(), BulkError> {
-        Err(BulkError::retryable(
-            "UpsertChangesetEvents is not ported (M9.9h)",
+        if events.is_empty() {
+            // `UpsertChangesetEvents()` with zero events inserts nothing; the
+            // production event provider is `EmptyChangesetEventProvider`.
+            return Ok(());
+        }
+        Err(BulkError::non_retryable(
+            "upserting changeset events is not ported",
         ))
     }
 
@@ -1299,9 +1499,11 @@ impl BulkProcessorStore for PgBulkProcessorStore {
         &self,
         _changeset: &Changeset,
     ) -> Result<(), BulkError> {
-        Err(BulkError::retryable(
-            "UpdateChangesetCodeHostState is not ported (M9.9h)",
-        ))
+        // `state.UpdateChangesetCodeHostState` persists the code-host metadata
+        // decoded by the source (title/state/fork names/…). The reduced bulk
+        // `Changeset` does not carry it; the changeset syncer refreshes those
+        // columns. The processor's call order is preserved (overview §4).
+        Ok(())
     }
 
     async fn update_changeset_ui_publication_state(
@@ -1453,9 +1655,15 @@ impl Job for BulkOperationProcessorJob {
         }
 
         let bulk_store = Arc::new(BulkStore::new(deps.frontend.clone()));
-        let handler = Arc::new(BulkProcessorHandler::new(
+        let provider: Arc<dyn ChangesetSourceProvider> = Arc::new(
+            ConfigChangesetSourceProvider::from_deps(
+                deps.frontend.clone(),
+                Arc::clone(&deps.keyring),
+            ),
+        );
+        let handler = Arc::new(BulkProcessorHandler::with_provider(
             deps.frontend.clone(),
-            Arc::new(NotPortedChangesetSource),
+            provider,
         ));
 
         let worker = WorkerRoutine::new(

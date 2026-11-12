@@ -12,9 +12,11 @@
 //!
 //! Code-host source calls go through the [`ChangesetSourceFactory`] seam.
 //! [`ExtsvcSourceFactory`] builds the real GitHub/GitLab/Bitbucket Server
-//! clients from `sg-extsvc` with an injectable [`sg_extsvc::HttpDoer`], while
-//! [`NotPortedSourceFactory`] remains the default when no credentials/config
-//! are wired. `state.SetDerivedState`, gitserver push
+//! clients from `sg-extsvc` with an injectable [`sg_extsvc::HttpDoer`];
+//! production wires [`ConfigSourceFactory`] over
+//! [`PgSourceConfigProvider`] (decrypted `external_services` configs), while
+//! [`NotPortedSourceFactory`] remains the test/injection fallback.
+//! `state.SetDerivedState`, gitserver push
 //! ([`ChangesetSource::push_commit`]), `Changeset.Events()` derivation and
 //! GitHub App commit signing remain explicit seams, see the slice overview §4.
 //!
@@ -1277,6 +1279,306 @@ impl ChangesetSourceFactory for ExtsvcSourceFactory {
 }
 
 // ---------------------------------------------------------------------------
+// External-service configuration provider
+// ---------------------------------------------------------------------------
+
+/// Resolves the plaintext code-host connection for a repository.
+///
+/// Production wires [`PgSourceConfigProvider`]; tests and the differential
+/// harness inject [`StaticSourceConfigProvider`]. This mirrors
+/// `sources.loadExternalService` + the per-kind constructors without doing any
+/// request.
+#[async_trait]
+pub trait SourceConfigProvider: Send + Sync {
+    async fn config_for(
+        &self,
+        external_service_type: &str,
+        repo_name: &str,
+    ) -> Result<extsvc::SourceConnection, SourceError>;
+}
+
+/// Selects the first (highest-id) service matching the repository kind + host,
+/// like `loadExternalService`'s `List` order (`internal/batches/sources/
+/// sources.go:500-533`).
+fn select_connection<'a>(
+    services: &'a [PgSourceService],
+    external_service_type: &str,
+    repo_name: &str,
+) -> Option<&'a Result<extsvc::SourceConnection, SourceError>> {
+    let kind = external_service_type.to_ascii_uppercase();
+    let host = repo_name
+        .split('/')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    services
+        .iter()
+        .find(|service| {
+            service.kind.eq_ignore_ascii_case(&kind)
+                && service.host.eq_ignore_ascii_case(&host)
+        })
+        .map(|service| &service.connection)
+}
+
+/// In-memory provider for tests.
+#[derive(Debug, Default, Clone)]
+pub struct StaticSourceConfigProvider {
+    services: Vec<PgSourceService>,
+}
+
+impl StaticSourceConfigProvider {
+    /// Build from already-resolved connections.
+    pub fn new(connections: Vec<extsvc::SourceConnection>) -> Self {
+        let services = connections
+            .into_iter()
+            .enumerate()
+            .map(|(index, connection)| PgSourceService {
+                id: index as i64,
+                kind: connection.kind.clone(),
+                host: connection
+                    .base_url
+                    .host_str()
+                    .unwrap_or_default()
+                    .to_ascii_lowercase(),
+                connection: Ok(connection),
+            })
+            .collect();
+        Self { services }
+    }
+}
+
+#[async_trait]
+impl SourceConfigProvider for StaticSourceConfigProvider {
+    async fn config_for(
+        &self,
+        external_service_type: &str,
+        repo_name: &str,
+    ) -> Result<extsvc::SourceConnection, SourceError> {
+        match select_connection(&self.services, external_service_type, repo_name) {
+            Some(Ok(connection)) => Ok(connection.clone()),
+            Some(Err(err)) => Err(err.clone()),
+            None => Err(SourceError::other("no external services found")),
+        }
+    }
+}
+
+/// A decrypted external service ready to become a source. The connection is a
+/// `Result` so one unsupported config (e.g. a GitHub App connection) does not
+/// poison every repository of that kind.
+#[derive(Debug, Clone)]
+pub struct PgSourceService {
+    pub id: i64,
+    pub kind: String,
+    pub host: String,
+    pub connection: Result<extsvc::SourceConnection, SourceError>,
+}
+
+/// Production provider: decrypts live `external_services` configs with the
+/// external-service key and caches the resolved connections. The cache is a
+/// `OnceCell` so a failed load is retried (like `internal/object`'s
+/// `lazyStore.initOnce`).
+pub struct PgSourceConfigProvider {
+    pool: PgPool,
+    keyring: Arc<sg_keyring::Keyring>,
+    cache: tokio::sync::OnceCell<Vec<PgSourceService>>,
+}
+
+impl PgSourceConfigProvider {
+    pub fn new(pool: PgPool, keyring: Arc<sg_keyring::Keyring>) -> Self {
+        Self {
+            pool,
+            keyring,
+            cache: tokio::sync::OnceCell::new(),
+        }
+    }
+
+    async fn load(&self) -> Result<Vec<PgSourceService>, SourceError> {
+        let store = sg_db::external_services::ExternalServiceStore::new(self.pool.clone());
+        let services = store
+            .list()
+            .await
+            .map_err(|err| SourceError::other(format!("loading external services: {err}")))?;
+
+        let mut resolved = Vec::new();
+        for service in services {
+            if extsvc::SourceKind::from_external_service_kind(&service.kind).is_none() {
+                // `loadExternalService` skips configs it cannot decode into one
+                // of the batches connection schemas.
+                continue;
+            }
+            let raw = sg_encryption::maybe_decrypt(
+                self.keyring.external_service_key().as_deref(),
+                &service.config,
+                &service.encryption_key_id,
+            )
+            .await
+            .map_err(|err| {
+                SourceError::other(format!(
+                    "external service id={} config error: {err}",
+                    service.id
+                ))
+            })?;
+            let plain = sg_config::strip_jsonc(&raw);
+            let value: serde_json::Value = serde_json::from_str(&plain).map_err(|err| {
+                SourceError::other(format!(
+                    "external service id={} config error: {err}",
+                    service.id
+                ))
+            })?;
+            let host = value
+                .get("url")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|raw| url::Url::parse(raw).ok())
+                .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
+                .unwrap_or_default();
+            let connection = extsvc::source_connection_from_config(&service.kind, &value)
+                .map_err(map_source_error);
+            resolved.push(PgSourceService {
+                id: service.id,
+                kind: service.kind,
+                host,
+                connection,
+            });
+        }
+        Ok(resolved)
+    }
+}
+
+#[async_trait]
+impl SourceConfigProvider for PgSourceConfigProvider {
+    async fn config_for(
+        &self,
+        external_service_type: &str,
+        repo_name: &str,
+    ) -> Result<extsvc::SourceConnection, SourceError> {
+        let services = self
+            .cache
+            .get_or_try_init(|| async { self.load().await })
+            .await?;
+        match select_connection(services, external_service_type, repo_name) {
+            Some(Ok(connection)) => Ok(connection.clone()),
+            Some(Err(err)) => Err(err.clone()),
+            None => Err(SourceError::other("no external services found")),
+        }
+    }
+}
+
+/// Production [`sg_extsvc::HttpDoer`] backed by `reqwest`.
+///
+/// Tests inject a recording fake instead, so the differential never contacts a
+/// code host.
+#[derive(Clone)]
+pub struct ReqwestHttpDoer {
+    client: reqwest::Client,
+}
+
+impl ReqwestHttpDoer {
+    pub fn new() -> Self {
+        Self {
+            client: reqwest::Client::new(),
+        }
+    }
+}
+
+impl Default for ReqwestHttpDoer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl sg_extsvc::HttpDoer for ReqwestHttpDoer {
+    async fn do_request(
+        &self,
+        request: sg_extsvc::HttpRequest,
+    ) -> Result<sg_extsvc::HttpResponse, String> {
+        let method = reqwest::Method::from_bytes(request.method.as_bytes())
+            .map_err(|err| format!("invalid HTTP method: {err}"))?;
+        let mut builder = self.client.request(method, &request.url);
+        for (name, value) in &request.headers {
+            builder = builder.header(name, value);
+        }
+        if !request.body.is_empty() {
+            builder = builder.body(request.body);
+        }
+        let response = builder
+            .send()
+            .await
+            .map_err(|err| format!("request failed: {err}"))?;
+        let status = response.status().as_u16();
+        let headers = response
+            .headers()
+            .iter()
+            .map(|(name, value)| {
+                (
+                    name.as_str().to_owned(),
+                    value.to_str().unwrap_or_default().to_owned(),
+                )
+            })
+            .collect();
+        let body = response
+            .bytes()
+            .await
+            .map_err(|err| format!("reading response: {err}"))?
+            .to_vec();
+        Ok(sg_extsvc::HttpResponse {
+            status,
+            headers,
+            body,
+        })
+    }
+}
+
+/// Production [`ChangesetSourceFactory`]: resolves the repository's external
+/// service config and builds one `sg-extsvc` source, matching
+/// `sourcer.ForChangeset` → `loadBatchesSource` → `buildChangesetSource`.
+pub struct ConfigSourceFactory {
+    configs: Arc<dyn SourceConfigProvider>,
+    http: Arc<dyn sg_extsvc::HttpDoer>,
+    repo_metadata: Arc<dyn RepoMetadataProvider>,
+}
+
+impl ConfigSourceFactory {
+    pub fn new(
+        configs: Arc<dyn SourceConfigProvider>,
+        http: Arc<dyn sg_extsvc::HttpDoer>,
+        repo_metadata: Arc<dyn RepoMetadataProvider>,
+    ) -> Self {
+        Self {
+            configs,
+            http,
+            repo_metadata,
+        }
+    }
+}
+
+#[async_trait]
+impl ChangesetSourceFactory for ConfigSourceFactory {
+    async fn for_changeset(
+        &self,
+        changeset: &Changeset,
+        target_repo: &Repo,
+    ) -> Result<Arc<dyn ChangesetSource>, SourceError> {
+        let connection = self
+            .configs
+            .config_for(&changeset.external_service_type, &target_repo.name)
+            .await
+            .map_err(|err| SourceError {
+                message: format!("loading external service: {}", err.message),
+                ..err
+            })?;
+        let factory = ExtsvcSourceFactory::new(
+            connection.kind,
+            connection.base_url,
+            connection.auth,
+            Arc::clone(&self.http),
+            Arc::clone(&self.repo_metadata),
+        );
+        factory.for_changeset(changeset, target_repo).await
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Store seam
 // ---------------------------------------------------------------------------
 
@@ -2522,9 +2824,18 @@ impl Job for BatchesReconcilerJob {
             deps.frontend.clone(),
             external_url,
         ));
+        let configs: Arc<dyn SourceConfigProvider> = Arc::new(PgSourceConfigProvider::new(
+            deps.frontend.clone(),
+            Arc::clone(&deps.keyring),
+        ));
+        let source_factory: Arc<dyn ChangesetSourceFactory> = Arc::new(ConfigSourceFactory::new(
+            configs,
+            Arc::new(ReqwestHttpDoer::new()),
+            Arc::new(NameRepoMetadataProvider),
+        ));
         let handler = Arc::new(ReconcilerHandler::new(
             store_factory,
-            Arc::new(NotPortedSourceFactory),
+            source_factory,
             false,
         ));
         let store = Arc::new(ChangesetWorkerStore::new(deps.frontend.clone()));
