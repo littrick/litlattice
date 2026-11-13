@@ -2679,6 +2679,7 @@ impl FrontendRootResolver {
                 code_monitors: None,
                 codeintel_uploads: None,
                 codeintel_autoindexing: None,
+                codeintel_policies: None,
                 batches: None,
                 github_apps: None,
                 teams: None,
@@ -2892,6 +2893,16 @@ impl FrontendRootResolver {
     ) -> Self {
         self.query.codeintel_autoindexing = codeintel_autoindexing.clone();
         self.mutation.codeintel_autoindexing = codeintel_autoindexing;
+        self
+    }
+
+    /// Attach the optional code-intel configuration-policy surface (M9.28c).
+    pub fn with_codeintel_policies(
+        mut self,
+        codeintel_policies: Option<crate::codeintel_policies_graphql::CodeIntelPoliciesHandle>,
+    ) -> Self {
+        self.query.codeintel_policies = codeintel_policies.clone();
+        self.mutation.codeintel_policies = codeintel_policies;
         self
     }
 
@@ -3235,6 +3246,9 @@ struct QueryRoot {
     /// autoindexing root fields and `Repository.indexConfiguration` unported.
     codeintel_autoindexing:
         Option<crate::codeintel_autoindexing_graphql::CodeIntelAutoindexingHandle>,
+    /// Optional configuration-policy surface (M9.28c). `None` leaves the
+    /// `codeintel.policies.graphql` fields unported.
+    codeintel_policies: Option<crate::codeintel_policies_graphql::CodeIntelPoliciesHandle>,
     /// Optional outbound webhook surface (M9.27b). `None` leaves
     /// `Query.outboundWebhooks` / `outboundWebhookEventTypes` and
     /// `node(OutboundWebhook)` unported.
@@ -3295,6 +3309,8 @@ pub struct MutationRoot {
     /// Optional code-intel autoindexing mutations (M9.28b).
     codeintel_autoindexing:
         Option<crate::codeintel_autoindexing_graphql::CodeIntelAutoindexingHandle>,
+    /// Optional configuration-policy mutations (M9.28c).
+    codeintel_policies: Option<crate::codeintel_policies_graphql::CodeIntelPoliciesHandle>,
 }
 
 impl MutationRoot {
@@ -3446,6 +3462,17 @@ impl ObjectValue for MutationRoot {
             if crate::codeintel_uploads_graphql::is_mutation_field(field) {
                 return crate::codeintel_uploads_graphql::mutation_field(
                     codeintel_uploads,
+                    field,
+                    arguments,
+                    actor,
+                );
+            }
+        }
+        // M9.28c configuration-policy mutations.
+        if let Some(codeintel_policies) = &self.codeintel_policies {
+            if crate::codeintel_policies_graphql::is_mutation_field(field) {
+                return crate::codeintel_policies_graphql::mutation_field(
+                    codeintel_policies,
                     field,
                     arguments,
                     actor,
@@ -3712,7 +3739,8 @@ impl QueryRoot {
                             .with_git(self.git.clone())
                             .with_embeddings(self.nested.repo_embeddings.clone())
                             .with_inventory_d(Some(self.inventory.graphql_d.clone()))
-                            .with_autoindexing(self.codeintel_autoindexing.clone()),
+                            .with_autoindexing(self.codeintel_autoindexing.clone())
+                            .with_codeintel_policies(self.codeintel_policies.clone()),
                     )))),
                     Some(RepoLookup::NotFound) => Ok(Some(FieldValue::Null)),
                     Some(RepoLookup::Blocked { name, reason }) => Err(ExecError::new(format!(
@@ -4211,7 +4239,8 @@ impl ObjectValue for QueryRoot {
                         let mut object = RepositoryObject::from_data(data.clone())
                             .with_git(self.git.clone())
                             .with_embeddings(self.nested.repo_embeddings.clone())
-                            .with_inventory_d(Some(self.inventory.graphql_d.clone()));
+                            .with_inventory_d(Some(self.inventory.graphql_d.clone()))
+                            .with_codeintel_policies(self.codeintel_policies.clone());
                         // `Repository.batchChanges` (M9.24c): the batch-changes
                         // resolver is attached to the object, like the
                         // `User`/`Org` root fields which get it through
@@ -4237,7 +4266,8 @@ impl ObjectValue for QueryRoot {
                             let mut object = RepositoryObject::from_data(data.clone())
                                 .with_git(self.git.clone())
                                 .with_embeddings(self.nested.repo_embeddings.clone())
-                                .with_inventory_d(Some(self.inventory.graphql_d.clone()));
+                                .with_inventory_d(Some(self.inventory.graphql_d.clone()))
+                                .with_codeintel_policies(self.codeintel_policies.clone());
                             if let Some(batches) = self.batches.clone() {
                                 object = object.with_batches(batches);
                             }
@@ -4267,7 +4297,8 @@ impl ObjectValue for QueryRoot {
                             .with_git(self.git.clone())
                             .with_embeddings(self.nested.repo_embeddings.clone())
                             .with_inventory_d(Some(self.inventory.graphql_d.clone()))
-                            .with_autoindexing(self.codeintel_autoindexing.clone()),
+                            .with_autoindexing(self.codeintel_autoindexing.clone())
+                            .with_codeintel_policies(self.codeintel_policies.clone()),
                     )))),
                     Some(RepoLookup::NotFound) => Ok(Some(FieldValue::Null)),
                     Some(RepoLookup::Blocked { name, reason }) => Err(ExecError::new(format!(
@@ -4287,7 +4318,8 @@ impl ObjectValue for QueryRoot {
                                 .with_git(self.git.clone())
                                 .with_embeddings(self.nested.repo_embeddings.clone())
                                 .with_inventory_d(Some(self.inventory.graphql_d.clone()))
-                            .with_autoindexing(self.codeintel_autoindexing.clone()),
+                            .with_autoindexing(self.codeintel_autoindexing.clone())
+                                .with_codeintel_policies(self.codeintel_policies.clone()),
                         )))),
                         Some(RepoLookup::NotFound) => Ok(Some(FieldValue::Null)),
                         Some(RepoLookup::Blocked { name, reason }) => Err(ExecError::new(format!(
@@ -4711,6 +4743,19 @@ impl ObjectValue for QueryRoot {
                             actor,
                         )
                     }
+                    // `NodeResolvers()["CodeIntelligenceConfigurationPolicy"]`
+                    // (M9.28c).
+                    _ if self.codeintel_policies.is_some()
+                        && crate::codeintel_policies_graphql::is_node_kind(kind.as_str()) =>
+                    {
+                        crate::codeintel_policies_graphql::node_field(
+                            self.codeintel_policies
+                                .as_ref()
+                                .expect("checked codeintel policies"),
+                            id,
+                            actor,
+                        )
+                    }
                     _ => self.node_int32(kind.as_str(), id),
                 }
             }
@@ -4996,6 +5041,21 @@ impl ObjectValue for QueryRoot {
                     self.outbound_webhooks
                         .as_ref()
                         .expect("checked outbound webhooks"),
+                    field,
+                    arguments,
+                    actor,
+                )
+            }
+            // Configuration-policy root fields
+            // (`Query.codeIntelligenceConfigurationPolicies`,
+            // `Query.previewRepositoryFilter`, M9.28c).
+            _ if self.codeintel_policies.is_some()
+                && crate::codeintel_policies_graphql::is_root_field(field) =>
+            {
+                crate::codeintel_policies_graphql::root_field(
+                    self.codeintel_policies
+                        .as_ref()
+                        .expect("checked codeintel policies"),
                     field,
                     arguments,
                     actor,
@@ -6669,6 +6729,9 @@ pub struct RepositoryObject {
     autoindexing: Option<
         crate::codeintel_autoindexing_graphql::CodeIntelAutoindexingHandleWrapper,
     >,
+    /// The configuration-policy surface (M9.28c); `None` leaves
+    /// `Repository.previewGitObjectFilter` unported.
+    codeintel_policies: Option<crate::codeintel_policies_graphql::CodeIntelPoliciesHandle>,
 }
 
 impl RepositoryObject {
@@ -6680,6 +6743,7 @@ impl RepositoryObject {
             inventory_d: None,
             batches: None,
             autoindexing: None,
+            codeintel_policies: None,
         }
     }
 
@@ -6699,6 +6763,15 @@ impl RepositoryObject {
         self.autoindexing = autoindexing.map(
             crate::codeintel_autoindexing_graphql::CodeIntelAutoindexingHandleWrapper,
         );
+        self
+    }
+
+    /// Attach the configuration-policy surface (M9.28c).
+    pub fn with_codeintel_policies(
+        mut self,
+        codeintel_policies: Option<crate::codeintel_policies_graphql::CodeIntelPoliciesHandle>,
+    ) -> Self {
+        self.codeintel_policies = codeintel_policies;
         self
     }
 
@@ -6762,6 +6835,16 @@ impl ObjectValue for RepositoryObject {
                     arguments,
                     actor,
                 ),
+                None => Ok(None),
+            },
+            // `RepositoryResolver.PreviewGitObjectFilter` (M9.28c).
+            "previewGitObjectFilter" => match &self.codeintel_policies {
+                Some(database) => crate::codeintel_policies_graphql::preview_git_object_filter(
+                    database,
+                    self.data.id,
+                    arguments,
+                )
+                .map(Some),
                 None => Ok(None),
             },
             // `RepositoryResolver.BatchChanges` (M9.24c).
