@@ -223,6 +223,36 @@ pub trait GitObjectSource: Send + Sync {
         ))
     }
 
+    /// `gitserver.Client.ListRefs` with `PointsAtCommit` (M9.31c, the
+    /// `policies.Matcher` seam). Defaulted so existing fakes keep compiling;
+    /// sources that cannot filter by commit fall back to [`Self::list_refs`].
+    async fn list_refs_with_points(
+        &self,
+        repo_id: i32,
+        repo_name: &str,
+        heads_only: bool,
+        tags_only: bool,
+        _points_at_commit: &[String],
+    ) -> Result<Vec<sg_git::GitRef>, GitSourceError> {
+        self.list_refs(repo_id, repo_name, heads_only, tags_only)
+            .await
+    }
+
+    /// `gitserver.Client.Commits` (`CommitsOptions` + `CommitLog`). Defaulted
+    /// so existing fakes keep compiling; the matcher reports the not-found
+    /// semantics when a source has no commit reader (it must never fabricate
+    /// commits).
+    async fn commits(
+        &self,
+        _repo_id: i32,
+        _repo_name: &str,
+        _options: &sg_git::CommitsOptions,
+    ) -> Result<Vec<sg_git::Commit>, GitSourceError> {
+        Err(GitSourceError::new(
+            "GitObjectSource::commits is not implemented",
+        ))
+    }
+
     /// `gitserver.Client.ListRefs(TagsOnly:true, PointsAtCommit:[oid])`
     /// (M9.30d, `gitresolvers/commit.go:58-76`). An empty result is
     /// `Ok(vec![])`, never an error.
@@ -492,6 +522,34 @@ impl GitObjectSource for GitserverGitObjects {
         let (client, _addr) = self.client_for(repo_name).await?;
         client
             .list_refs(repo_name, heads_only, tags_only, &[], None)
+            .await
+            .map_err(GitSourceError::from)
+    }
+
+    async fn list_refs_with_points(
+        &self,
+        _repo_id: i32,
+        repo_name: &str,
+        heads_only: bool,
+        tags_only: bool,
+        points_at_commit: &[String],
+    ) -> Result<Vec<sg_git::GitRef>, GitSourceError> {
+        let (client, _addr) = self.client_for(repo_name).await?;
+        client
+            .list_refs(repo_name, heads_only, tags_only, points_at_commit, None)
+            .await
+            .map_err(GitSourceError::from)
+    }
+
+    async fn commits(
+        &self,
+        _repo_id: i32,
+        repo_name: &str,
+        options: &sg_git::CommitsOptions,
+    ) -> Result<Vec<sg_git::Commit>, GitSourceError> {
+        let (client, _addr) = self.client_for(repo_name).await?;
+        client
+            .commits(repo_name, options)
             .await
             .map_err(GitSourceError::from)
     }
