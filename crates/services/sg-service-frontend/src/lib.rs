@@ -24,6 +24,7 @@ pub mod auth_providers_graphql;
 pub mod authz;
 pub mod batches_graphql;
 pub mod batches_graphql_store;
+pub mod batches_mutations;
 pub mod blame;
 pub mod client_configuration;
 pub mod clone_urls;

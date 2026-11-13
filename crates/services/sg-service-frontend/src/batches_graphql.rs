@@ -269,6 +269,77 @@ pub struct ChangesetSyncDataRow {
     pub external_updated_at: Option<OffsetDateTime>,
 }
 
+/// One `batch_specs` row as the mutation resolvers need it (M9.25b).
+///
+/// `name`/`description` are read from the `spec` JSONB column, matching
+/// `btypes.BatchSpec.Spec.Name`/`.Description` in the Go baseline.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BatchSpecRow {
+    pub id: i64,
+    pub rand_id: String,
+    pub raw_spec: String,
+    pub name: String,
+    pub description: String,
+    pub namespace_user_id: i32,
+    pub namespace_org_id: i32,
+    pub user_id: i32,
+    pub batch_change_id: i64,
+}
+
+impl BatchSpecRow {
+    pub fn namespace(&self) -> NamespaceIds {
+        NamespaceIds {
+            user: self.namespace_user_id,
+            org: self.namespace_org_id,
+        }
+    }
+}
+
+/// `batches.PublishedValue`: the quadruple `nil`, `true`, `false`, `"draft"`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum PublishedValue {
+    #[default]
+    Null,
+    Bool(bool),
+    Draft,
+}
+
+impl PublishedValue {
+    /// `ChangesetUiPublicationStateFromPublishedValue`: `nil` maps to `None`.
+    pub fn ui_publication_state(&self) -> Option<&'static str> {
+        match self {
+            PublishedValue::Null => None,
+            PublishedValue::Bool(true) => Some("PUBLISHED"),
+            PublishedValue::Bool(false) => Some("UNPUBLISHED"),
+            PublishedValue::Draft => Some("DRAFT"),
+        }
+    }
+}
+
+/// `service.ApplyBatchChangeOpts` as the GraphQL resolver builds it.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ApplyBatchChangeRequest {
+    pub batch_spec_rand_id: String,
+    pub ensure_batch_change_id: i64,
+    pub fail_if_batch_change_exists: bool,
+    pub publication_states: Vec<(String, PublishedValue)>,
+}
+
+/// `types.BulkOperation` aggregated over `changeset_jobs`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BulkOperationRow {
+    /// `changeset_jobs.bulk_group`, the GraphQL ID payload.
+    pub id: String,
+    /// `changeset_jobs.job_type`.
+    pub job_type: String,
+    pub state: String,
+    pub progress: f64,
+    pub user_id: i32,
+    pub changeset_count: i64,
+    pub created_at: OffsetDateTime,
+    pub finished_at: Option<OffsetDateTime>,
+}
+
 // ---------------------------------------------------------------------------
 // Database seam
 // ---------------------------------------------------------------------------
@@ -337,6 +408,88 @@ pub trait BatchesGraphqlDatabase: Send + Sync {
         repo_ids: &[i32],
         actor: Actor,
     ) -> Result<HashMap<i32, RepositoryData>, String>;
+
+    // -------------------------------------------------------------------
+    // M9.25b write surface
+    // -------------------------------------------------------------------
+
+    /// `conf.BatchChangesRestrictedToAdmins`.
+    fn batch_changes_restricted_to_admins(&self) -> bool {
+        false
+    }
+
+    /// `rbac.CheckCurrentUserHasPermission(..., BatchChangesWritePermission)`.
+    fn current_user_has_batch_changes_write(&self, actor: Actor) -> Result<(), String>;
+
+    /// `service.CheckNamespaceAccess`.
+    fn check_namespace_access(&self, actor: Actor, namespace: NamespaceIds) -> Result<(), String>;
+
+    /// `service.checkViewerCanAdminister` for an existing batch change
+    /// (`allowOrgMemberAccess == false`).
+    fn viewer_can_administer_batch_change(
+        &self,
+        actor: Actor,
+        namespace_org_id: i32,
+        creator_id: i32,
+    ) -> Result<(), String>;
+
+    /// The org setting `orgs.allMembersBatchChangesAdmin` (default false).
+    fn org_all_members_batch_changes_admin(&self, org_id: i32) -> Result<bool, String>;
+
+    /// `store.GetBatchSpec(RandID)`; `None` corresponds to `ErrNoResults`.
+    fn get_batch_spec_by_rand_id(&self, rand_id: &str) -> Result<Option<BatchSpecRow>, String>;
+
+    /// `service.ApplyBatchChange` (including `Rewire`), returning the batch
+    /// change to render.
+    fn apply_batch_change(
+        &self,
+        request: &ApplyBatchChangeRequest,
+        actor: Actor,
+    ) -> Result<BatchChangeRow, String>;
+
+    /// `service.CreateEmptyBatchChange`.
+    fn create_empty_batch_change(
+        &self,
+        namespace: NamespaceIds,
+        name: &str,
+        actor: Actor,
+    ) -> Result<BatchChangeRow, String>;
+
+    /// `service.MoveBatchChange`.
+    fn move_batch_change(
+        &self,
+        batch_change_id: i64,
+        new_name: Option<&str>,
+        new_namespace: Option<NamespaceIds>,
+        actor: Actor,
+    ) -> Result<BatchChangeRow, String>;
+
+    /// `service.CloseBatchChange`.
+    fn close_batch_change(
+        &self,
+        batch_change_id: i64,
+        close_changesets: bool,
+        actor: Actor,
+    ) -> Result<BatchChangeRow, String>;
+
+    /// `service.DeleteBatchChange`.
+    fn delete_batch_change(&self, batch_change_id: i64, actor: Actor) -> Result<(), String>;
+
+    /// `service.CreateChangesetJobs(ChangesetJobTypeReenqueue)`: `None` is
+    /// `store.ErrNoResults` from `GetBulkOperation`.
+    fn reenqueue_changesets(
+        &self,
+        batch_change_id: i64,
+        changeset_ids: &[i64],
+        actor: Actor,
+    ) -> Result<Option<BulkOperationRow>, String>;
+
+    /// `service.enqueueBatchChangeWebhook`. Fire-and-forget in the baseline
+    /// (errors only logged); the production adapter wires
+    /// `sg_extsvc::batches_webhooks` here.
+    fn enqueue_batch_change_webhook(&self, event_type: &str, graphql_id: &str) {
+        let _ = (event_type, graphql_id);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1020,6 +1173,21 @@ pub fn marshal_batch_change_id(id: i64) -> String {
 /// `relay.MarshalID("Changeset", id)`.
 pub fn marshal_changeset_id(id: i64) -> String {
     base64::engine::general_purpose::URL_SAFE.encode(format!("{CHANGESET_KIND}:{id}"))
+}
+
+/// `resolvers.marshalBulkOperationID` (`bulk_operation.go:24`): the payload is
+/// a JSON string, so the colon suffix is quoted.
+pub fn marshal_bulk_operation_id(id: &str) -> String {
+    base64::engine::general_purpose::URL_SAFE
+        .encode(format!("BulkOperation:{}", serde_json::json!(id)))
+}
+
+/// `relay.UnmarshalSpec` into a string (batch spec random IDs).
+pub fn unmarshal_relay_string(id: &str) -> Result<String, String> {
+    match unmarshal_relay_spec(id)? {
+        JsonValue::String(value) => Ok(value),
+        _ => Err("invalid graphql.ID".to_owned()),
+    }
 }
 
 fn json_str(value: impl Into<String>) -> FieldValue {
