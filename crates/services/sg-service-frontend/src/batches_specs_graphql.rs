@@ -215,6 +215,86 @@ pub struct ChangesetSpecPage {
     pub next: i64,
 }
 
+/// One unhydrated `btypes.RewirerMapping` (`GetRewirerMappings` scan).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RewirerMappingRow {
+    pub changeset_spec_id: i64,
+    pub changeset_id: i64,
+    pub repo_id: i32,
+}
+
+/// One `batch_change_ids` entry (`btypes.BatchChangeAssoc`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BatchChangeAssocRow {
+    pub batch_change_id: i64,
+    pub detach: bool,
+    pub archive: bool,
+    pub is_archived: bool,
+}
+
+/// The `changesets` fields the apply-preview dry-run planner reads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApplyChangesetRow {
+    pub id: i64,
+    pub repo_id: i32,
+    pub external_id: String,
+    pub external_service_type: String,
+    pub external_state: String,
+    pub publication_state: String,
+    pub owned_by_batch_change_id: i64,
+    pub current_spec_id: i64,
+    pub previous_spec_id: i64,
+    pub reconciler_state: String,
+    pub closing: bool,
+    pub ui_publication_state: Option<String>,
+    pub computed_state: String,
+    pub created_at: OffsetDateTime,
+    pub updated_at: OffsetDateTime,
+    pub batch_changes: Vec<BatchChangeAssocRow>,
+}
+
+impl ApplyChangesetRow {
+    /// `btypes.Changeset.Published`.
+    pub fn published(&self) -> bool {
+        self.publication_state == "PUBLISHED"
+    }
+
+    /// `btypes.Changeset.Unpublished`.
+    pub fn unpublished(&self) -> bool {
+        self.publication_state == "UNPUBLISHED"
+    }
+
+    /// `btypes.Changeset.AttachedTo`.
+    pub fn attached_to(&self, batch_change_id: i64) -> bool {
+        self.batch_changes
+            .iter()
+            .any(|assoc| assoc.batch_change_id == batch_change_id)
+    }
+
+    /// `btypes.Changeset.ArchivedIn`.
+    pub fn archived_in(&self, batch_change_id: i64) -> bool {
+        self.batch_changes
+            .iter()
+            .any(|assoc| assoc.batch_change_id == batch_change_id && assoc.is_archived)
+    }
+
+    /// `btypes.Changeset.Closeable`.
+    pub fn closeable(&self) -> bool {
+        !matches!(
+            self.external_state.as_str(),
+            "CLOSED" | "MERGED" | "READ_ONLY" | "READONLY"
+        )
+    }
+
+    /// `btypes.Changeset.SupportsDraft`.
+    pub fn supports_draft(&self) -> bool {
+        matches!(
+            self.external_service_type.as_str(),
+            "github" | "gitlab" | "azureDevOps" | "azuredevops" | "gerrit"
+        )
+    }
+}
+
 /// `batch_spec_workspaces` row plus the latest execution job.
 #[derive(Debug, Clone, PartialEq)]
 pub struct BatchSpecWorkspaceRow {
@@ -460,6 +540,30 @@ pub trait BatchesSpecsDatabase: Send + Sync {
     /// `store.ListChangesetSpecsWithConflictingHeadRef` grouped counts:
     /// `(repo_id, head_ref, count)`.
     fn conflicting_head_refs(&self, batch_spec_id: i64) -> Result<Vec<(i32, String, i64)>, String>;
+
+    /// `store.GetRewirerMappings` (unhydrated; SQL order: changeset spec id,
+    /// changeset id). Text search and `currentState` follow Go's three-branch
+    /// UNION.
+    fn get_rewirer_mappings(
+        &self,
+        batch_spec_id: i64,
+        batch_change_id: i64,
+        text_search: &[crate::batches_graphql::TextSearchTerm],
+        current_state: Option<&str>,
+    ) -> Result<Vec<RewirerMappingRow>, String>;
+
+    /// `store.ListChangesets{IDs}` projection used by the dry-run planner.
+    fn changesets_for_apply(&self, ids: &[i64]) -> Result<Vec<ApplyChangesetRow>, String>;
+
+    /// `store.ListBatchSpecRepoIDs` (authz-filtered, `DISTINCT repo.id`).
+    fn list_batch_spec_repo_ids(&self, batch_spec_id: i64, actor: Actor) -> Result<Vec<i32>, String>;
+
+    /// `store.ListCodeHosts` for a repo-id subset (only supported hosts).
+    fn code_hosts_for_repos(
+        &self,
+        repo_ids: &[i32],
+        only_without_webhooks: bool,
+    ) -> Result<Vec<crate::batches_changeset_read::CodeHostRow>, String>;
 }
 
 pub type BatchesSpecsHandle = Arc<dyn BatchesSpecsDatabase + Send + Sync>;
@@ -1321,8 +1425,15 @@ impl ObjectValue for BatchSpecObject {
                     self.db.clone(),
                 )))))
             }
-            // `applyPreview` and `viewerBatchChangesCodeHosts` are not ported
-            // in this slice (see the overview).
+            "applyPreview" | "viewerBatchChangesCodeHosts" => {
+                crate::batches_apply_preview::batch_spec_field(
+                    &self.db,
+                    &self.row,
+                    field,
+                    arguments,
+                    actor,
+                )
+            }
             _ => Ok(None),
         }
     }

@@ -11,12 +11,15 @@ use sg_graphql::exec::Actor;
 use sqlx::{PgPool, Postgres, Row};
 use time::OffsetDateTime;
 
+use crate::batches_changeset_read::CodeHostRow;
+use crate::batches_graphql::TextSearchTerm;
 use crate::batches_graphql_store::{block_on, PgBatchesGraphqlStore};
 use crate::batches_specs_graphql::{
-    canonical_batch_spec, BatchSpecFilter, BatchSpecPage, BatchSpecResolutionJobRow, BatchSpecRow,
-    BatchSpecStats, BatchSpecWorkspaceExecutionRow, BatchSpecWorkspaceFilter,
-    BatchSpecWorkspacePage, BatchSpecWorkspaceRow, BatchesSpecsDatabase, ChangesetSpecFilter,
-    ChangesetSpecPage, ChangesetSpecRow, NewBatchSpec, NewChangesetSpec,
+    canonical_batch_spec, ApplyChangesetRow, BatchChangeAssocRow, BatchSpecFilter, BatchSpecPage,
+    BatchSpecResolutionJobRow, BatchSpecRow, BatchSpecStats, BatchSpecWorkspaceExecutionRow,
+    BatchSpecWorkspaceFilter, BatchSpecWorkspacePage, BatchSpecWorkspaceRow, BatchesSpecsDatabase,
+    ChangesetSpecFilter, ChangesetSpecPage, ChangesetSpecRow, NewBatchSpec, NewChangesetSpec,
+    RewirerMappingRow,
 };
 
 const BATCH_SPEC_COLUMNS: &str = "batch_specs.id, batch_specs.rand_id, batch_specs.raw_spec, \
@@ -1177,4 +1180,331 @@ impl BatchesSpecsDatabase for PgBatchesGraphqlStore {
     fn conflicting_head_refs(&self, batch_spec_id: i64) -> Result<Vec<(i32, String, i64)>, String> {
         block_on(conflicting_head_refs_async(self.pool(), batch_spec_id))
     }
+
+    fn get_rewirer_mappings(
+        &self,
+        batch_spec_id: i64,
+        batch_change_id: i64,
+        text_search: &[TextSearchTerm],
+        current_state: Option<&str>,
+    ) -> Result<Vec<RewirerMappingRow>, String> {
+        block_on(get_rewirer_mappings_async(
+            self.pool(),
+            batch_spec_id,
+            batch_change_id,
+            text_search,
+            current_state,
+        ))
+    }
+
+    fn changesets_for_apply(&self, ids: &[i64]) -> Result<Vec<ApplyChangesetRow>, String> {
+        block_on(changesets_for_apply_async(self.pool(), ids))
+    }
+
+    fn list_batch_spec_repo_ids(
+        &self,
+        batch_spec_id: i64,
+        actor: Actor,
+    ) -> Result<Vec<i32>, String> {
+        block_on(list_batch_spec_repo_ids_async(self.pool(), batch_spec_id, actor))
+    }
+
+    fn code_hosts_for_repos(
+        &self,
+        repo_ids: &[i32],
+        only_without_webhooks: bool,
+    ) -> Result<Vec<CodeHostRow>, String> {
+        block_on(code_hosts_for_repos_async(
+            self.pool(),
+            repo_ids,
+            only_without_webhooks,
+        ))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// M9.29c apply-preview / viewer code hosts
+// ---------------------------------------------------------------------------
+
+/// `textSearchTermToClause` for the rewirer-mapping views (`text_search.go`).
+fn view_text_search_clause(term: &TextSearchTerm, binds: &mut Vec<Bind>) -> String {
+    let pattern = crate::batches_graphql::text_search_pattern(term);
+    let op = if term.not { "!~*" } else { "~*" };
+    let boolean = if term.not { "AND" } else { "OR" };
+    binds.push(Bind::Text(pattern.clone()));
+    let first_index = binds.len();
+    binds.push(Bind::Text(pattern));
+    let second_index = binds.len();
+    format!(
+        "(COALESCE(changeset_name, '') {op} ${first_index} {boolean} repo_name {op} ${second_index})"
+    )
+}
+
+/// Detach-branch variant: `changesets.external_title` + `repo.name`.
+fn detach_text_search_clause(term: &TextSearchTerm, binds: &mut Vec<Bind>) -> String {
+    let pattern = crate::batches_graphql::text_search_pattern(term);
+    let op = if term.not { "!~*" } else { "~*" };
+    let boolean = if term.not { "AND" } else { "OR" };
+    binds.push(Bind::Text(pattern.clone()));
+    let first_index = binds.len();
+    binds.push(Bind::Text(pattern));
+    let second_index = binds.len();
+    format!(
+        "(changesets.external_title {op} ${first_index} {boolean} repo.name {op} ${second_index})"
+    )
+}
+
+fn push_text_search(
+    sql: &mut String,
+    binds: &mut Vec<Bind>,
+    terms: &[TextSearchTerm],
+    detach: bool,
+) {
+    if terms.is_empty() {
+        return;
+    }
+    let clauses: Vec<String> = terms
+        .iter()
+        .map(|term| {
+            if detach {
+                detach_text_search_clause(term, binds)
+            } else {
+                view_text_search_clause(term, binds)
+            }
+        })
+        .collect();
+    sql.push_str(" AND ");
+    sql.push_str(&clauses.join(" AND "));
+}
+
+async fn get_rewirer_mappings_async(
+    pool: &PgPool,
+    batch_spec_id: i64,
+    batch_change_id: i64,
+    text_search: &[TextSearchTerm],
+    current_state: Option<&str>,
+) -> Result<Vec<RewirerMappingRow>, String> {
+    let mut binds: Vec<Bind> = Vec::new();
+    let mut sql = String::from("SELECT mappings.changeset_spec_id, mappings.changeset_id, \
+         mappings.repo_id FROM (");
+    // Tracking (existing) branch.
+    sql.push_str(" SELECT changeset_spec_id, changeset_id, repo_id \
+         FROM tracking_changeset_specs_and_changesets WHERE batch_spec_id = ");
+    push_bind(&mut sql, &mut binds, Bind::I64(batch_spec_id));
+    push_text_search(&mut sql, &mut binds, text_search, false);
+    if let Some(state) = current_state {
+        sql.push_str(" AND computed_state = ");
+        push_bind(&mut sql, &mut binds, Bind::Text(state.to_owned()));
+    }
+    // Branch branch.
+    sql.push_str(" UNION ALL SELECT changeset_spec_id, MAX(CASE WHEN owner_batch_change_id = ");
+    push_bind(&mut sql, &mut binds, Bind::I64(batch_change_id));
+    sql.push_str(" THEN changeset_id ELSE 0 END), repo_id \
+         FROM branch_changeset_specs_and_changesets WHERE batch_spec_id = ");
+    push_bind(&mut sql, &mut binds, Bind::I64(batch_spec_id));
+    push_text_search(&mut sql, &mut binds, text_search, false);
+    if let Some(state) = current_state {
+        sql.push_str(" AND computed_state = ");
+        push_bind(&mut sql, &mut binds, Bind::Text(state.to_owned()));
+    }
+    sql.push_str(" GROUP BY changeset_spec_id, repo_id");
+    // Detach branch.
+    sql.push_str(" UNION ALL SELECT 0 as changeset_spec_id, changesets.id as changeset_id, \
+         changesets.repo_id FROM changesets INNER JOIN repo ON changesets.repo_id = repo.id \
+         WHERE repo.deleted_at IS NULL AND changesets.id NOT IN ( \
+             SELECT changeset_id FROM tracking_changeset_specs_and_changesets \
+             WHERE batch_spec_id = ");
+    push_bind(&mut sql, &mut binds, Bind::I64(batch_spec_id));
+    sql.push_str(" UNION SELECT MAX(CASE WHEN owner_batch_change_id = ");
+    push_bind(&mut sql, &mut binds, Bind::I64(batch_change_id));
+    sql.push_str(" THEN changeset_id ELSE 0 END) \
+         FROM branch_changeset_specs_and_changesets WHERE batch_spec_id = ");
+    push_bind(&mut sql, &mut binds, Bind::I64(batch_spec_id));
+    sql.push_str(" GROUP BY changeset_spec_id, repo_id) \
+         AND changesets.batch_change_ids ? ");
+    push_bind(&mut sql, &mut binds, Bind::Text(batch_change_id.to_string()));
+    sql.push_str(" AND NOT COALESCE((changesets.batch_change_ids->");
+    push_bind(&mut sql, &mut binds, Bind::Text(batch_change_id.to_string()));
+    sql.push_str("->>'isArchived')::bool, false)");
+    push_text_search(&mut sql, &mut binds, text_search, true);
+    if let Some(state) = current_state {
+        sql.push_str(" AND computed_state = ");
+        push_bind(&mut sql, &mut binds, Bind::Text(state.to_owned()));
+    }
+    sql.push_str(") AS mappings ORDER BY mappings.changeset_spec_id ASC, \
+         mappings.changeset_id ASC");
+
+    let rows = bind_query(&sql, &binds)
+        .fetch_all(pool)
+        .await
+        .map_err(error)?;
+    rows.iter()
+        .map(|row| {
+            Ok(RewirerMappingRow {
+                changeset_spec_id: row.try_get(0)?,
+                changeset_id: row.try_get(1)?,
+                repo_id: row.try_get(2)?,
+            })
+        })
+        .collect::<Result<Vec<_>, sqlx::Error>>()
+        .map_err(error)
+}
+
+async fn changesets_for_apply_async(
+    pool: &PgPool,
+    ids: &[i64],
+) -> Result<Vec<ApplyChangesetRow>, String> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let rows = sqlx::query(
+        "SELECT changesets.id, changesets.repo_id, COALESCE(changesets.external_id, ''), \
+             changesets.external_service_type, COALESCE(changesets.external_state, ''), \
+             COALESCE(changesets.publication_state, ''), \
+             COALESCE(changesets.owned_by_batch_change_id, 0), \
+             COALESCE(changesets.current_spec_id, 0), \
+             COALESCE(changesets.previous_spec_id, 0), \
+             UPPER(COALESCE(changesets.reconciler_state, '')), COALESCE(changesets.closing, false), \
+             changesets.ui_publication_state, COALESCE(changesets.computed_state, ''), \
+             changesets.created_at, changesets.updated_at, \
+             COALESCE(changesets.batch_change_ids, '{}'::jsonb)::text \
+         FROM changesets INNER JOIN repo ON repo.id = changesets.repo_id \
+         WHERE repo.deleted_at IS NULL AND changesets.id = ANY($1) \
+         ORDER BY changesets.id ASC",
+    )
+    .bind(ids.to_vec())
+    .fetch_all(pool)
+    .await
+    .map_err(error)?;
+    rows.iter()
+        .map(|row| -> Result<ApplyChangesetRow, String> {
+            let assocs_text: String = row.try_get(15).map_err(error)?;
+            let assocs_value: serde_json::Value =
+                serde_json::from_str(&assocs_text).map_err(|error| error.to_string())?;
+            let mut batch_changes: Vec<BatchChangeAssocRow> = Vec::new();
+            if let serde_json::Value::Object(map) = assocs_value {
+                for (key, value) in map {
+                    let Ok(id) = key.parse::<i64>() else {
+                        continue;
+                    };
+                    let detach = value.get("detach").and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false);
+                    let archive = value.get("archive").and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false);
+                    let is_archived = value
+                        .get("isArchived")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false);
+                    batch_changes.push(BatchChangeAssocRow {
+                        batch_change_id: id,
+                        detach,
+                        archive,
+                        is_archived,
+                    });
+                }
+                batch_changes.sort_by_key(|assoc| assoc.batch_change_id);
+            }
+            Ok(ApplyChangesetRow {
+                id: row.try_get(0).map_err(error)?,
+                repo_id: row.try_get(1).map_err(error)?,
+                external_id: row.try_get(2).map_err(error)?,
+                external_service_type: row.try_get(3).map_err(error)?,
+                external_state: row.try_get(4).map_err(error)?,
+                publication_state: row.try_get(5).map_err(error)?,
+                owned_by_batch_change_id: row.try_get(6).map_err(error)?,
+                current_spec_id: row.try_get(7).map_err(error)?,
+                previous_spec_id: row.try_get(8).map_err(error)?,
+                reconciler_state: row.try_get(9).map_err(error)?,
+                closing: row.try_get(10).map_err(error)?,
+                ui_publication_state: row.try_get(11).map_err(error)?,
+                computed_state: row.try_get(12).map_err(error)?,
+                created_at: row.try_get(13).map_err(error)?,
+                updated_at: row.try_get(14).map_err(error)?,
+                batch_changes,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()
+}
+
+async fn list_batch_spec_repo_ids_async(
+    pool: &PgPool,
+    batch_spec_id: i64,
+    actor: Actor,
+) -> Result<Vec<i32>, String> {
+    let authz = crate::batches_graphql_store::authz_conds_async(pool, actor).await?;
+    let sql = format!(
+        "SELECT DISTINCT repo.id FROM repo \
+         LEFT JOIN changeset_specs ON repo.id = changeset_specs.repo_id \
+         LEFT JOIN batch_specs ON changeset_specs.batch_spec_id = batch_specs.id \
+         WHERE repo.deleted_at IS NULL AND batch_specs.id = $1 AND ({authz})"
+    );
+    let rows = sqlx::query(&sql)
+        .bind(batch_spec_id)
+        .fetch_all(pool)
+        .await
+        .map_err(error)?;
+    rows.iter()
+        .map(|row| row.try_get::<i32, _>(0).map_err(error))
+        .collect()
+}
+
+async fn code_hosts_for_repos_async(
+    pool: &PgPool,
+    repo_ids: &[i32],
+    only_without_webhooks: bool,
+) -> Result<Vec<CodeHostRow>, String> {
+    let supported = crate::batches_graphql_store::SUPPORTED_CODE_HOSTS
+        .iter()
+        .map(|kind| format!("'{kind}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let aggregate_pred = if only_without_webhooks {
+        "has_webhooks_count = 0 AND external_service_id NOT IN \
+         (SELECT DISTINCT(code_host_urn) FROM webhooks)"
+    } else {
+        "TRUE"
+    };
+    let sql = format!(
+        "WITH esr_with_ssh AS ( \
+             SELECT * FROM external_service_repos \
+             WHERE clone_url ILIKE $1 OR clone_url !~* '[[:alpha:]]+://'), \
+         esr_with_webhooks AS ( \
+             SELECT * FROM external_service_repos \
+             WHERE external_service_id IN ( \
+                 SELECT id FROM external_services \
+                 WHERE has_webhooks IS NULL OR has_webhooks = TRUE)), \
+         aggregated_repos AS ( \
+             SELECT repo.external_service_type, repo.external_service_id, \
+                 COUNT(esr_with_ssh.external_service_id) AS ssh_required_count, \
+                 COUNT(esr_with_webhooks.external_service_id) AS has_webhooks_count \
+             FROM repo \
+             LEFT JOIN esr_with_ssh ON repo.id = esr_with_ssh.repo_id \
+             LEFT JOIN esr_with_webhooks ON repo.id = esr_with_webhooks.repo_id \
+             WHERE repo.deleted_at IS NULL \
+             AND repo.external_service_type IN ({supported}) \
+             AND repo.id = ANY($2) \
+             GROUP BY repo.external_service_type, repo.external_service_id \
+             ORDER BY repo.external_service_type ASC, repo.external_service_id ASC) \
+         SELECT external_service_type, external_service_id, \
+             ssh_required_count > 0 AS ssh_required, \
+             has_webhooks_count > 0 AS has_webhooks \
+         FROM aggregated_repos WHERE {aggregate_pred}"
+    );
+    let rows = sqlx::query(&sql)
+        .bind("ssh://%")
+        .bind(repo_ids.to_vec())
+        .fetch_all(pool)
+        .await
+        .map_err(error)?;
+    rows.iter()
+        .map(|row| {
+            Ok(CodeHostRow {
+                external_service_type: row.try_get(0)?,
+                external_service_id: row.try_get(1)?,
+                requires_ssh: row.try_get(2)?,
+                has_webhooks: row.try_get(3)?,
+            })
+        })
+        .collect::<Result<Vec<_>, sqlx::Error>>()
+        .map_err(error)
 }
