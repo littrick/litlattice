@@ -215,8 +215,8 @@ pub struct ChangesetSpecPage {
     pub next: i64,
 }
 
-/// Minimal `batch_spec_workspaces` row.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// `batch_spec_workspaces` row plus the latest execution job.
+#[derive(Debug, Clone, PartialEq)]
 pub struct BatchSpecWorkspaceRow {
     pub id: i64,
     pub batch_spec_id: i64,
@@ -230,16 +230,83 @@ pub struct BatchSpecWorkspaceRow {
     pub ignored: bool,
     pub skipped: bool,
     pub cached_result_found: bool,
-    /// `GetBatchSpecWorkspaceExecutionJob` (latest job for the workspace).
-    pub execution_state: Option<String>,
-    pub execution_cancel: bool,
+    /// `btypes.BatchSpecWorkspace.ChangesetSpecIDs`.
+    pub changeset_spec_ids: Vec<i64>,
+    /// `btypes.BatchSpecWorkspace.StepCacheResults` (jsonb, 1-based keys).
+    pub step_cache_results: JsonValue,
+    /// Latest execution job, when present.
+    pub execution: Option<BatchSpecWorkspaceExecutionRow>,
     pub created_at: OffsetDateTime,
     pub updated_at: OffsetDateTime,
 }
 
+/// Subset of `batch_spec_workspace_execution_jobs` read by GraphQL.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BatchSpecWorkspaceExecutionRow {
+    pub id: i64,
+    pub state: String,
+    pub cancel: bool,
+    pub failure_message: Option<String>,
+    pub started_at: Option<OffsetDateTime>,
+    pub finished_at: Option<OffsetDateTime>,
+    pub created_at: OffsetDateTime,
+    pub place_in_user_queue: Option<i64>,
+    pub place_in_global_queue: Option<i64>,
+    pub execution_logs: JsonValue,
+    pub worker_hostname: String,
+    pub version: i32,
+}
+
+/// `store.ListBatchSpecWorkspacesOpts` (read predicates).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BatchSpecWorkspaceFilter {
+    pub limit: i64,
+    pub cursor: i64,
+    pub batch_spec_id: i64,
+    /// Lowercased execution job state (empty = no filter).
+    pub state: Option<String>,
+    pub only_cached_or_completed: bool,
+    pub only_without_execution_and_not_cached: bool,
+    pub cancel: Option<bool>,
+    pub skipped: Option<bool>,
+    pub search: Vec<TextSearchTerm>,
+}
+
+/// One parsed `search.TextSearchTerm` (repo name searches only).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TextSearchTerm {
+    pub negated: bool,
+    pub value: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct BatchSpecWorkspacePage {
+    pub rows: Vec<BatchSpecWorkspaceRow>,
+    pub next: i64,
+}
+
+/// `btypes.BatchSpecResolutionJob`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BatchSpecResolutionJobRow {
+    pub id: i64,
+    pub batch_spec_id: i64,
+    pub state: String,
+    pub failure_message: Option<String>,
+    pub started_at: Option<OffsetDateTime>,
+    pub finished_at: Option<OffsetDateTime>,
+    pub created_at: OffsetDateTime,
+    pub updated_at: OffsetDateTime,
+}
+
+impl BatchSpecResolutionJobRow {
+    /// `BatchSpecResolutionJobState.ToGraphQL` (uppercased).
+    pub fn state(&self) -> String {
+        self.state.to_uppercase()
+    }
+}
+
 impl BatchSpecWorkspaceRow {
-    /// `batchSpecWorkspaceResolver.State`: cached/skipped win, an absent
-    /// execution job is PENDING, otherwise the job state (uppercased).
+    /// `batchSpecWorkspaceResolver.State`.
     pub fn state(&self) -> String {
         if self.cached_result_found {
             return "COMPLETED".to_owned();
@@ -247,13 +314,21 @@ impl BatchSpecWorkspaceRow {
         if self.skipped {
             return "SKIPPED".to_owned();
         }
-        let Some(state) = self.execution_state.as_deref() else {
+        let Some(execution) = self.execution.as_ref() else {
             return "PENDING".to_owned();
         };
-        if self.execution_cancel && state == "processing" {
+        if execution.cancel && execution.state == "processing" {
             return "CANCELING".to_owned();
         }
-        state.to_uppercase()
+        execution.state.to_uppercase()
+    }
+
+    /// `batchSpecWorkspaceResolver.StepCacheResultCount`.
+    pub fn step_cache_result_count(&self) -> i64 {
+        self.step_cache_results
+            .as_object()
+            .map(|map| map.len() as i64)
+            .unwrap_or(0)
     }
 }
 
@@ -356,6 +431,31 @@ pub trait BatchesSpecsDatabase: Send + Sync {
         &self,
         id: i64,
     ) -> Result<Option<BatchSpecWorkspaceRow>, String>;
+
+    /// `store.ListBatchSpecWorkspaces`.
+    fn list_batch_spec_workspaces(
+        &self,
+        filter: &BatchSpecWorkspaceFilter,
+    ) -> Result<BatchSpecWorkspacePage, String>;
+
+    /// `store.CountBatchSpecWorkspaces`.
+    fn count_batch_spec_workspaces(&self, filter: &BatchSpecWorkspaceFilter)
+        -> Result<i64, String>;
+
+    /// `store.GetBatchSpecResolutionJob` (None when `ErrNoResults`).
+    fn get_batch_spec_resolution_job(
+        &self,
+        batch_spec_id: i64,
+    ) -> Result<Option<BatchSpecResolutionJobRow>, String>;
+
+    /// `store.GetNewestBatchSpec` (newest by namespace+name+creator).
+    fn get_newest_batch_spec(
+        &self,
+        user_id: i32,
+        namespace_user_id: i32,
+        namespace_org_id: i32,
+        name: &str,
+    ) -> Result<Option<BatchSpecRow>, String>;
 
     /// `store.ListChangesetSpecsWithConflictingHeadRef` grouped counts:
     /// `(repo_id, head_ref, count)`.
@@ -1182,8 +1282,47 @@ impl ObjectValue for BatchSpecObject {
                     type_name: "BatchSpecWorkspaceFileConnection",
                 },
             )))),
-            // `applyPreview`, `supersedingBatchSpec`, `viewerBatchChangesCodeHosts`
-            // and `workspaceResolution` are not ported (see the overview).
+            "workspaceResolution" => {
+                if !self.row.created_from_raw {
+                    return Ok(Some(FieldValue::Null));
+                }
+                Ok(Some(
+                    match specs(&self.db)?
+                        .get_batch_spec_resolution_job(self.row.id)
+                        .map_err(ExecError::new)?
+                    {
+                        Some(row) => FieldValue::Object(Arc::new(
+                            BatchSpecWorkspaceResolutionObject {
+                                row,
+                                batch_spec: self.row.clone(),
+                                db: self.db.clone(),
+                            },
+                        )),
+                        None => FieldValue::Null,
+                    },
+                ))
+            }
+            "supersedingBatchSpec" => {
+                let Some(uid) = actor.uid() else {
+                    return Err(ExecError::new("user is not authenticated"));
+                };
+                let namespace = self.row.namespace();
+                let newest = specs(&self.db)?
+                    .get_newest_batch_spec(uid, namespace.user, namespace.org, &self.row.name)
+                    .map_err(ExecError::new)?;
+                let Some(newest) = newest else {
+                    return Ok(Some(FieldValue::Null));
+                };
+                if newest.id == self.row.id || newest.user_id != self.row.user_id {
+                    return Ok(Some(FieldValue::Null));
+                }
+                Ok(Some(FieldValue::Object(Arc::new(BatchSpecObject::new(
+                    newest,
+                    self.db.clone(),
+                )))))
+            }
+            // `applyPreview` and `viewerBatchChangesCodeHosts` are not ported
+            // in this slice (see the overview).
             _ => Ok(None),
         }
     }
@@ -1633,13 +1772,483 @@ impl ObjectValue for ChangesetSpecConnectionObject {
 }
 
 // ---------------------------------------------------------------------------
-// BatchSpecWorkspace (minimal)
+// BatchSpecWorkspaceResolution / connection / workspace
 // ---------------------------------------------------------------------------
+
+/// `batchSpecWorkspaceResolutionResolver`.
+pub struct BatchSpecWorkspaceResolutionObject {
+    pub row: BatchSpecResolutionJobRow,
+    pub batch_spec: BatchSpecRow,
+    pub db: BatchesHandle,
+}
+
+impl ObjectValue for BatchSpecWorkspaceResolutionObject {
+    fn type_name(&self) -> &'static str {
+        "BatchSpecWorkspaceResolution"
+    }
+
+    fn field(
+        &self,
+        field: &str,
+        arguments: &Arguments,
+        _actor: Actor,
+    ) -> Result<Option<FieldValue>, ExecError> {
+        match field {
+            "state" => Ok(Some(json_str(self.row.state()))),
+            "startedAt" => Ok(Some(optional_str(
+                self.row.started_at.map(datetime_rfc3339).as_deref(),
+            ))),
+            "finishedAt" => Ok(Some(optional_str(
+                self.row.finished_at.map(datetime_rfc3339).as_deref(),
+            ))),
+            "failureMessage" => Ok(Some(optional_str(self.row.failure_message.as_deref()))),
+            "workspaces" => {
+                let filter = workspaces_args_to_filter(arguments, self.batch_spec.id)
+                    .map_err(ExecError::new)?;
+                Ok(Some(FieldValue::Object(Arc::new(
+                    BatchSpecWorkspaceConnectionObject {
+                        filter,
+                        db: self.db.clone(),
+                    },
+                ))))
+            }
+            // `TODO(ssbc): not implemented` in Go.
+            "recentlyCompleted" | "recentlyErrored" => Ok(Some(FieldValue::Null)),
+            _ => Ok(None),
+        }
+    }
+}
+
+/// `workspacesListArgsToDBOpts`.
+fn workspaces_args_to_filter(
+    arguments: &Arguments,
+    batch_spec_id: i64,
+) -> Result<BatchSpecWorkspaceFilter, String> {
+    let first = arguments.get("first").and_then(InputValue::as_i64).unwrap_or(50);
+    let mut filter = BatchSpecWorkspaceFilter {
+        limit: first,
+        batch_spec_id,
+        ..BatchSpecWorkspaceFilter::default()
+    };
+    if let Some(after) = arguments.get("after").and_then(InputValue::as_str) {
+        filter.cursor = after
+            .parse::<i64>()
+            .map_err(|_| format!("invalid after cursor {after:?}"))?;
+    }
+    if let Some(search) = arguments.get("search").and_then(InputValue::as_str) {
+        filter.search = parse_text_search(search);
+    }
+    if let Some(state) = arguments.get("state").and_then(InputValue::as_str) {
+        match state {
+            "COMPLETED" => filter.only_cached_or_completed = true,
+            "PENDING" => filter.only_without_execution_and_not_cached = true,
+            "CANCELING" => {
+                filter.cancel = Some(true);
+                filter.state = Some("processing".to_owned());
+            }
+            "SKIPPED" => filter.skipped = Some(true),
+            other => filter.state = Some(other.to_lowercase()),
+        }
+    }
+    Ok(filter)
+}
+
+/// Minimal `search.ParseTextSearch`: whitespace tokens, quoted phrases and
+/// `-` negation, matching against repository names.
+fn parse_text_search(input: &str) -> Vec<TextSearchTerm> {
+    let mut terms = Vec::new();
+    let mut current = String::new();
+    let mut negated = false;
+    let mut quoted = false;
+    let mut started = false;
+    for ch in input.chars() {
+        match ch {
+            '"' => {
+                quoted = !quoted;
+                started = true;
+            }
+            c if c.is_whitespace() && !quoted => {
+                if started && !current.is_empty() {
+                    terms.push(TextSearchTerm {
+                        negated,
+                        value: current.clone(),
+                    });
+                }
+                current.clear();
+                negated = false;
+                started = false;
+            }
+            '-' if !started && !quoted => {
+                negated = true;
+                started = true;
+            }
+            other => {
+                current.push(other);
+                started = true;
+            }
+        }
+    }
+    if started && !current.is_empty() {
+        terms.push(TextSearchTerm { negated, value: current });
+    }
+    terms
+}
+
+/// `batchSpecWorkspaceConnectionResolver`.
+pub struct BatchSpecWorkspaceConnectionObject {
+    pub filter: BatchSpecWorkspaceFilter,
+    pub db: BatchesHandle,
+}
+
+impl BatchSpecWorkspaceConnectionObject {
+    fn page(&self) -> Result<BatchSpecWorkspacePage, ExecError> {
+        specs(&self.db)?
+            .list_batch_spec_workspaces(&self.filter)
+            .map_err(ExecError::new)
+    }
+}
+
+impl ObjectValue for BatchSpecWorkspaceConnectionObject {
+    fn type_name(&self) -> &'static str {
+        "BatchSpecWorkspaceConnection"
+    }
+
+    fn field(
+        &self,
+        field: &str,
+        _arguments: &Arguments,
+        actor: Actor,
+    ) -> Result<Option<FieldValue>, ExecError> {
+        match field {
+            "totalCount" => {
+                let count = specs(&self.db)?
+                    .count_batch_spec_workspaces(&self.filter)
+                    .map_err(ExecError::new)?;
+                Ok(Some(FieldValue::Json(Json::Int(count))))
+            }
+            "pageInfo" => {
+                let page = self.page()?;
+                let (has_next, cursor) = if page.next != 0 {
+                    (true, Some(page.next.to_string()))
+                } else {
+                    (false, None)
+                };
+                Ok(Some(FieldValue::Object(Arc::new(PageInfoObject::new(
+                    has_next, cursor,
+                )))))
+            }
+            "nodes" => {
+                let page = self.page()?;
+                let repo_ids: Vec<i32> = page.rows.iter().map(|row| row.repo_id).collect();
+                let repos = self
+                    .db
+                    .repos_by_ids(&repo_ids, actor)
+                    .map_err(ExecError::new)?;
+                Ok(Some(FieldValue::List {
+                    items: page
+                        .rows
+                        .into_iter()
+                        .map(|row| {
+                            FieldValue::Object(Arc::new(BatchSpecWorkspaceObject {
+                                repo: repos.get(&row.repo_id).cloned(),
+                                row,
+                                db: self.db.clone(),
+                            }))
+                        })
+                        .collect(),
+                    element_type: Some("BatchSpecWorkspace"),
+                }))
+            }
+            "stats" => {
+                let stats = specs(&self.db)?
+                    .batch_spec_stats(self.filter.batch_spec_id)
+                    .map_err(ExecError::new)?
+                    .unwrap_or_default();
+                Ok(Some(FieldValue::Object(Arc::new(
+                    BatchSpecWorkspacesStatsObject {
+                        errored: stats.failed as i64,
+                        completed: (stats.completed + stats.cached_workspaces) as i64,
+                        processing: stats.processing as i64,
+                        queued: stats.queued as i64,
+                        ignored: (stats.skipped_workspaces - stats.cached_workspaces) as i64,
+                    },
+                ))))
+            }
+            _ => Ok(None),
+        }
+    }
+}
+
+struct BatchSpecWorkspacesStatsObject {
+    errored: i64,
+    completed: i64,
+    processing: i64,
+    queued: i64,
+    ignored: i64,
+}
+
+impl ObjectValue for BatchSpecWorkspacesStatsObject {
+    fn type_name(&self) -> &'static str {
+        "BatchSpecWorkspacesStats"
+    }
+
+    fn field(
+        &self,
+        field: &str,
+        _arguments: &Arguments,
+        _actor: Actor,
+    ) -> Result<Option<FieldValue>, ExecError> {
+        let value = match field {
+            "errored" => self.errored,
+            "completed" => self.completed,
+            "processing" => self.processing,
+            "queued" => self.queued,
+            "ignored" => self.ignored,
+            _ => return Ok(None),
+        };
+        Ok(Some(FieldValue::Json(Json::Int(value))))
+    }
+}
 
 pub struct BatchSpecWorkspaceObject {
     pub row: BatchSpecWorkspaceRow,
     pub db: BatchesHandle,
     pub repo: Option<RepositoryData>,
+}
+
+/// One `batcheslib.Step` as parsed from `batch_specs.spec`.
+struct StepSpec {
+    run: String,
+    container: String,
+    if_condition: Option<String>,
+}
+
+fn batch_spec_steps(spec_json: &str) -> Vec<StepSpec> {
+    let Ok(value) = serde_json::from_str::<JsonValue>(spec_json) else {
+        return Vec::new();
+    };
+    value
+        .get("steps")
+        .and_then(JsonValue::as_array)
+        .map(|steps| {
+            steps
+                .iter()
+                .map(|step| StepSpec {
+                    run: step
+                        .get("run")
+                        .and_then(JsonValue::as_str)
+                        .unwrap_or_default()
+                        .to_owned(),
+                    container: step
+                        .get("container")
+                        .and_then(JsonValue::as_str)
+                        .unwrap_or_default()
+                        .to_owned(),
+                    if_condition: step
+                        .get("if")
+                        .and_then(JsonValue::as_str)
+                        .filter(|value| !value.is_empty())
+                        .map(str::to_owned),
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn execution_logs(row: &BatchSpecWorkspaceRow) -> Vec<JsonValue> {
+    row.execution
+        .as_ref()
+        .and_then(|execution| execution.execution_logs.as_array().cloned())
+        .unwrap_or_default()
+}
+
+fn matching_log<'a>(logs: &'a [JsonValue], key: &str) -> Option<&'a JsonValue> {
+    logs.iter().find(|entry| {
+        entry
+            .get("key")
+            .and_then(JsonValue::as_str)
+            .map(|value| value == key || value == format!("step.src.{key}"))
+            .unwrap_or(false)
+    })
+}
+
+fn log_entry_field<'a>(entry: &'a JsonValue, field: &str) -> Option<&'a JsonValue> {
+    entry.get(field)
+}
+
+fn log_time(entry: &JsonValue, field: &str) -> Option<OffsetDateTime> {
+    log_entry_field(entry, field)
+        .and_then(JsonValue::as_str)
+        .and_then(|value| OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339).ok())
+}
+
+/// `batchSpecWorkspaceStepResolver` for either V1 or V2 executions.
+pub struct BatchSpecWorkspaceStepObject {
+    pub index: usize,
+    pub step: StepSpec,
+    pub skipped: bool,
+    pub cached_result_found: bool,
+    pub log_entry: Option<JsonValue>,
+    pub v2: bool,
+}
+
+impl ObjectValue for BatchSpecWorkspaceStepObject {
+    fn type_name(&self) -> &'static str {
+        "BatchSpecWorkspaceStep"
+    }
+
+    fn field(
+        &self,
+        field: &str,
+        arguments: &Arguments,
+        _actor: Actor,
+    ) -> Result<Option<FieldValue>, ExecError> {
+        match field {
+            "number" => Ok(Some(FieldValue::Json(Json::Int(self.index as i64 + 1)))),
+            "run" => Ok(Some(json_str(self.step.run.clone()))),
+            "container" => Ok(Some(json_str(self.step.container.clone()))),
+            "ifCondition" => Ok(Some(optional_str(self.step.if_condition.as_deref()))),
+            "cachedResultFound" => Ok(Some(FieldValue::Json(Json::Bool(
+                self.cached_result_found,
+            )))),
+            "skipped" => Ok(Some(FieldValue::Json(Json::Bool(
+                self.cached_result_found || self.skipped,
+            )))),
+            "outputLines" => {
+                let lines: Vec<String> = self
+                    .log_entry
+                    .as_ref()
+                    .and_then(|entry| log_entry_field(entry, "out"))
+                    .and_then(JsonValue::as_str)
+                    .map(|out| out.split('\n').map(str::to_owned).collect())
+                    .unwrap_or_default();
+                let first = arguments
+                    .get("first")
+                    .and_then(InputValue::as_i64)
+                    .unwrap_or(500);
+                let after = arguments
+                    .get("after")
+                    .and_then(InputValue::as_str)
+                    .and_then(|value| value.parse::<i64>().ok());
+                Ok(Some(FieldValue::Object(Arc::new(
+                    BatchSpecWorkspaceOutputLinesObject {
+                        lines,
+                        first,
+                        after,
+                    },
+                ))))
+            }
+            "startedAt" => Ok(Some(optional_str(
+                self.log_entry
+                    .as_ref()
+                    .and_then(|entry| log_time(entry, "startTime"))
+                    .map(datetime_rfc3339)
+                    .as_deref(),
+            ))),
+            "finishedAt" => {
+                let finished = self.log_entry.as_ref().and_then(|entry| {
+                    let start = log_time(entry, "startTime")?;
+                    let duration = log_entry_field(entry, "durationMs")?.as_i64()?;
+                    Some(start + Duration::milliseconds(duration))
+                });
+                Ok(Some(optional_str(
+                    finished.map(datetime_rfc3339).as_deref(),
+                )))
+            }
+            "exitCode" => {
+                let exit = self
+                    .log_entry
+                    .as_ref()
+                    .and_then(|entry| log_entry_field(entry, "exitCode"))
+                    .and_then(JsonValue::as_i64);
+                Ok(Some(match exit {
+                    Some(code) => FieldValue::Json(Json::Int(code)),
+                    None => FieldValue::Null,
+                }))
+            }
+            "environment" => Ok(Some(FieldValue::List {
+                items: Vec::new(),
+                element_type: Some("BatchSpecWorkspaceEnvironmentVariable"),
+            })),
+            "outputVariables" => Ok(Some(FieldValue::Null)),
+            "diffStat" | "diff" => Ok(Some(FieldValue::Null)),
+            _ => Ok(None),
+        }
+    }
+}
+
+/// `batchSpecWorkspaceOutputLinesResolver`.
+pub struct BatchSpecWorkspaceOutputLinesObject {
+    pub lines: Vec<String>,
+    pub first: i64,
+    pub after: Option<i64>,
+}
+
+impl BatchSpecWorkspaceOutputLinesObject {
+    fn compute(&self) -> (Vec<String>, i64, bool) {
+        let total = self.lines.len() as i64;
+        let after = self.after.unwrap_or(0);
+        let offset = after + self.first;
+        let mut subset: Vec<String> = if after < total {
+            self.lines[after as usize..].to_vec()
+        } else {
+            Vec::new()
+        };
+        if self.first < self.lines.len() as i64 && total > offset {
+            subset.truncate(self.first as usize);
+        }
+        let has_next = total > offset;
+        (subset, total, has_next)
+    }
+}
+
+impl ObjectValue for BatchSpecWorkspaceOutputLinesObject {
+    fn type_name(&self) -> &'static str {
+        "BatchSpecWorkspaceStepOutputLineConnection"
+    }
+
+    fn field(
+        &self,
+        field: &str,
+        _arguments: &Arguments,
+        _actor: Actor,
+    ) -> Result<Option<FieldValue>, ExecError> {
+        match field {
+            "totalCount" => Ok(Some(FieldValue::Json(Json::Int(self.compute().1)))),
+            "nodes" => Ok(Some(FieldValue::List {
+                items: self.compute().0.into_iter().map(json_str).collect(),
+                element_type: Some("String"),
+            })),
+            "pageInfo" => {
+                let (_, _, has_next) = self.compute();
+                let cursor = if has_next {
+                    Some((self.after.unwrap_or(0) + self.first).to_string())
+                } else {
+                    None
+                };
+                Ok(Some(FieldValue::Object(Arc::new(PageInfoObject::new(
+                    has_next, cursor,
+                )))))
+            }
+            _ => Ok(None),
+        }
+    }
+}
+
+impl BatchSpecWorkspaceObject {
+    fn changeset_specs(&self, actor: Actor) -> Result<Vec<ChangesetSpecRow>, ExecError> {
+        if self.row.changeset_spec_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let page = specs(&self.db)?
+            .list_changeset_specs(&ChangesetSpecFilter {
+                ids: self.row.changeset_spec_ids.clone(),
+                ..ChangesetSpecFilter::default()
+            })
+            .map_err(ExecError::new)?;
+        let _ = actor;
+        Ok(page.rows)
+    }
 }
 
 impl ObjectValue for BatchSpecWorkspaceObject {
@@ -1654,9 +2263,10 @@ impl ObjectValue for BatchSpecWorkspaceObject {
     fn field(
         &self,
         field: &str,
-        _arguments: &Arguments,
-        _actor: Actor,
+        arguments: &Arguments,
+        actor: Actor,
     ) -> Result<Option<FieldValue>, ExecError> {
+        let execution = self.row.execution.as_ref();
         match field {
             "id" => Ok(Some(json_str(marshal_batch_spec_workspace_id(self.row.id)))),
             "batchSpec" => Ok(Some(match specs(&self.db)?.get_batch_spec(
@@ -1678,15 +2288,124 @@ impl ObjectValue for BatchSpecWorkspaceObject {
             "cachedResultFound" => Ok(Some(FieldValue::Json(Json::Bool(
                 self.row.cached_result_found,
             )))),
-            "stepCacheResultCount" => Ok(Some(FieldValue::Json(Json::Int(0)))),
+            "stepCacheResultCount" => {
+                let steps = specs(&self.db)?
+                    .get_batch_spec(self.row.batch_spec_id, "", 0)
+                    .map_err(ExecError::new)?
+                    .map(|row| batch_spec_steps(&row.spec))
+                    .unwrap_or_default();
+                let count = self
+                    .row
+                    .step_cache_results
+                    .as_object()
+                    .map(|map| {
+                        map.keys()
+                            .filter_map(|key| key.parse::<usize>().ok())
+                            .filter(|index| *index >= 1 && *index <= steps.len())
+                            .count()
+                    })
+                    .unwrap_or(0) as i64;
+                Ok(Some(FieldValue::Json(Json::Int(count))))
+            }
             "state" => Ok(Some(json_str(self.row.state()))),
-            "queuedAt" | "startedAt" | "finishedAt" | "placeInQueue" | "placeInGlobalQueue"
-            | "diffStat" | "stages" | "executor" => Ok(Some(FieldValue::Null)),
-            "steps" => Ok(Some(FieldValue::List {
-                items: Vec::new(),
-                element_type: Some("BatchSpecWorkspaceStep"),
+            "queuedAt" => Ok(Some(optional_str(
+                if self.row.skipped {
+                    None
+                } else {
+                    execution
+                        .map(|execution| datetime_rfc3339(execution.created_at))
+                }
+                .as_deref(),
+            ))),
+            "startedAt" => Ok(Some(optional_str(
+                if self.row.skipped {
+                    None
+                } else {
+                    execution.and_then(|execution| execution.started_at.map(datetime_rfc3339))
+                }
+                .as_deref(),
+            ))),
+            "finishedAt" => Ok(Some(optional_str(
+                if self.row.skipped {
+                    None
+                } else {
+                    execution.and_then(|execution| execution.finished_at.map(datetime_rfc3339))
+                }
+                .as_deref(),
+            ))),
+            "failureMessage" => {
+                let message = if self.row.skipped {
+                    None
+                } else {
+                    execution.and_then(|execution| {
+                        if execution.state == "canceled" {
+                            None
+                        } else {
+                            execution.failure_message.clone()
+                        }
+                    })
+                };
+                Ok(Some(optional_str(message.as_deref())))
+            }
+            "placeInQueue" => Ok(Some(match execution {
+                Some(execution) if execution.state == "queued" => {
+                    FieldValue::Json(Json::Int(execution.place_in_user_queue.unwrap_or(0)))
+                }
+                _ => FieldValue::Null,
             })),
-            "step" => Ok(Some(FieldValue::Null)),
+            "placeInGlobalQueue" => Ok(Some(match execution {
+                Some(execution) if execution.state == "queued" => {
+                    FieldValue::Json(Json::Int(execution.place_in_global_queue.unwrap_or(0)))
+                }
+                _ => FieldValue::Null,
+            })),
+            "steps" => {
+                let spec = specs(&self.db)?
+                    .get_batch_spec(self.row.batch_spec_id, "", 0)
+                    .map_err(ExecError::new)?;
+                let steps = spec
+                    .as_ref()
+                    .map(|row| batch_spec_steps(&row.spec))
+                    .unwrap_or_default();
+                let logs = execution_logs(&self.row);
+                let v2 = execution.map(|execution| execution.version == 2).unwrap_or(false);
+                Ok(Some(FieldValue::List {
+                    items: self
+                        .step_objects(&steps, &logs, v2)
+                        .into_iter()
+                        .map(|step| FieldValue::Object(Arc::new(step)))
+                        .collect(),
+                    element_type: Some("BatchSpecWorkspaceStep"),
+                }))
+            }
+            "step" => {
+                let index = arguments
+                    .get("index")
+                    .and_then(InputValue::as_i64)
+                    .unwrap_or(0);
+                if index <= 0 {
+                    return Err(ExecError::new("invalid step index"));
+                }
+                let spec = specs(&self.db)?
+                    .get_batch_spec(self.row.batch_spec_id, "", 0)
+                    .map_err(ExecError::new)?;
+                let steps = spec
+                    .as_ref()
+                    .map(|row| batch_spec_steps(&row.spec))
+                    .unwrap_or_default();
+                if index as usize > steps.len() {
+                    return Ok(Some(FieldValue::Null));
+                }
+                let logs = execution_logs(&self.row);
+                let v2 = execution.map(|execution| execution.version == 2).unwrap_or(false);
+                let objects = self.step_objects(&steps, &logs, v2);
+                Ok(Some(FieldValue::Object(Arc::new(
+                    objects
+                        .into_iter()
+                        .nth(index as usize - 1)
+                        .expect("index checked"),
+                ))))
+            }
             "searchResultPaths" => Ok(Some(FieldValue::List {
                 items: self
                     .row
@@ -1696,8 +2415,67 @@ impl ObjectValue for BatchSpecWorkspaceObject {
                     .collect(),
                 element_type: Some("String"),
             })),
-            "failureMessage" => Ok(Some(FieldValue::Null)),
-            "changesetSpecs" => Ok(Some(FieldValue::Null)),
+            "changesetSpecs" => {
+                if self.repo.is_none() {
+                    return Ok(Some(FieldValue::Null));
+                }
+                if self.row.skipped && !self.row.cached_result_found {
+                    return Ok(Some(FieldValue::Null));
+                }
+                let rows = self.changeset_specs(actor)?;
+                Ok(Some(FieldValue::List {
+                    items: rows
+                        .into_iter()
+                        .map(|row| {
+                            FieldValue::Object(Arc::new(ChangesetSpecObject::new(
+                                row.clone(),
+                                self.db.clone(),
+                                self.repo.clone(),
+                            )))
+                        })
+                        .collect(),
+                    element_type: Some("VisibleChangesetSpec"),
+                }))
+            }
+            "diffStat" => {
+                if self.repo.is_none() {
+                    return Ok(Some(FieldValue::Null));
+                }
+                let rows = self.changeset_specs(actor)?;
+                let mut added = 0i64;
+                let mut deleted = 0i64;
+                let mut any = false;
+                for row in rows {
+                    if row.external_id.is_some() {
+                        continue;
+                    }
+                    added += row.diff_stat_added as i64;
+                    deleted += row.diff_stat_deleted as i64;
+                    any = true;
+                }
+                if !any {
+                    return Ok(Some(FieldValue::Null));
+                }
+                Ok(Some(FieldValue::Object(Arc::new(
+                    crate::batches_graphql::DiffStatObject {
+                        added: added as i32,
+                        deleted: deleted as i32,
+                    },
+                ))))
+            }
+            "stages" => {
+                let Some(execution) = execution else {
+                    return Ok(Some(FieldValue::Null));
+                };
+                Ok(Some(FieldValue::Object(Arc::new(
+                    BatchSpecWorkspaceStagesObject {
+                        logs: execution.execution_logs.as_array().cloned().unwrap_or_default(),
+                        v2: execution.version == 2,
+                    },
+                ))))
+            }
+            // Only site admins with a live executor row; not ported.
+            "executor" => Ok(Some(FieldValue::Null)),
             "repository" if self.repo.is_some() => Ok(Some(repository_object(
                 &self.db,
                 self.repo.clone().expect("checked repo"),
@@ -1709,6 +2487,173 @@ impl ObjectValue for BatchSpecWorkspaceObject {
                 db: self.db.clone(),
             })))),
             "path" => Ok(Some(json_str(self.row.path.clone()))),
+            _ => Ok(None),
+        }
+    }
+}
+
+impl BatchSpecWorkspaceObject {
+    fn step_objects(
+        &self,
+        steps: &[StepSpec],
+        logs: &[JsonValue],
+        v2: bool,
+    ) -> Vec<BatchSpecWorkspaceStepObject> {
+        steps
+            .iter()
+            .enumerate()
+            .map(|(index, step)| {
+                let number = index + 1;
+                let cached = self
+                    .row
+                    .step_cache_results
+                    .get(number.to_string())
+                    .is_some();
+                let log_key = if v2 {
+                    format!("step.docker.step.{index}.run")
+                } else {
+                    "step.src.batch-exec".to_owned()
+                };
+                let log_entry = matching_log(logs, &log_key).cloned().or_else(|| {
+                    if v2 {
+                        matching_log(logs, &format!("step.kubernetes.step.{index}.run")).cloned()
+                    } else {
+                        matching_log(logs, "step.src.0").cloned()
+                    }
+                });
+                BatchSpecWorkspaceStepObject {
+                    index,
+                    step: StepSpec {
+                        run: step.run.clone(),
+                        container: step.container.clone(),
+                        if_condition: step.if_condition.clone(),
+                    },
+                    skipped: self.row.skipped,
+                    cached_result_found: self.row.cached_result_found || cached,
+                    log_entry,
+                    v2,
+                }
+            })
+            .collect()
+    }
+}
+
+/// `batchSpecWorkspaceStagesResolver`.
+struct BatchSpecWorkspaceStagesObject {
+    logs: Vec<JsonValue>,
+    v2: bool,
+}
+
+impl BatchSpecWorkspaceStagesObject {
+    fn entries(&self, predicate: impl Fn(&str) -> bool) -> Vec<FieldValue> {
+        self.logs
+            .iter()
+            .filter(|entry| {
+                entry
+                    .get("key")
+                    .and_then(JsonValue::as_str)
+                    .map(&predicate)
+                    .unwrap_or(false)
+            })
+            .cloned()
+            .map(|entry| FieldValue::Object(Arc::new(ExecutionLogEntryObject { entry })))
+            .collect()
+    }
+}
+
+impl ObjectValue for BatchSpecWorkspaceStagesObject {
+    fn type_name(&self) -> &'static str {
+        "BatchSpecWorkspaceStages"
+    }
+
+    fn field(
+        &self,
+        field: &str,
+        _arguments: &Arguments,
+        _actor: Actor,
+    ) -> Result<Option<FieldValue>, ExecError> {
+        let items = match field {
+            "setup" => self.entries(|key| {
+                key.starts_with("setup.")
+                    || key == "step.docker.step.apply-diff"
+                    || key == "step.kubernetes.step.apply-diff"
+            }),
+            "srcExec" => {
+                let v2 = self.v2;
+                self.entries(move |key| {
+                    if v2 {
+                        key.starts_with("step.docker.step.")
+                            || key.starts_with("step.kubernetes.step.")
+                    } else {
+                        key == "step.src.batch-exec" || key == "step.src.0"
+                    }
+                })
+            }
+            "teardown" => self.entries(|key| key.starts_with("teardown.")),
+            _ => return Ok(None),
+        };
+        Ok(Some(FieldValue::List {
+            items,
+            element_type: Some("ExecutionLogEntry"),
+        }))
+    }
+}
+
+struct ExecutionLogEntryObject {
+    entry: JsonValue,
+}
+
+impl ObjectValue for ExecutionLogEntryObject {
+    fn type_name(&self) -> &'static str {
+        "ExecutionLogEntry"
+    }
+
+    fn field(
+        &self,
+        field: &str,
+        _arguments: &Arguments,
+        _actor: Actor,
+    ) -> Result<Option<FieldValue>, ExecError> {
+        match field {
+            "key" => Ok(Some(optional_str(
+                self.entry.get("key").and_then(JsonValue::as_str),
+            ))),
+            "command" => Ok(Some(FieldValue::List {
+                items: self
+                    .entry
+                    .get("command")
+                    .and_then(JsonValue::as_array)
+                    .map(|items| {
+                        items
+                            .iter()
+                            .filter_map(JsonValue::as_str)
+                            .map(|item| json_str(item.to_owned()))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                element_type: Some("String"),
+            })),
+            "startTime" => Ok(Some(optional_str(
+                log_time(&self.entry, "startTime")
+                    .map(datetime_rfc3339)
+                    .as_deref(),
+            ))),
+            "exitCode" => Ok(Some(
+                match self.entry.get("exitCode").and_then(JsonValue::as_i64) {
+                    Some(code) => FieldValue::Json(Json::Int(code)),
+                    None => FieldValue::Null,
+                },
+            )),
+            "out" => Ok(Some(optional_str(
+                self.entry.get("out").and_then(JsonValue::as_str),
+            ))),
+            "durationMs" => Ok(Some(
+                match self.entry.get("durationMs").and_then(JsonValue::as_i64) {
+                    Some(value) => FieldValue::Json(Json::Int(value)),
+                    None => FieldValue::Null,
+                },
+            )),
+            "url" => Ok(Some(FieldValue::Null)),
             _ => Ok(None),
         }
     }
