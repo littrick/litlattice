@@ -2918,12 +2918,14 @@ impl FrontendRootResolver {
         self
     }
 
-    /// Attach the read-only Code Insights surface (M9.29b).
+    /// Attach the Code Insights surface (read-only M9.29b; dashboard writes
+    /// M9.30a).
     pub fn with_insights(
         mut self,
         insights: Option<crate::insights_graphql::InsightsHandle>,
     ) -> Self {
-        self.query.insights = insights;
+        self.query.insights = insights.clone();
+        self.mutation.insights = insights;
         self
     }
 
@@ -3340,6 +3342,8 @@ pub struct MutationRoot {
     codeintel_policies: Option<crate::codeintel_policies_graphql::CodeIntelPoliciesHandle>,
     /// Optional Notebooks mutations (M9.29a).
     notebooks: Option<crate::notebooks_graphql::NotebooksHandle>,
+    /// Optional Code Insights dashboard mutations (M9.30a).
+    insights: Option<crate::insights_graphql::InsightsHandle>,
 }
 
 impl MutationRoot {
@@ -3513,6 +3517,14 @@ impl ObjectValue for MutationRoot {
             if crate::notebooks_graphql::is_mutation_field(field) {
                 return crate::notebooks_graphql::mutation_field(
                     notebooks, field, arguments, actor,
+                );
+            }
+        }
+        // M9.30a Code Insights dashboard mutations.
+        if let Some(insights) = &self.insights {
+            if crate::insights_graphql::is_mutation_field(field) {
+                return crate::insights_graphql::mutation_field(
+                    insights, field, arguments, actor,
                 );
             }
         }

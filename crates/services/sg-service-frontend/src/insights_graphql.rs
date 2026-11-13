@@ -113,6 +113,16 @@ pub struct DashboardQueryOptions {
     pub org_ids: Vec<i32>,
 }
 
+/// `store.DashboardGrant` (`internal/insights/store/permissions.go:115`): one
+/// principal per grant row. `global` is `Some(true)` only for a global grant
+/// (`GlobalDashboardGrant`); the other two principals are mutually exclusive.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct DashboardGrant {
+    pub user_id: Option<i32>,
+    pub org_id: Option<i32>,
+    pub global: Option<bool>,
+}
+
 /// The read-only database seam. The production implementation is
 /// [`crate::insights_store::PgInsightsStore`].
 pub trait InsightsDatabase: Send + Sync + std::fmt::Debug {
@@ -137,6 +147,71 @@ pub trait InsightsDatabase: Send + Sync + std::fmt::Debug {
 
     /// `InsightStore.GetReferenceCount`.
     fn dashboard_reference_count(&self, view_id: i32) -> Result<i64, String>;
+
+    // -- Dashboard write surface (M9.30a). --------------------------------
+
+    /// `licensing.Check(FeatureCodeInsights) != nil`: the baseline runs in
+    /// Limited Access Mode. Gates `deleteInsightsDashboard` /
+    /// `addInsightViewToDashboard` / `removeInsightViewFromDashboard`.
+    fn limited_access_mode(&self) -> bool;
+
+    /// `DBDashboardStore.CreateDashboard`: insert + grants in one transaction,
+    /// then `GetDashboards` for the caller (`None` when it is not visible).
+    fn create_dashboard(
+        &self,
+        title: &str,
+        grants: &[DashboardGrant],
+        user_ids: &[i32],
+        org_ids: &[i32],
+    ) -> Result<Option<DashboardData>, String>;
+
+    /// `DBDashboardStore.UpdateDashboard`: optional title, "delete all then
+    /// recreate" grants when `grants` is `Some`.
+    fn update_dashboard(
+        &self,
+        id: i32,
+        title: Option<&str>,
+        grants: Option<&[DashboardGrant]>,
+        user_ids: &[i32],
+        org_ids: &[i32],
+    ) -> Result<Option<DashboardData>, String>;
+
+    /// `DBDashboardStore.DeleteDashboard`: soft delete (`deleted_at = NOW()`).
+    fn delete_dashboard(&self, id: i32) -> Result<(), String>;
+
+    /// `DBDashboardStore.EnsureLimitedAccessModeDashboard`, own transaction.
+    fn ensure_limited_access_mode_dashboard(&self) -> Result<i32, String>;
+
+    /// `DBDashboardStore.HasDashboardPermission`: `count == ids.len()`.
+    fn has_dashboard_permission(
+        &self,
+        dashboard_ids: &[i32],
+        user_ids: &[i32],
+        org_ids: &[i32],
+    ) -> Result<bool, String>;
+
+    /// The whole `AddInsightViewToDashboard` resolver body inside one
+    /// transaction: LAM guard, dashboard guard, view guard, idempotent insert,
+    /// then a visible dashboard re-read. Errors match Go verbatim.
+    fn add_view_to_dashboard(
+        &self,
+        dashboard_id: i32,
+        view_id: &str,
+        user_ids: &[i32],
+        org_ids: &[i32],
+        limited_access_mode: bool,
+    ) -> Result<DashboardData, String>;
+
+    /// The whole `RemoveInsightViewFromDashboard` resolver body inside one
+    /// transaction (no view access check; removal is idempotent).
+    fn remove_view_from_dashboard(
+        &self,
+        dashboard_id: i32,
+        view_id: &str,
+        user_ids: &[i32],
+        org_ids: &[i32],
+        limited_access_mode: bool,
+    ) -> Result<DashboardData, String>;
 }
 
 // ---------------------------------------------------------------------------
@@ -255,6 +330,41 @@ fn extract_json_int(input: &str, name: &str) -> Option<i64> {
         .take_while(|ch| ch.is_ascii_digit() || *ch == '-')
         .collect();
     digits.parse().ok()
+}
+
+fn relay_decode(id: &str) -> Result<String, String> {
+    let decoded = base64::engine::general_purpose::URL_SAFE
+        .decode(id)
+        .or_else(|_| base64::engine::general_purpose::STANDARD.decode(id))
+        .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(id))
+        .map_err(|_| "invalid graphql.ID".to_owned())?;
+    String::from_utf8(decoded).map_err(|_| "invalid graphql.ID".to_owned())
+}
+
+/// `graphqlbackend.UnmarshalUserID`: `relay.UnmarshalSpec` into an int32. The
+/// baseline does not check the kind.
+fn unmarshal_user_id(id: &str) -> Result<i32, String> {
+    let decoded = relay_decode(id)?;
+    let (_, spec) = decoded
+        .split_once(':')
+        .ok_or_else(|| "invalid graphql.ID".to_owned())?;
+    spec.trim()
+        .parse::<i32>()
+        .map_err(|_| "invalid graphql.ID".to_owned())
+}
+
+/// `graphqlbackend.UnmarshalOrgID`: checks the `Org` kind, then an int32.
+fn unmarshal_org_id(id: &str) -> Result<i32, String> {
+    let decoded = relay_decode(id)?;
+    let (kind, spec) = decoded
+        .split_once(':')
+        .ok_or_else(|| "invalid graphql.ID".to_owned())?;
+    if kind != "Org" {
+        return Err(format!("invalid org id of kind \"{kind}\""));
+    }
+    spec.trim()
+        .parse::<i32>()
+        .map_err(|_| "invalid graphql.ID".to_owned())
 }
 
 // ---------------------------------------------------------------------------
@@ -484,6 +594,301 @@ fn dashboards_connection(
         next,
         database: database.clone(),
     })))
+}
+
+// ---------------------------------------------------------------------------
+// Mutations (M9.30a): `dashboard_resolvers.go:246-522`.
+// ---------------------------------------------------------------------------
+
+pub fn is_mutation_field(field: &str) -> bool {
+    matches!(
+        field,
+        "createInsightsDashboard"
+            | "updateInsightsDashboard"
+            | "deleteInsightsDashboard"
+            | "addInsightViewToDashboard"
+            | "removeInsightViewFromDashboard"
+    )
+}
+
+pub fn mutation_field(
+    database: &InsightsHandle,
+    field: &str,
+    arguments: &Arguments,
+    actor: Actor,
+) -> Result<Option<FieldValue>, ExecError> {
+    match field {
+        "createInsightsDashboard" => {
+            Ok(Some(create_insights_dashboard(database, arguments, actor)?))
+        }
+        "updateInsightsDashboard" => {
+            Ok(Some(update_insights_dashboard(database, arguments, actor)?))
+        }
+        "deleteInsightsDashboard" => {
+            Ok(Some(delete_insights_dashboard(database, arguments, actor)?))
+        }
+        "addInsightViewToDashboard" => {
+            Ok(Some(add_insight_view_to_dashboard(database, arguments, actor)?))
+        }
+        "removeInsightViewFromDashboard" => Ok(Some(remove_insight_view_from_dashboard(
+            database, arguments, actor,
+        )?)),
+        _ => Ok(None),
+    }
+}
+
+fn required_input<'a>(
+    arguments: &'a Arguments,
+) -> Result<&'a std::collections::BTreeMap<String, InputValue>, ExecError> {
+    input_object(arguments, "input").ok_or_else(|| ExecError::new("missing input"))
+}
+
+/// `parseDashboardGrants` (`dashboard_resolvers.go:317-341`). Returns the
+/// inner error; callers wrap it with "unable to parse dashboard grants".
+fn parse_dashboard_grants(
+    input: &std::collections::BTreeMap<String, InputValue>,
+) -> Result<Vec<DashboardGrant>, String> {
+    let mut grants = Vec::new();
+    if let Some(InputValue::List(items)) = input.get("users") {
+        for item in items {
+            if let InputValue::Str(id) = item {
+                let user_id = unmarshal_user_id(id)
+                    .map_err(|err| format!("unable to unmarshal user id: {id}: {err}"))?;
+                grants.push(DashboardGrant {
+                    user_id: Some(user_id),
+                    ..Default::default()
+                });
+            }
+        }
+    }
+    if let Some(InputValue::List(items)) = input.get("organizations") {
+        for item in items {
+            if let InputValue::Str(id) = item {
+                let org_id = unmarshal_org_id(id)
+                    .map_err(|err| format!("unable to unmarshal org id: {id}: {err}"))?;
+                grants.push(DashboardGrant {
+                    org_id: Some(org_id),
+                    ..Default::default()
+                });
+            }
+        }
+    }
+    if let Some(InputValue::Bool(true)) = input.get("global") {
+        grants.push(DashboardGrant {
+            global: Some(true),
+            ..Default::default()
+        });
+    }
+    Ok(grants)
+}
+
+/// `hasPermissionForGrants` (`dashboard_resolvers.go:344-368`): user/org grants
+/// must be inside the caller's permission set; global grants are unchecked.
+fn has_permission_for_grants(
+    grants: &[DashboardGrant],
+    user_ids: &[i32],
+    org_ids: &[i32],
+) -> bool {
+    grants.iter().all(|grant| {
+        grant.user_id.map_or(true, |id| user_ids.contains(&id))
+            && grant.org_id.map_or(true, |id| org_ids.contains(&id))
+    })
+}
+
+fn dashboard_payload(dashboard: Option<DashboardData>, database: &InsightsHandle) -> FieldValue {
+    FieldValue::Object(Arc::new(InsightsDashboardPayloadObject {
+        dashboard,
+        database: database.clone(),
+    }))
+}
+
+fn create_insights_dashboard(
+    database: &InsightsHandle,
+    arguments: &Arguments,
+    actor: Actor,
+) -> Result<FieldValue, ExecError> {
+    let input = required_input(arguments)?;
+    // `title: String!` is enforced by the schema before the resolver runs.
+    let title = object_str(input, "title").unwrap_or_default();
+    let grants_input = match input.get("grants") {
+        Some(InputValue::Object(object)) => object,
+        _ => return Err(ExecError::new("missing grants input")),
+    };
+    let grants = parse_dashboard_grants(grants_input).map_err(|err| {
+        ExecError::new(format!("unable to parse dashboard grants: {err}"))
+    })?;
+    if grants.is_empty() {
+        return Err(ExecError::new(
+            "dashboard must be created with at least one grant",
+        ));
+    }
+    let (user_ids, org_ids) = database
+        .user_permission_ids(actor)
+        .map_err(ExecError::new)?;
+    if !has_permission_for_grants(&grants, &user_ids, &org_ids) {
+        return Err(ExecError::new(
+            "user does not have permission to create this dashboard",
+        ));
+    }
+    let dashboard = database
+        .create_dashboard(&title, &grants, &user_ids, &org_ids)
+        .map_err(ExecError::new)?;
+    // Go returns a nil payload with a nil error when the created dashboard is
+    // not visible back to the caller; the payload's `dashboard` is null.
+    Ok(dashboard_payload(dashboard, database))
+}
+
+fn update_insights_dashboard(
+    database: &InsightsHandle,
+    arguments: &Arguments,
+    actor: Actor,
+) -> Result<FieldValue, ExecError> {
+    let input = required_input(arguments)?;
+    let dashboard_id = arguments
+        .string("id")
+        .ok_or_else(|| ExecError::new("missing id"))
+        .and_then(|id| {
+            unmarshal_dashboard_id(id)
+                .map_err(|err| ExecError::new(format!("unable to unmarshal dashboard id: {err}")))
+        })?;
+    let title = match input.get("title") {
+        Some(InputValue::Str(value)) => Some(value.clone()),
+        _ => None,
+    };
+    // `Input.Grants *InsightsPermissionGrants`: a present object (even empty)
+    // means "replace all grants"; an absent key means "leave grants alone".
+    let grants = match input.get("grants") {
+        Some(InputValue::Object(object)) => Some(
+            parse_dashboard_grants(object)
+                .map_err(|err| ExecError::new(format!("unable to parse dashboard grants: {err}")))?,
+        ),
+        _ => None,
+    };
+    if dashboard_id.id_type != "custom" {
+        return Err(ExecError::new("unable to update a virtualized dashboard"));
+    }
+    let (user_ids, org_ids) = database
+        .user_permission_ids(actor)
+        .map_err(ExecError::new)?;
+    let id = dashboard_id.arg as i32;
+    if !database
+        .has_dashboard_permission(&[id], &user_ids, &org_ids)
+        .map_err(ExecError::new)?
+    {
+        return Err(ExecError::new("dashboard not found"));
+    }
+    let dashboard = database
+        .update_dashboard(id, title.as_deref(), grants.as_deref(), &user_ids, &org_ids)
+        .map_err(ExecError::new)?;
+    Ok(dashboard_payload(dashboard, database))
+}
+
+fn delete_insights_dashboard(
+    database: &InsightsHandle,
+    arguments: &Arguments,
+    actor: Actor,
+) -> Result<FieldValue, ExecError> {
+    let dashboard_id = arguments
+        .string("id")
+        .ok_or_else(|| ExecError::new("missing id"))
+        .and_then(|id| {
+            unmarshal_dashboard_id(id).map_err(|err| ExecError::new(err.to_owned()))
+        })?;
+    if dashboard_id.id_type != "custom" {
+        // `isVirtualized()` returns an empty success without touching the DB.
+        return Ok(FieldValue::Object(Arc::new(
+            crate::temporary_settings::EmptyResponseObject,
+        )));
+    }
+    if database.limited_access_mode() {
+        let lam_id = database
+            .ensure_limited_access_mode_dashboard()
+            .map_err(|err| ExecError::new(format!("EnsureLimitedAccessModeDashboard: {err}")))?;
+        if lam_id == dashboard_id.arg as i32 {
+            return Err(ExecError::new(
+                "Cannot delete this dashboard in Limited Access Mode",
+            ));
+        }
+    }
+    let (user_ids, org_ids) = database
+        .user_permission_ids(actor)
+        .map_err(ExecError::new)?;
+    if !database
+        .has_dashboard_permission(&[dashboard_id.arg as i32], &user_ids, &org_ids)
+        .map_err(ExecError::new)?
+    {
+        return Err(ExecError::new("dashboard not found"));
+    }
+    database
+        .delete_dashboard(dashboard_id.arg as i32)
+        .map_err(ExecError::new)?;
+    Ok(FieldValue::Object(Arc::new(
+        crate::temporary_settings::EmptyResponseObject,
+    )))
+}
+
+fn mutation_view_id(
+    input: &std::collections::BTreeMap<String, InputValue>,
+) -> Result<String, ExecError> {
+    let raw = object_str(input, "insightViewId")
+        .ok_or_else(|| ExecError::new("missing insightViewId"))?;
+    unmarshal_string_spec(&raw)
+        .map_err(|err| ExecError::new(format!("unable to unmarshal insight view id: {err}")))
+}
+
+fn mutation_dashboard_id(
+    input: &std::collections::BTreeMap<String, InputValue>,
+) -> Result<DashboardId, ExecError> {
+    let raw = object_str(input, "dashboardId")
+        .ok_or_else(|| ExecError::new("missing dashboardId"))?;
+    unmarshal_dashboard_id(&raw)
+        .map_err(|err| ExecError::new(format!("unable to unmarshal dashboard id: {err}")))
+}
+
+fn add_insight_view_to_dashboard(
+    database: &InsightsHandle,
+    arguments: &Arguments,
+    actor: Actor,
+) -> Result<FieldValue, ExecError> {
+    let input = required_input(arguments)?;
+    let view_id = mutation_view_id(input)?;
+    let dashboard_id = mutation_dashboard_id(input)?;
+    let (user_ids, org_ids) = database
+        .user_permission_ids(actor)
+        .map_err(ExecError::new)?;
+    let dashboard = database
+        .add_view_to_dashboard(
+            dashboard_id.arg as i32,
+            &view_id,
+            &user_ids,
+            &org_ids,
+            database.limited_access_mode(),
+        )
+        .map_err(ExecError::new)?;
+    Ok(dashboard_payload(Some(dashboard), database))
+}
+
+fn remove_insight_view_from_dashboard(
+    database: &InsightsHandle,
+    arguments: &Arguments,
+    actor: Actor,
+) -> Result<FieldValue, ExecError> {
+    let input = required_input(arguments)?;
+    let view_id = mutation_view_id(input)?;
+    let dashboard_id = mutation_dashboard_id(input)?;
+    let (user_ids, org_ids) = database
+        .user_permission_ids(actor)
+        .map_err(ExecError::new)?;
+    let dashboard = database
+        .remove_view_from_dashboard(
+            dashboard_id.arg as i32,
+            &view_id,
+            &user_ids,
+            &org_ids,
+            database.limited_access_mode(),
+        )
+        .map_err(ExecError::new)?;
+    Ok(dashboard_payload(Some(dashboard), database))
 }
 
 // ---------------------------------------------------------------------------
@@ -1124,6 +1529,36 @@ impl ObjectValue for InsightsDashboardObject {
                     global_grant: self.dashboard.global_grant,
                 },
             )))),
+            _ => Ok(None),
+        }
+    }
+}
+
+/// `InsightsDashboardPayload` (`insights.graphql:383-388`).
+struct InsightsDashboardPayloadObject {
+    dashboard: Option<DashboardData>,
+    database: InsightsHandle,
+}
+
+impl ObjectValue for InsightsDashboardPayloadObject {
+    fn type_name(&self) -> &'static str {
+        "InsightsDashboardPayload"
+    }
+
+    fn field(
+        &self,
+        field: &str,
+        _arguments: &Arguments,
+        _actor: Actor,
+    ) -> Result<Option<FieldValue>, ExecError> {
+        match field {
+            "dashboard" => Ok(Some(match &self.dashboard {
+                Some(dashboard) => FieldValue::Object(Arc::new(InsightsDashboardObject {
+                    dashboard: dashboard.clone(),
+                    database: self.database.clone(),
+                })),
+                None => FieldValue::Null,
+            })),
             _ => Ok(None),
         }
     }

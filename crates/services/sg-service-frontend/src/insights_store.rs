@@ -18,8 +18,8 @@ use sg_graphql::exec::Actor;
 
 use crate::codeintel_uploads_graphql_store::block_on;
 use crate::insights_graphql::{
-    DashboardData, DashboardQueryOptions, InsightQueryOptions, InsightSeriesData, InsightViewData,
-    InsightViewFilters, InsightsDatabase,
+    DashboardData, DashboardGrant, DashboardQueryOptions, InsightQueryOptions, InsightSeriesData,
+    InsightViewData, InsightViewFilters, InsightsDatabase,
 };
 
 #[derive(Clone)]
@@ -29,6 +29,9 @@ pub struct PgInsightsStore {
     /// The frontend database, used only for `getUserPermissions`' org lookup.
     /// `None` reproduces an anonymous/internal actor (no user/org grants).
     frontend_pool: Option<PgPool>,
+    /// `licensing.Check(FeatureCodeInsights) != nil` (Limited Access Mode).
+    /// Gates the delete/add/remove mutations. Defaults to licensed.
+    limited_access_mode: bool,
 }
 
 impl std::fmt::Debug for PgInsightsStore {
@@ -44,11 +47,18 @@ impl PgInsightsStore {
         Self {
             pool,
             frontend_pool: None,
+            limited_access_mode: false,
         }
     }
 
     pub fn with_frontend_pool(mut self, pool: PgPool) -> Self {
         self.frontend_pool = Some(pool);
+        self
+    }
+
+    /// Reproduce `licensing.Check(FeatureCodeInsights) != nil`.
+    pub fn with_limited_access_mode(mut self, limited_access_mode: bool) -> Self {
+        self.limited_access_mode = limited_access_mode;
         self
     }
 }
@@ -357,8 +367,9 @@ LIMIT $6::int
             .bind(opts.after)
             .bind(&ids)
             .bind(&opts.with_view_unique_id)
-            .bind(&opts.user_ids)
+            // SQL uses `org_id = ANY($4) OR user_id = ANY($5)`.
             .bind(&opts.org_ids)
+            .bind(&opts.user_ids)
             .bind(limit)
             .fetch_all(&self.pool)
             .await
@@ -393,6 +404,350 @@ LIMIT $6::int
         })
         .map_err(|err| err.to_string())
     }
+
+    // -- M9.30a dashboard writes. -----------------------------------------
+
+    fn limited_access_mode(&self) -> bool {
+        self.limited_access_mode
+    }
+
+    fn create_dashboard(
+        &self,
+        title: &str,
+        grants: &[DashboardGrant],
+        user_ids: &[i32],
+        org_ids: &[i32],
+    ) -> Result<Option<DashboardData>, String> {
+        let id = block_on(async {
+            let mut tx = self.pool.begin().await.map_err(stringify)?;
+            let id: i32 = sqlx::query_scalar(
+                "INSERT INTO dashboard (title, save, type) VALUES ($1, $2, $3) RETURNING id",
+            )
+            .bind(title)
+            .bind(true)
+            .bind("standard")
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(stringify)?;
+            // `CreateDashboard` adds `Dashboard.InsightIDs`; the resolver passes
+            // none, so `AddViewsToDashboard` is a no-op here.
+            add_grants(&mut tx, id, grants).await?;
+            tx.commit().await.map_err(stringify)?;
+            Ok::<i32, String>(id)
+        })?;
+        self.dashboard_by_id(id, user_ids, org_ids)
+    }
+
+    fn update_dashboard(
+        &self,
+        id: i32,
+        title: Option<&str>,
+        grants: Option<&[DashboardGrant]>,
+        user_ids: &[i32],
+        org_ids: &[i32],
+    ) -> Result<Option<DashboardData>, String> {
+        block_on(async {
+            let mut tx = self.pool.begin().await.map_err(stringify)?;
+            if let Some(title) = title {
+                sqlx::query("UPDATE dashboard SET title = $1 WHERE id = $2")
+                    .bind(title)
+                    .bind(id)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(stringify)?;
+            }
+            if let Some(grants) = grants {
+                sqlx::query("DELETE FROM dashboard_grants WHERE dashboard_id = $1")
+                    .bind(id)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(stringify)?;
+                add_grants(&mut tx, id, grants).await?;
+            }
+            tx.commit().await.map_err(stringify)?;
+            Ok::<(), String>(())
+        })?;
+        self.dashboard_by_id(id, user_ids, org_ids)
+    }
+
+    fn delete_dashboard(&self, id: i32) -> Result<(), String> {
+        block_on(async {
+            sqlx::query("UPDATE dashboard SET deleted_at = NOW() WHERE id = $1")
+                .bind(id)
+                .execute(&self.pool)
+                .await
+        })
+        .map(|_| ())
+        .map_err(stringify)
+    }
+
+    fn ensure_limited_access_mode_dashboard(&self) -> Result<i32, String> {
+        block_on(async {
+            let mut tx = self.pool.begin().await.map_err(stringify)?;
+            let id = ensure_limited_access_mode(&mut tx).await?;
+            tx.commit().await.map_err(stringify)?;
+            Ok::<i32, String>(id)
+        })
+    }
+
+    fn has_dashboard_permission(
+        &self,
+        dashboard_ids: &[i32],
+        user_ids: &[i32],
+        org_ids: &[i32],
+    ) -> Result<bool, String> {
+        block_on(async {
+            let count: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM dashboard
+                 WHERE id = ANY($1)
+                   AND id IN (
+                       SELECT dashboard_id FROM dashboard_grants
+                       WHERE org_id = ANY($2) OR user_id = ANY($3) OR global IS TRUE)",
+            )
+            .bind(dashboard_ids)
+            .bind(org_ids)
+            .bind(user_ids)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(stringify)?;
+            Ok::<bool, String>(count == dashboard_ids.len() as i64)
+        })
+    }
+
+    fn add_view_to_dashboard(
+        &self,
+        dashboard_id: i32,
+        view_id: &str,
+        user_ids: &[i32],
+        org_ids: &[i32],
+        limited_access_mode: bool,
+    ) -> Result<DashboardData, String> {
+        block_on(async {
+            let mut tx = self.pool.begin().await.map_err(stringify)?;
+            if limited_access_mode {
+                let lam_id = ensure_limited_access_mode(&mut tx).await?;
+                if lam_id == dashboard_id {
+                    return Err(
+                        "Cannot add insights to this dashboard while in Limited Access Mode"
+                            .to_owned(),
+                    );
+                }
+            }
+            if !has_dashboard_permission_tx(&mut tx, dashboard_id, user_ids, org_ids).await? {
+                return Err("dashboard not found".to_owned());
+            }
+            if !view_visible_tx(&mut tx, view_id, user_ids, org_ids).await? {
+                return Err("insight not found".to_owned());
+            }
+            let exists: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM dashboard_insight_view div
+                 JOIN insight_view iv ON div.insight_view_id = iv.id
+                 WHERE div.dashboard_id = $1 AND iv.unique_id = $2",
+            )
+            .bind(dashboard_id)
+            .bind(view_id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(stringify)?;
+            if exists == 0 {
+                sqlx::query(
+                    "INSERT INTO dashboard_insight_view (dashboard_id, insight_view_id)
+                     SELECT $1, iv.id FROM insight_view iv
+                     WHERE iv.unique_id = $2
+                     ON CONFLICT DO NOTHING",
+                )
+                .bind(dashboard_id)
+                .bind(view_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(stringify)?;
+            }
+            tx.commit().await.map_err(stringify)?;
+            Ok::<(), String>(())
+        })?;
+        self.dashboard_by_id(dashboard_id, user_ids, org_ids)?
+            .ok_or_else(|| "dashboard not found".to_owned())
+    }
+
+    fn remove_view_from_dashboard(
+        &self,
+        dashboard_id: i32,
+        view_id: &str,
+        user_ids: &[i32],
+        org_ids: &[i32],
+        limited_access_mode: bool,
+    ) -> Result<DashboardData, String> {
+        block_on(async {
+            let mut tx = self.pool.begin().await.map_err(stringify)?;
+            if limited_access_mode {
+                let lam_id = ensure_limited_access_mode(&mut tx).await?;
+                if lam_id == dashboard_id {
+                    return Err(
+                        "Cannot remove insights from this dashboard while in Limited Access Mode"
+                            .to_owned(),
+                    );
+                }
+            }
+            if !has_dashboard_permission_tx(&mut tx, dashboard_id, user_ids, org_ids).await? {
+                return Err("dashboard not found".to_owned());
+            }
+            sqlx::query(
+                "DELETE FROM dashboard_insight_view
+                 WHERE dashboard_id = $1
+                   AND insight_view_id IN (
+                       SELECT id FROM insight_view WHERE unique_id = $2)",
+            )
+            .bind(dashboard_id)
+            .bind(view_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(stringify)?;
+            tx.commit().await.map_err(stringify)?;
+            Ok::<(), String>(())
+        })?;
+        self.dashboard_by_id(dashboard_id, user_ids, org_ids)?
+            .ok_or_else(|| "dashboard not found".to_owned())
+    }
+}
+
+fn stringify(err: sqlx::Error) -> String {
+    err.to_string()
+}
+
+impl PgInsightsStore {
+    /// `GetDashboards(IDs: [id], UserIDs, OrgIDs)`.
+    fn dashboard_by_id(
+        &self,
+        id: i32,
+        user_ids: &[i32],
+        org_ids: &[i32],
+    ) -> Result<Option<DashboardData>, String> {
+        let opts = DashboardQueryOptions {
+            ids: vec![id],
+            user_ids: user_ids.to_vec(),
+            org_ids: org_ids.to_vec(),
+            ..Default::default()
+        };
+        Ok(self.list_dashboards(&opts)?.into_iter().next())
+    }
+}
+
+/// `AddDashboardGrants`: one row per grant; empty grants is a no-op.
+async fn add_grants(
+    tx: &mut sqlx::PgConnection,
+    dashboard_id: i32,
+    grants: &[DashboardGrant],
+) -> Result<(), String> {
+    for grant in grants {
+        sqlx::query(
+            "INSERT INTO dashboard_grants (dashboard_id, user_id, org_id, global)
+             VALUES ($1, $2, $3, $4)",
+        )
+        .bind(dashboard_id)
+        .bind(grant.user_id)
+        .bind(grant.org_id)
+        .bind(grant.global)
+        .execute(&mut *tx)
+        .await
+        .map_err(stringify)?;
+    }
+    Ok(())
+}
+
+/// `EnsureLimitedAccessModeDashboard` in the caller's transaction: find,
+/// create-with-global-grant if missing, then restore `deleted_at`.
+async fn ensure_limited_access_mode(tx: &mut sqlx::PgConnection) -> Result<i32, String> {
+    let existing: Option<i32> =
+        sqlx::query_scalar("SELECT id FROM dashboard WHERE type = $1")
+            .bind("limited_access_mode")
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(stringify)?;
+    let id = match existing {
+        Some(id) => id,
+        None => {
+            let id: i32 = sqlx::query_scalar(
+                "INSERT INTO dashboard (title, save, type)
+                 VALUES ('Limited Access Mode Dashboard', true, 'limited_access_mode')
+                 RETURNING id",
+            )
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(stringify)?;
+            sqlx::query("INSERT INTO dashboard_grants (dashboard_id, global) VALUES ($1, true)")
+                .bind(id)
+                .execute(&mut *tx)
+                .await
+                .map_err(stringify)?;
+            id
+        }
+    };
+    sqlx::query("UPDATE dashboard SET deleted_at = NULL WHERE id = $1")
+        .bind(id)
+        .execute(&mut *tx)
+        .await
+        .map_err(stringify)?;
+    Ok(id)
+}
+
+/// `HasDashboardPermission` inside the Add/Remove transaction.
+async fn has_dashboard_permission_tx(
+    tx: &mut sqlx::PgConnection,
+    dashboard_id: i32,
+    user_ids: &[i32],
+    org_ids: &[i32],
+) -> Result<bool, String> {
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM dashboard
+         WHERE id = $1
+           AND id IN (
+               SELECT dashboard_id FROM dashboard_grants
+               WHERE org_id = ANY($2) OR user_id = ANY($3) OR global IS TRUE)",
+    )
+    .bind(dashboard_id)
+    .bind(org_ids)
+    .bind(user_ids)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(stringify)?;
+    Ok(count == 1)
+}
+
+/// `validateUserAccessForView` (`store.InsightStore.GetAll` with `UniqueID`):
+/// a view is visible when a non-deleted series is granted to the caller or it
+/// is attached to a visible (non-deleted) dashboard.
+async fn view_visible_tx(
+    tx: &mut sqlx::PgConnection,
+    view_id: &str,
+    user_ids: &[i32],
+    org_ids: &[i32],
+) -> Result<bool, String> {
+    sqlx::query_scalar(
+        "SELECT EXISTS (
+             SELECT 1
+             FROM insight_view iv
+             JOIN insight_view_series ivs ON iv.id = ivs.insight_view_id
+             JOIN insight_series i ON ivs.insight_series_id = i.id
+             WHERE iv.unique_id = $1
+               AND i.deleted_at IS NULL
+               AND (iv.id IN (
+                        SELECT div.insight_view_id
+                        FROM dashboard_insight_view div
+                        JOIN dashboard db ON db.id = div.dashboard_id
+                        WHERE db.deleted_at IS NULL
+                          AND db.id IN (
+                              SELECT dashboard_id FROM dashboard_grants
+                              WHERE org_id = ANY($2) OR user_id = ANY($3) OR global IS TRUE))
+                    OR iv.id IN (
+                        SELECT insight_view_id FROM insight_view_grants
+                        WHERE org_id = ANY($2) OR user_id = ANY($3) OR global IS TRUE)))",
+    )
+    .bind(view_id)
+    .bind(org_ids)
+    .bind(user_ids)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(stringify)
 }
 
 struct DashboardRow {
