@@ -13,9 +13,10 @@ use time::OffsetDateTime;
 
 use crate::batches_graphql_store::{block_on, PgBatchesGraphqlStore};
 use crate::batches_specs_graphql::{
-    canonical_batch_spec, BatchSpecFilter, BatchSpecPage, BatchSpecRow, BatchSpecStats,
-    BatchSpecWorkspaceRow, BatchesSpecsDatabase, ChangesetSpecFilter, ChangesetSpecPage,
-    ChangesetSpecRow, NewBatchSpec, NewChangesetSpec,
+    canonical_batch_spec, BatchSpecFilter, BatchSpecPage, BatchSpecResolutionJobRow, BatchSpecRow,
+    BatchSpecStats, BatchSpecWorkspaceExecutionRow, BatchSpecWorkspaceFilter,
+    BatchSpecWorkspacePage, BatchSpecWorkspaceRow, BatchesSpecsDatabase, ChangesetSpecFilter,
+    ChangesetSpecPage, ChangesetSpecRow, NewBatchSpec, NewChangesetSpec,
 };
 
 const BATCH_SPEC_COLUMNS: &str = "batch_specs.id, batch_specs.rand_id, batch_specs.raw_spec, \
@@ -46,6 +47,7 @@ fn error(error: sqlx::Error) -> String {
 enum Bind {
     I32(i32),
     I64(i64),
+    Bool(bool),
     Text(String),
     TextArray(Vec<String>),
 }
@@ -59,6 +61,7 @@ fn bind_query<'q>(
         query = match bind {
             Bind::I32(value) => query.bind(*value),
             Bind::I64(value) => query.bind(*value),
+            Bind::Bool(value) => query.bind(*value),
             Bind::Text(value) => query.bind(value.clone()),
             Bind::TextArray(value) => query.bind(value.clone()),
         };
@@ -600,56 +603,296 @@ async fn get_changeset_spec_async(
     row.as_ref().map(scan_changeset_spec).transpose()
 }
 
+/// Column list for `batch_spec_workspaces` + latest execution job. Kept in
+/// one place so `get` and `list` scan identically.
+const WORKSPACE_COLUMNS: &str = "batch_spec_workspaces.id, \
+     batch_spec_workspaces.batch_spec_id::bigint, \
+     batch_spec_workspaces.changeset_spec_ids::text, \
+     batch_spec_workspaces.repo_id, batch_spec_workspaces.branch, \
+     batch_spec_workspaces.commit, batch_spec_workspaces.path, \
+     batch_spec_workspaces.file_matches, batch_spec_workspaces.only_fetch_workspace, \
+     batch_spec_workspaces.unsupported, batch_spec_workspaces.ignored, \
+     batch_spec_workspaces.skipped, batch_spec_workspaces.cached_result_found, \
+     batch_spec_workspaces.step_cache_results::text, \
+     batch_spec_workspaces.created_at, batch_spec_workspaces.updated_at, \
+     ex.id, ex.state, ex.cancel, ex.failure_message, ex.started_at, ex.finished_at, \
+     ex.created_at, ex.place_in_user_queue, ex.place_in_global_queue, \
+     ex.execution_logs::text, ex.worker_hostname, ex.version";
+
+const WORKSPACE_EXECUTION_JOIN: &str = "LEFT JOIN LATERAL ( \
+     SELECT id, state, cancel, failure_message, started_at, finished_at, created_at, \
+            place_in_user_queue, place_in_global_queue, execution_logs, worker_hostname, version \
+     FROM batch_spec_workspace_execution_jobs_with_rank job \
+     WHERE job.batch_spec_workspace_id = batch_spec_workspaces.id \
+     ORDER BY job.id DESC LIMIT 1 \
+ ) AS ex ON TRUE";
+
+fn scan_workspace(row: &sqlx::postgres::PgRow) -> Result<BatchSpecWorkspaceRow, String> {
+    let changeset_spec_ids_text: Option<String> = row.try_get(2).map_err(error)?;
+    let changeset_spec_ids = changeset_spec_ids_text
+        .as_deref()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok())
+        .and_then(|value| {
+            value.as_object().map(|map| {
+                map.keys()
+                    .filter_map(|key| key.parse::<i64>().ok())
+                    .collect::<Vec<_>>()
+            })
+        })
+        .unwrap_or_default();
+    let step_cache_results_text: Option<String> = row.try_get(13).map_err(error)?;
+    let step_cache_results = step_cache_results_text
+        .as_deref()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok())
+        .unwrap_or(serde_json::Value::Null);
+    let execution_id: Option<i64> = row.try_get(16).map_err(error)?;
+    let execution = match execution_id {
+        Some(id) => Some(BatchSpecWorkspaceExecutionRow {
+            id,
+            state: row.try_get(17).map_err(error)?,
+            cancel: row.try_get(18).map_err(error)?,
+            failure_message: row.try_get(19).map_err(error)?,
+            started_at: row.try_get(20).map_err(error)?,
+            finished_at: row.try_get(21).map_err(error)?,
+            created_at: row.try_get(22).map_err(error)?,
+            place_in_user_queue: row.try_get(23).map_err(error)?,
+            place_in_global_queue: row.try_get(24).map_err(error)?,
+            execution_logs: row
+                .try_get::<Option<String>, _>(25)
+                .map_err(error)?
+                .as_deref()
+                .and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok())
+                .unwrap_or(serde_json::Value::Null),
+            worker_hostname: row.try_get::<Option<String>, _>(26).map_err(error)?.unwrap_or_default(),
+            version: row.try_get(27).map_err(error)?,
+        }),
+        None => None,
+    };
+    Ok(BatchSpecWorkspaceRow {
+        id: row.try_get(0).map_err(error)?,
+        batch_spec_id: row.try_get(1).map_err(error)?,
+        changeset_spec_ids,
+        repo_id: row.try_get(3).map_err(error)?,
+        branch: row.try_get(4).map_err(error)?,
+        commit: row.try_get(5).map_err(error)?,
+        path: row.try_get(6).map_err(error)?,
+        file_matches: row
+            .try_get::<Option<Vec<String>>, _>(7)
+            .map_err(error)?
+            .unwrap_or_default(),
+        only_fetch_workspace: row.try_get(8).map_err(error)?,
+        unsupported: row.try_get(9).map_err(error)?,
+        ignored: row.try_get(10).map_err(error)?,
+        skipped: row.try_get(11).map_err(error)?,
+        cached_result_found: row.try_get(12).map_err(error)?,
+        step_cache_results,
+        execution,
+        created_at: row.try_get(14).map_err(error)?,
+        updated_at: row.try_get(15).map_err(error)?,
+    })
+}
+
 async fn get_batch_spec_workspace_async(
     pool: &PgPool,
     id: i64,
 ) -> Result<Option<BatchSpecWorkspaceRow>, String> {
-    let row = sqlx::query(
-        "SELECT batch_spec_workspaces.id, batch_spec_workspaces.batch_spec_id::bigint, \
-                batch_spec_workspaces.repo_id, batch_spec_workspaces.branch, \
-                batch_spec_workspaces.commit, batch_spec_workspaces.path, \
-                batch_spec_workspaces.file_matches, batch_spec_workspaces.only_fetch_workspace, \
-                batch_spec_workspaces.unsupported, batch_spec_workspaces.ignored, \
-                batch_spec_workspaces.skipped, batch_spec_workspaces.cached_result_found, \
-                ex.state, ex.cancel, \
-                batch_spec_workspaces.created_at, batch_spec_workspaces.updated_at \
-         FROM batch_spec_workspaces \
+    let sql = format!(
+        "SELECT {WORKSPACE_COLUMNS} FROM batch_spec_workspaces \
          INNER JOIN repo ON repo.id = batch_spec_workspaces.repo_id \
-         LEFT JOIN LATERAL ( \
-             SELECT state, cancel FROM batch_spec_workspace_execution_jobs job \
-             WHERE job.batch_spec_workspace_id = batch_spec_workspaces.id \
-             ORDER BY job.id DESC LIMIT 1 \
-         ) AS ex ON TRUE \
-         WHERE repo.deleted_at IS NULL AND batch_spec_workspaces.id = $1 LIMIT 1",
+         {WORKSPACE_EXECUTION_JOIN} \
+         WHERE repo.deleted_at IS NULL AND batch_spec_workspaces.id = $1 LIMIT 1"
+    );
+    let row = sqlx::query(&sql)
+        .bind(id)
+        .fetch_optional(pool)
+        .await
+        .map_err(error)?;
+    row.as_ref().map(scan_workspace).transpose()
+}
+
+fn workspace_predicates(
+    filter: &BatchSpecWorkspaceFilter,
+    binds: &mut Vec<Bind>,
+    for_count: bool,
+) -> Vec<String> {
+    let mut preds = vec!["repo.deleted_at IS NULL".to_owned()];
+    if filter.batch_spec_id != 0 {
+        let mut pred = String::from("batch_spec_workspaces.batch_spec_id = ");
+        push_bind(&mut pred, binds, Bind::I64(filter.batch_spec_id));
+        preds.push(pred);
+    }
+    if !for_count && filter.cursor > 0 {
+        let mut pred = String::from("batch_spec_workspaces.id >= ");
+        push_bind(&mut pred, binds, Bind::I64(filter.cursor));
+        preds.push(pred);
+    }
+    if let Some(state) = filter.state.as_deref() {
+        if !state.is_empty() {
+            let mut pred = String::from("batch_spec_workspace_execution_jobs.state = ");
+            push_bind(&mut pred, binds, Bind::Text(state.to_owned()));
+            preds.push(pred);
+        }
+    }
+    if filter.only_without_execution_and_not_cached {
+        preds.push(
+            "batch_spec_workspace_execution_jobs.id IS NULL \
+             AND NOT batch_spec_workspaces.cached_result_found"
+                .to_owned(),
+        );
+    }
+    if filter.only_cached_or_completed {
+        preds.push(
+            "(batch_spec_workspaces.cached_result_found OR \
+             batch_spec_workspace_execution_jobs.state = 'completed')"
+                .to_owned(),
+        );
+    }
+    if let Some(cancel) = filter.cancel {
+        let mut pred = String::from("batch_spec_workspace_execution_jobs.cancel = ");
+        push_bind(&mut pred, binds, Bind::Bool(cancel));
+        preds.push(pred);
+    }
+    if let Some(skipped) = filter.skipped {
+        let mut pred = String::from("batch_spec_workspaces.skipped = ");
+        push_bind(&mut pred, binds, Bind::Bool(skipped));
+        preds.push(pred);
+    }
+    for term in &filter.search {
+        let mut pred = String::from(if term.negated {
+            "repo.name NOT ILIKE "
+        } else {
+            "repo.name ILIKE "
+        });
+        push_bind(
+            &mut pred,
+            binds,
+            Bind::Text(format!("%{}%", term.value)),
+        );
+        preds.push(pred);
+    }
+    preds
+}
+
+fn workspace_join(filter: &BatchSpecWorkspaceFilter) -> &'static str {
+    if filter.state.is_some()
+        || filter.only_cached_or_completed
+        || filter.only_without_execution_and_not_cached
+        || filter.cancel.is_some()
+    {
+        "LEFT JOIN batch_spec_workspace_execution_jobs \
+         ON batch_spec_workspace_execution_jobs.batch_spec_workspace_id = batch_spec_workspaces.id"
+    } else {
+        ""
+    }
+}
+
+async fn list_batch_spec_workspaces_async(
+    pool: &PgPool,
+    filter: &BatchSpecWorkspaceFilter,
+) -> Result<BatchSpecWorkspacePage, String> {
+    let mut binds: Vec<Bind> = Vec::new();
+    let preds = workspace_predicates(filter, &mut binds, false);
+    let mut sql = format!(
+        "SELECT {WORKSPACE_COLUMNS} FROM batch_spec_workspaces \
+         INNER JOIN repo ON repo.id = batch_spec_workspaces.repo_id \
+         {WORKSPACE_EXECUTION_JOIN} {} \
+         WHERE {} ORDER BY batch_spec_workspaces.id ASC",
+        workspace_join(filter),
+        preds.join("\n AND ")
+    );
+    if filter.limit > 0 {
+        sql.push_str(&format!("\nLIMIT {}", filter.limit + 1));
+    }
+    let rows = bind_query(&sql, &binds)
+        .fetch_all(pool)
+        .await
+        .map_err(error)?;
+    let mut page = BatchSpecWorkspacePage {
+        rows: rows.iter().map(scan_workspace).collect::<Result<_, _>>()?,
+        next: 0,
+    };
+    if filter.limit != 0 && page.rows.len() as i64 == filter.limit + 1 {
+        page.next = page.rows.last().map(|row| row.id).unwrap_or(0);
+        page.rows.pop();
+    }
+    Ok(page)
+}
+
+async fn count_batch_spec_workspaces_async(
+    pool: &PgPool,
+    filter: &BatchSpecWorkspaceFilter,
+) -> Result<i64, String> {
+    let mut binds: Vec<Bind> = Vec::new();
+    let preds = workspace_predicates(filter, &mut binds, true);
+    let sql = format!(
+        "SELECT COUNT(1)::bigint FROM batch_spec_workspaces \
+         INNER JOIN repo ON repo.id = batch_spec_workspaces.repo_id {} WHERE {}",
+        workspace_join(filter),
+        preds.join("\n AND ")
+    );
+    let row = bind_query(&sql, &binds)
+        .fetch_one(pool)
+        .await
+        .map_err(error)?;
+    row.try_get(0).map_err(error)
+}
+
+async fn get_batch_spec_resolution_job_async(
+    pool: &PgPool,
+    batch_spec_id: i64,
+) -> Result<Option<BatchSpecResolutionJobRow>, String> {
+    let row = sqlx::query(
+        "SELECT id, batch_spec_id::bigint, state, failure_message, started_at, finished_at, \
+                created_at, updated_at \
+         FROM batch_spec_resolution_jobs WHERE batch_spec_id = $1 LIMIT 1",
     )
-    .bind(id)
+    .bind(batch_spec_id)
     .fetch_optional(pool)
     .await
     .map_err(error)?;
-    let Some(row) = row else {
-        return Ok(None);
-    };
-    Ok(Some(BatchSpecWorkspaceRow {
-        id: row.try_get(0).map_err(error)?,
-        batch_spec_id: row.try_get(1).map_err(error)?,
-        repo_id: row.try_get(2).map_err(error)?,
-        branch: row.try_get(3).map_err(error)?,
-        commit: row.try_get(4).map_err(error)?,
-        path: row.try_get(5).map_err(error)?,
-        file_matches: row
-            .try_get::<Option<Vec<String>>, _>(6)
-            .map_err(error)?
-            .unwrap_or_default(),
-        only_fetch_workspace: row.try_get(7).map_err(error)?,
-        unsupported: row.try_get(8).map_err(error)?,
-        ignored: row.try_get(9).map_err(error)?,
-        skipped: row.try_get(10).map_err(error)?,
-        cached_result_found: row.try_get(11).map_err(error)?,
-        execution_state: row.try_get(12).map_err(error)?,
-        execution_cancel: row.try_get(13).map_err(error)?,
-        created_at: row.try_get(14).map_err(error)?,
-        updated_at: row.try_get(15).map_err(error)?,
+    Ok(row.map(|row| BatchSpecResolutionJobRow {
+        id: row.try_get(0).map_err(error).unwrap_or_default(),
+        batch_spec_id: row.try_get(1).map_err(error).unwrap_or_default(),
+        state: row.try_get(2).map_err(error).unwrap_or_default(),
+        failure_message: row.try_get(3).map_err(error).unwrap_or_default(),
+        started_at: row.try_get(4).map_err(error).unwrap_or_default(),
+        finished_at: row.try_get(5).map_err(error).unwrap_or_default(),
+        created_at: row
+            .try_get(6)
+            .map_err(error)
+            .unwrap_or_else(|_| OffsetDateTime::UNIX_EPOCH),
+        updated_at: row
+            .try_get(7)
+            .map_err(error)
+            .unwrap_or_else(|_| OffsetDateTime::UNIX_EPOCH),
     }))
+}
+
+async fn get_newest_batch_spec_async(
+    pool: &PgPool,
+    user_id: i32,
+    namespace_user_id: i32,
+    namespace_org_id: i32,
+    name: &str,
+) -> Result<Option<BatchSpecRow>, String> {
+    let mut sql = format!(
+        "SELECT {BATCH_SPEC_COLUMNS} FROM batch_specs \
+         WHERE batch_specs.user_id = $1 AND batch_specs.spec->>'name' = $2"
+    );
+    let mut binds: Vec<Bind> = vec![Bind::I32(user_id), Bind::Text(name.to_owned())];
+    if namespace_user_id != 0 {
+        sql.push_str(" AND batch_specs.namespace_user_id = $3");
+        binds.push(Bind::I32(namespace_user_id));
+    } else {
+        sql.push_str(" AND batch_specs.namespace_org_id = $3");
+        binds.push(Bind::I32(namespace_org_id));
+    }
+    sql.push_str(" ORDER BY batch_specs.id DESC LIMIT 1");
+    let row = bind_query(&sql, &binds)
+        .fetch_optional(pool)
+        .await
+        .map_err(error)?;
+    row.as_ref().map(scan_batch_spec).transpose()
 }
 
 async fn conflicting_head_refs_async(
@@ -889,6 +1132,46 @@ impl BatchesSpecsDatabase for PgBatchesGraphqlStore {
         id: i64,
     ) -> Result<Option<BatchSpecWorkspaceRow>, String> {
         block_on(get_batch_spec_workspace_async(self.pool(), id))
+    }
+
+    fn list_batch_spec_workspaces(
+        &self,
+        filter: &BatchSpecWorkspaceFilter,
+    ) -> Result<BatchSpecWorkspacePage, String> {
+        block_on(list_batch_spec_workspaces_async(self.pool(), filter))
+    }
+
+    fn count_batch_spec_workspaces(
+        &self,
+        filter: &BatchSpecWorkspaceFilter,
+    ) -> Result<i64, String> {
+        block_on(count_batch_spec_workspaces_async(self.pool(), filter))
+    }
+
+    fn get_batch_spec_resolution_job(
+        &self,
+        batch_spec_id: i64,
+    ) -> Result<Option<BatchSpecResolutionJobRow>, String> {
+        block_on(get_batch_spec_resolution_job_async(
+            self.pool(),
+            batch_spec_id,
+        ))
+    }
+
+    fn get_newest_batch_spec(
+        &self,
+        user_id: i32,
+        namespace_user_id: i32,
+        namespace_org_id: i32,
+        name: &str,
+    ) -> Result<Option<BatchSpecRow>, String> {
+        block_on(get_newest_batch_spec_async(
+            self.pool(),
+            user_id,
+            namespace_user_id,
+            namespace_org_id,
+            name,
+        ))
     }
 
     fn conflicting_head_refs(&self, batch_spec_id: i64) -> Result<Vec<(i32, String, i64)>, String> {
