@@ -10,7 +10,9 @@
 //! gRPC listener (`:3182`), and the debug `/repo-updater-state` and
 //! `/manual-purge` endpoints.
 //!
-//! Not yet covered (later slices): Batch Changes sync registry.
+//! The Batch Changes changeset sync registry is wired to the production
+//! code-host source loader and PostgreSQL backend (see
+//! [`changeset_sync`]).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -38,7 +40,11 @@ pub mod sync_worker;
 pub mod syncer;
 pub mod uncloned;
 
-use changeset_sync::{ChangesetSyncerMetrics, SyncRegistry};
+use changeset_sync::{
+    ChangesetSourceFactory, ChangesetSourceLoader, ChangesetSyncBackend, ChangesetSyncFn,
+    ChangesetSyncStore, ChangesetSyncerMetrics, PgChangesetSourceFactory,
+    PgChangesetSourceLoader, PgChangesetSyncBackend, SourceSyncFn, SyncRegistry,
+};
 use config::RepoUpdaterConfig;
 use debug::DebugContext;
 use gitserver::{GitserverRepoClient, ScopedGitserverClient};
@@ -252,6 +258,8 @@ impl Service for RepoUpdaterService {
             Arc::new(HttpClientGetter(sg_http::HttpClient::new()));
         let doer: Arc<dyn sg_extsvc::HttpDoer> =
             Arc::new(HttpClientDoer(sg_http::HttpClient::new()));
+        // The Batch Changes code-host sources use the same transport.
+        let changeset_http = Arc::clone(&doer);
         // Perforce and Gitolite reach gitserver through the same address
         // selection and connection cache as the scheduler/purge clients.
         let sources = Arc::new(gitserver::GitserverSourcesClient::production(Arc::clone(
@@ -319,11 +327,29 @@ impl Service for RepoUpdaterService {
             tokio::sync::mpsc::Receiver<Vec<i64>>,
         )> = None;
         if !config.disable_batch_changes {
-            let batches_store = Arc::new(sg_db::batches::BatchesStore::new(pool));
+            let batches_store = Arc::new(sg_db::batches::BatchesStore::new(pool.clone()));
+            // `syncer.New(frontendDB, gitserver, ...)`: the production
+            // `SyncChangeset` uses `sources.NewSourcer` (over the same
+            // external services and keyring) and the store's
+            // `UpdateChangesetCodeHostState`.
+            let sync_store: Arc<dyn ChangesetSyncStore> = batches_store.clone();
+            let backend: Arc<dyn ChangesetSyncBackend> =
+                Arc::new(PgChangesetSyncBackend::new(pool.clone()));
+            let changeset_source_factory: Arc<dyn ChangesetSourceFactory> =
+                Arc::new(PgChangesetSourceFactory::new(
+                    pool.clone(),
+                    Arc::clone(&keyring),
+                    changeset_http,
+                ));
+            let loader: Arc<dyn ChangesetSourceLoader> =
+                Arc::new(PgChangesetSourceLoader::new(pool.clone(), changeset_source_factory));
+            let sync_fn: Arc<dyn ChangesetSyncFn> =
+                Arc::new(SourceSyncFn::new(sync_store, loader, backend));
             let (registry, priority_rx) = SyncRegistry::new(
                 batches_store,
                 Arc::new(SystemClock),
                 Arc::new(ChangesetSyncerMetrics::new()),
+                sync_fn,
                 Arc::clone(&live),
                 tasks.clone(),
             );
