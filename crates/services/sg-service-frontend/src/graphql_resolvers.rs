@@ -2676,6 +2676,7 @@ impl FrontendRootResolver {
                 saved_searches: None,
                 code_monitors: None,
                 batches: None,
+                github_apps: None,
             },
             mutation: MutationRoot {
                 inventory: Arc::new(InventoryRoots::default()),
@@ -2800,6 +2801,15 @@ impl FrontendRootResolver {
         self.mutation.batches = batches.clone();
         let nested = Arc::make_mut(&mut self.query.nested);
         nested.batches = batches.map(crate::batches_graphql::BatchesHandleWrapper);
+        self
+    }
+
+    /// Attach the optional GitHub Apps read surface (M9.25c).
+    pub fn with_github_apps(
+        mut self,
+        github_apps: Option<crate::github_apps_graphql::GitHubAppsHandle>,
+    ) -> Self {
+        self.query.github_apps = github_apps;
         self
     }
 
@@ -3138,6 +3148,11 @@ struct QueryRoot {
     /// Optional Batch Changes database (M9.24c). `None` means the SDL was not
     /// appended and the root fields are absent.
     batches: Option<crate::batches_graphql::BatchesHandle>,
+    /// Optional GitHub Apps database (M9.25c). `None` reproduces an absent
+    /// `GitHubAppsResolver`: the `githubapps.graphql` document is not appended
+    /// and `Query.gitHubApps` / `gitHubApp` / `gitHubAppByAppID` /
+    /// `node(GitHubApp)` are absent.
+    github_apps: Option<crate::github_apps_graphql::GitHubAppsHandle>,
     /// Optional code-monitor resolver (M9.13a).
     code_monitors: Option<Arc<crate::code_monitors_graphql::CodeMonitorsResolver>>,
 }
@@ -4448,6 +4463,18 @@ impl ObjectValue for QueryRoot {
                             actor,
                         )
                     }
+                    // `NodeResolvers()["GitHubApp"]` (M9.25c): registered only
+                    // when the optional resolver is present.
+                    _ if self.github_apps.is_some()
+                        && crate::github_apps_graphql::is_node_kind(kind.as_str()) =>
+                    {
+                        crate::github_apps_graphql::node_field(
+                            self.github_apps.as_ref().expect("checked github apps"),
+                            kind.as_str(),
+                            id,
+                            actor,
+                        )
+                    }
                     _ => self.node_int32(kind.as_str(), id),
                 }
             }
@@ -4667,6 +4694,18 @@ impl ObjectValue for QueryRoot {
             {
                 crate::batches_graphql::root_field(
                     self.batches.as_ref().expect("checked batches"),
+                    field,
+                    arguments,
+                    actor,
+                )
+            }
+            // `GitHubAppsResolver` root fields (`Query.gitHubApps` /
+            // `Query.gitHubApp` / `Query.gitHubAppByAppID`, M9.25c).
+            _ if self.github_apps.is_some()
+                && crate::github_apps_graphql::is_root_field(field) =>
+            {
+                crate::github_apps_graphql::root_field(
+                    self.github_apps.as_ref().expect("checked github apps"),
                     field,
                     arguments,
                     actor,

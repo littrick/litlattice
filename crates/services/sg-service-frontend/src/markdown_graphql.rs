@@ -71,6 +71,7 @@ fn render_goldmark(source: &str) -> String {
         in_table_head: false,
         tbody_open: false,
         image_stack: Vec::new(),
+        syntax_block: None,
     };
     let mut idx = 0;
     while idx < events.len() {
@@ -107,6 +108,17 @@ struct Renderer<'a> {
     in_table_head: bool,
     tbody_open: bool,
     image_stack: Vec<PendingImage>,
+    /// A fenced code block whose language chroma knows: its raw content is
+    /// buffered until the closing event, then highlighted like
+    /// `goldmark-highlighting` does.
+    syntax_block: Option<PendingSyntaxBlock>,
+}
+
+struct PendingSyntaxBlock {
+    language: String,
+    line_numbers: crate::chroma::LineNumbers,
+    line_start: usize,
+    content: String,
 }
 
 impl<'a> Renderer<'a> {
@@ -148,6 +160,21 @@ impl<'a> Renderer<'a> {
             }
             Tag::CodeBlock(kind) => {
                 self.ensure_newline_in_item();
+                if let CodeBlockKind::Fenced(info) = kind {
+                    let language = info.split_whitespace().next().unwrap_or("");
+                    if !language.is_empty()
+                        && !crate::chroma::is_no_highlight(info)
+                        && crate::chroma::is_known_language(language)
+                    {
+                        self.syntax_block = Some(PendingSyntaxBlock {
+                            language: language.to_string(),
+                            line_numbers: crate::chroma::line_numbers_from_info(info),
+                            line_start: crate::chroma::line_numbers_start_from_info(info),
+                            content: String::new(),
+                        });
+                        return;
+                    }
+                }
                 self.out.push_str("<pre><code");
                 if let CodeBlockKind::Fenced(info) = kind {
                     if let Some(language) = info.split_whitespace().next() {
@@ -265,7 +292,27 @@ impl<'a> Renderer<'a> {
                 self.out.push_str(&format!("</h{n}>\n"));
             }
             TagEnd::BlockQuote(_) => self.out.push_str("</blockquote>\n"),
-            TagEnd::CodeBlock => self.out.push_str("</code></pre>\n"),
+            TagEnd::CodeBlock => {
+                if let Some(block) = self.syntax_block.take() {
+                    match crate::chroma::highlight(
+                        &block.language,
+                        block.line_numbers,
+                        block.line_start,
+                        &block.content,
+                    ) {
+                        Some(html) => self.out.push_str(&html),
+                        None => {
+                            self.out.push_str("<pre><code class=\"language-");
+                            self.out.push_str(&escape_html(&block.language));
+                            self.out.push_str("\">");
+                            self.out.push_str(&escape_html(&block.content));
+                            self.out.push_str("</code></pre>\n");
+                        }
+                    }
+                } else {
+                    self.out.push_str("</code></pre>\n");
+                }
+            }
             TagEnd::HtmlBlock => {}
             TagEnd::List(_) => {
                 let ordered = self.list_stack.pop().unwrap_or(false);
@@ -304,6 +351,10 @@ impl<'a> Renderer<'a> {
     }
 
     fn text(&mut self, text: &str) {
+        if let Some(block) = self.syntax_block.as_mut() {
+            block.content.push_str(text);
+            return;
+        }
         if let Some(image) = self.image_stack.last_mut() {
             image.alt.push_str(text);
             return;
