@@ -2680,6 +2680,7 @@ impl FrontendRootResolver {
                 codeintel_uploads: None,
                 codeintel_autoindexing: None,
                 codeintel_policies: None,
+                insights: None,
                 batches: None,
                 github_apps: None,
                 teams: None,
@@ -2903,6 +2904,15 @@ impl FrontendRootResolver {
     ) -> Self {
         self.query.codeintel_policies = codeintel_policies.clone();
         self.mutation.codeintel_policies = codeintel_policies;
+        self
+    }
+
+    /// Attach the read-only Code Insights surface (M9.29b).
+    pub fn with_insights(
+        mut self,
+        insights: Option<crate::insights_graphql::InsightsHandle>,
+    ) -> Self {
+        self.query.insights = insights;
         self
     }
 
@@ -3249,6 +3259,9 @@ struct QueryRoot {
     /// Optional configuration-policy surface (M9.28c). `None` leaves the
     /// `codeintel.policies.graphql` fields unported.
     codeintel_policies: Option<crate::codeintel_policies_graphql::CodeIntelPoliciesHandle>,
+    /// Optional Code Insights read-only surface (M9.29b). `None` leaves
+    /// `Query.insightViews` / `Query.insightsDashboards` unported.
+    insights: Option<crate::insights_graphql::InsightsHandle>,
     /// Optional outbound webhook surface (M9.27b). `None` leaves
     /// `Query.outboundWebhooks` / `outboundWebhookEventTypes` and
     /// `node(OutboundWebhook)` unported.
@@ -5056,6 +5069,16 @@ impl ObjectValue for QueryRoot {
                     self.codeintel_policies
                         .as_ref()
                         .expect("checked codeintel policies"),
+                    field,
+                    arguments,
+                    actor,
+                )
+            }
+            // Code Insights read-only root fields (`Query.insightViews`,
+            // `Query.insightsDashboards`, M9.29b).
+            _ if self.insights.is_some() && crate::insights_graphql::is_root_field(field) => {
+                crate::insights_graphql::root_field(
+                    self.insights.as_ref().expect("checked insights"),
                     field,
                     arguments,
                     actor,

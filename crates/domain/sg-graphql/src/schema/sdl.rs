@@ -48,3 +48,9 @@ pub const CODEINTEL_AUTOINDEXING_SCHEMA: &str =
 /// document references `CodeIntelligenceConfigurationPolicy`, so the two are
 /// registered together, exactly like `NewSchema`'s `ReadDir` batch.
 pub const CODEINTEL_POLICIES_SCHEMA: &str = include_str!("sdl/codeintel.policies.graphql");
+
+/// `//go:embed insights.graphql` — `OptionalResolver.InsightsResolver` SDL
+/// (`Query.insightViews`, `Query.insightsDashboards`, `InsightView`, ...).
+/// Appended only when the insights resolver is explicitly enabled (M9.29b);
+/// `assemble_oss` never includes it.
+pub const INSIGHTS_SCHEMA: &str = include_str!("sdl/insights.graphql");
