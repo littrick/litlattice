@@ -701,7 +701,7 @@ async fn executor_publish_creates_and_marks_published() {
     let outcome = execute_plan(&mut store, &factory, true, &plan).await;
 
     assert!(outcome.result.is_ok(), "{:?}", outcome.result);
-    assert_eq!(outcome.after_done, Some(WebhookKind::UpdateError));
+    assert_eq!(outcome.after_done, Some(WebhookKind::Publish));
     assert_eq!(
         outcome.changeset.publication_state,
         ChangesetPublicationState::Published
@@ -709,6 +709,38 @@ async fn executor_publish_creates_and_marks_published() {
     assert_eq!(outcome.changeset.external_id, "cl-1");
     assert!(source.calls.lock().unwrap().contains(&"push".to_owned()));
     assert!(source.calls.lock().unwrap().contains(&"create".to_owned()));
+}
+
+#[tokio::test]
+async fn executor_publish_existing_outdated_emits_update_webhook() {
+    let (done, updated) = fake_store_handle();
+    let mut store = FakeStore {
+        done_calls: done,
+        updated,
+        ..Default::default()
+    };
+    let source = Arc::new(FakeSource {
+        create_exists: true,
+        outdated: true,
+        ..Default::default()
+    });
+    let factory = FakeSourceFactory {
+        source: source.clone(),
+    };
+    let plan = plan_with(vec![
+        ReconcilerOperation::Publish,
+        ReconcilerOperation::Push,
+    ]);
+
+    let outcome = execute_plan(&mut store, &factory, true, &plan).await;
+
+    assert!(outcome.result.is_ok(), "{:?}", outcome.result);
+    assert_eq!(outcome.after_done, Some(WebhookKind::Update));
+    assert!(source.calls.lock().unwrap().contains(&"update".to_owned()));
+    assert_eq!(
+        outcome.changeset.publication_state,
+        ChangesetPublicationState::Published
+    );
 }
 
 #[tokio::test]
@@ -821,7 +853,7 @@ async fn handler_commits_on_success_and_enqueues_after_done() {
         .expect("handler succeeds");
 
     assert_eq!(*done.lock().unwrap(), vec![false]);
-    assert_eq!(*webhooks.lock().unwrap(), vec![WebhookKind::UpdateError]);
+    assert_eq!(*webhooks.lock().unwrap(), vec![WebhookKind::Publish]);
 }
 
 #[tokio::test]

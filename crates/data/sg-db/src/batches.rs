@@ -1196,6 +1196,7 @@ pub struct ChangesetUpdate<'a> {
     pub publication_state: &'a str,
     pub ui_publication_state: Option<&'a str>,
     pub external_id: Option<&'a str>,
+    pub external_branch: Option<&'a str>,
     pub external_state: Option<&'a str>,
     pub failure_message: Option<&'a str>,
     pub previous_failure_message: Option<&'a str>,
@@ -1213,11 +1214,12 @@ SET batch_change_ids = $2,
     detached_at = $3,
     closing = $4,
     publication_state = $5,
-    ui_publication_state = $6,
+    ui_publication_state = $6::batch_changes_changeset_ui_publication_state,
     external_id = $7,
-    external_state = $8,
-    failure_message = $9,
-    previous_failure_message = $10,
+    external_branch = $8,
+    external_state = $9,
+    failure_message = $10,
+    previous_failure_message = $11,
     updated_at = clock_timestamp()
 WHERE id = $1
 "#,
@@ -1229,6 +1231,7 @@ WHERE id = $1
     .bind(update.publication_state)
     .bind(update.ui_publication_state)
     .bind(update.external_id)
+    .bind(update.external_branch)
     .bind(update.external_state)
     .bind(update.failure_message)
     .bind(update.previous_failure_message)
@@ -1256,10 +1259,12 @@ pub async fn batch_change_link(
     .map_err(|err| err.to_string())?
     .ok_or_else(|| format!("batch change not found: {batch_change_id}"))?;
     let name: String = row.get("name");
-    let org_id: i32 = row.get("namespace_org_id");
-    let user_id: i32 = row.get("namespace_user_id");
+    // Exactly one namespace column is set (`batch_changes_has_1_namespace`).
+    let org_id: Option<i32> = row.get("namespace_org_id");
+    let user_id: Option<i32> = row.get("namespace_user_id");
 
-    let (prefix, namespace_name): (&str, String) = if org_id != 0 {
+    let (prefix, namespace_name): (&str, String) = if let Some(org_id) = org_id.filter(|id| *id != 0)
+    {
         let name = sqlx::query_scalar::<_, String>("SELECT name FROM orgs WHERE id = $1 LIMIT 1")
             .bind(org_id)
             .fetch_optional(&mut *conn)
@@ -1268,6 +1273,9 @@ pub async fn batch_change_link(
             .ok_or_else(|| format!("org not found: {org_id}"))?;
         ("organizations", name)
     } else {
+        let user_id = user_id
+            .filter(|id| *id != 0)
+            .ok_or_else(|| "batch change has no namespace".to_owned())?;
         let name =
             sqlx::query_scalar::<_, String>("SELECT username FROM users WHERE id = $1 LIMIT 1")
                 .bind(user_id)

@@ -79,6 +79,29 @@ pub const NO_DRAFT_SUPPORT: &str = "changeset source doesn't implement DraftChan
 pub const SOURCE_NOT_PORTED: &str =
     "changeset source is not ported (M9.9g); no code-host API client is available";
 
+/// `internal/licensing.FeatureBatchChanges` (`features.go`).
+///
+/// The Go worker never calls `Check`: `cmd/worker/internal/batches/*.go` only
+/// gates on `batches.IsEnabled()` (`internal/batches/conf.go`), while the
+/// frontend GraphQL resolvers call `checkLicense()` before the batch-change
+/// mutations. There is no license subsystem in the worker, so this seam keeps
+/// the Go default (allow) and lets a license-aware deployment inject the
+/// frontend check without changing the job signatures.
+pub trait BatchChangesLicenseGate: Send + Sync {
+    /// `(*FeatureBatchChanges).Check`; `Ok(())` when Batch Changes is licensed.
+    fn check_feature_batch_changes(&self) -> Result<(), String>;
+}
+
+/// Default gate: no license check, matching the worker baseline.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct WorkerBatchChangesLicenseGate;
+
+impl BatchChangesLicenseGate for WorkerBatchChangesLicenseGate {
+    fn check_feature_batch_changes(&self) -> Result<(), String> {
+        Ok(())
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Domain model (`internal/batches/types`)
 // ---------------------------------------------------------------------------
@@ -894,6 +917,16 @@ pub trait RepoMetadataProvider: Send + Sync {
 }
 
 /// Default provider: derive the code-host identity from `repo.name`.
+///
+/// Every `sg-extsvc` source decodes `repo.metadata` into its own repository
+/// type; the reduced reconciler [`Repo`] carries only id/name/archived, so
+/// this provider is the fallback when the store has no metadata (see
+/// [`PgRepoMetadataProvider`]). Per-kind fields mirror the code-host types:
+/// `github.Repository.NameWithOwner`, `gitlab.Project.PathWithNamespace`,
+/// `bitbucketserver.Repo.Slug`/`Project.Key`,
+/// `azuredevops.Repository.Name`/`Project.Name`,
+/// `bitbucketcloud.Repo.Slug`/`FullName`/`Name`; Gerrit and Perforce sources
+/// address the repository by name, so an empty object is sufficient.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct NameRepoMetadataProvider;
 
@@ -904,7 +937,10 @@ impl RepoMetadataProvider for NameRepoMetadataProvider {
         kind: &str,
         repo: &Repo,
     ) -> Result<serde_json::Value, SourceError> {
-        Ok(match kind {
+        // `external_services.kind` is upper-case in Go; accept any casing for
+        // callers that pass the repository's lower-case service type.
+        let kind = kind.to_ascii_uppercase();
+        Ok(match kind.as_str() {
             "GITHUB" => serde_json::json!({"name_with_owner": repo.name}),
             "GITLAB" => serde_json::json!({"path_with_namespace": repo.name}),
             "BITBUCKETSERVER" => {
@@ -915,12 +951,69 @@ impl RepoMetadataProvider for NameRepoMetadataProvider {
                     .unwrap_or_else(|| ("".to_owned(), repo.name.clone()));
                 serde_json::json!({"slug": slug, "project": {"key": project}})
             }
+            "AZUREDEVOPS" => {
+                // `organization/project/repository`; the API URL lives in the
+                // stored metadata, so the name-derived object is best-effort.
+                let parts: Vec<&str> = repo.name.split('/').collect();
+                let name = parts.last().copied().unwrap_or_default();
+                let project = parts
+                    .len()
+                    .checked_sub(2)
+                    .and_then(|index| parts.get(index))
+                    .copied()
+                    .unwrap_or_default();
+                serde_json::json!({"name": name, "project": {"name": project}})
+            }
+            "BITBUCKETCLOUD" => {
+                let slug = repo.name.rsplit('/').next().unwrap_or(&repo.name);
+                serde_json::json!({
+                    "slug": slug,
+                    "full_name": repo.name,
+                    "name": slug,
+                })
+            }
+            // Gerrit's source uses `repo.name` as the project; Perforce's
+            // connection is decoded from the external-service config.
+            "GERRIT" | "PERFORCE" => serde_json::json!({}),
             other => {
                 return Err(SourceError::non_retryable(format!(
                     "building changeset source: unsupported external service kind {other:?}"
                 )))
             }
         })
+    }
+}
+
+/// Production provider: reads `repo.metadata` (the exact JSON the Go sources
+/// decode into their repository types) and falls back to
+/// [`NameRepoMetadataProvider`] when the row has no metadata.
+pub struct PgRepoMetadataProvider {
+    pool: PgPool,
+}
+
+impl PgRepoMetadataProvider {
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
+}
+
+#[async_trait]
+impl RepoMetadataProvider for PgRepoMetadataProvider {
+    async fn metadata(
+        &self,
+        kind: &str,
+        repo: &Repo,
+    ) -> Result<serde_json::Value, SourceError> {
+        let stored = sg_db::repos::RepoStore::new(self.pool.clone())
+            .get_by_id(repo.id)
+            .await
+            .map_err(|err| SourceError::other(format!("loading repository metadata: {err}")))?
+            .map(|row| row.metadata)
+            .filter(|metadata| !metadata.is_null());
+        match stored {
+            Some(metadata) => Ok(metadata),
+            None => NameRepoMetadataProvider.metadata(kind, repo).await,
+        }
     }
 }
 
@@ -2105,6 +2198,10 @@ impl<'a> Executor<'a> {
         &mut self,
         as_draft: bool,
     ) -> (Option<WebhookKind>, Result<(), ReconcilerError>) {
+        // `executor.publishChangeset`: both `afterDoneUpdate` and
+        // `afterDonePublish` enqueue `webhooks.ChangesetUpdateError`
+        // (executor.go:242-243), so every failure path reports an update
+        // error. Only the success path distinguishes publish from update.
         let update_error = Some(WebhookKind::UpdateError);
 
         let body = match self.decorate_changeset_body().await {
@@ -2171,8 +2268,9 @@ impl<'a> Executor<'a> {
             }
         };
 
+        let mut outdated = false;
         if exists {
-            let outdated = match css.is_outdated(&cs).await {
+            outdated = match css.is_outdated(&cs).await {
                 Ok(value) => value,
                 Err(err) => {
                     return (
@@ -2197,9 +2295,13 @@ impl<'a> Executor<'a> {
         self.ch = cs.changeset;
         self.ch.publication_state = ChangesetPublicationState::Published;
 
-        // Both `afterDoneUpdate` and `afterDonePublish` enqueue
-        // `ChangesetUpdateError` in the baseline (overview §1.4).
-        (Some(WebhookKind::UpdateError), Ok(()))
+        // `exists && outdated` means the changeset already existed on the code
+        // host and was updated; every other success publishes it.
+        if exists && outdated {
+            (Some(WebhookKind::Update), Ok(()))
+        } else {
+            (Some(WebhookKind::Publish), Ok(()))
+        }
     }
 
     async fn update_changeset(&mut self) -> (Option<WebhookKind>, Result<(), ReconcilerError>) {
@@ -2857,6 +2959,8 @@ impl ReconcilerStore for PgReconcilerStore {
         };
         let external_id =
             (!changeset.external_id.is_empty()).then_some(changeset.external_id.as_str());
+        let external_branch = (!changeset.external_branch.is_empty())
+            .then_some(changeset.external_branch.as_str());
         let update = ChangesetUpdate {
             id: changeset.id,
             batch_change_ids: changeset.batch_changes_json(),
@@ -2865,6 +2969,7 @@ impl ReconcilerStore for PgReconcilerStore {
             publication_state,
             ui_publication_state: ui_state,
             external_id,
+            external_branch,
             external_state,
             failure_message: changeset.failure_message.as_deref(),
             previous_failure_message: changeset.previous_failure_message.as_deref(),
@@ -2927,6 +3032,14 @@ impl Job for BatchesReconcilerJob {
         if !batches_enabled() {
             return Ok(Vec::new());
         }
+        // `FeatureBatchChanges.Check` is a frontend-only gate in Go; the
+        // worker's default allows it (see the trait docs).
+        if WorkerBatchChangesLicenseGate
+            .check_feature_batch_changes()
+            .is_err()
+        {
+            return Ok(Vec::new());
+        }
 
         let external_url = deps
             .live_config
@@ -2961,7 +3074,7 @@ impl Job for BatchesReconcilerJob {
         let source_factory: Arc<dyn ChangesetSourceFactory> = Arc::new(ConfigSourceFactory::new(
             configs,
             Arc::new(ReqwestHttpDoer::new()),
-            Arc::new(NameRepoMetadataProvider),
+            Arc::new(PgRepoMetadataProvider::new(deps.frontend.clone())),
         ));
         let handler = Arc::new(ReconcilerHandler::new(
             store_factory,
@@ -3188,5 +3301,56 @@ mod tests {
         assert_eq!(parsed.len(), 2);
         assert!(!parsed[0].detach);
         assert!(parsed[1].detach && parsed[1].is_archived);
+    }
+
+    #[tokio::test]
+    async fn name_metadata_covers_every_production_source_kind() {
+        let repo = Repo {
+            id: 7,
+            name: "org/project/repository".to_owned(),
+            archived: false,
+        };
+        for (kind, key) in [
+            ("GITHUB", "name_with_owner"),
+            ("GITLAB", "path_with_namespace"),
+            ("BITBUCKETSERVER", "slug"),
+            ("AZUREDEVOPS", "name"),
+            ("BITBUCKETCLOUD", "slug"),
+        ] {
+            let metadata = NameRepoMetadataProvider
+                .metadata(kind, &repo)
+                .await
+                .unwrap();
+            assert!(
+                metadata.get(key).is_some(),
+                "{kind} metadata lacks {key}: {metadata}"
+            );
+        }
+        for kind in ["GERRIT", "PERFORCE"] {
+            assert_eq!(
+                NameRepoMetadataProvider
+                    .metadata(kind, &repo)
+                    .await
+                    .unwrap(),
+                serde_json::json!({})
+            );
+        }
+        // Lower-case service types are accepted too.
+        assert_eq!(
+            NameRepoMetadataProvider
+                .metadata("github", &repo)
+                .await
+                .unwrap(),
+            serde_json::json!({"name_with_owner": "org/project/repository"})
+        );
+    }
+
+    #[test]
+    fn worker_license_gate_defaults_to_allow() {
+        // Go's worker never license-gates Batch Changes (`features.go`'s
+        // `FeatureBatchChanges` is only called by the frontend resolvers).
+        assert!(WorkerBatchChangesLicenseGate
+            .check_feature_batch_changes()
+            .is_ok());
     }
 }
