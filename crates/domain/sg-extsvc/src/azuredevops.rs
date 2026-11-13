@@ -1,18 +1,23 @@
 #![forbid(unsafe_code)]
 
-//! `internal/extsvc/azuredevops`: the read-only surface the repo-updater
-//! Azure DevOps source needs.
+//! `internal/extsvc/azuredevops`: the code-host client shared by the
+//! repo-updater source (M9.13c) and the Batch Changes changeset source
+//! (M9.24b).
 //!
 //! Ported: configuration shape, `urlx.Parse` base-URL normalization, Basic
 //! authentication (PAT as the password), request building (`api-version=7.0`
 //! merging plus Go's `ResolveReference` semantics), the
 //! `x-ms-continuationtoken` capture used by branch listing, `429` retry
 //! (bounded like `maxRateLimitRetries`), `HTTPError` text, repository and
-//! project listings, and `GetAuthorizedProfile` (used by `CheckConnection`).
+//! project listings, `GetAuthorizedProfile` (used by `CheckConnection`), and
+//! the pull-request/fork write surface (`getPullRequest`,
+//! `createPullRequest`, `updatePullRequest`, `abandonPullRequest`,
+//! `completePullRequest`, `createPullRequestCommentThread`,
+//! `getPullRequestStatuses`, `forkRepository`).
 //!
-//! Not ported (see the M9.13c overview): the internal/external rate limiters,
-//! OAuth token refresh, pull-request/fork write APIs, organization listing and
-//! every other endpoint the repo source does not need.
+//! Not ported: the internal/external rate limiters, OAuth token refresh,
+//! organization listing and the webhook event parser (the Batch Changes
+//! source does not consume them).
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -34,6 +39,15 @@ pub const VISUAL_STUDIO_APP_URL: &str = "https://app.vssps.visualstudio.com/";
 pub const API_VERSION: &str = "7.0";
 /// `azuredevops.continuationTokenHeader`.
 pub const CONTINUATION_TOKEN_HEADER: &str = "x-ms-continuationtoken";
+
+/// `azuredevops.PullRequestStatusActive`.
+pub const PULL_REQUEST_STATUS_ACTIVE: &str = "active";
+/// `azuredevops.PullRequestStatusAbandoned`.
+pub const PULL_REQUEST_STATUS_ABANDONED: &str = "abandoned";
+/// `azuredevops.PullRequestStatusCompleted`.
+pub const PULL_REQUEST_STATUS_COMPLETED: &str = "completed";
+/// `azuredevops.PullRequestMergeStrategySquash`.
+pub const PULL_REQUEST_MERGE_STRATEGY_SQUASH: &str = "squash";
 
 /// The authenticator an [`AzureDevOpsAuth`] applies. The baseline only
 /// supports `auth.BasicAuth` and `auth.BasicAuthWithSSH`.
@@ -175,6 +189,276 @@ pub struct Profile {
     pub public_alias: String,
 }
 
+/// `azuredevops.CreatorInfo`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreatorInfo {
+    #[serde(default)]
+    pub id: String,
+    #[serde(rename = "displayName", default)]
+    pub display_name: String,
+    #[serde(rename = "uniqueName", default)]
+    pub unique_name: String,
+    #[serde(default)]
+    pub url: String,
+    #[serde(rename = "imageUrl", default)]
+    pub image_url: String,
+}
+
+/// `azuredevops.Reviewer`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Reviewer {
+    #[serde(default)]
+    pub vote: i64,
+    #[serde(default)]
+    pub id: String,
+    #[serde(rename = "hasDeclined", default)]
+    pub has_declined: bool,
+    #[serde(rename = "isRequired", default)]
+    pub is_required: bool,
+    #[serde(rename = "uniqueName", default)]
+    pub unique_name: String,
+}
+
+/// `azuredevops.PullRequestCommit`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PullRequestCommit {
+    #[serde(rename = "commitId", default)]
+    pub commit_id: String,
+    #[serde(default)]
+    pub url: String,
+}
+
+/// `azuredevops.ForkRef`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForkRef {
+    #[serde(default)]
+    pub repository: Repository,
+    #[serde(default)]
+    pub name: String,
+    /// Go's field is `URl` but the JSON tag is `url`.
+    #[serde(default)]
+    pub url: String,
+}
+
+/// `azuredevops.PullRequest`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PullRequest {
+    #[serde(default)]
+    pub repository: Repository,
+    #[serde(rename = "pullRequestId", default)]
+    pub id: i64,
+    #[serde(rename = "codeReviewId", default)]
+    pub code_review_id: i64,
+    #[serde(default)]
+    pub status: String,
+    #[serde(rename = "creationDate", default)]
+    pub creation_date: String,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(rename = "createdBy", default)]
+    pub created_by: CreatorInfo,
+    #[serde(rename = "sourceRefName", default)]
+    pub source_ref_name: String,
+    #[serde(rename = "targetRefName", default)]
+    pub target_ref_name: String,
+    #[serde(rename = "mergeStatus", default)]
+    pub merge_status: String,
+    #[serde(rename = "mergeId", default)]
+    pub merge_id: String,
+    #[serde(rename = "lastMergeSourceCommit", default)]
+    pub last_merge_source_commit: PullRequestCommit,
+    #[serde(rename = "lastMergeTargetCommit", default)]
+    pub last_merge_target_commit: PullRequestCommit,
+    #[serde(rename = "supportsIterations", default)]
+    pub supports_iterations: bool,
+    #[serde(rename = "artifactId", default)]
+    pub artifact_id: String,
+    #[serde(default)]
+    pub reviewers: Vec<Reviewer>,
+    #[serde(rename = "forkSource", default)]
+    pub fork_source: Option<ForkRef>,
+    #[serde(default)]
+    pub url: String,
+    #[serde(rename = "isDraft", default)]
+    pub is_draft: bool,
+}
+
+/// `azuredevops.PullRequestCompletionOptions`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PullRequestCompletionOptions {
+    #[serde(rename = "mergeStrategy", default, skip_serializing_if = "String::is_empty")]
+    pub merge_strategy: String,
+    #[serde(
+        rename = "deleteSourceBranch",
+        default,
+        skip_serializing_if = "is_false"
+    )]
+    pub delete_source_branch: bool,
+    #[serde(rename = "mergeCommitMessage", default)]
+    pub merge_commit_message: String,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+/// `azuredevops.CreatePullRequestInput`. Fields without `omitempty` in the
+/// baseline (including nil slices/pointers) serialise as JSON `null`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreatePullRequestInput {
+    #[serde(rename = "sourceRefName")]
+    pub source_ref_name: String,
+    #[serde(rename = "targetRefName")]
+    pub target_ref_name: String,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub reviewers: Option<Vec<Reviewer>>,
+    #[serde(rename = "forkSource", default)]
+    pub fork_source: Option<ForkRef>,
+    #[serde(rename = "isDraft", default)]
+    pub is_draft: bool,
+    #[serde(rename = "completionOptions", default)]
+    pub completion_options: Option<PullRequestCompletionOptions>,
+}
+
+/// `azuredevops.PullRequestUpdateInput`. Every field is a pointer in Go, so
+/// `None` serialises as `null`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PullRequestUpdateInput {
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(rename = "mergeOptions", default)]
+    pub merge_options: Option<serde_json::Value>,
+    #[serde(rename = "lastMergeSourceCommit", default)]
+    pub last_merge_source_commit: Option<PullRequestCommit>,
+    #[serde(rename = "targetRefName", default)]
+    pub target_ref_name: Option<String>,
+    #[serde(rename = "isDraft", default)]
+    pub is_draft: Option<bool>,
+    #[serde(rename = "completionOptions", default)]
+    pub completion_options: Option<PullRequestCompletionOptions>,
+}
+
+/// `azuredevops.PullRequestCompleteInput`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PullRequestCompleteInput {
+    pub commit_id: String,
+    pub merge_strategy: Option<String>,
+    pub delete_source_branch: bool,
+}
+
+/// `azuredevops.PullRequestCommentForInput`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PullRequestCommentForInput {
+    #[serde(rename = "parentCommentId", default)]
+    pub parent_comment_id: i64,
+    #[serde(default)]
+    pub content: String,
+    #[serde(rename = "commentType", default)]
+    pub comment_type: i64,
+}
+
+/// `azuredevops.PullRequestCommentInput`. Note the capitalised `Comments`
+/// key, matching the Go struct tag.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PullRequestCommentInput {
+    #[serde(rename = "Comments", default)]
+    pub comments: Vec<PullRequestCommentForInput>,
+}
+
+/// `azuredevops.PullRequestCommentResponse` (only the fields the source does
+/// not consume are omitted).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PullRequestCommentResponse {
+    #[serde(default)]
+    pub id: i64,
+    #[serde(rename = "Comments", default)]
+    pub comments: Vec<PullRequestCommentForResponse>,
+    #[serde(rename = "publishedDate", default)]
+    pub published_date: String,
+    #[serde(rename = "lastUpdatedOn", default)]
+    pub last_updated_on: String,
+    #[serde(rename = "isDeleted", default)]
+    pub is_deleted: bool,
+}
+
+/// `azuredevops.PullRequestCommentForResponse`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PullRequestCommentForResponse {
+    #[serde(default)]
+    pub id: i64,
+    #[serde(rename = "publishedDate", default)]
+    pub published_date: String,
+    #[serde(rename = "lastUpdatedOn", default)]
+    pub last_updated_on: String,
+    #[serde(default)]
+    pub content: String,
+    #[serde(rename = "commentType", default)]
+    pub comment_type: String,
+}
+
+/// `azuredevops.PullRequestStatuses`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PullRequestStatuses {
+    #[serde(default)]
+    pub value: Vec<PullRequestBuildStatus>,
+    #[serde(default)]
+    pub count: i64,
+}
+
+/// `azuredevops.PullRequestBuildStatus`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PullRequestBuildStatus {
+    #[serde(default)]
+    pub id: i64,
+    #[serde(default)]
+    pub state: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(rename = "creationDate", default)]
+    pub creation_date: String,
+    #[serde(rename = "updatedDate", default)]
+    pub updated_date: String,
+    #[serde(rename = "createdBy", default)]
+    pub created_by: CreatorInfo,
+}
+
+/// `azuredevops.ForkRepositoryInputProject`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForkRepositoryInputProject {
+    #[serde(default)]
+    pub id: String,
+}
+
+/// `azuredevops.ForkRepositoryInputParentRepository`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForkRepositoryInputParentRepository {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub project: ForkRepositoryInputProject,
+}
+
+/// `azuredevops.ForkRepositoryInput`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForkRepositoryInput {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub project: ForkRepositoryInputProject,
+    #[serde(rename = "parentRepository", default)]
+    pub parent_repository: ForkRepositoryInputParentRepository,
+}
+
 /// `azuredevops.HTTPError`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HTTPError {
@@ -224,6 +508,13 @@ impl std::fmt::Display for ClientError {
 }
 
 impl std::error::Error for ClientError {}
+
+impl ClientError {
+    /// `errcode.IsNotFound`: the baseline's `HTTPError.NotFound`.
+    pub fn is_not_found(&self) -> bool {
+        matches!(self, Self::Http(err) if err.status_code == 404)
+    }
+}
 
 impl From<HTTPError> for ClientError {
     fn from(err: HTTPError) -> Self {
@@ -373,9 +664,11 @@ impl Client {
     /// `Client.do`: resolve the relative request against the base (or the
     /// override), add `api-version`, authenticate and decode. Returns the
     /// `x-ms-continuationtoken` header value.
-    async fn do_get(
+    async fn do_request(
         &self,
+        method: &str,
         relative: &str,
+        body: Option<Vec<u8>>,
         url_override: Option<&str>,
     ) -> Result<(Option<String>, Vec<u8>), ClientError> {
         let base = match url_override {
@@ -410,17 +703,20 @@ impl Client {
         let mut retries = 0u8;
         loop {
             let mut headers = Vec::new();
+            if body.is_some() {
+                headers.push(("Content-Type".to_owned(), "application/json".to_owned()));
+            }
             self.auth
-                .authenticate("GET", &url_string, &mut headers)
+                .authenticate(method, &url_string, &mut headers)
                 .map_err(ClientError::Other)?;
 
             let response = self
                 .http
                 .do_request(HttpRequest {
-                    method: "GET".to_owned(),
+                    method: method.to_owned(),
                     url: url_string.clone(),
                     headers,
-                    body: Vec::new(),
+                    body: body.clone().unwrap_or_default(),
                 })
                 .await
                 .map_err(ClientError::Other)?;
@@ -442,6 +738,14 @@ impl Client {
             let continuation = header_value(&response, CONTINUATION_TOKEN_HEADER);
             return Ok((continuation, response.body));
         }
+    }
+
+    async fn do_get(
+        &self,
+        relative: &str,
+        url_override: Option<&str>,
+    ) -> Result<(Option<String>, Vec<u8>), ClientError> {
+        self.do_request("GET", relative, None, url_override).await
     }
 
     /// `ListRepositoriesByProjectOrOrg`. The baseline does not follow the
@@ -525,6 +829,170 @@ impl Client {
             .await?;
         serde_json::from_slice(&body).map_err(|err| ClientError::Other(err.to_string()))
     }
+
+    /// `GetPullRequest`.
+    pub async fn get_pull_request(
+        &self,
+        org: &str,
+        project: &str,
+        repo_name_or_id: &str,
+        pull_request_id: &str,
+    ) -> Result<PullRequest, ClientError> {
+        let relative = pull_request_path(org, project, repo_name_or_id, pull_request_id);
+        let (_, body) = self.do_request("GET", &relative, None, None).await?;
+        decode_body(&body)
+    }
+
+    /// `GetPullRequestStatuses`.
+    pub async fn get_pull_request_statuses(
+        &self,
+        org: &str,
+        project: &str,
+        repo_name_or_id: &str,
+        pull_request_id: &str,
+    ) -> Result<Vec<PullRequestBuildStatus>, ClientError> {
+        let relative = format!(
+            "{}/statuses",
+            pull_request_path(org, project, repo_name_or_id, pull_request_id)
+        );
+        let (_, body) = self.do_request("GET", &relative, None, None).await?;
+        let statuses: PullRequestStatuses = decode_body(&body)?;
+        Ok(statuses.value)
+    }
+
+    /// `CreatePullRequest`. The baseline documents that the API wants the
+    /// repository ID, but the source passes the repository name.
+    pub async fn create_pull_request(
+        &self,
+        org: &str,
+        project: &str,
+        repo_name_or_id: &str,
+        input: &CreatePullRequestInput,
+    ) -> Result<PullRequest, ClientError> {
+        let relative = format!("{org}/{project}/_apis/git/repositories/{repo_name_or_id}/pullrequests");
+        let (_, body) = self
+            .do_request("POST", &relative, Some(encode_body(input)?), None)
+            .await?;
+        decode_body(&body)
+    }
+
+    /// `UpdatePullRequest`.
+    pub async fn update_pull_request(
+        &self,
+        org: &str,
+        project: &str,
+        repo_name_or_id: &str,
+        pull_request_id: &str,
+        input: &PullRequestUpdateInput,
+    ) -> Result<PullRequest, ClientError> {
+        let relative = pull_request_path(org, project, repo_name_or_id, pull_request_id);
+        let (_, body) = self
+            .do_request("PATCH", &relative, Some(encode_body(input)?), None)
+            .await?;
+        decode_body(&body)
+    }
+
+    /// `AbandonPullRequest`.
+    pub async fn abandon_pull_request(
+        &self,
+        org: &str,
+        project: &str,
+        repo_name_or_id: &str,
+        pull_request_id: &str,
+    ) -> Result<PullRequest, ClientError> {
+        let relative = pull_request_path(org, project, repo_name_or_id, pull_request_id);
+        let input = PullRequestUpdateInput {
+            status: Some(PULL_REQUEST_STATUS_ABANDONED.to_owned()),
+            ..Default::default()
+        };
+        let (_, body) = self
+            .do_request("PATCH", &relative, Some(encode_body(&input)?), None)
+            .await?;
+        decode_body(&body)
+    }
+
+    /// `CreatePullRequestCommentThread`.
+    pub async fn create_pull_request_comment_thread(
+        &self,
+        org: &str,
+        project: &str,
+        repo_name_or_id: &str,
+        pull_request_id: &str,
+        input: &PullRequestCommentInput,
+    ) -> Result<PullRequestCommentResponse, ClientError> {
+        let relative = format!(
+            "{}/threads",
+            pull_request_path(org, project, repo_name_or_id, pull_request_id)
+        );
+        let (_, body) = self
+            .do_request("POST", &relative, Some(encode_body(input)?), None)
+            .await?;
+        decode_body(&body)
+    }
+
+    /// `CompletePullRequest`.
+    pub async fn complete_pull_request(
+        &self,
+        org: &str,
+        project: &str,
+        repo_name_or_id: &str,
+        pull_request_id: &str,
+        input: &PullRequestCompleteInput,
+    ) -> Result<PullRequest, ClientError> {
+        let relative = pull_request_path(org, project, repo_name_or_id, pull_request_id);
+        let mut completion = PullRequestCompletionOptions {
+            delete_source_branch: input.delete_source_branch,
+            ..Default::default()
+        };
+        if let Some(strategy) = &input.merge_strategy {
+            completion.merge_strategy = strategy.clone();
+        }
+        let update = PullRequestUpdateInput {
+            status: Some(PULL_REQUEST_STATUS_COMPLETED.to_owned()),
+            last_merge_source_commit: Some(PullRequestCommit {
+                commit_id: input.commit_id.clone(),
+                url: String::new(),
+            }),
+            completion_options: Some(completion),
+            ..Default::default()
+        };
+        let (_, body) = self
+            .do_request("PATCH", &relative, Some(encode_body(&update)?), None)
+            .await?;
+        decode_body(&body)
+    }
+
+    /// `ForkRepository`.
+    pub async fn fork_repository(
+        &self,
+        org: &str,
+        input: &ForkRepositoryInput,
+    ) -> Result<Repository, ClientError> {
+        let relative = format!("{org}/_apis/git/repositories");
+        let (_, body) = self
+            .do_request("POST", &relative, Some(encode_body(input)?), None)
+            .await?;
+        decode_body(&body)
+    }
+}
+
+fn pull_request_path(
+    org: &str,
+    project: &str,
+    repo_name_or_id: &str,
+    pull_request_id: &str,
+) -> String {
+    format!(
+        "{org}/{project}/_apis/git/repositories/{repo_name_or_id}/pullrequests/{pull_request_id}"
+    )
+}
+
+fn encode_body<T: Serialize>(value: &T) -> Result<Vec<u8>, ClientError> {
+    serde_json::to_vec(value).map_err(|err| ClientError::Other(format!("marshalling request: {err}")))
+}
+
+fn decode_body<T: for<'de> Deserialize<'de>>(body: &[u8]) -> Result<T, ClientError> {
+    serde_json::from_slice(body).map_err(|err| ClientError::Other(err.to_string()))
 }
 
 const API_VERSION_KEY: &str = "api-version";
