@@ -17,13 +17,27 @@
 //!   installation ID / base URL against the GitHub external services, exactly
 //!   like `gitHubAppResolver.compute` (`resolver.go:285-334`).
 //!
-//! Data comes from the existing `github_apps`, `github_app_installs` and
-//! `external_services` tables; no table, column or Redis key is added.
+//! Data comes from the existing `github_apps`, `github_app_installs`,
+//! `external_services` and `webhooks` tables; no table, column or Redis key is
+//! added.
 //!
-//! Unported sub-surfaces return `Ok(None)` (the executor reports the field as
-//! unported): `GitHubApp.webhook`, the `externalServices` `ExternalService`
-//! fields beyond the base read columns, and the two mutations. See
-//! `m9_25c_githubapps_and_chroma_overview.md` for the full list.
+//! M9.26d adds the write surface actually present in the SDL:
+//!
+//! - `Mutation.deleteGitHubApp` (`gitHubAppsStore.Delete`) and
+//!   `Mutation.refreshGitHubApp` (`gitHubAppResolver.syncInstallationsWithError`
+//!   + `gitHubAppsStore.SyncInstallations`), site-admin gated like the
+//!   baseline;
+//! - `GitHubApp.webhook`, which reads the outbound webhook by
+//!   `github_apps.webhook_id` and renders the shared
+//!   [`crate::graphql_inventory_c::WebhookObject`] (`nil` for a missing row or
+//!   a decryption error, matching the resolver).
+//!
+//! The outbound GitHub REST call behind `refreshGitHubApp` goes through the
+//! injectable [`crate::github_oauth::GithubHttpTransport`], so the differential
+//! replays responses without network access.
+//!
+//! Still unported: the `externalServices` `ExternalService` fields beyond the
+//! base read columns. See `m9_26d_githubapps_mutations_overview.md`.
 //!
 //! The database is injected through [`GitHubAppsGraphqlDatabase`], a
 //! synchronous seam in the same style as the batches resolver; the production
@@ -41,6 +55,7 @@ use time::OffsetDateTime;
 use crate::external_services::{
     marshal_external_service_id, redact_config, unique_code_host_identifier,
 };
+use crate::github_oauth::{github_api_root, GithubHttpRequest, GithubHttpTransport};
 use crate::graphql_resolvers::{datetime_rfc3339, PageInfoObject};
 
 /// `githubapp.gitHubAppIDKind` (`resolver.go:39`).
@@ -160,6 +175,34 @@ pub trait GitHubAppsGraphqlDatabase: Send + Sync {
 
     /// `ExternalServices().List(ctx, {Kinds: [GITHUB]})`, ordered by `id DESC`.
     fn list_github_external_services(&self) -> Result<Vec<GitHubExternalServiceData>, String>;
+
+    /// `gitHubAppsStore.Delete`: `DELETE FROM github_apps WHERE id = ?`.
+    /// Deleting a nonexistent row succeeds; `github_app_installs` rows are
+    /// removed by the `ON DELETE CASCADE` foreign key.
+    fn delete_app(&self, id: i64) -> Result<(), String>;
+
+    /// `gitHubAppsStore.Install`: the `(app_id, installation_id)` upsert.
+    fn install_installation(
+        &self,
+        app_id: i64,
+        install: &GitHubAppInstallationData,
+    ) -> Result<(), String>;
+
+    /// `gitHubAppsStore.BulkRemoveInstallations`: rows for `app_id` whose
+    /// `installation_id` is in `installation_ids`.
+    fn bulk_remove_installations(
+        &self,
+        app_id: i64,
+        installation_ids: &[i64],
+    ) -> Result<(), String>;
+
+    /// `Webhooks(keyring.Default().WebhookKey).GetByID`. `Ok(None)` covers the
+    /// `gitHubAppResolver.Webhook` contract: any lookup error (missing row,
+    /// undecryptable secret) renders `null` rather than a GraphQL error.
+    fn get_webhook_by_id(
+        &self,
+        id: i64,
+    ) -> Result<Option<crate::graphql_inventory_c::WebhookData>, String>;
 }
 
 // ---------------------------------------------------------------------------
@@ -179,6 +222,19 @@ pub fn check_current_user_is_site_admin(
         Some(false) => Err("must be site admin".to_owned()),
         Some(true) => Ok(()),
     }
+}
+
+/// `resolver.gitHubAppByID` (`resolver.go:160-177`): site-admin gate, Relay ID
+/// validation, then `gitHubAppsStore.GetByID`.
+pub fn github_app_by_id(
+    db: &dyn GitHubAppsGraphqlDatabase,
+    raw_id: &str,
+    actor: Actor,
+) -> Result<GitHubAppData, String> {
+    check_current_user_is_site_admin(db, actor)?;
+    let id = unmarshal_github_app_id(raw_id)?;
+    db.get_app_by_id(id)?
+        .ok_or_else(|| no_app_matching(&format!("id = {id}")))
 }
 
 /// `MarshalGitHubAppID` (`resolver.go:42-44`).
@@ -269,13 +325,8 @@ fn git_hub_app(
     arguments: &Arguments,
     actor: Actor,
 ) -> Result<FieldValue, ExecError> {
-    check_current_user_is_site_admin(db.as_ref(), actor).map_err(ExecError::new)?;
-    let raw = arguments.string("id").unwrap_or_default();
-    let id = unmarshal_github_app_id(raw).map_err(ExecError::new)?;
-    let app = db
-        .get_app_by_id(id)
-        .map_err(ExecError::new)?
-        .ok_or_else(|| ExecError::new(no_app_matching(&format!("id = {id}"))))?;
+    let app = github_app_by_id(db.as_ref(), arguments.string("id").unwrap_or_default(), actor)
+        .map_err(ExecError::new)?;
     Ok(FieldValue::Object(Arc::new(GitHubAppObject::new(app, db.clone()))))
 }
 
@@ -309,12 +360,7 @@ pub fn node_field(
     if kind != GITHUB_APP_KIND {
         return Ok(None);
     }
-    check_current_user_is_site_admin(db.as_ref(), actor).map_err(ExecError::new)?;
-    let app_id = unmarshal_github_app_id(id).map_err(ExecError::new)?;
-    let app = db
-        .get_app_by_id(app_id)
-        .map_err(ExecError::new)?
-        .ok_or_else(|| ExecError::new(no_app_matching(&format!("id = {app_id}"))))?;
+    let app = github_app_by_id(db.as_ref(), id, actor).map_err(ExecError::new)?;
     Ok(Some(FieldValue::Object(Arc::new(GitHubAppObject::new(
         app,
         db.clone(),
@@ -450,8 +496,29 @@ impl ObjectValue for GitHubAppObject {
                     element_type: Some("Installation"),
                 }))
             }
-            // `Webhook` needs the outbound-webhook store and the keyring.
-            "webhook" => Ok(None),
+            // `gitHubAppResolver.Webhook` (`resolver.go:266-276`): no
+            // `webhook_id` or any lookup error renders `null`.
+            "webhook" => {
+                let Some(webhook_id) = self.app.webhook_id else {
+                    return Ok(Some(FieldValue::Null));
+                };
+                let hook = self
+                    .db
+                    .get_webhook_by_id(webhook_id)
+                    .map_err(ExecError::new)?;
+                Ok(Some(match hook {
+                    Some(data) => FieldValue::Object(Arc::new(
+                        crate::graphql_inventory_c::WebhookObject {
+                            data,
+                            viewer_site_admin: false,
+                            nested: Arc::new(
+                                crate::graphql_resolvers::NestedPrefetch::default(),
+                            ),
+                        },
+                    )),
+                    None => FieldValue::Null,
+                }))
+            }
             _ => Ok(None),
         }
     }
@@ -681,6 +748,354 @@ impl ObjectValue for ComputedExternalServiceObject {
             ))))),
             _ => Ok(None),
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Mutations (M9.26d)
+// ---------------------------------------------------------------------------
+
+/// Whether `field` is one of the two GitHub Apps mutations.
+pub fn is_mutation_field(field: &str) -> bool {
+    matches!(field, "deleteGitHubApp" | "refreshGitHubApp")
+}
+
+/// Resolve `Mutation.deleteGitHubApp` / `Mutation.refreshGitHubApp`.
+///
+/// `http` is the injectable REST transport; `None` uses the production
+/// `reqwest` client. `deleteGitHubApp` never issues a request.
+pub fn mutation_field(
+    db: &GitHubAppsHandle,
+    http: Option<&dyn GithubHttpTransport>,
+    field: &str,
+    arguments: &Arguments,
+    actor: Actor,
+) -> Result<Option<FieldValue>, ExecError> {
+    match field {
+        "deleteGitHubApp" => delete_github_app(db.as_ref(), arguments, actor),
+        "refreshGitHubApp" => {
+            let fallback = crate::github_oauth::ReqwestGithubHttpClient::from_default_client();
+            let http = http.unwrap_or(&fallback);
+            refresh_github_app(db.as_ref(), http, arguments, actor)
+        }
+        _ => Ok(None),
+    }
+}
+
+/// `resolver.DeleteGitHubApp` (`resolver.go:58-72`).
+fn delete_github_app(
+    db: &dyn GitHubAppsGraphqlDatabase,
+    arguments: &Arguments,
+    actor: Actor,
+) -> Result<Option<FieldValue>, ExecError> {
+    check_current_user_is_site_admin(db, actor).map_err(ExecError::new)?;
+    let id = unmarshal_github_app_id(arguments.string("gitHubApp").unwrap_or_default())
+        .map_err(ExecError::new)?;
+    db.delete_app(id).map_err(ExecError::new)?;
+    Ok(Some(FieldValue::Object(Arc::new(
+        crate::temporary_settings::EmptyResponseObject,
+    ))))
+}
+
+/// `resolver.RefreshGitHubApp` + `gitHubAppResolver.syncInstallationsWithError`
+/// (`resolver.go:74-80`, `resolver.go:311-341`).
+fn refresh_github_app(
+    db: &dyn GitHubAppsGraphqlDatabase,
+    http: &dyn GithubHttpTransport,
+    arguments: &Arguments,
+    actor: Actor,
+) -> Result<Option<FieldValue>, ExecError> {
+    // `gitHubAppByID` performs the site-admin gate and lookup first.
+    let app = github_app_by_id(
+        db,
+        arguments.string("gitHubApp").unwrap_or_default(),
+        actor,
+    )
+    .map_err(ExecError::new)?;
+
+    // `auth.NewGitHubAppAuthenticator` parses the key, then `url.Parse`
+    // validates the base URL, both before any request.
+    let client = GitHubInstallationsClient::new(&app, http).map_err(ExecError::new)?;
+    let errors = sync_installations(db, &app, &client);
+    match combine_errors(&errors) {
+        Some(message) => Err(ExecError::new(message)),
+        // `RefreshGitHubApp` returns `nil` (not `&EmptyResponse{}`) when the
+        // sync succeeds, so the nullable field resolves to `null`.
+        None => Ok(Some(FieldValue::Null)),
+    }
+}
+
+/// `errors.MultiError` formatting: one error keeps its message, several use
+/// `"N errors occurred:\n\t* e1\n\t* e2"`.
+fn combine_errors(errors: &[String]) -> Option<String> {
+    match errors {
+        [] => None,
+        [single] => Some(single.clone()),
+        many => {
+            let mut message = format!("{} errors occurred:", many.len());
+            for error in many {
+                message.push_str("\n\t* ");
+                message.push_str(error);
+            }
+            Some(message)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// REST client for `GET <api>/app/installations?page=N`
+// ---------------------------------------------------------------------------
+
+/// `gogithub.Installation`, restricted to the fields the store reads. `id` is
+/// a pointer in go-github (`nil` entries are skipped); a nil account is
+/// rendered as empty strings through the getters.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
+struct RawInstallation {
+    #[serde(default)]
+    id: Option<i64>,
+    #[serde(default)]
+    html_url: String,
+    #[serde(default)]
+    account: Option<RawAccount>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
+struct RawAccount {
+    #[serde(default)]
+    login: String,
+    #[serde(default)]
+    avatar_url: String,
+    #[serde(default)]
+    html_url: String,
+    #[serde(default, rename = "type")]
+    account_type: String,
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+struct RawApiError {
+    #[serde(default)]
+    message: String,
+}
+
+/// `extsvc/github.APIError` reduced to what the sync observes: the HTTP status
+/// (`None` for JWT/transport errors) and the formatted message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FetchError {
+    status: Option<u16>,
+    message: String,
+}
+
+impl FetchError {
+    /// `errors.As(err, &e) && e.Code == http.StatusNotFound`.
+    fn is_not_found(&self) -> bool {
+        self.status == Some(404)
+    }
+}
+
+const ACCEPT_PREVIEW: &str =
+    "application/vnd.github.jean-grey-preview+json,application/vnd.github.mercy-preview+json";
+const ACCEPT_APP_PREVIEW: &str = "application/vnd.github.machine-man-preview+json";
+
+/// `github.V3Client` as used by `syncInstallationsWithError`: an RS256 JWT
+/// bearer token against the app's API root.
+struct GitHubInstallationsClient<'a> {
+    authenticator: sg_extsvc::auth::GitHubAppAuthenticator,
+    api_root: String,
+    http: &'a dyn GithubHttpTransport,
+}
+
+impl<'a> GitHubInstallationsClient<'a> {
+    /// Baseline order: `NewGitHubAppAuthenticator` parses the key, then
+    /// `url.Parse(app.BaseURL)` validates the base URL.
+    fn new(app: &GitHubAppData, http: &'a dyn GithubHttpTransport) -> Result<Self, String> {
+        let authenticator = sg_extsvc::auth::GitHubAppAuthenticator::new(
+            app.app_id as i32,
+            app.private_key.clone(),
+        )?;
+        // `url.Parse` rejects non-absolute/unknown-scheme URLs; `github_api_root`
+        // would silently fall back, so validate explicitly first.
+        url::Url::parse(&app.base_url).map_err(|err| err.to_string())?;
+        Ok(Self {
+            authenticator,
+            api_root: github_api_root(&app.base_url),
+            http,
+        })
+    }
+
+    /// `V3Client.GetAppInstallations`: one page of installations and whether
+    /// the `Link` header advertises `rel="next"`.
+    fn get_app_installations(
+        &self,
+        page: i64,
+    ) -> Result<(Vec<RawInstallation>, bool), FetchError> {
+        let url = installations_url(&self.api_root, page);
+        let jwt = self.authenticator.generate_jwt().map_err(|message| FetchError {
+            status: None,
+            message,
+        })?;
+        let request = GithubHttpRequest {
+            method: "GET".to_owned(),
+            url: url.clone(),
+            authorization: format!("Bearer {jwt}"),
+            accept: vec![ACCEPT_PREVIEW.to_owned(), ACCEPT_APP_PREVIEW.to_owned()],
+        };
+        let response = block_on(self.http.execute(&request)).map_err(|err| FetchError {
+            status: None,
+            message: format!("request failed: {err}"),
+        })?;
+        let status = response.status;
+        let has_next_page = response.link.contains("rel=\"next\"");
+
+        if !(200..400).contains(&status) {
+            // `doRequest` reads at most 8 KiB and decodes `{"message": ...}`.
+            let truncated = &response.body.as_bytes()[..response.body.len().min(8 * 1024)];
+            let body = String::from_utf8_lossy(truncated).into_owned();
+            let message = match serde_json::from_str::<RawApiError>(&body) {
+                Ok(error) => error.message,
+                Err(err) => {
+                    format!("failed to decode error response from GitHub API: {err}: {body:?}")
+                }
+            };
+            return Err(FetchError {
+                status: Some(status),
+                message: format!("request to {url} returned status {status}: {message}"),
+            });
+        }
+
+        // A 304 or 204 carries no body (the baseline returns early).
+        if status == 304 || status == 204 {
+            return Ok((Vec::new(), has_next_page));
+        }
+
+        let installations: Vec<RawInstallation> =
+            serde_json::from_str(&response.body).map_err(|err| FetchError {
+                status: None,
+                message: err.to_string(),
+            })?;
+        Ok((installations, has_next_page))
+    }
+}
+
+/// `V3Client.GetAppInstallations` request URL: `path.Join(apiURL.Path,
+/// "app/installations")` resolved against the API root, with `?page=N`.
+fn installations_url(api_root: &str, page: i64) -> String {
+    let Ok(mut url) = url::Url::parse(api_root) else {
+        return format!("{api_root}app/installations?page={page}");
+    };
+    let joined = format!(
+        "{}/{}",
+        url.path().trim_end_matches('/'),
+        "app/installations".trim_start_matches('/')
+    );
+    let joined = if joined.starts_with('/') {
+        joined
+    } else {
+        format!("/{joined}")
+    };
+    url.set_path(&joined);
+    url.set_query(Some(&format!("page={page}")));
+    url.to_string()
+}
+
+/// `gitHubAppsStore.SyncInstallations` (`store.go:471-592`): paginate the
+/// GitHub API, upsert every remote installation, then delete the database
+/// rows the API no longer reports. A 404 from GitHub removes every stored
+/// installation for the app; any other fetch error preserves them.
+fn sync_installations(
+    db: &dyn GitHubAppsGraphqlDatabase,
+    app: &GitHubAppData,
+    client: &GitHubInstallationsClient<'_>,
+) -> Vec<String> {
+    let mut errors = Vec::new();
+
+    let db_installations = match db.get_installations(app.id) {
+        Ok(installations) => installations,
+        Err(err) => return vec![err],
+    };
+
+    let mut remote_installations = Vec::new();
+    let mut page = 1;
+    loop {
+        match client.get_app_installations(page) {
+            Ok((installations, has_next_page)) => {
+                remote_installations.extend(installations);
+                if !has_next_page {
+                    break;
+                }
+                page += 1;
+            }
+            Err(err) => {
+                let not_found = err.is_not_found();
+                errors.push(err.message);
+
+                // A 404 means the GitHub App itself was deleted; drop every
+                // stored installation. Other errors preserve them.
+                if not_found {
+                    let installation_ids: Vec<i64> = db_installations
+                        .iter()
+                        .map(|install| install.installation_id)
+                        .collect();
+                    if !installation_ids.is_empty() {
+                        if let Err(delete_err) =
+                            db.bulk_remove_installations(app.id, &installation_ids)
+                        {
+                            errors.push(delete_err);
+                            return errors;
+                        }
+                    }
+                }
+                return errors;
+            }
+        }
+    }
+
+    let mut missing: std::collections::BTreeSet<i64> = db_installations
+        .iter()
+        .map(|install| install.installation_id)
+        .collect();
+
+    let mut to_be_added = Vec::new();
+    for install in remote_installations {
+        let Some(id) = install.id else {
+            continue;
+        };
+        let account = install.account.unwrap_or_default();
+        to_be_added.push(GitHubAppInstallationData {
+            installation_id: id,
+            url: install.html_url,
+            account_login: account.login,
+            account_avatar_url: account.avatar_url,
+            account_url: account.html_url,
+            account_type: account.account_type,
+        });
+        missing.remove(&id);
+    }
+
+    for install in &to_be_added {
+        if let Err(err) = db.install_installation(app.id, install) {
+            errors.push(err);
+        }
+    }
+
+    if !missing.is_empty() {
+        let installation_ids: Vec<i64> = missing.into_iter().collect();
+        if let Err(err) = db.bulk_remove_installations(app.id, &installation_ids) {
+            errors.push(err);
+            return errors;
+        }
+    }
+
+    errors
+}
+
+fn block_on<F: std::future::Future>(future: F) -> F::Output {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => tokio::task::block_in_place(|| handle.block_on(future)),
+        Err(_) => tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("github apps blocking runtime")
+            .block_on(future),
     }
 }
 

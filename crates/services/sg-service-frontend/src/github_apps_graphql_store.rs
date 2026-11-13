@@ -47,11 +47,23 @@ const SELECT_APP_COLUMNS: &str = "id, app_id, name, domain, slug, base_url, app_
 pub struct GitHubAppsPgDatabase {
     pool: PgPool,
     keyring: Arc<sg_keyring::Keyring>,
+    /// `conf.Get().ExternalURL`, used for `Webhook.url`.
+    external_url: String,
 }
 
 impl GitHubAppsPgDatabase {
     pub fn new(pool: PgPool, keyring: Arc<sg_keyring::Keyring>) -> Self {
-        Self { pool, keyring }
+        Self {
+            pool,
+            keyring,
+            external_url: String::new(),
+        }
+    }
+
+    /// Set `conf.Get().ExternalURL` (defaults to empty, like `conf.Unified{}`).
+    pub fn with_external_url(mut self, external_url: impl Into<String>) -> Self {
+        self.external_url = external_url.into();
+        self
     }
 
     fn github_app_key(&self) -> Option<Arc<dyn sg_encryption::Key>> {
@@ -281,5 +293,73 @@ impl GitHubAppsGraphqlDatabase for GitHubAppsPgDatabase {
             });
         }
         Ok(services)
+    }
+
+    fn delete_app(&self, id: i64) -> Result<(), String> {
+        // `gitHubAppsStore.Delete` (`store.go:161-164`). A zero-row delete is
+        // not an error.
+        block_on(
+            sqlx::query("DELETE FROM github_apps WHERE id = $1")
+                .bind(i32::try_from(id).map_err(|err| err.to_string())?)
+                .execute(&self.pool),
+        )
+        .map(|_| ())
+        .map_err(|err| err.to_string())
+    }
+
+    fn install_installation(
+        &self,
+        app_id: i64,
+        install: &GitHubAppInstallationData,
+    ) -> Result<(), String> {
+        let record = sg_db::github_apps::GitHubAppInstallation {
+            id: 0,
+            app_id: i32::try_from(app_id).map_err(|err| err.to_string())?,
+            installation_id: i32::try_from(install.installation_id)
+                .unwrap_or(i32::MAX),
+            url: Some(install.url.clone()),
+            account_login: Some(install.account_login.clone()),
+            account_avatar_url: Some(install.account_avatar_url.clone()),
+            account_url: Some(install.account_url.clone()),
+            account_type: Some(install.account_type.clone()),
+        };
+        block_on(sg_db::github_apps::install(&self.pool, &record)).map(|_| ())
+    }
+
+    fn bulk_remove_installations(
+        &self,
+        app_id: i64,
+        installation_ids: &[i64],
+    ) -> Result<(), String> {
+        // `BulkRemoveInstallations` renders an inline `IN (...)` list, so an
+        // empty list is never sent (the baseline would produce invalid SQL).
+        if installation_ids.is_empty() {
+            return Ok(());
+        }
+        let installation_ids: Vec<i32> = installation_ids
+            .iter()
+            .map(|id| i32::try_from(*id).unwrap_or(i32::MAX))
+            .collect();
+        block_on(sg_db::github_apps::bulk_remove_installations(
+            &self.pool,
+            i32::try_from(app_id).map_err(|err| err.to_string())?,
+            &installation_ids,
+        ))
+    }
+
+    fn get_webhook_by_id(
+        &self,
+        id: i64,
+    ) -> Result<Option<crate::graphql_inventory_c::WebhookData>, String> {
+        // `webhook_id` is an `int` in Go; the resolver converts it with
+        // `int32(*r.app.WebhookID)`, which wraps like `as i32`.
+        let id = id as i32;
+        // The resolver ignores every `GetByID` error and renders `null`.
+        Ok(block_on(crate::graphql_inventory_c::load_webhook_by_id(
+            &self.pool,
+            id,
+            &self.external_url,
+        ))
+        .ok())
     }
 }

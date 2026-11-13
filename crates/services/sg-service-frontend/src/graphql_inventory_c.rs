@@ -1319,7 +1319,7 @@ fn webhook_from_row(
 const WEBHOOK_COLUMNS: &str = "id, uuid::text AS uuid, code_host_kind, code_host_urn, secret, \
      created_at, updated_at, encryption_key_id, created_by_user_id, updated_by_user_id, name";
 
-async fn load_webhook_by_id(
+pub(crate) async fn load_webhook_by_id(
     pool: &PgPool,
     id: i32,
     external_url: &str,
