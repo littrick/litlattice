@@ -2766,6 +2766,17 @@ impl PgSamlProvisioner {
             sourcegraph_dotcom,
         }
     }
+
+    /// Read `permissions.userMapping.bindID` and
+    /// `log.securityEventLog.location` from the live configuration
+    /// (`conf.Get()`) when provisioning users.
+    pub fn with_live_configuration(
+        mut self,
+        live: std::sync::Arc<sg_config::LiveConfig>,
+    ) -> Self {
+        self.store = self.store.with_live_configuration(live);
+        self
+    }
 }
 
 #[async_trait]

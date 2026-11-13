@@ -41,7 +41,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use sqlx::PgPool;
 
-use sg_config::SiteConfiguration;
+use sg_config::{LiveConfig, SiteConfiguration};
 
 use crate::github_oauth::{
     GithubHttpTransport, GithubOAuthResolver, ReqwestGithubHttpClient, GITHUB_SERVICE_TYPE,
@@ -184,6 +184,7 @@ impl OidcHttpClient for ReqwestOidcHttpClient {
 struct GitlabProvisionerAdapter {
     pool: PgPool,
     dotcom: bool,
+    live: Option<Arc<LiveConfig>>,
 }
 
 impl GitlabProvisionerAdapter {
@@ -192,7 +193,10 @@ impl GitlabProvisionerAdapter {
         identity: &crate::gitlab_oauth::ExternalIdentity,
         create_if_not_exist: bool,
     ) -> Result<GitlabProvisionOutcome, GitlabProvisionError> {
-        let store = PgProvisionStore::new(self.pool.clone());
+        let mut store = PgProvisionStore::new(self.pool.clone());
+        if let Some(live) = &self.live {
+            store = store.with_live_configuration(Arc::clone(live));
+        }
         let suffix = OsUsernameSuffix;
         let deps = ProvisionDeps {
             store: &store,
@@ -245,6 +249,7 @@ struct OidcProvisionerAdapter {
     pool: PgPool,
     dotcom: bool,
     create_if_not_exist: bool,
+    live: Option<Arc<LiveConfig>>,
 }
 
 #[async_trait]
@@ -253,7 +258,10 @@ impl OidcProvisioner for OidcProvisionerAdapter {
         &self,
         identity: &crate::oidc_login::ExternalIdentity<'_>,
     ) -> Result<OidcProvisionOutcome, OidcProvisionError> {
-        let store = PgProvisionStore::new(self.pool.clone());
+        let mut store = PgProvisionStore::new(self.pool.clone());
+        if let Some(live) = &self.live {
+            store = store.with_live_configuration(Arc::clone(live));
+        }
         let suffix = OsUsernameSuffix;
         let deps = ProvisionDeps {
             store: &store,
@@ -409,6 +417,7 @@ fn gitlab_providers(site: &SiteConfiguration) -> Vec<GitlabOAuthProvider> {
 struct WiringOidcProvisionerFactory {
     pool: PgPool,
     dotcom: bool,
+    live: Option<Arc<LiveConfig>>,
 }
 
 impl crate::oidc_middleware::OidcProvisionerFactory for WiringOidcProvisionerFactory {
@@ -417,6 +426,7 @@ impl crate::oidc_middleware::OidcProvisionerFactory for WiringOidcProvisionerFac
             pool: self.pool.clone(),
             dotcom: self.dotcom,
             create_if_not_exist: config.allow_signup.unwrap_or(true),
+            live: self.live.clone(),
         })
     }
 }
@@ -463,6 +473,7 @@ struct GithubResolverAdapter {
     allow_orgs_map: BTreeMap<String, Vec<String>>,
     http: Arc<dyn GithubHttpTransport>,
     pool: PgPool,
+    live: Option<Arc<LiveConfig>>,
 }
 
 #[async_trait]
@@ -480,7 +491,10 @@ impl OAuthUserResolver for GithubResolverAdapter {
     }
 
     async fn get_or_create_user(&self, token: &OAuthToken) -> UserResolution {
-        let store = PgProvisionStore::new(self.pool.clone());
+        let mut store = PgProvisionStore::new(self.pool.clone());
+        if let Some(live) = &self.live {
+            store = store.with_live_configuration(Arc::clone(live));
+        }
         let suffix = OsUsernameSuffix;
         let resolver = GithubOAuthResolver::new(
             &self.service_id,
@@ -510,6 +524,7 @@ pub struct OAuthResolverWiring {
     github_http: Arc<dyn GithubHttpTransport>,
     gitlab_http: Arc<dyn GitlabApiClient>,
     oidc_http: Arc<dyn OidcHttpClient>,
+    live: Option<Arc<LiveConfig>>,
 }
 
 impl OAuthResolverWiring {
@@ -540,7 +555,16 @@ impl OAuthResolverWiring {
             github_http,
             gitlab_http,
             oidc_http,
+            live: None,
         }
+    }
+
+    /// Read `permissions.userMapping.bindID` and
+    /// `log.securityEventLog.location` from the live configuration
+    /// (`conf.Get()`) when provisioning users.
+    pub fn with_live_configuration(mut self, live: Arc<LiveConfig>) -> Self {
+        self.live = Some(live);
+        self
     }
 
     /// The discovery/JWKS/userinfo transport, shared with the OIDC middleware
@@ -557,6 +581,7 @@ impl OAuthResolverWiring {
         Arc::new(WiringOidcProvisionerFactory {
             pool: self.pool.clone(),
             dotcom: self.dotcom,
+            live: self.live.clone(),
         })
     }
 
@@ -583,6 +608,7 @@ impl OAuthResolverWiring {
         let http = Arc::clone(&self.github_http);
         let pool = self.pool.clone();
         let dotcom = self.dotcom;
+        let live = self.live.clone();
         registry.register_factory(
             GITHUB_SERVICE_TYPE,
             Arc::new(move |state: Option<&str>| {
@@ -601,6 +627,7 @@ impl OAuthResolverWiring {
                     allow_orgs_map: config.allow_orgs_map.clone(),
                     http: Arc::clone(&http),
                     pool: pool.clone(),
+                    live: live.clone(),
                 }) as Arc<dyn OAuthUserResolver>
             }),
         );
@@ -614,6 +641,7 @@ impl OAuthResolverWiring {
         let api = Arc::clone(&self.gitlab_http);
         let pool = self.pool.clone();
         let dotcom = self.dotcom;
+        let live = self.live.clone();
         registry.register_factory(
             gitlab_oauth::GITLAB_SERVICE_TYPE,
             Arc::new(move |state: Option<&str>| {
@@ -625,6 +653,7 @@ impl OAuthResolverWiring {
                 let provisioner: Arc<dyn GitlabProvisioner> = Arc::new(GitlabProvisionerAdapter {
                     pool: pool.clone(),
                     dotcom,
+                    live: live.clone(),
                 });
                 Arc::new(GitlabUserResolver::new(
                     provider,
@@ -644,6 +673,7 @@ impl OAuthResolverWiring {
         let http = Arc::clone(&self.oidc_http);
         let pool = self.pool.clone();
         let dotcom = self.dotcom;
+        let live = self.live.clone();
         registry.register_factory(
             "openidconnect",
             Arc::new(move |state: Option<&str>| {
@@ -663,6 +693,7 @@ impl OAuthResolverWiring {
                     pool: pool.clone(),
                     dotcom,
                     create_if_not_exist,
+                    live: live.clone(),
                 });
                 let resolver = OidcLoginResolver::new(
                     config.clone(),

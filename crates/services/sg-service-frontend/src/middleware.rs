@@ -451,6 +451,9 @@ pub fn external_handler_with_live(
     userpasswd_factory: Option<crate::userpasswd::UserpasswdFactory>,
     oauth_factory: Option<OAuthRouteFactory>,
     saml_factory: Option<SamlRouteFactory>,
+    // PostgreSQL pool for the per-request verify-email store (its
+    // `conf.Get()` values are read from the live configuration).
+    verify_email_pool: Option<sqlx::PgPool>,
     version: Bytes,
     blame_deps: Arc<dyn BlameDeps>,
     search_deps: Arc<dyn SearchDeps>,
@@ -484,6 +487,7 @@ pub fn external_handler_with_live(
         let chain_deps = Arc::clone(&chain_deps);
         let repo_refresh_deps = Arc::clone(&repo_refresh_deps);
         let llm_deps = Arc::clone(&llm_deps);
+        let verify_email_pool = verify_email_pool.clone();
         let version = version.clone();
         Box::pin(async move {
             let derived = middleware.current();
@@ -667,6 +671,10 @@ pub fn external_handler_with_live(
                                                         return redirect;
                                                     }
                                                 }
+                                                // The GraphQL actor the app handlers
+                                                // observe (the chain actor below is
+                                                // consumed by the request extension).
+                                                let graphql_actor = actor.to_graphql();
                                                 request.extensions_mut().insert(ChainActor(actor));
                                                 let mut response = match &route {
                                                     mux::Route::Api => {
@@ -682,11 +690,32 @@ pub fn external_handler_with_live(
                                                         .await
                                                     }
                                                     _ => {
+                                                        // The session actor and the
+                                                        // live `conf.Get()` values are
+                                                        // supplied per request
+                                                        // (`verify_email.go` handlers do
+                                                        // not carry either).
+                                                        let mut request_deps = (*app_deps).clone();
+                                                        request_deps.more.actor = graphql_actor;
+                                                        if let Some(pool) = &verify_email_pool {
+                                                            request_deps.more.verify_email = Some(
+                                                                Arc::new(
+                                                                    crate::app_handlers_more::PgVerifyEmailDb::new(
+                                                                        pool.clone(),
+                                                                        graphql_actor,
+                                                                    )
+                                                                    .with_live_configuration(
+                                                                        Arc::clone(&api_live),
+                                                                    ),
+                                                                ),
+                                                            );
+                                                        }
+                                                        let request_deps = Arc::new(request_deps);
                                                         app_router::dispatch_async_with_body(
                                                             request,
                                                             &app_env,
                                                             &app_config,
-                                                            &app_deps,
+                                                            &request_deps,
                                                         )
                                                         .await
                                                     }

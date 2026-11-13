@@ -822,6 +822,26 @@ impl SchemaGraphqlDeps {
         self
     }
 
+    /// Derive the admin store's `permissions.userMapping.bindID` and
+    /// `log.securityEventLog.location` from the live site configuration
+    /// (`conf.Get()`) on every call instead of the startup defaults.
+    pub fn with_live_site_configuration(
+        mut self,
+        pool: sqlx::PgPool,
+        live: Arc<LiveConfig>,
+    ) -> Self {
+        if let Some(deps) = self.admin_mutations.take() {
+            self.admin_mutations = Some(crate::admin_mutations::AdminMutationDeps::new(
+                Arc::new(
+                    crate::admin_store::PgAdminStore::new(pool)
+                        .with_live_configuration(live),
+                ),
+                deps.effects,
+            ));
+        }
+        self
+    }
+
     /// Enable the external-account GraphQL surface (M9.8ka): the
     /// `user_external_accounts` table, the user-external-account encryption key
     /// (`keyring.UserExternalAccountKey`) and the live configuration.

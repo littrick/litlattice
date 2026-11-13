@@ -619,6 +619,10 @@ pub struct PgAdminStore {
     /// `auditlog` when unset, so no `security_event_logs` row is written
     /// unless the caller supplies the parsed site configuration.
     security_event_logs_in_database: bool,
+    /// Live site configuration (`conf.Get()`); when set, both values above are
+    /// derived per call so configuration updates take effect without a
+    /// restart.
+    live: Option<Arc<sg_config::LiveConfig>>,
 }
 
 impl PgAdminStore {
@@ -627,6 +631,7 @@ impl PgAdminStore {
             pool,
             permissions_bind_id: "email".to_owned(),
             security_event_logs_in_database: false,
+            live: None,
         }
     }
 
@@ -637,6 +642,7 @@ impl PgAdminStore {
             "email" | "username" => bind_id,
             _ => "email".to_owned(),
         };
+        self.live = None;
         self
     }
 
@@ -646,17 +652,44 @@ impl PgAdminStore {
         self.permissions_bind_id = crate::userpasswd::permissions_user_mapping_bind_id(site);
         self.security_event_logs_in_database =
             sg_db::security_event_logs::security_event_logs_in_database(site.raw());
+        self.live = None;
+        self
+    }
+
+    /// Read the bind id and `security_event_logs` destination from the live
+    /// configuration (`conf.Get()`) on every call.
+    pub fn with_live_configuration(mut self, live: Arc<sg_config::LiveConfig>) -> Self {
+        self.live = Some(live);
         self
     }
 
     /// Set whether `security_event_logs` is a destination.
     pub fn with_security_event_logs_in_database(mut self, enabled: bool) -> Self {
         self.security_event_logs_in_database = enabled;
+        self.live = None;
         self
     }
 
     pub fn pool(&self) -> &PgPool {
         &self.pool
+    }
+
+    fn current_permissions_bind_id(&self) -> String {
+        match &self.live {
+            Some(live) => {
+                crate::userpasswd::permissions_user_mapping_bind_id(&live.current().site)
+            }
+            None => self.permissions_bind_id.clone(),
+        }
+    }
+
+    fn current_security_event_logs_in_database(&self) -> bool {
+        match &self.live {
+            Some(live) => sg_db::security_event_logs::security_event_logs_in_database(
+                live.current().site.raw(),
+            ),
+            None => self.security_event_logs_in_database,
+        }
     }
 
     fn account_event_context(&self, actor_uid: i32) -> sg_db::users::DeletionEventContext<'_> {
@@ -667,7 +700,7 @@ impl PgAdminStore {
             },
             version: sg_metrics::VERSION,
             now: OffsetDateTime::now_utc(),
-            security_event_logs_in_database: self.security_event_logs_in_database,
+            security_event_logs_in_database: self.current_security_event_logs_in_database(),
         }
     }
 }
@@ -844,6 +877,11 @@ impl AdminStore for PgAdminStore {
             .await
             .map_err(|e| e.to_string())?;
         }
+        // `CreateInTransaction` assigns the system roles in the same
+        // transaction as the user insert (`internal/database/users.go:432-447`).
+        sg_db::users::assign_new_user_system_roles(&mut *tx, user.id, user.site_admin)
+            .await
+            .map_err(|e| e.to_string())?;
         tx.commit().await.map_err(|e| e.to_string())?;
         // `logAccountCreatedEvent(ctx, NewDBWith(u), newUser, "")`
         // (`internal/database/users.go:261-265`); failures are logged only.
@@ -1028,10 +1066,11 @@ impl AdminStore for PgAdminStore {
         // Type: authz.PermRepos})` (`internal/database/authz.go:98`): enumerate
         // the user's live external accounts plus the configured user-mapping
         // identity, then grant each pending set in one transaction.
+        let bind_id = self.current_permissions_bind_id();
         sg_db::authz::grant_pending_permissions(
             &self.pool,
             user_id,
-            &self.permissions_bind_id,
+            &bind_id,
             OffsetDateTime::now_utc(),
         )
         .await
@@ -1289,10 +1328,11 @@ impl AdminStore for PgAdminStore {
                 .await;
             // `tx.Authz().GrantPendingPermissions`: failures are logged only,
             // so the email write still commits.
+            let bind_id = self.current_permissions_bind_id();
             let _ = sg_db::authz::grant_pending_permissions_in_tx(
                 &mut tx,
                 user_id,
-                &self.permissions_bind_id,
+                &bind_id,
                 OffsetDateTime::now_utc(),
             )
             .await;

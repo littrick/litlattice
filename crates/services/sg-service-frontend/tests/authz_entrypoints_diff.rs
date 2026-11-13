@@ -73,6 +73,29 @@ struct Case {
     account_id: String,
     #[serde(default)]
     org_name: String,
+    /// `permissions.userMapping.bindID` (normalized like `conf.Get()`).
+    #[serde(default = "default_bind_id")]
+    bind_id: String,
+    /// `log.securityEventLog.location` (`all`/`database`/`none`).
+    #[serde(default = "default_event_location")]
+    security_event_location: String,
+}
+
+fn default_bind_id() -> String {
+    "email".to_owned()
+}
+
+fn default_event_location() -> String {
+    "all".to_owned()
+}
+
+/// The per-case site configuration both sides read through `conf.Get()`.
+fn case_site(bind_id: &str, location: &str) -> sg_config::SiteConfiguration {
+    let raw = serde_json::json!({
+        "permissions.userMapping": {"enabled": true, "bindID": bind_id},
+        "log": {"securityEventLog": {"location": location}},
+    });
+    sg_config::SiteConfiguration::parse(&raw.to_string()).expect("site configuration")
 }
 
 /// The harness never sends e-mail, audits, or schedules syncs; every effect
@@ -218,6 +241,19 @@ async fn snapshot(pool: &PgPool) {
         let account_id: String = row.try_get("account_id").expect("account_id");
         let deleted: bool = row.try_get("deleted").expect("deleted");
         println!("ep ext uid={user_id} st={service_type} aid={account_id} deleted={deleted}");
+    }
+
+    for row in sqlx::query(
+        "SELECT ur.user_id, r.name FROM user_roles ur JOIN roles r ON r.id = ur.role_id \
+         WHERE ur.user_id BETWEEN 9960 AND 10099 ORDER BY ur.user_id, r.name",
+    )
+    .fetch_all(pool)
+    .await
+    .expect("select user_roles")
+    {
+        let user_id: i32 = row.try_get("user_id").expect("user_id");
+        let name: String = row.try_get("name").expect("name");
+        println!("ep role uid={user_id} name={name}");
     }
 
     for row in sqlx::query(
@@ -379,11 +415,10 @@ async fn authz_entrypoints_diff() {
     let pool = PgPool::connect(&dsn).await.expect("connect");
     let schema = assemble_sdl(SDL).expect("schema");
     let effects = NoopEffects;
-    let store = PgAdminStore::new(pool.clone())
-        .with_permissions_bind_id("email")
-        .with_security_event_logs_in_database(true);
 
     for case in cases {
+        let site = case_site(&case.bind_id, &case.security_event_location);
+        let store = PgAdminStore::new(pool.clone()).with_site_configuration(&site);
         let error = match case.kind.as_str() {
             "verify_email" => {
                 let deps = MoreDeps {
@@ -397,8 +432,7 @@ async fn authz_entrypoints_diff() {
                                 uid: case.user_id,
                             },
                         )
-                        .with_permissions_bind_id("email")
-                        .with_security_event_logs_in_database(true),
+                        .with_site_configuration(&site),
                     )),
                     ..MoreDeps::default()
                 };
@@ -470,9 +504,8 @@ async fn authz_entrypoints_diff() {
             }
             "create_org" => store.create_org(&case.org_name, None).await.is_err(),
             "oauth_signup" | "oauth_upsert" => {
-                let provision = PgProvisionStore::new(pool.clone())
-                    .with_permissions_bind_id("email")
-                    .with_security_event_logs_in_database(true);
+                let provision =
+                    PgProvisionStore::new(pool.clone()).with_site_configuration(&site);
                 let suffix = FixedSuffix;
                 let deps = ProvisionDeps {
                     store: &provision,

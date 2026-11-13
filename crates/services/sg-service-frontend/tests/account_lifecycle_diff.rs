@@ -16,6 +16,7 @@ use sg_service_frontend::admin_store::{AdminStore, NewUser, PgAdminStore};
 use sg_service_frontend::user_provisioning::{
     ExternalIdentity, NewUserRow, PgProvisionStore, ProvisionStore,
 };
+use sg_service_frontend::userpasswd::{NewUserData, PgUserpasswdStore, UserpasswdStore};
 use sqlx::postgres::PgPool;
 use sqlx::Row;
 
@@ -41,6 +42,12 @@ struct Case {
     service_id: String,
     #[serde(default)]
     account_id: String,
+    /// `assign_system_roles`: role names assigned explicitly.
+    #[serde(default)]
+    roles: Vec<String>,
+    /// `set_site_admin`: the value `Users().SetIsSiteAdmin` writes.
+    #[serde(default)]
+    site_admin: bool,
 }
 
 fn default_true() -> bool {
@@ -94,6 +101,23 @@ async fn snapshot(pool: &PgPool) {
         let arg: String = row.try_get("arg").expect("arg");
         println!("al evt name={name} uid={user_id} anon={anonymous_user_id} source={source} arg={arg}");
     }
+
+    // Role assignments written in the user-creation transaction
+    // (`internal/database/users.go:432-447`) and by the explicit role APIs.
+    for row in sqlx::query(
+        "SELECT ur.user_id, r.name \
+         FROM user_roles ur JOIN roles r ON r.id = ur.role_id \
+         WHERE ur.user_id BETWEEN 9910 AND 10099 \
+         ORDER BY ur.user_id, r.name",
+    )
+    .fetch_all(pool)
+    .await
+    .expect("select user_roles")
+    {
+        let user_id: i32 = row.try_get("user_id").expect("user_id");
+        let name: String = row.try_get("name").expect("name");
+        println!("al role uid={user_id} name={name}");
+    }
 }
 
 #[tokio::test]
@@ -109,7 +133,7 @@ async fn account_lifecycle_diff() {
     let pool = PgPool::connect(&dsn).await.expect("connect");
 
     for case in cases {
-        let error = match case.kind.as_str() {
+        let result = match case.kind.as_str() {
             "create" => {
                 let store = PgAdminStore::new(pool.clone())
                     .with_permissions_bind_id("email")
@@ -126,7 +150,8 @@ async fn account_lifecycle_diff() {
                         case.creator,
                     )
                     .await
-                    .is_err()
+                    .map(|_| ())
+                    .map_err(|error| error.to_string())
             }
             "create_external" => {
                 let store = PgProvisionStore::new(pool.clone())
@@ -154,7 +179,62 @@ async fn account_lifecycle_diff() {
                 store
                     .create_with_external_account(&new_user, &identity)
                     .await
-                    .is_err()
+                    .map(|_| ())
+                    .map_err(|error| format!("{error:?}"))
+            }
+            "userpasswd_create" => {
+                // The built-in password sign-up store
+                // (`pgUserpasswdStore.create_user`) is a separate Rust
+                // implementation of Go's `Users().Create`.
+                let store = PgUserpasswdStore::new(pool.clone(), "email")
+                    .with_site_configuration(
+                        &sg_config::SiteConfiguration::parse(
+                            r#"{"permissions.userMapping":{"enabled":true,"bindID":"email"},
+                                "log":{"securityEventLog":{"location":"all"}}}"#,
+                        )
+                        .expect("site configuration"),
+                    );
+                store
+                    .create_user(&NewUserData {
+                        email: case.email.clone(),
+                        username: case.username.clone(),
+                        password_hash: None,
+                        fail_if_not_initial_user: false,
+                        email_is_verified: case.email_verified,
+                        email_verification_code: None,
+                    })
+                    .await
+                    .map(|_| ())
+                    .map_err(|error| format!("{error:?}"))
+            }
+            "assign_system_roles" => {
+                let roles: Vec<&str> = case.roles.iter().map(String::as_str).collect();
+                sg_db::users::bulk_assign_system_roles_to_user(
+                    &pool,
+                    case.user_id,
+                    &roles,
+                )
+                .await
+                .map_err(|error| error.to_string())
+            }
+            "set_site_admin" => {
+                let ctx = sg_db::users::DeletionEventContext {
+                    actor: sg_db::users::BackendActor {
+                        uid: case.creator,
+                        sourcegraph_operator: false,
+                    },
+                    version: sg_metrics::VERSION,
+                    now: sqlx::types::time::OffsetDateTime::now_utc(),
+                    security_event_logs_in_database: true,
+                };
+                sg_db::users::set_is_site_admin(
+                    &pool,
+                    case.user_id,
+                    case.site_admin,
+                    &ctx,
+                )
+                .await
+                .map_err(|error| error.to_string())
             }
             "delete" | "hard_delete" => {
                 let store = PgAdminStore::new(pool.clone())
@@ -167,10 +247,11 @@ async fn account_lifecycle_diff() {
                         case.deleter,
                     )
                     .await
-                    .is_err()
+                    .map_err(|error| error.to_string())
             }
             other => panic!("unknown case kind {other}"),
         };
+        let error = result.is_err();
         println!("al case={} error={}", case.name, error);
         snapshot(&pool).await;
     }

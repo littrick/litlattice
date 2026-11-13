@@ -742,10 +742,11 @@ impl UserpasswdDeps {
             .unwrap_or_default()
             .into_bytes();
         let email: Arc<dyn EmailSender> = Arc::new(TxEmailSender::new(site));
-        let store: Arc<dyn UserpasswdStore> = Arc::new(PgUserpasswdStore::new(
-            pool,
-            permissions_user_mapping_bind_id(site),
-        ));
+        let store: Arc<dyn UserpasswdStore> =
+            Arc::new(PgUserpasswdStore::new(pool, permissions_user_mapping_bind_id(site))
+                .with_security_event_logs_in_database(
+                    sg_db::security_event_logs::security_event_logs_in_database(site.raw()),
+                ));
         let lockout: Arc<dyn LockoutStore> = match cache {
             Some(cache) => Arc::new(RedisLockoutStore::from_env(
                 cache,
@@ -2092,6 +2093,9 @@ pub struct PgUserpasswdStore {
     pool: PgPool,
     /// `conf.PermissionsUserMapping().BindID`, normalized at construction.
     permissions_bind_id: String,
+    /// `log.securityEventLog.location` includes the database
+    /// (`database`/`all`); gates the `AccountCreated` security event.
+    security_event_logs_in_database: bool,
 }
 
 impl PgUserpasswdStore {
@@ -2099,7 +2103,24 @@ impl PgUserpasswdStore {
         Self {
             pool,
             permissions_bind_id: permissions_bind_id.into(),
+            security_event_logs_in_database: false,
         }
+    }
+
+    /// Derive the pending-permissions bind id and the
+    /// `security_event_logs` destination from site configuration
+    /// (`conf.PermissionsUserMapping`, `log.securityEventLog`).
+    pub fn with_site_configuration(mut self, site: &SiteConfiguration) -> Self {
+        self.permissions_bind_id = permissions_user_mapping_bind_id(site);
+        self.security_event_logs_in_database =
+            sg_db::security_event_logs::security_event_logs_in_database(site.raw());
+        self
+    }
+
+    /// Set whether `log.securityEventLog.location` includes the database.
+    pub fn with_security_event_logs_in_database(mut self, enabled: bool) -> Self {
+        self.security_event_logs_in_database = enabled;
+        self
     }
 }
 
@@ -2290,7 +2311,30 @@ impl UserpasswdStore for PgUserpasswdStore {
             })?;
         }
 
+        // `CreateInTransaction` assigns the system roles in the same
+        // transaction (`internal/database/users.go:432-447`): `USER` for
+        // everyone, `SITE_ADMINISTRATOR` when the inserted user is a site
+        // admin.
+        sg_db::users::assign_new_user_system_roles(&mut *tx, id, site_admin)
+            .await
+            .map_err(db_error)?;
+
         tx.commit().await.map_err(db_error)?;
+
+        // `logAccountCreatedEvent(ctx, ..., newUser, "")`
+        // (`internal/database/users.go:261-265,481-517`). The sign-up actor is
+        // anonymous (`UID == 0`); failures are logged only.
+        let ctx = sg_db::users::DeletionEventContext {
+            actor: sg_db::users::BackendActor {
+                uid: 0,
+                sourcegraph_operator: false,
+            },
+            version: sg_metrics::VERSION,
+            now: OffsetDateTime::now_utc(),
+            security_event_logs_in_database: self.security_event_logs_in_database,
+        };
+        let _ = sg_db::users::log_account_created_event(&self.pool, id, site_admin, "", &ctx).await;
+
         Ok(UserIdentity {
             id,
             username: user.username.clone(),

@@ -19,6 +19,8 @@
 //! differential harness can run against an in-memory store; [`PgProvisionStore`]
 //! is the production adapter over `sg-db`.
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use regex::Regex;
 use sqlx::PgPool;
@@ -734,6 +736,10 @@ pub struct PgProvisionStore {
     permissions_bind_id: String,
     /// `log.securityEventLog.location` is `database`/`all`.
     security_event_logs_in_database: bool,
+    /// Live site configuration (`conf.Get()`); when set, both values above are
+    /// derived per call so configuration updates take effect without a
+    /// restart.
+    live: Option<Arc<sg_config::LiveConfig>>,
 }
 
 impl PgProvisionStore {
@@ -742,6 +748,7 @@ impl PgProvisionStore {
             pool,
             permissions_bind_id: "email".to_owned(),
             security_event_logs_in_database: false,
+            live: None,
         }
     }
 
@@ -752,6 +759,7 @@ impl PgProvisionStore {
             "email" | "username" => bind_id,
             _ => "email".to_owned(),
         };
+        self.live = None;
         self
     }
 
@@ -761,13 +769,40 @@ impl PgProvisionStore {
         self.permissions_bind_id = crate::userpasswd::permissions_user_mapping_bind_id(site);
         self.security_event_logs_in_database =
             sg_db::security_event_logs::security_event_logs_in_database(site.raw());
+        self.live = None;
+        self
+    }
+
+    /// Read the bind id and `security_event_logs` destination from the live
+    /// configuration (`conf.Get()`) on every call.
+    pub fn with_live_configuration(mut self, live: Arc<sg_config::LiveConfig>) -> Self {
+        self.live = Some(live);
         self
     }
 
     /// Set whether `security_event_logs` is a destination.
     pub fn with_security_event_logs_in_database(mut self, enabled: bool) -> Self {
         self.security_event_logs_in_database = enabled;
+        self.live = None;
         self
+    }
+
+    fn current_permissions_bind_id(&self) -> String {
+        match &self.live {
+            Some(live) => {
+                crate::userpasswd::permissions_user_mapping_bind_id(&live.current().site)
+            }
+            None => self.permissions_bind_id.clone(),
+        }
+    }
+
+    fn current_security_event_logs_in_database(&self) -> bool {
+        match &self.live {
+            Some(live) => sg_db::security_event_logs::security_event_logs_in_database(
+                live.current().site.raw(),
+            ),
+            None => self.security_event_logs_in_database,
+        }
     }
 }
 
@@ -870,7 +905,7 @@ impl ProvisionStore for PgProvisionStore {
             },
             version: sg_metrics::VERSION,
             now: sqlx::types::time::OffsetDateTime::now_utc(),
-            security_event_logs_in_database: self.security_event_logs_in_database,
+            security_event_logs_in_database: self.current_security_event_logs_in_database(),
         };
         let _ = sg_db::users::log_account_created_event(
             &self.pool,
@@ -901,10 +936,11 @@ impl ProvisionStore for PgProvisionStore {
     }
 
     async fn grant_pending_permissions(&self, user_id: i32) -> Result<(), String> {
+        let bind_id = self.current_permissions_bind_id();
         sg_db::authz::grant_pending_permissions(
             &self.pool,
             user_id,
-            &self.permissions_bind_id,
+            &bind_id,
             sqlx::types::time::OffsetDateTime::now_utc(),
         )
         .await

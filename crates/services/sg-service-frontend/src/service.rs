@@ -1079,6 +1079,14 @@ impl Service for FrontendService {
         });
         let graphql_deps =
             SchemaGraphqlDeps::with_session(Arc::clone(&graphql_schema), session_pool.clone())
+                // M9.23a: the admin store reads
+                // `permissions.userMapping.bindID` and
+                // `log.securityEventLog.location` from the live configuration
+                // (`conf.Get()`) on every call.
+                .with_live_site_configuration(
+                    session_pool.clone(),
+                    Arc::clone(wiring.live()),
+                )
                 // M9.21c: `internal/featureflag`'s evaluated-flag cache uses
                 // `redispool.Store` (lazily dialed, so startup does not depend
                 // on Redis).
@@ -1388,9 +1396,10 @@ impl Service for FrontendService {
         let oauth_license = Arc::clone(&chain_deps.license);
         let oauth_cookie_key = chain_deps.session_cookie_key.clone();
         let oauth_pool = chain_pool.clone();
-        let oauth_wiring = Arc::new(crate::oauth_wiring::OAuthResolverWiring::new(
-            chain_pool.clone(),
-        ));
+        let oauth_wiring = Arc::new(
+            crate::oauth_wiring::OAuthResolverWiring::new(chain_pool.clone())
+                .with_live_configuration(Arc::clone(wiring.live())),
+        );
         // The OAuth factory's `move` closure takes the store/license/cookie
         // key; keep copies for the SAML factory built alongside.
         let saml_store = Arc::clone(&oauth_store);
@@ -1457,6 +1466,9 @@ impl Service for FrontendService {
                 crate::service_connections::sourcegraph_dotcom_mode(&getenv)
             };
             let http = Arc::clone(&saml_http);
+            // `conf.Get()` values for the provisioned user
+            // (`permissions.userMapping.bindID`, `log.securityEventLog`).
+            let provisioner_live = Arc::clone(wiring.live());
             Arc::new(move |site: &sg_config::SiteConfiguration| {
                 let raw = site.raw();
                 let external_url = raw
@@ -1487,10 +1499,10 @@ impl Service for FrontendService {
                     secure,
                     configured_expiry,
                     license: Arc::clone(&license),
-                    provisioner: Arc::new(crate::saml_auth::PgSamlProvisioner::new(
-                        pool.clone(),
-                        dotcom,
-                    )),
+                    provisioner: Arc::new(
+                        crate::saml_auth::PgSamlProvisioner::new(pool.clone(), dotcom)
+                            .with_live_configuration(Arc::clone(&provisioner_live)),
+                    ),
                     users: Arc::new(crate::saml_auth::PgSamlUsers::new(pool.clone())),
                     suffix: Arc::new(crate::user_provisioning::OsUsernameSuffix),
                     sourcegraph_dotcom: dotcom,
@@ -1512,6 +1524,7 @@ impl Service for FrontendService {
                 Some(userpasswd_factory),
                 Some(oauth_factory),
                 Some(saml_factory),
+                Some(chain_pool.clone()),
                 self.version.bytes(),
                 blame_deps,
                 search_deps,
