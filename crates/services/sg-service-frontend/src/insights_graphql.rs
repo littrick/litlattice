@@ -13,20 +13,31 @@
 //!   `insight_view_series`, `insight_view_grants`, `dashboard`,
 //!   `dashboard_grants`, `dashboard_insight_view`).
 //!
-//! Not covered (documented in
-//! `dev/rs/docs/overviews/m9_29b_insights_overview.md`): the query engine and
-//! aggregation computation (`InsightsSeries.points`, `InsightSeriesStatus`,
-//! `InsightView.dataSeries`, `seriesCount`), live preview, every mutation, and
-//! `node(InsightView)` (the baseline never registers the `insight_view` node
-//! kind, so `node(id)` returns `invalid id`; we reproduce that).
+//! M9.31a adds the recorded data-series read side:
+//! `InsightView.dataSeries` / `seriesCount`, the recorded and capture-group
+//! generators (`fetchSeries`, time-series aggregation, augmentation),
+//! `InsightsSeries.points`/`status`, `sortSeriesResolvers`, and
+//! `InsightDataPoint.diffQuery`/`pointInTimeQuery`. See
+//! `dev/rs/docs/overviews/m9_31a_insights_data_series_overview.md`.
+//!
+//! Still not covered: just-in-time search generators, live preview,
+//! aggregation/backfill scheduling, search-context unwrapping, and
+//! `InsightSeriesStatus.incompleteDatapoints`.
 //!
 //! No table/column/Redis key is added.
 
+use std::cmp::Ordering;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use base64::Engine as _;
 use sg_graphql::exec::{Actor, Arguments, ExecError, FieldValue, InputValue, ObjectValue};
 use sg_graphql::Json;
+use sg_insights_query::sg_search_query::SearchType;
+use sg_insights_query::{
+    new_pattern_replacer, point_diff_query, point_in_time_query, PointDiffQueryOpts,
+};
+use time::{OffsetDateTime, PrimitiveDateTime};
 
 pub type InsightsHandle = Arc<dyn InsightsDatabase>;
 
@@ -49,6 +60,8 @@ pub struct InsightViewFilters {
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct InsightSeriesData {
+    /// `insight_series.id` (integer id used by recording times/backfills).
+    pub insight_series_id: i32,
     pub series_id: String,
     pub query: String,
     pub label: String,
@@ -61,6 +74,30 @@ pub struct InsightSeriesData {
     pub generation_method: String,
     pub group_by: Option<String>,
     pub repository_criteria: Option<String>,
+    /// `insight_series.backfill_queued_at` (`timestamp without time zone`).
+    pub backfill_queued_at: Option<PrimitiveDateTime>,
+    /// `insight_series.supports_augmentation`.
+    pub supports_augmentation: bool,
+}
+
+/// One aggregated time-series point (`store.SeriesPoint`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SeriesPointData {
+    pub series_id: String,
+    pub time: OffsetDateTime,
+    pub value: f64,
+    pub capture: Option<String>,
+}
+
+/// `insightStatusResolver.calculateStatus` result (`statusInfo`).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct InsightSeriesStatusData {
+    pub total_points: i32,
+    pub pending_jobs: i32,
+    pub completed_jobs: i32,
+    pub failed_jobs: i32,
+    pub backfill_queued_at: Option<PrimitiveDateTime>,
+    pub is_loading: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -147,6 +184,25 @@ pub trait InsightsDatabase: InsightsWriteDatabase + Send + Sync + std::fmt::Debu
 
     /// `InsightStore.GetReferenceCount`.
     fn dashboard_reference_count(&self, view_id: i32) -> Result<i64, String>;
+
+    // -- Recorded data series (M9.31a). -----------------------------------
+
+    /// `fetchSeries` → `getRecordedSeriesPointOpts` + `timeSeriesStore.SeriesPoints`
+    /// (+ `augmentSeriesPoints`). Regex filters come from the applied view
+    /// filters; `num_samples` bounds the `after` recording-time offset.
+    fn load_series_points(
+        &self,
+        series: &InsightSeriesData,
+        filters: &InsightViewFilters,
+        num_samples: Option<i32>,
+    ) -> Result<Vec<SeriesPointData>, String>;
+
+    /// `insightStatusResolver.calculateStatus`: `insights_query_runner_jobs`
+    /// (frontend DB) + `insight_series_backfill` (code-insights DB).
+    fn load_series_status(
+        &self,
+        series: &InsightSeriesData,
+    ) -> Result<InsightSeriesStatusData, String>;
 
     // -- Dashboard write surface (M9.30a). --------------------------------
 
@@ -1018,6 +1074,434 @@ impl InsightViewObject {
             Err(ExecError::new("unresolvable InsightRepositoryDefinition"))
         }
     }
+
+    /// `computeDataSeries` (`insight_view_resolvers.go:171`). Returns
+    /// `(totalSeries, sortedAndLimitedResolvers)`; `totalSeries` is captured
+    /// before sorting/limiting (used by `seriesCount`).
+    fn compute_data_series(&self) -> Result<(i32, Vec<SeriesResolverData>), ExecError> {
+        if self.view.is_frozen {
+            // Frozen views never show time series data.
+            return Ok((0, Vec::new()));
+        }
+        let filters = self.effective_filters();
+        let options = self.effective_series_options();
+        let mut resolvers: Vec<SeriesResolverData> = Vec::new();
+        for series in &self.view.series {
+            let generated = self
+                .generate_series(series, &filters, &options)
+                .map_err(|error| {
+                    ExecError::new(format!(
+                        "generate for seriesID: {}: {}",
+                        series.series_id, error
+                    ))
+                })?;
+            resolvers.extend(generated);
+        }
+        let total = resolvers.len() as i32;
+        let sorted = sort_series_resolvers(resolvers, &options);
+        Ok((total, sorted))
+    }
+
+    /// One link of the generator chain (`registerDataSeriesGenerators`).
+    fn generate_series(
+        &self,
+        series: &InsightSeriesData,
+        filters: &InsightViewFilters,
+        options: &SeriesDisplayOptionsData,
+    ) -> Result<Vec<SeriesResolverData>, String> {
+        if !series.just_in_time && series.generated_from_capture_groups {
+            self.expand_capture_group_series(series, filters, options)
+        } else if !series.just_in_time {
+            self.recorded_series(series, filters, options)
+        } else {
+            Err(format!(
+                "no resolvers for insights series with ID {}",
+                series.series_id
+            ))
+        }
+    }
+
+    /// `recordedSeries`: one resolver, label/series id from the view series.
+    fn recorded_series(
+        &self,
+        series: &InsightSeriesData,
+        filters: &InsightViewFilters,
+        options: &SeriesDisplayOptionsData,
+    ) -> Result<Vec<SeriesResolverData>, String> {
+        let points = self
+            .database
+            .load_series_points(series, filters, options.num_samples)?;
+        let status = self.database.load_series_status(series)?;
+        Ok(vec![build_series_resolver(
+            series,
+            series.label.clone(),
+            series.series_id.clone(),
+            points,
+            filters,
+            status,
+        )])
+    }
+
+    /// `expandCaptureGroupSeriesRecorded`: one resolver per capture value.
+    fn expand_capture_group_series(
+        &self,
+        series: &InsightSeriesData,
+        filters: &InsightViewFilters,
+        options: &SeriesDisplayOptionsData,
+    ) -> Result<Vec<SeriesResolverData>, String> {
+        let all_points = self
+            .database
+            .load_series_points(series, filters, options.num_samples)?;
+        let status = self.database.load_series_status(series)?;
+
+        let mut grouped: BTreeMap<String, Vec<SeriesPointData>> = BTreeMap::new();
+        for point in all_points {
+            let Some(capture) = point.capture.clone() else {
+                // Skip nil values, this shouldn't be a real possibility.
+                continue;
+            };
+            grouped.entry(capture).or_default().push(point);
+        }
+
+        let mut resolvers: Vec<SeriesResolverData> = Vec::new();
+        for (captured_value, mut points) in grouped {
+            points.sort_by(|left, right| left.time.cmp(&right.time));
+            resolvers.push(build_series_resolver(
+                series,
+                captured_value.clone(),
+                format!("{}-{}", series.series_id, captured_value),
+                points,
+                filters,
+                status.clone(),
+            ));
+        }
+        if resolvers.is_empty() {
+            // Manually populated mostly-empty resolver: keeps loading-state
+            // behaviour for capture-group insights with zero series.
+            resolvers.push(build_series_resolver(
+                series,
+                series.label.clone(),
+                series.series_id.clone(),
+                Vec::new(),
+                filters,
+                status,
+            ));
+        }
+        Ok(resolvers)
+    }
+}
+
+/// One resolved series (Go `precalculatedInsightSeriesResolver`).
+struct SeriesResolverData {
+    series_id: String,
+    label: String,
+    points: Vec<ResolvedPointData>,
+    status: InsightSeriesStatusData,
+}
+
+struct ResolvedPointData {
+    time: OffsetDateTime,
+    value: f64,
+    diff_query: Option<String>,
+    point_in_time_query: Option<String>,
+}
+
+/// `precalculatedInsightSeriesResolver` body: `removeClosePoints`, capture
+/// rewrite, and the diff/point-in-time queries.
+fn build_series_resolver(
+    definition: &InsightSeriesData,
+    label: String,
+    series_id: String,
+    points: Vec<SeriesPointData>,
+    filters: &InsightViewFilters,
+    status: InsightSeriesStatusData,
+) -> SeriesResolverData {
+    let modified = remove_close_points(points, definition);
+
+    let mut filter_repo_includes: Vec<String> = Vec::new();
+    let mut filter_repo_excludes: Vec<String> = Vec::new();
+    if let Some(regex) = &filters.include_repo_regex {
+        if !regex.is_empty() {
+            filter_repo_includes.push(regex.clone());
+        }
+    }
+    if let Some(regex) = &filters.exclude_repo_regex {
+        if !regex.is_empty() {
+            filter_repo_excludes.push(regex.clone());
+        }
+    }
+
+    // Replacing capture group values if present; ignore errors so it falls
+    // back to the entered query.
+    let mut query = definition.query.clone();
+    if definition.generated_from_capture_groups && !modified.is_empty() {
+        if let Some(capture) = modified[0].capture.as_ref() {
+            if let Ok(replacer) = new_pattern_replacer(&query, SearchType::Regex) {
+                query = replacer.replace(capture);
+            }
+        }
+    }
+
+    let mut resolved = Vec::with_capacity(modified.len());
+    for (index, point) in modified.iter().enumerate() {
+        let after = if index > 0 {
+            Some(modified[index - 1].time)
+        } else {
+            None
+        };
+        let opts = PointDiffQueryOpts {
+            before: Some(point.time),
+            after,
+            filter_repo_includes: filter_repo_includes.clone(),
+            filter_repo_excludes: filter_repo_excludes.clone(),
+            repo_list: definition.repositories.clone(),
+            repo_search: definition.repository_criteria.clone(),
+            search_query: query.clone(),
+        };
+        let diff_query = point_diff_query(opts.clone()).ok();
+        let point_in_time_query = point_in_time_query(opts).ok();
+        resolved.push(ResolvedPointData {
+            time: point.time,
+            value: point.value,
+            diff_query,
+            point_in_time_query,
+        });
+    }
+
+    SeriesResolverData {
+        series_id,
+        label,
+        points: resolved,
+        status,
+    }
+}
+
+/// `removeClosePoints`: drop snapshots closer than 20% of the interval; the
+/// last point is always kept.
+fn remove_close_points(
+    points: Vec<SeriesPointData>,
+    series: &InsightSeriesData,
+) -> Vec<SeriesPointData> {
+    let buffer = interval_to_minutes(&series.sample_interval_unit, series.sample_interval_value)
+        / 5.0;
+    let mut modified = Vec::new();
+    let mut index = 0;
+    while index + 1 < points.len() {
+        modified.push(points[index].clone());
+        let delta = (points[index + 1].time - points[index].time).as_seconds_f64() / 60.0;
+        if delta < buffer {
+            index += 1;
+        }
+        index += 1;
+    }
+    if let Some(last) = points.last() {
+        modified.push(last.clone());
+    }
+    modified
+}
+
+/// Approximate interval length in minutes (`intervalToMinutes`).
+fn interval_to_minutes(unit: &str, value: i32) -> f64 {
+    let value = f64::from(value);
+    match unit {
+        "DAY" => 60.0 * 24.0 * value,
+        "WEEK" => 60.0 * 24.0 * 7.0 * value,
+        "MONTH" => 60.0 * 24.0 * 30.0 * value,
+        "YEAR" => 60.0 * 24.0 * 365.0 * value,
+        _ => 60.0 * value,
+    }
+}
+
+/// `sortSeriesResolvers` (`insight_view_resolvers.go:1502`).
+fn sort_series_resolvers(
+    mut resolvers: Vec<SeriesResolverData>,
+    options: &SeriesDisplayOptionsData,
+) -> Vec<SeriesResolverData> {
+    let sort_mode = options
+        .sort_options
+        .as_ref()
+        .and_then(|sort| sort.mode.clone())
+        .unwrap_or_else(|| "RESULT_COUNT".to_owned());
+    let sort_direction = options
+        .sort_options
+        .as_ref()
+        .and_then(|sort| sort.direction.clone())
+        .unwrap_or_else(|| "DESC".to_owned());
+    let limit = options.limit.unwrap_or(20);
+
+    // Pre-sort ascending by label so ties are stable.
+    resolvers.sort_by(|left, right| asc_lex_compare(&left.label, &right.label));
+
+    match sort_mode.as_str() {
+        "RESULT_COUNT" => {
+            if sort_direction == "ASC" {
+                resolvers.sort_by(|left, right| {
+                    most_recent_value(left)
+                        .partial_cmp(&most_recent_value(right))
+                        .unwrap_or(Ordering::Equal)
+                });
+            } else {
+                resolvers.sort_by(|left, right| {
+                    most_recent_value(right)
+                        .partial_cmp(&most_recent_value(left))
+                        .unwrap_or(Ordering::Equal)
+                });
+            }
+        }
+        "LEXICOGRAPHICAL" => {
+            if sort_direction != "ASC" {
+                resolvers.sort_by(|left, right| desc_lex_compare(&left.label, &right.label));
+            }
+        }
+        "DATE_ADDED" => {
+            if sort_direction == "ASC" {
+                resolvers.sort_by(|left, right| first_point_time(left).cmp(&first_point_time(right)));
+            } else {
+                resolvers.sort_by(|left, right| first_point_time(right).cmp(&first_point_time(left)));
+            }
+        }
+        _ => {}
+    }
+
+    let count = std::cmp::min(resolvers.len() as i64, i64::from(limit));
+    if count < 0 {
+        return Vec::new();
+    }
+    resolvers.truncate(count as usize);
+    resolvers
+}
+
+fn most_recent_value(resolver: &SeriesResolverData) -> f64 {
+    resolver.points.last().map(|point| point.value).unwrap_or(0.0)
+}
+
+fn first_point_time(resolver: &SeriesResolverData) -> OffsetDateTime {
+    // Go indexes points[0] (panics on an empty list); the corpus never selects
+    // DATE_ADDED for a point-less series.
+    resolver
+        .points
+        .first()
+        .map(|point| point.time)
+        .unwrap_or(OffsetDateTime::UNIX_EPOCH)
+}
+
+fn asc_lex_compare(left: &str, right: &str) -> Ordering {
+    match (parse_semver(left), parse_semver(right)) {
+        (Some(left), Some(right)) => left.cmp(&right),
+        // A parseable label sorts before an unparseable one.
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => left.cmp(right),
+    }
+}
+
+fn desc_lex_compare(left: &str, right: &str) -> Ordering {
+    match (parse_semver(left), parse_semver(right)) {
+        (Some(left), Some(right)) => right.cmp(&left),
+        (None, Some(_)) => Ordering::Less,
+        (Some(_), None) => Ordering::Greater,
+        (None, None) => right.cmp(left),
+    }
+}
+
+/// The subset of `Masterminds/semver.NewVersion` the sort predicate observes:
+/// optional `v`, 1–3 numeric segments, optional prerelease, optional build
+/// metadata.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SemVersion {
+    major: u64,
+    minor: u64,
+    patch: u64,
+    prerelease: Vec<String>,
+}
+
+impl Ord for SemVersion {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.major
+            .cmp(&other.major)
+            .then(self.minor.cmp(&other.minor))
+            .then(self.patch.cmp(&other.patch))
+            .then_with(|| compare_prerelease(&self.prerelease, &other.prerelease))
+    }
+}
+
+impl PartialOrd for SemVersion {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+fn compare_prerelease(left: &[String], right: &[String]) -> Ordering {
+    match (left.is_empty(), right.is_empty()) {
+        (true, true) => Ordering::Equal,
+        (true, false) => Ordering::Greater,
+        (false, true) => Ordering::Less,
+        (false, false) => {
+            for (left_id, right_id) in left.iter().zip(right.iter()) {
+                let left_num = left_id.parse::<u64>().ok();
+                let right_num = right_id.parse::<u64>().ok();
+                let ordering = match (left_num, right_num) {
+                    (Some(left_num), Some(right_num)) => left_num.cmp(&right_num),
+                    (Some(_), None) => Ordering::Less,
+                    (None, Some(_)) => Ordering::Greater,
+                    (None, None) => left_id.cmp(right_id),
+                };
+                if ordering != Ordering::Equal {
+                    return ordering;
+                }
+            }
+            left.len().cmp(&right.len())
+        }
+    }
+}
+
+fn parse_semver(value: &str) -> Option<SemVersion> {
+    let value = value.strip_prefix('v').unwrap_or(value);
+    if value.is_empty() {
+        return None;
+    }
+    let core_and_build = value.split('+').next()?;
+    let (core, prerelease) = match core_and_build.split_once('-') {
+        Some((core, prerelease)) => (core, Some(prerelease)),
+        None => (core_and_build, None),
+    };
+    let parts: Vec<&str> = core.split('.').collect();
+    if parts.is_empty() || parts.len() > 3 {
+        return None;
+    }
+    let mut numbers = [0u64; 3];
+    for (index, part) in parts.iter().enumerate() {
+        if part.is_empty() || !part.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        numbers[index] = part.parse().ok()?;
+    }
+    let prerelease = match prerelease {
+        Some(prerelease) => {
+            if prerelease.is_empty() {
+                return None;
+            }
+            let mut identifiers = Vec::new();
+            for identifier in prerelease.split('.') {
+                if identifier.is_empty()
+                    || !identifier
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+                {
+                    return None;
+                }
+                identifiers.push(identifier.to_owned());
+            }
+            identifiers
+        }
+        None => Vec::new(),
+    };
+    Some(SemVersion {
+        major: numbers[0],
+        minor: numbers[1],
+        patch: numbers[2],
+        prerelease,
+    })
 }
 
 impl ObjectValue for InsightViewObject {
@@ -1045,8 +1529,18 @@ impl ObjectValue for InsightViewObject {
                     filters: self.effective_filters(),
                 },
             )))),
-            // Query-engine dependent; explicitly not ported (see module doc).
-            "dataSeries" => Ok(None),
+            "dataSeries" => {
+                let (_total, resolvers) = self.compute_data_series()?;
+                Ok(Some(FieldValue::List {
+                    element_type: Some("InsightsSeries"),
+                    items: resolvers
+                        .into_iter()
+                        .map(|resolver| {
+                            FieldValue::Object(Arc::new(InsightsSeriesObject { resolver }))
+                        })
+                        .collect(),
+                }))
+            }
             "presentation" => {
                 if self.view.presentation_type == "PIE" {
                     Ok(Some(FieldValue::Object(Arc::new(
@@ -1119,8 +1613,10 @@ impl ObjectValue for InsightViewObject {
                     Some(self.view.unique_id.clone()),
                 )?))
             }
-            // Depends on the data-series generators (query engine).
-            "seriesCount" => Ok(None),
+            "seriesCount" => {
+                let (total, _resolvers) = self.compute_data_series()?;
+                Ok(Some(FieldValue::Json(Json::Int(i64::from(total)))))
+            }
             "repositoryDefinition" => match self.first_series() {
                 None => Err(ExecError::new("no repository definitions available")),
                 Some(series) => Ok(Some(Self::repository_definition(series)?)),
@@ -1252,6 +1748,131 @@ impl ObjectValue for SeriesSortOptionsObject {
             "direction" => Ok(Some(match direction {
                 Some(value) => FieldValue::Json(Json::Str(value)),
                 None => FieldValue::Null,
+            })),
+            _ => Ok(None),
+        }
+    }
+}
+
+// -- Recorded data series objects (M9.31a). --------------------------------
+
+struct InsightsSeriesObject {
+    resolver: SeriesResolverData,
+}
+
+impl ObjectValue for InsightsSeriesObject {
+    fn type_name(&self) -> &'static str {
+        "InsightsSeries"
+    }
+
+    fn field(
+        &self,
+        field: &str,
+        _arguments: &Arguments,
+        _actor: Actor,
+    ) -> Result<Option<FieldValue>, ExecError> {
+        match field {
+            "seriesId" => Ok(Some(FieldValue::Json(Json::Str(
+                self.resolver.series_id.clone(),
+            )))),
+            "label" => Ok(Some(FieldValue::Json(Json::Str(
+                self.resolver.label.clone(),
+            )))),
+            // `from`/`to`/`includeRepoRegex`/`excludeRepoRegex` are deprecated
+            // and ignored by the baseline.
+            "points" => Ok(Some(FieldValue::List {
+                element_type: Some("InsightDataPoint"),
+                items: self
+                    .resolver
+                    .points
+                    .iter()
+                    .map(|point| {
+                        FieldValue::Object(Arc::new(InsightDataPointObject {
+                            time: point.time,
+                            value: point.value,
+                            diff_query: point.diff_query.clone(),
+                            point_in_time_query: point.point_in_time_query.clone(),
+                        }))
+                    })
+                    .collect(),
+            })),
+            "status" => Ok(Some(FieldValue::Object(Arc::new(
+                InsightSeriesStatusObject {
+                    status: self.resolver.status.clone(),
+                },
+            )))),
+            _ => Ok(None),
+        }
+    }
+}
+
+struct InsightDataPointObject {
+    time: OffsetDateTime,
+    value: f64,
+    diff_query: Option<String>,
+    point_in_time_query: Option<String>,
+}
+
+impl ObjectValue for InsightDataPointObject {
+    fn type_name(&self) -> &'static str {
+        "InsightDataPoint"
+    }
+
+    fn field(
+        &self,
+        field: &str,
+        _arguments: &Arguments,
+        _actor: Actor,
+    ) -> Result<Option<FieldValue>, ExecError> {
+        let optional_query = |query: &Option<String>| match query {
+            Some(query) => FieldValue::Json(Json::Str(query.clone())),
+            None => FieldValue::Null,
+        };
+        match field {
+            "dateTime" => Ok(Some(FieldValue::Json(Json::Str(
+                crate::graphql_resolvers::datetime_rfc3339(self.time),
+            )))),
+            "value" => Ok(Some(FieldValue::Json(Json::Float(self.value)))),
+            "diffQuery" => Ok(Some(optional_query(&self.diff_query))),
+            "pointInTimeQuery" => Ok(Some(optional_query(&self.point_in_time_query))),
+            _ => Ok(None),
+        }
+    }
+}
+
+struct InsightSeriesStatusObject {
+    status: InsightSeriesStatusData,
+}
+
+impl ObjectValue for InsightSeriesStatusObject {
+    fn type_name(&self) -> &'static str {
+        "InsightSeriesStatus"
+    }
+
+    fn field(
+        &self,
+        field: &str,
+        _arguments: &Arguments,
+        _actor: Actor,
+    ) -> Result<Option<FieldValue>, ExecError> {
+        let int = |value: i32| FieldValue::Json(Json::Int(i64::from(value)));
+        match field {
+            "totalPoints" => Ok(Some(int(self.status.total_points))),
+            "pendingJobs" => Ok(Some(int(self.status.pending_jobs))),
+            "completedJobs" => Ok(Some(int(self.status.completed_jobs))),
+            "failedJobs" => Ok(Some(int(self.status.failed_jobs))),
+            "backfillQueuedAt" => Ok(Some(match self.status.backfill_queued_at {
+                Some(value) => FieldValue::Json(Json::Str(
+                    crate::graphql_resolvers::datetime_rfc3339(value.assume_utc()),
+                )),
+                None => FieldValue::Null,
+            })),
+            "isLoadingData" => Ok(Some(FieldValue::Json(Json::Bool(self.status.is_loading)))),
+            // Not ported (see overview document): empty list rather than an
+            // error so partial documents still resolve.
+            "incompleteDatapoints" => Ok(Some(FieldValue::List {
+                element_type: Some("IncompleteDatapointAlert"),
+                items: Vec::new(),
             })),
             _ => Ok(None),
         }
