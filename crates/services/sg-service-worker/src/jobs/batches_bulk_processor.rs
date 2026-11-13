@@ -45,7 +45,8 @@ use tokio_util::sync::CancellationToken;
 
 use super::batches::batches_enabled;
 use super::batches_reconciler::{
-    PgSourceConfigProvider, ReqwestHttpDoer, SourceConfigProvider,
+    BatchChangesLicenseGate, PgRepoMetadataProvider, PgSourceConfigProvider, RepoMetadataProvider,
+    ReqwestHttpDoer, SourceConfigProvider,
 };
 use super::{Job, JobDeps};
 use crate::framework::dbworker::{
@@ -433,11 +434,24 @@ pub fn dedupe_changeset_events(events: Vec<ChangesetEvent>) -> Vec<ChangesetEven
 }
 
 fn kind_from_external_service_type(external_service_type: &str) -> Option<&'static str> {
-    match external_service_type {
-        "github" => Some("GITHUB"),
-        "gitlab" => Some("GITLAB"),
-        "bitbucketserver" => Some("BITBUCKETSERVER"),
-        _ => None,
+    // `repo.external_service_type` stores the lower-case Go external service
+    // type; `SourceKind` and `new_source` key off the upper-case kind.
+    if external_service_type.eq_ignore_ascii_case("github") {
+        Some("GITHUB")
+    } else if external_service_type.eq_ignore_ascii_case("gitlab") {
+        Some("GITLAB")
+    } else if external_service_type.eq_ignore_ascii_case("bitbucketserver") {
+        Some("BITBUCKETSERVER")
+    } else if external_service_type.eq_ignore_ascii_case("azuredevops") {
+        Some("AZUREDEVOPS")
+    } else if external_service_type.eq_ignore_ascii_case("bitbucketcloud") {
+        Some("BITBUCKETCLOUD")
+    } else if external_service_type.eq_ignore_ascii_case("gerrit") {
+        Some("GERRIT")
+    } else if external_service_type.eq_ignore_ascii_case("perforce") {
+        Some("PERFORCE")
+    } else {
+        None
     }
 }
 
@@ -463,11 +477,32 @@ fn repo_metadata_for_bulk(kind: &str, repo: &RepoRef) -> Value {
                 .unwrap_or_else(|| (String::new(), repo.name.clone()));
             serde_json::json!({"slug": slug, "project": {"key": project}})
         }
+        "AZUREDEVOPS" => {
+            let parts: Vec<&str> = repo.name.split('/').collect();
+            let name = parts.last().copied().unwrap_or_default();
+            let project = parts
+                .len()
+                .checked_sub(2)
+                .and_then(|index| parts.get(index))
+                .copied()
+                .unwrap_or_default();
+            serde_json::json!({"name": name, "project": {"name": project}})
+        }
+        "BITBUCKETCLOUD" => {
+            let slug = repo.name.rsplit('/').next().unwrap_or(&repo.name);
+            serde_json::json!({"slug": slug, "full_name": repo.name, "name": slug})
+        }
+        "GERRIT" | "PERFORCE" => serde_json::json!({}),
         _ => Value::Null,
     }
 }
 
-fn bulk_ext_repo(kind: &str, repo: &RepoRef) -> extsvc::Repo {
+fn bulk_ext_repo_with_metadata(kind: &str, repo: &RepoRef, metadata: Value) -> extsvc::Repo {
+    let metadata = if metadata.is_null() {
+        repo_metadata_for_bulk(kind, repo)
+    } else {
+        metadata
+    };
     extsvc::Repo {
         id: repo.id,
         name: repo.name.clone(),
@@ -476,7 +511,7 @@ fn bulk_ext_repo(kind: &str, repo: &RepoRef) -> extsvc::Repo {
             service_type: extsvc::kind_to_type(kind),
             service_id: repo.external_service_id.clone(),
         },
-        metadata: repo_metadata_for_bulk(kind, repo),
+        metadata,
         ..Default::default()
     }
 }
@@ -491,7 +526,14 @@ pub struct ExtsvcChangesetSource {
     source: Arc<dyn extsvc::ChangesetSource>,
     metadata: Arc<dyn ChangesetMetadataResolver>,
     events: Arc<dyn ChangesetEventProvider>,
-    repo: Mutex<Option<RepoRef>>,
+    repo_metadata: Arc<dyn RepoMetadataProvider>,
+    repo: Mutex<Option<CachedBulkRepo>>,
+}
+
+#[derive(Clone)]
+struct CachedBulkRepo {
+    repo: RepoRef,
+    metadata: Value,
 }
 
 impl ExtsvcChangesetSource {
@@ -502,6 +544,7 @@ impl ExtsvcChangesetSource {
         http: Arc<dyn sg_extsvc::HttpDoer>,
         metadata: Arc<dyn ChangesetMetadataResolver>,
         events: Arc<dyn ChangesetEventProvider>,
+        repo_metadata: Arc<dyn RepoMetadataProvider>,
     ) -> Result<Self, BulkError> {
         let Some(kind) = kind_from_external_service_type(external_service_type) else {
             return Err(BulkError::non_retryable(format!(
@@ -514,11 +557,12 @@ impl ExtsvcChangesetSource {
             source,
             metadata,
             events,
+            repo_metadata,
             repo: Mutex::new(None),
         })
     }
 
-    fn cached_repo(&self) -> Result<RepoRef, BulkError> {
+    fn cached_repo(&self) -> Result<CachedBulkRepo, BulkError> {
         self.repo
             .lock()
             .map_err(|_| BulkError::retryable("changeset source repo cache poisoned"))?
@@ -539,7 +583,7 @@ impl ExtsvcChangesetSource {
         base_ref: &str,
     ) -> Result<extsvc::SourceChangeset, BulkError> {
         let repo = self.cached_repo()?;
-        let target_repo = bulk_ext_repo(self.kind, &repo);
+        let target_repo = bulk_ext_repo_with_metadata(self.kind, &repo.repo, repo.metadata);
         let external_id = self.metadata.external_id(changeset).await?;
         let metadata = self.metadata.metadata(changeset).await?;
         Ok(extsvc::SourceChangeset {
@@ -570,11 +614,29 @@ impl ChangesetSource for ExtsvcChangesetSource {
                 self.kind, repo.external_service_type
             )));
         }
+        // The Go `sourser.ForUser` loads the repository row; the bulk job's
+        // reduced `RepoRef` has no metadata column, so read it from the store
+        // (falling back to the name-derived object).
+        let metadata = self
+            .repo_metadata
+            .metadata(
+                self.kind,
+                &super::batches_reconciler::Repo {
+                    id: repo.id,
+                    name: repo.name.clone(),
+                    archived: false,
+                },
+            )
+            .await
+            .map_err(config_error_to_bulk)?;
         *self
             .repo
             .lock()
             .map_err(|_| BulkError::retryable("changeset source repo cache poisoned"))? =
-            Some(repo.clone());
+            Some(CachedBulkRepo {
+                repo: repo.clone(),
+                metadata,
+            });
         Ok(())
     }
 
@@ -583,7 +645,19 @@ impl ChangesetSource for ExtsvcChangesetSource {
         repo: &RepoRef,
         changeset: &Changeset,
     ) -> Result<(), BulkError> {
-        let target_repo = bulk_ext_repo(self.kind, repo);
+        let metadata = self
+            .repo_metadata
+            .metadata(
+                self.kind,
+                &super::batches_reconciler::Repo {
+                    id: repo.id,
+                    name: repo.name.clone(),
+                    archived: false,
+                },
+            )
+            .await
+            .map_err(config_error_to_bulk)?;
+        let target_repo = bulk_ext_repo_with_metadata(self.kind, repo, metadata);
         let external_id = self.metadata.external_id(changeset).await?;
         let metadata = self.metadata.metadata(changeset).await?;
         let ch = extsvc::Changeset {
@@ -739,6 +813,7 @@ pub struct ConfigChangesetSourceProvider {
     http: Arc<dyn sg_extsvc::HttpDoer>,
     metadata: Arc<dyn ChangesetMetadataResolver>,
     events: Arc<dyn ChangesetEventProvider>,
+    repo_metadata: Arc<dyn RepoMetadataProvider>,
 }
 
 impl ConfigChangesetSourceProvider {
@@ -748,6 +823,7 @@ impl ConfigChangesetSourceProvider {
         http: Arc<dyn sg_extsvc::HttpDoer>,
         metadata: Arc<dyn ChangesetMetadataResolver>,
         events: Arc<dyn ChangesetEventProvider>,
+        repo_metadata: Arc<dyn RepoMetadataProvider>,
     ) -> Self {
         Self {
             pool,
@@ -755,6 +831,7 @@ impl ConfigChangesetSourceProvider {
             http,
             metadata,
             events,
+            repo_metadata,
         }
     }
 
@@ -764,8 +841,9 @@ impl ConfigChangesetSourceProvider {
             pool.clone(),
             Arc::new(PgSourceConfigProvider::new(pool.clone(), keyring)),
             Arc::new(ReqwestHttpDoer::new()),
-            Arc::new(PgChangesetMetadataResolver::new(pool)),
+            Arc::new(PgChangesetMetadataResolver::new(pool.clone())),
             Arc::new(EmptyChangesetEventProvider),
+            Arc::new(PgRepoMetadataProvider::new(pool)),
         )
     }
 }
@@ -810,6 +888,7 @@ impl ChangesetSourceProvider for ConfigChangesetSourceProvider {
             Arc::clone(&self.http),
             Arc::clone(&self.metadata),
             Arc::clone(&self.events),
+            Arc::clone(&self.repo_metadata),
         )?;
         Ok(Arc::new(source))
     }
@@ -1735,6 +1814,14 @@ impl Job for BulkOperationProcessorJob {
         _setup_ctx: CancellationToken,
     ) -> Result<Vec<BackgroundRoutine>, String> {
         if !batches_enabled() {
+            return Ok(Vec::new());
+        }
+        // `FeatureBatchChanges.Check` is a frontend-only gate in Go; the
+        // worker's default allows it (see `BatchChangesLicenseGate`).
+        if super::batches_reconciler::WorkerBatchChangesLicenseGate
+            .check_feature_batch_changes()
+            .is_err()
+        {
             return Ok(Vec::new());
         }
 
