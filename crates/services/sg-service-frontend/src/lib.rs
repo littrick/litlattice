@@ -84,6 +84,8 @@ pub mod graphql_inventory_d;
 pub mod graphql_metrics;
 pub mod graphql_resolvers;
 pub mod health;
+pub mod insights_graphql;
+pub mod insights_store;
 pub mod internal_api;
 pub mod ipallowlist;
 pub mod license_config;

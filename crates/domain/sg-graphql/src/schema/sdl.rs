@@ -54,3 +54,9 @@ pub const CODEINTEL_POLICIES_SCHEMA: &str = include_str!("sdl/codeintel.policies
 /// notebook mutations. `NewSchema` appends it only when the notebooks
 /// resolver is present, so `assemble_oss` never includes it.
 pub const NOTEBOOKS_SCHEMA: &str = include_str!("sdl/notebooks.graphql");
+
+/// `//go:embed insights.graphql` — `OptionalResolver.InsightsResolver` SDL
+/// (`Query.insightViews`, `Query.insightsDashboards`, `InsightView`, ...).
+/// Appended only when the insights resolver is explicitly enabled (M9.29b);
+/// `assemble_oss` never includes it.
+pub const INSIGHTS_SCHEMA: &str = include_str!("sdl/insights.graphql");

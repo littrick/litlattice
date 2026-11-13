@@ -2681,6 +2681,7 @@ impl FrontendRootResolver {
                 codeintel_autoindexing: None,
                 codeintel_policies: None,
                 notebooks: None,
+                insights: None,
                 batches: None,
                 github_apps: None,
                 teams: None,
@@ -2914,6 +2915,15 @@ impl FrontendRootResolver {
     ) -> Self {
         self.query.notebooks = notebooks.clone();
         self.mutation.notebooks = notebooks;
+        self
+    }
+
+    /// Attach the read-only Code Insights surface (M9.29b).
+    pub fn with_insights(
+        mut self,
+        insights: Option<crate::insights_graphql::InsightsHandle>,
+    ) -> Self {
+        self.query.insights = insights;
         self
     }
 
@@ -3263,6 +3273,9 @@ struct QueryRoot {
     /// Optional Notebooks surface (M9.29a). `None` leaves the
     /// `notebooks.graphql` fields unported.
     notebooks: Option<crate::notebooks_graphql::NotebooksHandle>,
+    /// Optional Code Insights read-only surface (M9.29b). `None` leaves
+    /// `Query.insightViews` / `Query.insightsDashboards` unported.
+    insights: Option<crate::insights_graphql::InsightsHandle>,
     /// Optional outbound webhook surface (M9.27b). `None` leaves
     /// `Query.outboundWebhooks` / `outboundWebhookEventTypes` and
     /// `node(OutboundWebhook)` unported.
@@ -5099,6 +5112,16 @@ impl ObjectValue for QueryRoot {
             {
                 crate::notebooks_graphql::root_field(
                     self.notebooks.as_ref().expect("checked notebooks"),
+                    field,
+                    arguments,
+                    actor,
+                )
+            }
+            // Code Insights read-only root fields (`Query.insightViews`,
+            // `Query.insightsDashboards`, M9.29b).
+            _ if self.insights.is_some() && crate::insights_graphql::is_root_field(field) => {
+                crate::insights_graphql::root_field(
+                    self.insights.as_ref().expect("checked insights"),
                     field,
                     arguments,
                     actor,
