@@ -311,13 +311,14 @@ impl PgBatchesGraphqlStore {
 use std::collections::BTreeMap;
 use std::time::Duration;
 
+use crate::batches_changeset_read_store::{bind_all, Param};
 use crate::batches_graphql::{
     ApplyBatchChangeRequest, BatchSpecRow, BulkOperationRow, NamespaceIds, PublishedValue,
 };
 use crate::batches_mutations::{
-    DELETED_NAMESPACE, INVALID_BATCH_CHANGE_NAME, MATCHING_BATCH_CHANGE_EXISTS,
-    MISSING_BATCH_CHANGES_WRITE, MUST_BE_SITE_ADMIN_OR_SAME_USER, NAME_NOT_UNIQUE, NO_NAMESPACE,
-    NO_RESULTS, NOT_AN_ORG_MEMBER, NOT_AUTHENTICATED,
+    CHANGESETS_FOR_JOB_NOT_FOUND, DELETED_NAMESPACE, INVALID_BATCH_CHANGE_NAME,
+    MATCHING_BATCH_CHANGE_EXISTS, MISSING_BATCH_CHANGES_WRITE, MUST_BE_SITE_ADMIN_OR_SAME_USER,
+    NAME_NOT_UNIQUE, NO_NAMESPACE, NO_RESULTS, NOT_AN_ORG_MEMBER, NOT_AUTHENTICATED,
 };
 
 /// `btypes.GetSupportedExternalServices` (`types/util.go:24-38`), without the
@@ -1263,13 +1264,43 @@ impl PgBatchesGraphqlStore {
         get_batch_change_by_id_async(&self.pool, batch_change.id).await
     }
 
+    /// M9.25b `reenqueueChangesets` through the M9.27c generic enqueue path:
+    /// `ListChangesetsOpts{ReconcilerStates: [failed]}` (archived excluded by
+    /// default), payload `{}`.
     async fn reenqueue_changesets_async(
         &self,
         batch_change_id: i64,
         changeset_ids: &[i64],
         actor: Actor,
     ) -> Result<Option<BulkOperationRow>, String> {
-        let batch_change = get_batch_change_by_id_async(&self.pool, batch_change_id)
+        self.create_changeset_jobs_async(
+            &crate::batches_bulk_mutations::CreateChangesetJobsRequest {
+                batch_change_id,
+                changeset_ids: changeset_ids.to_vec(),
+                job_type: "reenqueue",
+                payload: "{}".to_owned(),
+                only_archived: false,
+                include_archived: false,
+                publication_state: None,
+                reconciler_states: vec!["failed"],
+                external_states: Vec::new(),
+            },
+            actor,
+        )
+        .await
+    }
+
+    /// `service.CreateChangesetJobs` (`service.go:1339-1404`): load the batch
+    /// change, check write access, select the changesets with the
+    /// `store.ListChangesets` predicates (`ORDER BY id ASC`), and insert one
+    /// `queued` `changeset_jobs` row per selected changeset in one
+    /// transaction.
+    async fn create_changeset_jobs_async(
+        &self,
+        request: &crate::batches_bulk_mutations::CreateChangesetJobsRequest,
+        actor: Actor,
+    ) -> Result<Option<BulkOperationRow>, String> {
+        let batch_change = get_batch_change_by_id_async(&self.pool, request.batch_change_id)
             .await
             .map_err(|error| format!("loading batch change: {error}"))?;
         viewer_can_administer_async(
@@ -1282,48 +1313,169 @@ impl PgBatchesGraphqlStore {
         .await?;
 
         let authz = authz_conds_async(&self.pool, actor).await?;
+        let batch_change_id = request.batch_change_id.to_string();
+        let archived = format!(
+            "(COALESCE((changesets.batch_change_ids->$2->>'isArchived')::bool, false) \
+             OR COALESCE((changesets.batch_change_ids->$2->>'archive')::bool, false))"
+        );
+        let mut params = vec![
+            Param::I64Array(request.changeset_ids.clone()),
+            Param::Text(batch_change_id.clone()),
+        ];
+        let mut preds = vec![
+            "repo.deleted_at IS NULL".to_owned(),
+            "changesets.id = ANY($1)".to_owned(),
+            "changesets.batch_change_ids ? $2".to_owned(),
+        ];
+        if request.only_archived {
+            preds.push(archived);
+        } else if !request.include_archived {
+            preds.push(format!("NOT ({archived})"));
+        }
+        if let Some(state) = request.publication_state {
+            params.push(Param::Text(state.to_owned()));
+            preds.push(format!("changesets.publication_state = ${}", params.len()));
+        }
+        if !request.reconciler_states.is_empty() {
+            params.push(Param::TextArray(
+                request.reconciler_states.iter().map(|s| (*s).to_owned()).collect(),
+            ));
+            preds.push(format!(
+                "changesets.reconciler_state = ANY(${})",
+                params.len()
+            ));
+        }
+        if !request.external_states.is_empty() {
+            params.push(Param::TextArray(
+                request.external_states.iter().map(|s| (*s).to_owned()).collect(),
+            ));
+            preds.push(format!("changesets.external_state = ANY(${})", params.len()));
+        }
         let sql = format!(
             "SELECT changesets.id FROM changesets INNER JOIN repo ON repo.id = changesets.repo_id \
-             WHERE repo.deleted_at IS NULL AND changesets.id = ANY($1) \
-             AND changesets.batch_change_ids ? $2 \
-             AND NOT (COALESCE((changesets.batch_change_ids->$2->>'isArchived')::bool, false) \
-                 OR COALESCE((changesets.batch_change_ids->$2->>'archive')::bool, false)) \
-             AND changesets.reconciler_state = ANY($3) AND {authz}"
+             WHERE {} AND {authz} ORDER BY changesets.id ASC",
+            preds.join(" AND ")
         );
-        let rows = sqlx::query(&sql)
-            .bind(changeset_ids.to_vec())
-            .bind(batch_change_id.to_string())
-            .bind(vec!["failed".to_owned()])
+        let rows = bind_all(sqlx::query(&sql), params)
             .fetch_all(&self.pool)
             .await
             .map_err(|error| format!("listing changesets: {error}"))?;
-        if rows.len() != changeset_ids.len() {
-            return Err("some changesets could not be found".to_owned());
+        if rows.len() != request.changeset_ids.len() {
+            return Err(CHANGESETS_FOR_JOB_NOT_FOUND.to_owned());
         }
         let found: Vec<i64> = rows
             .iter()
             .map(|row| row.try_get(0).map_err(error))
             .collect::<Result<_, _>>()?;
 
-        let bulk_group = uuid::Uuid::new_v4().simple().to_string();
+        // `store.RandomID` is `uuid.NewRandom().String()` (hyphenated).
+        let bulk_group = uuid::Uuid::new_v4().to_string();
         let uid = actor.uid().unwrap_or(0);
         let mut tx = self.pool.begin().await.map_err(error)?;
         for changeset_id in found {
             sqlx::query(
                 "INSERT INTO changeset_jobs (bulk_group, user_id, batch_change_id, changeset_id, \
                  job_type, payload, state, created_at, updated_at) \
-                 VALUES ($1, $2, $3, $4, 'reenqueue', '{}'::jsonb, 'queued', now(), now())",
+                 VALUES ($1, $2, $3, $4, $5, $6::jsonb, 'queued', now(), now())",
             )
             .bind(&bulk_group)
             .bind(uid)
-            .bind(batch_change_id as i32)
+            .bind(request.batch_change_id as i32)
             .bind(changeset_id)
+            .bind(request.job_type)
+            .bind(&request.payload)
             .execute(&mut *tx)
             .await
             .map_err(|error| format!("creating changeset jobs: {error}"))?;
         }
         tx.commit().await.map_err(error)?;
         get_bulk_operation_async(&self.pool, &bulk_group).await
+    }
+
+    /// `service.GetAvailableBulkOperations` (`service.go:1704-1791`).
+    async fn available_bulk_operations_async(
+        &self,
+        batch_change_id: i64,
+        changeset_ids: &[i64],
+        actor: Actor,
+    ) -> Result<Vec<String>, String> {
+        let authz = authz_conds_async(&self.pool, actor).await?;
+        let sql = format!(
+            "SELECT changesets.external_state, changesets.reconciler_state, \
+             COALESCE(changesets.owned_by_batch_change_id, 0) AS owned_by, \
+             (COALESCE((changesets.batch_change_ids->$2->>'isArchived')::bool, false) \
+                 OR COALESCE((changesets.batch_change_ids->$2->>'archive')::bool, false)) AS archived \
+             FROM changesets INNER JOIN repo ON repo.id = changesets.repo_id \
+             WHERE changesets.id = ANY($1) AND repo.deleted_at IS NULL AND {authz} \
+             ORDER BY changesets.id ASC"
+        );
+        let rows = sqlx::query(&sql)
+            .bind(changeset_ids.to_vec())
+            .bind(batch_change_id.to_string())
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|error| format!("listing changesets: {error}"))?;
+
+        let mut export = 0i64;
+        let mut comment = 0i64;
+        let mut detach = 0i64;
+        let mut reenqueue = 0i64;
+        let mut publish = 0i64;
+        let mut close = 0i64;
+        let mut merge = 0i64;
+        for row in &rows {
+            let external_state: String = row.try_get(0).map_err(error)?;
+            let reconciler_state: String = row.try_get(1).map_err(error)?;
+            let owned_by: i64 = row.try_get(2).map_err(error)?;
+            let archived: bool = row.try_get(3).map_err(error)?;
+
+            // Every changeset is exportable (and read-only changesets get no
+            // other operation).
+            export += 1;
+            if external_state == "READONLY" {
+                continue;
+            }
+            if archived {
+                detach += 1;
+            }
+            if !archived && reconciler_state == "failed" {
+                reenqueue += 1;
+            }
+            if !archived && owned_by != 0 {
+                publish += 1;
+            }
+            let closable = external_state == "OPEN" || external_state == "DRAFT";
+            let commentable = matches!(
+                external_state.as_str(),
+                "OPEN" | "DRAFT" | "MERGED" | "CLOSED"
+            );
+            if !archived && closable {
+                close += 1;
+            }
+            if !archived && reconciler_state != "failed" && external_state == "OPEN" {
+                merge += 1;
+            }
+            if commentable {
+                comment += 1;
+            }
+        }
+
+        let requested = changeset_ids.len() as i64;
+        let mut operations = Vec::new();
+        for (operation, count) in [
+            ("EXPORT", export),
+            ("COMMENT", comment),
+            ("DETACH", detach),
+            ("REENQUEUE", reenqueue),
+            ("PUBLISH", publish),
+            ("CLOSE", close),
+            ("MERGE", merge),
+        ] {
+            if count == requested {
+                operations.push(operation.to_owned());
+            }
+        }
+        Ok(operations)
     }
 }
 
@@ -2457,6 +2609,30 @@ impl BatchesGraphqlDatabase for PgBatchesGraphqlStore {
         actor: Actor,
     ) -> Result<Option<BulkOperationRow>, String> {
         block_on(self.reenqueue_changesets_async(batch_change_id, changeset_ids, actor))
+    }
+
+    fn create_changeset_jobs(
+        &self,
+        request: &crate::batches_bulk_mutations::CreateChangesetJobsRequest,
+        actor: Actor,
+    ) -> Result<Option<BulkOperationRow>, String> {
+        block_on(self.create_changeset_jobs_async(request, actor))
+    }
+
+    fn available_bulk_operations(
+        &self,
+        batch_change_id: i64,
+        changeset_ids: &[i64],
+        actor: Actor,
+    ) -> Result<Vec<String>, String> {
+        block_on(self.available_bulk_operations_async(batch_change_id, changeset_ids, actor))
+    }
+
+    fn get_bulk_operation(
+        &self,
+        bulk_group: &str,
+    ) -> Result<Option<BulkOperationRow>, String> {
+        block_on(get_bulk_operation_async(&self.pool, bulk_group))
     }
 }
 

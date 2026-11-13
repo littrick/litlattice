@@ -491,6 +491,37 @@ pub trait BatchesGraphqlDatabase: Send + Sync {
         actor: Actor,
     ) -> Result<Option<BulkOperationRow>, String>;
 
+    /// `service.CreateChangesetJobs` for the bulk-operation mutations
+    /// (M9.27c). `None` is `store.ErrNoResults` from `GetBulkOperation`.
+    fn create_changeset_jobs(
+        &self,
+        request: &crate::batches_bulk_mutations::CreateChangesetJobsRequest,
+        actor: Actor,
+    ) -> Result<Option<BulkOperationRow>, String> {
+        let _ = (request, actor);
+        Err("createChangesetJobs is not wired".to_owned())
+    }
+
+    /// `service.GetAvailableBulkOperations` (M9.27c).
+    fn available_bulk_operations(
+        &self,
+        batch_change_id: i64,
+        changeset_ids: &[i64],
+        actor: Actor,
+    ) -> Result<Vec<String>, String> {
+        let _ = (batch_change_id, changeset_ids, actor);
+        Err("availableBulkOperations is not wired".to_owned())
+    }
+
+    /// `store.GetBulkOperation` (M9.27c); `None` is `store.ErrNoResults`.
+    fn get_bulk_operation(
+        &self,
+        bulk_group: &str,
+    ) -> Result<Option<BulkOperationRow>, String> {
+        let _ = bulk_group;
+        Err("bulk operation node is not wired".to_owned())
+    }
+
     /// `service.enqueueBatchChangeWebhook`. Fire-and-forget in the baseline
     /// (errors only logged); the production adapter wires
     /// `sg_extsvc::batches_webhooks` here.
@@ -1957,6 +1988,9 @@ pub fn root_field(
     let value = match field {
         "batchChanges" => batch_changes(db, arguments, actor, BatchChangeScope::default())?,
         "batchChange" => batch_change(db, arguments, actor)?,
+        _ if crate::batches_bulk_mutations::is_root_field(field) => {
+            return crate::batches_bulk_mutations::root_field(db, field, arguments, actor)
+        }
         _ => return crate::batches_changeset_read::root_field(db, field, arguments, actor),
     };
     Ok(Some(value))
@@ -1965,6 +1999,7 @@ pub fn root_field(
 /// Whether `field` is owned by this surface.
 pub fn is_root_field(field: &str) -> bool {
     matches!(field, "batchChanges" | "batchChange")
+        || crate::batches_bulk_mutations::is_root_field(field)
         || crate::batches_changeset_read::is_root_field(field)
 }
 
@@ -2065,11 +2100,15 @@ pub fn node_field(
     match kind {
         BATCH_CHANGE_KIND => node_batch_change(db, id, actor),
         CHANGESET_KIND => node_changeset(db, id, actor),
+        _ if crate::batches_bulk_mutations::is_node_kind(kind) => {
+            crate::batches_bulk_mutations::node_field(db, kind, id, actor)
+        }
         _ => Ok(None),
     }
 }
 
-/// Whether `kind` is one of the two node kinds.
+/// Whether `kind` is one of the two node kinds (plus `BulkOperation`).
 pub fn is_node_kind(kind: &str) -> bool {
     matches!(kind, BATCH_CHANGE_KIND | CHANGESET_KIND)
+        || crate::batches_bulk_mutations::is_node_kind(kind)
 }

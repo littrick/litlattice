@@ -107,7 +107,7 @@ pub fn mutation_field(
 }
 
 /// `enterprise.BatchChangesEnabledForUser`.
-fn batch_changes_enabled_for_user(
+pub(crate) fn batch_changes_enabled_for_user(
     db: &BatchesHandle,
     actor: Actor,
 ) -> Result<(), String> {
@@ -438,7 +438,8 @@ impl BulkOperationObject {
     /// `changesetJobTypeToBulkOperationType`.
     fn operation_type(job_type: &str) -> Result<&'static str, String> {
         Ok(match job_type {
-            "comment" => "COMMENT",
+            // `btypes.ChangesetJobTypeComment` is `"commentatore"`.
+            "commentatore" | "comment" => "COMMENT",
             "detach" => "DETACH",
             "reenqueue" => "REENQUEUE",
             "merge" => "MERGE",
