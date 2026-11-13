@@ -1,14 +1,17 @@
 #![forbid(unsafe_code)]
 
-//! Code Intel uploads GraphQL read-only surface (M9.27d, first phase).
+//! Code Intel uploads GraphQL read-only surface (M9.27d + M9.29d).
 //!
 //! Ports `internal/codeintel/uploads/transport/graphql`:
 //!
 //! - `Query.preciseIndexes` (`root_resolver_index_queries.go:26`) including
 //!   `first`/`after` cursors, `repo`, `query`, `states` bifurcation,
-//!   `indexerKey` expansion and the upload/index merge;
-//! - the `PreciseIndex` read-only fields (`precise_index_resolver.go`) and the
-//!   associated-record dataloader pre-submits (`dataloader.go`);
+//!   `indexerKey` expansion, `dependencyOf`/`dependentOf` CTEs,
+//!   `includeDeleted` audit-log union and the upload/index merge;
+//! - the `PreciseIndex` read-only fields (`precise_index_resolver.go`),
+//!   including `auditLogs`, and the associated-record dataloader pre-submits
+//!   (`dataloader.go`);
+//! - `Query.codeIntelSummary` (`root_resolver_coverage.go`);
 //! - `IndexSteps` / execution-log entries (`index_steps_resolver.go`);
 //! - indexer metadata (`indexer_resolver.go`,
 //!   `internal/codeintel/uploads/shared/indexers2.go`);
@@ -20,11 +23,10 @@
 //! `block_in_place`. No table, column or Redis key is added.
 //!
 //! Deviations (also recorded in
-//! `dev/rs/docs/overviews/m9_27d_codeintel_uploads_overview.md`):
+//! `dev/rs/docs/overviews/m9_29d_codeintel_uploads_remaining_overview.md`):
 //! - `projectRoot`/`tags` need gitserver and return `null`/`[]`;
 //! - `retentionPolicyOverview` resolves as an empty connection;
-//! - `auditLogs` returns `null`, `dependencyOf`/`dependentOf` and
-//!   `includeDeleted` return explicit errors (CTEs not ported);
+//! - `Repository.codeIntelSummary` is not implemented;
 //! - repository-permission filtering reproduces the internal-actor
 //!   `AuthzQueryConds` (the differential oracle uses an internal actor).
 
@@ -116,8 +118,44 @@ pub struct GetUploadsOptions {
     pub states: Vec<String>,
     pub term: String,
     pub indexer_names: Vec<String>,
+    pub dependency_of: i64,
+    pub dependent_of: i64,
+    pub allow_deleted_upload: bool,
     pub limit: i32,
     pub offset: i32,
+}
+
+/// One `LSIFUploadAuditLog` (`shared.UploadLog`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuditLogRow {
+    pub log_timestamp: OffsetDateTime,
+    pub record_deleted_at: Option<OffsetDateTime>,
+    pub upload_id: i32,
+    pub commit: String,
+    pub root: String,
+    pub uploaded_at: OffsetDateTime,
+    pub indexer: String,
+    /// `{"column": ..., "old": ..., "new": ...}` per transition.
+    pub transition_columns: Vec<serde_json::Value>,
+    pub reason: Option<String>,
+    pub operation: String,
+}
+
+/// `shared.RepositoryWithCount` (`repositoriesWithErrors`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepositoryWithCountRow {
+    pub repository_id: i32,
+    pub repository_name: String,
+    pub count: i64,
+}
+
+/// `shared.RepositoryWithAvailableIndexers` (`repositoriesWithConfiguration`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepositoryWithConfigurationRow {
+    pub repository_id: i32,
+    pub repository_name: String,
+    /// Raw `available_indexers` jsonb text.
+    pub available_indexers: String,
 }
 
 /// `shared.GetAutoIndexJobsOptions` subset used by `PreciseIndexes`.
@@ -213,6 +251,22 @@ pub trait CodeIntelUploadsDatabase: Send + Sync {
     ) -> Result<(), String>;
     /// `store.GetIndexers` (`Query.indexerKeys`).
     fn get_indexer_names(&self, repository_id: i32) -> Result<Vec<String>, String>;
+    /// `store.GetAuditLogsForUpload` (`PreciseIndex.auditLogs`).
+    fn get_audit_logs_for_upload(&self, upload_id: i32) -> Result<Vec<AuditLogRow>, String>;
+    /// `store.NumRepositoriesWithCodeIntelligence` (`Query.codeIntelSummary`).
+    fn num_repositories_with_code_intelligence(&self) -> Result<i64, String>;
+    /// `store.RepositoryIDsWithErrors` (`Query.codeIntelSummary`).
+    fn repository_ids_with_errors(
+        &self,
+        offset: i64,
+        limit: i64,
+    ) -> Result<(Vec<RepositoryWithCountRow>, i64), String>;
+    /// `autoindexing store.RepositoryIDsWithConfiguration`.
+    fn repository_ids_with_configuration(
+        &self,
+        offset: i64,
+        limit: i64,
+    ) -> Result<(Vec<RepositoryWithConfigurationRow>, i64), String>;
 }
 
 // ---------------------------------------------------------------------------
@@ -457,6 +511,8 @@ pub fn indexer_from_name(name: &str) -> CodeIntelIndexer {
 pub struct PreciseIndexRecord {
     pub upload: Option<UploadRow>,
     pub index: Option<AutoIndexJobRow>,
+    /// `PreciseIndex.auditLogs` (`nil` when there is no upload).
+    pub audit_logs: Option<Vec<AuditLogRow>>,
 }
 
 /// `rootResolver.PreciseIndexes` (`root_resolver_index_queries.go:26`).
@@ -503,23 +559,35 @@ pub fn precise_indexes(
     let (upload_states, index_states) =
         bifurcate_states(&requested_states).map_err(ExecError::new)?;
     let skip_uploads = upload_states.is_empty() && !index_states.is_empty();
-    let skip_indexes = !upload_states.is_empty() && index_states.is_empty();
+    let mut skip_indexes = !upload_states.is_empty() && index_states.is_empty();
 
-    if arguments.string("dependencyOf").is_some() {
-        return Err(ExecError::new(
-            "dependencyOf is not supported by the Rust code-intel port",
-        ));
+    let mut dependency_of = 0i64;
+    if let Some(id) = arguments.string("dependencyOf") {
+        let (upload_id, index_id) = decode_precise_index_id(id).map_err(ExecError::new)?;
+        let upload_id = upload_id.unwrap_or(0);
+        if upload_id == 0 {
+            return Err(ExecError::new(format!(
+                "requested dependency of precise index record without data (indexid={})",
+                index_id.unwrap_or(0)
+            )));
+        }
+        dependency_of = upload_id;
+        skip_indexes = true;
     }
-    if arguments.string("dependentOf").is_some() {
-        return Err(ExecError::new(
-            "dependentOf is not supported by the Rust code-intel port",
-        ));
+    let mut dependent_of = 0i64;
+    if let Some(id) = arguments.string("dependentOf") {
+        let (upload_id, index_id) = decode_precise_index_id(id).map_err(ExecError::new)?;
+        let upload_id = upload_id.unwrap_or(0);
+        if upload_id == 0 {
+            return Err(ExecError::new(format!(
+                "requested dependent of precise index record without data (indexid={})",
+                index_id.unwrap_or(0)
+            )));
+        }
+        dependent_of = upload_id;
+        skip_indexes = true;
     }
-    if arguments.bool("includeDeleted") == Some(true) {
-        return Err(ExecError::new(
-            "includeDeleted is not supported by the Rust code-intel port",
-        ));
-    }
+    let allow_deleted_upload = arguments.bool("includeDeleted").unwrap_or(false);
 
     let repository_id = match arguments.string("repo") {
         Some(id) => unmarshal_relay_id(id).map_err(ExecError::new)?,
@@ -540,6 +608,9 @@ pub fn precise_indexes(
                 states: upload_states,
                 term: term.clone(),
                 indexer_names: indexer_names.clone(),
+                dependency_of,
+                dependent_of,
+                allow_deleted_upload,
                 limit: page_size,
                 offset: upload_offset,
             })
@@ -578,12 +649,14 @@ pub fn precise_indexes(
             pairs.push(PreciseIndexRecord {
                 upload: Some(uploads[u_idx].clone()),
                 index: None,
+                audit_logs: None,
             });
             u_idx += 1;
         } else {
             pairs.push(PreciseIndexRecord {
                 upload: None,
                 index: Some(auto_index_jobs[i_idx].clone()),
+                audit_logs: None,
             });
             i_idx += 1;
         }
@@ -592,6 +665,7 @@ pub fn precise_indexes(
         pairs.push(PreciseIndexRecord {
             upload: Some(uploads[u_idx].clone()),
             index: None,
+            audit_logs: None,
         });
         u_idx += 1;
     }
@@ -599,6 +673,7 @@ pub fn precise_indexes(
         pairs.push(PreciseIndexRecord {
             upload: None,
             index: Some(auto_index_jobs[i_idx].clone()),
+            audit_logs: None,
         });
         i_idx += 1;
     }
@@ -660,6 +735,14 @@ pub fn precise_indexes(
                 }
             }
         }
+        // `PreciseIndex.auditLogs` (`precise_index_resolver.go:380`): nil when
+        // there is no upload, otherwise the upload's audit trail.
+        if let Some(upload) = &pair.upload {
+            pair.audit_logs = Some(
+                db.get_audit_logs_for_upload(upload.id as i32)
+                    .map_err(ExecError::new)?,
+            );
+        }
         nodes.push(PreciseIndexObject { record: pair });
     }
 
@@ -695,10 +778,15 @@ pub fn precise_index_by_id(
                 .map_err(ExecError::new)?,
             None => None,
         };
+        let audit_logs = Some(
+            db.get_audit_logs_for_upload(upload.id as i32)
+                .map_err(ExecError::new)?,
+        );
         return Ok(Some(FieldValue::Object(Arc::new(PreciseIndexObject {
             record: PreciseIndexRecord {
                 upload: Some(upload),
                 index,
+                audit_logs,
             },
         }))));
     }
@@ -717,10 +805,18 @@ pub fn precise_index_by_id(
         Some(upload_id) => db.get_upload_by_id(upload_id).map_err(ExecError::new)?,
         None => None,
     };
+    let audit_logs = match &upload {
+        Some(upload) => Some(
+            db.get_audit_logs_for_upload(upload.id as i32)
+                .map_err(ExecError::new)?,
+        ),
+        None => None,
+    };
     Ok(Some(FieldValue::Object(Arc::new(PreciseIndexObject {
         record: PreciseIndexRecord {
             upload,
             index: Some(index),
+            audit_logs,
         },
     }))))
 }
@@ -745,6 +841,21 @@ pub fn indexer_keys(
     keys.sort();
     keys.dedup();
     Ok(string_list(&keys))
+}
+
+/// `rootResolver.CodeIntelSummary` (`root_resolver_coverage.go:27`).
+pub fn code_intel_summary(
+    db: &CodeIntelUploadsHandle,
+    _arguments: &Arguments,
+    _actor: Actor,
+) -> Result<FieldValue, ExecError> {
+    let num_repositories_with_code_intelligence = db
+        .num_repositories_with_code_intelligence()
+        .map_err(ExecError::new)?;
+    Ok(FieldValue::Object(Arc::new(CodeIntelSummaryObject {
+        db: db.clone(),
+        num_repositories_with_code_intelligence,
+    })))
 }
 
 fn check_site_admin(actor: Actor) -> Result<(), ExecError> {
@@ -915,7 +1026,7 @@ fn required_id(arguments: &Arguments) -> Result<String, ExecError> {
 
 /// Whether this module owns the root field.
 pub fn is_root_field(field: &str) -> bool {
-    field == "preciseIndexes" || field == "indexerKeys"
+    field == "preciseIndexes" || field == "indexerKeys" || field == "codeIntelSummary"
 }
 
 /// Root field dispatch.
@@ -928,6 +1039,7 @@ pub fn root_field(
     match field {
         "preciseIndexes" => precise_indexes(db, arguments, actor).map(Some),
         "indexerKeys" => indexer_keys(db, arguments, actor).map(Some),
+        "codeIntelSummary" => code_intel_summary(db, arguments, actor).map(Some),
         _ => Ok(None),
     }
 }
@@ -1003,6 +1115,7 @@ pub fn precise_index_from_auto_index_job(job: AutoIndexJobRow) -> FieldValue {
         record: PreciseIndexRecord {
             upload: None,
             index: Some(job),
+            audit_logs: None,
         },
     }))
 }
@@ -1230,7 +1343,18 @@ impl ObjectValue for PreciseIndexObject {
                 // empty connection rather than an unported error.
                 FieldValue::Object(Arc::new(EmptyRetentionPolicyConnectionObject))
             }
-            "auditLogs" => FieldValue::Null,
+            "auditLogs" => match &self.record.audit_logs {
+                None => FieldValue::Null,
+                Some(logs) => FieldValue::List {
+                    items: logs
+                        .iter()
+                        .map(|log| {
+                            FieldValue::Object(Arc::new(AuditLogObject { log: log.clone() }))
+                        })
+                        .collect(),
+                    element_type: Some("LSIFUploadAuditLog"),
+                },
+            },
             _ => return Ok(None),
         };
         Ok(Some(value))
@@ -1274,6 +1398,392 @@ impl ObjectValue for CodeIntelIndexerObject {
                 Some(name) => FieldValue::Json(Json::Str(name.clone())),
                 None => FieldValue::Null,
             })),
+            _ => Ok(None),
+        }
+    }
+}
+
+/// `lsifUploadsAuditLogResolver` (`precise_index_resolver.go:430`).
+struct AuditLogObject {
+    log: AuditLogRow,
+}
+
+impl ObjectValue for AuditLogObject {
+    fn type_name(&self) -> &'static str {
+        "LSIFUploadAuditLog"
+    }
+
+    fn field(
+        &self,
+        field: &str,
+        _arguments: &Arguments,
+        _actor: Actor,
+    ) -> Result<Option<FieldValue>, ExecError> {
+        let value = match field {
+            "logTimestamp" => FieldValue::Json(Json::Str(datetime_rfc3339(
+                self.log.log_timestamp,
+            ))),
+            "uploadDeletedAt" => FieldValue::Json(datetime_json(self.log.record_deleted_at)),
+            "reason" => FieldValue::Json(match &self.log.reason {
+                Some(reason) => Json::Str(reason.clone()),
+                None => Json::Null,
+            }),
+            "changedColumns" => FieldValue::List {
+                items: self
+                    .log
+                    .transition_columns
+                    .iter()
+                    .map(|transition| {
+                        FieldValue::Object(Arc::new(AuditLogColumnChangeObject {
+                            transition: transition.clone(),
+                        }))
+                    })
+                    .collect(),
+                element_type: Some("AuditLogColumnChange"),
+            },
+            // `resolverstubs.MarshalID("LSIFUpload", r.log.UploadID)`: an int
+            // spec is JSON-marshaled without quotes.
+            "uploadId" => FieldValue::Json(Json::Str(
+                base64::engine::general_purpose::URL_SAFE
+                    .encode(format!("LSIFUpload:{}", self.log.upload_id)),
+            )),
+            "inputCommit" => FieldValue::Json(Json::Str(self.log.commit.clone())),
+            "inputRoot" => FieldValue::Json(Json::Str(self.log.root.clone())),
+            "inputIndexer" => FieldValue::Json(Json::Str(self.log.indexer.clone())),
+            "uploadedAt" => FieldValue::Json(Json::Str(datetime_rfc3339(self.log.uploaded_at))),
+            "operation" => FieldValue::Json(Json::Str(self.log.operation.to_uppercase())),
+            _ => return Ok(None),
+        };
+        Ok(Some(value))
+    }
+}
+
+/// `auditLogColumnChangeResolver` (`precise_index_resolver.go:473`).
+struct AuditLogColumnChangeObject {
+    transition: serde_json::Value,
+}
+
+impl AuditLogColumnChangeObject {
+    fn lookup(&self, key: &str) -> Option<String> {
+        self.transition
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+    }
+}
+
+impl ObjectValue for AuditLogColumnChangeObject {
+    fn type_name(&self) -> &'static str {
+        "AuditLogColumnChange"
+    }
+
+    fn field(
+        &self,
+        field: &str,
+        _arguments: &Arguments,
+        _actor: Actor,
+    ) -> Result<Option<FieldValue>, ExecError> {
+        let value = match field {
+            "column" => FieldValue::Json(Json::Str(self.lookup("column").unwrap_or_default())),
+            "old" => FieldValue::Json(match self.lookup("old") {
+                Some(value) => Json::Str(value),
+                None => Json::Null,
+            }),
+            "new" => FieldValue::Json(match self.lookup("new") {
+                Some(value) => Json::Str(value),
+                None => Json::Null,
+            }),
+            _ => return Ok(None),
+        };
+        Ok(Some(value))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Query.codeIntelSummary (`root_resolver_coverage.go`)
+// ---------------------------------------------------------------------------
+
+const SUMMARY_DEFAULT_PAGE_SIZE: i64 = 25;
+
+struct CodeIntelSummaryObject {
+    db: CodeIntelUploadsHandle,
+    num_repositories_with_code_intelligence: i64,
+}
+
+impl ObjectValue for CodeIntelSummaryObject {
+    fn type_name(&self) -> &'static str {
+        "CodeIntelSummary"
+    }
+
+    fn field(
+        &self,
+        field: &str,
+        arguments: &Arguments,
+        _actor: Actor,
+    ) -> Result<Option<FieldValue>, ExecError> {
+        match field {
+            "numRepositoriesWithCodeIntelligence" => Ok(Some(FieldValue::Json(Json::Int(
+                self.num_repositories_with_code_intelligence,
+            )))),
+            "repositoriesWithErrors" => {
+                let (page_size, offset) = summary_pagination(arguments);
+                let (rows, total) = self
+                    .db
+                    .repository_ids_with_errors(offset, page_size)
+                    .map_err(ExecError::new)?;
+                Ok(Some(FieldValue::Object(Arc::new(
+                    CodeIntelRepositoryWithErrorConnectionObject {
+                        nodes: rows,
+                        total_count: total as i32,
+                        end_cursor: summary_end_cursor(offset, page_size, total),
+                    },
+                ))))
+            }
+            "repositoriesWithConfiguration" => {
+                let (page_size, offset) = summary_pagination(arguments);
+                let (rows, total) = self
+                    .db
+                    .repository_ids_with_configuration(offset, page_size)
+                    .map_err(ExecError::new)?;
+                Ok(Some(FieldValue::Object(Arc::new(
+                    CodeIntelRepositoryWithConfigurationConnectionObject {
+                        nodes: rows,
+                        total_count: total as i32,
+                        end_cursor: summary_end_cursor(offset, page_size, total),
+                    },
+                ))))
+            }
+            _ => Ok(None),
+        }
+    }
+}
+
+/// `pageSize := 25; offset := Atoi(after)` (error ignored).
+fn summary_pagination(arguments: &Arguments) -> (i64, i64) {
+    let page_size = arguments.i64("first").unwrap_or(SUMMARY_DEFAULT_PAGE_SIZE);
+    let offset = arguments
+        .string("after")
+        .and_then(|after| after.parse::<i64>().ok())
+        .unwrap_or(0);
+    (page_size, offset)
+}
+
+fn summary_end_cursor(offset: i64, page_size: i64, total: i64) -> Option<String> {
+    let new_offset = offset + page_size;
+    (new_offset < total).then(|| new_offset.to_string())
+}
+
+struct CodeIntelRepositoryObject {
+    id: i32,
+    name: String,
+}
+
+impl ObjectValue for CodeIntelRepositoryObject {
+    fn type_name(&self) -> &'static str {
+        "CodeIntelRepository"
+    }
+
+    fn field(
+        &self,
+        field: &str,
+        _arguments: &Arguments,
+        _actor: Actor,
+    ) -> Result<Option<FieldValue>, ExecError> {
+        match field {
+            "id" => Ok(Some(FieldValue::Json(Json::Str(
+                crate::graphql_resolvers::RepositoryObject::relay_id(self.id),
+            )))),
+            "name" => Ok(Some(FieldValue::Json(Json::Str(self.name.clone())))),
+            "url" => Ok(Some(FieldValue::Json(Json::Str(format!("/{}", self.name))))),
+            "externalRepository" => Ok(Some(FieldValue::Null)),
+            _ => Ok(None),
+        }
+    }
+}
+
+struct CodeIntelRepositoryWithErrorObject {
+    row: RepositoryWithCountRow,
+}
+
+impl ObjectValue for CodeIntelRepositoryWithErrorObject {
+    fn type_name(&self) -> &'static str {
+        "CodeIntelRepositoryWithError"
+    }
+
+    fn field(
+        &self,
+        field: &str,
+        _arguments: &Arguments,
+        _actor: Actor,
+    ) -> Result<Option<FieldValue>, ExecError> {
+        match field {
+            "repository" => Ok(Some(FieldValue::Object(Arc::new(
+                CodeIntelRepositoryObject {
+                    id: self.row.repository_id,
+                    name: self.row.repository_name.clone(),
+                },
+            )))),
+            "count" => Ok(Some(FieldValue::Json(Json::Int(self.row.count)))),
+            _ => Ok(None),
+        }
+    }
+}
+
+struct CodeIntelRepositoryWithErrorConnectionObject {
+    nodes: Vec<RepositoryWithCountRow>,
+    total_count: i32,
+    end_cursor: Option<String>,
+}
+
+impl ObjectValue for CodeIntelRepositoryWithErrorConnectionObject {
+    fn type_name(&self) -> &'static str {
+        "CodeIntelRepositoryWithErrorConnection"
+    }
+
+    fn field(
+        &self,
+        field: &str,
+        _arguments: &Arguments,
+        _actor: Actor,
+    ) -> Result<Option<FieldValue>, ExecError> {
+        match field {
+            "nodes" => Ok(Some(FieldValue::List {
+                items: self
+                    .nodes
+                    .iter()
+                    .map(|row| {
+                        FieldValue::Object(Arc::new(CodeIntelRepositoryWithErrorObject {
+                            row: row.clone(),
+                        }))
+                    })
+                    .collect(),
+                element_type: Some("CodeIntelRepositoryWithError"),
+            })),
+            "totalCount" => Ok(Some(FieldValue::Json(Json::Int(i64::from(
+                self.total_count,
+            ))))),
+            "pageInfo" => Ok(Some(FieldValue::Object(Arc::new(PageInfoObject::new(
+                self.end_cursor.is_some(),
+                self.end_cursor.clone(),
+            ))))),
+            _ => Ok(None),
+        }
+    }
+}
+
+struct IndexerWithCountObject {
+    indexer: CodeIntelIndexer,
+    count: i32,
+}
+
+impl ObjectValue for IndexerWithCountObject {
+    fn type_name(&self) -> &'static str {
+        "IndexerWithCount"
+    }
+
+    fn field(
+        &self,
+        field: &str,
+        _arguments: &Arguments,
+        _actor: Actor,
+    ) -> Result<Option<FieldValue>, ExecError> {
+        match field {
+            "indexer" => Ok(Some(indexer_field(&self.indexer.name, None))),
+            "count" => Ok(Some(FieldValue::Json(Json::Int(i64::from(self.count))))),
+            _ => Ok(None),
+        }
+    }
+}
+
+struct CodeIntelRepositoryWithConfigurationObject {
+    row: RepositoryWithConfigurationRow,
+}
+
+impl ObjectValue for CodeIntelRepositoryWithConfigurationObject {
+    fn type_name(&self) -> &'static str {
+        "CodeIntelRepositoryWithConfiguration"
+    }
+
+    fn field(
+        &self,
+        field: &str,
+        _arguments: &Arguments,
+        _actor: Actor,
+    ) -> Result<Option<FieldValue>, ExecError> {
+        match field {
+            "repository" => Ok(Some(FieldValue::Object(Arc::new(
+                CodeIntelRepositoryObject {
+                    id: self.row.repository_id,
+                    name: self.row.repository_name.clone(),
+                },
+            )))),
+            "indexers" => {
+                // `map[string]AvailableIndexer` (Go field names, no JSON tags):
+                // `Indexer.CodeIntelIndexer` / `Roots []string`.
+                let parsed: serde_json::Value =
+                    serde_json::from_str(&self.row.available_indexers)
+                        .map_err(|error| ExecError::new(error.to_string()))?;
+                let mut items = Vec::new();
+                if let Some(entries) = parsed.as_object() {
+                    for (name, meta) in entries {
+                        let roots = meta
+                            .get("Roots")
+                            .and_then(serde_json::Value::as_array)
+                            .map(|roots| roots.len())
+                            .unwrap_or(0);
+                        items.push(FieldValue::Object(Arc::new(IndexerWithCountObject {
+                            indexer: indexer_from_name(name),
+                            count: roots as i32,
+                        })));
+                    }
+                }
+                Ok(Some(FieldValue::List {
+                    items,
+                    element_type: Some("IndexerWithCount"),
+                }))
+            }
+            _ => Ok(None),
+        }
+    }
+}
+
+struct CodeIntelRepositoryWithConfigurationConnectionObject {
+    nodes: Vec<RepositoryWithConfigurationRow>,
+    total_count: i32,
+    end_cursor: Option<String>,
+}
+
+impl ObjectValue for CodeIntelRepositoryWithConfigurationConnectionObject {
+    fn type_name(&self) -> &'static str {
+        "CodeIntelRepositoryWithConfigurationConnection"
+    }
+
+    fn field(
+        &self,
+        field: &str,
+        _arguments: &Arguments,
+        _actor: Actor,
+    ) -> Result<Option<FieldValue>, ExecError> {
+        match field {
+            "nodes" => Ok(Some(FieldValue::List {
+                items: self
+                    .nodes
+                    .iter()
+                    .map(|row| {
+                        FieldValue::Object(Arc::new(
+                            CodeIntelRepositoryWithConfigurationObject { row: row.clone() },
+                        ))
+                    })
+                    .collect(),
+                element_type: Some("CodeIntelRepositoryWithConfiguration"),
+            })),
+            "totalCount" => Ok(Some(FieldValue::Json(Json::Int(i64::from(
+                self.total_count,
+            ))))),
+            "pageInfo" => Ok(Some(FieldValue::Object(Arc::new(PageInfoObject::new(
+                self.end_cursor.is_some(),
+                self.end_cursor.clone(),
+            ))))),
             _ => Ok(None),
         }
     }

@@ -1783,3 +1783,293 @@ pub async fn get_indexer_names(
     .fetch_all(pool)
     .await
 }
+
+// ---------------------------------------------------------------------------
+// Precise-index GraphQL remaining reads (M9.29d)
+//
+// Ports the summary/dependency/audit SQL of
+// `internal/codeintel/uploads/internal/store` and
+// `internal/codeintel/autoindexing/internal/store/coverage.go`. The
+// internal-actor `AuthzQueryConds` is `TRUE` and therefore omitted. No table,
+// column or index is added.
+// ---------------------------------------------------------------------------
+
+/// `packageRankingQueryFragment` (`store/util.go:40`).
+pub const PACKAGE_RANKING_FRAGMENT: &str = "rank() OVER ( \
+    PARTITION BY p.scheme, p.manager, p.name, p.version, u.repository_id, u.indexer, u.root \
+    ORDER BY (SELECT cd.committed_at FROM codeintel_commit_dates cd \
+        WHERE cd.repository_id = u.repository_id AND cd.commit_bytea = decode(u.commit, 'hex')) NULLS LAST, \
+        u.id \
+)";
+
+/// `rankedDependencyCandidateCTEQuery` (`store/uploads.go:1089`) with the
+/// `r.dump_id = %s` parameter rendered as `{dependency_of}`.
+pub const RANKED_DEPENDENCIES_CTE_TEMPLATE: &str = "ranked_dependencies AS ( \
+    SELECT p.dump_id AS pkg_id, r.dump_id AS ref_id, \
+        PACKAGE_RANKING AS rank \
+    FROM lsif_uploads u \
+    JOIN lsif_packages p ON p.dump_id = u.id \
+    JOIN lsif_references r ON \
+        r.scheme = p.scheme AND r.manager = p.manager AND \
+        r.name = p.name AND r.version = p.version AND r.dump_id != p.dump_id \
+    WHERE u.state = 'completed' AND r.dump_id = {dependency_of} \
+)";
+
+/// `rankedDependentCandidateCTEQuery` (`store/uploads.go:1112`).
+pub const RANKED_DEPENDENTS_CTE_TEMPLATE: &str = "ranked_dependents AS ( \
+    SELECT p.dump_id AS pkg_id, p.scheme AS scheme, p.manager AS manager, \
+        p.name AS name, p.version AS version, \
+        PACKAGE_RANKING AS rank \
+    FROM lsif_uploads u \
+    JOIN lsif_packages p ON p.dump_id = u.id \
+    WHERE u.state = 'completed' AND \
+        (p.scheme, p.manager, p.name, p.version) IN ( \
+            SELECT p.scheme, p.manager, p.name, p.version \
+            FROM lsif_packages p WHERE p.dump_id = {dependent_of} \
+        ) \
+)";
+
+/// Render a dependency CTE template with a bind placeholder.
+pub fn dependency_cte(template: &str, placeholder: &str) -> String {
+    template
+        .replace("PACKAGE_RANKING", PACKAGE_RANKING_FRAGMENT)
+        .replace("{dependency_of}", placeholder)
+        .replace("{dependent_of}", placeholder)
+}
+
+/// `deletedUploadsFromAuditLogsCTEQuery` (`store/uploads.go:1132`).
+pub const DELETED_UPLOADS_CTE: &str = "deleted_uploads AS ( \
+    SELECT DISTINCT ON (s.upload_id) s.upload_id AS id, au.commit, au.root, \
+        au.uploaded_at, 'deleted' AS state, \
+        s.snapshot->'failure_message' AS failure_message, \
+        (s.snapshot->'started_at')::timestamptz AS started_at, \
+        (s.snapshot->'finished_at')::timestamptz AS finished_at, \
+        (s.snapshot->'process_after')::timestamptz AS process_after, \
+        COALESCE((s.snapshot->'num_resets')::integer, -1) AS num_resets, \
+        COALESCE((s.snapshot->'num_failures')::integer, -1) AS num_failures, \
+        au.repository_id, au.indexer, au.indexer_version, \
+        COALESCE((s.snapshot->'num_parts')::integer, -1) AS num_parts, \
+        NULL::integer[] AS uploaded_parts, \
+        au.upload_size, au.associated_index_id, au.content_type, \
+        false AS should_reindex, \
+        COALESCE((s.snapshot->'expired')::boolean, false) AS expired, \
+        NULL::bigint AS uncompressed_size \
+    FROM ( \
+        SELECT upload_id, snapshot_transition_columns(transition_columns ORDER BY sequence ASC) AS snapshot \
+        FROM lsif_uploads_audit_logs \
+        WHERE record_deleted_at IS NOT NULL \
+        GROUP BY upload_id \
+    ) AS s \
+    JOIN lsif_uploads_audit_logs au ON au.upload_id = s.upload_id \
+)";
+
+/// The union source table that appends audit-log snapshots of deleted uploads.
+pub const DELETED_UPLOADS_SOURCE: &str = "( \
+    SELECT id, commit, root, uploaded_at, state, failure_message, started_at, \
+        finished_at, process_after, num_resets, num_failures, repository_id, \
+        indexer, indexer_version, num_parts, uploaded_parts, upload_size, \
+        associated_index_id, content_type, should_reindex, expired, uncompressed_size \
+    FROM lsif_uploads \
+    UNION ALL \
+    SELECT * FROM deleted_uploads \
+) AS u";
+
+/// `shared.UploadLog` reduced to the GraphQL `LSIFUploadAuditLog` fields.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UploadAuditLogRow {
+    pub log_timestamp: OffsetDateTime,
+    pub record_deleted_at: Option<OffsetDateTime>,
+    pub upload_id: i32,
+    pub commit: String,
+    pub root: String,
+    pub uploaded_at: OffsetDateTime,
+    pub indexer: String,
+    /// One hstore per transition, rendered as a JSON object
+    /// `{"column": ..., "old": ..., "new": ...}`.
+    pub transition_columns: Vec<serde_json::Value>,
+    pub reason: Option<String>,
+    pub operation: String,
+}
+
+/// `getAuditLogsForUploadQuery` (`store/uploads.go:633`), with the
+/// `hstore[]` transitions rendered as `json` text so sqlx can decode them.
+const GET_AUDIT_LOGS_FOR_UPLOAD_QUERY: &str = " \
+SELECT \
+    u.log_timestamp, u.record_deleted_at, u.upload_id, u.commit, u.root, \
+    u.uploaded_at, u.indexer, \
+    ARRAY(SELECT hstore_to_json(e)::text FROM unnest(u.transition_columns) e) AS transitions, \
+    u.reason, u.operation::text AS operation \
+FROM lsif_uploads_audit_logs u \
+JOIN repo ON repo.id = u.repository_id \
+WHERE u.upload_id = $1 \
+ORDER BY u.sequence";
+
+/// `store.GetAuditLogsForUpload` (`store/uploads.go:624`).
+pub async fn get_audit_logs_for_upload(
+    pool: &PgPool,
+    upload_id: i32,
+) -> Result<Vec<UploadAuditLogRow>, sqlx::Error> {
+    let rows = sqlx::query(GET_AUDIT_LOGS_FOR_UPLOAD_QUERY)
+    .bind(upload_id)
+    .fetch_all(pool)
+    .await?;
+    rows.into_iter()
+        .map(|row| {
+            let transitions: Vec<String> = row.try_get("transitions")?;
+            let transition_columns = transitions
+                .iter()
+                .map(|text| {
+                    serde_json::from_str(text).map_err(|error| {
+                        sqlx::Error::Decode(Box::new(error))
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(UploadAuditLogRow {
+                log_timestamp: row.try_get("log_timestamp")?,
+                record_deleted_at: row.try_get("record_deleted_at")?,
+                upload_id: row.try_get("upload_id")?,
+                commit: row.try_get("commit")?,
+                root: row.try_get("root")?,
+                uploaded_at: row.try_get("uploaded_at")?,
+                indexer: row.try_get("indexer")?,
+                transition_columns,
+                reason: row.try_get("reason")?,
+                operation: row.try_get("operation")?,
+            })
+        })
+        .collect()
+}
+
+/// `countRepositoriesQuery` (`store/summary.go:387`).
+pub async fn num_repositories_with_code_intelligence(
+    pool: &PgPool,
+) -> Result<i64, sqlx::Error> {
+    sqlx::query_scalar(
+        "WITH candidate_repositories AS ( \
+             SELECT DISTINCT uvt.repository_id AS id \
+             FROM lsif_uploads_visible_at_tip uvt \
+             WHERE is_default_branch \
+         ) \
+         SELECT COUNT(*) FROM candidate_repositories s \
+         JOIN repo r ON r.id = s.id \
+         WHERE r.deleted_at IS NULL AND r.blocked IS NULL",
+    )
+    .fetch_one(pool)
+    .await
+}
+
+/// `shared.RepositoryWithCount`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepositoryWithCount {
+    pub repository_id: i32,
+    pub repository_name: String,
+    pub count: i64,
+}
+
+/// `repositoriesWithErrorsQuery` (`store/summary.go:310`), joining the repo
+/// name so the GraphQL `CodeIntelRepository` fields can be built inline.
+pub async fn repository_ids_with_errors(
+    pool: &PgPool,
+    offset: i64,
+    limit: i64,
+) -> Result<(Vec<RepositoryWithCount>, i64), sqlx::Error> {
+    let rows = sqlx::query(
+        "WITH candidates_from_uploads AS ( \
+             SELECT u.repository_id \
+             FROM lsif_uploads_with_repository_name u \
+             WHERE u.state = 'failed' AND NOT EXISTS ( \
+                 SELECT 1 FROM lsif_uploads u2 \
+                 WHERE u2.state = 'completed' AND u2.repository_id = u.repository_id \
+                   AND u2.root = u.root AND u2.indexer = u.indexer \
+                   AND u2.finished_at > u.finished_at \
+             ) \
+             GROUP BY u.repository_id, u.root, u.indexer \
+         ), candidates_from_indexes AS ( \
+             SELECT u.repository_id FROM lsif_indexes u \
+             WHERE u.state = 'failed' AND NOT EXISTS ( \
+                 SELECT 1 FROM lsif_indexes u2 \
+                 WHERE u2.state = 'completed' AND u2.repository_id = u.repository_id \
+                   AND u2.root = u.root AND u2.indexer = u.indexer \
+                   AND u2.finished_at > u.finished_at \
+             ) \
+             GROUP BY u.repository_id, u.root, u.indexer \
+         ), candidates AS ( \
+             SELECT * FROM candidates_from_uploads UNION ALL \
+             SELECT * FROM candidates_from_indexes \
+         ), grouped_candidates AS ( \
+             SELECT r.repository_id, COUNT(*) AS num_failures \
+             FROM candidates r GROUP BY r.repository_id \
+         ) \
+         SELECT g.repository_id, repo.name::text AS name, g.num_failures, COUNT(*) OVER() AS count \
+         FROM grouped_candidates g JOIN repo ON repo.id = g.repository_id \
+         ORDER BY g.num_failures DESC, g.repository_id \
+         LIMIT $1 OFFSET $2",
+    )
+    .bind(limit)
+    .bind(offset)
+    .fetch_all(pool)
+    .await?;
+    let total = rows
+        .first()
+        .map(|row| row.try_get::<i64, _>("count"))
+        .transpose()?
+        .unwrap_or(0);
+    let items = rows
+        .into_iter()
+        .map(|row| {
+            Ok(RepositoryWithCount {
+                repository_id: row.try_get("repository_id")?,
+                repository_name: row.try_get("name")?,
+                count: row.try_get("num_failures")?,
+            })
+        })
+        .collect::<Result<Vec<_>, sqlx::Error>>()?;
+    Ok((items, total))
+}
+
+/// `shared.RepositoryWithAvailableIndexers` (`cached_available_indexers`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepositoryWithConfiguration {
+    pub repository_id: i32,
+    pub repository_name: String,
+    /// Raw `available_indexers` jsonb text (`map[string]AvailableIndexer`).
+    pub available_indexers: String,
+}
+
+/// `repositoriesWithConfigurationQuery` (`autoindexing/internal/store/coverage.go:73`).
+pub async fn repository_ids_with_configuration(
+    pool: &PgPool,
+    offset: i64,
+    limit: i64,
+) -> Result<(Vec<RepositoryWithConfiguration>, i64), sqlx::Error> {
+    let rows = sqlx::query(
+        "SELECT r.id, r.name::text AS name, cai.available_indexers::text AS available_indexers, \
+                COUNT(*) OVER() AS count \
+         FROM cached_available_indexers cai \
+         JOIN repo r ON r.id = cai.repository_id \
+         WHERE available_indexers != '{}'::jsonb AND \
+             r.deleted_at IS NULL AND r.blocked IS NULL \
+         ORDER BY num_events DESC \
+         LIMIT $1 OFFSET $2",
+    )
+    .bind(limit)
+    .bind(offset)
+    .fetch_all(pool)
+    .await?;
+    let total = rows
+        .first()
+        .map(|row| row.try_get::<i64, _>("count"))
+        .transpose()?
+        .unwrap_or(0);
+    let items = rows
+        .into_iter()
+        .map(|row| {
+            Ok(RepositoryWithConfiguration {
+                repository_id: row.try_get("id")?,
+                repository_name: row.try_get("name")?,
+                available_indexers: row.try_get("available_indexers")?,
+            })
+        })
+        .collect::<Result<Vec<_>, sqlx::Error>>()?;
+    Ok((items, total))
+}
