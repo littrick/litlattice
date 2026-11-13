@@ -485,6 +485,9 @@ pub struct SchemaGraphqlDeps {
     /// `SavedSearchesResolver`'s database seam (M9.13a); `None` reproduces an
     /// absent optional resolver (SDL not appended, root fields/types absent).
     saved_searches: Option<crate::saved_searches_graphql::SavedSearchesHandle>,
+    /// `BatchChangesResolver`'s database seam (M9.24c); `None` reproduces an
+    /// absent optional resolver (SDL not appended, root fields/types absent).
+    batches: Option<crate::batches_graphql::BatchesHandle>,
     /// `CodeMonitorsResolver`'s resolver (M9.13a); `None` reproduces an absent
     /// optional resolver.
     code_monitors: Option<Arc<crate::code_monitors_graphql::CodeMonitorsResolver>>,
@@ -570,6 +573,7 @@ impl SchemaGraphqlDeps {
             executor_secrets: None,
             rbac: None,
             saved_searches: None,
+            batches: None,
             code_monitors: None,
             embeddings: None,
             diagnostics: None,
@@ -640,6 +644,7 @@ impl SchemaGraphqlDeps {
             executor_secrets: None,
             rbac: None,
             saved_searches: None,
+            batches: None,
             code_monitors: None,
             embeddings: None,
             diagnostics: None,
@@ -985,6 +990,28 @@ impl SchemaGraphqlDeps {
         Ok(self)
     }
 
+    /// Enable the Batch Changes GraphQL read surface (M9.24c): append
+    /// `batches.graphql` (as `NewSchema` does for a non-nil
+    /// `BatchChangesResolver`) and hand the database seam to the executor.
+    ///
+    /// `batches.graphql` references `GitHubApp`, so the `githubapps.graphql`
+    /// document must be registered too — `NewSchemaWithBatchChangesResolver`
+    /// takes a `GitHubAppsResolver` and appends its schema in the same call.
+    /// The GitHub App query fields stay unported (`Ok(None)`), but the type
+    /// surface is required for the schema to assemble.
+    pub fn with_batches(
+        mut self,
+        db: crate::batches_graphql::BatchesHandle,
+    ) -> Result<Self, sg_graphql::schema::SchemaError> {
+        self.schema = Arc::new(sg_graphql::schema::assemble(&[
+            self.schema.schema_string.as_str(),
+            sg_graphql::schema::BATCHES_SCHEMA,
+            sg_graphql::schema::GITHUB_APPS_SCHEMA,
+        ])?);
+        self.batches = Some(db);
+        Ok(self)
+    }
+
     /// Attach the `Repository.embeddingExists` database seam (M9.14c).
     pub fn with_embeddings(
         mut self,
@@ -1207,6 +1234,7 @@ impl SchemaGraphqlDeps {
             executor_secrets: None,
             rbac: None,
             saved_searches: None,
+            batches: None,
             code_monitors: None,
             embeddings: None,
             diagnostics: None,
@@ -2408,6 +2436,7 @@ impl GraphqlDeps for SchemaGraphqlDeps {
             .with_executor_secret_roots(executor_secret_roots)
             .with_search_contexts(self.search_contexts.clone())
             .with_saved_searches(self.saved_searches.clone())
+            .with_batches(self.batches.clone())
             .with_code_monitors(self.code_monitors.clone())
             .with_ranking_roots(ranking_roots)
             .with_search_roots(search_root)
