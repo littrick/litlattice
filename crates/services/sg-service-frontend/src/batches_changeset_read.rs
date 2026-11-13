@@ -1385,6 +1385,12 @@ pub struct BatchChangesCodeHostObject {
     host: CodeHostRow,
 }
 
+impl BatchChangesCodeHostObject {
+    pub fn new(host: CodeHostRow) -> Self {
+        Self { host }
+    }
+}
+
 impl ObjectValue for BatchChangesCodeHostObject {
     fn type_name(&self) -> &'static str {
         "BatchChangesCodeHost"
