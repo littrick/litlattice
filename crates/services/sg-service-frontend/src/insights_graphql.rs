@@ -204,6 +204,13 @@ pub trait InsightsDatabase: InsightsWriteDatabase + Send + Sync + std::fmt::Debu
         series: &InsightSeriesData,
     ) -> Result<InsightSeriesStatusData, String>;
 
+    /// M9.32a: streaming search / repository / gitserver seam for the live
+    /// preview fields. The default is not connected and reports errors rather
+    /// than fabricating aggregation results.
+    fn preview_seam(&self) -> &dyn crate::insights_preview::PreviewSearchSeam {
+        &crate::insights_preview::UnavailablePreviewSeam
+    }
+
     // -- Dashboard write surface (M9.30a). --------------------------------
 
     /// `licensing.Check(FeatureCodeInsights) != nil`: the baseline runs in
@@ -495,7 +502,13 @@ fn object_int(
 pub fn is_root_field(field: &str) -> bool {
     matches!(
         field,
-        "insightViews" | "insightsDashboards" | "insightSeriesQueryStatus"
+        "insightViews"
+            | "insightsDashboards"
+            | "insightSeriesQueryStatus"
+            | "searchInsightLivePreview"
+            | "searchInsightPreview"
+            | "validateScopedInsightQuery"
+            | "previewRepositoriesFromQuery"
     )
 }
 
@@ -522,6 +535,14 @@ pub fn root_field(
         "insightSeriesQueryStatus" => {
             Ok(Some(insight_series_query_status(database, actor)?))
         }
+        "searchInsightLivePreview"
+        | "searchInsightPreview"
+        | "validateScopedInsightQuery"
+        | "previewRepositoriesFromQuery" => Ok(crate::insights_preview::root_field(
+            database.preview_seam(),
+            field,
+            arguments,
+        )?),
         _ => Ok(None),
     }
 }
