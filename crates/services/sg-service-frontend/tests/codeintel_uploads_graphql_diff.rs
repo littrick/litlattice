@@ -34,8 +34,9 @@ use sg_graphql::schema::{
 };
 use sg_graphql::Json;
 use sg_service_frontend::codeintel_uploads_graphql::{
-    delete_precise_index, delete_precise_indexes, indexer_keys, precise_index_by_id,
-    precise_indexes, reindex_precise_index, reindex_precise_indexes, CodeIntelUploadsHandle,
+    code_intel_summary, delete_precise_index, delete_precise_indexes, indexer_keys,
+    precise_index_by_id, precise_indexes, reindex_precise_index, reindex_precise_indexes,
+    CodeIntelUploadsHandle,
 };
 use sg_service_frontend::codeintel_uploads_graphql_store::PgCodeIntelUploadsStore;
 
@@ -67,6 +68,12 @@ struct Case {
     repository: Option<String>,
     #[serde(default)]
     is_latest_for_repo: Option<bool>,
+    #[serde(default)]
+    dependency_of: Option<String>,
+    #[serde(default)]
+    dependent_of: Option<String>,
+    #[serde(default)]
+    include_deleted: Option<bool>,
 }
 
 fn case_kind(case: &Case) -> &str {
@@ -102,10 +109,27 @@ fn arguments_for(case: &Case) -> Arguments {
             if let Some(after) = &case.after {
                 push("after", InputValue::Str(after.clone()));
             }
+            if let Some(dependency_of) = &case.dependency_of {
+                push("dependencyOf", InputValue::Str(dependency_of.clone()));
+            }
+            if let Some(dependent_of) = &case.dependent_of {
+                push("dependentOf", InputValue::Str(dependent_of.clone()));
+            }
+            if let Some(include_deleted) = case.include_deleted {
+                push("includeDeleted", InputValue::Bool(include_deleted));
+            }
         }
         "indexerKeys" => {
             if let Some(repo) = &case.repo {
                 push("repo", InputValue::Str(repo.clone()));
+            }
+        }
+        "codeIntelSummary" => {
+            if let Some(first) = case.first {
+                push("first", InputValue::Int(first));
+            }
+            if let Some(after) = &case.after {
+                push("after", InputValue::Str(after.clone()));
             }
         }
         "preciseIndexByID" => {
@@ -167,7 +191,33 @@ fn fields_for(type_name: &str) -> Option<&'static [&'static str]> {
             "isLatestForRepo",
             "indexer",
             "steps",
+            "auditLogs",
         ]),
+        "LSIFUploadAuditLog" => Some(&[
+            "logTimestamp",
+            "uploadDeletedAt",
+            "reason",
+            "changedColumns",
+            "uploadId",
+            "inputCommit",
+            "inputRoot",
+            "inputIndexer",
+            "uploadedAt",
+            "operation",
+        ]),
+        "AuditLogColumnChange" => Some(&["column", "old", "new"]),
+        "CodeIntelSummary" => Some(&[
+            "numRepositoriesWithCodeIntelligence",
+            "repositoriesWithErrors",
+        ]),
+        "CodeIntelRepositoryWithErrorConnection" => Some(&["nodes", "totalCount", "pageInfo"]),
+        "CodeIntelRepositoryWithError" => Some(&["repository", "count"]),
+        "CodeIntelRepositoryWithConfigurationConnection" => {
+            Some(&["nodes", "totalCount", "pageInfo"])
+        }
+        "CodeIntelRepositoryWithConfiguration" => Some(&["repository", "indexers"]),
+        "IndexerWithCount" => Some(&["indexer", "count"]),
+        "CodeIntelRepository" => Some(&["id", "name", "url"]),
         "CodeIntelIndexer" => Some(&["key", "name", "url", "imageName"]),
         "IndexSteps" => Some(&["setup", "preIndex", "index", "upload", "teardown"]),
         "PreIndexStep" => Some(&["root", "image", "commands", "logEntry"]),
@@ -237,6 +287,39 @@ fn render_object(object: &dyn ObjectValue) -> Result<Value, String> {
             .ok_or_else(|| format!("codeintel diff: unresolved {type_name}.{field}"))?;
         map.insert((*field).to_owned(), render_field(value)?);
     }
+    Ok(Value::Object(map))
+}
+
+/// Renders `Query.codeIntelSummary`, passing the case `first`/`after` through
+/// to `repositoriesWithErrors` (the generic renderer uses empty arguments).
+fn render_code_intel_summary(value: FieldValue, arguments: &Arguments) -> Result<Value, String> {
+    let object = match value {
+        FieldValue::Object(object) => object,
+        other => return render_field(other),
+    };
+    let mut map = Map::new();
+    let num = object
+        .field(
+            "numRepositoriesWithCodeIntelligence",
+            &Arguments::default(),
+            Actor::Internal,
+        )
+        .map_err(|error| error.message)?
+        .ok_or_else(|| {
+            "codeintel diff: unresolved CodeIntelSummary.numRepositoriesWithCodeIntelligence"
+                .to_owned()
+        })?;
+    map.insert(
+        "numRepositoriesWithCodeIntelligence".to_owned(),
+        render_field(num)?,
+    );
+    let errors = object
+        .field("repositoriesWithErrors", arguments, Actor::Internal)
+        .map_err(|error| error.message)?
+        .ok_or_else(|| {
+            "codeintel diff: unresolved CodeIntelSummary.repositoriesWithErrors".to_owned()
+        })?;
+    map.insert("repositoriesWithErrors".to_owned(), render_field(errors)?);
     Ok(Value::Object(map))
 }
 
@@ -335,6 +418,14 @@ async fn codeintel_uploads_graphql_harness() {
             "reindexPreciseIndexes" => {
                 let outcome = reindex_precise_indexes(&handle, &arguments, Actor::Internal);
                 mutation_document(&pool, outcome.err()).await
+            }
+            "codeIntelSummary" => {
+                match code_intel_summary(&handle, &Arguments::default(), Actor::Internal) {
+                    Ok(value) => render_code_intel_summary(value, &arguments).unwrap_or_else(
+                        |error| panic!("render {}: {error}", case.name),
+                    ),
+                    Err(error) => error_document(&error),
+                }
             }
             other => panic!("unknown case kind {other}"),
         };

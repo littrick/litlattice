@@ -25,9 +25,10 @@ use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
 use crate::codeintel_uploads_graphql::{
-    AutoIndexJobRow, CodeIntelUploadsDatabase, DeleteAutoIndexJobsOptions, DeleteUploadsOptions,
-    DockerStep, ExecutionLogEntry, GetAutoIndexJobsOptions, GetUploadsOptions,
-    ReindexUploadsOptions, SetRerunAutoIndexJobsOptions, UploadRow,
+    AuditLogRow, AutoIndexJobRow, CodeIntelUploadsDatabase, DeleteAutoIndexJobsOptions,
+    DeleteUploadsOptions, DockerStep, ExecutionLogEntry, GetAutoIndexJobsOptions,
+    GetUploadsOptions, ReindexUploadsOptions, RepositoryWithConfigurationRow,
+    RepositoryWithCountRow, SetRerunAutoIndexJobsOptions, UploadRow,
 };
 
 pub(crate) fn block_on<F: Future>(future: F) -> F::Output {
@@ -330,6 +331,7 @@ impl CodeIntelUploadsDatabase for PgCodeIntelUploadsStore {
     fn get_uploads(&self, opts: &GetUploadsOptions) -> Result<(Vec<UploadRow>, i64), String> {
         let mut conditions: Vec<String> = Vec::new();
         let mut params: Vec<Param> = Vec::new();
+        let mut ctes: Vec<String> = Vec::new();
         if opts.repository_id != 0 {
             let index = add_param(&mut params, Param::Int(opts.repository_id as i64));
             conditions.push(format!("u.repository_id = ${index}"));
@@ -349,30 +351,72 @@ impl CodeIntelUploadsDatabase for PgCodeIntelUploadsStore {
                 &mut params,
             ));
         }
+        // `buildGetConditionsAndCte`: dependency filters rank the providers of
+        // the referenced packages and keep the canonical (rank 1) providers.
+        if opts.dependency_of != 0 {
+            let index = add_param(&mut params, Param::Int(opts.dependency_of));
+            ctes.push(sg_db::codeintel_uploads::dependency_cte(
+                sg_db::codeintel_uploads::RANKED_DEPENDENCIES_CTE_TEMPLATE,
+                &format!("${index}"),
+            ));
+            conditions.push(
+                "u.id IN (SELECT rd.pkg_id FROM ranked_dependencies rd WHERE rd.rank = 1)"
+                    .to_owned(),
+            );
+        }
+        if opts.dependent_of != 0 {
+            let index = add_param(&mut params, Param::Int(opts.dependent_of));
+            ctes.push(sg_db::codeintel_uploads::dependency_cte(
+                sg_db::codeintel_uploads::RANKED_DEPENDENTS_CTE_TEMPLATE,
+                &format!("${index}"),
+            ));
+            conditions.push(format!(
+                "u.id IN (SELECT r.dump_id FROM ranked_dependents rd \
+                 JOIN lsif_references r ON r.scheme = rd.scheme AND r.manager = rd.manager \
+                   AND r.name = rd.name AND r.version = rd.version AND r.dump_id != rd.pkg_id \
+                 WHERE rd.pkg_id = ${index} AND rd.rank = 1)"
+            ));
+        }
+        // `allowDeletedUploads := AllowDeletedUpload && (State == "" || State == "deleted")`.
+        let allow_deleted_uploads = opts.allow_deleted_upload;
+        if allow_deleted_uploads {
+            ctes.push(sg_db::codeintel_uploads::DELETED_UPLOADS_CTE.to_owned());
+        }
         if let Some(condition) = state_condition(&opts.states, &mut params) {
             conditions.push(condition);
-        } else {
-            // `buildGetConditionsAndCte`: exclude soft-deleted uploads when no
-            // state filter and `includeDeleted` is unset.
+        } else if !allow_deleted_uploads {
             conditions.push("u.state != 'deleted'".to_owned());
         }
         if let Some(condition) = indexer_condition(&opts.indexer_names, &mut params) {
             conditions.push(condition);
         }
+        conditions.push("NOT u.expired".to_owned());
+        conditions.push("repo.deleted_at IS NULL".to_owned());
+        conditions.push("repo.blocked IS NULL".to_owned());
         let where_clause = if conditions.is_empty() {
             "TRUE".to_owned()
         } else {
             conditions.join(" AND ")
         };
+        let source_table = if allow_deleted_uploads {
+            sg_db::codeintel_uploads::DELETED_UPLOADS_SOURCE
+        } else {
+            "lsif_uploads u"
+        };
+        let cte_prefix = if ctes.is_empty() {
+            String::new()
+        } else {
+            format!("WITH {}\n", ctes.join(", "))
+        };
 
         let limit = add_param(&mut params, Param::Int(opts.limit as i64));
         let offset = add_param(&mut params, Param::Int(opts.offset as i64));
-        let select = upload_select();
+        let select = upload_select().replace("FROM lsif_uploads u", &format!("FROM {source_table}"));
         let select_sql = format!(
-            "{select}\nWHERE {where_clause}\nORDER BY uploaded_at DESC, id\nLIMIT ${limit} OFFSET ${offset}"
+            "{cte_prefix}{select}\nWHERE {where_clause}\nORDER BY uploaded_at DESC, id\nLIMIT ${limit} OFFSET ${offset}"
         );
         let count_sql = format!(
-            "SELECT COUNT(*) AS count FROM lsif_uploads u JOIN repo ON repo.id = u.repository_id WHERE {where_clause}"
+            "{cte_prefix}SELECT COUNT(*) AS count FROM {source_table} JOIN repo ON repo.id = u.repository_id WHERE {where_clause}"
         );
         let count_params = params[..params.len() - 2].to_vec();
 
@@ -634,6 +678,83 @@ impl CodeIntelUploadsDatabase for PgCodeIntelUploadsStore {
             &self.pool,
             repository_id,
         ))
+        .map_err(|error| error.to_string())
+    }
+
+    fn get_audit_logs_for_upload(&self, upload_id: i32) -> Result<Vec<AuditLogRow>, String> {
+        block_on(sg_db::codeintel_uploads::get_audit_logs_for_upload(
+            &self.pool,
+            upload_id,
+        ))
+        .map(|rows| {
+            rows.into_iter()
+                .map(|row| AuditLogRow {
+                    log_timestamp: row.log_timestamp,
+                    record_deleted_at: row.record_deleted_at,
+                    upload_id: row.upload_id,
+                    commit: row.commit,
+                    root: row.root,
+                    uploaded_at: row.uploaded_at,
+                    indexer: row.indexer,
+                    transition_columns: row.transition_columns,
+                    reason: row.reason,
+                    operation: row.operation,
+                })
+                .collect()
+        })
+        .map_err(|error| error.to_string())
+    }
+
+    fn num_repositories_with_code_intelligence(&self) -> Result<i64, String> {
+        block_on(sg_db::codeintel_uploads::num_repositories_with_code_intelligence(
+            &self.pool,
+        ))
+        .map_err(|error| error.to_string())
+    }
+
+    fn repository_ids_with_errors(
+        &self,
+        offset: i64,
+        limit: i64,
+    ) -> Result<(Vec<RepositoryWithCountRow>, i64), String> {
+        block_on(sg_db::codeintel_uploads::repository_ids_with_errors(
+            &self.pool, offset, limit,
+        ))
+        .map(|(rows, total)| {
+            (
+                rows.into_iter()
+                    .map(|row| RepositoryWithCountRow {
+                        repository_id: row.repository_id,
+                        repository_name: row.repository_name,
+                        count: row.count,
+                    })
+                    .collect(),
+                total,
+            )
+        })
+        .map_err(|error| error.to_string())
+    }
+
+    fn repository_ids_with_configuration(
+        &self,
+        offset: i64,
+        limit: i64,
+    ) -> Result<(Vec<RepositoryWithConfigurationRow>, i64), String> {
+        block_on(sg_db::codeintel_uploads::repository_ids_with_configuration(
+            &self.pool, offset, limit,
+        ))
+        .map(|(rows, total)| {
+            (
+                rows.into_iter()
+                    .map(|row| RepositoryWithConfigurationRow {
+                        repository_id: row.repository_id,
+                        repository_name: row.repository_name,
+                        available_indexers: row.available_indexers,
+                    })
+                    .collect(),
+                total,
+            )
+        })
         .map_err(|error| error.to_string())
     }
 }
