@@ -1524,6 +1524,28 @@ impl Service for FrontendService {
         ctx.ready.mark_ready();
         ready.store(true, Ordering::SeqCst);
 
+        // M9.32c: `SetupGitHubAppRoutes` production dependencies. The baseline
+        // creates the `rcache` (`redispool.Cache`, `github_app_state`) and uses
+        // `database.DB` plus `httpcli.UncachedExternalClient`; here the Redis
+        // pool is dialed alongside the other startup connections and the
+        // PostgreSQL pool/keyring come from the assembled process.
+        let github_app = match sg_redis::KeyValue::connect(&sg_redis::cache_endpoint()).await {
+            Ok(kv) => Some(Arc::new(
+                crate::githubapp_http_api::GitHubAppServer::production(
+                    session_pool.clone(),
+                    Arc::clone(&keyring),
+                    kv,
+                ),
+            )),
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "GitHub App state Redis unavailable: /githubapp keeps the offline wiring"
+                );
+                None
+            }
+        };
+
         tracing::info!(addr = %external_addr, "frontend listening");
         let served = sg_http::serve_http(
             external,
@@ -1535,6 +1557,7 @@ impl Service for FrontendService {
                 Some(oauth_factory),
                 Some(saml_factory),
                 Some(chain_pool.clone()),
+                github_app,
                 self.version.bytes(),
                 blame_deps,
                 search_deps,

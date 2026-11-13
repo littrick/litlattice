@@ -36,6 +36,13 @@ const CACHE_TTL_SECONDS: i64 = 60 * 60;
 /// The production `rcache` key prefix (`github_app_state`).
 pub const STATE_CACHE_PREFIX: &str = "github_app_state";
 
+/// `extsvc.KindGitHub` (`internal/extsvc/types.go:225,290`): the
+/// `code_host_kind` the webhook service sees. M9.31d passed the wire *type*
+/// `"github"` here; the baseline passes the **kind** `"GITHUB"`, and the store
+/// validates it (`validateCodeHostKindAndSecret`). Errata recorded in the
+/// overview: the production adapter would reject `"github"`.
+pub const CODE_HOST_KIND_GITHUB: &str = "GITHUB";
+
 /// One `/githubapp/` subroute (`httpapi.go:64-68`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum GitHubAppRoute {
@@ -567,10 +574,16 @@ fn api_root(base_url: &str) -> Result<String, String> {
         return Ok("https://api.github.com/".to_owned());
     }
     let path = parsed.path();
+    // `url.URL.ResolveReference` keeps the authority verbatim, including any
+    // explicit port (M9.31d dropped it here, which breaks non-default ports).
+    let authority = match parsed.port() {
+        Some(port) => format!("{}:{port}", parsed.host_str().unwrap_or("")),
+        None => parsed.host_str().unwrap_or("").to_owned(),
+    };
     let base = format!(
         "{}://{}{}",
         parsed.scheme(),
-        parsed.host_str().unwrap_or(""),
+        authority,
         if parsed.path().is_empty() { "/" } else { path }
     );
     if path.is_empty() || path == "/" {
@@ -927,7 +940,10 @@ impl GitHubAppServer {
 
         let mut webhook_uuid = String::new();
         if !webhook_urn.is_empty() {
-            match self.webhooks.create(&app_name, "github", &webhook_urn) {
+            match self
+                .webhooks
+                .create(&app_name, CODE_HOST_KIND_GITHUB, &webhook_urn)
+            {
                 Ok(uuid) => webhook_uuid = uuid,
                 Err(error) => {
                     return http_error(
@@ -1462,4 +1478,397 @@ fn parse_go_url(raw: &str) -> Result<String, String> {
 /// Route method guard: the baseline routes are GET-only.
 pub fn method_allowed(method: &Method) -> bool {
     method == Method::GET
+}
+
+// ---------------------------------------------------------------------------
+// Production adapters (M9.32c)
+//
+// These replace the M9.31d in-memory seams with the real dependencies the Go
+// server uses: `database.GitHubApps()` (`github_apps`), `database.Webhooks(...)`
+// (`webhooks`, keyring-encrypted), `httpcli.UncachedExternalClient` and the
+// `rcache.Cache`. No table, column or Redis key is added.
+// ---------------------------------------------------------------------------
+
+/// `gitHubAppsStore` behind [`GitHubAppStore`].
+pub struct PgGitHubAppStore {
+    pool: sqlx::PgPool,
+    keyring: std::sync::Arc<sg_keyring::Keyring>,
+}
+
+impl PgGitHubAppStore {
+    pub fn new(pool: sqlx::PgPool, keyring: std::sync::Arc<sg_keyring::Keyring>) -> Self {
+        Self { pool, keyring }
+    }
+
+    fn github_app_key(&self) -> Option<std::sync::Arc<dyn sg_encryption::Key>> {
+        self.keyring.github_app_key()
+    }
+
+    /// `gitHubAppsStore.GetByDomainAndKind` (`store.go:430-433`).
+    /// `baseURLWhere` trims the trailing slash from the stored column.
+    fn find_by_domain_and_kind(
+        &self,
+        domain: &str,
+        kind: &str,
+        base_url: &str,
+    ) -> Result<Option<StoredApp>, String> {
+        let row = block_on(
+            sqlx::query(
+                "SELECT id, name FROM github_apps \
+                 WHERE domain = $1 AND kind = $2::github_app_kind \
+                   AND trim(trailing '/' from base_url) = $3",
+            )
+            .bind(domain)
+            .bind(kind)
+            .bind(base_url.trim_end_matches('/'))
+            .fetch_optional(&self.pool),
+        )
+        .map_err(|err| err.to_string())?;
+        Ok(row.map(|row| StoredApp {
+            id: sqlx::Row::get(&row, "id"),
+            name: sqlx::Row::get(&row, "name"),
+        }))
+    }
+}
+
+impl GitHubAppStore for PgGitHubAppStore {
+    fn create(&self, app: &NewGitHubApp) -> Result<i32, String> {
+        let key = self.github_app_key();
+        // `clientSecret, _, err := MaybeEncrypt(...)` — the client-secret key ID
+        // is discarded; `privateKey, keyID, err` supplies `encryption_key_id`.
+        let (client_secret, _) =
+            block_on(sg_encryption::maybe_encrypt(key.as_deref(), &app.client_secret))
+                .map_err(|err| err.to_string())?;
+        let (private_key, key_id) =
+            block_on(sg_encryption::maybe_encrypt(key.as_deref(), &app.private_key))
+                .map_err(|err| err.to_string())?;
+
+        let base_url = normalize_base_url(&app.base_url)
+            .map_err(|_| "unable to parse base URL: ".to_owned())?;
+
+        let domain = if app.domain.is_empty() {
+            "repos".to_owned()
+        } else {
+            app.domain.clone()
+        };
+        let kind = if app.kind.is_empty() {
+            "REPO_SYNC".to_owned()
+        } else if !valid_kind(&app.kind) {
+            return Err(format!("The GitHubAppKind {} is not valid.", app.kind));
+        } else {
+            app.kind.clone()
+        };
+
+        if domain == "batches" && kind == "COMMIT_SIGNING" {
+            // `store.go:136-147` errata: a *hit* makes `GetByDomainAndKind`
+            // return `(app, nil)`; the `ErrNoGitHubAppFound` assertion then
+            // fails and `errors.Wrap(nil, ...)` is nil, so `Create` returns
+            // `(-1, nil)` without inserting the duplicate.
+            match self.find_by_domain_and_kind(&domain, &kind, &base_url) {
+                Ok(Some(_)) => return Ok(-1),
+                Ok(None) => {}
+                Err(error) => {
+                    return Err(format!("checking for existing batches app: {error}"))
+                }
+            }
+        }
+
+        // `store.go:150` passes the plain `keyID` string (not a NULL column),
+        // and `github_apps.encryption_key_id` is NOT NULL: the no-key path
+        // stores the empty string.
+        let row = block_on(
+            sqlx::query(
+                "INSERT INTO github_apps \
+                     (app_id, name, domain, slug, base_url, app_url, client_id, client_secret, \
+                      private_key, encryption_key_id, logo, kind, creator_id) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, \
+                         $12::github_app_kind, $13) \
+                 RETURNING id",
+            )
+            .bind(app.app_id)
+            .bind(&app.name)
+            .bind(&domain)
+            .bind(&app.slug)
+            .bind(&base_url)
+            .bind(&app.app_url)
+            .bind(&app.client_id)
+            .bind(&client_secret)
+            .bind(&private_key)
+            .bind(&key_id)
+            .bind(&app.logo)
+            .bind(&kind)
+            .bind(app.created_by_user_id)
+            .fetch_one(&self.pool),
+        )
+        .map_err(|err| err.to_string())?;
+        Ok(sqlx::Row::get(&row, "id"))
+    }
+
+    fn get_by_id(&self, id: i32) -> Result<StoredApp, String> {
+        let row = block_on(
+            sqlx::query("SELECT id, name FROM github_apps WHERE id = $1")
+                .bind(id)
+                .fetch_optional(&self.pool),
+        )
+        .map_err(|err| err.to_string())?;
+        match row {
+            Some(row) => Ok(StoredApp {
+                id: sqlx::Row::get(&row, "id"),
+                name: sqlx::Row::get(&row, "name"),
+            }),
+            None => Err(format!("no app exists matching criteria: 'id = {id}'")),
+        }
+    }
+}
+
+/// `webhookStore` behind [`WebhookBackend`] (`internal/database/webhooks.go`)
+/// plus `backend.NewWebhookService`'s kind/URN validation.
+pub struct PgWebhookBackend {
+    pool: sqlx::PgPool,
+    keyring: std::sync::Arc<sg_keyring::Keyring>,
+    /// `actor.FromContext(ctx).UID`; the internal actor is 0 (stored NULL).
+    actor_uid: i32,
+}
+
+impl PgWebhookBackend {
+    pub fn new(
+        pool: sqlx::PgPool,
+        keyring: std::sync::Arc<sg_keyring::Keyring>,
+        actor_uid: i32,
+    ) -> Self {
+        Self {
+            pool,
+            keyring,
+            actor_uid,
+        }
+    }
+
+    fn webhook_key(&self) -> Option<std::sync::Arc<dyn sg_encryption::Key>> {
+        self.keyring.webhook_key()
+    }
+}
+
+/// `validateCodeHostKindAndSecret` (`internal/backend/webhooks.go:96-110`).
+fn validate_code_host_kind(kind: &str, has_secret: bool) -> Result<(), String> {
+    match kind {
+        "GITHUB" | "GITLAB" | "BITBUCKETSERVER" | "BITBUCKETCLOUD" => Ok(()),
+        "AZUREDEVOPS" => {
+            if has_secret {
+                Err(format!(
+                    "webhooks do not support secrets for code host kind {kind}"
+                ))
+            } else {
+                Ok(())
+            }
+        }
+        _ => Err(format!(
+            "webhooks are not supported for code host kind {kind}"
+        )),
+    }
+}
+
+/// `extsvc.NewCodeHostBaseURL`: lowercase host, trailing slash on the path.
+fn normalize_code_host_url(raw: &str) -> Result<String, String> {
+    let mut parsed = url::Url::parse(raw).map_err(|error| error.to_string())?;
+    if let Some(host) = parsed.host_str() {
+        let lowered = host.to_ascii_lowercase();
+        if lowered != host {
+            parsed
+                .set_host(Some(&lowered))
+                .map_err(|error| error.to_string())?;
+        }
+    }
+    let path = parsed.path().to_owned();
+    if !path.ends_with('/') {
+        parsed.set_path(&format!("{path}/"));
+    }
+    Ok(parsed.to_string())
+}
+
+impl WebhookBackend for PgWebhookBackend {
+    fn create(&self, name: &str, kind: &str, urn: &str) -> Result<String, String> {
+        validate_code_host_kind(kind, false)?;
+        let urn = normalize_code_host_url(urn)?;
+        let created_by = if self.actor_uid == 0 {
+            None
+        } else {
+            Some(self.actor_uid)
+        };
+        let row = block_on(
+            sqlx::query(
+                "INSERT INTO webhooks \
+                     (name, code_host_kind, code_host_urn, secret, encryption_key_id, \
+                      created_by_user_id) \
+                 VALUES ($1, $2, $3, NULL, NULL, $4) RETURNING uuid::text AS uuid",
+            )
+            .bind(name)
+            .bind(kind)
+            .bind(&urn)
+            .bind(created_by)
+            .fetch_one(&self.pool),
+        )
+        .map_err(|err| err.to_string())?;
+        Ok(sqlx::Row::get(&row, "uuid"))
+    }
+
+    fn get_by_uuid(&self, uuid: &str) -> Result<WebhookRecord, String> {
+        let row = block_on(
+            sqlx::query(
+                "SELECT uuid::text AS uuid, name, secret, encryption_key_id \
+                 FROM webhooks WHERE uuid = $1::uuid",
+            )
+            .bind(uuid)
+            .fetch_optional(&self.pool),
+        )
+        .map_err(|err| err.to_string())?;
+        let Some(row) = row else {
+            return Err(format!("webhook with UUID {uuid} not found"));
+        };
+        let raw_secret: Option<String> = sqlx::Row::get(&row, "secret");
+        let key_id: Option<String> = sqlx::Row::get(&row, "encryption_key_id");
+        let secret = match (key_id.as_deref().unwrap_or(""), raw_secret) {
+            ("", Some(raw)) if !raw.is_empty() => Some(raw),
+            ("", _) => None,
+            (key_id, Some(raw)) if !raw.is_empty() => Some(
+                block_on(sg_encryption::maybe_decrypt(
+                    self.webhook_key().as_deref(),
+                    &raw,
+                    key_id,
+                ))
+                .map_err(|err| err.to_string())?,
+            ),
+            _ => None,
+        };
+        Ok(WebhookRecord {
+            uuid: sqlx::Row::get(&row, "uuid"),
+            name: sqlx::Row::get::<Option<String>, _>(&row, "name").unwrap_or_default(),
+            secret,
+        })
+    }
+
+    fn update(&self, record: &WebhookRecord) -> Result<(), String> {
+        // `webhookStore.Update` writes the whole fetched row back, including
+        // `webhook.CodeHostURN.String()` (re-normalized by `scanWebhook`) and
+        // `CodeHostKind`; fetch them so the stored URN gains its trailing `/`.
+        let current = block_on(
+            sqlx::query(
+                "SELECT code_host_kind, code_host_urn FROM webhooks WHERE uuid = $1::uuid",
+            )
+            .bind(&record.uuid)
+            .fetch_optional(&self.pool),
+        )
+        .map_err(|err| err.to_string())?;
+        let Some(current) = current else {
+            return Err(format!("webhook with UUID {} not found", record.uuid));
+        };
+        let code_host_kind: String = sqlx::Row::get(&current, "code_host_kind");
+        let raw_urn: String = sqlx::Row::get(&current, "code_host_urn");
+        let code_host_urn = normalize_code_host_url(&raw_urn).unwrap_or(raw_urn);
+
+        let (encrypted_secret, key_id) = match record.secret.as_deref() {
+            Some(secret) => {
+                let (value, key_id) = block_on(sg_encryption::maybe_encrypt(
+                    self.webhook_key().as_deref(),
+                    secret,
+                ))
+                .map_err(|err| format!("encrypting secret: {err}"))?;
+                if value.is_empty() && key_id.is_empty() {
+                    return Err("empty secret and key provided".to_owned());
+                }
+                (Some(value), if key_id.is_empty() { None } else { Some(key_id) })
+            }
+            None => (None, None),
+        };
+        let updated_by = if self.actor_uid == 0 {
+            None
+        } else {
+            Some(self.actor_uid)
+        };
+        let result = block_on(
+            sqlx::query(
+                "UPDATE webhooks SET name = $1, code_host_urn = $2, code_host_kind = $3, \
+                     secret = $4, encryption_key_id = $5, updated_at = NOW(), \
+                     updated_by_user_id = $6 \
+                 WHERE uuid = $7::uuid",
+            )
+            .bind(&record.name)
+            .bind(&code_host_urn)
+            .bind(&code_host_kind)
+            .bind(encrypted_secret)
+            .bind(key_id)
+            .bind(updated_by)
+            .bind(&record.uuid)
+            .execute(&self.pool),
+        )
+        .map_err(|err| err.to_string())?;
+        if result.rows_affected() == 0 {
+            return Err(format!("webhook with UUID {} not found", record.uuid));
+        }
+        Ok(())
+    }
+}
+
+/// `httpcli.UncachedExternalClient` behind [`HttpDoer`].
+pub struct ReqwestHttpDoer {
+    client: reqwest::Client,
+}
+
+impl ReqwestHttpDoer {
+    pub fn new() -> Self {
+        Self {
+            client: reqwest::Client::new(),
+        }
+    }
+}
+
+impl Default for ReqwestHttpDoer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl HttpDoer for ReqwestHttpDoer {
+    fn post(&self, url: &str) -> Result<(u16, Vec<u8>), String> {
+        let client = self.client.clone();
+        let url = url.to_owned();
+        block_on(async move {
+            let response = client
+                .post(&url)
+                .body(reqwest::Body::from(Vec::new()))
+                .send()
+                .await
+                .map_err(|error| error.to_string())?;
+            let status = response.status().as_u16();
+            let body = response
+                .bytes()
+                .await
+                .map_err(|error| error.to_string())?
+                .to_vec();
+            Ok((status, body))
+        })
+    }
+}
+
+impl GitHubAppServer {
+    /// The production wiring (`SetupGitHubAppRoutes`): real Redis, Postgres and
+    /// the external HTTP client. `keyring` may be the default empty ring, in
+    /// which case secrets are stored plaintext exactly like Go with no keys.
+    pub fn production(
+        pool: sqlx::PgPool,
+        keyring: std::sync::Arc<sg_keyring::Keyring>,
+        kv: sg_redis::KeyValue,
+    ) -> Self {
+        Self {
+            cache: std::sync::Arc::new(RcacheStateStore::with_kv(kv)),
+            apps: std::sync::Arc::new(PgGitHubAppStore::new(pool.clone(), keyring.clone())),
+            webhooks: std::sync::Arc::new(PgWebhookBackend::new(pool, keyring, 0)),
+            http: std::sync::Arc::new(ReqwestHttpDoer::new()),
+            sleeper: std::sync::Arc::new(RealSleeper),
+            state: std::sync::Arc::new(SystemStateGenerator),
+            // The site-admin gate is not plumbed to the actor chain for this
+            // synchronous route (documented gap); the production wiring keeps
+            // the seam's allow-all policy.
+            site_admin: std::sync::Arc::new(AllowAllSiteAdmin),
+        }
+    }
 }
