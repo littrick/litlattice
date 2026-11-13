@@ -25,8 +25,9 @@ use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
 use crate::codeintel_uploads_graphql::{
-    AutoIndexJobRow, CodeIntelUploadsDatabase, DockerStep, ExecutionLogEntry, GetAutoIndexJobsOptions,
-    GetUploadsOptions, UploadRow,
+    AutoIndexJobRow, CodeIntelUploadsDatabase, DeleteAutoIndexJobsOptions, DeleteUploadsOptions,
+    DockerStep, ExecutionLogEntry, GetAutoIndexJobsOptions, GetUploadsOptions,
+    ReindexUploadsOptions, SetRerunAutoIndexJobsOptions, UploadRow,
 };
 
 pub(crate) fn block_on<F: Future>(future: F) -> F::Output {
@@ -512,5 +513,127 @@ impl CodeIntelUploadsDatabase for PgCodeIntelUploadsStore {
             .map(scan_index)
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| error.to_string())
+    }
+
+    fn get_upload_by_id(&self, id: i64) -> Result<Option<UploadRow>, String> {
+        let select = upload_select();
+        let sql = format!(
+            "{select}\nWHERE repo.deleted_at IS NULL AND u.state != 'deleted' AND u.id = $1"
+        );
+        let row = block_on(
+            sqlx::query(&sql)
+                .bind(id)
+                .fetch_optional(&self.pool),
+        )
+        .map_err(|error| error.to_string())?;
+        row.map(|row| scan_upload(&row))
+            .transpose()
+            .map_err(|error| error.to_string())
+    }
+
+    fn get_auto_index_job_by_id(&self, id: i64) -> Result<Option<AutoIndexJobRow>, String> {
+        let select = index_select();
+        let sql = format!("{select}\nWHERE repo.deleted_at IS NULL AND u.id = $1");
+        let row = block_on(
+            sqlx::query(&sql)
+                .bind(id)
+                .fetch_optional(&self.pool),
+        )
+        .map_err(|error| error.to_string())?;
+        row.map(|row| scan_index(&row))
+            .transpose()
+            .map_err(|error| error.to_string())
+    }
+
+    fn delete_upload_by_id(&self, id: i64) -> Result<(), String> {
+        block_on(sg_db::codeintel_uploads::delete_upload_by_id(&self.pool, id))
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    fn delete_auto_index_job_by_id(&self, id: i64) -> Result<(), String> {
+        block_on(sg_db::codeintel_uploads::delete_auto_index_job_by_id(
+            &self.pool,
+            id,
+        ))
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+    }
+
+    fn delete_uploads(&self, opts: &DeleteUploadsOptions) -> Result<(), String> {
+        block_on(sg_db::codeintel_uploads::delete_uploads_by_filter(
+            &self.pool,
+            opts.repository_id,
+            &opts.states,
+            &opts.indexer_names,
+            &opts.term,
+            opts.visible_at_tip,
+        ))
+        .map_err(|error| error.to_string())
+    }
+
+    fn delete_auto_index_jobs(&self, opts: &DeleteAutoIndexJobsOptions) -> Result<(), String> {
+        block_on(sg_db::codeintel_uploads::delete_auto_index_jobs_by_filter(
+            &self.pool,
+            opts.repository_id,
+            &opts.states,
+            &opts.indexer_names,
+            &opts.term,
+            opts.without_upload,
+        ))
+        .map_err(|error| error.to_string())
+    }
+
+    fn reindex_upload_by_id(&self, id: i64) -> Result<(), String> {
+        block_on(sg_db::codeintel_uploads::reindex_upload_by_id(
+            &self.pool,
+            id,
+        ))
+        .map_err(|error| error.to_string())
+    }
+
+    fn set_rerun_auto_index_job_by_id(&self, id: i64) -> Result<(), String> {
+        block_on(sg_db::codeintel_uploads::set_rerun_auto_index_job_by_id(
+            &self.pool,
+            id,
+        ))
+        .map_err(|error| error.to_string())
+    }
+
+    fn reindex_uploads(&self, opts: &ReindexUploadsOptions) -> Result<(), String> {
+        block_on(sg_db::codeintel_uploads::reindex_uploads_by_filter(
+            &self.pool,
+            opts.repository_id,
+            &opts.states,
+            &opts.indexer_names,
+            &opts.term,
+            opts.visible_at_tip,
+        ))
+        .map_err(|error| error.to_string())
+    }
+
+    fn set_rerun_auto_index_jobs(
+        &self,
+        opts: &SetRerunAutoIndexJobsOptions,
+    ) -> Result<(), String> {
+        block_on(
+            sg_db::codeintel_uploads::set_rerun_auto_index_jobs_by_filter(
+                &self.pool,
+                opts.repository_id,
+                &opts.states,
+                &opts.indexer_names,
+                &opts.term,
+                opts.without_upload,
+            ),
+        )
+        .map_err(|error| error.to_string())
+    }
+
+    fn get_indexer_names(&self, repository_id: i32) -> Result<Vec<String>, String> {
+        block_on(sg_db::codeintel_uploads::get_indexer_names(
+            &self.pool,
+            repository_id,
+        ))
+        .map_err(|error| error.to_string())
     }
 }

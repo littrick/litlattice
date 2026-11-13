@@ -132,6 +132,46 @@ pub struct GetAutoIndexJobsOptions {
     pub offset: i32,
 }
 
+/// `shared.DeleteUploadsOptions` (`DeletePreciseIndexes`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DeleteUploadsOptions {
+    pub repository_id: i32,
+    pub states: Vec<String>,
+    pub indexer_names: Vec<String>,
+    pub term: String,
+    pub visible_at_tip: bool,
+}
+
+/// `shared.DeleteAutoIndexJobsOptions` (`DeletePreciseIndexes`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DeleteAutoIndexJobsOptions {
+    pub repository_id: i32,
+    pub states: Vec<String>,
+    pub indexer_names: Vec<String>,
+    pub term: String,
+    pub without_upload: bool,
+}
+
+/// `shared.ReindexUploadsOptions` (`ReindexPreciseIndexes`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReindexUploadsOptions {
+    pub repository_id: i32,
+    pub states: Vec<String>,
+    pub indexer_names: Vec<String>,
+    pub term: String,
+    pub visible_at_tip: bool,
+}
+
+/// `shared.SetRerunAutoIndexJobsOptions` (`ReindexPreciseIndexes`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SetRerunAutoIndexJobsOptions {
+    pub repository_id: i32,
+    pub states: Vec<String>,
+    pub indexer_names: Vec<String>,
+    pub term: String,
+    pub without_upload: bool,
+}
+
 // ---------------------------------------------------------------------------
 // Database seam
 // ---------------------------------------------------------------------------
@@ -148,6 +188,31 @@ pub trait CodeIntelUploadsDatabase: Send + Sync {
     fn get_uploads_by_ids(&self, ids: &[i64]) -> Result<Vec<UploadRow>, String>;
     /// `store.GetAutoIndexJobsByIDs` (dataloader backfill).
     fn get_auto_index_jobs_by_ids(&self, ids: &[i64]) -> Result<Vec<AutoIndexJobRow>, String>;
+    /// `store.GetUploadByID` (single-row `PreciseIndexByID`).
+    fn get_upload_by_id(&self, id: i64) -> Result<Option<UploadRow>, String>;
+    /// `store.GetAutoIndexJobByID` (single-row `PreciseIndexByID`).
+    fn get_auto_index_job_by_id(&self, id: i64) -> Result<Option<AutoIndexJobRow>, String>;
+    /// `store.DeleteUploadByID`.
+    fn delete_upload_by_id(&self, id: i64) -> Result<(), String>;
+    /// `store.DeleteAutoIndexJobByID`.
+    fn delete_auto_index_job_by_id(&self, id: i64) -> Result<(), String>;
+    /// `store.DeleteUploads`.
+    fn delete_uploads(&self, opts: &DeleteUploadsOptions) -> Result<(), String>;
+    /// `store.DeleteAutoIndexJobs`.
+    fn delete_auto_index_jobs(&self, opts: &DeleteAutoIndexJobsOptions) -> Result<(), String>;
+    /// `store.ReindexUploadByID`.
+    fn reindex_upload_by_id(&self, id: i64) -> Result<(), String>;
+    /// `store.SetRerunAutoIndexJobByID`.
+    fn set_rerun_auto_index_job_by_id(&self, id: i64) -> Result<(), String>;
+    /// `store.ReindexUploads`.
+    fn reindex_uploads(&self, opts: &ReindexUploadsOptions) -> Result<(), String>;
+    /// `store.SetRerunAutoIndexJobs`.
+    fn set_rerun_auto_index_jobs(
+        &self,
+        opts: &SetRerunAutoIndexJobsOptions,
+    ) -> Result<(), String>;
+    /// `store.GetIndexers` (`Query.indexerKeys`).
+    fn get_indexer_names(&self, repository_id: i32) -> Result<Vec<String>, String>;
 }
 
 // ---------------------------------------------------------------------------
@@ -171,7 +236,27 @@ pub fn marshal_precise_index_id(upload_id: Option<i64>, index_id: Option<i64>) -
 }
 
 /// `UnmarshalPreciseIndexGQLID` (`util_identifiers.go:11`).
+///
+/// Mirrors the two nested `errors.Wrap(err, "unexpected precise index ID")`
+/// calls: `unmarshalRawPreciseIndexGQLID` wraps a `relay.UnmarshalSpec`
+/// failure once, and `UnmarshalPreciseIndexGQLID` wraps the result again.
+/// Zero ids are normalized to `None` (the Go code branches on `!= 0`).
 pub fn decode_precise_index_id(id: &str) -> Result<(Option<i64>, Option<i64>), String> {
+    let raw = unmarshal_raw_precise_index_id(id)
+        .map_err(|error| format!("unexpected precise index ID: {error}"))?;
+    if raw.0.unwrap_or(0) == 0 && raw.1.unwrap_or(0) == 0 {
+        return Err(format!(
+            "unexpected precise index ID: invalid precise index id {id:?}"
+        ));
+    }
+    Ok(raw)
+}
+
+const EXPECTED_PAIRS: &str = "expected pairs of `U:<id>`, `I:<id>`";
+
+fn unmarshal_raw_precise_index_id(
+    id: &str,
+) -> Result<(Option<i64>, Option<i64>), String> {
     let decoded = base64::engine::general_purpose::URL_SAFE
         .decode(id)
         .map_err(|error| format!("unexpected precise index ID: {error}"))?;
@@ -181,34 +266,21 @@ pub fn decode_precise_index_id(id: &str) -> Result<(Option<i64>, Option<i64>), S
     };
     // `relay.UnmarshalSpec` JSON-decodes the payload into a string.
     let payload: String = serde_json::from_str(payload)
-        .map_err(|_| "unexpected precise index ID: invalid graphql.ID".to_owned())?;
+        .map_err(|error| format!("unexpected precise index ID: {error}"))?;
     let parts: Vec<&str> = payload.split(':').collect();
     if parts.len() % 2 != 0 {
-        return Err(
-            "unexpected precise index ID: expected pairs of `U:<id>`, `I:<id>`".to_owned(),
-        );
+        return Err(EXPECTED_PAIRS.to_owned());
     }
-    let mut upload_id = None;
-    let mut index_id = None;
+    let (mut upload_id, mut index_id) = (None, None);
     let mut i = 0;
     while i + 1 < parts.len() {
-        let value: i64 = parts[i + 1]
-            .parse()
-            .map_err(|_| "unexpected precise index ID: expected pairs of `U:<id>`, `I:<id>`".to_owned())?;
+        let value: i64 = parts[i + 1].parse().map_err(|_| EXPECTED_PAIRS.to_owned())?;
         match parts[i] {
-            "U" => upload_id = Some(value),
-            "I" => index_id = Some(value),
-            _ => {
-                return Err(
-                    "unexpected precise index ID: expected pairs of `U:<id>`, `I:<id>`"
-                        .to_owned(),
-                )
-            }
+            "U" => upload_id = (value != 0).then_some(value),
+            "I" => index_id = (value != 0).then_some(value),
+            _ => return Err(EXPECTED_PAIRS.to_owned()),
         }
         i += 2;
-    }
-    if upload_id.is_none() && index_id.is_none() {
-        return Err(format!("unexpected precise index ID: invalid precise index id {id:?}"));
     }
     Ok((upload_id, index_id))
 }
@@ -598,9 +670,252 @@ pub fn precise_indexes(
     })))
 }
 
+/// `rootResolver.PreciseIndexByID` (`root_resolver_index_queries.go:213`).
+///
+/// Returns `None` for a missing record (GraphQL `null`), matching the Go
+/// `(nil, nil)` return. An upload id wins over an index id.
+pub fn precise_index_by_id(
+    db: &CodeIntelUploadsHandle,
+    id: &str,
+    _actor: Actor,
+) -> Result<Option<FieldValue>, ExecError> {
+    let (upload_id, index_id) = decode_precise_index_id(id).map_err(ExecError::new)?;
+
+    if let Some(upload_id) = upload_id {
+        let Some(upload) = db
+            .get_upload_by_id(upload_id)
+            .map_err(ExecError::new)?
+        else {
+            return Ok(None);
+        };
+        // `newPreciseIndexResolver`: load the upload's associated index.
+        let index = match upload.associated_index_id {
+            Some(index_id) => db
+                .get_auto_index_job_by_id(index_id)
+                .map_err(ExecError::new)?,
+            None => None,
+        };
+        return Ok(Some(FieldValue::Object(Arc::new(PreciseIndexObject {
+            record: PreciseIndexRecord {
+                upload: Some(upload),
+                index,
+            },
+        }))));
+    }
+
+    let Some(index_id) = index_id else {
+        return Err(ExecError::new("invalid identifier"));
+    };
+    let Some(index) = db
+        .get_auto_index_job_by_id(index_id)
+        .map_err(ExecError::new)?
+    else {
+        return Ok(None);
+    };
+    // `newPreciseIndexResolver`: load the index's associated upload.
+    let upload = match index.associated_upload_id {
+        Some(upload_id) => db.get_upload_by_id(upload_id).map_err(ExecError::new)?,
+        None => None,
+    };
+    Ok(Some(FieldValue::Object(Arc::new(PreciseIndexObject {
+        record: PreciseIndexRecord {
+            upload,
+            index: Some(index),
+        },
+    }))))
+}
+
+/// `rootResolver.IndexerKeys` (`root_resolver_index_queries.go:257`).
+pub fn indexer_keys(
+    db: &CodeIntelUploadsHandle,
+    arguments: &Arguments,
+    _actor: Actor,
+) -> Result<FieldValue, ExecError> {
+    let repository_id = match arguments.string("repo") {
+        Some(id) => unmarshal_relay_id(id).map_err(ExecError::new)?,
+        None => 0,
+    };
+    let names = db
+        .get_indexer_names(repository_id)
+        .map_err(ExecError::new)?;
+    let mut keys: Vec<String> = names
+        .into_iter()
+        .map(|name| indexer_from_name(&name).language_key)
+        .collect();
+    keys.sort();
+    keys.dedup();
+    Ok(string_list(&keys))
+}
+
+fn check_site_admin(actor: Actor) -> Result<(), ExecError> {
+    crate::admin_store::check_current_user_is_site_admin(actor, false).map_err(ExecError::new)
+}
+
+fn states_argument(arguments: &Arguments) -> Vec<String> {
+    match arguments.get("states") {
+        Some(InputValue::List(items)) => items
+            .iter()
+            .filter_map(InputValue::as_str)
+            .map(str::to_owned)
+            .collect(),
+        Some(InputValue::Null) | None => Vec::new(),
+        Some(other) => other
+            .as_str()
+            .map(|state| vec![state.to_owned()])
+            .unwrap_or_default(),
+    }
+}
+
+fn indexer_names_argument(arguments: &Arguments) -> Vec<String> {
+    arguments
+        .string("indexerKey")
+        .map(names_for_key)
+        .unwrap_or_default()
+}
+
+fn repository_argument(arguments: &Arguments) -> Result<i32, ExecError> {
+    match arguments.string("repository") {
+        Some(id) => unmarshal_relay_id(id).map_err(ExecError::new),
+        None => Ok(0),
+    }
+}
+
+fn empty_response() -> FieldValue {
+    FieldValue::Object(Arc::new(EmptyResponseObject))
+}
+
+/// `rootResolver.DeletePreciseIndex` (`root_resolver_index_mutations.go:15`).
+pub fn delete_precise_index(
+    db: &CodeIntelUploadsHandle,
+    arguments: &Arguments,
+    actor: Actor,
+) -> Result<FieldValue, ExecError> {
+    check_site_admin(actor)?;
+    let id = required_id(arguments)?;
+    let (upload_id, index_id) = decode_precise_index_id(&id).map_err(ExecError::new)?;
+    if let Some(upload_id) = upload_id {
+        db.delete_upload_by_id(upload_id).map_err(ExecError::new)?;
+    } else if let Some(index_id) = index_id {
+        db.delete_auto_index_job_by_id(index_id)
+            .map_err(ExecError::new)?;
+    }
+    Ok(empty_response())
+}
+
+/// `rootResolver.DeletePreciseIndexes` (`root_resolver_index_mutations.go:43`).
+pub fn delete_precise_indexes(
+    db: &CodeIntelUploadsHandle,
+    arguments: &Arguments,
+    actor: Actor,
+) -> Result<FieldValue, ExecError> {
+    check_site_admin(actor)?;
+    let (upload_states, index_states) =
+        bifurcate_states(&states_argument(arguments)).map_err(ExecError::new)?;
+    let skip_uploads = upload_states.is_empty() && !index_states.is_empty();
+    let mut skip_indexes = !upload_states.is_empty() && index_states.is_empty();
+    let indexer_names = indexer_names_argument(arguments);
+    let repository_id = repository_argument(arguments)?;
+    let term = arguments.string("query").unwrap_or_default().to_owned();
+    let mut visible_at_tip = false;
+    if let Some(value) = arguments.bool("isLatestForRepo") {
+        visible_at_tip = value;
+        skip_indexes = true;
+    }
+
+    if !skip_uploads {
+        db.delete_uploads(&DeleteUploadsOptions {
+            repository_id,
+            states: upload_states,
+            indexer_names: indexer_names.clone(),
+            term: term.clone(),
+            visible_at_tip,
+        })
+        .map_err(ExecError::new)?;
+    }
+    if !skip_indexes {
+        db.delete_auto_index_jobs(&DeleteAutoIndexJobsOptions {
+            repository_id,
+            states: index_states,
+            indexer_names,
+            term,
+            without_upload: true,
+        })
+        .map_err(ExecError::new)?;
+    }
+    Ok(empty_response())
+}
+
+/// `rootResolver.ReindexPreciseIndex` (`root_resolver_index_mutations.go:109`).
+pub fn reindex_precise_index(
+    db: &CodeIntelUploadsHandle,
+    arguments: &Arguments,
+    actor: Actor,
+) -> Result<FieldValue, ExecError> {
+    check_site_admin(actor)?;
+    let id = required_id(arguments)?;
+    let (upload_id, index_id) = decode_precise_index_id(&id).map_err(ExecError::new)?;
+    if let Some(upload_id) = upload_id {
+        db.reindex_upload_by_id(upload_id).map_err(ExecError::new)?;
+    } else if let Some(index_id) = index_id {
+        db.set_rerun_auto_index_job_by_id(index_id)
+            .map_err(ExecError::new)?;
+    }
+    Ok(empty_response())
+}
+
+/// `rootResolver.ReindexPreciseIndexes` (`root_resolver_index_mutations.go:137`).
+pub fn reindex_precise_indexes(
+    db: &CodeIntelUploadsHandle,
+    arguments: &Arguments,
+    actor: Actor,
+) -> Result<FieldValue, ExecError> {
+    check_site_admin(actor)?;
+    let (upload_states, index_states) =
+        bifurcate_states(&states_argument(arguments)).map_err(ExecError::new)?;
+    let skip_uploads = upload_states.is_empty() && !index_states.is_empty();
+    let mut skip_indexes = !upload_states.is_empty() && index_states.is_empty();
+    let indexer_names = indexer_names_argument(arguments);
+    let repository_id = repository_argument(arguments)?;
+    let term = arguments.string("query").unwrap_or_default().to_owned();
+    let mut visible_at_tip = false;
+    if let Some(value) = arguments.bool("isLatestForRepo") {
+        visible_at_tip = value;
+        skip_indexes = true;
+    }
+
+    if !skip_uploads {
+        db.reindex_uploads(&ReindexUploadsOptions {
+            repository_id,
+            states: upload_states,
+            indexer_names: indexer_names.clone(),
+            term: term.clone(),
+            visible_at_tip,
+        })
+        .map_err(ExecError::new)?;
+    }
+    if !skip_indexes {
+        db.set_rerun_auto_index_jobs(&SetRerunAutoIndexJobsOptions {
+            repository_id,
+            states: index_states,
+            indexer_names,
+            term,
+            without_upload: true,
+        })
+        .map_err(ExecError::new)?;
+    }
+    Ok(empty_response())
+}
+
+fn required_id(arguments: &Arguments) -> Result<String, ExecError> {
+    arguments
+        .string("id")
+        .map(str::to_owned)
+        .ok_or_else(|| ExecError::new("missing id argument"))
+}
+
 /// Whether this module owns the root field.
 pub fn is_root_field(field: &str) -> bool {
-    field == "preciseIndexes"
+    field == "preciseIndexes" || field == "indexerKeys"
 }
 
 /// Root field dispatch.
@@ -612,7 +927,56 @@ pub fn root_field(
 ) -> Result<Option<FieldValue>, ExecError> {
     match field {
         "preciseIndexes" => precise_indexes(db, arguments, actor).map(Some),
+        "indexerKeys" => indexer_keys(db, arguments, actor).map(Some),
         _ => Ok(None),
+    }
+}
+
+/// Whether this module owns a `Mutation` field.
+pub fn is_mutation_field(field: &str) -> bool {
+    matches!(
+        field,
+        "deletePreciseIndex"
+            | "deletePreciseIndexes"
+            | "reindexPreciseIndex"
+            | "reindexPreciseIndexes"
+    )
+}
+
+/// `Mutation` dispatch (`rootResolvers` in `root_resolver_index_mutations.go`).
+pub fn mutation_field(
+    db: &CodeIntelUploadsHandle,
+    field: &str,
+    arguments: &Arguments,
+    actor: Actor,
+) -> Result<Option<FieldValue>, ExecError> {
+    match field {
+        "deletePreciseIndex" => delete_precise_index(db, arguments, actor).map(Some),
+        "deletePreciseIndexes" => delete_precise_indexes(db, arguments, actor).map(Some),
+        "reindexPreciseIndex" => reindex_precise_index(db, arguments, actor).map(Some),
+        "reindexPreciseIndexes" => reindex_precise_indexes(db, arguments, actor).map(Some),
+        _ => Ok(None),
+    }
+}
+
+/// `resolverstubs.EmptyResponse` (`AlwaysNil() == nil`).
+pub struct EmptyResponseObject;
+
+impl ObjectValue for EmptyResponseObject {
+    fn type_name(&self) -> &'static str {
+        "EmptyResponse"
+    }
+
+    fn field(
+        &self,
+        field: &str,
+        _arguments: &Arguments,
+        _actor: Actor,
+    ) -> Result<Option<FieldValue>, ExecError> {
+        match field {
+            "alwaysNil" => Ok(Some(FieldValue::Null)),
+            _ => Ok(None),
+        }
     }
 }
 

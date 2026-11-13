@@ -2871,12 +2871,14 @@ impl FrontendRootResolver {
         self
     }
 
-    /// Attach the optional code-intel uploads database (M9.27d).
+    /// Attach the optional code-intel uploads database (M9.27d; mutations
+    /// added in M9.28a).
     pub fn with_codeintel_uploads(
         mut self,
         codeintel_uploads: Option<crate::codeintel_uploads_graphql::CodeIntelUploadsHandle>,
     ) -> Self {
-        self.query.codeintel_uploads = codeintel_uploads;
+        self.query.codeintel_uploads = codeintel_uploads.clone();
+        self.mutation.codeintel_uploads = codeintel_uploads;
         self
     }
 
@@ -3270,6 +3272,9 @@ pub struct MutationRoot {
     github_apps_http: Option<Arc<dyn crate::github_oauth::GithubHttpTransport>>,
     /// Optional outbound webhook mutations (M9.27b).
     outbound_webhooks: Option<crate::outbound_webhooks_graphql::OutboundWebhooksHandle>,
+    /// Optional code-intel uploads mutations (M9.28a): `deletePreciseIndex(es)`
+    /// / `reindexPreciseIndex(es)`.
+    codeintel_uploads: Option<crate::codeintel_uploads_graphql::CodeIntelUploadsHandle>,
 }
 
 impl MutationRoot {
@@ -3399,6 +3404,17 @@ impl ObjectValue for MutationRoot {
             if crate::outbound_webhooks_graphql::is_mutation_field(field) {
                 return crate::outbound_webhooks_graphql::mutation_field(
                     outbound_webhooks,
+                    field,
+                    arguments,
+                    actor,
+                );
+            }
+        }
+        // M9.28a code-intel uploads mutations.
+        if let Some(codeintel_uploads) = &self.codeintel_uploads {
+            if crate::codeintel_uploads_graphql::is_mutation_field(field) {
+                return crate::codeintel_uploads_graphql::mutation_field(
+                    codeintel_uploads,
                     field,
                     arguments,
                     actor,
@@ -4430,6 +4446,18 @@ impl ObjectValue for QueryRoot {
                         Some(Err(message)) => Err(ExecError::new(message.clone())),
                         None => Ok(None),
                     },
+                    // `NodeResolvers()["PreciseIndex"]` → `PreciseIndexByID`
+                    // (M9.28a). The uploads store bridges with `block_in_place`,
+                    // so the synchronous call is safe inside the executor.
+                    "PreciseIndex" if self.codeintel_uploads.is_some() => {
+                        crate::codeintel_uploads_graphql::precise_index_by_id(
+                            self.codeintel_uploads
+                                .as_ref()
+                                .expect("checked codeintel uploads"),
+                            id,
+                            actor,
+                        )
+                    }
                     // `NodeResolvers()["GitCommit"]` → `gitCommitByID`
                     // (`git_commit.go:34-39`): `repositoryByID` then
                     // `repo.Commit(Rev: oid)`. A missing revision is `null`.
