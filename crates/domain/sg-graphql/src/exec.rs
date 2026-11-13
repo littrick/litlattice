@@ -168,6 +168,12 @@ impl InputValue {
 pub struct Arguments(BTreeMap<String, InputValue>);
 
 impl Arguments {
+    /// Build an argument map from name/value pairs (used by differential
+    /// harnesses that invoke a resolver without going through the parser).
+    pub fn from_entries(entries: Vec<(String, InputValue)>) -> Self {
+        Self(entries.into_iter().collect())
+    }
+
     pub fn get(&self, name: &str) -> Option<&InputValue> {
         self.0.get(name)
     }

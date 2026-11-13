@@ -498,6 +498,10 @@ pub struct SchemaGraphqlDeps {
     /// `CodeMonitorsResolver`'s resolver (M9.13a); `None` reproduces an absent
     /// optional resolver.
     code_monitors: Option<Arc<crate::code_monitors_graphql::CodeMonitorsResolver>>,
+    /// `UploadsServiceResolver`'s database seam (M9.27d); `None` reproduces an
+    /// absent code-intel resolver (`codeintel.autoindexing.graphql` and
+    /// `codeintel.policies.graphql` are not appended).
+    codeintel_uploads: Option<crate::codeintel_uploads_graphql::CodeIntelUploadsHandle>,
     /// `Repository.embeddingExists`'s database seam (M9.14c); `None` keeps the
     /// field unported.
     embeddings: Option<Arc<dyn crate::embeddings_graphql::RepositoryEmbeddingsStore>>,
@@ -584,6 +588,7 @@ impl SchemaGraphqlDeps {
             github_apps: None,
             github_apps_schema: false,
             code_monitors: None,
+            codeintel_uploads: None,
             embeddings: None,
             diagnostics: None,
             org_invitation_config: None,
@@ -657,6 +662,7 @@ impl SchemaGraphqlDeps {
             github_apps: None,
             github_apps_schema: false,
             code_monitors: None,
+            codeintel_uploads: None,
             embeddings: None,
             diagnostics: None,
             org_invitation_config: None,
@@ -987,6 +993,26 @@ impl SchemaGraphqlDeps {
         Ok(self)
     }
 
+    /// Enable the code-intel uploads GraphQL surface (M9.27d): append the
+    /// vendored `codeintel.autoindexing.graphql` and `codeintel.policies.graphql`
+    /// documents (the baseline appends every `codeintel*.graphql` for a non-nil
+    /// `CodeIntelResolver`), handing the database seam to the executor.
+    ///
+    /// The default [`sg_graphql::schema::assemble_oss`] schema never includes
+    /// these documents, so OSS introspection stays unchanged.
+    pub fn with_codeintel_uploads(
+        mut self,
+        db: crate::codeintel_uploads_graphql::CodeIntelUploadsHandle,
+    ) -> Result<Self, sg_graphql::schema::SchemaError> {
+        self.schema = Arc::new(sg_graphql::schema::assemble(&[
+            self.schema.schema_string.as_str(),
+            sg_graphql::schema::CODEINTEL_AUTOINDEXING_SCHEMA,
+            sg_graphql::schema::CODEINTEL_POLICIES_SCHEMA,
+        ])?);
+        self.codeintel_uploads = Some(db);
+        Ok(self)
+    }
+
     /// Enable the saved-searches GraphQL surface (M9.13a): append
     /// `saved_searches.graphql` and hand the database seam to the executor.
     pub fn with_saved_searches(
@@ -1271,6 +1297,7 @@ impl SchemaGraphqlDeps {
             github_apps: None,
             github_apps_schema: false,
             code_monitors: None,
+            codeintel_uploads: None,
             embeddings: None,
             diagnostics: None,
             org_invitation_config: None,
@@ -2474,6 +2501,7 @@ impl GraphqlDeps for SchemaGraphqlDeps {
             .with_batches(self.batches.clone())
             .with_github_apps(self.github_apps.clone())
             .with_code_monitors(self.code_monitors.clone())
+            .with_codeintel_uploads(self.codeintel_uploads.clone())
             .with_ranking_roots(ranking_roots)
             .with_search_roots(search_root)
             .with_git(git)

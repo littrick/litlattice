@@ -36,3 +36,15 @@ pub const BATCHES_SCHEMA: &str = include_str!("sdl/batches.graphql");
 /// Resolver` registers this document alongside it; the vendored copy is
 /// byte-identical to the baseline.
 pub const GITHUB_APPS_SCHEMA: &str = include_str!("sdl/githubapps.graphql");
+
+/// `//go:embed codeintel*.graphql` — the Code Intel auto-indexing document
+/// (`Query.preciseIndexes`, `PreciseIndex`, `IndexSteps`, ...). Appended only
+/// when the code-intel resolver is explicitly enabled (M9.27d); `assemble_oss`
+/// never includes it.
+pub const CODEINTEL_AUTOINDEXING_SCHEMA: &str =
+    include_str!("sdl/codeintel.autoindexing.graphql");
+
+/// `//go:embed codeintel*.graphql` — the policies document. The auto-indexing
+/// document references `CodeIntelligenceConfigurationPolicy`, so the two are
+/// registered together, exactly like `NewSchema`'s `ReadDir` batch.
+pub const CODEINTEL_POLICIES_SCHEMA: &str = include_str!("sdl/codeintel.policies.graphql");
