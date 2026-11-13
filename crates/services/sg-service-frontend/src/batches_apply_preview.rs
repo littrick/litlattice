@@ -1375,8 +1375,18 @@ pub struct ViewerCodeHostConnectionObject {
     first: i64,
     offset: i64,
     only_without_webhooks: bool,
+    only_without_credential: bool,
     actor: Actor,
     hosts: OnceLock<Result<Vec<CodeHostRow>, String>>,
+    credentials: OnceLock<
+        Result<
+            std::collections::HashMap<
+                (String, String),
+                crate::batches_credentials::ResolvedCredential,
+            >,
+            String,
+        >,
+    >,
 }
 
 impl ViewerCodeHostConnectionObject {
@@ -1401,9 +1411,28 @@ impl ViewerCodeHostConnectionObject {
             first,
             offset,
             only_without_webhooks: arguments.bool("onlyWithoutWebhooks").unwrap_or(false),
+            only_without_credential: arguments.bool("onlyWithoutCredential").unwrap_or(false),
             actor,
             hosts: OnceLock::new(),
+            credentials: OnceLock::new(),
         })
+    }
+
+    fn credentials(
+        &self,
+    ) -> Result<
+        &std::collections::HashMap<
+            (String, String),
+            crate::batches_credentials::ResolvedCredential,
+        >,
+        String,
+    > {
+        self.credentials
+            .get_or_init(|| {
+                crate::batches_credentials::resolve_credentials(&self.db, self.actor.uid())
+            })
+            .as_ref()
+            .map_err(Clone::clone)
     }
 
     fn hosts(&self) -> Result<&Vec<CodeHostRow>, String> {
@@ -1419,7 +1448,20 @@ impl ViewerCodeHostConnectionObject {
         if repo_ids.is_empty() {
             return Ok(Vec::new());
         }
-        db.code_hosts_for_repos(&repo_ids, self.only_without_webhooks)
+        let hosts = db.code_hosts_for_repos(&repo_ids, self.only_without_webhooks)?;
+        if !self.only_without_credential {
+            return Ok(hosts);
+        }
+        let credentials = self.credentials()?;
+        Ok(hosts
+            .into_iter()
+            .filter(|host| {
+                !credentials.contains_key(&(
+                    host.external_service_type.clone(),
+                    host.external_service_id.clone(),
+                ))
+            })
+            .collect())
     }
 
     fn page(&self) -> Result<&[CodeHostRow], String> {
@@ -1451,19 +1493,32 @@ impl ObjectValue for ViewerCodeHostConnectionObject {
         _actor: Actor,
     ) -> Result<Option<FieldValue>, ExecError> {
         match field {
-            "nodes" => Ok(Some(FieldValue::List {
-                items: self
-                    .page()
-                    .map_err(ExecError::new)?
-                    .iter()
-                    .map(|host| {
-                        FieldValue::Object(Arc::new(BatchChangesCodeHostObject::new(
-                            host.clone(),
-                        )))
-                    })
-                    .collect(),
-                element_type: Some("BatchChangesCodeHost"),
-            })),
+            "nodes" => {
+                let credentials = self.credentials().map_err(ExecError::new)?;
+                Ok(Some(FieldValue::List {
+                    items: self
+                        .page()
+                        .map_err(ExecError::new)?
+                        .iter()
+                        .map(|host| {
+                            let credential = credentials
+                                .get(&(
+                                    host.external_service_type.clone(),
+                                    host.external_service_id.clone(),
+                                ))
+                                .cloned();
+                            FieldValue::Object(Arc::new(
+                                BatchChangesCodeHostObject::with_credential(
+                                    self.db.clone(),
+                                    host.clone(),
+                                    credential,
+                                ),
+                            ))
+                        })
+                        .collect(),
+                    element_type: Some("BatchChangesCodeHost"),
+                }))
+            }
             "totalCount" => Ok(Some(json_i64(
                 self.hosts().map_err(ExecError::new)?.len() as i64
             ))),

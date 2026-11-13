@@ -539,6 +539,19 @@ pub trait BatchesGraphqlDatabase: Send + Sync {
     fn specs_database(&self) -> Option<&dyn crate::batches_specs_graphql::BatchesSpecsDatabase> {
         None
     }
+
+    // -------------------------------------------------------------------
+    // M9.30c credentials surface
+    // -------------------------------------------------------------------
+
+    /// The `user_credentials` / `batch_changes_site_credentials` seam.
+    /// Implemented by `PgBatchesGraphqlStore` in `batches_credentials_store.rs`;
+    /// `None` leaves credentials unresolved (the fields render `null`).
+    fn credentials_database(
+        &self,
+    ) -> Option<&dyn crate::batches_credentials::BatchesCredentialsDatabase> {
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1991,6 +2004,9 @@ pub fn root_field(
         _ if crate::batches_bulk_mutations::is_root_field(field) => {
             return crate::batches_bulk_mutations::root_field(db, field, arguments, actor)
         }
+        _ if crate::batches_credentials::is_root_field(field) => {
+            return crate::batches_credentials::root_field(db, field, arguments, actor)
+        }
         _ => return crate::batches_changeset_read::root_field(db, field, arguments, actor),
     };
     Ok(Some(value))
@@ -2000,6 +2016,7 @@ pub fn root_field(
 pub fn is_root_field(field: &str) -> bool {
     matches!(field, "batchChanges" | "batchChange")
         || crate::batches_bulk_mutations::is_root_field(field)
+        || crate::batches_credentials::is_root_field(field)
         || crate::batches_changeset_read::is_root_field(field)
 }
 

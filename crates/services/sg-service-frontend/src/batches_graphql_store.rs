@@ -229,6 +229,9 @@ pub struct PgBatchesGraphqlStore {
     /// client is wired into the store.
     pub(crate) changeset_diff_source:
         Option<std::sync::Arc<dyn crate::batches_changeset_read::ChangesetDiffSource>>,
+    /// M9.30c: `keyring.Default()` for the batch changes credential key. `None`
+    /// keeps credentials in plaintext, like the Go baseline with a nil key.
+    pub(crate) credential_keyring: Option<std::sync::Arc<sg_keyring::Keyring>>,
 }
 
 impl PgBatchesGraphqlStore {
@@ -238,7 +241,14 @@ impl PgBatchesGraphqlStore {
             batch_changes_enabled: true,
             batch_changes_restricted_to_admins: false,
             changeset_diff_source: None,
+            credential_keyring: None,
         }
+    }
+
+    /// Wire the keyring used by `keyring.Default().BatchChangesCredentialKey`.
+    pub fn with_keyring(mut self, keyring: std::sync::Arc<sg_keyring::Keyring>) -> Self {
+        self.credential_keyring = Some(keyring);
+        self
     }
 
     /// Test seam for the M9.26c `Changeset.diff` gitserver access.
@@ -2132,6 +2142,12 @@ impl BatchesGraphqlDatabase for PgBatchesGraphqlStore {
     }
 
     fn specs_database(&self) -> Option<&dyn crate::batches_specs_graphql::BatchesSpecsDatabase> {
+        Some(self)
+    }
+
+    fn credentials_database(
+        &self,
+    ) -> Option<&dyn crate::batches_credentials::BatchesCredentialsDatabase> {
         Some(self)
     }
 

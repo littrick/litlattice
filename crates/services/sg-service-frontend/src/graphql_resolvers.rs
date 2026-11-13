@@ -3440,6 +3440,15 @@ impl ObjectValue for MutationRoot {
                 return crate::batches_mutations::mutation_field(batches, field, arguments, actor);
             }
         }
+        // M9.30c Batch Changes credentials (`createBatchChangesCredential`,
+        // `deleteBatchChangesCredential`, `checkBatchChangesCredential`).
+        if let Some(batches) = &self.batches {
+            if crate::batches_credentials::is_mutation_field(field) {
+                return crate::batches_credentials::mutation_field(
+                    batches, field, arguments, actor,
+                );
+            }
+        }
         // M9.27c Batch Changes bulk operations (`detachChangesets`,
         // `createChangesetComments`, `mergeChangesets`, `closeChangesets`,
         // `publishChangesets`); `reenqueueChangesets` stays above.
@@ -4745,6 +4754,17 @@ impl ObjectValue for QueryRoot {
                             actor,
                         )
                     }
+                    // `NodeResolvers()["BatchChangesCredential"]` (M9.30c).
+                    _ if self.batches.is_some()
+                        && crate::batches_credentials::is_node_kind(kind.as_str()) =>
+                    {
+                        crate::batches_credentials::node_field(
+                            self.batches.as_ref().expect("checked batches"),
+                            kind.as_str(),
+                            id,
+                            actor,
+                        )
+                    }
                     // `NodeResolvers()["BatchSpec"]` / `["ChangesetSpec"]` /
                     // `["BatchSpecWorkspace"]` (M9.26a).
                     _ if self.batches.is_some()
@@ -5564,6 +5584,18 @@ impl ObjectValue for UserObject {
                         user: self.data.id,
                         org: 0,
                     },
+                    arguments,
+                    actor,
+                )
+                .map(Some),
+                None => Ok(None),
+            },
+            // `UserResolver.BatchChangesCodeHosts` (M9.30c): the extension
+            // resolver sets `UserID` to the owner and delegates.
+            "batchChangesCodeHosts" => match &self.nested.batches {
+                Some(batches) => crate::batches_changeset_read::user_batch_changes_code_hosts(
+                    &batches.0,
+                    self.data.id,
                     arguments,
                     actor,
                 )
