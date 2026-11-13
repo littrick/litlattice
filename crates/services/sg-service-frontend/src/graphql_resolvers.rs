@@ -2790,12 +2790,14 @@ impl FrontendRootResolver {
         self
     }
 
-    /// Attach the optional Batch Changes read surface (M9.24c).
+    /// Attach the optional Batch Changes read surface (M9.24c) and write
+    /// mutations (M9.25b).
     pub fn with_batches(
         mut self,
         batches: Option<crate::batches_graphql::BatchesHandle>,
     ) -> Self {
         self.query.batches = batches.clone();
+        self.mutation.batches = batches.clone();
         let nested = Arc::make_mut(&mut self.query.nested);
         nested.batches = batches.map(crate::batches_graphql::BatchesHandleWrapper);
         self
@@ -3174,6 +3176,8 @@ pub struct MutationRoot {
     saved_searches: Option<crate::saved_searches_graphql::SavedSearchesHandle>,
     /// Optional code-monitor resolver (M9.13a).
     code_monitors: Option<Arc<crate::code_monitors_graphql::CodeMonitorsResolver>>,
+    /// Optional Batch Changes write surface (M9.25b).
+    batches: Option<crate::batches_graphql::BatchesHandle>,
 }
 
 impl MutationRoot {
@@ -3254,6 +3258,14 @@ impl ObjectValue for MutationRoot {
         arguments: &Arguments,
         actor: Actor,
     ) -> Result<Option<FieldValue>, ExecError> {
+        // M9.25b Batch Changes mutations. The resolver runs the enterprise
+        // gate, RBAC check and database work directly (the store bridges with
+        // `block_in_place`), matching the Go `Resolver` methods.
+        if let Some(batches) = &self.batches {
+            if crate::batches_mutations::is_mutation_field(field) {
+                return crate::batches_mutations::mutation_field(batches, field, arguments, actor);
+            }
+        }
         if self.search_contexts.is_some()
             && crate::search_contexts_schema::field_handler(
                 SearchContextsOperation::Mutation,
