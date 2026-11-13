@@ -506,6 +506,9 @@ pub struct SchemaGraphqlDeps {
     /// absent code-intel resolver (`codeintel.autoindexing.graphql` and
     /// `codeintel.policies.graphql` are not appended).
     codeintel_uploads: Option<crate::codeintel_uploads_graphql::CodeIntelUploadsHandle>,
+    /// `CodeIntelPoliciesResolver`'s database seam (M9.28c); `None`
+    /// reproduces an absent resolver.
+    codeintel_policies: Option<crate::codeintel_policies_graphql::CodeIntelPoliciesHandle>,
     /// `Repository.embeddingExists`'s database seam (M9.14c); `None` keeps the
     /// field unported.
     embeddings: Option<Arc<dyn crate::embeddings_graphql::RepositoryEmbeddingsStore>>,
@@ -594,6 +597,7 @@ impl SchemaGraphqlDeps {
             outbound_webhooks: None,
             code_monitors: None,
             codeintel_uploads: None,
+            codeintel_policies: None,
             embeddings: None,
             diagnostics: None,
             org_invitation_config: None,
@@ -669,6 +673,7 @@ impl SchemaGraphqlDeps {
             outbound_webhooks: None,
             code_monitors: None,
             codeintel_uploads: None,
+            codeintel_policies: None,
             embeddings: None,
             diagnostics: None,
             org_invitation_config: None,
@@ -1010,12 +1015,44 @@ impl SchemaGraphqlDeps {
         mut self,
         db: crate::codeintel_uploads_graphql::CodeIntelUploadsHandle,
     ) -> Result<Self, sg_graphql::schema::SchemaError> {
-        self.schema = Arc::new(sg_graphql::schema::assemble(&[
-            self.schema.schema_string.as_str(),
-            sg_graphql::schema::CODEINTEL_AUTOINDEXING_SCHEMA,
-            sg_graphql::schema::CODEINTEL_POLICIES_SCHEMA,
-        ])?);
+        let mut documents = vec![self.schema.schema_string.as_str()];
+        if !self.schema.types.contains_key("PreciseIndex") {
+            documents.push(sg_graphql::schema::CODEINTEL_AUTOINDEXING_SCHEMA);
+        }
+        if !self
+            .schema
+            .types
+            .contains_key("CodeIntelligenceConfigurationPolicy")
+        {
+            documents.push(sg_graphql::schema::CODEINTEL_POLICIES_SCHEMA);
+        }
+        self.schema = Arc::new(sg_graphql::schema::assemble(&documents)?);
         self.codeintel_uploads = Some(db);
+        Ok(self)
+    }
+
+    /// Enable the configuration-policy GraphQL surface (M9.28c): append the
+    /// vendored `codeintel.policies.graphql` document if it is not already
+    /// present (the uploads builder appends it too) and hand the database seam
+    /// to the executor.
+    ///
+    /// The default [`sg_graphql::schema::assemble_oss`] schema never includes
+    /// this document, so OSS introspection stays unchanged.
+    pub fn with_codeintel_policies(
+        mut self,
+        db: crate::codeintel_policies_graphql::CodeIntelPoliciesHandle,
+    ) -> Result<Self, sg_graphql::schema::SchemaError> {
+        if !self
+            .schema
+            .types
+            .contains_key("CodeIntelligenceConfigurationPolicy")
+        {
+            self.schema = Arc::new(sg_graphql::schema::assemble(&[
+                self.schema.schema_string.as_str(),
+                sg_graphql::schema::CODEINTEL_POLICIES_SCHEMA,
+            ])?);
+        }
+        self.codeintel_policies = Some(db);
         Ok(self)
     }
 
@@ -1321,6 +1358,7 @@ impl SchemaGraphqlDeps {
             outbound_webhooks: None,
             code_monitors: None,
             codeintel_uploads: None,
+            codeintel_policies: None,
             embeddings: None,
             diagnostics: None,
             org_invitation_config: None,
@@ -2526,6 +2564,7 @@ impl GraphqlDeps for SchemaGraphqlDeps {
             .with_outbound_webhooks(self.outbound_webhooks.clone())
             .with_code_monitors(self.code_monitors.clone())
             .with_codeintel_uploads(self.codeintel_uploads.clone())
+            .with_codeintel_policies(self.codeintel_policies.clone())
             .with_ranking_roots(ranking_roots)
             .with_search_roots(search_root)
             .with_git(git)

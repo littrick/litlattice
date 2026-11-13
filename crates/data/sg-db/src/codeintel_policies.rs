@@ -433,3 +433,404 @@ mod tests {
         assert_eq!(binds, vec!["darth%".to_owned(), "r1".to_owned()]);
     }
 }
+
+//
+// M9.28c: GraphQL-facing queries of the configuration-policy store.
+//
+// Ported from `internal/codeintel/policies/internal/store/configurations.go`
+// (`GetConfigurationPolicyByID`, `CreateConfigurationPolicy`,
+// `UpdateConfigurationPolicy`, `DeleteConfigurationPolicyByID`) and
+// `repository_matches.go` (`GetRepoIDsByGlobPatterns`), plus `RepoCount`
+// (`global_metadata.go`) and the repository row lookup the previews need.
+//
+// `database.AuthzQueryConds` is reproduced as the internal-actor predicate
+// (`TRUE`); request-actor repository permissions are a documented gap in
+// `m9_28c_codeintel_policies_overview.md`.
+//
+
+/// `Store.CreateConfigurationPolicy` input (`shared.ConfigurationPolicy`,
+/// excluding the id/protected fields the insert generates).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewConfigurationPolicy {
+    pub repository_id: Option<i32>,
+    pub repository_patterns: Option<Vec<String>>,
+    pub name: String,
+    pub policy_type: String,
+    pub pattern: String,
+    pub retention_enabled: bool,
+    /// `optionalNumHours(policy.RetentionDuration)`: already whole hours.
+    pub retention_duration_hours: Option<i32>,
+    pub retain_intermediate_commits: bool,
+    pub indexing_enabled: bool,
+    pub syntactic_indexing_enabled: bool,
+    pub index_commit_max_age_hours: Option<i32>,
+    pub index_intermediate_commits: bool,
+    pub embeddings_enabled: bool,
+}
+
+/// `Store.UpdateConfigurationPolicy` input (`shared.ConfigurationPolicyPatch`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigurationPolicyPatch {
+    pub id: i32,
+    /// `*[]string`: `None` is SQL NULL, `Some(vec![])` is `{}`.
+    pub repository_patterns: Option<Vec<String>>,
+    pub name: String,
+    pub policy_type: String,
+    pub pattern: String,
+    pub retention_enabled: bool,
+    pub retention_duration_hours: Option<i32>,
+    pub retain_intermediate_commits: bool,
+    pub indexing_enabled: bool,
+    /// `None` keeps the current column value.
+    pub syntactic_indexing_enabled: Option<bool>,
+    pub index_commit_max_age_hours: Option<i32>,
+    pub index_intermediate_commits: bool,
+    pub embeddings_enabled: bool,
+}
+
+/// Exported error texts of the store, verbatim.
+pub const UNKNOWN_CONFIGURATION_POLICY: &str = "unknown configuration policy";
+pub const ILLEGAL_CONFIGURATION_POLICY_UPDATE: &str = "protected configuration policies must keep the same names, types, patterns, and retention values (except duration)";
+pub const ILLEGAL_CONFIGURATION_POLICY_DELETE: &str =
+    "protected configuration policies cannot be deleted";
+
+/// `Store.GetConfigurationPolicyByID`; `None` mirrors the `!exists` return.
+pub async fn get_configuration_policy_by_id(
+    pool: &PgPool,
+    id: i32,
+) -> Result<Option<ConfigurationPolicy>, String> {
+    // `p.repository_id IS NULL OR (authz)`: the internal actor's authz
+    // predicate is `TRUE`, so the disjunction is always true.
+    let query = format!(
+        "{GET_CONFIGURATION_POLICIES_SELECT}WHERE p.id = $1 AND (p.repository_id IS NULL OR TRUE)"
+    );
+    let row = sqlx::query(&query)
+        .bind(id)
+        .fetch_optional(pool)
+        .await
+        .map_err(|err| err.to_string())?;
+    match row {
+        Some(row) => scan_configuration_policy(&row).map(Some),
+        None => Ok(None),
+    }
+}
+
+/// `Store.CreateConfigurationPolicy`: inserts and returns the hydrated row.
+pub async fn create_configuration_policy(
+    pool: &PgPool,
+    policy: &NewConfigurationPolicy,
+) -> Result<ConfigurationPolicy, String> {
+    let row = sqlx::query(CREATE_CONFIGURATION_POLICY_QUERY)
+        .bind(policy.repository_id)
+        .bind(policy.repository_patterns.clone())
+        .bind(&policy.name)
+        .bind(&policy.policy_type)
+        .bind(&policy.pattern)
+        .bind(policy.retention_enabled)
+        .bind(policy.retention_duration_hours)
+        .bind(policy.retain_intermediate_commits)
+        .bind(policy.indexing_enabled)
+        .bind(policy.syntactic_indexing_enabled)
+        .bind(policy.index_commit_max_age_hours)
+        .bind(policy.index_intermediate_commits)
+        .bind(policy.embeddings_enabled)
+        .fetch_one(pool)
+        .await
+        .map_err(|err| err.to_string())?;
+    scan_configuration_policy(&row)
+}
+
+/// `Store.UpdateConfigurationPolicy`.
+pub async fn update_configuration_policy(
+    pool: &PgPool,
+    patch: &ConfigurationPolicyPatch,
+) -> Result<(), String> {
+    let mut tx = pool.begin().await.map_err(|err| err.to_string())?;
+
+    let row = sqlx::query(UPDATE_CONFIGURATION_POLICY_SELECT_QUERY)
+        .bind(patch.id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|err| err.to_string())?;
+    let current = match row {
+        Some(row) => scan_configuration_policy(&row)?,
+        None => {
+            return Err(UNKNOWN_CONFIGURATION_POLICY.to_owned());
+        }
+    };
+
+    if current.protected
+        && (patch.name != current.name.as_deref().unwrap_or_default()
+            || patch.policy_type != current.policy_type
+            || patch.pattern != current.pattern
+            || patch.retention_enabled != current.retention_enabled
+            || patch.retain_intermediate_commits != current.retain_intermediate_commits)
+    {
+        return Err(ILLEGAL_CONFIGURATION_POLICY_UPDATE.to_owned());
+    }
+
+    let syntactic = patch
+        .syntactic_indexing_enabled
+        .unwrap_or(current.syntactic_indexing_enabled);
+
+    sqlx::query(UPDATE_CONFIGURATION_POLICY_QUERY)
+        .bind(&patch.name)
+        .bind(patch.repository_patterns.clone())
+        .bind(&patch.policy_type)
+        .bind(&patch.pattern)
+        .bind(patch.retention_enabled)
+        .bind(patch.retention_duration_hours)
+        .bind(patch.retain_intermediate_commits)
+        .bind(patch.indexing_enabled)
+        .bind(syntactic)
+        .bind(patch.index_commit_max_age_hours)
+        .bind(patch.index_intermediate_commits)
+        .bind(patch.embeddings_enabled)
+        .bind(patch.id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|err| err.to_string())?;
+
+    tx.commit().await.map_err(|err| err.to_string())
+}
+
+/// `Store.DeleteConfigurationPolicyByID`.
+pub async fn delete_configuration_policy_by_id(pool: &PgPool, id: i32) -> Result<(), String> {
+    let mut tx = pool.begin().await.map_err(|err| err.to_string())?;
+
+    let protected: Option<bool> = sqlx::query_scalar(DELETE_CONFIGURATION_POLICY_BY_ID_QUERY)
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|err| err.to_string())?;
+    match protected {
+        None => return Err(UNKNOWN_CONFIGURATION_POLICY.to_owned()),
+        Some(true) => return Err(ILLEGAL_CONFIGURATION_POLICY_DELETE.to_owned()),
+        Some(false) => {}
+    }
+
+    sqlx::query(DELETE_CONFIGURATION_POLICIES_REPOSITORY_PATTERN_LOOKUP)
+        .bind(id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|err| err.to_string())?;
+
+    tx.commit().await.map_err(|err| err.to_string())
+}
+
+/// `Store.GetRepoIDsByGlobPatterns`: returns `(ids, totalCount)`.
+///
+/// The authz predicate is again the internal-actor `TRUE` form.
+pub async fn get_repo_ids_by_glob_patterns(
+    pool: &PgPool,
+    patterns: &[String],
+    limit: i64,
+    offset: i64,
+) -> Result<(Vec<i32>, i64), String> {
+    if patterns.is_empty() {
+        return Ok((Vec::new(), 0));
+    }
+    let (condition, binds) = pattern_condition(patterns);
+
+    let mut tx = pool.begin().await.map_err(|err| err.to_string())?;
+
+    let count_query = format!(
+        "SELECT COUNT(*)\nFROM repo\nWHERE\n\t({condition}) AND\n\tdeleted_at IS NULL AND\n\tblocked IS NULL AND\n\t(TRUE)"
+    );
+    let mut count = sqlx::query(&count_query);
+    for bind in &binds {
+        count = count.bind(bind.clone());
+    }
+    let row = count
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|err| err.to_string())?;
+    let total_count: i64 = row.try_get(0).map_err(|err| err.to_string())?;
+
+    let select_query = format!(
+        "SELECT id\nFROM repo\nWHERE\n\t({condition}) AND\n\tdeleted_at IS NULL AND\n\tblocked IS NULL AND\n\t(TRUE)\nORDER BY stars DESC NULLS LAST, id\nLIMIT {limit}\nOFFSET {offset}"
+    );
+    let mut select = sqlx::query(&select_query);
+    for bind in &binds {
+        select = select.bind(bind.clone());
+    }
+    let rows = select
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|err| err.to_string())?;
+    let ids = rows
+        .iter()
+        .map(|row| row.try_get::<i32, _>(0).map_err(|err| err.to_string()))
+        .collect::<Result<Vec<_>, String>>()?;
+
+    tx.commit().await.map_err(|err| err.to_string())?;
+    Ok((ids, total_count))
+}
+
+/// `Store.RepoCount`: `SELECT SUM(total) FROM repo_statistics`. An empty
+/// table scans NULL and errors, like the baseline's `ScanFirstInt`.
+pub async fn repo_count(pool: &PgPool) -> Result<i64, String> {
+    let total: Option<i64> = sqlx::query_scalar("SELECT SUM(total)::bigint FROM repo_statistics")
+        .fetch_one(pool)
+        .await
+        .map_err(|err| err.to_string())?;
+    total.ok_or_else(|| {
+        "sql: Scan error on column index 0, name \"sum\": converting NULL to int is unsupported"
+            .to_owned()
+    })
+}
+
+/// A repository row the previews need (`repos.Get` semantics).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepositoryRow {
+    pub id: i32,
+    pub name: String,
+}
+
+/// `repoStore.Get`: excludes deleted repositories, then surfaces the blocked
+/// error. Errors are verbatim (`RepoNotFoundErr`, `BlockedRepoError`).
+pub async fn get_repository(pool: &PgPool, id: i32) -> Result<RepositoryRow, String> {
+    let row = sqlx::query("SELECT id, name, blocked FROM repo WHERE id = $1 AND deleted_at IS NULL")
+        .bind(id)
+        .fetch_optional(pool)
+        .await
+        .map_err(|err| err.to_string())?;
+    let row = match row {
+        Some(row) => row,
+        None => return Err(format!("repo not found: id={id}")),
+    };
+    let name: String = row.try_get("name").map_err(|err| err.to_string())?;
+    let blocked: Option<serde_json::Value> = row.try_get("blocked").map_err(|err| err.to_string())?;
+    if let Some(blocked) = blocked {
+        let reason = blocked
+            .get("reason")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+        return Err(format!(
+            "repository {name} has been blocked. reason: {reason}"
+        ));
+    }
+    let id: i32 = row.try_get("id").map_err(|err| err.to_string())?;
+    Ok(RepositoryRow { id, name })
+}
+
+/// `gitresolvers.NewRepositoryFromID` node lookup (id + name only).
+pub async fn get_repository_names(
+    pool: &PgPool,
+    ids: &[i32],
+) -> Result<Vec<RepositoryRow>, String> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let rows = sqlx::query("SELECT id, name FROM repo WHERE id = ANY($1)")
+        .bind(ids)
+        .fetch_all(pool)
+        .await
+        .map_err(|err| err.to_string())?;
+    let mut by_id = std::collections::HashMap::new();
+    for row in &rows {
+        by_id.insert(
+            row.try_get::<i32, _>("id").map_err(|err| err.to_string())?,
+            row.try_get::<String, _>("name")
+                .map_err(|err| err.to_string())?,
+        );
+    }
+    Ok(ids
+        .iter()
+        .filter_map(|id| {
+            by_id
+                .get(id)
+                .map(|name| RepositoryRow { id: *id, name: name.clone() })
+        })
+        .collect())
+}
+
+const CREATE_CONFIGURATION_POLICY_QUERY: &str = r#"
+INSERT INTO lsif_configuration_policies (
+	repository_id,
+	repository_patterns,
+	name,
+	type,
+	pattern,
+	retention_enabled,
+	retention_duration_hours,
+	retain_intermediate_commits,
+	indexing_enabled,
+	syntactic_indexing_enabled,
+	index_commit_max_age_hours,
+	index_intermediate_commits,
+	embeddings_enabled
+) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+RETURNING
+	id,
+	repository_id,
+	repository_patterns,
+	name,
+	type,
+	pattern,
+	false as protected,
+	retention_enabled,
+	retention_duration_hours,
+	retain_intermediate_commits,
+	indexing_enabled,
+	syntactic_indexing_enabled,
+	index_commit_max_age_hours,
+	index_intermediate_commits,
+	embeddings_enabled
+"#;
+
+const UPDATE_CONFIGURATION_POLICY_SELECT_QUERY: &str = r#"
+SELECT
+	id,
+	repository_id,
+	repository_patterns,
+	name,
+	type,
+	pattern,
+	protected,
+	retention_enabled,
+	retention_duration_hours,
+	retain_intermediate_commits,
+	indexing_enabled,
+	syntactic_indexing_enabled,
+	index_commit_max_age_hours,
+	index_intermediate_commits,
+	embeddings_enabled
+FROM lsif_configuration_policies
+WHERE id = $1
+FOR UPDATE
+"#;
+
+const UPDATE_CONFIGURATION_POLICY_QUERY: &str = r#"
+UPDATE lsif_configuration_policies p SET
+	name = $1,
+	repository_patterns = $2,
+	type = $3,
+	pattern = $4,
+	retention_enabled = $5,
+	retention_duration_hours = $6,
+	retain_intermediate_commits = $7,
+	indexing_enabled = $8,
+	syntactic_indexing_enabled = $9,
+	index_commit_max_age_hours = $10,
+	index_intermediate_commits = $11,
+	embeddings_enabled = $12
+WHERE id = $13
+"#;
+
+const DELETE_CONFIGURATION_POLICY_BY_ID_QUERY: &str = r#"
+WITH
+candidate AS (
+	SELECT id, protected
+	FROM lsif_configuration_policies
+	WHERE id = $1
+	ORDER BY id FOR UPDATE
+),
+deleted AS (
+	DELETE FROM lsif_configuration_policies WHERE id IN (SELECT id FROM candidate WHERE NOT protected)
+)
+SELECT protected FROM candidate
+"#;
+
+const DELETE_CONFIGURATION_POLICIES_REPOSITORY_PATTERN_LOOKUP: &str =
+    "DELETE FROM lsif_configuration_policies_repository_pattern_lookup WHERE policy_id = $1";
