@@ -15,6 +15,7 @@ regex = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true, features = ["oid"] }
+sqlx = { workspace = true }
 thiserror = { workspace = true }
 rsa = { version = "0.9", features = ["pem"] }
 sha1 = { version = "0.10", features = ["oid"] }

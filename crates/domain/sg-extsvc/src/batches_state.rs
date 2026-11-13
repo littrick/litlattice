@@ -21,6 +21,18 @@ use std::collections::{BTreeMap, HashMap};
 
 use time::OffsetDateTime;
 
+/// Go's `time.Time{}` (year 1, UTC). Used whenever the baseline leaves a
+/// timestamp unset, including `ChangesetEvent.Timestamp()` returning the zero
+/// `time.Time` for event types it does not know.
+pub fn go_zero_time() -> OffsetDateTime {
+    time::macros::datetime!(0001-01-01 00:00:00 UTC)
+}
+
+/// True when `t` is Go's zero `time.Time`.
+pub fn is_go_zero_time(t: OffsetDateTime) -> bool {
+    t == go_zero_time()
+}
+
 /// `btypes.ChangesetExternalState`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ChangesetExternalState {
@@ -341,6 +353,10 @@ pub enum EventMetadata {
     /// `ConvertToDraftEvent` — all carry only `CreatedAt` for our purposes; the
     /// event `kind` distinguishes them.
     GithubCreated { created_at: OffsetDateTime },
+    /// `*github.IssueComment` (`github:commented`) and
+    /// `*github.PullRequestReviewComment` (`github:review_commented`). The
+    /// baseline's `Timestamp()` uses their `UpdatedAt`.
+    GithubUpdated { updated_at: OffsetDateTime },
     /// `*gitlab.Pipeline` (no `Timestamp()` case in the baseline).
     GitlabPipeline {
         status: String,
@@ -385,14 +401,27 @@ pub enum EventMetadata {
         author: String,
         date: OffsetDateTime,
     },
-    /// `bitbucketcloud.PullRequestFulfilledEvent`/`RejectedEvent`.
+    /// `bitbucketcloud.PullRequestFulfilledEvent`/`RejectedEvent`/
+    /// `PullRequestUpdatedEvent` (all read `PullRequest.UpdatedOn`).
     BitbucketCloudUpdated { updated_on: OffsetDateTime },
+    /// `bitbucketcloud.PullRequestComment{Created,Deleted,Updated}Event`;
+    /// `updated` selects `UpdatedOn` (deleted/updated) over `CreatedOn`.
+    BitbucketCloudComment {
+        created_on: OffsetDateTime,
+        updated_on: OffsetDateTime,
+        updated: bool,
+    },
     /// `azuredevops.PullRequest{Merged,Approved,ApprovedWithSuggestions,
-    /// WaitingForAuthor,Rejected}Event`.
+    /// WaitingForAuthor,Rejected,Updated}Event`.
     AzureDevOpsEvent {
         author: String,
         created_date: OffsetDateTime,
     },
+    /// A metadata type whose `Timestamp()` is not implemented in the baseline
+    /// (Azure DevOps `PullRequestBuildStatus`, Gerrit `Reviewer`) or whose
+    /// metadata is never read by the derived-state functions. Behaves like the
+    /// zero `time.Time`.
+    Zero,
 }
 
 /// A `ChangesetEvent` (`kind`, metadata, and owning changeset id).
@@ -456,16 +485,23 @@ impl Changeset {
             )
     }
 
-    /// `Changeset.ExternalCreatedAt` (None = zero time).
+    /// `Changeset.ExternalCreatedAt`; `None` is Go's zero `time.Time`, which
+    /// `computeHistory` rejects with "changeset ExternalCreatedAt has zero
+    /// value".
     pub fn external_created_at(&self) -> Option<OffsetDateTime> {
-        match &self.metadata {
-            ChangesetMetadata::Github(pr) => Some(pr.created_at),
-            ChangesetMetadata::Gitlab(mr) => Some(mr.created_at),
-            ChangesetMetadata::BitbucketServer(pr) => Some(pr.created_date),
-            ChangesetMetadata::BitbucketCloud(pr) => Some(pr.created_on),
-            ChangesetMetadata::AzureDevOps(pr) => Some(pr.creation_date),
-            ChangesetMetadata::Gerrit(change) => Some(change.created),
-            ChangesetMetadata::Perforce(cl) => Some(cl.creation_date),
+        let at = match &self.metadata {
+            ChangesetMetadata::Github(pr) => pr.created_at,
+            ChangesetMetadata::Gitlab(mr) => mr.created_at,
+            ChangesetMetadata::BitbucketServer(pr) => pr.created_date,
+            ChangesetMetadata::BitbucketCloud(pr) => pr.created_on,
+            ChangesetMetadata::AzureDevOps(pr) => pr.creation_date,
+            ChangesetMetadata::Gerrit(change) => change.created,
+            ChangesetMetadata::Perforce(cl) => cl.creation_date,
+        };
+        if is_go_zero_time(at) {
+            None
+        } else {
+            Some(at)
         }
     }
 
@@ -584,14 +620,20 @@ pub const REQUIRED_EVENT_TYPES_FOR_HISTORY: &[&str] = &[
 pub fn event_timestamp(event: &ChangesetEvent) -> Option<OffsetDateTime> {
     match &event.metadata {
         EventMetadata::GithubCommitStatus { received_at, .. } => Some(*received_at),
-        EventMetadata::GithubPullRequestCommit { committed_date, .. } => Some(*committed_date),
+        // `*github.PullRequestCommit` has no `Timestamp()` case in the
+        // baseline, so it sorts at the zero time.
+        EventMetadata::GithubPullRequestCommit { .. } => None,
         EventMetadata::GithubCheckSuite { received_at, .. } => Some(*received_at),
         EventMetadata::GithubCheckRun { received_at, .. } => Some(*received_at),
         EventMetadata::GithubLabel { created_at, .. } => Some(*created_at),
         EventMetadata::GithubReview { updated_at, .. } => Some(*updated_at),
         EventMetadata::GithubReviewDismissed { created_at, .. } => Some(*created_at),
         EventMetadata::GithubCreated { created_at } => Some(*created_at),
-        // `*gitlab.Pipeline` has no `Timestamp()` case in the baseline.
+        EventMetadata::GithubUpdated { updated_at } => Some(*updated_at),
+        // The baseline's `*gitlabwebhooks.PipelineEvent` case returns the
+        // event row's `CreatedAt`, not a code-host timestamp. The loader keeps
+        // that in `created_at`; the pure corpus path (which has no row) is the
+        // zero time. Pipeline events do not influence external/review state.
         EventMetadata::GitlabPipeline { .. } => None,
         EventMetadata::GitlabReview { created_at, .. } => Some(*created_at),
         EventMetadata::GitlabCreated { created_at } => Some(*created_at),
@@ -606,7 +648,15 @@ pub fn event_timestamp(event: &ChangesetEvent) -> Option<OffsetDateTime> {
         EventMetadata::BitbucketCloudApproval { date, .. } => Some(*date),
         EventMetadata::BitbucketCloudChangesRequest { date, .. } => Some(*date),
         EventMetadata::BitbucketCloudUpdated { updated_on } => Some(*updated_on),
+        EventMetadata::BitbucketCloudComment {
+            created_on,
+            updated_on,
+            updated,
+        } => Some(if *updated { *updated_on } else { *created_on }),
         EventMetadata::AzureDevOpsEvent { created_date, .. } => Some(*created_date),
+        // Types without a `Timestamp()` case in the baseline (Azure DevOps
+        // build status, Gerrit reviewers) sort at the zero time.
+        EventMetadata::Zero => None,
     }
 }
 
