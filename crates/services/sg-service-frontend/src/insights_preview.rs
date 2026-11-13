@@ -135,6 +135,157 @@ impl PreviewSearchSeam for UnavailablePreviewSeam {
     }
 }
 
+/// Production seam assembled by the frontend search combination root.
+///
+/// The frontend keeps search execution behind a synchronous [`search_stream`]
+/// tree runner, so the combination root injects already-wired executors here
+/// instead of re-implementing the streaming/gitserver clients. Operations left
+/// `None` keep the baseline's `search execution is not connected` error.
+#[derive(Default)]
+pub struct ProductionPreviewSeam {
+    now: Option<Box<dyn Fn() -> OffsetDateTime + Send + Sync>>,
+    repo_search: Option<Box<dyn Fn(&str) -> Result<Vec<PreviewRepo>, String> + Send + Sync>>,
+    repo_by_name: Option<Box<dyn Fn(&str) -> Result<i32, String> + Send + Sync>>,
+    first_commit:
+        Option<Box<dyn Fn(&str) -> Result<Option<OffsetDateTime>, String> + Send + Sync>>,
+    recent_commit:
+        Option<Box<dyn Fn(&str, OffsetDateTime) -> Result<Option<String>, String> + Send + Sync>>,
+    capture_group_search:
+        Option<Box<dyn Fn(&str) -> Result<Vec<GroupedMatch>, String> + Send + Sync>>,
+    compute_search: Option<Box<dyn Fn(&str) -> Result<Vec<GroupedMatch>, String> + Send + Sync>>,
+    streaming_search: Option<Box<dyn Fn(&str) -> Result<i64, String> + Send + Sync>>,
+}
+
+impl std::fmt::Debug for ProductionPreviewSeam {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProductionPreviewSeam")
+            .field("repo_search", &self.repo_search.is_some())
+            .field("capture_group_search", &self.capture_group_search.is_some())
+            .field("compute_search", &self.compute_search.is_some())
+            .field("streaming_search", &self.streaming_search.is_some())
+            .finish()
+    }
+}
+
+impl ProductionPreviewSeam {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    pub fn with_now(mut self, now: impl Fn() -> OffsetDateTime + Send + Sync + 'static) -> Self {
+        self.now = Some(Box::new(now));
+        self
+    }
+    pub fn with_repo_search(
+        mut self,
+        repo_search: impl Fn(&str) -> Result<Vec<PreviewRepo>, String> + Send + Sync + 'static,
+    ) -> Self {
+        self.repo_search = Some(Box::new(repo_search));
+        self
+    }
+    pub fn with_repo_by_name(
+        mut self,
+        repo_by_name: impl Fn(&str) -> Result<i32, String> + Send + Sync + 'static,
+    ) -> Self {
+        self.repo_by_name = Some(Box::new(repo_by_name));
+        self
+    }
+    pub fn with_first_commit(
+        mut self,
+        first_commit: impl Fn(&str) -> Result<Option<OffsetDateTime>, String> + Send + Sync + 'static,
+    ) -> Self {
+        self.first_commit = Some(Box::new(first_commit));
+        self
+    }
+    pub fn with_recent_commit(
+        mut self,
+        recent_commit: impl Fn(&str, OffsetDateTime) -> Result<Option<String>, String>
+            + Send
+            + Sync
+            + 'static,
+    ) -> Self {
+        self.recent_commit = Some(Box::new(recent_commit));
+        self
+    }
+    pub fn with_capture_group_search(
+        mut self,
+        capture_group_search: impl Fn(&str) -> Result<Vec<GroupedMatch>, String>
+            + Send
+            + Sync
+            + 'static,
+    ) -> Self {
+        self.capture_group_search = Some(Box::new(capture_group_search));
+        self
+    }
+    pub fn with_compute_search(
+        mut self,
+        compute_search: impl Fn(&str) -> Result<Vec<GroupedMatch>, String> + Send + Sync + 'static,
+    ) -> Self {
+        self.compute_search = Some(Box::new(compute_search));
+        self
+    }
+    pub fn with_streaming_search(
+        mut self,
+        streaming_search: impl Fn(&str) -> Result<i64, String> + Send + Sync + 'static,
+    ) -> Self {
+        self.streaming_search = Some(Box::new(streaming_search));
+        self
+    }
+}
+
+impl PreviewSearchSeam for ProductionPreviewSeam {
+    fn now(&self) -> OffsetDateTime {
+        self.now
+            .as_ref()
+            .map_or_else(OffsetDateTime::now_utc, |now| now())
+    }
+    fn repo_search(&self, query: &str) -> Result<Vec<PreviewRepo>, String> {
+        match &self.repo_search {
+            Some(repo_search) => repo_search(query),
+            None => Err(NOT_CONNECTED.to_owned()),
+        }
+    }
+    fn repo_by_name(&self, name: &str) -> Result<i32, String> {
+        match &self.repo_by_name {
+            Some(repo_by_name) => repo_by_name(name),
+            None => Err(NOT_CONNECTED.to_owned()),
+        }
+    }
+    fn first_commit(&self, repo: &str) -> Result<Option<OffsetDateTime>, String> {
+        match &self.first_commit {
+            Some(first_commit) => first_commit(repo),
+            None => Err(NOT_CONNECTED.to_owned()),
+        }
+    }
+    fn recent_commit(
+        &self,
+        repo: &str,
+        before: OffsetDateTime,
+    ) -> Result<Option<String>, String> {
+        match &self.recent_commit {
+            Some(recent_commit) => recent_commit(repo, before),
+            None => Err(NOT_CONNECTED.to_owned()),
+        }
+    }
+    fn capture_group_search(&self, query: &str) -> Result<Vec<GroupedMatch>, String> {
+        match &self.capture_group_search {
+            Some(capture_group_search) => capture_group_search(query),
+            None => Err(NOT_CONNECTED.to_owned()),
+        }
+    }
+    fn compute_search(&self, query: &str) -> Result<Vec<GroupedMatch>, String> {
+        match &self.compute_search {
+            Some(compute_search) => compute_search(query),
+            None => Err(NOT_CONNECTED.to_owned()),
+        }
+    }
+    fn streaming_search(&self, query: &str) -> Result<i64, String> {
+        match &self.streaming_search {
+            Some(streaming_search) => streaming_search(query),
+            None => Err(NOT_CONNECTED.to_owned()),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Inputs
 // ---------------------------------------------------------------------------
