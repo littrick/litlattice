@@ -227,3 +227,19 @@ mod tests {
         assert!(DEFAULT_SCRIPT.contains("[\"sg.rust\"] = false"));
     }
 }
+
+const SET_INFERENCE_SCRIPT_SQL: &str = "
+INSERT INTO codeintel_inference_scripts (script)
+VALUES($1)
+";
+
+/// `store.SetInferenceScript`. The baseline parses the script with
+/// `gopher-lua` first; that validation is the caller's responsibility (the
+/// store method itself only inserts).
+pub async fn set_inference_script(pool: &PgPool, script: &str) -> Result<(), sqlx::Error> {
+    sqlx::query(SET_INFERENCE_SCRIPT_SQL)
+        .bind(script)
+        .execute(pool)
+        .await?;
+    Ok(())
+}

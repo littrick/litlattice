@@ -506,6 +506,12 @@ pub struct SchemaGraphqlDeps {
     /// absent code-intel resolver (`codeintel.autoindexing.graphql` and
     /// `codeintel.policies.graphql` are not appended).
     codeintel_uploads: Option<crate::codeintel_uploads_graphql::CodeIntelUploadsHandle>,
+    /// `AutoindexingServiceResolver`'s seam (M9.28b); `None` keeps the
+    /// autoindexing root fields and `Repository.indexConfiguration` unported.
+    /// The SDL documents are appended by
+    /// [`Self::with_codeintel_uploads`].
+    codeintel_autoindexing:
+        Option<crate::codeintel_autoindexing_graphql::CodeIntelAutoindexingHandle>,
     /// `Repository.embeddingExists`'s database seam (M9.14c); `None` keeps the
     /// field unported.
     embeddings: Option<Arc<dyn crate::embeddings_graphql::RepositoryEmbeddingsStore>>,
@@ -594,6 +600,7 @@ impl SchemaGraphqlDeps {
             outbound_webhooks: None,
             code_monitors: None,
             codeintel_uploads: None,
+            codeintel_autoindexing: None,
             embeddings: None,
             diagnostics: None,
             org_invitation_config: None,
@@ -669,6 +676,7 @@ impl SchemaGraphqlDeps {
             outbound_webhooks: None,
             code_monitors: None,
             codeintel_uploads: None,
+            codeintel_autoindexing: None,
             embeddings: None,
             diagnostics: None,
             org_invitation_config: None,
@@ -1019,6 +1027,17 @@ impl SchemaGraphqlDeps {
         Ok(self)
     }
 
+    /// Attach the code-intel autoindexing seam (M9.28b). The
+    /// `codeintel.autoindexing.graphql` document is appended by
+    /// [`Self::with_codeintel_uploads`], so both must be enabled.
+    pub fn with_codeintel_autoindexing(
+        mut self,
+        db: crate::codeintel_autoindexing_graphql::CodeIntelAutoindexingHandle,
+    ) -> Self {
+        self.codeintel_autoindexing = Some(db);
+        self
+    }
+
     /// Enable the saved-searches GraphQL surface (M9.13a): append
     /// `saved_searches.graphql` and hand the database seam to the executor.
     pub fn with_saved_searches(
@@ -1321,6 +1340,7 @@ impl SchemaGraphqlDeps {
             outbound_webhooks: None,
             code_monitors: None,
             codeintel_uploads: None,
+            codeintel_autoindexing: None,
             embeddings: None,
             diagnostics: None,
             org_invitation_config: None,
@@ -2526,6 +2546,7 @@ impl GraphqlDeps for SchemaGraphqlDeps {
             .with_outbound_webhooks(self.outbound_webhooks.clone())
             .with_code_monitors(self.code_monitors.clone())
             .with_codeintel_uploads(self.codeintel_uploads.clone())
+            .with_codeintel_autoindexing(self.codeintel_autoindexing.clone())
             .with_ranking_roots(ranking_roots)
             .with_search_roots(search_root)
             .with_git(git)
