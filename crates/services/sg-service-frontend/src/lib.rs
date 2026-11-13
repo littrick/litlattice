@@ -96,6 +96,8 @@ pub mod oidc_middleware;
 pub mod org_admin_graphql;
 pub mod org_store;
 pub mod otlp_wire;
+pub mod outbound_webhooks_graphql;
+pub mod outbound_webhooks_store;
 pub mod out_of_band_migrations_graphql;
 pub mod outbound_requests_graphql;
 pub mod package_repo_filters;

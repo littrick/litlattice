@@ -495,6 +495,10 @@ pub struct SchemaGraphqlDeps {
     /// `with_batches` or by `with_github_apps`; the document must not be
     /// registered twice).
     github_apps_schema: bool,
+    /// `OutboundWebhooksResolver`'s database seam (M9.27b); `None` reproduces
+    /// an unported surface. The SDL is always part of the assembled OSS schema,
+    /// so no document registration is involved.
+    outbound_webhooks: Option<crate::outbound_webhooks_graphql::OutboundWebhooksHandle>,
     /// `CodeMonitorsResolver`'s resolver (M9.13a); `None` reproduces an absent
     /// optional resolver.
     code_monitors: Option<Arc<crate::code_monitors_graphql::CodeMonitorsResolver>>,
@@ -587,6 +591,7 @@ impl SchemaGraphqlDeps {
             batches: None,
             github_apps: None,
             github_apps_schema: false,
+            outbound_webhooks: None,
             code_monitors: None,
             codeintel_uploads: None,
             embeddings: None,
@@ -661,6 +666,7 @@ impl SchemaGraphqlDeps {
             batches: None,
             github_apps: None,
             github_apps_schema: false,
+            outbound_webhooks: None,
             code_monitors: None,
             codeintel_uploads: None,
             embeddings: None,
@@ -1071,6 +1077,22 @@ impl SchemaGraphqlDeps {
         Ok(self)
     }
 
+    /// Enable the outbound webhook GraphQL surface (M9.27b):
+    /// `Query.outboundWebhooks`/`outboundWebhookEventTypes`, the
+    /// `create/update/deleteOutboundWebhook` mutations and
+    /// `node(OutboundWebhook)`.
+    ///
+    /// Unlike the other optional resolvers the SDL
+    /// (`outbound_webhooks.graphql`) is always part of the assembled OSS
+    /// schema, so this only hands the database seam to the executor.
+    pub fn with_outbound_webhooks(
+        mut self,
+        db: crate::outbound_webhooks_graphql::OutboundWebhooksHandle,
+    ) -> Self {
+        self.outbound_webhooks = Some(db);
+        self
+    }
+
     /// Attach the `Repository.embeddingExists` database seam (M9.14c).
     pub fn with_embeddings(
         mut self,
@@ -1296,6 +1318,7 @@ impl SchemaGraphqlDeps {
             batches: None,
             github_apps: None,
             github_apps_schema: false,
+            outbound_webhooks: None,
             code_monitors: None,
             codeintel_uploads: None,
             embeddings: None,
@@ -2500,6 +2523,7 @@ impl GraphqlDeps for SchemaGraphqlDeps {
             .with_saved_searches(self.saved_searches.clone())
             .with_batches(self.batches.clone())
             .with_github_apps(self.github_apps.clone())
+            .with_outbound_webhooks(self.outbound_webhooks.clone())
             .with_code_monitors(self.code_monitors.clone())
             .with_codeintel_uploads(self.codeintel_uploads.clone())
             .with_ranking_roots(ranking_roots)
@@ -4352,5 +4376,119 @@ mod tests {
             body.starts_with(r#"{"errors":[{"message":"GraphQL field \"hello\" of \"Query\" has no ported resolver""#),
             "unexpected body: {body}"
         );
+    }
+
+    /// M9.27b: the outbound webhook resolver must be reachable through the
+    /// production dependency bundle, not only through a harness-built
+    /// `FrontendRootResolver`. The SDL is part of `assemble_oss()`, so the same
+    /// query that is unported by default reaches the site-admin gate once
+    /// `with_outbound_webhooks` is called.
+    struct StubOutboundWebhooks;
+
+    impl crate::outbound_webhooks_graphql::OutboundWebhooksGraphqlDatabase for StubOutboundWebhooks {
+        fn current_user_site_admin(&self, _actor: Actor) -> Result<Option<bool>, String> {
+            Ok(None)
+        }
+
+        fn list_webhooks(
+            &self,
+            _opts: &crate::outbound_webhooks_graphql::ListOpts,
+        ) -> Result<Vec<crate::outbound_webhooks_graphql::WebhookData>, String> {
+            Err("unexpected List".to_owned())
+        }
+
+        fn count_webhooks(
+            &self,
+            _opts: &crate::outbound_webhooks_graphql::CountOpts,
+        ) -> Result<i64, String> {
+            Err("unexpected Count".to_owned())
+        }
+
+        fn get_webhook(
+            &self,
+            _id: i64,
+        ) -> Result<Option<crate::outbound_webhooks_graphql::WebhookData>, String> {
+            Err("unexpected GetByID".to_owned())
+        }
+
+        fn create_webhook(
+            &self,
+            _created_by: i32,
+            _updated_by: i32,
+            _url: &str,
+            _secret: &str,
+            _event_types: &[crate::outbound_webhooks_graphql::ScopedEventTypeData],
+        ) -> Result<crate::outbound_webhooks_graphql::WebhookData, String> {
+            Err("unexpected Create".to_owned())
+        }
+
+        fn update_webhook(
+            &self,
+            _id: i64,
+            _updated_by: i32,
+            _url: &str,
+            _event_types: &[crate::outbound_webhooks_graphql::ScopedEventTypeData],
+        ) -> Result<Option<crate::outbound_webhooks_graphql::WebhookData>, String> {
+            Err("unexpected Update".to_owned())
+        }
+
+        fn delete_webhook(&self, _id: i64) -> Result<(), String> {
+            Err("unexpected Delete".to_owned())
+        }
+
+        fn decrypt_url(&self, _raw: &[u8], _encryption_key_id: &str) -> Result<String, String> {
+            Err("unexpected Decrypt".to_owned())
+        }
+    }
+
+    #[tokio::test]
+    async fn outbound_webhooks_production_builder_dispatches() {
+        let schema = Arc::new(sg_graphql::schema::assemble_oss().expect("schema"));
+        let variables = Map::new();
+        let request = GraphqlExecRequest {
+            query: "{ outboundWebhooks { totalCount } }",
+            operation_name: "",
+            variables: &variables,
+            actor: Actor::Anonymous,
+            anonymous_uid: "",
+        };
+
+        // Default bundle: no outbound webhook resolver, so the field is not
+        // resolved by the real implementation.
+        let unported: Arc<dyn GraphqlDeps> = Arc::new(SchemaGraphqlDeps::new(Arc::clone(&schema)));
+        let unported_response = unported.exec(request).await;
+        assert_ne!(
+            unported_response
+                .errors
+                .first()
+                .map(|error| error.message.as_str()),
+            Some("not authenticated"),
+            "the resolver must not be wired by default"
+        );
+
+        // Production bundle: the same query reaches the store and reports the
+        // site-admin gate for an anonymous actor.
+        let deps: Arc<dyn GraphqlDeps> = Arc::new(
+            SchemaGraphqlDeps::new(Arc::clone(&schema))
+                .with_outbound_webhooks(Arc::new(StubOutboundWebhooks)),
+        );
+        let response = deps.exec(request).await;
+        assert_eq!(response.errors.len(), 1, "unexpected: {response:?}");
+        assert_eq!(response.errors[0].message, "not authenticated");
+
+        // Injection must not touch the schema: introspection is byte-for-byte
+        // the default `assemble_oss()` result either way.
+        let introspection = GraphqlExecRequest {
+            query: "{ __schema { queryType { name } types { name } } }",
+            operation_name: "",
+            variables: &variables,
+            actor: Actor::Anonymous,
+            anonymous_uid: "",
+        };
+        let before = unported.exec(introspection).await;
+        let after = deps.exec(introspection).await;
+        assert_eq!(before.data, after.data);
+        assert!(before.errors.is_empty(), "unexpected: {before:?}");
+        assert!(after.errors.is_empty(), "unexpected: {after:?}");
     }
 }

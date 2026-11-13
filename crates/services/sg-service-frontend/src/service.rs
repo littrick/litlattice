@@ -1300,6 +1300,16 @@ impl Service for FrontendService {
                     "failed to register saved-search/code-monitor GraphQL surfaces: {err}"
                 ))
             })?;
+        // M9.27b: `Query.outboundWebhooks`/`outboundWebhookEventTypes`, the
+        // outbound webhook mutations and `node(OutboundWebhook)` read/write the
+        // existing `outbound_webhooks*` tables. The SDL is already part of the
+        // assembled OSS schema, so this only injects the production adapter.
+        let graphql_deps = graphql_deps.with_outbound_webhooks(Arc::new(
+            crate::outbound_webhooks_store::OutboundWebhooksPgDatabase::new(
+                session_pool.clone(),
+                Arc::clone(&keyring),
+            ),
+        ));
         let graphql_deps = graphql_deps
             .with_production_surfaces(
                 Some(search_contexts),

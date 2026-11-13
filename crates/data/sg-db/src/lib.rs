@@ -38,6 +38,7 @@ pub mod global_state;
 pub mod insights_scheduler;
 pub mod orgs;
 pub mod out_of_band_migrations;
+pub mod outbound_webhooks;
 pub mod own_signal_configurations;
 pub mod permission_sync_jobs;
 pub mod perms_store;
