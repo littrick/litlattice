@@ -24,10 +24,14 @@
 //!   close/reopen/comment/merge/fork), including the build-status annotation
 //!   the metadata carries.
 //!
-//! Explicit not-ported (enterprise / credential-store boundaries): GitHub App
-//! authenticators and commit signing, Gerrit / Perforce / Bitbucket Cloud
-//! sources, outbound webhook GraphQL payloads, and `state.SetDerivedState`
-//! (gitserver).
+//! The batches-domain GitHub App installation-token authenticator
+//! (`withGitHubAppAuthenticator`) is ported through the
+//! [`BatchesGitHubAppStore`] / [`GitHubAppTokenSeams`] boundaries; commit
+//! signing itself (gitserver push + REST duplicate) remains a seam.
+//!
+//! Explicit not-ported (enterprise / credential-store boundaries): Gerrit /
+//! Perforce / Bitbucket Cloud sources, outbound webhook GraphQL payloads, and
+//! `state.SetDerivedState` (gitserver).
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -37,7 +41,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use url::Url;
 
-use crate::auth::Authenticator as _;
+use crate::auth::{
+    Authenticator as _, GitHubAppAuthenticator, InstallationAuthenticator, InstallationTokenCache,
+};
 use crate::azuredevops::{self, AzureDevOpsAuth, BaseUrl};
 use crate::bitbucketcloud as bbc;
 use crate::gerrit;
@@ -814,7 +820,7 @@ fn header_get<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str
 }
 
 /// The authenticator/source authentication mode.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub enum SourceAuth {
     None,
     /// GitHub OAuth/PAT (`token <token>`) or GitLab OAuth bearer.
@@ -825,7 +831,42 @@ pub enum SourceAuth {
     Basic { username: String, password: String },
     /// Bitbucket Server bearer token.
     BearerToken(String),
+    /// `github_apps/auth.InstallationAuthenticator`: the batches-domain GitHub
+    /// App installation token installed by `withGitHubAppAuthenticator`.
+    GitHubAppInstallation(Arc<crate::auth::InstallationAuthenticator>),
 }
+
+impl PartialEq for SourceAuth {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (SourceAuth::None, SourceAuth::None) => true,
+            (SourceAuth::OAuthToken(a), SourceAuth::OAuthToken(b)) => a == b,
+            (SourceAuth::GitLabPrivateToken(a), SourceAuth::GitLabPrivateToken(b)) => a == b,
+            (
+                SourceAuth::Basic {
+                    username: ua,
+                    password: pa,
+                },
+                SourceAuth::Basic {
+                    username: ub,
+                    password: pb,
+                },
+            ) => ua == ub && pa == pb,
+            (SourceAuth::BearerToken(a), SourceAuth::BearerToken(b)) => a == b,
+            // Installation access tokens are short-lived; compare the identity
+            // the baseline's `Hash` uses (installation ID + App base URL).
+            (
+                SourceAuth::GitHubAppInstallation(a),
+                SourceAuth::GitHubAppInstallation(b),
+            ) => {
+                a.installation_id() == b.installation_id() && a.base_url() == b.base_url()
+            }
+            _ => false,
+        }
+    }
+}
+
+impl Eq for SourceAuth {}
 
 impl SourceAuth {
     fn apply(&self, headers: &mut Vec<(String, String)>) {
@@ -846,6 +887,11 @@ impl SourceAuth {
             }
             SourceAuth::BearerToken(token) => {
                 header_set(headers, "Authorization", &format!("Bearer {token}"));
+            }
+            SourceAuth::GitHubAppInstallation(auth) => {
+                // Like the baseline client, use the currently-held token; the
+                // gitserver push path refreshes it lazily.
+                let _ = auth.authenticate("", "", headers);
             }
         }
     }
@@ -3847,6 +3893,205 @@ pub fn source_connection_from_config(
     Ok(SourceConnection {
         kind: external_service_kind.to_owned(),
         base_url,
+        auth,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Batches-domain GitHub App runtime authentication
+// (`sources.withGitHubAppAuthenticator`)
+// ---------------------------------------------------------------------------
+
+/// The domain used by Batch Changes GitHub Apps (`internal/types`:
+/// `BatchesGitHubAppDomain`).
+pub const BATCHES_GITHUB_APP_DOMAIN: &str = "batches";
+
+/// The subset of `github_apps` that `withGitHubAppAuthenticator` reads.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct BatchesGitHubApp {
+    pub app_id: i32,
+    /// PEM-encoded RSA private key (decrypted).
+    pub private_key: String,
+    /// The App's stored base URL (not the external-service URL).
+    pub base_url: String,
+}
+
+/// `github_apps.Store` subset used by the batches GitHub App authenticator:
+/// `GetByDomainAndKind` + `GetInstallID`.
+///
+/// The production Postgres/Redis adapter lives with the existing GitHub Apps
+/// database wiring; this seam carries the exact semantics:
+///
+/// * `get_by_domain_and_kind(domain, kind, base_url)` compares
+///   `trim(trailing '/' from github_apps.base_url)` and returns any error for a
+///   missing row.
+/// * `get_install_id(app_id, account)` returns the newest
+///   `github_app_installs.installation_id` for `app_id` whose lowercased
+///   `account_login` matches `account`; a missing install is an error.
+#[async_trait]
+pub trait BatchesGitHubAppStore: Send + Sync {
+    async fn get_by_domain_and_kind(
+        &self,
+        domain: &str,
+        kind: &str,
+        base_url: &str,
+    ) -> Result<BatchesGitHubApp, String>;
+
+    async fn get_install_id(&self, app_id: i32, account: &str) -> Result<i32, String>;
+}
+
+/// Injectable pieces of the installation-authenticator construction. The
+/// baseline always passes the site keyring's `GitHubAppKey` and a Redis cache;
+/// both are seams here, and `doer` is only used if the token is refreshed.
+#[derive(Clone)]
+pub struct GitHubAppTokenSeams {
+    pub cache: Option<Arc<dyn InstallationTokenCache>>,
+    pub doer: Arc<dyn HttpDoer>,
+}
+
+impl GitHubAppTokenSeams {
+    pub fn offline(doer: Arc<dyn HttpDoer>) -> Self {
+        Self { cache: None, doer }
+    }
+}
+
+/// `sources.ForChangeset`'s early rejection: a `GITHUB_APP` strategy can only
+/// be used with a GitHub connection, checked before the source is built.
+pub fn reject_non_github_app_authentication(
+    strategy: &str,
+    external_service_kind: &str,
+) -> Result<(), SourceError> {
+    if strategy == "GITHUB_APP" && external_service_kind != "GITHUB" {
+        return Err(SourceError::other(EXTERNAL_SERVICE_NOT_GITHUB));
+    }
+    Ok(())
+}
+
+/// `sources.withGitHubAppAuthenticator`: resolve the batches-domain GitHub App
+/// for the connection's normalized base URL, look up the account's installation
+/// and return its installation-token authenticator.
+///
+/// Error priority and text match the baseline exactly:
+/// non-GitHub kind → `ErrExternalServiceNotGitHub`; unparsable connection URL →
+/// `"parsing GitHub connection URL: ..."`; any app lookup error →
+/// `ErrNoGitHubAppConfigured`; install lookup error or ID `0` →
+/// `ErrNoGitHubAppInstallation`; bad key → `"creating GitHub App
+/// authenticator: ..."`; unparsable App base URL → `"parsing GitHub App base
+/// URL: ..."`.
+pub async fn with_github_app_authenticator(
+    external_service_kind: &str,
+    config: &Value,
+    store: &dyn BatchesGitHubAppStore,
+    account: &str,
+    kind: &str,
+    seams: GitHubAppTokenSeams,
+) -> Result<SourceAuth, SourceError> {
+    if external_service_kind != "GITHUB" {
+        return Err(SourceError::other(EXTERNAL_SERVICE_NOT_GITHUB));
+    }
+
+    let raw_url = config
+        .get("url")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let connection_url = Url::parse(raw_url).map_err(|err| {
+        SourceError::other(format!("parsing GitHub connection URL: {err}"))
+    })?;
+    let connection_url = github::normalize_base_url(&connection_url);
+
+    let app = store
+        .get_by_domain_and_kind(
+            BATCHES_GITHUB_APP_DOMAIN,
+            kind,
+            connection_url.as_str(),
+        )
+        .await
+        .map_err(|_| SourceError::other(NO_GITHUB_APP_CONFIGURED))?;
+
+    let installation_id = store
+        .get_install_id(app.app_id, account)
+        .await
+        .map_err(|_| SourceError::other(NO_GITHUB_APP_INSTALLATION))?;
+    if installation_id == 0 {
+        return Err(SourceError::other(NO_GITHUB_APP_INSTALLATION));
+    }
+
+    let app_authenticator = Arc::new(
+        GitHubAppAuthenticator::new(app.app_id, app.private_key).map_err(|err| {
+            SourceError::other(format!("creating GitHub App authenticator: {err}"))
+        })?,
+    );
+
+    let app_base_url = Url::parse(&app.base_url).map_err(|err| {
+        SourceError::other(format!("parsing GitHub App base URL: {err}"))
+    })?;
+
+    Ok(SourceAuth::GitHubAppInstallation(Arc::new(
+        InstallationAuthenticator::new(
+            app_base_url,
+            installation_id,
+            app_authenticator,
+            seams.cache,
+            seams.doer,
+        ),
+    )))
+}
+
+/// Runtime source selection for `Sourcer.ForChangeset` / `ForExternalService`:
+/// build the connection from config, then let a `GITHUB_APP` strategy replace
+/// the config-derived authenticator with the batches-domain installation token.
+///
+/// The GitHub App path takes priority over the connection's PAT; a
+/// `USER_CREDENTIAL` strategy keeps the config-derived authenticator and never
+/// touches the App store. An empty `app_kind` is rejected with the baseline's
+/// caller-level message (the store lookup itself is not attempted).
+pub async fn resolve_changeset_source_connection(
+    external_service_kind: &str,
+    config: &Value,
+    strategy: &str,
+    app_kind: Option<&str>,
+    account: &str,
+    store: Option<&dyn BatchesGitHubAppStore>,
+    seams: GitHubAppTokenSeams,
+) -> Result<SourceConnection, SourceError> {
+    reject_non_github_app_authentication(strategy, external_service_kind)?;
+
+    if strategy != "GITHUB_APP" {
+        return source_connection_from_config(external_service_kind, config);
+    }
+
+    let app_kind = app_kind.unwrap_or_default();
+    if app_kind.is_empty() {
+        return Err(SourceError::other(
+            "ForChangeset with AuthenticationStrategyGitHubApp must be called with a gitHubAppKind, but was called with empty string.",
+        ));
+    }
+
+    let Some(store) = store else {
+        return Err(SourceError::other(NO_GITHUB_APP_CONFIGURED));
+    };
+    let auth = with_github_app_authenticator(
+        external_service_kind,
+        config,
+        store,
+        account,
+        app_kind,
+        seams,
+    )
+    .await?;
+
+    // The source is still built from the external-service connection URL;
+    // only its authenticator is replaced (Go: `css.WithAuthenticator`).
+    let raw_url = config
+        .get("url")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let base_url = Url::parse(raw_url).map_err(|err| {
+        SourceError::other(format!("parsing GitHub connection URL: {err}"))
+    })?;
+    Ok(SourceConnection {
+        kind: external_service_kind.to_owned(),
+        base_url: github::normalize_base_url(&base_url),
         auth,
     })
 }

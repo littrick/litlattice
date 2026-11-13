@@ -774,10 +774,18 @@ impl InstallationAuthenticator {
         }
 
         let (mut api_url, _) = crate::github::api_root(&self.base_url);
-        let path = format!("/app/installations/{}/access_tokens", self.installation_id);
-        api_url = api_url
-            .join(&path)
-            .map_err(|err| format!("invalid API URL: {err}"))?;
+        // `url.URL.JoinPath`: append to the API root path instead of
+        // replacing it (Rust `Url::join` treats a leading `/` as absolute,
+        // which would drop `/api/v3` for GitHub Enterprise).
+        let mut joined_path = api_url.path().to_owned();
+        if !joined_path.ends_with('/') {
+            joined_path.push('/');
+        }
+        joined_path.push_str(&format!(
+            "app/installations/{}/access_tokens",
+            self.installation_id
+        ));
+        api_url.set_path(&joined_path);
 
         let mut headers = Vec::new();
         self.app
@@ -827,6 +835,12 @@ impl InstallationAuthenticator {
     /// `InstallationAuthenticator.InstallationID`.
     pub fn installation_id(&self) -> i32 {
         self.installation_id
+    }
+
+    /// The parsed GitHub App base URL the authenticator was built with
+    /// (`NewInstallationAccessToken`'s `baseURL`).
+    pub fn base_url(&self) -> &url::Url {
+        &self.base_url
     }
 
     /// Test hook: set the cached token directly.
