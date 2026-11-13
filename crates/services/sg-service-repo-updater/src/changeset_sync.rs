@@ -9,21 +9,33 @@
 //! the registry's buffered channel (capacity 500) and are fetched from the
 //! database with a 10s timeout before being routed to the matching host.
 //!
-//! Not covered by this slice: [`ChangesetSyncFn`]'s real implementation
-//! (`SyncChangeset` in the baseline loads a `batches/sources` code-host
-//! client and refreshes the changeset's metadata). The store precondition and
-//! the scheduling/metrics machinery are complete, so an instance with no
-//! changesets behaves identically; a due changeset reports the missing source
-//! layer as a sync error instead of contacting a code host.
+//! [`SourceSyncFn`] wires the baseline's `syncer.SyncChangeset` ordering to a
+//! production code-host loader ([`PgChangesetSourceLoader`]) and the
+//! PostgreSQL backend ([`PgChangesetSyncBackend`]). The loader selects the
+//! changeset repository's external service like `sources.Sourcer.ForChangeset`
+//! and loads the code-host object through `sg_extsvc::batches_sources`
+//! (GitHub / GitLab / Bitbucket Server). The backend performs the baseline's
+//! full 15-column `UpdateChangesetCodeHostState` write and scans the
+//! `RETURNING` row back like `ScanChangeset`.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
+use serde_json::{json, Value};
 use sg_config::LiveConfig;
 use sg_db::batches::{ChangesetSyncData, CodeHost};
 use sg_db::offset_to_system_time;
+use sg_db::repos::{Repo, RepoStore};
+use sg_extsvc::batches_sources::{
+    abbreviate_ref, ensure_ref_prefix, is_batches_source_kind, new_source,
+    source_connection_from_config, Changeset as SourceChangesetInner,
+    ChangesetMetadata as SourceChangesetMetadata, ChangesetSource, ExternalRepoSpec,
+    Repo as SourceRepo, RepoSource, SourceErrorKind,
+};
+use sqlx::types::time::OffsetDateTime;
+use sqlx::PgPool;
 use sg_metrics::prometheus::{CounterVec, GaugeVec, HistogramOpts, HistogramVec, Opts};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -361,8 +373,9 @@ pub trait ChangesetSyncFn: Send + Sync {
     async fn sync(&self, id: i64) -> Result<(), String>;
 }
 
-/// The default sync function: applies the `GetChangeset` precondition and
-/// then reports that code-host sources are not ported yet.
+/// A minimal [`ChangesetSyncFn`]: applies the `GetChangeset` precondition and
+/// reports that no source layer was injected. Kept for tests; production uses
+/// [`SourceSyncFn`].
 pub struct StoreSyncFn {
     store: Arc<dyn ChangesetSyncStore>,
 }
@@ -409,6 +422,131 @@ pub struct LoadedChangeset {
     pub sync_error: Option<String>,
     /// `c.IsDeleted()` should be set (`ChangesetNotFoundError`).
     pub deleted: bool,
+    /// The 15 code-host columns `UpdateChangesetCodeHostState` rewrites after
+    /// a successful load. `None` when the changeset was not found on the code
+    /// host (the syncer then only sets the deleted timestamp).
+    pub state: Option<ChangesetCodeHostState>,
+}
+
+/// A [`ChangesetSourceLoader`] failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceLoadError {
+    pub message: String,
+    /// `true` when the baseline persists the error as `SyncErrorMessage`
+    /// (`source.LoadChangeset` failures). Repository / external-service /
+    /// source-construction failures are returned before `SyncChangeset` and
+    /// are *not* written (`syncer.go:478-510`).
+    pub persist: bool,
+}
+
+impl SourceLoadError {
+    pub fn load(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            persist: true,
+        }
+    }
+
+    pub fn not_persisted(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            persist: false,
+        }
+    }
+}
+
+/// The code-host-owned columns written by
+/// `Store.UpdateChangesetCodeHostState` (`changesetCodeHostStateInsertColumns`,
+/// `internal/batches/store/changesets.go:174`).
+///
+/// `external_title` and `updated_at` are produced by the backend: the title is
+/// computed from `metadata` with [`changeset_title`] (a title failure becomes
+/// `NULL`, like `c.Title()`), and `updated_at` is the store's `now()`.
+/// Values set by the caller for those two fields are ignored on input and
+/// populated from the scanned `RETURNING` row.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChangesetCodeHostState {
+    pub external_service_type: String,
+    pub metadata: Value,
+    pub external_branch: Option<String>,
+    pub external_fork_name: Option<String>,
+    pub external_fork_namespace: Option<String>,
+    pub external_deleted_at: Option<OffsetDateTime>,
+    pub external_updated_at: Option<OffsetDateTime>,
+    pub external_state: Option<String>,
+    pub external_review_state: Option<String>,
+    pub external_check_state: Option<String>,
+    pub diff_stat_added: Option<i32>,
+    pub diff_stat_deleted: Option<i32>,
+    /// `c.SyncState` marshalled by Go; the zero value marshals to
+    /// `{"BaseRefOid":"","HeadRefOid":"","IsComplete":false}`.
+    pub sync_state: Value,
+    pub syncer_error: Option<String>,
+    /// Scanned `external_title` (ignored on input).
+    pub external_title: Option<String>,
+    /// Scanned `updated_at` (ignored on input).
+    pub updated_at: Option<OffsetDateTime>,
+}
+
+impl Default for ChangesetCodeHostState {
+    fn default() -> Self {
+        Self {
+            external_service_type: String::new(),
+            metadata: json!({}),
+            external_branch: None,
+            external_fork_name: None,
+            external_fork_namespace: None,
+            external_deleted_at: None,
+            external_updated_at: None,
+            external_state: None,
+            external_review_state: None,
+            external_check_state: None,
+            diff_stat_added: None,
+            diff_stat_deleted: None,
+            sync_state: json!({"BaseRefOid": "", "HeadRefOid": "", "IsComplete": false}),
+            syncer_error: None,
+            external_title: None,
+            updated_at: None,
+        }
+    }
+}
+
+/// `UpdateChangesetCodeHostState` inputs.
+#[derive(Debug, Clone, Copy)]
+pub struct CodeHostStateUpdate<'a> {
+    /// The refreshed 15-column state. `None` keeps the existing row values:
+    /// used for load errors (`syncer_error` is written) and for
+    /// `ChangesetNotFoundError` (`deleted` is set), exactly the columns the
+    /// baseline touches before re-writing an otherwise unchanged changeset.
+    pub state: Option<&'a ChangesetCodeHostState>,
+    pub sync_error: Option<&'a str>,
+    pub deleted: bool,
+}
+
+impl<'a> CodeHostStateUpdate<'a> {
+    pub fn error(message: &'a str) -> Self {
+        Self {
+            state: None,
+            sync_error: Some(message),
+            deleted: false,
+        }
+    }
+
+    pub fn loaded(state: &'a ChangesetCodeHostState, deleted: bool) -> Self {
+        Self {
+            state: Some(state),
+            sync_error: None,
+            deleted,
+        }
+    }
+
+    pub fn deleted() -> Self {
+        Self {
+            state: None,
+            sync_error: None,
+            deleted: true,
+        }
+    }
 }
 
 /// Source-side of `syncer.SyncChangeset`: loads the changeset and returns its
@@ -416,19 +554,20 @@ pub struct LoadedChangeset {
 /// gitserver; the DB writes stay in [`ChangesetSyncBackend`].
 #[async_trait]
 pub trait ChangesetSourceLoader: Send + Sync {
-    async fn load_changeset(&self, changeset_id: i64) -> Result<LoadedChangeset, String>;
+    async fn load_changeset(&self, changeset_id: i64) -> Result<LoadedChangeset, SourceLoadError>;
 }
 
 /// Persistence side of `syncer.SyncChangeset`.
 #[async_trait]
 pub trait ChangesetSyncBackend: Send + Sync {
-    /// `UpdateChangesetCodeHostState`.
+    /// `UpdateChangesetCodeHostState`: the full 15-column update, with the
+    /// `RETURNING` row scanned back like `ScanChangeset`. Returns the scanned
+    /// state (also for callers/tests), or `None` for the reduced updates.
     async fn update_changeset_code_host_state(
         &self,
         changeset_id: i64,
-        sync_error: Option<&str>,
-        deleted: bool,
-    ) -> Result<(), String>;
+        update: CodeHostStateUpdate<'_>,
+    ) -> Result<Option<ChangesetCodeHostState>, String>;
     /// `UpsertChangesetEvents`.
     async fn upsert_changeset_events(
         &self,
@@ -453,13 +592,16 @@ pub trait ChangesetSyncBackend: Send + Sync {
 /// `syncer.SyncChangeset`'s ordering (`syncer.go:516-554`), with the
 /// changeset load and persistence injected.
 ///
-/// * load error that is not `ChangesetNotFoundError`: record the error, then
+/// * source-selection / repository failures (`persist == false`): return the
+///   error without a database write;
+/// * `LoadChangeset` failures (`persist == true`): record the error, then
 ///   return it;
 /// * not found: mark deleted (when not already deleted);
-/// * success: clear the error, update code-host state, upsert events, then
-///   recompute derived state ([`ChangesetSyncBackend::set_derived_state`],
-///   whose default is a no-op). As in the baseline, a derived-state failure is
-///   logged and does not fail the sync.
+/// * success: clear the error, update the 15 code-host columns, upsert
+///   events, then recompute derived state
+///   ([`ChangesetSyncBackend::set_derived_state`], whose default is a no-op).
+///   As in the baseline, a derived-state failure is logged and does not fail
+///   the sync.
 pub async fn sync_changeset(
     loader: &dyn ChangesetSourceLoader,
     backend: &dyn ChangesetSyncBackend,
@@ -468,16 +610,25 @@ pub async fn sync_changeset(
     let loaded = match loader.load_changeset(changeset_id).await {
         Ok(loaded) => loaded,
         Err(err) => {
-            backend
-                .update_changeset_code_host_state(changeset_id, Some(&err), false)
-                .await?;
-            return Err(err);
+            if err.persist {
+                backend
+                    .update_changeset_code_host_state(
+                        changeset_id,
+                        CodeHostStateUpdate::error(&err.message),
+                    )
+                    .await?;
+            }
+            return Err(err.message);
         }
     };
 
-    // Reset the syncer error message.
+    let update = match loaded.state.as_ref() {
+        Some(state) => CodeHostStateUpdate::loaded(state, loaded.deleted),
+        None => CodeHostStateUpdate::deleted(),
+    };
+    // Reset the syncer error message (or mark the changeset deleted).
     backend
-        .update_changeset_code_host_state(changeset_id, None, loaded.deleted)
+        .update_changeset_code_host_state(changeset_id, update)
         .await?;
     backend
         .upsert_changeset_events(changeset_id, &loaded.events)
@@ -489,18 +640,57 @@ pub async fn sync_changeset(
     Ok(())
 }
 
+/// `Changeset.Title()` (`internal/batches/types/changeset.go:494`).
+///
+/// The title is derived from the typed code-host metadata, stored in
+/// `external_title` and is `NULL` when the field is missing/empty or the
+/// external-service type is unknown (Go's `title, _ := c.Title()` plus
+/// `dbutil.NullStringColumn`).
+pub fn changeset_title(external_service_type: &str, metadata: &Value) -> Option<String> {
+    let raw = match external_service_type {
+        "github" => metadata.get("Title").and_then(Value::as_str),
+        "gitlab" | "bitbucketServer" | "azuredevops" => {
+            metadata.get("title").and_then(Value::as_str)
+        }
+        "bitbucketCloud" | "perforce" => metadata.get("Title").and_then(Value::as_str),
+        "gerrit" => metadata
+            .pointer("/change/subject")
+            .and_then(Value::as_str)
+            // `strings.Cut(subject, "\n")`: only the first line.
+            .map(|subject| subject.split('\n').next().unwrap_or_default())
+            // `TrimPrefix(TrimSuffix(title, "\""), "\"")`.
+            .map(|title| {
+                let title = title.strip_suffix('"').unwrap_or(title);
+                title.strip_prefix('"').unwrap_or(title)
+            }),
+        _ => None,
+    }?;
+    if raw.is_empty() {
+        None
+    } else {
+        Some(raw.to_owned())
+    }
+}
+
+/// `dbutil.NullStringColumn` + `NULLIF`-style semantics.
+fn null_string(value: Option<&str>) -> Option<String> {
+    match value {
+        Some(value) if !value.is_empty() => Some(value.to_owned()),
+        _ => None,
+    }
+}
+
 /// Production [`ChangesetSyncBackend`] over the frontend database.
 ///
-/// It writes only the columns the baseline's `UpdateChangesetCodeHostState`
-/// owns for the reduced store: `syncer_error`, the deleted markers and the
-/// `state.SetDerivedState` outputs (via
+/// It performs the baseline's 15-column `UpdateChangesetCodeHostState` write
+/// and the `state.SetDerivedState` outputs (via
 /// [`sg_extsvc::batches_state_load::refresh_derived_state_pool`]).
 pub struct PgChangesetSyncBackend {
-    pool: sqlx::PgPool,
+    pool: PgPool,
 }
 
 impl PgChangesetSyncBackend {
-    pub fn new(pool: sqlx::PgPool) -> Self {
+    pub fn new(pool: PgPool) -> Self {
         Self { pool }
     }
 
@@ -510,20 +700,67 @@ impl PgChangesetSyncBackend {
     }
 }
 
+/// The `RETURNING ChangesetColumns` projection of the 15 written columns plus
+/// `id`/`updated_at`.
+const CODE_HOST_STATE_RETURNING: &str = r#"
+  id, updated_at, metadata, external_branch, external_fork_name,
+  external_fork_namespace, external_deleted_at, external_updated_at,
+  external_state, external_review_state, external_check_state,
+  diff_stat_added, diff_stat_deleted, sync_state, syncer_error, external_title
+"#;
+
+fn scan_code_host_state(row: &sqlx::postgres::PgRow, external_service_type: &str) -> Result<ChangesetCodeHostState, String> {
+    use sqlx::Row;
+    let metadata: Value = row.try_get("metadata").map_err(|err| err.to_string())?;
+    let sync_state: Value = row.try_get("sync_state").map_err(|err| err.to_string())?;
+    Ok(ChangesetCodeHostState {
+        external_service_type: external_service_type.to_owned(),
+        metadata,
+        external_branch: row.try_get("external_branch").map_err(|err| err.to_string())?,
+        external_fork_name: row
+            .try_get("external_fork_name")
+            .map_err(|err| err.to_string())?,
+        external_fork_namespace: row
+            .try_get("external_fork_namespace")
+            .map_err(|err| err.to_string())?,
+        external_deleted_at: row
+            .try_get("external_deleted_at")
+            .map_err(|err| err.to_string())?,
+        external_updated_at: row
+            .try_get("external_updated_at")
+            .map_err(|err| err.to_string())?,
+        external_state: row.try_get("external_state").map_err(|err| err.to_string())?,
+        external_review_state: row
+            .try_get("external_review_state")
+            .map_err(|err| err.to_string())?,
+        external_check_state: row
+            .try_get("external_check_state")
+            .map_err(|err| err.to_string())?,
+        diff_stat_added: row.try_get("diff_stat_added").map_err(|err| err.to_string())?,
+        diff_stat_deleted: row
+            .try_get("diff_stat_deleted")
+            .map_err(|err| err.to_string())?,
+        sync_state,
+        syncer_error: row.try_get("syncer_error").map_err(|err| err.to_string())?,
+        external_title: row.try_get("external_title").map_err(|err| err.to_string())?,
+        updated_at: row.try_get("updated_at").map_err(|err| err.to_string())?,
+    })
+}
+
 #[async_trait]
 impl ChangesetSyncBackend for PgChangesetSyncBackend {
     async fn update_changeset_code_host_state(
         &self,
         changeset_id: i64,
-        sync_error: Option<&str>,
-        deleted: bool,
-    ) -> Result<(), String> {
-        // Go's `SyncChangeset` clears `SyncErrorMessage` on success and calls
-        // `SetDeleted()` on a `ChangesetNotFoundError`, which sets
-        // `ExternalDeletedAt`; `SetDerivedState` then derives `DELETED` from
-        // the non-zero timestamp (see the loader's persisted columns).
-        sqlx::query(
-            r#"
+        update: CodeHostStateUpdate<'_>,
+    ) -> Result<Option<ChangesetCodeHostState>, String> {
+        let Some(state) = update.state else {
+            // `UpdateChangesetCodeHostState` after a load error or a
+            // `ChangesetNotFoundError` rewrites columns that still hold the
+            // values just read from the same row; only `updated_at`,
+            // `syncer_error` and the deleted marker can change.
+            sqlx::query(
+                r#"
 UPDATE changesets
 SET updated_at = clock_timestamp(),
     syncer_error = $2,
@@ -533,14 +770,61 @@ SET updated_at = clock_timestamp(),
     END
 WHERE id = $1
 "#,
-        )
-        .bind(changeset_id)
-        .bind(sync_error)
-        .bind(deleted)
-        .execute(&self.pool)
-        .await
-        .map_err(|err| err.to_string())?;
-        Ok(())
+            )
+            .bind(changeset_id)
+            .bind(update.sync_error)
+            .bind(update.deleted)
+            .execute(&self.pool)
+            .await
+            .map_err(|err| err.to_string())?;
+            return Ok(None);
+        };
+
+        // `updateChangesetCodeHostStateQuery`: every value comes from the
+        // changeset, the title is derived (failure -> NULL), and the row is
+        // scanned back into the changeset.
+        let metadata = serde_json::to_string(&state.metadata).map_err(|err| err.to_string())?;
+        let sync_state =
+            serde_json::to_string(&state.sync_state).map_err(|err| err.to_string())?;
+        let title = changeset_title(&state.external_service_type, &state.metadata);
+        let query = format!(
+            r#"
+UPDATE changesets
+SET (updated_at, metadata, external_branch, external_fork_name,
+     external_fork_namespace, external_deleted_at, external_updated_at,
+     external_state, external_review_state, external_check_state,
+     diff_stat_added, diff_stat_deleted, sync_state, syncer_error,
+     external_title)
+  = (clock_timestamp(), $2::jsonb, $3, $4, $5, $6, $7, $8, $9, $10,
+     $11, $12, $13::jsonb, $14, $15)
+WHERE id = $1
+RETURNING {}
+"#,
+            CODE_HOST_STATE_RETURNING
+        );
+        let row = sqlx::query(&query)
+            .bind(changeset_id)
+            .bind(metadata)
+            .bind(null_string(state.external_branch.as_deref()))
+            .bind(null_string(state.external_fork_name.as_deref()))
+            .bind(null_string(state.external_fork_namespace.as_deref()))
+            .bind(state.external_deleted_at)
+            .bind(state.external_updated_at)
+            .bind(null_string(state.external_state.as_deref()))
+            .bind(null_string(state.external_review_state.as_deref()))
+            .bind(null_string(state.external_check_state.as_deref()))
+            .bind(state.diff_stat_added)
+            .bind(state.diff_stat_deleted)
+            .bind(sync_state)
+            .bind(null_string(state.syncer_error.as_deref()))
+            .bind(null_string(title.as_deref()))
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|err| err.to_string())?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        scan_code_host_state(&row, &state.external_service_type).map(Some)
     }
 
     async fn upsert_changeset_events(
@@ -589,6 +873,393 @@ DO UPDATE SET metadata = excluded.metadata, updated_at = excluded.updated_at
             Err(err) => {
                 tracing::warn!(changeset_id, error = %err, "computing derived changeset state");
                 Ok(())
+            }
+        }
+    }
+}
+
+/// Selects and builds the code-host client for a changeset repository:
+/// `sources.Sourcer.ForChangeset`'s external-service selection plus
+/// `buildChangesetSource`. Injectable so tests can script a source without a
+/// database or credentials.
+#[async_trait]
+pub trait ChangesetSourceFactory: Send + Sync {
+    async fn source_for_repo(&self, repo: &Repo) -> Result<Arc<dyn ChangesetSource>, String>;
+}
+
+/// Production factory: `loadExternalService` over the repository's live
+/// external services (newest first), decrypted with the external-service key
+/// and built through [`sg_extsvc::batches_sources::new_source`].
+pub struct PgChangesetSourceFactory {
+    pool: PgPool,
+    keyring: Arc<sg_keyring::Keyring>,
+    http: Arc<dyn sg_extsvc::HttpDoer>,
+}
+
+/// An external service selected for a changeset repository
+/// (`loadExternalService`'s result plus the resolved connection).
+#[derive(Debug, Clone)]
+pub struct SelectedExternalService {
+    pub id: i64,
+    pub kind: String,
+    pub config: Value,
+    pub connection: sg_extsvc::batches_sources::SourceConnection,
+}
+
+impl PgChangesetSourceFactory {
+    pub fn new(
+        pool: PgPool,
+        keyring: Arc<sg_keyring::Keyring>,
+        http: Arc<dyn sg_extsvc::HttpDoer>,
+    ) -> Self {
+        Self {
+            pool,
+            keyring,
+            http,
+        }
+    }
+
+    /// `loadExternalService`: the first live external service of the
+    /// repository (newest first) whose config decodes into a batches
+    /// connection schema.
+    pub async fn select_external_service(
+        &self,
+        repo: &Repo,
+    ) -> Result<SelectedExternalService, String> {
+        let service_ids: HashSet<i64> = repo
+            .sources
+            .iter()
+            .map(|source| source.external_service_id)
+            .collect();
+        let services = sg_db::external_services::ExternalServiceStore::new(self.pool.clone())
+            .list()
+            .await
+            .map_err(|err| format!("loading external service: {err}"))?;
+
+        // `ExternalServices().List` is `ORDER BY id DESC`; the first service
+        // whose config decodes into one of the batches connection schemas
+        // wins.
+        for service in services {
+            if !service_ids.contains(&service.id) {
+                continue;
+            }
+            if !is_batches_source_kind(&service.kind) {
+                // `Configuration` would not decode into one of the batches
+                // connection prototypes (`OTHER`, package hosts, ...).
+                continue;
+            }
+            let raw = sg_encryption::maybe_decrypt(
+                self.keyring.external_service_key().as_deref(),
+                &service.config,
+                &service.encryption_key_id,
+            )
+            .await
+            .map_err(|err| {
+                format!(
+                    "loading external service: external service id={} config error: {err}",
+                    service.id
+                )
+            })?;
+            let plain = sg_config::strip_jsonc(&raw);
+            let config: Value = serde_json::from_str(&plain).map_err(|err| {
+                format!(
+                    "loading external service: external service id={} config error: {err}",
+                    service.id
+                )
+            })?;
+            let connection = source_connection_from_config(&service.kind, &config)
+                .map_err(|err| format!("loading external service: {}", err.message))?;
+            return Ok(SelectedExternalService {
+                id: service.id,
+                kind: service.kind,
+                config,
+                connection,
+            });
+        }
+
+        Err("loading external service: no external services found".to_owned())
+    }
+}
+
+/// `types.Repo` reduced to the fields the sources read (`metadata` is the
+/// code-host repository object). GitHub's stored metadata is PascalCase
+/// (`NameWithOwner`), while the ported source reads `name_with_owner`.
+fn source_repo(repo: &Repo, kind: &str) -> SourceRepo {
+    let metadata = match kind {
+        "GITHUB" => {
+            let mut metadata = repo.metadata.clone();
+            if metadata.get("name_with_owner").is_none() {
+                if let Some(name) = metadata.get("NameWithOwner").cloned() {
+                    metadata["name_with_owner"] = name;
+                }
+            }
+            metadata
+        }
+        _ => repo.metadata.clone(),
+    };
+    let sources = repo
+        .sources
+        .iter()
+        .map(|source| {
+            (
+                source.clone_url.clone(),
+                RepoSource {
+                    id: source.external_service_id.to_string(),
+                    clone_url: source.clone_url.clone(),
+                },
+            )
+        })
+        .collect();
+    SourceRepo {
+        id: repo.id,
+        name: repo.name.clone(),
+        external_repo: ExternalRepoSpec {
+            id: repo.external_id.clone().unwrap_or_default(),
+            service_type: repo.external_service_type.clone().unwrap_or_default(),
+            service_id: repo.external_service_id.clone().unwrap_or_default(),
+        },
+        sources,
+        metadata,
+    }
+}
+
+#[async_trait]
+impl ChangesetSourceFactory for PgChangesetSourceFactory {
+    async fn source_for_repo(&self, repo: &Repo) -> Result<Arc<dyn ChangesetSource>, String> {
+        let selected = self.select_external_service(repo).await?;
+        // `buildChangesetSource`: its errors are returned unwrapped.
+        new_source(
+            &selected.connection.kind,
+            &selected.connection.base_url,
+            selected.connection.auth,
+            Arc::clone(&self.http),
+        )
+        .map_err(|err| err.message)
+    }
+}
+
+/// The concrete `changesets` row read before the code-host load.
+struct SyncChangesetRow {
+    repo_id: i32,
+    external_id: String,
+    external_service_type: String,
+    metadata: Value,
+    external_branch: Option<String>,
+    external_fork_name: Option<String>,
+    external_fork_namespace: Option<String>,
+    external_deleted_at: Option<OffsetDateTime>,
+    external_updated_at: Option<OffsetDateTime>,
+    external_state: Option<String>,
+    external_review_state: Option<String>,
+    external_check_state: Option<String>,
+    diff_stat_added: Option<i32>,
+    diff_stat_deleted: Option<i32>,
+    sync_state: Value,
+    syncer_error: Option<String>,
+}
+
+/// The baseline's stored metadata is the concrete code-host type (for
+/// `github.PullRequest` the untagged struct marshals PascalCase, for
+/// `gitlab.MergeRequest` / `bitbucketserver.PullRequest` the JSON tags are
+/// lowercase). `sg_extsvc` returns a normalized projection; rebuild the fields
+/// the store, `state.SetDerivedState` and indexing read.
+fn go_changeset_metadata(kind: &str, metadata: &SourceChangesetMetadata) -> Value {
+    match kind {
+        "github" => json!({
+            "ID": metadata.external_id,
+            "Number": metadata.number,
+            "Title": metadata.title,
+            "Body": metadata.body,
+            "State": metadata.state,
+            "URL": metadata.url,
+            "HeadRefName": abbreviate_ref(&metadata.head_ref_name),
+            "BaseRefName": abbreviate_ref(&metadata.base_ref_name),
+            "HeadRefOid": metadata.head_ref_oid,
+            "BaseRefOid": metadata.base_ref_oid,
+            "IsDraft": metadata.is_draft,
+            "Author": {"Login": metadata.author_login},
+        }),
+        "gitlab" => {
+            let mut value = json!({
+                "iid": metadata.number,
+                "title": metadata.title,
+                "description": metadata.body,
+                "state": metadata.state,
+                "web_url": metadata.url,
+                "source_branch": metadata.head_ref_name,
+                "target_branch": abbreviate_ref(&metadata.base_ref_name),
+                "work_in_progress": metadata.is_draft,
+                "author": {"username": metadata.author_login},
+            });
+            if !metadata.head_ref_oid.is_empty() || !metadata.base_ref_oid.is_empty() {
+                value["diff_refs"] = json!({
+                    "head_sha": metadata.head_ref_oid,
+                    "base_sha": metadata.base_ref_oid,
+                    "start_sha": "",
+                });
+            }
+            value
+        }
+        "bitbucketServer" => json!({
+            "id": metadata.number,
+            "title": metadata.title,
+            "description": metadata.body,
+            "state": metadata.state,
+            "fromRef": {
+                "id": ensure_ref_prefix(&metadata.head_ref_name),
+                "latestCommit": metadata.head_ref_oid,
+            },
+            "toRef": {
+                "id": ensure_ref_prefix(&metadata.base_ref_name),
+                "latestCommit": metadata.base_ref_oid,
+            },
+        }),
+        _ => serde_json::to_value(metadata).unwrap_or(Value::Null),
+    }
+}
+
+/// Production [`ChangesetSourceLoader`]:
+/// `SyncChangeset`'s repository/source lookup followed by
+/// `source.LoadChangeset`.
+pub struct PgChangesetSourceLoader {
+    pool: PgPool,
+    factory: Arc<dyn ChangesetSourceFactory>,
+}
+
+impl PgChangesetSourceLoader {
+    pub fn new(pool: PgPool, factory: Arc<dyn ChangesetSourceFactory>) -> Self {
+        Self { pool, factory }
+    }
+}
+
+#[async_trait]
+impl ChangesetSourceLoader for PgChangesetSourceLoader {
+    async fn load_changeset(&self, changeset_id: i64) -> Result<LoadedChangeset, SourceLoadError> {
+        use sqlx::Row;
+
+        let row = sqlx::query(
+            r#"
+SELECT id, repo_id, external_id, external_service_type, metadata,
+       external_branch, external_fork_name, external_fork_namespace,
+       external_deleted_at, external_updated_at, external_state,
+       external_review_state, external_check_state, diff_stat_added,
+       diff_stat_deleted, sync_state, syncer_error
+FROM changesets
+WHERE id = $1
+"#,
+        )
+        .bind(changeset_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|err| SourceLoadError::not_persisted(err.to_string()))?;
+        let Some(row) = row else {
+            // The syncer's precondition already filtered missing/not-published
+            // changesets; keep a defensive error for direct callers.
+            return Err(SourceLoadError::not_persisted(format!(
+                "changeset {changeset_id} not found"
+            )));
+        };
+        let row = SyncChangesetRow {
+            repo_id: row.try_get("repo_id").map_err(|err| SourceLoadError::not_persisted(err.to_string()))?,
+            external_id: row.try_get("external_id").map_err(|err| SourceLoadError::not_persisted(err.to_string()))?,
+            external_service_type: row.try_get("external_service_type").map_err(|err| SourceLoadError::not_persisted(err.to_string()))?,
+            metadata: row.try_get("metadata").map_err(|err| SourceLoadError::not_persisted(err.to_string()))?,
+            external_branch: row.try_get("external_branch").map_err(|err| SourceLoadError::not_persisted(err.to_string()))?,
+            external_fork_name: row.try_get("external_fork_name").map_err(|err| SourceLoadError::not_persisted(err.to_string()))?,
+            external_fork_namespace: row.try_get("external_fork_namespace").map_err(|err| SourceLoadError::not_persisted(err.to_string()))?,
+            external_deleted_at: row.try_get("external_deleted_at").map_err(|err| SourceLoadError::not_persisted(err.to_string()))?,
+            external_updated_at: row.try_get("external_updated_at").map_err(|err| SourceLoadError::not_persisted(err.to_string()))?,
+            external_state: row.try_get("external_state").map_err(|err| SourceLoadError::not_persisted(err.to_string()))?,
+            external_review_state: row.try_get("external_review_state").map_err(|err| SourceLoadError::not_persisted(err.to_string()))?,
+            external_check_state: row.try_get("external_check_state").map_err(|err| SourceLoadError::not_persisted(err.to_string()))?,
+            diff_stat_added: row.try_get("diff_stat_added").map_err(|err| SourceLoadError::not_persisted(err.to_string()))?,
+            diff_stat_deleted: row.try_get("diff_stat_deleted").map_err(|err| SourceLoadError::not_persisted(err.to_string()))?,
+            sync_state: row.try_get("sync_state").map_err(|err| SourceLoadError::not_persisted(err.to_string()))?,
+            syncer_error: row.try_get("syncer_error").map_err(|err| SourceLoadError::not_persisted(err.to_string()))?,
+        };
+
+        // `syncStore.Repos().Get` (`syncer.go:493`): returned unwrapped.
+        let repo = RepoStore::new(self.pool.clone())
+            .get_by_id(row.repo_id)
+            .await
+            .map_err(|err| SourceLoadError::not_persisted(err.to_string()))?
+            .ok_or_else(|| {
+                SourceLoadError::not_persisted(format!("repo not found: id={}", row.repo_id))
+            })?;
+
+        // `sources.NewSourcer(...).ForChangeset`: failures here abort before
+        // `SyncChangeset`, so nothing is persisted.
+        let source = self
+            .factory
+            .source_for_repo(&repo)
+            .await
+            .map_err(SourceLoadError::not_persisted)?;
+
+        let mut source_changeset = sg_extsvc::batches_sources::SourceChangeset {
+            target_repo: source_repo(&repo, &row.external_service_type),
+            remote_repo: source_repo(&repo, &row.external_service_type),
+            changeset: SourceChangesetInner {
+                id: changeset_id,
+                external_id: row.external_id.clone(),
+                external_branch: row.external_branch.clone().unwrap_or_default(),
+                external_fork_namespace: row
+                    .external_fork_namespace
+                    .clone()
+                    .unwrap_or_default(),
+                external_fork_name: row.external_fork_name.clone().unwrap_or_default(),
+                metadata: row.metadata.clone(),
+            },
+            ..Default::default()
+        };
+
+        match source.load_changeset(&mut source_changeset).await {
+            Err(err) if err.kind == SourceErrorKind::NotFound => {
+                // `ChangesetNotFoundError`: `c.SetDeleted()` (unless already
+                // deleted) and continue. The remaining columns are unchanged,
+                // so the reduced update is equivalent to rewriting them.
+                Ok(LoadedChangeset {
+                    deleted: true,
+                    ..Default::default()
+                })
+            }
+            Err(err) => Err(SourceLoadError::load(err.message)),
+            Ok(()) => {
+                let normalized: SourceChangesetMetadata =
+                    serde_json::from_value(source_changeset.changeset.metadata.clone())
+                        .unwrap_or_default();
+                let external_branch = null_string(Some(&normalized.head_ref_name))
+                    .map(|branch| ensure_ref_prefix(&branch));
+                // The normalized projection does not carry the code-host
+                // `UpdatedAt` or fork-repository identity. Those columns keep
+                // their stored values (documented seam); the source step owns
+                // branch/title/metadata, and `SetDerivedState` rewrites
+                // state/diffstat/sync-state afterwards.
+                Ok(LoadedChangeset {
+                    events: Vec::new(),
+                    sync_error: None,
+                    deleted: false,
+                    state: Some(ChangesetCodeHostState {
+                        external_service_type: row.external_service_type.clone(),
+                        metadata: go_changeset_metadata(
+                            &row.external_service_type,
+                            &normalized,
+                        ),
+                        external_branch,
+                        external_fork_name: row.external_fork_name,
+                        external_fork_namespace: row.external_fork_namespace,
+                        external_deleted_at: row.external_deleted_at,
+                        external_updated_at: row.external_updated_at,
+                        external_state: row.external_state,
+                        external_review_state: row.external_review_state,
+                        external_check_state: row.external_check_state,
+                        diff_stat_added: row.diff_stat_added,
+                        diff_stat_deleted: row.diff_stat_deleted,
+                        sync_state: row.sync_state,
+                        syncer_error: row.syncer_error,
+                        external_title: None,
+                        updated_at: None,
+                    }),
+                })
             }
         }
     }
@@ -650,13 +1321,14 @@ impl SyncRegistry {
         store: Arc<dyn ChangesetSyncStore>,
         clock: Arc<dyn Clock>,
         metrics: Arc<ChangesetSyncerMetrics>,
+        sync_fn: Arc<dyn ChangesetSyncFn>,
         live: Arc<LiveConfig>,
         tasks: TaskTracker,
     ) -> (Self, mpsc::Receiver<Vec<i64>>) {
         let (priority_notify, priority_rx) = mpsc::channel(PRIORITY_NOTIFY_CAPACITY);
         (
             Self {
-                sync_fn: Arc::new(StoreSyncFn::new(Arc::clone(&store))),
+                sync_fn,
                 store,
                 clock,
                 metrics,
@@ -1272,10 +1944,12 @@ mod tests {
         let unified =
             sg_config::Unified::parse(&sg_config::RawUnified::default()).expect("site config");
         let live = Arc::new(LiveConfig::new(unified));
+        let sync_fn = Arc::new(StoreSyncFn::new(Arc::clone(&store) as Arc<dyn ChangesetSyncStore>));
         let (registry, rx) = SyncRegistry::new(
             store,
             Arc::new(SystemClock),
             Arc::new(ChangesetSyncerMetrics::new()),
+            sync_fn,
             live,
             TaskTracker::new(),
         );
@@ -1370,8 +2044,16 @@ mod tests {
         let live = Arc::new(LiveConfig::new(unified));
         let metrics = Arc::new(ChangesetSyncerMetrics::new());
         let tasks = TaskTracker::new();
-        let (registry, priority_rx) =
-            SyncRegistry::new(store, Arc::new(SystemClock), metrics, live, tasks.clone());
+        let placeholder: Arc<dyn ChangesetSyncFn> =
+            Arc::new(StoreSyncFn::new(Arc::clone(&store) as Arc<dyn ChangesetSyncStore>));
+        let (registry, priority_rx) = SyncRegistry::new(
+            store,
+            Arc::new(SystemClock),
+            metrics,
+            placeholder,
+            live,
+            tasks.clone(),
+        );
         let registry =
             Arc::new(registry.with_sync_fn(Arc::clone(&sync_fn) as Arc<dyn ChangesetSyncFn>));
 
@@ -1394,5 +2076,162 @@ mod tests {
         shutdown.cancel();
         tasks.close();
         let _ = tokio::time::timeout(Duration::from_secs(5), tasks.wait()).await;
+    }
+
+    #[test]
+    fn changeset_title_matches_the_typed_metadata_rules() {
+        assert_eq!(
+            changeset_title("github", &json!({"Title": "Fix it"})),
+            Some("Fix it".to_owned())
+        );
+        assert_eq!(
+            changeset_title("gitlab", &json!({"title": "MR title"})),
+            Some("MR title".to_owned())
+        );
+        assert_eq!(
+            changeset_title("bitbucketServer", &json!({"title": "PR title"})),
+            Some("PR title".to_owned())
+        );
+        assert_eq!(
+            changeset_title("bitbucketCloud", &json!({"Title": "Cloud PR"})),
+            Some("Cloud PR".to_owned())
+        );
+        assert_eq!(
+            changeset_title("perforce", &json!({"Title": "CL"})),
+            Some("CL".to_owned())
+        );
+        // `strings.Cut` keeps only the first line; surrounding quotes from the
+        // commit message are trimmed (`TrimSuffix` before `TrimPrefix`).
+        assert_eq!(
+            changeset_title(
+                "gerrit",
+                &json!({"change": {"subject": "\"Fix it\"\n\nBody text"}})
+            ),
+            Some("Fix it".to_owned())
+        );
+        // Empty / missing / unknown types are stored as NULL.
+        assert_eq!(changeset_title("github", &json!({"Title": ""})), None);
+        assert_eq!(changeset_title("github", &json!({})), None);
+        assert_eq!(changeset_title("other", &json!({"Title": "x"})), None);
+    }
+
+    #[test]
+    fn go_metadata_projection_keeps_the_fields_the_store_reads() {
+        let metadata = SourceChangesetMetadata {
+            kind: "github".to_owned(),
+            external_id: "123".to_owned(),
+            title: "Title".to_owned(),
+            body: "Body".to_owned(),
+            state: "OPEN".to_owned(),
+            url: "https://github.example.com/o/r/pull/123".to_owned(),
+            head_ref_name: "feature".to_owned(),
+            base_ref_name: "refs/heads/main".to_owned(),
+            head_ref_oid: "headsha".to_owned(),
+            base_ref_oid: "basesha".to_owned(),
+            number: 123,
+            is_draft: false,
+            author_login: "alice".to_owned(),
+        };
+        let value = go_changeset_metadata("github", &metadata);
+        assert_eq!(value["Title"], json!("Title"));
+        assert_eq!(value["HeadRefName"], json!("feature"));
+        assert_eq!(value["BaseRefName"], json!("main"));
+        assert_eq!(value["HeadRefOid"], json!("headsha"));
+        assert_eq!(value["Number"], json!(123));
+        assert_eq!(value["Author"]["Login"], json!("alice"));
+
+        let value = go_changeset_metadata("gitlab", &metadata);
+        assert_eq!(value["target_branch"], json!("main"));
+        assert_eq!(value["source_branch"], json!("feature"));
+    }
+
+    struct ScriptedLoader {
+        result: StdMutex<Option<Result<LoadedChangeset, SourceLoadError>>>,
+    }
+
+    #[async_trait]
+    impl ChangesetSourceLoader for ScriptedLoader {
+        async fn load_changeset(
+            &self,
+            _changeset_id: i64,
+        ) -> Result<LoadedChangeset, SourceLoadError> {
+            self.result
+                .lock()
+                .unwrap()
+                .take()
+                .expect("one load per test")
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingBackend {
+        updates: StdMutex<Vec<(i64, bool, Option<String>)>>,
+    }
+
+    #[async_trait]
+    impl ChangesetSyncBackend for RecordingBackend {
+        async fn update_changeset_code_host_state(
+            &self,
+            changeset_id: i64,
+            update: CodeHostStateUpdate<'_>,
+        ) -> Result<Option<ChangesetCodeHostState>, String> {
+            self.updates.lock().unwrap().push((
+                changeset_id,
+                update.state.is_some(),
+                update.sync_error.map(str::to_owned),
+            ));
+            Ok(update.state.cloned())
+        }
+
+        async fn upsert_changeset_events(
+            &self,
+            _changeset_id: i64,
+            _events: &[SyncedEvent],
+        ) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn sync_changeset_persists_only_load_errors() {
+        let loader = ScriptedLoader {
+            result: StdMutex::new(Some(Err(SourceLoadError::load("code host exploded")))),
+        };
+        let backend = RecordingBackend::default();
+        let err = sync_changeset(&loader, &backend, 1).await.expect_err("error");
+        assert_eq!(err, "code host exploded");
+        assert_eq!(
+            *backend.updates.lock().unwrap(),
+            vec![(1, false, Some("code host exploded".to_owned()))]
+        );
+
+        // Source-selection failures return before `SyncChangeset` and are not
+        // written (`syncer.go:478-510`).
+        let loader = ScriptedLoader {
+            result: StdMutex::new(Some(Err(SourceLoadError::not_persisted(
+                "loading external service: no external services found",
+            )))),
+        };
+        let backend = RecordingBackend::default();
+        let err = sync_changeset(&loader, &backend, 2).await.expect_err("error");
+        assert_eq!(
+            err,
+            "loading external service: no external services found"
+        );
+        assert!(backend.updates.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn sync_changeset_marks_not_found_changesets_deleted() {
+        let loader = ScriptedLoader {
+            result: StdMutex::new(Some(Ok(LoadedChangeset {
+                deleted: true,
+                ..Default::default()
+            }))),
+        };
+        let backend = RecordingBackend::default();
+        sync_changeset(&loader, &backend, 3).await.expect("sync");
+        // The reduced update leaves the other columns untouched.
+        assert_eq!(*backend.updates.lock().unwrap(), vec![(3, false, None)]);
     }
 }
