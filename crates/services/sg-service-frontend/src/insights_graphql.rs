@@ -115,7 +115,7 @@ pub struct DashboardQueryOptions {
 
 /// The read-only database seam. The production implementation is
 /// [`crate::insights_store::PgInsightsStore`].
-pub trait InsightsDatabase: Send + Sync + std::fmt::Debug {
+pub trait InsightsDatabase: InsightsWriteDatabase + Send + Sync + std::fmt::Debug {
     /// `getUserPermissions` (`resolver.go:132`): the actor's user id (if any)
     /// plus the ids of the orgs it belongs to. UID 0 (anonymous/internal)
     /// yields two empty lists, leaving only `global is true` grants.
@@ -188,10 +188,21 @@ fn go_json_quote(value: &str) -> String {
 
 /// `relay.UnmarshalSpec` into a string (insight unique id / dashboard view
 /// after cursor).
+/// Go's `base64.CorruptInputError` message, used verbatim by relay IDs.
+fn base64_message(error: base64::DecodeError) -> String {
+    let offset = match error {
+        base64::DecodeError::InvalidByte(offset, _)
+        | base64::DecodeError::InvalidLength(offset)
+        | base64::DecodeError::InvalidLastSymbol(offset, _) => offset,
+        base64::DecodeError::InvalidPadding => 0,
+    };
+    format!("illegal base64 data at input byte {offset}")
+}
+
 pub fn unmarshal_string_spec(id: &str) -> Result<String, String> {
     let decoded = base64::engine::general_purpose::URL_SAFE
         .decode(id)
-        .map_err(|err| err.to_string())?;
+        .map_err(base64_message)?;
     let decoded = String::from_utf8(decoded).map_err(|err| err.to_string())?;
     let (_, spec) = decoded
         .split_once(':')
@@ -217,7 +228,7 @@ struct DashboardId {
 fn unmarshal_dashboard_id(id: &str) -> Result<DashboardId, String> {
     let decoded = base64::engine::general_purpose::URL_SAFE
         .decode(id)
-        .map_err(|err| err.to_string())?;
+        .map_err(base64_message)?;
     let decoded = String::from_utf8(decoded).map_err(|err| err.to_string())?;
     let (_, spec) = decoded
         .split_once(':')
@@ -316,7 +327,10 @@ fn object_int(
 // ---------------------------------------------------------------------------
 
 pub fn is_root_field(field: &str) -> bool {
-    matches!(field, "insightViews" | "insightsDashboards")
+    matches!(
+        field,
+        "insightViews" | "insightsDashboards" | "insightSeriesQueryStatus"
+    )
 }
 
 pub fn root_field(
@@ -338,6 +352,9 @@ pub fn root_field(
                 org_ids,
                 None,
             )?))
+        }
+        "insightSeriesQueryStatus" => {
+            Ok(Some(insight_series_query_status(database, actor)?))
         }
         _ => Ok(None),
     }
@@ -578,18 +595,22 @@ impl InsightViewObject {
 
     fn repository_definition(
         series: &InsightSeriesData,
-    ) -> FieldValue {
+    ) -> Result<FieldValue, ExecError> {
         if !series.repositories.is_empty() && series.repository_criteria.is_none() {
-            FieldValue::Object(Arc::new(InsightRepositoryScopeObject {
+            Ok(FieldValue::Object(Arc::new(InsightRepositoryScopeObject {
                 repositories: series.repositories.clone(),
-            }))
-        } else {
-            let all_repositories =
-                series.repository_criteria.is_none() && series.repositories.is_empty();
-            FieldValue::Object(Arc::new(RepositorySearchScopeObject {
+            })))
+        } else if series.repositories.is_empty() {
+            let all_repositories = series.repository_criteria.is_none();
+            Ok(FieldValue::Object(Arc::new(RepositorySearchScopeObject {
                 search: series.repository_criteria.clone().unwrap_or_default(),
                 all_repositories,
-            }))
+            })))
+        } else {
+            // Go returns a union member that satisfies neither `ToInsightRepositoryScope`
+            // (criteria set) nor `ToRepositorySearchScope` (repositories set); resolving
+            // the union then fails.
+            Err(ExecError::new("unresolvable InsightRepositoryDefinition"))
         }
     }
 }
@@ -697,7 +718,7 @@ impl ObjectValue for InsightViewObject {
             "seriesCount" => Ok(None),
             "repositoryDefinition" => match self.first_series() {
                 None => Err(ExecError::new("no repository definitions available")),
-                Some(series) => Ok(Some(Self::repository_definition(series))),
+                Some(series) => Ok(Some(Self::repository_definition(series)?)),
             },
             "timeScope" => match self.first_series() {
                 None => Err(ExecError::new("no time scope available")),
@@ -942,9 +963,9 @@ impl ObjectValue for SearchInsightDataSeriesDefinitionObject {
                     repositories: self.series.repositories.clone(),
                 },
             )))),
-            "repositoryDefinition" => Ok(Some(InsightViewObject::repository_definition(
-                &self.series,
-            ))),
+            "repositoryDefinition" => {
+                Ok(Some(InsightViewObject::repository_definition(&self.series)?))
+            }
             "timeScope" => Ok(Some(FieldValue::Object(Arc::new(
                 InsightIntervalTimeScopeObject {
                     unit: self.series.sample_interval_unit.clone(),
@@ -1207,6 +1228,824 @@ impl ObjectValue for InsightsPermissionGrantsObject {
                     .collect(),
             })),
             "global" => Ok(Some(FieldValue::Json(Json::Bool(self.global_grant)))),
+            _ => Ok(None),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Write surface (M9.30b).
+// ---------------------------------------------------------------------------
+
+/// `graphqlbackend.LineChartSearchInsightDataSeriesInput` after the
+/// view-level scope fallback has been applied by the caller.
+#[derive(Debug, Clone, Default)]
+pub struct SeriesMutationInput {
+    pub series_id: Option<String>,
+    pub query: String,
+    /// `emptyIfNil(options.label)`.
+    pub label: String,
+    /// `emptyIfNil(options.lineColor)`.
+    pub stroke: String,
+    pub repository_scope: Option<RepositoryScopeInput>,
+    pub time_scope: Option<TimeScopeInput>,
+    pub generated_from_capture_groups: Option<bool>,
+    /// Raw `GroupByField` enum value; stored lowercase (`lowercaseGroupBy`).
+    pub group_by: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct RepositoryScopeInput {
+    pub repositories: Vec<String>,
+    pub repository_criteria: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct TimeScopeInput {
+    pub unit: String,
+    pub value: i32,
+}
+
+impl SeriesMutationInput {
+    /// `isValidSeriesInput` (`insight_view_resolvers.go:1608`), including the
+    /// verbatim `critieria` typo.
+    pub fn validate(&self) -> Result<(), String> {
+        let Some(scope) = &self.repository_scope else {
+            return Err("a repository scope is required".to_owned());
+        };
+        if self.time_scope.is_none() {
+            return Err("a time scope is required".to_owned());
+        }
+        let repo_criteria_specified = scope.repository_criteria.is_some();
+        let repo_list_specified = !scope.repositories.is_empty();
+        if repo_list_specified && repo_criteria_specified {
+            return Err(
+                "series can not specify both a repository list and repository critieria".to_owned(),
+            );
+        }
+        if !repo_list_specified && self.group_by.is_some() {
+            return Err(
+                "group by series require a list of repositories to be specified.".to_owned(),
+            );
+        }
+        if let Some(criteria) = &scope.repository_criteria {
+            let plan = sg_insights_query::parse_query(criteria, "literal")
+                .map_err(|err| format!("ParseQuery: {err}"))?;
+            let (message, valid) = sg_insights_query::is_valid_scope_query(&plan);
+            if !valid {
+                return Err(message);
+            }
+        }
+        Ok(())
+    }
+
+    /// `existingSeriesHasChanged` (`insight_view_resolvers.go:743`) against a
+    /// persisted series row.
+    pub fn has_changed(&self, existing: &InsightSeriesData) -> bool {
+        let scope = self.repository_scope.as_ref().expect("validated scope");
+        if self.query != existing.query {
+            return true;
+        }
+        let time = self.time_scope.as_ref().expect("validated time scope");
+        if time.unit != existing.sample_interval_unit {
+            return true;
+        }
+        if time.value != existing.sample_interval_value {
+            return true;
+        }
+        if scope.repositories.len() != existing.repositories.len() {
+            return true;
+        }
+        let mut new_repos = scope.repositories.clone();
+        new_repos.sort();
+        let mut old_repos = existing.repositories.clone();
+        old_repos.sort();
+        if new_repos != old_repos {
+            return true;
+        }
+        if scope.repository_criteria.is_some() != existing.repository_criteria.is_some() {
+            return true;
+        }
+        if let (Some(new_criteria), Some(old_criteria)) =
+            (&scope.repository_criteria, &existing.repository_criteria)
+        {
+            if new_criteria != old_criteria {
+                return true;
+            }
+        }
+        self.group_by.clone().unwrap_or_default()
+            != existing.group_by.clone().unwrap_or_default()
+    }
+}
+
+/// `LineChartSearchInsightInput` / `UpdateLineChartSearchInsightInput`.
+#[derive(Debug, Clone, Default)]
+pub struct LineChartMutationInput {
+    /// `emptyIfNil(options.title)` (create) / `presentationOptions.title`
+    /// (update).
+    pub title: String,
+    /// Flattened `viewControls.filters` (`filtersFromInput`).
+    pub filters: InsightViewFilters,
+    pub sort_mode: Option<String>,
+    pub sort_direction: Option<String>,
+    pub limit: Option<i32>,
+    pub num_samples: Option<i32>,
+    /// `Input.Dashboards` (create only); `Some` iff the argument was provided.
+    pub dashboards: Option<Vec<i64>>,
+    pub series: Vec<SeriesMutationInput>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct PieChartCreateInput {
+    pub title: String,
+    pub other_threshold: f64,
+    pub query: String,
+    pub repositories: Vec<String>,
+    pub dashboards: Option<Vec<i64>>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct PieChartUpdateInput {
+    pub title: String,
+    pub other_threshold: f64,
+    pub query: String,
+    pub repositories: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct SaveAsNewViewInput {
+    pub unique_id: String,
+    /// `args.Input.ViewControls != nil`; `None` leaves filters empty.
+    pub filters: Option<InsightViewFilters>,
+    pub title: String,
+    pub dashboard: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InsightSeriesMetadataData {
+    pub series_id: String,
+    pub query: String,
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InsightSeriesQueryStatusData {
+    pub series_id: String,
+    pub query: String,
+    pub enabled: bool,
+    pub errored: i32,
+    pub completed: i32,
+    pub processing: i32,
+    pub failed: i32,
+    pub queued: i32,
+}
+
+/// The write half of the database seam. Implementations mirror the Go
+/// resolver transaction boundaries documented in
+/// `dev/rs/docs/overviews/m9_30b_insights_view_mutations_overview.md`.
+pub trait InsightsWriteDatabase: Send + Sync {
+    /// `licensing.Check(FeatureCodeInsights) == nil` (`false` reproduces
+    /// Limited Access Mode).
+    fn code_insights_licensed(&self) -> bool {
+        true
+    }
+
+    /// `auth.CheckUserIsSiteAdmin`; `Err` carries the verbatim message.
+    fn actor_is_site_admin(&self, actor: Actor) -> Result<bool, String>;
+
+    /// `validateRepositoryList`: every name exists in the repo store.
+    fn repositories_exist(&self, names: &[String]) -> Result<bool, String>;
+
+    fn create_line_chart(
+        &self,
+        actor: Actor,
+        input: &LineChartMutationInput,
+    ) -> Result<String, String>;
+
+    fn update_line_chart(
+        &self,
+        actor: Actor,
+        unique_id: &str,
+        input: &LineChartMutationInput,
+    ) -> Result<String, String>;
+
+    fn create_pie_chart(
+        &self,
+        actor: Actor,
+        input: &PieChartCreateInput,
+    ) -> Result<String, String>;
+
+    fn update_pie_chart(
+        &self,
+        actor: Actor,
+        unique_id: &str,
+        input: &PieChartUpdateInput,
+    ) -> Result<String, String>;
+
+    /// No transaction (`DeleteInsightView` calls the non-tx stores directly).
+    fn delete_insight_view(&self, actor: Actor, unique_id: &str) -> Result<(), String>;
+
+    fn save_insight_as_new_view(
+        &self,
+        actor: Actor,
+        input: &SaveAsNewViewInput,
+    ) -> Result<String, String>;
+
+    fn update_insight_series(
+        &self,
+        actor: Actor,
+        series_id: &str,
+        enabled: Option<bool>,
+    ) -> Result<InsightSeriesMetadataData, String>;
+
+    fn insight_series_query_status(
+        &self,
+        actor: Actor,
+    ) -> Result<Vec<InsightSeriesQueryStatusData>, String>;
+}
+
+// ----- Argument parsing ----------------------------------------------------
+
+fn object_bool(
+    object: &std::collections::BTreeMap<String, InputValue>,
+    name: &str,
+) -> Option<bool> {
+    match object.get(name) {
+        Some(InputValue::Bool(value)) => Some(*value),
+        _ => None,
+    }
+}
+
+fn object_float(
+    object: &std::collections::BTreeMap<String, InputValue>,
+    name: &str,
+) -> Option<f64> {
+    match object.get(name) {
+        Some(InputValue::Float(value)) => Some(*value),
+        Some(InputValue::Int(value)) => Some(*value as f64),
+        _ => None,
+    }
+}
+
+fn object_value<'a>(
+    object: &'a std::collections::BTreeMap<String, InputValue>,
+    name: &str,
+) -> Option<&'a std::collections::BTreeMap<String, InputValue>> {
+    match object.get(name) {
+        Some(InputValue::Object(value)) => Some(value),
+        _ => None,
+    }
+}
+
+fn object_string_list(
+    object: &std::collections::BTreeMap<String, InputValue>,
+    name: &str,
+) -> Option<Vec<String>> {
+    match object.get(name) {
+        Some(InputValue::List(items)) => Some(
+            items
+                .iter()
+                .filter_map(|item| item.as_str().map(str::to_owned))
+                .collect(),
+        ),
+        Some(InputValue::Null) | None => None,
+        _ => None,
+    }
+}
+
+fn parse_repository_scope(
+    object: &std::collections::BTreeMap<String, InputValue>,
+) -> RepositoryScopeInput {
+    RepositoryScopeInput {
+        repositories: object_string_list(object, "repositories").unwrap_or_default(),
+        repository_criteria: object_str(object, "repositoryCriteria"),
+    }
+}
+
+fn parse_time_scope(
+    object: &std::collections::BTreeMap<String, InputValue>,
+) -> TimeScopeInput {
+    let Some(step) = object_value(object, "stepInterval") else {
+        return TimeScopeInput::default();
+    };
+    TimeScopeInput {
+        unit: object_str(step, "unit").unwrap_or_default(),
+        value: object_int(step, "value").unwrap_or(0),
+    }
+}
+
+fn parse_series(
+    object: &std::collections::BTreeMap<String, InputValue>,
+    top_repository_scope: Option<&std::collections::BTreeMap<String, InputValue>>,
+    top_time_scope: Option<&std::collections::BTreeMap<String, InputValue>>,
+) -> Result<SeriesMutationInput, String> {
+    let options = object_value(object, "options");
+    let mut repository_scope = object_value(object, "repositoryScope").map(parse_repository_scope);
+    let mut time_scope = object_value(object, "timeScope").map(parse_time_scope);
+    if repository_scope.is_none() {
+        repository_scope = top_repository_scope.map(parse_repository_scope);
+    }
+    if time_scope.is_none() {
+        time_scope = top_time_scope.map(parse_time_scope);
+    }
+    Ok(SeriesMutationInput {
+        series_id: match object.get("seriesId") {
+            Some(InputValue::Str(value)) => Some(value.clone()),
+            _ => None,
+        },
+        query: object_str(object, "query").unwrap_or_default(),
+        label: options.and_then(|options| object_str(options, "label")).unwrap_or_default(),
+        stroke: options
+            .and_then(|options| object_str(options, "lineColor"))
+            .unwrap_or_default(),
+        repository_scope,
+        time_scope,
+        generated_from_capture_groups: object_bool(object, "generatedFromCaptureGroups"),
+        group_by: match object.get("groupBy") {
+            Some(InputValue::Enum(value)) => Some(value.clone()),
+            Some(InputValue::Str(value)) => Some(value.clone()),
+            _ => None,
+        },
+    })
+}
+
+/// `dataSeries: [LineChartSearchInsightDataSeriesInput!]!`.
+fn parse_series_list(
+    input: &std::collections::BTreeMap<String, InputValue>,
+) -> Result<Vec<SeriesMutationInput>, String> {
+    let top_repository_scope = object_value(input, "repositoryScope");
+    let top_time_scope = object_value(input, "timeScope");
+    let Some(InputValue::List(items)) = input.get("dataSeries") else {
+        return Ok(Vec::new());
+    };
+    let mut series = Vec::with_capacity(items.len());
+    for item in items {
+        let InputValue::Object(object) = item else {
+            return Err("invalid data series".to_owned());
+        };
+        series.push(parse_series(object, top_repository_scope, top_time_scope)?);
+    }
+    Ok(series)
+}
+
+fn parse_filters(
+    input: &std::collections::BTreeMap<String, InputValue>,
+    name: &str,
+) -> InsightViewFilters {
+    let Some(filters) = object_value(input, name) else {
+        return InsightViewFilters::default();
+    };
+    InsightViewFilters {
+        include_repo_regex: object_str(filters, "includeRepoRegex"),
+        exclude_repo_regex: object_str(filters, "excludeRepoRegex"),
+        search_contexts: object_string_list(filters, "searchContexts"),
+    }
+}
+
+/// `ViewControls.filters` when `ViewControls` is present.
+fn parse_view_controls_filters(
+    input: &std::collections::BTreeMap<String, InputValue>,
+) -> InsightViewFilters {
+    match object_value(input, "viewControls") {
+        Some(controls) => parse_filters(controls, "filters"),
+        None => InsightViewFilters::default(),
+    }
+}
+
+/// `ViewControls.seriesDisplayOptions`.
+fn parse_series_display_options(
+    input: &std::collections::BTreeMap<String, InputValue>,
+) -> (Option<String>, Option<String>, Option<i32>, Option<i32>) {
+    let Some(controls) = object_value(input, "viewControls") else {
+        return (None, None, None, None);
+    };
+    let Some(options) = object_value(controls, "seriesDisplayOptions") else {
+        return (None, None, None, None);
+    };
+    let sort = object_value(options, "sortOptions");
+    (
+        sort.and_then(|sort| object_str(sort, "mode")),
+        sort.and_then(|sort| object_str(sort, "direction")),
+        object_int(options, "limit"),
+        object_int(options, "numSamples"),
+    )
+}
+
+fn parse_dashboards(
+    input: &std::collections::BTreeMap<String, InputValue>,
+) -> Result<Option<Vec<i64>>, String> {
+    match input.get("dashboards") {
+        None | Some(InputValue::Null) => Ok(None),
+        Some(InputValue::List(items)) => {
+            let mut ids = Vec::with_capacity(items.len());
+            for item in items {
+                let Some(id) = item.as_str() else {
+                    return Err("invalid graphql.ID".to_owned());
+                };
+                let id = unmarshal_dashboard_id(id)
+                    .map_err(|err| format!("unmarshalDashboardID, id:{err}"))?;
+                ids.push(id.arg);
+            }
+            Ok(Some(ids))
+        }
+        _ => Err("invalid graphql.ID".to_owned()),
+    }
+}
+
+fn input_object_argument(
+    arguments: &Arguments,
+) -> Result<&std::collections::BTreeMap<String, InputValue>, ExecError> {
+    input_object(arguments, "input")
+        .ok_or_else(|| ExecError::new("missing input argument"))
+}
+
+fn parse_line_chart(
+    input: &std::collections::BTreeMap<String, InputValue>,
+    update: bool,
+) -> Result<LineChartMutationInput, ExecError> {
+    let series = parse_series_list(input).map_err(ExecError::new)?;
+    let options = object_value(input, "options")
+        .or_else(|| object_value(input, "presentationOptions"));
+    let title = options
+        .and_then(|options| object_str(options, "title"))
+        .unwrap_or_default();
+    let (sort_mode, sort_direction, limit, num_samples) =
+        parse_series_display_options(input);
+    let filters = parse_view_controls_filters(input);
+    let dashboards = if update {
+        None
+    } else {
+        parse_dashboards(input).map_err(ExecError::new)?
+    };
+    Ok(LineChartMutationInput {
+        title,
+        filters,
+        sort_mode,
+        sort_direction,
+        limit,
+        num_samples,
+        dashboards,
+        series,
+    })
+}
+
+// ----- Mutation dispatch ---------------------------------------------------
+
+pub fn is_mutation_field(field: &str) -> bool {
+    matches!(
+        field,
+        "createLineChartSearchInsight"
+            | "createPieChartSearchInsight"
+            | "updateLineChartSearchInsight"
+            | "updatePieChartSearchInsight"
+            | "deleteInsightView"
+            | "saveInsightAsNewView"
+            | "updateInsightSeries"
+    )
+}
+
+pub fn mutation_field(
+    database: &InsightsHandle,
+    field: &str,
+    arguments: &Arguments,
+    actor: Actor,
+) -> Result<Option<FieldValue>, ExecError> {
+    match field {
+        "createLineChartSearchInsight" => {
+            let input = input_object_argument(arguments)?;
+            let input = parse_line_chart(input, false)?;
+            if input.series.is_empty() {
+                return Err(ExecError::new(
+                    "At least one data series is required to create an insight view",
+                ));
+            }
+            for series in &input.series {
+                series.validate().map_err(ExecError::new)?;
+                if let Some(scope) = &series.repository_scope {
+                    validate_repository_list(database, &scope.repositories)?;
+                }
+            }
+            let unique_id = database
+                .create_line_chart(actor, &input)
+                .map_err(ExecError::new)?;
+            Ok(Some(payload_object(database.clone(), unique_id)))
+        }
+        "updateLineChartSearchInsight" => {
+            let input = input_object_argument(arguments)?;
+            let input = parse_line_chart(input, true)?;
+            if input.series.is_empty() {
+                return Err(ExecError::new(
+                    "At least one data series is required to update an insight view",
+                ));
+            }
+            for series in &input.series {
+                series.validate().map_err(ExecError::new)?;
+                if let Some(scope) = &series.repository_scope {
+                    validate_repository_list(database, &scope.repositories)?;
+                }
+            }
+            let id = arguments
+                .string("id")
+                .ok_or_else(|| ExecError::new("missing id argument"))?;
+            let unique_id = unmarshal_string_spec(id).map_err(|err| {
+                ExecError::new(format!("error unmarshalling the insight view id: {err}"))
+            })?;
+            let unique_id = database
+                .update_line_chart(actor, &unique_id, &input)
+                .map_err(ExecError::new)?;
+            Ok(Some(payload_object(database.clone(), unique_id)))
+        }
+        "createPieChartSearchInsight" => {
+            let input = input_object_argument(arguments)?;
+            let presentation = object_value(input, "presentationOptions")
+                .ok_or_else(|| ExecError::new("missing presentationOptions"))?;
+            let repository_scope = object_value(input, "repositoryScope")
+                .ok_or_else(|| ExecError::new("missing repositoryScope"))?;
+            let input = PieChartCreateInput {
+                title: object_str(presentation, "title").unwrap_or_default(),
+                other_threshold: object_float(presentation, "otherThreshold")
+                    .unwrap_or(0.0),
+                query: object_str(input, "query").unwrap_or_default(),
+                repositories: object_string_list(repository_scope, "repositories")
+                    .unwrap_or_default(),
+                dashboards: parse_dashboards(input).map_err(ExecError::new)?,
+            };
+            let unique_id = database
+                .create_pie_chart(actor, &input)
+                .map_err(ExecError::new)?;
+            Ok(Some(payload_object(database.clone(), unique_id)))
+        }
+        "updatePieChartSearchInsight" => {
+            let input = input_object_argument(arguments)?;
+            let presentation = object_value(input, "presentationOptions")
+                .ok_or_else(|| ExecError::new("missing presentationOptions"))?;
+            let repository_scope = object_value(input, "repositoryScope")
+                .ok_or_else(|| ExecError::new("missing repositoryScope"))?;
+            let input = PieChartUpdateInput {
+                title: object_str(presentation, "title").unwrap_or_default(),
+                other_threshold: object_float(presentation, "otherThreshold")
+                    .unwrap_or(0.0),
+                query: object_str(input, "query").unwrap_or_default(),
+                repositories: object_string_list(repository_scope, "repositories")
+                    .unwrap_or_default(),
+            };
+            let id = arguments
+                .string("id")
+                .ok_or_else(|| ExecError::new("missing id argument"))?;
+            let unique_id = unmarshal_string_spec(id).map_err(|err| {
+                ExecError::new(format!("error unmarshalling the insight view id: {err}"))
+            })?;
+            let unique_id = database
+                .update_pie_chart(actor, &unique_id, &input)
+                .map_err(ExecError::new)?;
+            Ok(Some(payload_object(database.clone(), unique_id)))
+        }
+        "deleteInsightView" => {
+            let id = arguments
+                .string("id")
+                .ok_or_else(|| ExecError::new("missing id argument"))?;
+            let unique_id = unmarshal_string_spec(id).map_err(|err| {
+                ExecError::new(format!("error unmarshalling the insight view id: {err}"))
+            })?;
+            database
+                .delete_insight_view(actor, &unique_id)
+                .map_err(ExecError::new)?;
+            Ok(Some(FieldValue::Object(Arc::new(
+                crate::temporary_settings::EmptyResponseObject,
+            ))))
+        }
+        "saveInsightAsNewView" => {
+            let input = input_object_argument(arguments)?;
+            let id = object_str(input, "insightViewId")
+                .ok_or_else(|| ExecError::new("missing insightViewId"))?;
+            let unique_id = unmarshal_string_spec(&id).map_err(|err| {
+                ExecError::new(format!("error unmarshalling the insight view id: {err}"))
+            })?;
+            let options = object_value(input, "options");
+            let filters = match object_value(input, "viewControls") {
+                Some(controls) => Some(parse_filters(controls, "filters")),
+                None => None,
+            };
+            let dashboard = match input.get("dashboard") {
+                Some(InputValue::Str(value)) => Some(
+                    unmarshal_dashboard_id(value)
+                        .map_err(|err| {
+                            ExecError::new(format!("unmarshalDashboardID, id:{err}"))
+                        })?
+                        .arg,
+                ),
+                _ => None,
+            };
+            let input = SaveAsNewViewInput {
+                unique_id,
+                filters,
+                title: options
+                    .and_then(|options| object_str(options, "title"))
+                    .unwrap_or_default(),
+                dashboard,
+            };
+            let unique_id = database
+                .save_insight_as_new_view(actor, &input)
+                .map_err(ExecError::new)?;
+            Ok(Some(payload_object(database.clone(), unique_id)))
+        }
+        "updateInsightSeries" => {
+            let input = input_object_argument(arguments)?;
+            let series_id = object_str(input, "seriesId")
+                .ok_or_else(|| ExecError::new("missing seriesId"))?;
+            let enabled = object_bool(input, "enabled");
+            let series = database
+                .update_insight_series(actor, &series_id, enabled)
+                .map_err(ExecError::new)?;
+            Ok(Some(FieldValue::Object(Arc::new(
+                InsightSeriesMetadataPayloadObject { series },
+            ))))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn validate_repository_list(
+    database: &InsightsHandle,
+    repositories: &[String],
+) -> Result<(), ExecError> {
+    if repositories.is_empty() {
+        return Ok(());
+    }
+    let all_found = database
+        .repositories_exist(repositories)
+        .map_err(ExecError::new)?;
+    if !all_found {
+        return Err(ExecError::new("repositories not found"));
+    }
+    Ok(())
+}
+
+fn payload_object(database: InsightsHandle, unique_id: String) -> FieldValue {
+    FieldValue::Object(Arc::new(InsightViewPayloadObject {
+        database,
+        unique_id,
+    }))
+}
+
+struct InsightViewPayloadObject {
+    database: InsightsHandle,
+    unique_id: String,
+}
+
+impl ObjectValue for InsightViewPayloadObject {
+    fn type_name(&self) -> &'static str {
+        "InsightViewPayload"
+    }
+
+    fn field(
+        &self,
+        field: &str,
+        _arguments: &Arguments,
+        actor: Actor,
+    ) -> Result<Option<FieldValue>, ExecError> {
+        match field {
+            // `insightPayloadResolver.View`: `GetAllMapped` restricted to the
+            // view's unique id and the actor's grants.
+            "view" => {
+                let (user_ids, org_ids) = self
+                    .database
+                    .user_permission_ids(actor)
+                    .map_err(ExecError::new)?;
+                let views = self
+                    .database
+                    .list_views(&InsightQueryOptions {
+                        unique_id: Some(self.unique_id.clone()),
+                        user_ids,
+                        org_ids,
+                        ..Default::default()
+                    })
+                    .map_err(ExecError::new)?;
+                if std::env::var("M930B_TRACE").as_deref() == Ok("1") {
+                    eprintln!("M930B_TRACE payload views={}", views.len());
+                };
+                let Some(view) = views.into_iter().next() else {
+                    return Err(ExecError::new("insight not found"));
+                };
+                Ok(Some(FieldValue::Object(Arc::new(InsightViewObject {
+                    view,
+                    database: self.database.clone(),
+                    override_filters: None,
+                    override_series_options: None,
+                }))))
+            }
+            _ => Ok(None),
+        }
+    }
+}
+
+struct InsightSeriesMetadataPayloadObject {
+    series: InsightSeriesMetadataData,
+}
+
+impl ObjectValue for InsightSeriesMetadataPayloadObject {
+    fn type_name(&self) -> &'static str {
+        "InsightSeriesMetadataPayload"
+    }
+
+    fn field(
+        &self,
+        field: &str,
+        _arguments: &Arguments,
+        _actor: Actor,
+    ) -> Result<Option<FieldValue>, ExecError> {
+        match field {
+            "series" => Ok(Some(FieldValue::Object(Arc::new(
+                InsightSeriesMetadataObject {
+                    series: self.series.clone(),
+                },
+            )))),
+            _ => Ok(None),
+        }
+    }
+}
+
+struct InsightSeriesMetadataObject {
+    series: InsightSeriesMetadataData,
+}
+
+impl ObjectValue for InsightSeriesMetadataObject {
+    fn type_name(&self) -> &'static str {
+        "InsightSeriesMetadata"
+    }
+
+    fn field(
+        &self,
+        field: &str,
+        _arguments: &Arguments,
+        _actor: Actor,
+    ) -> Result<Option<FieldValue>, ExecError> {
+        match field {
+            "seriesId" => Ok(Some(FieldValue::Json(Json::Str(
+                self.series.series_id.clone(),
+            )))),
+            "query" => Ok(Some(FieldValue::Json(Json::Str(self.series.query.clone())))),
+            "enabled" => Ok(Some(FieldValue::Json(Json::Bool(self.series.enabled)))),
+            _ => Ok(None),
+        }
+    }
+}
+
+/// `Query.insightSeriesQueryStatus` (`admin_resolver.go:56`).
+pub fn insight_series_query_status(
+    database: &InsightsHandle,
+    actor: Actor,
+) -> Result<FieldValue, ExecError> {
+    let statuses = database
+        .insight_series_query_status(actor)
+        .map_err(ExecError::new)?;
+    Ok(FieldValue::List {
+        element_type: Some("InsightSeriesQueryStatus"),
+        items: statuses
+            .into_iter()
+            .map(|status| {
+                FieldValue::Object(Arc::new(InsightSeriesQueryStatusObject { status }))
+            })
+            .collect(),
+    })
+}
+
+struct InsightSeriesQueryStatusObject {
+    status: InsightSeriesQueryStatusData,
+}
+
+impl ObjectValue for InsightSeriesQueryStatusObject {
+    fn type_name(&self) -> &'static str {
+        "InsightSeriesQueryStatus"
+    }
+
+    fn field(
+        &self,
+        field: &str,
+        _arguments: &Arguments,
+        _actor: Actor,
+    ) -> Result<Option<FieldValue>, ExecError> {
+        match field {
+            "seriesId" => Ok(Some(FieldValue::Json(Json::Str(
+                self.status.series_id.clone(),
+            )))),
+            "query" => Ok(Some(FieldValue::Json(Json::Str(self.status.query.clone())))),
+            "enabled" => Ok(Some(FieldValue::Json(Json::Bool(self.status.enabled)))),
+            "errored" => Ok(Some(FieldValue::Json(Json::Int(i64::from(
+                self.status.errored,
+            ))))),
+            "completed" => Ok(Some(FieldValue::Json(Json::Int(i64::from(
+                self.status.completed,
+            ))))),
+            "processing" => Ok(Some(FieldValue::Json(Json::Int(i64::from(
+                self.status.processing,
+            ))))),
+            "failed" => Ok(Some(FieldValue::Json(Json::Int(i64::from(
+                self.status.failed,
+            ))))),
+            "queued" => Ok(Some(FieldValue::Json(Json::Int(i64::from(
+                self.status.queued,
+            ))))),
             _ => Ok(None),
         }
     }

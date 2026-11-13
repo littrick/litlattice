@@ -4388,6 +4388,7 @@ dependencies = [
  "sg-graphql",
  "sg-http",
  "sg-httpcli",
+ "sg-insights-query",
  "sg-jsonx",
  "sg-keyring",
  "sg-licensing",

@@ -18,9 +18,12 @@ use sg_graphql::exec::Actor;
 
 use crate::codeintel_uploads_graphql_store::block_on;
 use crate::insights_graphql::{
-    DashboardData, DashboardQueryOptions, InsightQueryOptions, InsightSeriesData, InsightViewData,
-    InsightViewFilters, InsightsDatabase,
+    DashboardData, DashboardQueryOptions, InsightQueryOptions, InsightSeriesData,
+    InsightSeriesMetadataData, InsightSeriesQueryStatusData, InsightsDatabase,
+    InsightsWriteDatabase, InsightViewData, InsightViewFilters, LineChartMutationInput,
+    PieChartCreateInput, PieChartUpdateInput, SaveAsNewViewInput, SeriesMutationInput,
 };
+use time::{Date, Duration, Month, OffsetDateTime, PrimitiveDateTime, Time};
 
 #[derive(Clone)]
 pub struct PgInsightsStore {
@@ -29,6 +32,9 @@ pub struct PgInsightsStore {
     /// The frontend database, used only for `getUserPermissions`' org lookup.
     /// `None` reproduces an anonymous/internal actor (no user/org grants).
     frontend_pool: Option<PgPool>,
+    /// `licensing.Check(FeatureCodeInsights) == nil`; `false` drives the
+    /// Limited Access Mode branches of the create mutations.
+    code_insights_licensed: bool,
 }
 
 impl std::fmt::Debug for PgInsightsStore {
@@ -44,11 +50,17 @@ impl PgInsightsStore {
         Self {
             pool,
             frontend_pool: None,
+            code_insights_licensed: true,
         }
     }
 
     pub fn with_frontend_pool(mut self, pool: PgPool) -> Self {
         self.frontend_pool = Some(pool);
+        self
+    }
+
+    pub fn with_code_insights_licensed(mut self, licensed: bool) -> Self {
+        self.code_insights_licensed = licensed;
         self
     }
 }
@@ -228,11 +240,11 @@ impl InsightsDatabase for PgInsightsStore {
                 r#"
 WITH visible_dashboards AS (
     SELECT dashboard_id FROM dashboard_grants
-    WHERE org_id = ANY($1) OR user_id = ANY($2) OR global IS TRUE
+    WHERE user_id = ANY($1) OR org_id = ANY($2) OR global IS TRUE
 ),
 visible_views AS (
     SELECT insight_view_id FROM insight_view_grants
-    WHERE org_id = ANY($1) OR user_id = ANY($2) OR global IS TRUE
+    WHERE user_id = ANY($1) OR org_id = ANY($2) OR global IS TRUE
 )
 SELECT DISTINCT iv.unique_id
 FROM insight_view iv
@@ -393,6 +405,1208 @@ LIMIT $6::int
         })
         .map_err(|err| err.to_string())
     }
+}
+
+// ---------------------------------------------------------------------------
+// Write surface (M9.30b).
+// ---------------------------------------------------------------------------
+
+fn now_primitive() -> PrimitiveDateTime {
+    let now = OffsetDateTime::now_utc();
+    PrimitiveDateTime::new(now.date(), now.time())
+}
+
+fn zero_time() -> PrimitiveDateTime {
+    PrimitiveDateTime::new(
+        Date::from_calendar_date(1, Month::January, 1).expect("year 1"),
+        Time::MIDNIGHT,
+    )
+}
+
+fn next_snapshot(now: PrimitiveDateTime) -> PrimitiveDateTime {
+    PrimitiveDateTime::new(now.date() + Duration::days(1), Time::MIDNIGHT)
+}
+
+/// `timeseries.TimeInterval.StepForwards` (calendar semantics are not
+/// observable through the mutation snapshot; every timestamp is normalized).
+fn step_forwards(now: PrimitiveDateTime, unit: &str, value: i32) -> PrimitiveDateTime {
+    let value = i64::from(value);
+    let duration = match unit {
+        "YEAR" => Duration::days(365 * value),
+        "MONTH" => Duration::days(30 * value),
+        "WEEK" => Duration::days(7 * value),
+        "DAY" => Duration::days(value),
+        "HOUR" => Duration::hours(value),
+        _ => return now,
+    };
+    now + duration
+}
+
+fn series_fill_metadata(series: &SeriesMutationInput) -> (Option<String>, Option<String>) {
+    (Some(series.label.clone()), Some(series.stroke.clone()))
+}
+
+struct MappedSeries {
+    series_pk: i32,
+    series_id: String,
+    query: String,
+    label: String,
+    stroke: String,
+    repositories: Vec<String>,
+    sample_interval_unit: String,
+    sample_interval_value: i32,
+    generated_from_capture_groups: bool,
+    just_in_time: bool,
+    generation_method: String,
+    group_by: Option<String>,
+    repository_criteria: Option<String>,
+}
+
+impl MappedSeries {
+    fn data(&self) -> InsightSeriesData {
+        InsightSeriesData {
+            series_id: self.series_id.clone(),
+            query: self.query.clone(),
+            label: self.label.clone(),
+            stroke: self.stroke.clone(),
+            repositories: self.repositories.clone(),
+            sample_interval_unit: self.sample_interval_unit.clone(),
+            sample_interval_value: self.sample_interval_value,
+            generated_from_capture_groups: self.generated_from_capture_groups,
+            just_in_time: self.just_in_time,
+            generation_method: self.generation_method.clone(),
+            group_by: self.group_by.clone(),
+            repository_criteria: self.repository_criteria.clone(),
+        }
+    }
+}
+
+fn mapped_series_from_row(row: &sqlx::postgres::PgRow) -> Result<MappedSeries, sqlx::Error> {
+    Ok(MappedSeries {
+        series_pk: row.try_get("series_pk")?,
+        series_id: row.try_get("series_id")?,
+        query: row.try_get("query")?,
+        label: row.try_get("label")?,
+        stroke: row.try_get("stroke")?,
+        repositories: row.try_get("repositories")?,
+        sample_interval_unit: row.try_get("sample_interval_unit")?,
+        sample_interval_value: row.try_get("sample_interval_value")?,
+        generated_from_capture_groups: row.try_get("generated_from_capture_groups")?,
+        just_in_time: row.try_get("just_in_time")?,
+        generation_method: row.try_get("generation_method")?,
+        group_by: row.try_get("group_by")?,
+        repository_criteria: row.try_get("repository_criteria")?,
+    })
+}
+
+/// `InsightStore.GetMapped` (`getInsightByViewSql`): includes soft-deleted
+/// series rows.
+async fn get_mapped(
+    conn: &mut sqlx::PgConnection,
+    unique_id: &str,
+) -> Result<Option<(i32, Vec<MappedSeries>)>, String> {
+    let rows = sqlx::query(
+        r#"
+SELECT iv.id AS view_id, ivs.label, ivs.stroke,
+       i.id AS series_pk, i.series_id, i.query, i.repositories,
+       i.sample_interval_unit::text AS sample_interval_unit, i.sample_interval_value,
+       i.generated_from_capture_groups, i.just_in_time, i.generation_method,
+       i.group_by, i.repository_criteria
+FROM insight_view iv
+JOIN insight_view_series ivs ON iv.id = ivs.insight_view_id
+JOIN insight_series i ON ivs.insight_series_id = i.id
+WHERE iv.unique_id = $1
+ORDER BY iv.id, i.series_id
+"#,
+    )
+    .bind(unique_id)
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(|err| err.to_string())?;
+    if rows.is_empty() {
+        return Ok(None);
+    }
+    let view_id: i32 = rows[0]
+        .try_get("view_id")
+        .map_err(|err| err.to_string())?;
+    let series = rows
+        .iter()
+        .map(mapped_series_from_row)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|err| err.to_string())?;
+    Ok(Some((view_id, series)))
+}
+
+/// `InsightPermissionsValidator.validateUserAccessForView` (`GetAll` with the
+/// actor's grants).
+async fn visible_view_exists(
+    conn: &mut sqlx::PgConnection,
+    unique_id: &str,
+    user_ids: &[i32],
+    org_ids: &[i32],
+) -> Result<bool, String> {
+    let count: i64 = sqlx::query_scalar(
+        r#"
+SELECT COUNT(DISTINCT iv.unique_id)
+FROM insight_view iv
+JOIN insight_view_series ivs ON iv.id = ivs.insight_view_id
+JOIN insight_series i ON ivs.insight_series_id = i.id
+WHERE (iv.id IN (
+           SELECT div.insight_view_id
+           FROM dashboard_insight_view div
+           JOIN dashboard db ON db.id = div.dashboard_id
+           WHERE db.deleted_at IS NULL
+             AND db.id IN (
+                 SELECT dashboard_id FROM dashboard_grants
+                 WHERE org_id = ANY($1) OR user_id = ANY($2) OR global IS TRUE))
+       OR iv.id IN (
+           SELECT insight_view_id FROM insight_view_grants
+           WHERE org_id = ANY($1) OR user_id = ANY($2) OR global IS TRUE))
+  AND iv.unique_id = $3
+"#,
+    )
+    .bind(org_ids)
+    .bind(user_ids)
+    .bind(unique_id)
+    .fetch_one(&mut *conn)
+    .await
+    .map_err(|err| err.to_string())?;
+    Ok(count > 0)
+}
+
+async fn create_view(
+    conn: &mut sqlx::PgConnection,
+    title: &str,
+    unique_id: &str,
+    filters: &InsightViewFilters,
+    other_threshold: Option<f64>,
+    presentation_type: &str,
+) -> Result<i32, String> {
+    sqlx::query_scalar(
+        r#"
+INSERT INTO insight_view (title, description, unique_id, default_filter_include_repo_regex,
+                          default_filter_exclude_repo_regex, default_filter_search_contexts,
+                          other_threshold, presentation_type)
+VALUES ($1, '', $2, $3, $4, $5, $6, $7::presentation_type_enum)
+RETURNING id
+"#,
+    )
+    .bind(title)
+    .bind(unique_id)
+    .bind(&filters.include_repo_regex)
+    .bind(&filters.exclude_repo_regex)
+    .bind(&filters.search_contexts)
+    .bind(other_threshold)
+    .bind(presentation_type)
+    .fetch_one(&mut *conn)
+    .await
+    .map_err(|err| err.to_string())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn update_view(
+    conn: &mut sqlx::PgConnection,
+    unique_id: &str,
+    title: &str,
+    filters: &InsightViewFilters,
+    other_threshold: Option<f64>,
+    presentation_type: &str,
+    sort_mode: Option<&str>,
+    sort_direction: Option<&str>,
+    limit: Option<i32>,
+    num_samples: Option<i32>,
+) -> Result<i32, String> {
+    sqlx::query_scalar(
+        r#"
+UPDATE insight_view
+SET title = $1, description = '', default_filter_include_repo_regex = $2,
+    default_filter_exclude_repo_regex = $3, default_filter_search_contexts = $4,
+    other_threshold = $5, presentation_type = $6::presentation_type_enum,
+    series_sort_mode = $7::series_sort_mode_enum,
+    series_sort_direction = $8::series_sort_direction_enum,
+    series_limit = $9, series_num_samples = $10
+WHERE unique_id = $11
+RETURNING id
+"#,
+    )
+    .bind(title)
+    .bind(&filters.include_repo_regex)
+    .bind(&filters.exclude_repo_regex)
+    .bind(&filters.search_contexts)
+    .bind(other_threshold)
+    .bind(presentation_type)
+    .bind(sort_mode)
+    .bind(sort_direction)
+    .bind(limit)
+    .bind(num_samples)
+    .bind(unique_id)
+    .fetch_one(&mut *conn)
+    .await
+    .map_err(|err| err.to_string())
+}
+
+async fn add_view_grant(
+    conn: &mut sqlx::PgConnection,
+    view_id: i32,
+    uid: i32,
+) -> Result<(), String> {
+    sqlx::query(
+        "INSERT INTO insight_view_grants (insight_view_id, org_id, user_id, global) VALUES ($1, NULL, $2, NULL)",
+    )
+    .bind(view_id)
+    .bind(uid)
+    .execute(&mut *conn)
+    .await
+    .map_err(|err| err.to_string())?;
+    Ok(())
+}
+
+async fn set_series_enabled(
+    conn: &mut sqlx::PgConnection,
+    series_id: &str,
+    enabled: bool,
+) -> Result<(), String> {
+    if enabled {
+        sqlx::query("UPDATE insight_series SET deleted_at = NULL WHERE series_id = $1")
+            .bind(series_id)
+            .execute(&mut *conn)
+            .await
+            .map_err(|err| err.to_string())?;
+    } else {
+        sqlx::query("UPDATE insight_series SET deleted_at = $2 WHERE series_id = $1")
+            .bind(series_id)
+            .bind(now_primitive())
+            .execute(&mut *conn)
+            .await
+            .map_err(|err| err.to_string())?;
+    }
+    Ok(())
+}
+
+async fn attach_series_to_view(
+    conn: &mut sqlx::PgConnection,
+    series_pk: i32,
+    series_id: &str,
+    view_id: i32,
+    label: &str,
+    stroke: &str,
+) -> Result<(), String> {
+    sqlx::query(
+        "INSERT INTO insight_view_series (insight_series_id, insight_view_id, label, stroke) VALUES ($1, $2, $3, $4)",
+    )
+    .bind(series_pk)
+    .bind(view_id)
+    .bind(label)
+    .bind(stroke)
+    .execute(&mut *conn)
+    .await
+    .map_err(|err| err.to_string())?;
+    set_series_enabled(conn, series_id, true).await
+}
+
+async fn update_view_series_metadata(
+    conn: &mut sqlx::PgConnection,
+    series_id: &str,
+    view_id: i32,
+    label: &str,
+    stroke: &str,
+) -> Result<(), String> {
+    sqlx::query(
+        r#"
+UPDATE insight_view_series vs
+SET label = $1, stroke = $2
+FROM insight_series s
+WHERE s.series_id = $3 AND vs.insight_series_id = s.id AND vs.insight_view_id = $4
+"#,
+    )
+    .bind(label)
+    .bind(stroke)
+    .bind(series_id)
+    .bind(view_id)
+    .execute(&mut *conn)
+    .await
+    .map_err(|err| err.to_string())?;
+    Ok(())
+}
+
+async fn remove_series_from_view(
+    conn: &mut sqlx::PgConnection,
+    series_id: &str,
+    view_id: i32,
+) -> Result<(), String> {
+    sqlx::query(
+        r#"
+DELETE FROM insight_view_series vs
+USING insight_series s
+WHERE s.series_id = $1 AND vs.insight_series_id = s.id AND vs.insight_view_id = $2
+"#,
+    )
+    .bind(series_id)
+    .bind(view_id)
+    .execute(&mut *conn)
+    .await
+    .map_err(|err| err.to_string())?;
+    let references: i64 = sqlx::query_scalar(
+        r#"
+SELECT COUNT(*) FROM insight_view_series viewSeries
+INNER JOIN insight_series series ON viewSeries.insight_series_id = series.id
+WHERE series.series_id = $1
+"#,
+    )
+    .bind(series_id)
+    .fetch_one(&mut *conn)
+    .await
+    .map_err(|err| err.to_string())?;
+    if references == 0 {
+        set_series_enabled(conn, series_id, false).await?;
+    }
+    Ok(())
+}
+
+async fn find_matching_series(
+    conn: &mut sqlx::PgConnection,
+    series: &SeriesMutationInput,
+) -> Result<Option<MappedSeries>, String> {
+    let group_by = series.group_by.as_ref().map(|value| value.to_lowercase());
+    let time = series.time_scope.as_ref().expect("validated time scope");
+    let dynamic = series.generated_from_capture_groups.unwrap_or(false);
+    // NOTE: `FindMatchingSeries` does not filter `deleted_at`.
+    let rows = sqlx::query(
+        r#"
+SELECT i.id AS series_pk, i.series_id, i.query, i.repositories,
+       i.sample_interval_unit::text AS sample_interval_unit, i.sample_interval_value,
+       i.generated_from_capture_groups, i.just_in_time, i.generation_method,
+       i.group_by, i.repository_criteria,
+       COALESCE(ivs.label, '') AS label, COALESCE(ivs.stroke, '') AS stroke
+FROM insight_series i
+LEFT JOIN insight_view_series ivs ON ivs.insight_series_id = i.id
+WHERE (i.repositories = '{}' OR i.repositories IS NULL)
+  AND i.query = $1
+  AND i.sample_interval_unit = $2::time_unit
+  AND i.sample_interval_value = $3
+  AND i.generated_from_capture_groups = $4
+  AND (($5::text IS NULL AND i.group_by IS NULL) OR i.group_by = $5)
+ORDER BY i.id
+LIMIT 1
+"#,
+    )
+    .bind(&series.query)
+    .bind(&time.unit)
+    .bind(time.value)
+    .bind(dynamic)
+    .bind(&group_by)
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(|err| err.to_string())?;
+    match rows.first() {
+        Some(row) => mapped_series_from_row(row)
+            .map(Some)
+            .map_err(|err| err.to_string()),
+        None => Ok(None),
+    }
+}
+
+async fn create_series(
+    conn: &mut sqlx::PgConnection,
+    series: &SeriesMutationInput,
+) -> Result<MappedSeries, String> {
+    let now = now_primitive();
+    let time = series.time_scope.as_ref().expect("validated time scope");
+    let repositories = series
+        .repository_scope
+        .as_ref()
+        .map(|scope| scope.repositories.clone())
+        .unwrap_or_default();
+    let repository_criteria = series
+        .repository_scope
+        .as_ref()
+        .and_then(|scope| scope.repository_criteria.clone());
+    let dynamic = series.generated_from_capture_groups.unwrap_or(false);
+    let group_by = series.group_by.as_ref().map(|value| value.to_lowercase());
+    let (next_recording_after, oldest_historical_at) = if group_by.is_some() {
+        (
+            PrimitiveDateTime::new(
+                Date::from_calendar_date(9999, Month::December, 31).expect("year 9999"),
+                Time::MIDNIGHT,
+            ),
+            now,
+        )
+    } else {
+        (
+            step_forwards(now, &time.unit, time.value),
+            now - Duration::days(7 * 26),
+        )
+    };
+    let generation_method = if dynamic {
+        if group_by.is_some() {
+            "mapping-compute"
+        } else {
+            "search-compute"
+        }
+    } else {
+        "search"
+    };
+    let series_id = uuid::Uuid::new_v4().to_string();
+    let series_pk: i32 = sqlx::query_scalar(
+        r#"
+INSERT INTO insight_series (series_id, query, created_at, oldest_historical_at,
+                            last_recorded_at, next_recording_after, last_snapshot_at,
+                            next_snapshot_after, repositories, sample_interval_unit,
+                            sample_interval_value, generated_from_capture_groups, just_in_time,
+                            generation_method, group_by, needs_migration, repository_criteria)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::time_unit, $11, $12, false, $13, $14, false,
+        $15)
+RETURNING id
+"#,
+    )
+    .bind(&series_id)
+    .bind(&series.query)
+    .bind(now)
+    .bind(oldest_historical_at)
+    .bind(zero_time())
+    .bind(next_recording_after)
+    .bind(zero_time())
+    .bind(next_snapshot(now))
+    .bind(&repositories)
+    .bind(&time.unit)
+    .bind(time.value)
+    .bind(dynamic)
+    .bind(generation_method)
+    .bind(&group_by)
+    .bind(&repository_criteria)
+    .fetch_one(&mut *conn)
+    .await
+    .map_err(|err| err.to_string())?;
+    Ok(MappedSeries {
+        series_pk,
+        series_id,
+        query: series.query.clone(),
+        label: series.label.clone(),
+        stroke: series.stroke.clone(),
+        repositories,
+        sample_interval_unit: time.unit.clone(),
+        sample_interval_value: time.value,
+        generated_from_capture_groups: dynamic,
+        just_in_time: false,
+        generation_method: generation_method.to_owned(),
+        group_by,
+        repository_criteria,
+    })
+}
+
+/// `createAndAttachSeries` (`insight_view_resolvers.go:1313`).
+async fn create_and_attach_series(
+    conn: &mut sqlx::PgConnection,
+    view_id: i32,
+    series: &SeriesMutationInput,
+) -> Result<(), String> {
+    if series.group_by.is_some() || series.generated_from_capture_groups.is_some() {
+        sg_insights_query::compute::parse(&series.query)
+            .map_err(|err| format!("query validation: compute.Parse: {err}"))?;
+    } else {
+        sg_insights_query::parse_query(&series.query, "literal")
+            .map_err(|err| format!("query validation: {err}"))?;
+    }
+
+    let scope = series.repository_scope.as_ref().expect("validated scope");
+    let mut found = None;
+    if scope.repositories.is_empty() && scope.repository_criteria.is_none() {
+        found = find_matching_series(conn, series).await?;
+    }
+    let (series_pk, series_id) = match found {
+        Some(series) => (series.series_pk, series.series_id),
+        None => {
+            let created = create_series(conn, series).await?;
+            (created.series_pk, created.series_id)
+        }
+    };
+    let (label, stroke) = series_fill_metadata(series);
+    attach_series_to_view(
+        conn,
+        series_pk,
+        &series_id,
+        view_id,
+        label.as_deref().unwrap_or(""),
+        stroke.as_deref().unwrap_or(""),
+    )
+    .await
+}
+
+async fn add_views_to_dashboard(
+    conn: &mut sqlx::PgConnection,
+    dashboard_id: i32,
+    view_unique_id: &str,
+) -> Result<(), String> {
+    sqlx::query(
+        r#"
+INSERT INTO dashboard_insight_view (dashboard_id, insight_view_id)
+SELECT $1, insight_view.id FROM insight_view WHERE unique_id = $2
+ON CONFLICT DO NOTHING
+"#,
+    )
+    .bind(dashboard_id)
+    .bind(view_unique_id)
+    .execute(&mut *conn)
+    .await
+    .map_err(|err| err.to_string())?;
+    Ok(())
+}
+
+async fn validate_dashboard_permissions(
+    conn: &mut sqlx::PgConnection,
+    dashboard_ids: &[i64],
+    user_ids: &[i32],
+    org_ids: &[i32],
+) -> Result<(), String> {
+    if dashboard_ids.is_empty() {
+        return Ok(());
+    }
+    let ids: Vec<i32> = dashboard_ids.iter().map(|id| *id as i32).collect();
+    let count: i64 = sqlx::query_scalar(
+        r#"
+SELECT COUNT(DISTINCT db.id)
+FROM dashboard db
+WHERE db.id = ANY($1)
+  AND db.id IN (
+      SELECT dashboard_id FROM dashboard_grants
+      WHERE org_id = ANY($2) OR user_id = ANY($3) OR global IS TRUE)
+"#,
+    )
+    .bind(&ids)
+    .bind(org_ids)
+    .bind(user_ids)
+    .fetch_one(&mut *conn)
+    .await
+    .map_err(|err| err.to_string())?;
+    if count == dashboard_ids.len() as i64 {
+        Ok(())
+    } else {
+        Err("missing dashboard permission".to_owned())
+    }
+}
+
+/// `createInsightLicenseCheck`.
+async fn license_check(
+    conn: &mut sqlx::PgConnection,
+    licensed: bool,
+    dashboard_ids: &[i64],
+) -> Result<Option<i64>, String> {
+    if licensed {
+        return Ok(None);
+    }
+    let global_unfrozen: i64 = sqlx::query_scalar(
+        r#"
+SELECT COUNT(DISTINCT iv.id) FROM insight_view iv
+JOIN dashboard_insight_view d ON iv.id = d.insight_view_id
+JOIN dashboard_grants dg ON d.dashboard_id = dg.dashboard_id
+WHERE iv.is_frozen = FALSE AND dg.global = TRUE
+"#,
+    )
+    .fetch_one(&mut *conn)
+    .await
+    .map_err(|err| err.to_string())?;
+    if global_unfrozen >= 2 {
+        return Err(
+            "Cannot create more than 2 global insights in Limited Access Mode.".to_owned(),
+        );
+    }
+    if !dashboard_ids.is_empty() {
+        let ids: Vec<i32> = dashboard_ids.iter().map(|id| *id as i32).collect();
+        let rows = sqlx::query(
+            r#"
+SELECT db.id, BOOL_OR(dg.global IS TRUE) AS global_grant
+FROM dashboard db
+JOIN dashboard_grants dg ON db.id = dg.dashboard_id
+WHERE db.deleted_at IS NULL AND db.id = ANY($1)
+GROUP BY db.id
+"#,
+        )
+        .bind(&ids)
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(|err| err.to_string())?;
+        for row in rows {
+            let global: bool = row.try_get("global_grant").map_err(|err| err.to_string())?;
+            if !global {
+                return Err(
+                    "Cannot create an insight on a non-global dashboard in Limited Access Mode."
+                        .to_owned(),
+                );
+            }
+        }
+    }
+    let existing: Option<i32> =
+        sqlx::query_scalar("SELECT id FROM dashboard WHERE type = 'limited_access_mode' LIMIT 1")
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(|err| err.to_string())?;
+    let id = match existing {
+        Some(id) => id,
+        None => {
+            let id: i32 = sqlx::query_scalar(
+                "INSERT INTO dashboard (title, save, type) VALUES ('Limited Access Mode Dashboard', true, 'limited_access_mode') RETURNING id",
+            )
+            .fetch_one(&mut *conn)
+            .await
+            .map_err(|err| err.to_string())?;
+            sqlx::query(
+                "INSERT INTO dashboard_grants (dashboard_id, user_id, org_id, global) VALUES ($1, NULL, NULL, true)",
+            )
+            .bind(id)
+            .execute(&mut *conn)
+            .await
+            .map_err(|err| err.to_string())?;
+            id
+        }
+    };
+    sqlx::query("UPDATE dashboard SET deleted_at = NULL WHERE id = $1")
+        .bind(id)
+        .execute(&mut *conn)
+        .await
+        .map_err(|err| err.to_string())?;
+    Ok(Some(i64::from(id)))
+}
+
+async fn apply_dashboards(
+    conn: &mut sqlx::PgConnection,
+    dashboards_provided: bool,
+    dashboard_ids: &[i64],
+    view_unique_id: &str,
+    user_ids: &[i32],
+    org_ids: &[i32],
+) -> Result<(), String> {
+    if dashboard_ids.is_empty() {
+        return Ok(());
+    }
+    if dashboards_provided {
+        validate_dashboard_permissions(conn, dashboard_ids, user_ids, org_ids).await?;
+    }
+    for dashboard_id in dashboard_ids {
+        add_views_to_dashboard(conn, *dashboard_id as i32, view_unique_id).await?;
+    }
+    Ok(())
+}
+
+impl InsightsWriteDatabase for PgInsightsStore {
+    fn code_insights_licensed(&self) -> bool {
+        self.code_insights_licensed
+    }
+
+    fn actor_is_site_admin(&self, actor: Actor) -> Result<bool, String> {
+        if actor.is_internal() {
+            return Ok(true);
+        }
+        let uid = actor.uid().unwrap_or(0);
+        let pool = self.frontend_pool.as_ref().unwrap_or(&self.pool);
+        let site_admin: Option<bool> =
+            block_on(async { sqlx::query_scalar("SELECT site_admin FROM users WHERE id = $1")
+                .bind(uid)
+                .fetch_optional(pool)
+                .await })
+            .map_err(|err| err.to_string())?;
+        match site_admin {
+            None => Err("not authenticated".to_owned()),
+            Some(true) => Ok(true),
+            Some(false) => Err("must be site admin".to_owned()),
+        }
+    }
+
+    fn repositories_exist(&self, names: &[String]) -> Result<bool, String> {
+        if names.is_empty() {
+            return Ok(true);
+        }
+        let pool = self.frontend_pool.as_ref().unwrap_or(&self.pool);
+        let found: Vec<String> = block_on(async {
+            sqlx::query_scalar("SELECT name::text FROM repo WHERE name = ANY($1) AND deleted_at IS NULL")
+                .bind(names)
+                .fetch_all(pool)
+                .await
+        })
+        .map_err(|err| err.to_string())?;
+        Ok(found.len() == names.iter().collect::<std::collections::BTreeSet<_>>().len()
+            && names.iter().all(|name| found.contains(name)))
+    }
+
+    fn create_line_chart(
+        &self,
+        actor: Actor,
+        input: &LineChartMutationInput,
+    ) -> Result<String, String> {
+        let pool = self.pool.clone();
+        let licensed = self.code_insights_licensed;
+        let uid = actor.uid().unwrap_or(0);
+        let (user_ids, org_ids) = self.user_permission_ids(actor)?;
+        block_on(async move {
+            let mut tx = pool.begin().await.map_err(|err| err.to_string())?;
+            let conn = &mut *tx;
+            let mut dashboard_ids = input.dashboards.clone().unwrap_or_default();
+            if let Some(lam) = license_check(conn, licensed, &dashboard_ids)
+                .await
+                .map_err(|err| format!("createInsightLicenseCheck: {err}"))?
+            {
+                dashboard_ids.push(lam);
+            }
+            let unique_id = uuid::Uuid::new_v4().to_string();
+            let view_id = create_view(
+                conn,
+                &input.title,
+                &unique_id,
+                &input.filters,
+                None,
+                "LINE",
+            )
+            .await?;
+            add_view_grant(conn, view_id, uid).await?;
+            for series in &input.series {
+                create_and_attach_series(conn, view_id, series).await?;
+            }
+            apply_dashboards(
+                conn,
+                input.dashboards.is_some(),
+                &dashboard_ids,
+                &unique_id,
+                &user_ids,
+                &org_ids,
+            )
+            .await?;
+            tx.commit().await.map_err(|err| err.to_string())?;
+            Ok(unique_id)
+        })
+    }
+
+    fn update_line_chart(
+        &self,
+        actor: Actor,
+        unique_id: &str,
+        input: &LineChartMutationInput,
+    ) -> Result<String, String> {
+        let pool = self.pool.clone();
+        let unique_id = unique_id.to_owned();
+        let (user_ids, org_ids) = self.user_permission_ids(actor)?;
+        block_on(async move {
+            let mut tx = pool.begin().await.map_err(|err| err.to_string())?;
+            let conn = &mut *tx;
+            if !visible_view_exists(conn, &unique_id, &user_ids, &org_ids).await? {
+                return Err("insight not found".to_owned());
+            }
+            let Some((view_id, existing)) = get_mapped(conn, &unique_id).await? else {
+                return Err("No insight view found with this id".to_owned());
+            };
+            update_view(
+                conn,
+                &unique_id,
+                &input.title,
+                &input.filters,
+                None,
+                "LINE",
+                input.sort_mode.as_deref(),
+                input.sort_direction.as_deref(),
+                input.limit,
+                input.num_samples,
+            )
+            .await?;
+
+            let capture_group = input
+                .series
+                .iter()
+                .any(|series| series.generated_from_capture_groups == Some(true));
+            if capture_group {
+                update_capture_group_insight(conn, view_id, &input.series[0], &existing).await?;
+            } else {
+                update_search_or_compute_insight(conn, view_id, &input.series, &existing).await?;
+            }
+            tx.commit().await.map_err(|err| err.to_string())?;
+            Ok(unique_id)
+        })
+    }
+
+    fn create_pie_chart(
+        &self,
+        actor: Actor,
+        input: &PieChartCreateInput,
+    ) -> Result<String, String> {
+        let pool = self.pool.clone();
+        let licensed = self.code_insights_licensed;
+        let uid = actor.uid().unwrap_or(0);
+        let (user_ids, org_ids) = self.user_permission_ids(actor)?;
+        block_on(async move {
+            let mut tx = pool.begin().await.map_err(|err| err.to_string())?;
+            let conn = &mut *tx;
+            let mut dashboard_ids = input.dashboards.clone().unwrap_or_default();
+            if let Some(lam) = license_check(conn, licensed, &dashboard_ids)
+                .await
+                .map_err(|err| format!("createInsightLicenseCheck: {err}"))?
+            {
+                dashboard_ids.push(lam);
+            }
+            let unique_id = uuid::Uuid::new_v4().to_string();
+            let filters = InsightViewFilters::default();
+            let view_id = create_view(
+                conn,
+                &input.title,
+                &unique_id,
+                &filters,
+                Some(input.other_threshold),
+                "PIE",
+            )
+            .await?;
+            add_view_grant(conn, view_id, uid).await?;
+
+            let series_id = uuid::Uuid::new_v4().to_string();
+            let now = now_primitive();
+            let series_pk: i32 = sqlx::query_scalar(
+                r#"
+INSERT INTO insight_series (series_id, query, created_at, oldest_historical_at,
+                            last_recorded_at, next_recording_after, last_snapshot_at,
+                            next_snapshot_after, repositories, sample_interval_unit,
+                            sample_interval_value, generated_from_capture_groups, just_in_time,
+                            generation_method, group_by, needs_migration, repository_criteria)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'MONTH'::time_unit, 0, false, $10,
+        'language-stats', NULL, false, NULL)
+RETURNING id
+"#,
+            )
+            .bind(&series_id)
+            .bind(&input.query)
+            .bind(now)
+            .bind(now - Duration::days(7 * 26))
+            .bind(zero_time())
+            .bind(now)
+            .bind(zero_time())
+            .bind(next_snapshot(now))
+            .bind(&input.repositories)
+            .bind(!input.repositories.is_empty())
+            .fetch_one(&mut *conn)
+            .await
+            .map_err(|err| err.to_string())?;
+            attach_series_to_view(conn, series_pk, &series_id, view_id, "", "").await?;
+
+            apply_dashboards(
+                conn,
+                input.dashboards.is_some(),
+                &dashboard_ids,
+                &unique_id,
+                &user_ids,
+                &org_ids,
+            )
+            .await?;
+            tx.commit().await.map_err(|err| err.to_string())?;
+            Ok(unique_id)
+        })
+    }
+
+    fn update_pie_chart(
+        &self,
+        actor: Actor,
+        unique_id: &str,
+        input: &PieChartUpdateInput,
+    ) -> Result<String, String> {
+        let pool = self.pool.clone();
+        let unique_id = unique_id.to_owned();
+        let (user_ids, org_ids) = self.user_permission_ids(actor)?;
+        block_on(async move {
+            let mut tx = pool.begin().await.map_err(|err| err.to_string())?;
+            let conn = &mut *tx;
+            if !visible_view_exists(conn, &unique_id, &user_ids, &org_ids).await? {
+                return Err("insight not found".to_owned());
+            }
+            let Some((_view_id, existing)) = get_mapped(conn, &unique_id).await? else {
+                return Err("No insight view found with this id".to_owned());
+            };
+            if existing.is_empty() {
+                return Err(
+                    "No matching series found for this view. The view data may be corrupted."
+                        .to_owned(),
+                );
+            }
+            let filters = InsightViewFilters::default();
+            update_view(
+                conn,
+                &unique_id,
+                &input.title,
+                &filters,
+                Some(input.other_threshold),
+                "PIE",
+                None,
+                None,
+                None,
+                None,
+            )
+            .await?;
+            // BUG parity: `UpdateFrontendSeriesArgs` leaves `StepIntervalValue`
+            // zero and does not update `repository_criteria`.
+            sqlx::query(
+                r#"
+UPDATE insight_series
+SET query = $1, repositories = $2, sample_interval_unit = 'MONTH'::time_unit,
+    sample_interval_value = 0, group_by = NULL
+WHERE series_id = $3
+"#,
+            )
+            .bind(&input.query)
+            .bind(&input.repositories)
+            .bind(&existing[0].series_id)
+            .execute(&mut *conn)
+            .await
+            .map_err(|err| err.to_string())?;
+            tx.commit().await.map_err(|err| err.to_string())?;
+            Ok(unique_id)
+        })
+    }
+
+    fn delete_insight_view(&self, actor: Actor, unique_id: &str) -> Result<(), String> {
+        let pool = self.pool.clone();
+        let unique_id = unique_id.to_owned();
+        let (user_ids, org_ids) = self.user_permission_ids(actor)?;
+        block_on(async move {
+            let mut connection = pool.acquire().await.map_err(|err| err.to_string())?;
+            let conn = &mut *connection;
+            if !visible_view_exists(conn, &unique_id, &user_ids, &org_ids).await? {
+                return Err("insight not found".to_owned());
+            }
+            let Some((view_id, series)) = get_mapped(conn, &unique_id).await? else {
+                return Err("Insight not found.".to_owned());
+            };
+            // `len(insights) != 1`: `GetMapped` returns at most one view row set.
+            let _ = view_id;
+            if series.is_empty() {
+                return Err("Insight not found.".to_owned());
+            }
+            for item in &series {
+                remove_series_from_view(conn, &item.series_id, view_id).await?;
+            }
+            sqlx::query("DELETE FROM insight_view WHERE unique_id = $1")
+                .bind(&unique_id)
+                .execute(&mut *conn)
+                .await
+                .map_err(|err| err.to_string())?;
+            Ok(())
+        })
+    }
+
+    fn save_insight_as_new_view(
+        &self,
+        actor: Actor,
+        input: &SaveAsNewViewInput,
+    ) -> Result<String, String> {
+        let pool = self.pool.clone();
+        let licensed = self.code_insights_licensed;
+        let uid = actor.uid().unwrap_or(0);
+        let unique_id = input.unique_id.clone();
+        let input = input.clone();
+        let (user_ids, org_ids) = self.user_permission_ids(actor)?;
+        block_on(async move {
+            let mut tx = pool.begin().await.map_err(|err| err.to_string())?;
+            let conn = &mut *tx;
+            if !visible_view_exists(conn, &unique_id, &user_ids, &org_ids).await? {
+                return Err("insight not found".to_owned());
+            }
+            let mut dashboard_ids: Vec<i64> = input.dashboard.into_iter().collect();
+            if let Some(lam) = license_check(conn, licensed, &dashboard_ids)
+                .await
+                .map_err(|err| format!("createInsightLicenseCheck: {err}"))?
+            {
+                dashboard_ids.push(lam);
+            }
+            let Some((_view_id, existing)) = get_mapped(conn, &unique_id).await? else {
+                return Err("No insight view found with this id".to_owned());
+            };
+            let new_unique_id = uuid::Uuid::new_v4().to_string();
+            let filters = input.filters.unwrap_or_default();
+            let view_id = create_view(
+                conn,
+                &input.title,
+                &new_unique_id,
+                &filters,
+                None,
+                "LINE",
+            )
+            .await?;
+            add_view_grant(conn, view_id, uid).await?;
+            for series in &existing {
+                attach_series_to_view(
+                    conn,
+                    series.series_pk,
+                    &series.series_id,
+                    view_id,
+                    &series.label,
+                    &series.stroke,
+                )
+                .await?;
+            }
+            apply_dashboards(
+                conn,
+                input.dashboard.is_some(),
+                &dashboard_ids,
+                &new_unique_id,
+                &user_ids,
+                &org_ids,
+            )
+            .await?;
+            tx.commit().await.map_err(|err| err.to_string())?;
+            Ok(new_unique_id)
+        })
+    }
+
+    fn update_insight_series(
+        &self,
+        actor: Actor,
+        series_id: &str,
+        enabled: Option<bool>,
+    ) -> Result<InsightSeriesMetadataData, String> {
+        self.actor_is_site_admin(actor)?;
+        let pool = self.pool.clone();
+        let series_id = series_id.to_owned();
+        block_on(async move {
+            let mut connection = pool.acquire().await.map_err(|err| err.to_string())?;
+            let conn = &mut *connection;
+            if let Some(enabled) = enabled {
+                set_series_enabled(conn, &series_id, enabled).await?;
+            }
+            let row = sqlx::query(
+                r#"
+SELECT series_id, query, (CASE WHEN deleted_at IS NULL THEN TRUE ELSE FALSE END) AS enabled
+FROM insight_series
+WHERE series_id = $1
+"#,
+            )
+            .bind(&series_id)
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(|err| err.to_string())?;
+            let Some(row) = row else {
+                return Err(format!("unable to fetch series with series_id: {series_id}"));
+            };
+            Ok(InsightSeriesMetadataData {
+                series_id: row.try_get("series_id").map_err(|err| err.to_string())?,
+                query: row.try_get("query").map_err(|err| err.to_string())?,
+                enabled: row.try_get("enabled").map_err(|err| err.to_string())?,
+            })
+        })
+    }
+
+    fn insight_series_query_status(
+        &self,
+        actor: Actor,
+    ) -> Result<Vec<InsightSeriesQueryStatusData>, String> {
+        self.actor_is_site_admin(actor)?;
+        let pool = self.pool.clone();
+        let queue_pool = self.frontend_pool.clone().unwrap_or_else(|| pool.clone());
+        block_on(async move {
+            let mut connection = pool.acquire().await.map_err(|err| err.to_string())?;
+            let conn = &mut *connection;
+            let statuses = sqlx::query(
+                r#"
+SELECT series_id,
+       SUM(CASE WHEN state = 'errored' THEN 1 ELSE 0 END) AS errored,
+       SUM(CASE WHEN state = 'processing' THEN 1 ELSE 0 END) AS processing,
+       SUM(CASE WHEN state = 'failed' THEN 1 ELSE 0 END) AS failed,
+       SUM(CASE WHEN state = 'completed' THEN 1 ELSE 0 END) AS completed,
+       SUM(CASE WHEN state = 'queued' THEN 1 ELSE 0 END) AS queued
+FROM insights_query_runner_jobs
+GROUP BY series_id
+ORDER BY series_id
+"#,
+            )
+            .fetch_all(&queue_pool)
+            .await
+            .map_err(|err| err.to_string())?;
+            let metadata = sqlx::query(
+                r#"
+SELECT series_id, query, (CASE WHEN deleted_at IS NULL THEN TRUE ELSE FALSE END) AS enabled
+FROM insight_series
+"#,
+            )
+            .fetch_all(&mut *conn)
+            .await
+            .map_err(|err| err.to_string())?;
+            let mut by_id: std::collections::HashMap<String, (String, bool)> =
+                std::collections::HashMap::new();
+            for row in &metadata {
+                by_id.insert(
+                    row.try_get("series_id").map_err(|err| err.to_string())?,
+                    (
+                        row.try_get("query").map_err(|err| err.to_string())?,
+                        row.try_get("enabled").map_err(|err| err.to_string())?,
+                    ),
+                );
+            }
+            let mut result = Vec::with_capacity(statuses.len());
+            for row in &statuses {
+                let series_id: String = row.try_get("series_id").map_err(|err| err.to_string())?;
+                let (query, enabled) = by_id
+                    .get(&series_id)
+                    .cloned()
+                    .unwrap_or_else(|| (String::new(), false));
+                result.push(InsightSeriesQueryStatusData {
+                    series_id,
+                    query,
+                    enabled,
+                    errored: row.try_get::<i64, _>("errored").unwrap_or(0) as i32,
+                    completed: row.try_get::<i64, _>("completed").unwrap_or(0) as i32,
+                    processing: row.try_get::<i64, _>("processing").unwrap_or(0) as i32,
+                    failed: row.try_get::<i64, _>("failed").unwrap_or(0) as i32,
+                    queued: row.try_get::<i64, _>("queued").unwrap_or(0) as i32,
+                });
+            }
+            Ok(result)
+        })
+    }
+}
+
+async fn update_capture_group_insight(
+    conn: &mut sqlx::PgConnection,
+    view_id: i32,
+    input: &SeriesMutationInput,
+    existing: &[MappedSeries],
+) -> Result<(), String> {
+    if existing.is_empty() {
+        create_and_attach_series(conn, view_id, input).await
+    } else if input.has_changed(&existing[0].data()) {
+        remove_series_from_view(conn, &existing[0].series_id, view_id).await?;
+        create_and_attach_series(conn, view_id, input).await
+    } else {
+        update_view_series_metadata(conn, &existing[0].series_id, view_id, &input.label, &input.stroke)
+            .await
+    }
+}
+
+async fn update_search_or_compute_insight(
+    conn: &mut sqlx::PgConnection,
+    view_id: i32,
+    input: &[SeriesMutationInput],
+    existing: &[MappedSeries],
+) -> Result<(), String> {
+    let input_ids: std::collections::BTreeSet<&str> = input
+        .iter()
+        .filter_map(|series| series.series_id.as_deref())
+        .collect();
+    let mut by_id: std::collections::HashMap<&str, &MappedSeries> =
+        std::collections::HashMap::new();
+    for old in existing {
+        if input_ids.contains(old.series_id.as_str()) {
+            by_id.insert(old.series_id.as_str(), old);
+        } else {
+            remove_series_from_view(conn, &old.series_id, view_id).await?;
+        }
+    }
+    for series in input {
+        match series.series_id.as_deref() {
+            None => create_and_attach_series(conn, view_id, series).await?,
+            Some(id) => match by_id.get(id) {
+                Some(old) if series.has_changed(&old.data()) => {
+                    remove_series_from_view(conn, id, view_id).await?;
+                    create_and_attach_series(conn, view_id, series).await?;
+                }
+                Some(_) => {
+                    update_view_series_metadata(conn, id, view_id, &series.label, &series.stroke)
+                        .await?;
+                }
+                None => create_and_attach_series(conn, view_id, series).await?,
+            },
+        }
+    }
+    Ok(())
 }
 
 struct DashboardRow {
