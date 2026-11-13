@@ -119,6 +119,78 @@ FROM github_app_installs
 WHERE app_id = $1
 "#;
 
+const SELECT_APP_BY_DOMAIN_KIND_QUERY: &str = r#"
+SELECT
+    id,
+    app_id,
+    name,
+    base_url,
+    client_secret,
+    private_key,
+    encryption_key_id,
+    logo IS NOT NULL AS logo_present
+FROM github_apps
+WHERE domain = $1
+  AND kind = $2
+  AND trim(trailing '/' from base_url) = trim(trailing '/' from $3)
+LIMIT 1
+"#;
+
+/// `gitHubAppsStore.GetByDomainAndKind` (`store.go:430-433`): the first app
+/// matching `domain = ? AND kind = ? AND trim(trailing '/' from base_url) = ?`.
+///
+/// The baseline's `get` has no `ORDER BY`; `LIMIT 1` matches its
+/// `ScanFirstGitHubApp` and keeps the result deterministic. The private key is
+/// returned encrypted; callers with a keyring decrypt it.
+pub async fn get_by_domain_and_kind(
+    pool: &PgPool,
+    domain: &str,
+    kind: &str,
+    base_url: &str,
+) -> Result<Option<GitHubApp>, String> {
+    let rows = sqlx::query(SELECT_APP_BY_DOMAIN_KIND_QUERY)
+        .bind(domain)
+        .bind(kind)
+        .bind(base_url)
+        .fetch_all(pool)
+        .await
+        .map_err(|err| err.to_string())?;
+    rows.first().map(scan_app).transpose()
+}
+
+const SELECT_INSTALL_ID_QUERY: &str = r#"
+SELECT installation_id
+FROM github_app_installs
+JOIN github_apps ON github_app_installs.app_id = github_apps.id
+WHERE github_apps.app_id = $1
+  AND LOWER(github_app_installs.account_login) = $2
+ORDER BY github_app_installs.id DESC
+LIMIT 1
+"#;
+
+/// `gitHubAppsStore.GetInstallID` (`store.go:324-334`): the newest
+/// installation of the GitHub App (`github_apps.app_id`, not the row id) whose
+/// lowercased `account_login` matches `account`.
+pub async fn get_install_id(
+    pool: &PgPool,
+    app_id: i32,
+    account: &str,
+) -> Result<Option<i32>, String> {
+    let row = sqlx::query(SELECT_INSTALL_ID_QUERY)
+        .bind(app_id)
+        .bind(account.to_ascii_lowercase())
+        .fetch_optional(pool)
+        .await
+        .map_err(|err| err.to_string())?;
+    match row {
+        Some(row) => Ok(Some(
+            row.try_get("installation_id")
+                .map_err(|err| err.to_string())?,
+        )),
+        None => Ok(None),
+    }
+}
+
 /// `gitHubAppsStore.GetInstallations`: installations for the database app
 /// row id.
 pub async fn get_installations(

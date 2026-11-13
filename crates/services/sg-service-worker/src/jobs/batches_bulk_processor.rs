@@ -839,7 +839,11 @@ impl ConfigChangesetSourceProvider {
     pub fn from_deps(pool: PgPool, keyring: Arc<sg_keyring::Keyring>) -> Self {
         Self::new(
             pool.clone(),
-            Arc::new(PgSourceConfigProvider::new(pool.clone(), keyring)),
+            Arc::new(PgSourceConfigProvider::new(
+                pool.clone(),
+                keyring,
+                Arc::new(ReqwestHttpDoer::new()),
+            )),
             Arc::new(ReqwestHttpDoer::new()),
             Arc::new(PgChangesetMetadataResolver::new(pool.clone())),
             Arc::new(EmptyChangesetEventProvider),

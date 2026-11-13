@@ -30,9 +30,10 @@ use sg_db::offset_to_system_time;
 use sg_db::repos::{Repo, RepoStore};
 use sg_extsvc::batches_sources::{
     abbreviate_ref, ensure_ref_prefix, is_batches_source_kind, new_source,
-    source_connection_from_config, Changeset as SourceChangesetInner,
-    ChangesetMetadata as SourceChangesetMetadata, ChangesetSource, ExternalRepoSpec,
-    Repo as SourceRepo, RepoSource, SourceErrorKind,
+    resolve_runtime_changeset_source_connection, BatchesGitHubAppStore,
+    Changeset as SourceChangesetInner, ChangesetMetadata as SourceChangesetMetadata,
+    ChangesetSource, ExternalRepoSpec, GitHubAppTokenSeams, Repo as SourceRepo, RepoSource,
+    RuntimeSourceRequest, SourceErrorKind, AUTHENTICATION_STRATEGY_USER_CREDENTIAL,
 };
 use sqlx::types::time::OffsetDateTime;
 use sqlx::PgPool;
@@ -894,6 +895,59 @@ pub struct PgChangesetSourceFactory {
     pool: PgPool,
     keyring: Arc<sg_keyring::Keyring>,
     http: Arc<dyn sg_extsvc::HttpDoer>,
+    /// `github_apps`/`github_app_installs` store used when the runtime selects
+    /// `GITHUB_APP`; `None` keeps the config/PAT connection.
+    github_app_store: Option<Arc<dyn BatchesGitHubAppStore>>,
+    /// Installation-token cache + HTTP doer for the App authenticator.
+    github_app_seams: GitHubAppTokenSeams,
+}
+
+/// `github_apps.Store` adapter for runtime GitHub App authentication (syncer).
+///
+/// Reads the existing `github_apps`/`github_app_installs` rows and decrypts
+/// the App private key with the site `GitHubAppKey`. No table/column/key is
+/// added.
+pub struct PgBatchesGitHubAppStore {
+    pool: PgPool,
+    keyring: Arc<sg_keyring::Keyring>,
+}
+
+impl PgBatchesGitHubAppStore {
+    pub fn new(pool: PgPool, keyring: Arc<sg_keyring::Keyring>) -> Self {
+        Self { pool, keyring }
+    }
+}
+
+#[async_trait]
+impl BatchesGitHubAppStore for PgBatchesGitHubAppStore {
+    async fn get_by_domain_and_kind(
+        &self,
+        domain: &str,
+        kind: &str,
+        base_url: &str,
+    ) -> Result<sg_extsvc::batches_sources::BatchesGitHubApp, String> {
+        let app = sg_db::github_apps::get_by_domain_and_kind(&self.pool, domain, kind, base_url)
+            .await?
+            .ok_or_else(|| "no app exists matching criteria".to_owned())?;
+        let private_key = sg_encryption::maybe_decrypt(
+            self.keyring.github_app_key().as_deref(),
+            &app.private_key,
+            &app.encryption_key_id,
+        )
+        .await
+        .map_err(|err| err.to_string())?;
+        Ok(sg_extsvc::batches_sources::BatchesGitHubApp {
+            app_id: app.app_id,
+            private_key,
+            base_url: app.base_url,
+        })
+    }
+
+    async fn get_install_id(&self, app_id: i32, account: &str) -> Result<i32, String> {
+        sg_db::github_apps::get_install_id(&self.pool, app_id, account)
+            .await?
+            .ok_or_else(|| "no installation found".to_owned())
+    }
 }
 
 /// An external service selected for a changeset repository
@@ -915,8 +969,30 @@ impl PgChangesetSourceFactory {
         Self {
             pool,
             keyring,
-            http,
+            http: Arc::clone(&http),
+            github_app_store: None,
+            github_app_seams: GitHubAppTokenSeams::offline(http),
         }
+    }
+
+    /// Enable `GITHUB_APP` runtime authentication for this factory. The store
+    /// reads the existing `github_apps`/`github_app_installs` rows.
+    pub fn with_github_app_store(
+        mut self,
+        store: Arc<dyn BatchesGitHubAppStore>,
+    ) -> Self {
+        self.github_app_store = Some(store);
+        self
+    }
+
+    /// Inject the installation-token cache (the baseline's Redis-backed
+    /// `GitHubAppKey` cache); the HTTP doer defaults to the factory's.
+    pub fn with_github_app_cache(
+        mut self,
+        cache: Arc<dyn sg_extsvc::auth::InstallationTokenCache>,
+    ) -> Self {
+        self.github_app_seams.cache = Some(cache);
+        self
     }
 
     /// `loadExternalService`: the first live external service of the
@@ -967,8 +1043,24 @@ impl PgChangesetSourceFactory {
                     service.id
                 )
             })?;
-            let connection = source_connection_from_config(&service.kind, &config)
-                .map_err(|err| format!("loading external service: {}", err.message))?;
+            // `sourcer.ForChangeset` with `AuthenticationStrategyUserCredential`:
+            // keep the config-derived site/PAT connection, but route through
+            // the M9.32b resolver so a `GITHUB_APP` runtime selection reuses
+            // the same path.
+            let connection = resolve_runtime_changeset_source_connection(
+                RuntimeSourceRequest {
+                    external_service_kind: &service.kind,
+                    config: &config,
+                    strategy: AUTHENTICATION_STRATEGY_USER_CREDENTIAL,
+                    github_app_kind: None,
+                    account: "",
+                    as_non_credential: false,
+                },
+                self.github_app_store.as_deref(),
+                self.github_app_seams.clone(),
+            )
+            .await
+            .map_err(|err| format!("loading external service: {}", err.message))?;
             return Ok(SelectedExternalService {
                 id: service.id,
                 kind: service.kind,

@@ -4096,6 +4096,225 @@ pub async fn resolve_changeset_source_connection(
     })
 }
 
+// ---------------------------------------------------------------------------
+// M9.33b runtime caller wiring (`internal/batches/syncer`,
+// `internal/batches/reconciler/executor.go`)
+// ---------------------------------------------------------------------------
+
+/// `sources.AuthenticationStrategyUserCredential`.
+pub const AUTHENTICATION_STRATEGY_USER_CREDENTIAL: &str = "USER_CREDENTIAL";
+/// `sources.AuthenticationStrategyGitHubApp`.
+pub const AUTHENTICATION_STRATEGY_GITHUB_APP: &str = "GITHUB_APP";
+/// `ghtypes.CommitSigningGitHubAppKind`.
+pub const COMMIT_SIGNING_GITHUB_APP_KIND: &str = "COMMIT_SIGNING";
+/// `createChangesetSourceForGHApp`'s strategy guard.
+pub const COMMIT_SIGNING_ONLY_GITHUB_APPS: &str =
+    "commit signing is only supported for GitHub apps";
+/// `runAfterCommit`'s message when commit signing is required but absent.
+pub const NO_APP_TO_SIGN_COMMIT: &str =
+    "no GitHub App configured to sign commit, rejecting unverified commit";
+/// `runAfterCommit`'s wrapper for non-`ErrNoGitHubAppConfigured` failures.
+pub const GET_COMMIT_SIGNING_APP_FAILED: &str = "failed to get GitHub App for commit verification";
+/// `changesetSpecForkNamespaceUser`: the sentinel meaning "fork into the
+/// current user's namespace", which `GetForkNamespace` maps back to `nil`.
+pub const FORK_NAMESPACE_USER: &str = "<user>";
+
+/// The inputs of a runtime `Sourcer.ForChangeset` call (`SourcerOpts`).
+#[derive(Debug, Clone)]
+pub struct RuntimeSourceRequest<'a> {
+    pub external_service_kind: &'a str,
+    pub config: &'a Value,
+    pub strategy: &'a str,
+    pub github_app_kind: Option<&'a str>,
+    pub account: &'a str,
+    /// `SourcerOpts.AsNonCredential`: build the source without a user/site
+    /// credential and authenticate through the GitHub App.
+    pub as_non_credential: bool,
+}
+
+/// Runtime source selection shared by the batches syncer and reconciler.
+///
+/// * `as_non_credential` forces the GitHub App path and rejects any other
+///   strategy with `"commit signing is only supported for GitHub apps"`.
+/// * Everything else delegates to [`resolve_changeset_source_connection`]
+///   (M9.32b): `GITHUB_APP` takes priority, `USER_CREDENTIAL` keeps the
+///   config-derived site/PAT connection.
+pub async fn resolve_runtime_changeset_source_connection(
+    request: RuntimeSourceRequest<'_>,
+    store: Option<&dyn BatchesGitHubAppStore>,
+    seams: GitHubAppTokenSeams,
+) -> Result<SourceConnection, SourceError> {
+    if request.as_non_credential && request.strategy != AUTHENTICATION_STRATEGY_GITHUB_APP {
+        return Err(SourceError::other(COMMIT_SIGNING_ONLY_GITHUB_APPS));
+    }
+    resolve_changeset_source_connection(
+        request.external_service_kind,
+        request.config,
+        request.strategy,
+        request.github_app_kind,
+        request.account,
+        store,
+        seams,
+    )
+    .await
+}
+
+/// `github.SplitRepositoryNameWithOwner`.
+pub fn split_repository_name_with_owner(
+    name_with_owner: &str,
+) -> Result<(String, String), SourceError> {
+    let mut parts = name_with_owner.splitn(2, '/');
+    let owner = parts.next().unwrap_or_default();
+    let name = parts.next();
+    match name {
+        Some(name) if !name.contains('/') && !owner.is_empty() && !name.is_empty() => {
+            Ok((owner.to_owned(), name.to_owned()))
+        }
+        _ => Err(SourceError::other(format!(
+            "invalid GitHub repository \"owner/name\" string: {name_with_owner:?}"
+        ))),
+    }
+}
+
+/// `sources.getOwnerFromChangeset`: the account namespace whose GitHub App
+/// installation signs/creates the changeset.
+///
+/// * fork with an explicit namespace → that namespace (`<user>` counts as
+///   implicit);
+/// * fork without one → the target repo's clone-URL owner;
+/// * otherwise → the target repo metadata's `NameWithOwner` / `name_with_owner`.
+pub fn changeset_owner_from_changeset(
+    target_repo: &Repo,
+    spec: Option<&ChangesetSpec>,
+) -> Result<String, SourceError> {
+    let spec = spec
+        .ok_or_else(|| SourceError::other("getting changeset spec: changeset spec not found"))?;
+
+    if spec.is_fork() {
+        if let Some(namespace) = spec.fork_namespace() {
+            if namespace != FORK_NAMESPACE_USER {
+                return Ok(namespace.clone());
+            }
+        }
+        let clone_url = get_clone_url(target_repo)
+            .map_err(|err| err.with_prefix("getting url for forked changeset"))?;
+        let path = clone_url.path().trim_start_matches('/');
+        split_repository_name_with_owner(path)
+            .map(|(owner, _)| owner)
+            .map_err(|err| err.with_prefix("getting owner from repo name"))
+    } else {
+        let name_with_owner = target_repo
+            .metadata
+            .get("NameWithOwner")
+            .or_else(|| target_repo.metadata.get("name_with_owner"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        split_repository_name_with_owner(name_with_owner)
+            .map(|(owner, _)| owner)
+            .map_err(|err| err.with_prefix("getting owner from repo name"))
+    }
+}
+
+/// Result of `executor.runAfterCommit`'s GitHub App resolution step.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CommitSigningResolution {
+    /// A `GITHUB_APP`-authenticated source for `COMMIT_SIGNING`.
+    UseSource(SourceConnection),
+    /// `ErrNoGitHubAppConfigured` and `reject_unverified` is off: warn/noop.
+    SkipNoApp,
+    /// Any other resolution error and `reject_unverified` is off: log/noop.
+    SkipError(String),
+}
+
+/// Inputs of `executor.runAfterCommit`.
+#[derive(Debug, Clone)]
+pub struct CommitSigningRequest<'a> {
+    pub external_service_kind: &'a str,
+    pub config: &'a Value,
+    /// Owner resolved by [`changeset_owner_from_changeset`].
+    pub account: &'a str,
+    /// The strategy used for the original push; when it was not `GITHUB_APP`
+    /// the signing source is built without a credential (`AsNonCredential`).
+    pub original_strategy: &'a str,
+    pub reject_unverified: bool,
+}
+
+/// `runAfterCommit`'s source-resolution semantics, without the gitserver push
+/// or the REST duplicate (both remain seams).
+///
+/// `ErrNoGitHubAppConfigured` is a no-op unless `reject_unverified` is set;
+/// any other error is likewise only fatal when rejecting. On success the
+/// caller is expected to duplicate the commit through the signed source.
+pub async fn resolve_commit_signing_source(
+    request: CommitSigningRequest<'_>,
+    store: Option<&dyn BatchesGitHubAppStore>,
+    seams: GitHubAppTokenSeams,
+) -> Result<CommitSigningResolution, SourceError> {
+    let resolution = resolve_runtime_changeset_source_connection(
+        RuntimeSourceRequest {
+            external_service_kind: request.external_service_kind,
+            config: request.config,
+            strategy: AUTHENTICATION_STRATEGY_GITHUB_APP,
+            github_app_kind: Some(COMMIT_SIGNING_GITHUB_APP_KIND),
+            account: request.account,
+            as_non_credential: request.original_strategy != AUTHENTICATION_STRATEGY_GITHUB_APP,
+        },
+        store,
+        seams,
+    )
+    .await;
+
+    match resolution {
+        Ok(connection) => Ok(CommitSigningResolution::UseSource(connection)),
+        Err(err) if err.message == NO_GITHUB_APP_CONFIGURED => {
+            if request.reject_unverified {
+                Err(SourceError::other(NO_APP_TO_SIGN_COMMIT))
+            } else {
+                Ok(CommitSigningResolution::SkipNoApp)
+            }
+        }
+        Err(err) => {
+            if request.reject_unverified {
+                Err(err.with_prefix(GET_COMMIT_SIGNING_APP_FAILED))
+            } else {
+                Ok(CommitSigningResolution::SkipError(err.message))
+            }
+        }
+    }
+}
+
+/// `sources.GitserverPushConfig`'s authenticator dispatch: the push credential
+/// derived from a resolved source connection.
+///
+/// GitHub App installation tokens are read from the currently-held token; the
+/// baseline refreshes inside `GitserverPushConfig`, which needs a mutable
+/// authenticator and is therefore left to the push seam.
+pub fn push_authenticator_for_source_auth(auth: &SourceAuth) -> Option<PushAuthenticator> {
+    match auth {
+        SourceAuth::None => None,
+        SourceAuth::OAuthToken(token) | SourceAuth::GitLabPrivateToken(token) => {
+            Some(PushAuthenticator::OAuthBearerToken {
+                token: token.clone(),
+            })
+        }
+        SourceAuth::BearerToken(token) => Some(PushAuthenticator::OAuthBearerToken {
+            token: token.clone(),
+        }),
+        SourceAuth::Basic {
+            username,
+            password,
+        } => Some(PushAuthenticator::BasicAuth {
+            username: username.clone(),
+            password: password.clone(),
+        }),
+        SourceAuth::GitHubAppInstallation(auth) => {
+            Some(PushAuthenticator::GitHubAppInstallationToken {
+                token: auth.get_token().token,
+            })
+        }
+    }
+}
+
 /// Exposed for the differential harness: merge-request probe used by
 /// `loadChangeset` returning the normalized metadata for a fixture.
 pub async fn probe_load(
