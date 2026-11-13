@@ -2677,6 +2677,7 @@ impl FrontendRootResolver {
                     crate::executor_secrets_graphql::ExecutorSecretRoots::default(),
                 saved_searches: None,
                 code_monitors: None,
+                codeintel_uploads: None,
                 batches: None,
                 github_apps: None,
                 teams: None,
@@ -2856,6 +2857,15 @@ impl FrontendRootResolver {
         let nested = Arc::make_mut(&mut self.query.nested);
         nested.code_monitors =
             code_monitors.map(crate::code_monitors_graphql::CodeMonitorsHandleWrapper);
+        self
+    }
+
+    /// Attach the optional code-intel uploads database (M9.27d).
+    pub fn with_codeintel_uploads(
+        mut self,
+        codeintel_uploads: Option<crate::codeintel_uploads_graphql::CodeIntelUploadsHandle>,
+    ) -> Self {
+        self.query.codeintel_uploads = codeintel_uploads;
         self
     }
 
@@ -3191,6 +3201,10 @@ struct QueryRoot {
     /// Optional Teams surface (M9.27a). `None` keeps `Query.team`/`teams` and
     /// `node(Team)` unported.
     teams: Option<crate::teams_graphql::TeamsHandle>,
+    /// Optional code-intel uploads database (M9.27d). `None` means
+    /// `codeintel.autoindexing.graphql` was not appended and
+    /// `Query.preciseIndexes` is absent.
+    codeintel_uploads: Option<crate::codeintel_uploads_graphql::CodeIntelUploadsHandle>,
 }
 
 /// `Mutation` root: `settingsMutation`/log events/temporary settings/feature
@@ -4833,6 +4847,20 @@ impl ObjectValue for QueryRoot {
             {
                 crate::github_apps_graphql::root_field(
                     self.github_apps.as_ref().expect("checked github apps"),
+                    field,
+                    arguments,
+                    actor,
+                )
+            }
+            // `UploadsServiceResolver` root field (`Query.preciseIndexes`,
+            // M9.27d).
+            _ if self.codeintel_uploads.is_some()
+                && crate::codeintel_uploads_graphql::is_root_field(field) =>
+            {
+                crate::codeintel_uploads_graphql::root_field(
+                    self.codeintel_uploads
+                        .as_ref()
+                        .expect("checked codeintel uploads"),
                     field,
                     arguments,
                     actor,

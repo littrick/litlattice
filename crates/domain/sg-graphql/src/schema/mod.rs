@@ -47,8 +47,9 @@ pub mod sdl;
 /// optional M9.13a documents (`code_monitors.graphql` then
 /// `saved_searches.graphql`, the order `NewSchema` appends them in).
 pub use sdl::{
-    BATCHES_SCHEMA, CODE_MONITORS_SCHEMA, GITHUB_APPS_SCHEMA, MAIN_SCHEMA,
-    OUTBOUND_WEBHOOKS_SCHEMA, SAVED_SEARCHES_SCHEMA, VIEWER_SCHEMA,
+    BATCHES_SCHEMA, CODEINTEL_AUTOINDEXING_SCHEMA, CODEINTEL_POLICIES_SCHEMA,
+    CODE_MONITORS_SCHEMA, GITHUB_APPS_SCHEMA, MAIN_SCHEMA, OUTBOUND_WEBHOOKS_SCHEMA,
+    SAVED_SEARCHES_SCHEMA, VIEWER_SCHEMA,
 };
 
 /// Built-in scalars provided by the GraphQL runtime (graph-gophers preloads
