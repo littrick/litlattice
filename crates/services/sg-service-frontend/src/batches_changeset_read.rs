@@ -54,7 +54,7 @@ use crate::git_commit_extra::{
     ComparisonData, FileDiffConnectionObject, RepositoryComparisonObject,
 };
 use crate::git_comparison_graphql::NewFileSource;
-use crate::git_graphql::GitObjectSource;
+use crate::git_graphql::{GitObjectSource, GitPrefetch};
 use crate::graphql_resolvers::{
     datetime_rfc3339, PageInfoObject, RepositoryData, RepositoryObject,
 };
@@ -157,6 +157,16 @@ pub struct CodeHostRow {
     pub has_webhooks: bool,
 }
 
+/// The richer `Changeset.diff` comparison result (M9.33d): the eager
+/// [`ComparisonData`] plus the gitserver content prefetch backing
+/// `oldFile`/`newFile`, and the source used to compute
+/// `RepositoryComparison.commits` lazily.
+pub struct ChangesetComparison {
+    pub data: ComparisonData,
+    pub git: Option<Arc<GitPrefetch>>,
+    pub source: Option<Arc<dyn GitObjectSource>>,
+}
+
 /// Synchronous gitserver seam for `Changeset.diff`.
 ///
 /// `comparison` backs `NewRepositoryComparison`; `preview` backs
@@ -175,6 +185,35 @@ pub trait ChangesetDiffSource: Send + Sync {
         base_rev: &str,
         patch: &[u8],
     ) -> Result<PreviewComparisonObject, String>;
+
+    /// M9.33d production path: like [`Self::comparison`], but also carries the
+    /// prefetched `oldFile`/`newFile` contents and the gitserver source for the
+    /// lazy `RepositoryComparison.commits` connection. The default keeps the
+    /// existing fixture sources working with the plain comparison.
+    fn comparison_with_git(
+        &self,
+        repo: &MinimalRepo,
+        base_revspec: &str,
+        head_revspec: &str,
+    ) -> Result<ChangesetComparison, String> {
+        Ok(ChangesetComparison {
+            data: self.comparison(repo, base_revspec, head_revspec)?,
+            git: None,
+            source: None,
+        })
+    }
+
+    /// M9.33d production path: like [`Self::preview`], but resolves the
+    /// `oldFile` contents through gitserver and derives each `newFile` with
+    /// `applyPatch`.
+    fn preview_with_git(
+        &self,
+        repo: &MinimalRepo,
+        base_rev: &str,
+        patch: &[u8],
+    ) -> Result<PreviewComparisonObject, String> {
+        self.preview(repo, base_rev, patch)
+    }
 }
 
 /// Production [`ChangesetDiffSource`] over the shared [`GitObjectSource`]
@@ -290,6 +329,51 @@ impl GitserverChangesetDiffSource {
         })
     }
 
+    /// M9.33d: the same comparison plus the `oldFile`/`newFile` content
+    /// prefetch (`FileDiff.oldFile.content` reads the base OID, `newFile` the
+    /// head OID) and the source for the lazy `commits` connection.
+    async fn comparison_with_git_async(
+        &self,
+        repo: &MinimalRepo,
+        base_revspec: &str,
+        head_revspec: &str,
+    ) -> Result<ChangesetComparison, String> {
+        let data = self.comparison_async(repo, base_revspec, head_revspec).await?;
+        let mut prefetch = GitPrefetch::default();
+        if let Some(Ok(files)) = &data.file_diffs {
+            for file in files {
+                if let (Some(path), Some(oid)) = (
+                    crate::git_comparison_graphql::diff_path(&file.orig_name),
+                    &data.base_oid,
+                ) {
+                    crate::git_comparison_graphql::ensure_content(
+                        self.objects.as_ref(),
+                        &mut prefetch,
+                        repo,
+                        oid,
+                        &path,
+                    )
+                    .await;
+                }
+                if let Some(path) = crate::git_comparison_graphql::diff_path(&file.new_name) {
+                    crate::git_comparison_graphql::ensure_content(
+                        self.objects.as_ref(),
+                        &mut prefetch,
+                        repo,
+                        &data.head_oid,
+                        &path,
+                    )
+                    .await;
+                }
+            }
+        }
+        Ok(ChangesetComparison {
+            data,
+            git: Some(Arc::new(prefetch)),
+            source: Some(self.objects.clone()),
+        })
+    }
+
     async fn preview_async(
         &self,
         repo: &MinimalRepo,
@@ -304,6 +388,36 @@ impl GitserverChangesetDiffSource {
             repo: repo.clone(),
             commit_oid,
             file_diffs,
+            preview: None,
+            git: None,
+        })
+    }
+
+    /// M9.33d: `previewNewFile`'s content. Reuse the shared production
+    /// `new_preview_repository_comparison`, which reads each `oldFile` through
+    /// gitserver `ReadFile` at the resolved base commit and derives the new
+    /// content with `applyPatch`.
+    async fn preview_with_git_async(
+        &self,
+        repo: &MinimalRepo,
+        base_rev: &str,
+        patch: &[u8],
+    ) -> Result<PreviewComparisonObject, String> {
+        let mut prefetch = GitPrefetch::default();
+        let rich = crate::git_comparison_graphql::new_preview_repository_comparison(
+            self.objects.as_ref(),
+            &mut prefetch,
+            repo,
+            base_rev,
+            patch,
+        )
+        .await?;
+        Ok(PreviewComparisonObject {
+            repo: rich.repo,
+            commit_oid: rich.commit_oid,
+            file_diffs: rich.file_diffs,
+            preview: Some(rich.preview),
+            git: Some(Arc::new(prefetch)),
         })
     }
 }
@@ -327,6 +441,26 @@ impl ChangesetDiffSource for GitserverChangesetDiffSource {
         patch: &[u8],
     ) -> Result<PreviewComparisonObject, String> {
         crate::batches_graphql_store::block_on(self.preview_async(repo, base_rev, patch))
+    }
+
+    fn comparison_with_git(
+        &self,
+        repo: &MinimalRepo,
+        base_revspec: &str,
+        head_revspec: &str,
+    ) -> Result<ChangesetComparison, String> {
+        crate::batches_graphql_store::block_on(
+            self.comparison_with_git_async(repo, base_revspec, head_revspec),
+        )
+    }
+
+    fn preview_with_git(
+        &self,
+        repo: &MinimalRepo,
+        base_rev: &str,
+        patch: &[u8],
+    ) -> Result<PreviewComparisonObject, String> {
+        crate::batches_graphql_store::block_on(self.preview_with_git_async(repo, base_rev, patch))
     }
 }
 
@@ -814,6 +948,12 @@ pub struct PreviewComparisonObject {
     pub repo: MinimalRepo,
     pub commit_oid: String,
     pub file_diffs: Vec<FileDiff>,
+    /// M9.33d: the patched `newFile` contents (`applyPatch` over the gitserver
+    /// `oldFile` reads). `None` keeps the pre-M9.33d tree-backed behaviour used
+    /// by the existing read fixture.
+    pub preview: Option<Arc<crate::git_comparison_graphql::PreviewData>>,
+    /// M9.33d: the gitserver content prefetch backing `oldFile`.
+    pub git: Option<Arc<GitPrefetch>>,
 }
 
 impl ObjectValue for PreviewComparisonObject {
@@ -829,7 +969,8 @@ impl ObjectValue for PreviewComparisonObject {
     ) -> Result<Option<FieldValue>, ExecError> {
         match field {
             "baseRepository" => Ok(Some(FieldValue::Object(Arc::new(
-                RepositoryObject::from_data(repository_data(&self.repo)),
+                RepositoryObject::from_data(repository_data(&self.repo))
+                    .with_git(self.git.clone()),
             )))),
             "fileDiffs" => Ok(Some(FieldValue::Object(Arc::new(FileDiffConnectionObject {
                 repo: self.repo.clone(),
@@ -838,8 +979,11 @@ impl ObjectValue for PreviewComparisonObject {
                 after: arguments.string("after").map(str::to_owned),
                 base_oid: Some(self.commit_oid.clone()),
                 head_oid: self.commit_oid.clone(),
-                new_file: NewFileSource::Tree,
-                git: None,
+                new_file: match &self.preview {
+                    Some(preview) => NewFileSource::Preview(preview.clone()),
+                    None => NewFileSource::Tree,
+                },
+                git: self.git.clone(),
             })))),
             _ => Ok(None),
         }
@@ -893,7 +1037,7 @@ fn changeset_diff_field(object: &ChangesetObject) -> Result<Option<FieldValue>, 
             return Ok(Some(FieldValue::Null));
         };
         let preview = source
-            .preview(&minimal_repo(repo), &spec.base_rev, &spec.diff)
+            .preview_with_git(&minimal_repo(repo), &spec.base_rev, &spec.diff)
             .map_err(ExecError::new)?;
         return Ok(Some(FieldValue::Object(Arc::new(preview))));
     }
@@ -919,14 +1063,15 @@ fn changeset_diff_field(object: &ChangesetObject) -> Result<Option<FieldValue>, 
     let Some(source) = read_db.changeset_diff_source() else {
         return Ok(Some(FieldValue::Null));
     };
-    let data = source
-        .comparison(&minimal_repo(repo), &base, &head)
+    let comparison = source
+        .comparison_with_git(&minimal_repo(repo), &base, &head)
         .map_err(ExecError::new)?;
     Ok(Some(FieldValue::Object(Arc::new(
         RepositoryComparisonObject {
             repo: minimal_repo(repo),
-            data,
-            git: None,
+            data: comparison.data,
+            git: comparison.git,
+            commits_source: comparison.source,
         },
     ))))
 }
@@ -1819,4 +1964,80 @@ pub fn code_hosts_connection_field(
 /// Whether `field` is a root field owned by this module.
 pub fn is_root_field(field: &str) -> bool {
     matches!(field, "globalChangesetsStats" | "batchChangesCodeHosts")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use async_trait::async_trait;
+    use sg_git::{CommitDetails, GitObject};
+
+    use crate::git_graphql::GitSourceError;
+
+    /// `GitObjectSource` with one base file; `RepositoryComparison`/preview
+    /// only need `ResolveRevision` + `ReadFile`.
+    struct FakeObjects;
+
+    #[async_trait]
+    impl GitObjectSource for FakeObjects {
+        async fn resolve_revision(
+            &self,
+            _repo_id: i32,
+            _repo_name: &str,
+            rev: &str,
+        ) -> Result<String, GitSourceError> {
+            Ok(rev.to_owned())
+        }
+
+        async fn get_commit(
+            &self,
+            _repo_id: i32,
+            _repo_name: &str,
+            _oid: &str,
+        ) -> Result<CommitDetails, GitSourceError> {
+            Err(GitSourceError::new("get_commit is not used"))
+        }
+
+        async fn get_object(
+            &self,
+            _repo_id: i32,
+            _repo_name: &str,
+            _revspec: &str,
+        ) -> Result<GitObject, GitSourceError> {
+            Err(GitSourceError::new("get_object is not used"))
+        }
+
+        async fn read_file(
+            &self,
+            _repo_id: i32,
+            _repo_name: &str,
+            _oid: &str,
+            path: &str,
+        ) -> Result<Vec<u8>, GitSourceError> {
+            match path {
+                "a.txt" => Ok(b"keep\nold\n".to_vec()),
+                _ => Ok(Vec::new()),
+            }
+        }
+    }
+
+    /// M9.33d: the batches preview reads `oldFile` through the gitserver seam
+    /// and derives `newFile` with `applyPatch`. This is the path used by
+    /// `ChangesetSpec.description.diff`, whose Go baseline hardcodes a
+    /// `gitserver.NewClient` (covered here through the seam instead).
+    #[test]
+    fn preview_with_git_applies_patch_over_gitserver_content() {
+        let source = GitserverChangesetDiffSource::new(Arc::new(FakeObjects));
+        let repo = MinimalRepo {
+            id: 1,
+            name: "example.com/r".to_owned(),
+        };
+        let patch = b"diff --git a.txt a.txt\n--- a.txt\n+++ a.txt\n@@ -1,2 +1,3 @@\n keep\n-old\n+new\n";
+        let preview = source.preview_with_git(&repo, "base", patch).expect("preview");
+        assert_eq!(preview.commit_oid, "base");
+        assert!(preview.git.is_some());
+        let data = preview.preview.expect("preview data");
+        assert_eq!(data.content("a.txt").expect("content"), "keep\nnew\n");
+    }
 }

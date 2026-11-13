@@ -1648,7 +1648,7 @@ impl ObjectValue for GitBranchChangesetDescriptionObject {
                     name: self.repo.name.clone(),
                 };
                 let preview = source
-                    .preview(
+                    .preview_with_git(
                         &repo,
                         self.row.base_rev.as_deref().unwrap_or_default(),
                         &self.row.diff,

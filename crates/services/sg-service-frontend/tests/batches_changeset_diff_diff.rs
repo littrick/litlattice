@@ -31,7 +31,7 @@ use sqlx::postgres::PgPoolOptions;
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
-use sg_git::{CommitDetails, CommitsOptions, GitObject, RawDiffOptions};
+use sg_git::{CommitDetails, CommitSignature, CommitsOptions, GitObject, RawDiffOptions};
 use sg_graphql::exec::{execute_with, Actor, ExecRequest};
 use sg_graphql::schema::{
     assemble, BATCHES_SCHEMA, GITHUB_APPS_SCHEMA, MAIN_SCHEMA, OUTBOUND_WEBHOOKS_SCHEMA,
@@ -69,6 +69,42 @@ diff --git docs/guide.md docs/guide.md
 /// base (empty for `nombase-*`), and `git diff` returns [`COMPARISON_DIFF`].
 struct FakeGitObjects;
 
+/// Base file contents returned by the fake `ReadFile`; same map as the Go
+/// oracle's `NewFileReaderFunc`.
+fn file_content(path: &str) -> &'static str {
+    match path {
+        "README.md" => "line one\nline two\n",
+        "docs/guide.md" => "header\n\nold line\ncontext\n",
+        "hello.txt" => "line one\nold line\n",
+        _ => "",
+    }
+}
+
+/// The commit sequence both sides return; `path` filters like a real `git log`
+/// and `max_commits == 0` means "no limit" (Go `CommitsOptions.N`).
+fn commits_for(path: &str, max_commits: u32) -> Vec<CommitDetails> {
+    let mut oids = vec!["commit-1", "commit-2", "commit-3"];
+    if !path.is_empty() {
+        oids = vec!["commit-3"];
+    }
+    if max_commits > 0 && oids.len() > max_commits as usize {
+        oids.truncate(max_commits as usize);
+    }
+    oids.into_iter()
+        .map(|oid| CommitDetails {
+            oid: oid.to_owned(),
+            parents: Vec::new(),
+            author: CommitSignature {
+                name: "Alice".to_owned(),
+                email: "alice@example.com".to_owned(),
+                date: None,
+            },
+            committer: None,
+            message: format!("{oid} message\n"),
+        })
+        .collect()
+}
+
 #[async_trait]
 impl GitObjectSource for FakeGitObjects {
     async fn resolve_revision(
@@ -77,12 +113,24 @@ impl GitObjectSource for FakeGitObjects {
         _repo_name: &str,
         rev: &str,
     ) -> Result<String, GitSourceError> {
-        if rev.contains("missing") {
+        if rev.contains("missing") || rev.starts_with("base-932066..") {
             return Err(GitSourceError::revision_not_found(format!(
                 "revision not found: {rev}"
             )));
         }
         Ok(rev.to_owned())
+    }
+
+    /// M9.33d: file contents backing `oldFile`/`newFile` and the preview
+    /// `applyPatch`. Mirrors the Go oracle's `NewFileReaderFunc`.
+    async fn read_file(
+        &self,
+        _repo_id: i32,
+        _repo_name: &str,
+        _oid: &str,
+        path: &str,
+    ) -> Result<Vec<u8>, GitSourceError> {
+        Ok(file_content(path).to_owned().into_bytes())
     }
 
     async fn get_commit(
@@ -136,9 +184,9 @@ impl GitCommitExtraSource for FakeGitObjects {
         &self,
         _repo_id: i32,
         _repo_name: &str,
-        _options: &CommitsOptions,
+        options: &CommitsOptions,
     ) -> Result<Vec<CommitDetails>, GitSourceError> {
-        Err(GitSourceError::new("commit_log is not used by Changeset.diff"))
+        Ok(commits_for(&options.path, options.max_commits))
     }
 }
 

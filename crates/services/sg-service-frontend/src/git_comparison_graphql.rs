@@ -380,7 +380,7 @@ async fn compute_repository_comparison(
 // FileDiff content / highlight prefetch (shared with `GitCommit.diff`)
 // ---------------------------------------------------------------------------
 
-async fn ensure_content(
+pub(crate) async fn ensure_content(
     source: &dyn GitObjectSource,
     prefetch: &mut GitPrefetch,
     repo: &MinimalRepo,

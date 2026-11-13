@@ -101,6 +101,8 @@ impl ChangesetDiffSource for FixtureDiffSource {
             repo: repo.clone(),
             commit_oid: base_rev.to_owned(),
             file_diffs: files,
+            preview: None,
+            git: None,
         })
     }
 }
