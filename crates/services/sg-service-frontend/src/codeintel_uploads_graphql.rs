@@ -616,6 +616,33 @@ pub fn root_field(
     }
 }
 
+/// `NewCodeIntelIndexerResolver(name, imageName)` (`indexer_resolver.go:19`),
+/// used by the autoindexing `AutoIndexJobDescription.indexer` field.
+pub fn indexer_field(indexer: &str, image_name: Option<String>) -> FieldValue {
+    FieldValue::Object(Arc::new(CodeIntelIndexerObject {
+        indexer: indexer_from_name(indexer),
+        image_name,
+    }))
+}
+
+/// `NewAutoIndexJobStepsResolver` (`index_steps_resolver.go:13`): the same
+/// `IndexSteps` shape the uploads surface serves, built from the job's
+/// pre-index steps, local steps, indexer arguments and outfile.
+pub fn steps_field_from_auto_index_job(job: &AutoIndexJobRow) -> FieldValue {
+    FieldValue::Object(Arc::new(IndexStepsObject { job: job.clone() }))
+}
+
+/// `PreciseIndexResolverFactory.Create(..., &index)` for the jobs returned by
+/// `queueAutoIndexJobsForRepo` (`root_resolver_inference.go:117`).
+pub fn precise_index_from_auto_index_job(job: AutoIndexJobRow) -> FieldValue {
+    FieldValue::Object(Arc::new(PreciseIndexObject {
+        record: PreciseIndexRecord {
+            upload: None,
+            index: Some(job),
+        },
+    }))
+}
+
 // ---------------------------------------------------------------------------
 // Objects
 // ---------------------------------------------------------------------------

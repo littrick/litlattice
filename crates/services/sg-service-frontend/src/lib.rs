@@ -36,6 +36,8 @@ pub mod client_configuration;
 pub mod clone_urls;
 pub mod code_monitors_graphql;
 pub mod code_monitors_graphql_store;
+pub mod codeintel_autoindexing_graphql;
+pub mod codeintel_autoindexing_graphql_store;
 pub mod codeintel_uploads_graphql;
 pub mod codeintel_uploads_graphql_store;
 pub mod codemonitors_search;

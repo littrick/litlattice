@@ -4391,6 +4391,7 @@ dependencies = [
  "sg-jsonx",
  "sg-keyring",
  "sg-licensing",
+ "sg-luasandbox",
  "sg-metrics",
  "sg-proto",
  "sg-rcache",

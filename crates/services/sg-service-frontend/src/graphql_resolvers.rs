@@ -2678,6 +2678,7 @@ impl FrontendRootResolver {
                 saved_searches: None,
                 code_monitors: None,
                 codeintel_uploads: None,
+                codeintel_autoindexing: None,
                 batches: None,
                 github_apps: None,
                 teams: None,
@@ -2877,6 +2878,18 @@ impl FrontendRootResolver {
         codeintel_uploads: Option<crate::codeintel_uploads_graphql::CodeIntelUploadsHandle>,
     ) -> Self {
         self.query.codeintel_uploads = codeintel_uploads;
+        self
+    }
+
+    /// Attach the optional code-intel autoindexing database (M9.28b).
+    pub fn with_codeintel_autoindexing(
+        mut self,
+        codeintel_autoindexing: Option<
+            crate::codeintel_autoindexing_graphql::CodeIntelAutoindexingHandle,
+        >,
+    ) -> Self {
+        self.query.codeintel_autoindexing = codeintel_autoindexing.clone();
+        self.mutation.codeintel_autoindexing = codeintel_autoindexing;
         self
     }
 
@@ -3216,6 +3229,10 @@ struct QueryRoot {
     /// `codeintel.autoindexing.graphql` was not appended and
     /// `Query.preciseIndexes` is absent.
     codeintel_uploads: Option<crate::codeintel_uploads_graphql::CodeIntelUploadsHandle>,
+    /// Optional code-intel autoindexing database (M9.28b). `None` keeps the
+    /// autoindexing root fields and `Repository.indexConfiguration` unported.
+    codeintel_autoindexing:
+        Option<crate::codeintel_autoindexing_graphql::CodeIntelAutoindexingHandle>,
     /// Optional outbound webhook surface (M9.27b). `None` leaves
     /// `Query.outboundWebhooks` / `outboundWebhookEventTypes` and
     /// `node(OutboundWebhook)` unported.
@@ -3270,6 +3287,9 @@ pub struct MutationRoot {
     github_apps_http: Option<Arc<dyn crate::github_oauth::GithubHttpTransport>>,
     /// Optional outbound webhook mutations (M9.27b).
     outbound_webhooks: Option<crate::outbound_webhooks_graphql::OutboundWebhooksHandle>,
+    /// Optional code-intel autoindexing mutations (M9.28b).
+    codeintel_autoindexing:
+        Option<crate::codeintel_autoindexing_graphql::CodeIntelAutoindexingHandle>,
 }
 
 impl MutationRoot {
@@ -3388,6 +3408,17 @@ impl ObjectValue for MutationRoot {
                 return crate::github_apps_graphql::mutation_field(
                     github_apps,
                     self.github_apps_http.as_deref(),
+                    field,
+                    arguments,
+                    actor,
+                );
+            }
+        }
+        // M9.28b Code Intel autoindexing mutations.
+        if let Some(codeintel_autoindexing) = &self.codeintel_autoindexing {
+            if crate::codeintel_autoindexing_graphql::is_mutation_field(field) {
+                return crate::codeintel_autoindexing_graphql::mutation_field(
+                    codeintel_autoindexing,
                     field,
                     arguments,
                     actor,
@@ -3664,7 +3695,8 @@ impl QueryRoot {
                         RepositoryObject::from_data(data.clone())
                             .with_git(self.git.clone())
                             .with_embeddings(self.nested.repo_embeddings.clone())
-                            .with_inventory_d(Some(self.inventory.graphql_d.clone())),
+                            .with_inventory_d(Some(self.inventory.graphql_d.clone()))
+                            .with_autoindexing(self.codeintel_autoindexing.clone()),
                     )))),
                     Some(RepoLookup::NotFound) => Ok(Some(FieldValue::Null)),
                     Some(RepoLookup::Blocked { name, reason }) => Err(ExecError::new(format!(
@@ -4171,6 +4203,7 @@ impl ObjectValue for QueryRoot {
                         if let Some(batches) = self.batches.clone() {
                             object = object.with_batches(batches);
                         }
+                        object = object.with_autoindexing(self.codeintel_autoindexing.clone());
                         Ok(Some(FieldValue::Object(Arc::new(object))))
                     }
                     Some(RepoLookup::NotFound) => Ok(Some(FieldValue::Null)),
@@ -4192,6 +4225,7 @@ impl ObjectValue for QueryRoot {
                             if let Some(batches) = self.batches.clone() {
                                 object = object.with_batches(batches);
                             }
+                            object = object.with_autoindexing(self.codeintel_autoindexing.clone());
                             Ok(Some(FieldValue::Object(Arc::new(object))))
                         }
                         Some(RepoLookup::NotFound) => Ok(Some(FieldValue::Null)),
@@ -4216,7 +4250,8 @@ impl ObjectValue for QueryRoot {
                         RepositoryObject::from_data(data.clone())
                             .with_git(self.git.clone())
                             .with_embeddings(self.nested.repo_embeddings.clone())
-                            .with_inventory_d(Some(self.inventory.graphql_d.clone())),
+                            .with_inventory_d(Some(self.inventory.graphql_d.clone()))
+                            .with_autoindexing(self.codeintel_autoindexing.clone()),
                     )))),
                     Some(RepoLookup::NotFound) => Ok(Some(FieldValue::Null)),
                     Some(RepoLookup::Blocked { name, reason }) => Err(ExecError::new(format!(
@@ -4235,7 +4270,8 @@ impl ObjectValue for QueryRoot {
                             RepositoryObject::from_data(data.clone())
                                 .with_git(self.git.clone())
                                 .with_embeddings(self.nested.repo_embeddings.clone())
-                                .with_inventory_d(Some(self.inventory.graphql_d.clone())),
+                                .with_inventory_d(Some(self.inventory.graphql_d.clone()))
+                            .with_autoindexing(self.codeintel_autoindexing.clone()),
                         )))),
                         Some(RepoLookup::NotFound) => Ok(Some(FieldValue::Null)),
                         Some(RepoLookup::Blocked { name, reason }) => Err(ExecError::new(format!(
@@ -4903,6 +4939,21 @@ impl ObjectValue for QueryRoot {
                     self.codeintel_uploads
                         .as_ref()
                         .expect("checked codeintel uploads"),
+                    field,
+                    arguments,
+                    actor,
+                )
+            }
+            // Code Intel autoindexing root fields
+            // (`Query.codeIntelligenceInferenceScript` /
+            // `Query.inferAutoIndexJobsForRepo`, M9.28b).
+            _ if self.codeintel_autoindexing.is_some()
+                && crate::codeintel_autoindexing_graphql::is_root_field(field) =>
+            {
+                crate::codeintel_autoindexing_graphql::root_field(
+                    self.codeintel_autoindexing
+                        .as_ref()
+                        .expect("checked codeintel autoindexing"),
                     field,
                     arguments,
                     actor,
@@ -6585,6 +6636,11 @@ pub struct RepositoryObject {
     /// The Batch Changes read surface (M9.24c); `None` leaves
     /// `Repository.batchChanges` unported.
     batches: Option<crate::batches_graphql::BatchesHandleWrapper>,
+    /// The Code Intel autoindexing surface (M9.28b); `None` leaves
+    /// `Repository.indexConfiguration` unported.
+    autoindexing: Option<
+        crate::codeintel_autoindexing_graphql::CodeIntelAutoindexingHandleWrapper,
+    >,
 }
 
 impl RepositoryObject {
@@ -6595,12 +6651,26 @@ impl RepositoryObject {
             embeddings: None,
             inventory_d: None,
             batches: None,
+            autoindexing: None,
         }
     }
 
     /// Attach the Batch Changes read surface (M9.24c).
     pub fn with_batches(mut self, batches: crate::batches_graphql::BatchesHandle) -> Self {
         self.batches = Some(crate::batches_graphql::BatchesHandleWrapper(batches));
+        self
+    }
+
+    /// Attach the Code Intel autoindexing surface (M9.28b).
+    pub fn with_autoindexing(
+        mut self,
+        autoindexing: Option<
+            crate::codeintel_autoindexing_graphql::CodeIntelAutoindexingHandle,
+        >,
+    ) -> Self {
+        self.autoindexing = autoindexing.map(
+            crate::codeintel_autoindexing_graphql::CodeIntelAutoindexingHandleWrapper,
+        );
         self
     }
 
@@ -6655,6 +6725,17 @@ impl ObjectValue for RepositoryObject {
         actor: Actor,
     ) -> Result<Option<FieldValue>, ExecError> {
         match field {
+            // `Repository.indexConfiguration` (M9.28b).
+            "indexConfiguration" => match &self.autoindexing {
+                Some(db) => crate::codeintel_autoindexing_graphql::repository_field(
+                    &db.0,
+                    self.data.id,
+                    field,
+                    arguments,
+                    actor,
+                ),
+                None => Ok(None),
+            },
             // `RepositoryResolver.BatchChanges` (M9.24c).
             "batchChanges" => match &self.batches {
                 Some(batches) => crate::batches_graphql::repository_batch_changes(
