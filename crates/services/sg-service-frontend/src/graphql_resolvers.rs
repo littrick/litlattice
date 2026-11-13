@@ -3342,7 +3342,7 @@ pub struct MutationRoot {
     codeintel_policies: Option<crate::codeintel_policies_graphql::CodeIntelPoliciesHandle>,
     /// Optional Notebooks mutations (M9.29a).
     notebooks: Option<crate::notebooks_graphql::NotebooksHandle>,
-    /// Optional Code Insights dashboard mutations (M9.30a).
+    /// Optional Code Insights dashboard and view/series mutations (M9.30a/b).
     insights: Option<crate::insights_graphql::InsightsHandle>,
 }
 
@@ -3530,6 +3530,7 @@ impl ObjectValue for MutationRoot {
             }
         }
         // M9.30a Code Insights dashboard mutations.
+    // M9.30b Code Insights view/series mutations.
         if let Some(insights) = &self.insights {
             if crate::insights_graphql::is_mutation_field(field) {
                 return crate::insights_graphql::mutation_field(
