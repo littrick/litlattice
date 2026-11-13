@@ -36,7 +36,7 @@ use sg_graphql::Json;
 use sg_service_frontend::codeintel_uploads_graphql::{
     code_intel_summary, delete_precise_index, delete_precise_indexes, indexer_keys,
     precise_index_by_id, precise_indexes, reindex_precise_index, reindex_precise_indexes,
-    CodeIntelUploadsHandle,
+    repository_code_intel_summary, CodeIntelUploadsHandle,
 };
 use sg_service_frontend::codeintel_uploads_graphql_store::PgCodeIntelUploadsStore;
 
@@ -74,6 +74,8 @@ struct Case {
     dependent_of: Option<String>,
     #[serde(default)]
     include_deleted: Option<bool>,
+    #[serde(default)]
+    matches_only: Option<bool>,
 }
 
 fn case_kind(case: &Case) -> &str {
@@ -137,6 +139,28 @@ fn arguments_for(case: &Case) -> Arguments {
                 push("id", InputValue::Str(id.clone()));
             }
         }
+        "retentionPolicyOverview" => {
+            if let Some(id) = &case.id {
+                push("id", InputValue::Str(id.clone()));
+            }
+            if let Some(first) = case.first {
+                push("first", InputValue::Int(first));
+            }
+            if let Some(after) = &case.after {
+                push("after", InputValue::Str(after.clone()));
+            }
+            if let Some(query) = &case.query {
+                push("query", InputValue::Str(query.clone()));
+            }
+            if let Some(matches_only) = case.matches_only {
+                push("matchesOnly", InputValue::Bool(matches_only));
+            }
+        }
+        "repositorySummary" => {
+            if let Some(repository) = &case.repository {
+                push("repository", InputValue::Str(repository.clone()));
+            }
+        }
         "deletePreciseIndex" | "reindexPreciseIndex" => {
             if let Some(id) = &case.id {
                 push("id", InputValue::Str(id.clone()));
@@ -190,9 +214,45 @@ fn fields_for(type_name: &str) -> Option<&'static [&'static str]> {
             "shouldReindex",
             "isLatestForRepo",
             "indexer",
+            "projectRoot",
+            "tags",
+            "retentionPolicyOverview",
             "steps",
             "auditLogs",
         ]),
+        "CodeIntelGitTree" => Some(&["path", "name", "url", "commit", "repository"]),
+        "CodeIntelCommit" => Some(&["oid", "url", "repository"]),
+        "CodeIntelligenceRetentionPolicyMatchesConnection" => {
+            Some(&["nodes", "totalCount", "pageInfo"])
+        }
+        "CodeIntelligenceRetentionPolicyMatch" => {
+            Some(&["configurationPolicy", "matches", "protectingCommits"])
+        }
+        "CodeIntelligenceConfigurationPolicy" => Some(&[
+            "id",
+            "name",
+            "repository",
+            "repositoryPatterns",
+            "type",
+            "pattern",
+            "protected",
+            "retentionEnabled",
+            "retentionDurationHours",
+            "retainIntermediateCommits",
+            "indexingEnabled",
+            "syntacticIndexingEnabled",
+            "indexCommitMaxAgeHours",
+            "indexIntermediateCommits",
+            "embeddingsEnabled",
+        ]),
+        "CodeIntelRepositorySummary" => Some(&[
+            "recentActivity",
+            "lastUploadRetentionScan",
+            "lastIndexScan",
+            "availableIndexers",
+            "limitError",
+        ]),
+        "InferredAvailableIndexers" => Some(&["indexer", "roots"]),
         "LSIFUploadAuditLog" => Some(&[
             "logTimestamp",
             "uploadDeletedAt",
@@ -271,6 +331,31 @@ fn render_field(value: FieldValue) -> Result<Value, String> {
             Ok(Value::Array(rendered))
         }
         FieldValue::Object(object) => render_object(object.as_ref()),
+    }
+}
+
+/// Resolve one field with the case arguments and render it (retention needs
+/// `first`/`after`/`query`/`matchesOnly`, the generic renderer uses defaults).
+fn render_named_field(
+    value: FieldValue,
+    field: &str,
+    arguments: &Arguments,
+) -> Result<Value, String> {
+    match value {
+        FieldValue::Object(object) => {
+            let value = object
+                .field(field, arguments, Actor::Internal)
+                .map_err(|error| error.message)?
+                .ok_or_else(|| {
+                    format!(
+                        "codeintel diff: unresolved {} field {}",
+                        object.type_name(),
+                        field
+                    )
+                })?;
+            render_field(value)
+        }
+        other => render_field(other),
     }
 }
 
@@ -356,7 +441,9 @@ async fn codeintel_uploads_graphql_harness() {
         .connect(&dsn)
         .await
         .expect("connect");
-    let handle: CodeIntelUploadsHandle = Arc::new(PgCodeIntelUploadsStore::new(pool.clone()));
+    let handle: CodeIntelUploadsHandle = Arc::new(
+        PgCodeIntelUploadsStore::new(pool.clone()).with_git(Arc::new(DiffGitObjects)),
+    );
 
     for case in &corpus.cases {
         let arguments = arguments_for(case);
@@ -419,6 +506,46 @@ async fn codeintel_uploads_graphql_harness() {
                 let outcome = reindex_precise_indexes(&handle, &arguments, Actor::Internal);
                 mutation_document(&pool, outcome.err()).await
             }
+            "retentionPolicyOverview" => {
+                match precise_index_by_id(&handle, case.id.as_deref().unwrap_or_default(), Actor::Internal) {
+                    Ok(Some(value)) => {
+                        let mut map = Map::new();
+                        map.insert(
+                            "node".to_owned(),
+                            render_field(value.clone()).unwrap_or_else(|error| {
+                                panic!("render {}: {error}", case.name);
+                            }),
+                        );
+                        map.insert(
+                            "retentionPolicyOverview".to_owned(),
+                            render_named_field(value, "retentionPolicyOverview", &arguments)
+                                .unwrap_or_else(|error| {
+                                    panic!("render {}: {error}", case.name);
+                                }),
+                        );
+                        Value::Object(map)
+                    }
+                    Ok(None) => {
+                        let mut map = Map::new();
+                        map.insert("node".to_owned(), Value::Null);
+                        Value::Object(map)
+                    }
+                    Err(error) => error_document(&error),
+                }
+            }
+            "repositorySummary" => {
+                let repository_id = case
+                    .repository
+                    .as_deref()
+                    .and_then(|value| value.parse::<i32>().ok())
+                    .unwrap_or_default();
+                match repository_code_intel_summary(&handle, repository_id, Actor::Internal) {
+                    Ok(value) => render_field(value).unwrap_or_else(|error| {
+                        panic!("render {}: {error}", case.name);
+                    }),
+                    Err(error) => error_document(&error),
+                }
+            }
             "codeIntelSummary" => {
                 match code_intel_summary(&handle, &Arguments::default(), Actor::Internal) {
                     Ok(value) => render_code_intel_summary(value, &arguments).unwrap_or_else(
@@ -432,6 +559,65 @@ async fn codeintel_uploads_graphql_harness() {
         let body = serde_json::to_string(&document).expect("serialize");
         std::fs::write(Path::new(&out).join(format!("{}.json", case.name)), &body).expect("write");
         println!("RUST {} len={}", case.name, body.len());
+    }
+}
+
+/// Mirrors the Go oracle's `gitserver.NewMockClient()` defaults
+/// (`ResolveRevision` → `("", nil)`, `ListRefs` → `(nil, nil)`).
+struct DiffGitObjects;
+
+#[async_trait::async_trait]
+impl sg_service_frontend::git_graphql::GitObjectSource for DiffGitObjects {
+    async fn resolve_revision(
+        &self,
+        _repo_id: i32,
+        _repo_name: &str,
+        rev: &str,
+    ) -> Result<String, sg_service_frontend::git_graphql::GitSourceError> {
+        // Fixture commits are canonical 40-character SHAs; the real gitserver
+        // resolves a canonical revision to itself (see the Go oracle hook).
+        Ok(rev.to_owned())
+    }
+
+    async fn get_commit(
+        &self,
+        _repo_id: i32,
+        _repo_name: &str,
+        _oid: &str,
+    ) -> Result<sg_git::CommitDetails, sg_service_frontend::git_graphql::GitSourceError> {
+        Err(sg_service_frontend::git_graphql::GitSourceError::new(
+            "DiffGitObjects::get_commit is not implemented",
+        ))
+    }
+
+    async fn get_object(
+        &self,
+        _repo_id: i32,
+        _repo_name: &str,
+        _revspec: &str,
+    ) -> Result<sg_git::GitObject, sg_service_frontend::git_graphql::GitSourceError> {
+        Err(sg_service_frontend::git_graphql::GitSourceError::new(
+            "DiffGitObjects::get_object is not implemented",
+        ))
+    }
+
+    async fn list_refs(
+        &self,
+        _repo_id: i32,
+        _repo_name: &str,
+        _heads_only: bool,
+        _tags_only: bool,
+    ) -> Result<Vec<sg_git::GitRef>, sg_service_frontend::git_graphql::GitSourceError> {
+        Ok(Vec::new())
+    }
+
+    async fn list_refs_at_commit(
+        &self,
+        _repo_id: i32,
+        _repo_name: &str,
+        _oid: &str,
+    ) -> Result<Vec<sg_git::GitRef>, sg_service_frontend::git_graphql::GitSourceError> {
+        Ok(Vec::new())
     }
 }
 

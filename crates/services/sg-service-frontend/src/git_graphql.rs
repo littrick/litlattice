@@ -223,6 +223,20 @@ pub trait GitObjectSource: Send + Sync {
         ))
     }
 
+    /// `gitserver.Client.ListRefs(TagsOnly:true, PointsAtCommit:[oid])`
+    /// (M9.30d, `gitresolvers/commit.go:58-76`). An empty result is
+    /// `Ok(vec![])`, never an error.
+    async fn list_refs_at_commit(
+        &self,
+        _repo_id: i32,
+        _repo_name: &str,
+        _oid: &str,
+    ) -> Result<Vec<sg_git::GitRef>, GitSourceError> {
+        Err(GitSourceError::new(
+            "GitObjectSource::list_refs_at_commit is not implemented",
+        ))
+    }
+
     /// `gitserver.Client.GetDefaultBranch(repo, false)` (M9.19a). `Ok(None)`
     /// is the empty default branch (`refName == ""`).
     async fn default_branch(
@@ -478,6 +492,19 @@ impl GitObjectSource for GitserverGitObjects {
         let (client, _addr) = self.client_for(repo_name).await?;
         client
             .list_refs(repo_name, heads_only, tags_only, &[], None)
+            .await
+            .map_err(GitSourceError::from)
+    }
+
+    async fn list_refs_at_commit(
+        &self,
+        _repo_id: i32,
+        repo_name: &str,
+        oid: &str,
+    ) -> Result<Vec<sg_git::GitRef>, GitSourceError> {
+        let (client, _addr) = self.client_for(repo_name).await?;
+        client
+            .list_refs(repo_name, false, true, &[oid.to_owned()], None)
             .await
             .map_err(GitSourceError::from)
     }

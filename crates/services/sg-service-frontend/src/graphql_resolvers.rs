@@ -3777,7 +3777,8 @@ impl QueryRoot {
                             .with_embeddings(self.nested.repo_embeddings.clone())
                             .with_inventory_d(Some(self.inventory.graphql_d.clone()))
                             .with_autoindexing(self.codeintel_autoindexing.clone())
-                            .with_codeintel_policies(self.codeintel_policies.clone()),
+                            .with_codeintel_policies(self.codeintel_policies.clone())
+                            .with_codeintel_uploads(self.codeintel_uploads.clone()),
                     )))),
                     Some(RepoLookup::NotFound) => Ok(Some(FieldValue::Null)),
                     Some(RepoLookup::Blocked { name, reason }) => Err(ExecError::new(format!(
@@ -4277,7 +4278,8 @@ impl ObjectValue for QueryRoot {
                             .with_git(self.git.clone())
                             .with_embeddings(self.nested.repo_embeddings.clone())
                             .with_inventory_d(Some(self.inventory.graphql_d.clone()))
-                            .with_codeintel_policies(self.codeintel_policies.clone());
+                            .with_codeintel_policies(self.codeintel_policies.clone())
+                            .with_codeintel_uploads(self.codeintel_uploads.clone());
                         // `Repository.batchChanges` (M9.24c): the batch-changes
                         // resolver is attached to the object, like the
                         // `User`/`Org` root fields which get it through
@@ -4304,7 +4306,8 @@ impl ObjectValue for QueryRoot {
                                 .with_git(self.git.clone())
                                 .with_embeddings(self.nested.repo_embeddings.clone())
                                 .with_inventory_d(Some(self.inventory.graphql_d.clone()))
-                                .with_codeintel_policies(self.codeintel_policies.clone());
+                                .with_codeintel_policies(self.codeintel_policies.clone())
+                            .with_codeintel_uploads(self.codeintel_uploads.clone());
                             if let Some(batches) = self.batches.clone() {
                                 object = object.with_batches(batches);
                             }
@@ -4335,7 +4338,8 @@ impl ObjectValue for QueryRoot {
                             .with_embeddings(self.nested.repo_embeddings.clone())
                             .with_inventory_d(Some(self.inventory.graphql_d.clone()))
                             .with_autoindexing(self.codeintel_autoindexing.clone())
-                            .with_codeintel_policies(self.codeintel_policies.clone()),
+                            .with_codeintel_policies(self.codeintel_policies.clone())
+                            .with_codeintel_uploads(self.codeintel_uploads.clone()),
                     )))),
                     Some(RepoLookup::NotFound) => Ok(Some(FieldValue::Null)),
                     Some(RepoLookup::Blocked { name, reason }) => Err(ExecError::new(format!(
@@ -4356,7 +4360,8 @@ impl ObjectValue for QueryRoot {
                                 .with_embeddings(self.nested.repo_embeddings.clone())
                                 .with_inventory_d(Some(self.inventory.graphql_d.clone()))
                             .with_autoindexing(self.codeintel_autoindexing.clone())
-                                .with_codeintel_policies(self.codeintel_policies.clone()),
+                                .with_codeintel_policies(self.codeintel_policies.clone())
+                            .with_codeintel_uploads(self.codeintel_uploads.clone()),
                         )))),
                         Some(RepoLookup::NotFound) => Ok(Some(FieldValue::Null)),
                         Some(RepoLookup::Blocked { name, reason }) => Err(ExecError::new(format!(
@@ -6798,6 +6803,9 @@ pub struct RepositoryObject {
     /// The configuration-policy surface (M9.28c); `None` leaves
     /// `Repository.previewGitObjectFilter` unported.
     codeintel_policies: Option<crate::codeintel_policies_graphql::CodeIntelPoliciesHandle>,
+    /// The uploads surface (M9.30d); `None` leaves
+    /// `Repository.codeIntelSummary` unported.
+    codeintel_uploads: Option<crate::codeintel_uploads_graphql::CodeIntelUploadsHandle>,
 }
 
 impl RepositoryObject {
@@ -6810,7 +6818,17 @@ impl RepositoryObject {
             batches: None,
             autoindexing: None,
             codeintel_policies: None,
+            codeintel_uploads: None,
         }
+    }
+
+    /// Attach the uploads surface (M9.30d).
+    pub fn with_codeintel_uploads(
+        mut self,
+        codeintel_uploads: Option<crate::codeintel_uploads_graphql::CodeIntelUploadsHandle>,
+    ) -> Self {
+        self.codeintel_uploads = codeintel_uploads;
+        self
     }
 
     /// Attach the Batch Changes read surface (M9.24c).
@@ -6909,6 +6927,17 @@ impl ObjectValue for RepositoryObject {
                     database,
                     self.data.id,
                     arguments,
+                )
+                .map(Some),
+                None => Ok(None),
+            },
+            // `RepositoryResolver.CodeIntelSummary` (M9.30d,
+            // `repository.go:571-573`).
+            "codeIntelSummary" => match &self.codeintel_uploads {
+                Some(db) => crate::codeintel_uploads_graphql::repository_code_intel_summary(
+                    db,
+                    self.data.id,
+                    actor,
                 )
                 .map(Some),
                 None => Ok(None),

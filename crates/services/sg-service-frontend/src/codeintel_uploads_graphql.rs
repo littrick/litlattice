@@ -45,6 +45,12 @@ pub const DEFAULT_PAGE_SIZE: i32 = 50;
 
 pub type CodeIntelUploadsHandle = Arc<dyn CodeIntelUploadsDatabase + Send + Sync>;
 
+impl std::fmt::Debug for dyn CodeIntelUploadsDatabase + Send + Sync {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("CodeIntelUploadsDatabase")
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Rows
 // ---------------------------------------------------------------------------
@@ -158,6 +164,26 @@ pub struct RepositoryWithConfigurationRow {
     pub available_indexers: String,
 }
 
+/// `policiesshared.RetentionPolicyMatchCandidate` (`precise_index_resolver.go`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetentionPolicyMatchRow {
+    /// `nil` only for the implicit tip-of-default-branch match.
+    pub policy: Option<sg_db::codeintel_policies::ConfigurationPolicy>,
+    /// `RetentionPolicyMatchCandidate.Matched`.
+    pub matched: bool,
+    /// `nil` for a policy that matched the upload commit directly; `Some`
+    /// (possibly empty) for a visible-commit match.
+    pub protecting_commits: Option<Vec<String>>,
+}
+
+/// The recent-activity rows of `Repository.codeIntelSummary`
+/// (`GetRecentUploadsSummary` + `GetRecentAutoIndexJobsSummary`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RecentActivityRows {
+    pub uploads: Vec<UploadRow>,
+    pub indexes: Vec<AutoIndexJobRow>,
+}
+
 /// `shared.GetAutoIndexJobsOptions` subset used by `PreciseIndexes`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct GetAutoIndexJobsOptions {
@@ -267,6 +293,54 @@ pub trait CodeIntelUploadsDatabase: Send + Sync {
         offset: i64,
         limit: i64,
     ) -> Result<(Vec<RepositoryWithConfigurationRow>, i64), String>;
+
+    // -- M9.30d: `projectRoot` / `tags` / `retentionPolicyOverview` /
+    //    `Repository.codeIntelSummary` -------------------------------------
+
+    /// `repoStore.Get(id).Name` (`nil` when the repository is unknown).
+    fn repository_name(&self, repository_id: i32) -> Result<Option<String>, String>;
+    /// `gitserver.ResolveRevision(EnsureRevision: false)` via the injected
+    /// [`crate::git_graphql::GitObjectSource`]. `None` is the baseline's
+    /// `RevisionNotFoundError → (nil, nil)`; sources that are not injected
+    /// behave like an unknown revision.
+    fn resolve_revision(
+        &self,
+        repo_id: i32,
+        repo_name: &str,
+        rev: &str,
+    ) -> Result<Option<String>, String>;
+    /// `gitserver.ListRefs(TagsOnly: true, PointsAtCommit: [oid])`, returning
+    /// `ShortName`s. An empty result is `[]`, never `None`.
+    fn list_tags_at_commit(
+        &self,
+        repo_id: i32,
+        repo_name: &str,
+        oid: &str,
+    ) -> Result<Vec<String>, String>;
+    /// `policies.Service.GetRetentionPolicyOverview` (with its gitserver
+    /// matcher). Returns the candidates in the baseline's sort order.
+    fn retention_policy_overview(
+        &self,
+        upload: &UploadRow,
+        matches_only: bool,
+        first: i64,
+        after: i64,
+        term: &str,
+    ) -> Result<Vec<RetentionPolicyMatchRow>, String>;
+    /// `autoindexing store.GetLastIndexScanForRepository`.
+    fn last_index_scan(&self, repository_id: i32) -> Result<Option<OffsetDateTime>, String>;
+    /// `store.GetLastUploadRetentionScanForRepository`.
+    fn last_upload_retention_scan(
+        &self,
+        repository_id: i32,
+    ) -> Result<Option<OffsetDateTime>, String>;
+    /// `store.GetRecentUploadsSummary` + `GetRecentAutoIndexJobsSummary`
+    /// (grouped, then flattened; the caller sorts by id).
+    fn recent_activity(&self, repository_id: i32) -> Result<RecentActivityRows, String>;
+    /// `conf.CodeIntelAutoIndexingEnabled`.
+    fn auto_indexing_enabled(&self) -> bool {
+        false
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -743,7 +817,10 @@ pub fn precise_indexes(
                     .map_err(ExecError::new)?,
             );
         }
-        nodes.push(PreciseIndexObject { record: pair });
+        nodes.push(PreciseIndexObject {
+            record: pair,
+            db: Some(db.clone()),
+        });
     }
 
     Ok(FieldValue::Object(Arc::new(PreciseIndexConnectionObject {
@@ -788,6 +865,7 @@ pub fn precise_index_by_id(
                 index,
                 audit_logs,
             },
+            db: Some(db.clone()),
         }))));
     }
 
@@ -818,6 +896,7 @@ pub fn precise_index_by_id(
             index: Some(index),
             audit_logs,
         },
+        db: Some(db.clone()),
     }))))
 }
 
@@ -856,6 +935,129 @@ pub fn code_intel_summary(
         db: db.clone(),
         num_repositories_with_code_intelligence,
     })))
+}
+
+/// `rootResolver.RepositorySummary` (`root_resolver_coverage.go:37-160`) —
+/// `Repository.codeIntelSummary`.
+pub fn repository_code_intel_summary(
+    db: &CodeIntelUploadsHandle,
+    repository_id: i32,
+    actor: Actor,
+) -> Result<FieldValue, ExecError> {
+    check_site_admin(actor)?;
+    let last_upload_retention_scan = db
+        .last_upload_retention_scan(repository_id)
+        .map_err(ExecError::new)?;
+    let last_index_scan = db
+        .last_index_scan(repository_id)
+        .map_err(ExecError::new)?;
+    let activity = db.recent_activity(repository_id).map_err(ExecError::new)?;
+    let nodes = repository_summary_nodes(db, activity)?;
+    Ok(FieldValue::Object(Arc::new(RepositorySummaryObject {
+        nodes,
+        last_upload_retention_scan,
+        last_index_scan,
+        available_indexers: db.auto_indexing_enabled(),
+    })))
+}
+
+/// `repositorySummaryResolver.RecentActivity` (`root_resolver_coverage.go:359-401`):
+/// pair uploads with their associated index (the dataloader fetches it from
+/// the DB when it is not part of the summary), skip indexes whose associated
+/// upload is already listed, then sort by the relay ID string.
+fn repository_summary_nodes(
+    db: &CodeIntelUploadsHandle,
+    activity: RecentActivityRows,
+) -> Result<Vec<PreciseIndexObject>, ExecError> {
+    let mut index_by_id: std::collections::HashMap<i64, AutoIndexJobRow> = activity
+        .indexes
+        .iter()
+        .cloned()
+        .map(|index| (index.id, index))
+        .collect();
+    let missing_index_ids: Vec<i64> = activity
+        .uploads
+        .iter()
+        .filter_map(|upload| upload.associated_index_id)
+        .filter(|id| !index_by_id.contains_key(id))
+        .collect();
+    if !missing_index_ids.is_empty() {
+        for index in db
+            .get_auto_index_jobs_by_ids(&missing_index_ids)
+            .map_err(ExecError::new)?
+        {
+            index_by_id.insert(index.id, index);
+        }
+    }
+
+    let mut upload_by_id: std::collections::HashMap<i64, UploadRow> = activity
+        .uploads
+        .iter()
+        .cloned()
+        .map(|upload| (upload.id, upload))
+        .collect();
+    let missing_upload_ids: Vec<i64> = activity
+        .indexes
+        .iter()
+        .filter_map(|index| index.associated_upload_id)
+        .filter(|id| !upload_by_id.contains_key(id))
+        .collect();
+    if !missing_upload_ids.is_empty() {
+        for upload in db
+            .get_uploads_by_ids(&missing_upload_ids)
+            .map_err(ExecError::new)?
+        {
+            upload_by_id.insert(upload.id, upload);
+        }
+    }
+
+    let recent_upload_ids: std::collections::HashSet<i64> =
+        activity.uploads.iter().map(|upload| upload.id).collect();
+    let mut nodes: Vec<PreciseIndexObject> = Vec::new();
+    for upload in &activity.uploads {
+        let index = upload
+            .associated_index_id
+            .and_then(|id| index_by_id.get(&id).cloned());
+        let audit_logs = Some(
+            db.get_audit_logs_for_upload(upload.id as i32)
+                .map_err(ExecError::new)?,
+        );
+        nodes.push(PreciseIndexObject {
+            record: PreciseIndexRecord {
+                upload: Some(upload.clone()),
+                index,
+                audit_logs,
+            },
+            db: Some(db.clone()),
+        });
+    }
+    for index in &activity.indexes {
+        if let Some(associated_upload_id) = index.associated_upload_id {
+            if recent_upload_ids.contains(&associated_upload_id) {
+                continue;
+            }
+        }
+        let upload = index
+            .associated_upload_id
+            .and_then(|id| upload_by_id.get(&id).cloned());
+        let audit_logs = match &upload {
+            Some(upload) => Some(
+                db.get_audit_logs_for_upload(upload.id as i32)
+                    .map_err(ExecError::new)?,
+            ),
+            None => None,
+        };
+        nodes.push(PreciseIndexObject {
+            record: PreciseIndexRecord {
+                upload,
+                index: Some(index.clone()),
+                audit_logs,
+            },
+            db: Some(db.clone()),
+        });
+    }
+    nodes.sort_by(|a, b| a.id().cmp(&b.id()));
+    Ok(nodes)
 }
 
 fn check_site_admin(actor: Actor) -> Result<(), ExecError> {
@@ -1117,6 +1319,7 @@ pub fn precise_index_from_auto_index_job(job: AutoIndexJobRow) -> FieldValue {
             index: Some(job),
             audit_logs: None,
         },
+        db: None,
     }))
 }
 
@@ -1166,6 +1369,11 @@ impl ObjectValue for PreciseIndexConnectionObject {
 #[derive(Clone)]
 struct PreciseIndexObject {
     record: PreciseIndexRecord,
+    /// The uploads-policies seam (`projectRoot`/`tags`/`retentionPolicyOverview`).
+    /// `None` only for the autoindexing mutation response, where the baseline
+    /// resolver still has the uploads service; those fields are left unreached
+    /// there.
+    db: Option<CodeIntelUploadsHandle>,
 }
 
 impl PreciseIndexObject {
@@ -1267,6 +1475,302 @@ impl PreciseIndexObject {
             .map(|job| job.should_reindex)
             .unwrap_or(false)
     }
+
+    /// `projectRootMetadata` (`precise_index_resolver.go:326-336`).
+    fn project_root_metadata(&self) -> (i32, String, String) {
+        if let Some(upload) = &self.record.upload {
+            return (upload.repository_id, upload.commit.clone(), upload.root.clone());
+        }
+        match &self.record.index {
+            Some(job) => (job.repository_id, job.commit.clone(), job.root.clone()),
+            None => (0, String::new(), String::new()),
+        }
+    }
+
+    /// `PreciseIndex.ProjectRoot` (`precise_index_resolver.go:305-314`):
+    /// a cached `Path` lookup; unknown repository/commit → `null`.
+    fn project_root(&self) -> Result<FieldValue, ExecError> {
+        let Some(db) = &self.db else {
+            return Ok(FieldValue::Null);
+        };
+        let (repo_id, commit, root) = self.project_root_metadata();
+        let Some(repo_name) = db.repository_name(repo_id).map_err(ExecError::new)? else {
+            return Ok(FieldValue::Null);
+        };
+        let Some(oid) = db
+            .resolve_revision(repo_id, &repo_name, &commit)
+            .map_err(ExecError::new)?
+        else {
+            return Ok(FieldValue::Null);
+        };
+        Ok(FieldValue::Object(Arc::new(ProjectRootObject {
+            repo_id,
+            repo_name,
+            rev: if commit.is_empty() { oid.clone() } else { commit },
+            oid,
+            path: root,
+        })))
+    }
+
+    /// `PreciseIndex.Tags` (`precise_index_resolver.go:316-324` +
+    /// `gitresolvers/commit.go:58-76`): unknown repo/commit → `null` (the
+    /// baseline's non-null violation), otherwise `ListRefs(TagsOnly,
+    /// PointsAtCommit)` short names (an empty slice, never `null`).
+    fn tags(&self) -> Result<FieldValue, ExecError> {
+        let Some(db) = &self.db else {
+            return Ok(string_list(&[]));
+        };
+        let (repo_id, commit, _) = self.project_root_metadata();
+        let Some(repo_name) = db.repository_name(repo_id).map_err(ExecError::new)? else {
+            return Ok(FieldValue::Null);
+        };
+        let Some(oid) = db
+            .resolve_revision(repo_id, &repo_name, &commit)
+            .map_err(ExecError::new)?
+        else {
+            return Ok(FieldValue::Null);
+        };
+        let tags = db
+            .list_tags_at_commit(repo_id, &repo_name, &oid)
+            .map_err(ExecError::new)?;
+        Ok(string_list(&tags))
+    }
+
+    /// `PreciseIndex.RetentionPolicyOverview` (`precise_index_resolver.go:343`):
+    /// an index-only node returns `null` (Go `(nil, nil)`).
+    fn retention_overview(&self, arguments: &Arguments) -> Result<FieldValue, ExecError> {
+        let Some(upload) = self.record.upload.as_ref() else {
+            return Ok(FieldValue::Null);
+        };
+        let Some(db) = &self.db else {
+            return Ok(FieldValue::Null);
+        };
+        let after = match arguments.string("after") {
+            Some(value) => unmarshal_relay_i64(value).map_err(ExecError::new)?,
+            None => 0,
+        };
+        let first = arguments.i64("first").unwrap_or(i64::from(
+            DEFAULT_RETENTION_POLICY_MATCHES_PAGE_SIZE,
+        ));
+        let matches_only = arguments.bool("matchesOnly").unwrap_or(false);
+        let term = arguments.string("query").unwrap_or_default();
+        let rows = db
+            .retention_policy_overview(upload, matches_only, first, after, term)
+            .map_err(ExecError::new)?;
+        let total_count = rows.len() as i64;
+        let nodes = rows
+            .into_iter()
+            .map(|row| {
+                let repository = row.policy.as_ref().and_then(|policy| {
+                    policy.repository_id.and_then(|id| {
+                        db.repository_name(id)
+                            .ok()
+                            .flatten()
+                            .map(|name| (id, name))
+                    })
+                });
+                FieldValue::Object(Arc::new(RetentionPolicyMatchObject { row, repository }))
+            })
+            .collect();
+        Ok(FieldValue::Object(Arc::new(RetentionPolicyConnectionObject {
+            nodes,
+            total_count,
+        })))
+    }
+}
+
+/// `resolverstubs.UnmarshalID[int64]` (`relay.UnmarshalSpec` for an integer):
+/// decode the URL-safe base64, skip the `<kind>:` prefix and parse the rest.
+fn unmarshal_relay_i64(id: &str) -> Result<i64, String> {
+    let decoded = base64::engine::general_purpose::URL_SAFE
+        .decode(id)
+        .map_err(|error| error.to_string())?;
+    let text = String::from_utf8_lossy(&decoded);
+    let Some((_, spec)) = text.split_once(':') else {
+        return Err("invalid graphql.ID".to_owned());
+    };
+    serde_json::from_str(spec).map_err(|error| error.to_string())
+}
+
+/// `DefaultRetentionPolicyMatchesPageSize` (`precise_index_resolver.go:341`).
+pub const DEFAULT_RETENTION_POLICY_MATCHES_PAGE_SIZE: i32 = 50;
+
+/// `CodeIntelGitTree` (`projectRoot`). Only the non-lazy fields are
+/// resolvable; `content` needs the tree-entry blob reader.
+struct ProjectRootObject {
+    repo_id: i32,
+    repo_name: String,
+    /// `commitResolver.rev` (`inputRev` when non-empty, else the oid).
+    rev: String,
+    oid: String,
+    path: String,
+}
+
+impl ObjectValue for ProjectRootObject {
+    fn type_name(&self) -> &'static str {
+        "CodeIntelGitTree"
+    }
+
+    fn field(
+        &self,
+        field: &str,
+        _arguments: &Arguments,
+        _actor: Actor,
+    ) -> Result<Option<FieldValue>, ExecError> {
+        let repository = || {
+            FieldValue::Object(Arc::new(ProjectRootRepositoryObject {
+                id: self.repo_id,
+                name: self.repo_name.clone(),
+            }))
+        };
+        let value = match field {
+            "path" => FieldValue::Json(Json::Str(self.path.clone())),
+            // `path.Base` (Go): "." for "", "sub" for "sub/".
+            "name" => FieldValue::Json(Json::Str(go_path_base(&self.path))),
+            // `treeEntryResolver.URL` = `commit.URI()` + uriSuffix, where the
+            // suffix is empty for the repository root.
+            "url" => FieldValue::Json(Json::Str(format!(
+                "/{}@{}{}",
+                self.repo_name,
+                self.rev,
+                go_tree_uri_suffix(&self.path)
+            ))),
+            "commit" => FieldValue::Object(Arc::new(ProjectRootCommitObject {
+                repo_id: self.repo_id,
+                repo_name: self.repo_name.clone(),
+                rev: self.rev.clone(),
+                oid: self.oid.clone(),
+            })),
+            "repository" => repository(),
+            _ => return Ok(None),
+        };
+        Ok(Some(value))
+    }
+}
+
+struct ProjectRootCommitObject {
+    repo_id: i32,
+    repo_name: String,
+    rev: String,
+    oid: String,
+}
+
+impl ObjectValue for ProjectRootCommitObject {
+    fn type_name(&self) -> &'static str {
+        "CodeIntelCommit"
+    }
+
+    fn field(
+        &self,
+        field: &str,
+        _arguments: &Arguments,
+        _actor: Actor,
+    ) -> Result<Option<FieldValue>, ExecError> {
+        let value = match field {
+            "id" => FieldValue::Json(Json::Str(marshal_git_commit_id(
+                self.repo_id,
+                &self.oid,
+            ))),
+            "oid" => FieldValue::Json(Json::Str(self.oid.clone())),
+            "abbreviatedOID" => FieldValue::Json(Json::Str(
+                self.oid.chars().take(7).collect::<String>(),
+            )),
+            "url" => FieldValue::Json(Json::Str(format!(
+                "/{}/-/commit/{}",
+                self.repo_name, self.rev
+            ))),
+            "repository" => FieldValue::Object(Arc::new(ProjectRootRepositoryObject {
+                id: self.repo_id,
+                name: self.repo_name.clone(),
+            })),
+            _ => return Ok(None),
+        };
+        Ok(Some(value))
+    }
+}
+
+struct ProjectRootRepositoryObject {
+    id: i32,
+    name: String,
+}
+
+impl ObjectValue for ProjectRootRepositoryObject {
+    fn type_name(&self) -> &'static str {
+        "CodeIntelRepository"
+    }
+
+    fn field(
+        &self,
+        field: &str,
+        _arguments: &Arguments,
+        _actor: Actor,
+    ) -> Result<Option<FieldValue>, ExecError> {
+        let value = match field {
+            "id" => FieldValue::Json(Json::Str(
+                crate::graphql_resolvers::RepositoryObject::relay_id(self.id),
+            )),
+            "name" => FieldValue::Json(Json::Str(self.name.clone())),
+            "url" => FieldValue::Json(Json::Str(format!("/{}", self.name))),
+            "externalRepository" => FieldValue::Null,
+            _ => return Ok(None),
+        };
+        Ok(Some(value))
+    }
+}
+
+/// `resolverstubs.MarshalID("GitCommit", map{"r": repoID, "c": oid})`.
+fn marshal_git_commit_id(repo_id: i32, oid: &str) -> String {
+    let spec = serde_json::json!({ "r": repo_id, "c": oid });
+    base64::engine::general_purpose::URL_SAFE.encode(format!(
+        "GitCommit:{}",
+        serde_json::to_string(&spec).expect("git commit spec")
+    ))
+}
+
+/// Go `path.Base` for the tree-entry name.
+fn go_path_base(path: &str) -> String {
+    if path.is_empty() {
+        return ".".to_owned();
+    }
+    let trimmed = path.trim_end_matches('/');
+    if trimmed.is_empty() {
+        return "/".to_owned();
+    }
+    trimmed
+        .rsplit('/')
+        .next()
+        .unwrap_or(trimmed)
+        .to_owned()
+}
+
+/// `treeEntryResolver.uriSuffix`: `""` for the root, else
+/// `/-/tree/<path>` (`stdpath.Clean("/"+path) != "/"`).
+fn go_tree_uri_suffix(path: &str) -> String {
+    // `stdpath.Clean("/" + path)` differs from "/" unless the path is empty.
+    let normalized = format!("/{path}");
+    let collapsed = collapse_slashes(&normalized);
+    if collapsed == "/" {
+        String::new()
+    } else {
+        // The baseline keeps the raw path (`path` is not cleaned):
+        // `/-/tree/sub/` for `sub/`.
+        format!("/-/tree/{path}")
+    }
+}
+
+/// Minimal `path.Clean` for slash-separated paths (no `..` handling beyond
+/// dropping empty and "." segments, which covers upload roots).
+fn collapse_slashes(path: &str) -> String {
+    let mut out = String::from("/");
+    let mut parts: Vec<&str> = Vec::new();
+    for segment in path.split('/') {
+        if segment.is_empty() || segment == "." {
+            continue;
+        }
+        parts.push(segment);
+    }
+    out.push_str(&parts.join("/"));
+    out
 }
 
 impl ObjectValue for PreciseIndexObject {
@@ -1277,19 +1781,16 @@ impl ObjectValue for PreciseIndexObject {
     fn field(
         &self,
         field: &str,
-        _arguments: &Arguments,
+        arguments: &Arguments,
         _actor: Actor,
     ) -> Result<Option<FieldValue>, ExecError> {
         let value = match field {
             "id" => FieldValue::Json(Json::Str(self.id())),
-            "projectRoot" => FieldValue::Null,
+            "projectRoot" => self.project_root()?,
             "inputCommit" => FieldValue::Json(Json::Str(self.input_commit())),
             "inputRoot" => FieldValue::Json(Json::Str(self.input_root())),
             "inputIndexer" => FieldValue::Json(Json::Str(self.input_indexer())),
-            "tags" => FieldValue::List {
-                items: Vec::new(),
-                element_type: Some("String"),
-            },
+            "tags" => self.tags()?,
             "indexer" => match self.indexer() {
                 Some(indexer) => FieldValue::Object(Arc::new(CodeIntelIndexerObject {
                     indexer,
@@ -1338,11 +1839,7 @@ impl ObjectValue for PreciseIndexObject {
                     .map(|upload| upload.visible_at_tip)
                     .unwrap_or(false),
             )),
-            "retentionPolicyOverview" => {
-                // Not ported in this phase; the field is non-null, so return an
-                // empty connection rather than an unported error.
-                FieldValue::Object(Arc::new(EmptyRetentionPolicyConnectionObject))
-            }
+            "retentionPolicyOverview" => self.retention_overview(arguments)?,
             "auditLogs" => match &self.record.audit_logs {
                 None => FieldValue::Null,
                 Some(logs) => FieldValue::List {
@@ -1573,6 +2070,62 @@ fn summary_end_cursor(offset: i64, page_size: i64, total: i64) -> Option<String>
     (new_offset < total).then(|| new_offset.to_string())
 }
 
+/// `CodeIntelRepositorySummary` (`root_resolver_coverage.go:360-422`).
+struct RepositorySummaryObject {
+    nodes: Vec<PreciseIndexObject>,
+    last_upload_retention_scan: Option<OffsetDateTime>,
+    last_index_scan: Option<OffsetDateTime>,
+    /// `conf.CodeIntelAutoIndexingEnabled()`. Structural inference itself
+    /// needs the autoindexing service, which is not part of this seam; when
+    /// enabled the list stays empty (documented gap).
+    available_indexers: bool,
+}
+
+impl ObjectValue for RepositorySummaryObject {
+    fn type_name(&self) -> &'static str {
+        "CodeIntelRepositorySummary"
+    }
+
+    fn field(
+        &self,
+        field: &str,
+        _arguments: &Arguments,
+        _actor: Actor,
+    ) -> Result<Option<FieldValue>, ExecError> {
+        let value = match field {
+            // `var resolvers []` is nil for an empty summary (schema
+            // violation in the baseline; reproduced as null).
+            "recentActivity" => {
+                if self.nodes.is_empty() {
+                    FieldValue::Null
+                } else {
+                    FieldValue::List {
+                        items: self
+                            .nodes
+                            .iter()
+                            .map(|node| FieldValue::Object(Arc::new(node.clone())))
+                            .collect(),
+                        element_type: Some("PreciseIndex"),
+                    }
+                }
+            }
+            "lastUploadRetentionScan" => {
+                FieldValue::Json(datetime_json(self.last_upload_retention_scan))
+            }
+            "lastIndexScan" => FieldValue::Json(datetime_json(self.last_index_scan)),
+            // `make([]..., 0, len(...))`: always `[]` without inference.
+            "availableIndexers" => FieldValue::List {
+                items: Vec::new(),
+                element_type: Some("InferredAvailableIndexers"),
+            },
+            "limitError" => FieldValue::Null,
+            _ => return Ok(None),
+        };
+        let _ = self.available_indexers;
+        Ok(Some(value))
+    }
+}
+
 struct CodeIntelRepositoryObject {
     id: i32,
     name: String,
@@ -1783,33 +2336,6 @@ impl ObjectValue for CodeIntelRepositoryWithConfigurationConnectionObject {
             "pageInfo" => Ok(Some(FieldValue::Object(Arc::new(PageInfoObject::new(
                 self.end_cursor.is_some(),
                 self.end_cursor.clone(),
-            ))))),
-            _ => Ok(None),
-        }
-    }
-}
-
-struct EmptyRetentionPolicyConnectionObject;
-
-impl ObjectValue for EmptyRetentionPolicyConnectionObject {
-    fn type_name(&self) -> &'static str {
-        "CodeIntelligenceRetentionPolicyMatchesConnection"
-    }
-
-    fn field(
-        &self,
-        field: &str,
-        _arguments: &Arguments,
-        _actor: Actor,
-    ) -> Result<Option<FieldValue>, ExecError> {
-        match field {
-            "nodes" => Ok(Some(FieldValue::List {
-                items: Vec::new(),
-                element_type: Some("CodeIntelligenceRetentionPolicyMatch"),
-            })),
-            "totalCount" => Ok(Some(FieldValue::Json(Json::Int(0)))),
-            "pageInfo" => Ok(Some(FieldValue::Object(Arc::new(PageInfoObject::new(
-                false, None,
             ))))),
             _ => Ok(None),
         }
@@ -2039,6 +2565,151 @@ impl ObjectValue for ExecutionLogEntryObject {
             "out" => Ok(Some(FieldValue::Json(Json::Str(String::new())))),
             _ => Ok(None),
         }
+    }
+}
+
+/// `CodeIntelligenceRetentionPolicyMatchesConnection`
+/// (`NewTotalCountConnectionResolver(resolvers, 0, totalCount)`).
+struct RetentionPolicyConnectionObject {
+    nodes: Vec<FieldValue>,
+    total_count: i64,
+}
+
+impl ObjectValue for RetentionPolicyConnectionObject {
+    fn type_name(&self) -> &'static str {
+        "CodeIntelligenceRetentionPolicyMatchesConnection"
+    }
+
+    fn field(
+        &self,
+        field: &str,
+        _arguments: &Arguments,
+        _actor: Actor,
+    ) -> Result<Option<FieldValue>, ExecError> {
+        let value = match field {
+            "nodes" => FieldValue::List {
+                items: self.nodes.clone(),
+                element_type: Some("CodeIntelligenceRetentionPolicyMatch"),
+            },
+            "totalCount" => FieldValue::Json(Json::Int(self.total_count)),
+            // `offset` is always 0 and the node count equals `totalCount`, so
+            // the page never reports more pages (`resolvers/utils.go:137`).
+            "pageInfo" => FieldValue::Object(Arc::new(PageInfoObject::new(false, None))),
+            _ => return Ok(None),
+        };
+        Ok(Some(value))
+    }
+}
+
+/// `CodeIntelligenceRetentionPolicyMatch` (`retentionPolicyMatcherResolver`).
+struct RetentionPolicyMatchObject {
+    row: RetentionPolicyMatchRow,
+    repository: Option<(i32, String)>,
+}
+
+impl ObjectValue for RetentionPolicyMatchObject {
+    fn type_name(&self) -> &'static str {
+        "CodeIntelligenceRetentionPolicyMatch"
+    }
+
+    fn field(
+        &self,
+        field: &str,
+        _arguments: &Arguments,
+        _actor: Actor,
+    ) -> Result<Option<FieldValue>, ExecError> {
+        let value = match field {
+            "configurationPolicy" => match &self.row.policy {
+                Some(policy) => FieldValue::Object(Arc::new(
+                    RetentionConfigurationPolicyObject {
+                        policy: policy.clone(),
+                        repository: self.repository.clone(),
+                    },
+                )),
+                None => FieldValue::Null,
+            },
+            "matches" => FieldValue::Json(Json::Bool(self.row.matched)),
+            // `ProtectingCommits` returns `&policy.ProtectingCommits`: a nil
+            // slice (direct match) renders as JSON `null`, a visible-commit
+            // match as an array (schema comment says "empty", implementation
+            // is null).
+            "protectingCommits" => match &self.row.protecting_commits {
+                Some(commits) => string_list(commits),
+                None => FieldValue::Null,
+            },
+            _ => return Ok(None),
+        };
+        Ok(Some(value))
+    }
+}
+
+/// `policiesgraphql.NewConfigurationPolicyResolver` as reached from a
+/// retention match. The repository is pre-resolved (the baseline resolves it
+/// lazily through `repoStore`).
+struct RetentionConfigurationPolicyObject {
+    policy: sg_db::codeintel_policies::ConfigurationPolicy,
+    repository: Option<(i32, String)>,
+}
+
+impl ObjectValue for RetentionConfigurationPolicyObject {
+    fn type_name(&self) -> &'static str {
+        "CodeIntelligenceConfigurationPolicy"
+    }
+
+    fn field(
+        &self,
+        field: &str,
+        _arguments: &Arguments,
+        _actor: Actor,
+    ) -> Result<Option<FieldValue>, ExecError> {
+        let policy = &self.policy;
+        let value = match field {
+            "id" => FieldValue::Json(Json::Str(
+                crate::codeintel_policies_graphql::marshal_configuration_policy_id(policy.id),
+            )),
+            "name" => FieldValue::Json(Json::Str(policy.name.clone().unwrap_or_default())),
+            "repository" => match &self.repository {
+                Some((id, name)) => FieldValue::Object(Arc::new(ProjectRootRepositoryObject {
+                    id: *id,
+                    name: name.clone(),
+                })),
+                None => FieldValue::Null,
+            },
+            "repositoryPatterns" => match &policy.repository_patterns {
+                Some(patterns) => string_list(patterns),
+                None => FieldValue::Null,
+            },
+            "type" => match policy.policy_type.as_str() {
+                "GIT_COMMIT" | "GIT_TAG" | "GIT_TREE" => {
+                    FieldValue::Json(Json::Str(policy.policy_type.clone()))
+                }
+                other => return Err(ExecError::new(format!("unknown git object type {other}"))),
+            },
+            "pattern" => FieldValue::Json(Json::Str(policy.pattern.clone())),
+            "protected" => FieldValue::Json(Json::Bool(policy.protected)),
+            "retentionEnabled" => FieldValue::Json(Json::Bool(policy.retention_enabled)),
+            "retentionDurationHours" => match policy.retention_duration_hours {
+                Some(hours) => FieldValue::Json(Json::Int(i64::from(hours))),
+                None => FieldValue::Null,
+            },
+            "retainIntermediateCommits" => {
+                FieldValue::Json(Json::Bool(policy.retain_intermediate_commits))
+            }
+            "indexingEnabled" => FieldValue::Json(Json::Bool(policy.indexing_enabled)),
+            "syntacticIndexingEnabled" => {
+                FieldValue::Json(Json::Bool(policy.syntactic_indexing_enabled))
+            }
+            "indexCommitMaxAgeHours" => match policy.index_commit_max_age_hours {
+                Some(hours) => FieldValue::Json(Json::Int(i64::from(hours))),
+                None => FieldValue::Null,
+            },
+            "indexIntermediateCommits" => {
+                FieldValue::Json(Json::Bool(policy.index_intermediate_commits))
+            }
+            "embeddingsEnabled" => FieldValue::Json(Json::Bool(policy.embeddings_enabled)),
+            _ => return Ok(None),
+        };
+        Ok(Some(value))
     }
 }
 

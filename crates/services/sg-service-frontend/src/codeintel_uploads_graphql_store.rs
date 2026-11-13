@@ -18,18 +18,24 @@
 //! `m9_27d_codeintel_uploads_overview.md`. No table, column or index is added.
 
 use std::future::Future;
+use std::sync::Arc;
 
 use sqlx::postgres::PgRow;
 use sqlx::{PgPool, Postgres, Row};
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
+use sg_db::codeintel_policies::{self, ConfigurationPolicy, GetConfigurationPoliciesOptions};
+use sg_git::RefType;
+
 use crate::codeintel_uploads_graphql::{
     AuditLogRow, AutoIndexJobRow, CodeIntelUploadsDatabase, DeleteAutoIndexJobsOptions,
     DeleteUploadsOptions, DockerStep, ExecutionLogEntry, GetAutoIndexJobsOptions,
-    GetUploadsOptions, ReindexUploadsOptions, RepositoryWithConfigurationRow,
-    RepositoryWithCountRow, SetRerunAutoIndexJobsOptions, UploadRow,
+    GetUploadsOptions, RecentActivityRows, ReindexUploadsOptions,
+    RepositoryWithConfigurationRow, RepositoryWithCountRow, RetentionPolicyMatchRow,
+    SetRerunAutoIndexJobsOptions, UploadRow,
 };
+use crate::git_graphql::GitObjectSource;
 
 pub(crate) fn block_on<F: Future>(future: F) -> F::Output {
     match tokio::runtime::Handle::try_current() {
@@ -319,11 +325,33 @@ fn scan_index(row: &PgRow) -> Result<AutoIndexJobRow, sqlx::Error> {
 /// Production adapter over the shared `PgPool`.
 pub struct PgCodeIntelUploadsStore {
     pool: PgPool,
+    /// M9.30d: the `projectRoot`/`tags`/retention-matcher gitserver seam. The
+    /// production server injects [`crate::git_graphql::GitserverGitObjects`];
+    /// only the differential harness injects a fixture-backed fake.
+    git: Option<Arc<dyn GitObjectSource>>,
+    /// `conf.CodeIntelAutoIndexingEnabled`.
+    auto_indexing_enabled: bool,
 }
 
 impl PgCodeIntelUploadsStore {
     pub fn new(pool: PgPool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            git: None,
+            auto_indexing_enabled: false,
+        }
+    }
+
+    /// Inject the gitserver reads (`ResolveRevision`, `ListRefs`).
+    pub fn with_git(mut self, git: Arc<dyn GitObjectSource>) -> Self {
+        self.git = Some(git);
+        self
+    }
+
+    /// `conf.CodeIntelAutoIndexingEnabled` injection.
+    pub fn with_auto_indexing_enabled(mut self, enabled: bool) -> Self {
+        self.auto_indexing_enabled = enabled;
+        self
     }
 }
 
@@ -757,4 +785,366 @@ impl CodeIntelUploadsDatabase for PgCodeIntelUploadsStore {
         })
         .map_err(|error| error.to_string())
     }
+
+    // -- M9.30d: projectRoot / tags / retentionPolicyOverview /
+    //    Repository.codeIntelSummary ---------------------------------------
+
+    fn repository_name(&self, repository_id: i32) -> Result<Option<String>, String> {
+        let row = block_on(
+            sqlx::query("SELECT name FROM repo WHERE id = $1")
+                .bind(repository_id)
+                .fetch_optional(&self.pool),
+        )
+        .map_err(|error| error.to_string())?;
+        row.map(|row| row.try_get("name"))
+            .transpose()
+            .map_err(|error| error.to_string())
+    }
+
+    fn resolve_revision(
+        &self,
+        repo_id: i32,
+        repo_name: &str,
+        rev: &str,
+    ) -> Result<Option<String>, String> {
+        let Some(git) = &self.git else {
+            return Ok(None);
+        };
+        match block_on(git.resolve_revision(repo_id, repo_name, rev)) {
+            Ok(oid) => Ok(Some(oid)),
+            Err(error) if error.revision_not_found => Ok(None),
+            Err(error) => Err(error.message),
+        }
+    }
+
+    fn list_tags_at_commit(
+        &self,
+        repo_id: i32,
+        repo_name: &str,
+        oid: &str,
+    ) -> Result<Vec<String>, String> {
+        let Some(git) = &self.git else {
+            return Ok(Vec::new());
+        };
+        let refs = block_on(git.list_refs_at_commit(repo_id, repo_name, oid))
+            .map_err(|error| error.message)?;
+        Ok(refs.into_iter().map(|git_ref| git_ref.short_name).collect())
+    }
+
+    fn retention_policy_overview(
+        &self,
+        upload: &UploadRow,
+        matches_only: bool,
+        first: i64,
+        after: i64,
+        term: &str,
+    ) -> Result<Vec<RetentionPolicyMatchRow>, String> {
+        // `policies.Service.GetRetentionPolicyOverview` (`service.go:106-182`).
+        let opts = GetConfigurationPoliciesOptions {
+            repository_id: upload.repository_id,
+            term: term.to_owned(),
+            protected: None,
+            for_data_retention: Some(true),
+            for_precise_indexing: None,
+            for_syntactic_indexing: None,
+            for_embeddings: None,
+            limit: first,
+            offset: after,
+        };
+        let (policies, _total_count) =
+            block_on(codeintel_policies::get_configuration_policies(&self.pool, &opts))?;
+
+        // `getCommitsVisibleToUpload` (`service.go:283-296`): 50 per page.
+        let mut visible_commits: Vec<String> = Vec::new();
+        let mut token: Option<String> = None;
+        loop {
+            let (commits, next_token) = block_on(
+                sg_db::codeintel_uploads::get_commits_visible_to_upload(
+                    &self.pool,
+                    upload.id,
+                    50,
+                    token.as_deref(),
+                ),
+            )
+            .map_err(|error| error.to_string())?;
+            token = next_token;
+            let done = token.is_none();
+            visible_commits.extend(commits);
+            if done {
+                break;
+            }
+        }
+
+        let Some(repo_name) = self.repository_name(upload.repository_id)? else {
+            return Err(format!("repository not found: {}", upload.repository_id));
+        };
+        let matching =
+            self.commits_described_by_policy(upload.repository_id, &repo_name, &policies)?;
+
+        // `populateMatchingCommits` (`service.go:301-363`).
+        let now = OffsetDateTime::now_utc();
+        let mut potential_matches: Vec<RetentionPolicyMatchRow> = Vec::new();
+        let mut index_set: std::collections::HashMap<i32, usize> =
+            std::collections::HashMap::new();
+        if let Some(policy_matches) = matching.get(&upload.commit) {
+            for policy_match in policy_matches {
+                if policy_match.duration_hours.is_none()
+                    || now - upload.uploaded_at
+                        < time::Duration::hours(i64::from(
+                            policy_match.duration_hours.unwrap_or_default(),
+                        ))
+                {
+                    let policy_id = policy_match.policy_id.unwrap_or(-1);
+                    potential_matches.push(RetentionPolicyMatchRow {
+                        policy: policy_by_id(&policies, policy_id),
+                        matched: true,
+                        protecting_commits: None,
+                    });
+                    index_set.insert(policy_id, potential_matches.len() - 1);
+                }
+            }
+        }
+        for commit in &visible_commits {
+            if commit == &upload.commit {
+                continue;
+            }
+            if let Some(policy_matches) = matching.get(commit) {
+                for policy_match in policy_matches {
+                    if policy_match.duration_hours.is_none()
+                        || now - upload.uploaded_at
+                            < time::Duration::hours(i64::from(
+                                policy_match.duration_hours.unwrap_or_default(),
+                            ))
+                    {
+                        let policy_id = policy_match.policy_id.unwrap_or(-1);
+                        match index_set.get(&policy_id) {
+                            Some(&index)
+                                if potential_matches[index].protecting_commits.is_some() =>
+                            {
+                                potential_matches[index]
+                                    .protecting_commits
+                                    .as_mut()
+                                    .expect("protecting commits")
+                                    .push(commit.clone());
+                            }
+                            Some(_) => {}
+                            None => {
+                                potential_matches.push(RetentionPolicyMatchRow {
+                                    policy: policy_by_id(&policies, policy_id),
+                                    matched: true,
+                                    protecting_commits: Some(vec![commit.clone()]),
+                                });
+                                index_set.insert(policy_id, potential_matches.len() - 1);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if !matches_only {
+            for policy in &policies {
+                if !index_set.contains_key(&policy.id) {
+                    potential_matches.push(RetentionPolicyMatchRow {
+                        policy: Some(policy.clone()),
+                        matched: false,
+                        protecting_commits: None,
+                    });
+                }
+            }
+        }
+
+        // Implicit policy (`ConfigurationPolicy == nil`) first, then matches,
+        // then ID ascending (`service.go:161-179`).
+        potential_matches.sort_by(|a, b| {
+            let a_key = (
+                a.policy.is_some(),
+                !a.matched,
+                a.policy.as_ref().map(|policy| policy.id).unwrap_or(-1),
+            );
+            let b_key = (
+                b.policy.is_some(),
+                !b.matched,
+                b.policy.as_ref().map(|policy| policy.id).unwrap_or(-1),
+            );
+            a_key.cmp(&b_key)
+        });
+        Ok(potential_matches)
+    }
+
+    fn last_index_scan(&self, repository_id: i32) -> Result<Option<OffsetDateTime>, String> {
+        let row = block_on(
+            sqlx::query(
+                "SELECT last_index_scan_at FROM lsif_last_index_scan WHERE repository_id = $1",
+            )
+            .bind(repository_id)
+            .fetch_optional(&self.pool),
+        )
+        .map_err(|error| error.to_string())?;
+        row.map(|row| row.try_get("last_index_scan_at"))
+            .transpose()
+            .map_err(|error| error.to_string())
+    }
+
+    fn last_upload_retention_scan(
+        &self,
+        repository_id: i32,
+    ) -> Result<Option<OffsetDateTime>, String> {
+        let row = block_on(
+            sqlx::query(
+                "SELECT last_retention_scan_at FROM lsif_last_retention_scan WHERE repository_id = $1",
+            )
+            .bind(repository_id)
+            .fetch_optional(&self.pool),
+        )
+        .map_err(|error| error.to_string())?;
+        row.map(|row| row.try_get("last_retention_scan_at"))
+            .transpose()
+            .map_err(|error| error.to_string())
+    }
+
+    fn recent_activity(&self, repository_id: i32) -> Result<RecentActivityRows, String> {
+        let upload_groups = block_on(
+            sg_db::codeintel_autoindexing_summary::recent_uploads_summary(
+                &self.pool,
+                repository_id,
+            ),
+        )
+        .map_err(|error| error.to_string())?;
+        let index_groups = block_on(
+            sg_db::codeintel_autoindexing_summary::recent_auto_index_jobs_summary(
+                &self.pool,
+                repository_id,
+            ),
+        )
+        .map_err(|error| error.to_string())?;
+
+        let upload_ids: Vec<i64> = upload_groups
+            .iter()
+            .flat_map(|group| group.ids.iter().copied())
+            .collect();
+        let index_ids: Vec<i64> = index_groups
+            .iter()
+            .flat_map(|group| group.ids.iter().copied())
+            .collect();
+        let uploads = if upload_ids.is_empty() {
+            Vec::new()
+        } else {
+            self.get_uploads_by_ids(&upload_ids)?
+        };
+        let indexes = if index_ids.is_empty() {
+            Vec::new()
+        } else {
+            self.get_auto_index_jobs_by_ids(&index_ids)?
+        };
+        Ok(RecentActivityRows { uploads, indexes })
+    }
+
+    fn auto_indexing_enabled(&self) -> bool {
+        self.auto_indexing_enabled
+    }
+}
+
+/// One `policies.PolicyMatch` (`matcher.go:26-32`) reduced to the fields
+/// retention uses.
+struct PolicyMatchRow {
+    policy_id: Option<i32>,
+    duration_hours: Option<i32>,
+}
+
+impl PgCodeIntelUploadsStore {
+    /// `Matcher.CommitsDescribedByPolicy` (`policies/matcher.go:61-117`).
+    ///
+    /// The tag/branch ref matching is ported; intermediate branch commits
+    /// (`gitserver.Commits`) and `GIT_COMMIT` policies need a commit reader
+    /// that [`GitObjectSource`] does not expose, so they are rejected rather
+    /// than silently mis-matched (documented gap).
+    fn commits_described_by_policy(
+        &self,
+        repository_id: i32,
+        repo_name: &str,
+        policies: &[ConfigurationPolicy],
+    ) -> Result<std::collections::HashMap<String, Vec<PolicyMatchRow>>, String> {
+        let mut commit_map: std::collections::HashMap<String, Vec<PolicyMatchRow>> =
+            std::collections::HashMap::new();
+        if policies.is_empty() {
+            return Ok(commit_map);
+        }
+        let mut patterns: std::collections::HashMap<String, sg_codeintel::glob::Glob> =
+            std::collections::HashMap::new();
+        for policy in policies {
+            if policy.policy_type == "GIT_COMMIT" || patterns.contains_key(&policy.pattern) {
+                continue;
+            }
+            let glob = sg_codeintel::glob::Glob::compile(&policy.pattern).map_err(|_| {
+                format!(
+                    "failed to compile glob pattern `{}` in configuration policy {}",
+                    policy.pattern, policy.id
+                )
+            })?;
+            patterns.insert(policy.pattern.clone(), glob);
+        }
+
+        let refs = match &self.git {
+            Some(git) => block_on(git.list_refs(repository_id, repo_name, true, true))
+                .map_err(|error| error.message)?,
+            None => Vec::new(),
+        };
+        for git_ref in &refs {
+            match git_ref.ref_type {
+                RefType::Tag => {
+                    for policy in policies.iter().filter(|p| p.policy_type == "GIT_TAG") {
+                        if patterns[&policy.pattern].matches(&git_ref.short_name) {
+                            commit_map
+                                .entry(git_ref.target_commit.clone())
+                                .or_default()
+                                .push(PolicyMatchRow {
+                                    policy_id: Some(policy.id),
+                                    duration_hours: policy.retention_duration_hours,
+                                });
+                        }
+                    }
+                }
+                RefType::Branch => {
+                    // `includeTipOfDefaultBranch` (`matchBranchHeads`).
+                    if git_ref.is_head {
+                        commit_map
+                            .entry(git_ref.target_commit.clone())
+                            .or_default()
+                            .push(PolicyMatchRow {
+                                policy_id: None,
+                                duration_hours: None,
+                            });
+                    }
+                    for policy in policies.iter().filter(|p| p.policy_type == "GIT_TREE") {
+                        if patterns[&policy.pattern].matches(&git_ref.short_name) {
+                            commit_map
+                                .entry(git_ref.target_commit.clone())
+                                .or_default()
+                                .push(PolicyMatchRow {
+                                    policy_id: Some(policy.id),
+                                    duration_hours: policy.retention_duration_hours,
+                                });
+                        }
+                    }
+                }
+                RefType::Unknown => {}
+            }
+        }
+        if policies.iter().any(|policy| policy.policy_type == "GIT_COMMIT") {
+            return Err(
+                "GIT_COMMIT configuration policies are not supported: the gitserver seam has no \
+                 commit reader"
+                    .to_owned(),
+            );
+        }
+        Ok(commit_map)
+    }
+}
+
+/// `policyByID` (`service.go:365-375`): `-1` is the implicit policy.
+fn policy_by_id(policies: &[ConfigurationPolicy], id: i32) -> Option<ConfigurationPolicy> {
+    if id == -1 {
+        return None;
+    }
+    policies.iter().find(|policy| policy.id == id).cloned()
 }

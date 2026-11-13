@@ -4378,6 +4378,7 @@ dependencies = [
  "rsa",
  "serde",
  "serde_json",
+ "sg-codeintel",
  "sg-codeintel-ranking",
  "sg-config",
  "sg-core",
