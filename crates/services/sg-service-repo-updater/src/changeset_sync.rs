@@ -489,6 +489,111 @@ pub async fn sync_changeset(
     Ok(())
 }
 
+/// Production [`ChangesetSyncBackend`] over the frontend database.
+///
+/// It writes only the columns the baseline's `UpdateChangesetCodeHostState`
+/// owns for the reduced store: `syncer_error`, the deleted markers and the
+/// `state.SetDerivedState` outputs (via
+/// [`sg_extsvc::batches_state_load::refresh_derived_state_pool`]).
+pub struct PgChangesetSyncBackend {
+    pool: sqlx::PgPool,
+}
+
+impl PgChangesetSyncBackend {
+    pub fn new(pool: sqlx::PgPool) -> Self {
+        Self { pool }
+    }
+
+    /// Build the backend from an existing batches store.
+    pub fn from_store(store: &sg_db::batches::BatchesStore) -> Self {
+        Self::new(store.pool().clone())
+    }
+}
+
+#[async_trait]
+impl ChangesetSyncBackend for PgChangesetSyncBackend {
+    async fn update_changeset_code_host_state(
+        &self,
+        changeset_id: i64,
+        sync_error: Option<&str>,
+        deleted: bool,
+    ) -> Result<(), String> {
+        // Go's `SyncChangeset` clears `SyncErrorMessage` on success and calls
+        // `SetDeleted()` on a `ChangesetNotFoundError`, which sets
+        // `ExternalDeletedAt`; `SetDerivedState` then derives `DELETED` from
+        // the non-zero timestamp (see the loader's persisted columns).
+        sqlx::query(
+            r#"
+UPDATE changesets
+SET updated_at = clock_timestamp(),
+    syncer_error = $2,
+    external_deleted_at = CASE
+        WHEN $3 THEN COALESCE(external_deleted_at, clock_timestamp())
+        ELSE external_deleted_at
+    END
+WHERE id = $1
+"#,
+        )
+        .bind(changeset_id)
+        .bind(sync_error)
+        .bind(deleted)
+        .execute(&self.pool)
+        .await
+        .map_err(|err| err.to_string())?;
+        Ok(())
+    }
+
+    async fn upsert_changeset_events(
+        &self,
+        changeset_id: i64,
+        events: &[SyncedEvent],
+    ) -> Result<(), String> {
+        // `UpsertChangesetEvents`: `CreatedAt` defaults to the store's now and
+        // `UpdatedAt` to now when it is not after `CreatedAt`; the conflict
+        // clause updates metadata and `updated_at` only.
+        for event in events {
+            sqlx::query(
+                r#"
+INSERT INTO changeset_events (changeset_id, kind, key, created_at, updated_at, metadata)
+VALUES ($1, $2, $3, clock_timestamp(), clock_timestamp(), $4::jsonb)
+ON CONFLICT ON CONSTRAINT changeset_events_changeset_id_kind_key_unique
+DO UPDATE SET metadata = excluded.metadata, updated_at = excluded.updated_at
+"#,
+            )
+            .bind(changeset_id)
+            .bind(&event.kind)
+            .bind(&event.key)
+            .bind(event.metadata.to_string())
+            .execute(&self.pool)
+            .await
+            .map_err(|err| err.to_string())?;
+        }
+        Ok(())
+    }
+
+    async fn set_derived_state(
+        &self,
+        changeset_id: i64,
+        _events: &[SyncedEvent],
+    ) -> Result<(), String> {
+        // Gitserver stays injectable; the network-independent derived state
+        // (check/external/review state, labels) is still computed and written.
+        match sg_extsvc::batches_state_load::refresh_derived_state_pool(
+            &self.pool,
+            changeset_id,
+            None,
+        )
+        .await
+        {
+            Ok(_) => Ok(()),
+            Err(err) => {
+                tracing::warn!(changeset_id, error = %err, "computing derived changeset state");
+                Ok(())
+            }
+        }
+    }
+}
+
 /// [`ChangesetSyncFn`] wired to an injected code-host loader/backend.
 pub struct SourceSyncFn {
     store: Arc<dyn ChangesetSyncStore>,

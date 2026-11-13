@@ -18,11 +18,13 @@
 //! [`NotPortedSourceFactory`] remains the test/injection fallback.
 //! gitserver push ([`ChangesetSource::push_commit`]), `Changeset.Events()`
 //! derivation and GitHub App commit signing remain explicit seams, see the
-//! slice overview §4. `state.SetDerivedState` is now the
-//! [`SetDerivedStateFn`] hook: its pure logic lives in
-//! [`sg_extsvc::batches_state`], and the default is a no-op because the
-//! dequeued row does not yet carry code-host metadata/events (no schema
-//! changes in this slice).
+//! slice overview §4. `state.SetDerivedState` is applied by
+//! [`ReconcilerStore::set_derived_state`]: the production store reloads the
+//! persisted metadata/events/repo and calls
+//! [`sg_extsvc::batches_state::set_derived_state`] with no gitserver client
+//! (sync state/diffstat stay as persisted). Outbound webhooks for the
+//! after-done hook go through
+//! [`sg_extsvc::batches_webhooks`] into `outbound_webhook_jobs`.
 //!
 //! Handler transaction semantics match `Reconciler.HandlerFunc`: `process`
 //! runs inside a store transaction, `done(err)` commits or rolls back, and the
@@ -1606,6 +1608,15 @@ pub trait ReconcilerStore: Send {
     /// metadata (seam, overview §4).
     async fn upsert_changeset_events(&mut self, changeset: &Changeset) -> Result<(), String>;
     async fn update_changeset(&mut self, changeset: &Changeset) -> Result<(), String>;
+    /// `state.SetDerivedState` (`executor.go:148`), run after the plan and
+    /// the row update. The handler row carried by
+    /// [`ChangesetWorkerStore`] has no code-host metadata or events, so the
+    /// production store reloads the persisted row inside the open
+    /// transaction. Errors are logged and ignored, exactly like the
+    /// baseline's void `SetDerivedState`.
+    async fn set_derived_state(&mut self, _changeset_id: i64) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 /// Opens a [`ReconcilerStore`] transaction per handler invocation.
@@ -2439,33 +2450,11 @@ impl DbRecord for ChangesetRecord {
     }
 }
 
-/// `state.SetDerivedState` hook, invoked by the reconciler after the executor
-/// finishes (`executor.go:148`).
-///
-/// A production implementation maps this reduced [`Changeset`] plus its
-/// events and repo onto [`sg_extsvc::batches_state::set_derived_state`]. The
-/// dequeued row here does not carry code-host metadata or events (adding them
-/// would be a schema change), so the default no-op preserves the executor's
-/// current observable behaviour.
-#[async_trait]
-pub trait SetDerivedStateFn: Send + Sync {
-    async fn set_derived_state(&self, changeset: &Changeset);
-}
-
-/// Default [`SetDerivedStateFn`]: does nothing.
-pub struct NoopSetDerivedState;
-
-#[async_trait]
-impl SetDerivedStateFn for NoopSetDerivedState {
-    async fn set_derived_state(&self, _changeset: &Changeset) {}
-}
-
 /// `(*Reconciler).HandlerFunc`.
 pub struct ReconcilerHandler {
     store_factory: Arc<dyn ReconcilerStoreFactory>,
     source_factory: Arc<dyn ChangesetSourceFactory>,
     no_sleep_before_sync: bool,
-    set_derived_state: Arc<dyn SetDerivedStateFn>,
 }
 
 impl ReconcilerHandler {
@@ -2478,14 +2467,7 @@ impl ReconcilerHandler {
             store_factory,
             source_factory,
             no_sleep_before_sync,
-            set_derived_state: Arc::new(NoopSetDerivedState),
         }
-    }
-
-    /// Override the `state.SetDerivedState` hook (default [`NoopSetDerivedState`]).
-    pub fn with_set_derived_state(mut self, f: Arc<dyn SetDerivedStateFn>) -> Self {
-        self.set_derived_state = f;
-        self
     }
 
     /// `process`.
@@ -2528,11 +2510,18 @@ impl ReconcilerHandler {
             &plan,
         )
         .await;
-        // `state.SetDerivedState(ctx, ..., &c, events)` after the ops run and
-        // before the changeset is persisted.
-        self.set_derived_state
-            .set_derived_state(&outcome.changeset)
-            .await;
+        // `state.SetDerivedState` runs after the ops and the row update; the
+        // store reloads the persisted metadata/events/repo. Not reached when
+        // an operation failed, matching `executor.Run`'s early returns.
+        if outcome.result.is_ok() {
+            if let Err(err) = store.set_derived_state(outcome.changeset.id).await {
+                tracing::warn!(
+                    changeset_id = outcome.changeset.id,
+                    error = %err,
+                    "computing derived changeset state"
+                );
+            }
+        }
         (outcome.after_done, outcome.result, outcome.changeset)
     }
 }
@@ -2686,6 +2675,37 @@ fn parse_batch_change_ids(value: &serde_json::Value) -> Vec<BatchChangeAssoc> {
 // Production store adapter + job
 // ---------------------------------------------------------------------------
 
+/// [`sg_extsvc::batches_webhooks::WebhookEnqueueSink`] over the existing
+/// `outbound_webhook_jobs` queue (`WebhookJobQueue::create`).
+///
+/// The sender runs with no key (see the outbound webhook module docs), so the
+/// payload is stored as plaintext with an empty `encryption_key_id`, matching
+/// Go's `encryption.NewUnencrypted` + nil scope.
+pub struct OutboundWebhookQueueSink {
+    queue: Arc<crate::jobs::outbound_webhooks::store::WebhookJobQueue>,
+}
+
+impl OutboundWebhookQueueSink {
+    pub fn new(queue: Arc<crate::jobs::outbound_webhooks::store::WebhookJobQueue>) -> Self {
+        Self { queue }
+    }
+}
+
+#[async_trait]
+impl sg_extsvc::batches_webhooks::WebhookEnqueueSink for OutboundWebhookQueueSink {
+    async fn enqueue(
+        &self,
+        event_type: &str,
+        scope: Option<&str>,
+        payload: &[u8],
+    ) -> Result<(), String> {
+        self.queue
+            .create(event_type, scope, payload)
+            .await
+            .map(|_| ())
+    }
+}
+
 /// `(*store.Store)` transaction adapter over a `PgConnection`.
 pub struct PgReconcilerStore {
     conn: sqlx::pool::PoolConnection<sqlx::Postgres>,
@@ -2705,19 +2725,65 @@ impl ReconcilerStoreFactory for PgReconcilerStoreFactory {
             external_url: self.external_url.clone(),
         }))
     }
+
+    /// `afterDone` (`webhooks.EnqueueChangeset`) for the executor's
+    /// publish/close/update/update_error hooks. Fire-and-forget: failures are
+    /// logged, never propagated.
+    async fn enqueue_webhook(
+        &self,
+        kind: WebhookKind,
+        changeset_id: i64,
+    ) -> Result<(), String> {
+        let event_type = match kind {
+            WebhookKind::UpdateError => sg_extsvc::batches_webhooks::CHANGESET_UPDATE_ERROR,
+            WebhookKind::Update => sg_extsvc::batches_webhooks::CHANGESET_UPDATE,
+            WebhookKind::Publish => sg_extsvc::batches_webhooks::CHANGESET_PUBLISH,
+            WebhookKind::Close => sg_extsvc::batches_webhooks::CHANGESET_CLOSE,
+        };
+        let id = sg_extsvc::batches_webhooks::changeset_gql_id(changeset_id);
+        if let Err(err) = sg_extsvc::batches_webhooks::enqueue_changeset(
+            self.webhook_sink.as_ref(),
+            self.http.as_ref(),
+            &self.internal_api_url,
+            event_type,
+            &id,
+        )
+        .await
+        {
+            tracing::warn!(
+                changeset_id,
+                event_type,
+                error = %err,
+                "enqueuing changeset webhook"
+            );
+        }
+        Ok(())
+    }
 }
 
 /// Opens [`PgReconcilerStore`] transactions.
 pub struct PgReconcilerStoreFactory {
     pool: PgPool,
     external_url: String,
+    webhook_sink: Arc<dyn sg_extsvc::batches_webhooks::WebhookEnqueueSink>,
+    http: Arc<dyn sg_extsvc::HttpDoer>,
+    internal_api_url: String,
 }
 
 impl PgReconcilerStoreFactory {
-    pub fn new(pool: PgPool, external_url: impl Into<String>) -> Self {
+    pub fn new(
+        pool: PgPool,
+        external_url: impl Into<String>,
+        webhook_sink: Arc<dyn sg_extsvc::batches_webhooks::WebhookEnqueueSink>,
+        http: Arc<dyn sg_extsvc::HttpDoer>,
+        internal_api_url: impl Into<String>,
+    ) -> Self {
         Self {
             pool,
             external_url: external_url.into(),
+            webhook_sink,
+            http,
+            internal_api_url: internal_api_url.into(),
         }
     }
 }
@@ -2807,6 +2873,19 @@ impl ReconcilerStore for PgReconcilerStore {
             .await
             .map_err(|err| err.to_string())
     }
+
+    async fn set_derived_state(&mut self, changeset_id: i64) -> Result<(), String> {
+        // Network-independent state is always computed and persisted.
+        // Gitserver stays a seam (`None`), so sync state and diff stat keep
+        // their persisted values.
+        sg_extsvc::batches_state_load::refresh_derived_state(
+            &mut *self.conn,
+            changeset_id,
+            None,
+        )
+        .await
+        .map(|_| ())
+    }
 }
 
 impl Repo {
@@ -2858,9 +2937,22 @@ impl Job for BatchesReconcilerJob {
             .and_then(serde_json::Value::as_str)
             .unwrap_or("")
             .to_owned();
+        let internal_api_url = sg_config::normalize_address(
+            &std::env::var("SRC_FRONTEND_INTERNAL")
+                .unwrap_or_else(|_| sg_config::DEFAULT_FRONTEND_INTERNAL.to_owned()),
+        );
+        let webhook_queue = Arc::new(
+            crate::jobs::outbound_webhooks::store::WebhookJobQueue::new(
+                deps.frontend.clone(),
+                None,
+            ),
+        );
         let store_factory = Arc::new(PgReconcilerStoreFactory::new(
             deps.frontend.clone(),
             external_url,
+            Arc::new(OutboundWebhookQueueSink::new(webhook_queue)),
+            Arc::new(ReqwestHttpDoer::new()),
+            internal_api_url,
         ));
         let configs: Arc<dyn SourceConfigProvider> = Arc::new(PgSourceConfigProvider::new(
             deps.frontend.clone(),

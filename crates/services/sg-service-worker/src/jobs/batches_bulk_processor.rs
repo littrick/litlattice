@@ -1219,6 +1219,9 @@ pub struct BulkProcessorHandler {
     pool: PgPool,
     source: Option<Arc<dyn ChangesetSource>>,
     provider: Option<Arc<dyn ChangesetSourceProvider>>,
+    webhook_sink: Option<Arc<dyn sg_extsvc::batches_webhooks::WebhookEnqueueSink>>,
+    http: Option<Arc<dyn sg_extsvc::HttpDoer>>,
+    internal_api_url: String,
 }
 
 impl BulkProcessorHandler {
@@ -1227,6 +1230,9 @@ impl BulkProcessorHandler {
             pool,
             source: Some(source),
             provider: None,
+            webhook_sink: None,
+            http: None,
+            internal_api_url: String::new(),
         }
     }
 
@@ -1235,7 +1241,23 @@ impl BulkProcessorHandler {
             pool,
             source: None,
             provider: Some(provider),
+            webhook_sink: None,
+            http: None,
+            internal_api_url: String::new(),
         }
+    }
+
+    /// Configure the `afterDone` outbound webhook seams.
+    pub fn with_webhooks(
+        mut self,
+        sink: Arc<dyn sg_extsvc::batches_webhooks::WebhookEnqueueSink>,
+        http: Arc<dyn sg_extsvc::HttpDoer>,
+        internal_api_url: impl Into<String>,
+    ) -> Self {
+        self.webhook_sink = Some(sink);
+        self.http = Some(http);
+        self.internal_api_url = internal_api_url.into();
+        self
     }
 
     async fn resolve_source(&self, record: &ChangesetJob) -> Result<Arc<dyn ChangesetSource>, String> {
@@ -1276,7 +1298,14 @@ impl DbWorkerHandler<BulkStore> for BulkProcessorHandler {
         // `store.Transact` returns a per-call transaction handle; `NumHandlers`
         // handlers run concurrently, so each invocation owns its own
         // `PgBulkProcessorStore` (and therefore its own transaction slot).
-        let store = PgBulkProcessorStore::new(self.pool.clone());
+        let mut store = PgBulkProcessorStore::new(self.pool.clone());
+        if let (Some(sink), Some(http)) = (&self.webhook_sink, &self.http) {
+            store = store.with_webhooks(
+                Arc::clone(sink),
+                Arc::clone(http),
+                self.internal_api_url.clone(),
+            );
+        }
         if let Err(err) = store.begin().await {
             return Err(err.message);
         }
@@ -1365,6 +1394,9 @@ impl DbWorkerStore for BulkStore {
 pub struct PgBulkProcessorStore {
     pool: PgPool,
     tx: tokio::sync::Mutex<Option<sqlx::Transaction<'static, sqlx::Postgres>>>,
+    webhook_sink: Option<Arc<dyn sg_extsvc::batches_webhooks::WebhookEnqueueSink>>,
+    http: Option<Arc<dyn sg_extsvc::HttpDoer>>,
+    internal_api_url: String,
 }
 
 impl PgBulkProcessorStore {
@@ -1372,7 +1404,23 @@ impl PgBulkProcessorStore {
         Self {
             pool,
             tx: tokio::sync::Mutex::new(None),
+            webhook_sink: None,
+            http: None,
+            internal_api_url: String::new(),
         }
+    }
+
+    /// Wire the outbound webhook queue/GraphQL seams used by `afterDone`.
+    pub fn with_webhooks(
+        mut self,
+        sink: Arc<dyn sg_extsvc::batches_webhooks::WebhookEnqueueSink>,
+        http: Arc<dyn sg_extsvc::HttpDoer>,
+        internal_api_url: impl Into<String>,
+    ) -> Self {
+        self.webhook_sink = Some(sink);
+        self.http = Some(http);
+        self.internal_api_url = internal_api_url.into();
+        self
     }
 
     /// `store.Transact`.
@@ -1480,14 +1528,22 @@ impl BulkProcessorStore for PgBulkProcessorStore {
         Ok(())
     }
 
-    async fn set_derived_state(&self, _changeset: &Changeset) -> Result<(), BulkError> {
-        // The shared implementation is
-        // `sg_extsvc::batches_state::set_derived_state`; it needs the
-        // changeset's code-host metadata, the refreshed events and the repo,
-        // none of which this row carries yet (adding them would change the
-        // `changesets` schema, which this slice must not do). Keep the seam as
-        // a no-op until the metadata loader is wired; merge/close ordering is
-        // already reproduced by `run_bulk_job`.
+    async fn set_derived_state(&self, changeset: &Changeset) -> Result<(), BulkError> {
+        // `state.SetDerivedState` is void in the baseline: errors are logged
+        // and the merge/close flow continues to UpsertChangesetEvents and
+        // UpdateChangesetCodeHostState.
+        let mut guard = self.tx.lock().await;
+        let tx = guard.as_mut().ok_or_else(no_active_transaction)?;
+        if let Err(err) =
+            sg_extsvc::batches_state_load::refresh_derived_state(&mut *tx, changeset.id, None)
+                .await
+        {
+            tracing::warn!(
+                changeset_id = changeset.id,
+                error = %err,
+                "computing derived changeset state"
+            );
+        }
         Ok(())
     }
 
@@ -1534,16 +1590,33 @@ impl BulkProcessorStore for PgBulkProcessorStore {
 
     async fn enqueue_changeset_webhook(
         &self,
-        _event_type: &str,
-        _changeset_id: i64,
+        event_type: &str,
+        changeset_id: i64,
     ) -> Result<(), BulkError> {
-        // webhooks.EnqueueChangeset marshals a GraphQL payload with the
-        // internal doer before writing `outbound_webhook_jobs`; that
-        // marshaller is not ported. The ordering is still reproduced by
-        // `run_bulk_job`.
-        Err(BulkError::retryable(
-            "changeset webhook enqueue is not ported (M9.9h)",
-        ))
+        let (Some(sink), Some(http)) = (self.webhook_sink.as_ref(), self.http.as_ref()) else {
+            // Tests and jobs without the webhook seam configured.
+            return Ok(());
+        };
+        let id = sg_extsvc::batches_webhooks::changeset_gql_id(changeset_id);
+        // `afterDone` is fire-and-forget: failures are logged, never fail the
+        // job.
+        if let Err(err) = sg_extsvc::batches_webhooks::enqueue_changeset(
+            sink.as_ref(),
+            http.as_ref(),
+            &self.internal_api_url,
+            event_type,
+            &id,
+        )
+        .await
+        {
+            tracing::warn!(
+                changeset_id,
+                event_type,
+                error = %err,
+                "enqueuing changeset webhook"
+            );
+        }
+        Ok(())
     }
 }
 
@@ -1672,10 +1745,25 @@ impl Job for BulkOperationProcessorJob {
                 Arc::clone(&deps.keyring),
             ),
         );
-        let handler = Arc::new(BulkProcessorHandler::with_provider(
-            deps.frontend.clone(),
-            provider,
-        ));
+        let internal_api_url = sg_config::normalize_address(
+            &std::env::var("SRC_FRONTEND_INTERNAL")
+                .unwrap_or_else(|_| sg_config::DEFAULT_FRONTEND_INTERNAL.to_owned()),
+        );
+        let webhook_queue = Arc::new(
+            crate::jobs::outbound_webhooks::store::WebhookJobQueue::new(
+                deps.frontend.clone(),
+                None,
+            ),
+        );
+        let handler = Arc::new(
+            BulkProcessorHandler::with_provider(deps.frontend.clone(), provider).with_webhooks(
+                Arc::new(
+                    crate::jobs::batches_reconciler::OutboundWebhookQueueSink::new(webhook_queue),
+                ),
+                Arc::new(crate::jobs::batches_reconciler::ReqwestHttpDoer::new()),
+                internal_api_url,
+            ),
+        );
 
         let worker = WorkerRoutine::new(
             bulk_store,
