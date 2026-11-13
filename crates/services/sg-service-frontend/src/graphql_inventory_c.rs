@@ -41,12 +41,10 @@ use sqlx::{PgPool, Row};
 use time::OffsetDateTime;
 
 use crate::admin_store::{
-    check_current_user_is_site_admin, check_site_admin_or_same_user, MUST_BE_SITE_ADMIN,
-    MUST_BE_SITE_ADMIN_OR_SAME_USER,
+    MUST_BE_SITE_ADMIN, MUST_BE_SITE_ADMIN_OR_SAME_USER, check_current_user_is_site_admin,
+    check_site_admin_or_same_user,
 };
-use crate::graphql_resolvers::{
-    datetime_rfc3339, unmarshal_relay_id, PageInfoObject, UserData,
-};
+use crate::graphql_resolvers::{PageInfoObject, UserData, datetime_rfc3339, unmarshal_relay_id};
 
 // ---------------------------------------------------------------------------
 // Relay helpers
@@ -75,8 +73,8 @@ fn namespace_spec_json(id: i64, name: &str, external_id: &str) -> String {
 }
 
 fn decode_url(s: &str) -> Option<Vec<u8>> {
-    use base64::engine::general_purpose::{URL_SAFE, URL_SAFE_NO_PAD};
     use base64::Engine as _;
+    use base64::engine::general_purpose::{URL_SAFE, URL_SAFE_NO_PAD};
     URL_SAFE_NO_PAD
         .decode(s)
         .or_else(|_| URL_SAFE.decode(s))
@@ -132,8 +130,14 @@ pub trait MarkdownRenderer: Send + Sync {
 
 /// `highlight.Code` (`cmd/frontend/internal/highlight/highlight.go:316`).
 /// `filepath` is `"file." + SyntectLanguageMap[strings.ToLower(fuzzyLanguage)]`.
+#[async_trait::async_trait]
 pub trait CodeHighlighter: Send + Sync {
-    fn highlight(&self, code: &str, filepath: &str, disable_timeout: bool) -> Result<String, String>;
+    async fn highlight(
+        &self,
+        code: &str,
+        filepath: &str,
+        disable_timeout: bool,
+    ) -> Result<String, String>;
 }
 
 /// `backend.ExternalServicesService.ListNamespaces` / `DiscoverRepos`
@@ -200,8 +204,10 @@ pub trait PhabricatorGit: Send + Sync {
     /// `ResolveRevision`: `Ok(true)` = found, `Ok(false)` =
     /// `RevisionNotFoundError`, `Err` = any other error.
     async fn resolve_revision(&self, repo: &str, rev: &str) -> Result<bool, String>;
-    async fn create_commit_from_patch(&self, request: &PhabricatorPatchRequest)
-        -> Result<(), String>;
+    async fn create_commit_from_patch(
+        &self,
+        request: &PhabricatorPatchRequest,
+    ) -> Result<(), String>;
     /// `RepositoryResolver.Commit`: `Ok(None)` = commit not found.
     async fn commit_oid(&self, repo: &str, rev: &str) -> Result<Option<String>, String>;
 }
@@ -219,11 +225,7 @@ pub trait PasswordResetUrlProvider: Send + Sync {
 /// error `txemail` reports.
 #[async_trait::async_trait]
 pub trait PasswordResetEmailSender: Send + Sync {
-    async fn send_reset_password_email(
-        &self,
-        user_id: i32,
-        reset_url: &str,
-    ) -> Result<(), String>;
+    async fn send_reset_password_email(&self, user_id: i32, reset_url: &str) -> Result<(), String>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -249,66 +251,11 @@ pub struct PhabricatorPatchRequest {
 pub const UNIMPLEMENTED_DISCOVERY: &str =
     "External Service type does not support discovery of repositories and namespaces.";
 
-/// The default (production) renderer: goldmark-equivalent subset for
-/// single-paragraph Markdown. Multi-paragraph/blank-line content is split on
-/// blank lines; inline markup other than paragraph wrapping is not rendered.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct SubsetMarkdownRenderer;
+/// The production renderer (`internal/markdown.Render`).
+pub type DefaultMarkdownRenderer = crate::markdown_graphql::GoldmarkRenderer;
 
-fn escape_html(input: &str) -> String {
-    let mut out = String::with_capacity(input.len());
-    for ch in input.chars() {
-        match ch {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            '"' => out.push_str("&quot;"),
-            '\'' => out.push_str("&#39;"),
-            _ => out.push(ch),
-        }
-    }
-    out
-}
-
-impl MarkdownRenderer for SubsetMarkdownRenderer {
-    fn render(&self, markdown: &str) -> Result<String, String> {
-        if markdown.is_empty() {
-            return Ok(String::new());
-        }
-        let mut out = String::new();
-        for paragraph in markdown.split("\n\n") {
-            if paragraph.is_empty() {
-                continue;
-            }
-            out.push_str("<p>");
-            out.push_str(&escape_html(paragraph));
-            out.push_str("</p>\n");
-        }
-        Ok(out)
-    }
-}
-
-/// The default highlighter: a deterministic HTML wrapper. Byte-identical
-/// syntect output is out of scope (the seam exists so production can inject a
-/// real highlighter).
-#[derive(Debug, Default, Clone, Copy)]
-pub struct SubsetCodeHighlighter;
-
-impl CodeHighlighter for SubsetCodeHighlighter {
-    fn highlight(
-        &self,
-        code: &str,
-        filepath: &str,
-        _disable_timeout: bool,
-    ) -> Result<String, String> {
-        let extension = filepath.rsplit('.').next().unwrap_or("");
-        Ok(format!(
-            "<pre><code class=\"language-{}\">{}</code></pre>",
-            escape_html(extension),
-            escape_html(code)
-        ))
-    }
-}
+/// The production highlighter (`highlight.Code` over syntect-server).
+pub type DefaultCodeHighlighter = crate::markdown_graphql::SyntectCodeHighlighter;
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct UnimplementedDiscovery;
@@ -586,8 +533,8 @@ impl std::fmt::Debug for InventoryCDeps {
 impl Default for InventoryCDeps {
     fn default() -> Self {
         Self {
-            markdown: Arc::new(SubsetMarkdownRenderer),
-            highlighter: Arc::new(SubsetCodeHighlighter),
+            markdown: Arc::new(DefaultMarkdownRenderer::default()),
+            highlighter: Arc::new(DefaultCodeHighlighter::from_env()),
             external_service_discovery: Arc::new(UnimplementedDiscovery),
             mirror_checker: Arc::new(UnconfiguredMirrorChecker),
             repo_updater: Arc::new(UnconfiguredRepoUpdater),
@@ -689,14 +636,18 @@ pub enum InventoryCOutcome {
     /// `PackageFilter!` (`addPackageRepoFilter`).
     PackageFilter(crate::package_repo_filters::PackageRepoFilterData),
     /// `CheckMirrorRepositoryConnectionResult!`.
-    CheckMirror { error: Option<String> },
+    CheckMirror {
+        error: Option<String>,
+    },
     /// `RandomizeUserPasswordResult!`.
     RandomizePassword {
         reset_url: Option<String>,
         email_sent: bool,
     },
     /// `GitCommit` returned by `resolvePhabricatorDiff`.
-    PhabricatorCommit { oid: String },
+    PhabricatorCommit {
+        oid: String,
+    },
     /// Plain string (`String!` from `sendTestEmail`).
     Text(String),
     /// A resolver that succeeded while returning a nil pointer: the baseline
@@ -1073,11 +1024,8 @@ impl ObjectValue for ExternalServiceNamespaceObject {
             "id" => {
                 // `relay.MarshalID` marshals the struct with `encoding/json`,
                 // which emits the fields in declaration order.
-                let spec = namespace_spec_json(
-                    self.node.id,
-                    &self.node.name,
-                    &self.node.external_id,
-                );
+                let spec =
+                    namespace_spec_json(self.node.id, &self.node.name, &self.node.external_id);
                 Ok(Some(FieldValue::Json(Json::Str(marshal_relay_json(
                     "ExternalServiceNamespace",
                     &spec,
@@ -1141,11 +1089,8 @@ impl ObjectValue for ExternalServiceRepositoryObject {
     ) -> Result<Option<FieldValue>, ExecError> {
         match field {
             "id" => {
-                let spec = namespace_spec_json(
-                    self.node.id,
-                    &self.node.name,
-                    &self.node.external_id,
-                );
+                let spec =
+                    namespace_spec_json(self.node.id, &self.node.name, &self.node.external_id);
                 Ok(Some(FieldValue::Json(Json::Str(marshal_relay_json(
                     "ExternalServiceRepository",
                     &spec,
@@ -1316,11 +1261,14 @@ fn parse_webhook_cursor_cond(cursor: Option<&RelayCursor>) -> Result<Option<Stri
             return Err(format!(
                 "missing or invalid cursor direction: {:?}",
                 cursor.d
-            ))
+            ));
         }
     };
     if cursor.c != "id" {
-        return Err(format!("missing or invalid cursor: {:?} {:?}", cursor.c, cursor.v));
+        return Err(format!(
+            "missing or invalid cursor: {:?} {:?}",
+            cursor.c, cursor.v
+        ));
     }
     Ok(Some(format!("({}) {} ({})", cursor.c, operator, cursor.v)))
 }
@@ -1408,9 +1356,8 @@ async fn load_webhooks(
     first: Option<i32>,
     external_url: &str,
 ) -> Result<WebhookConnectionData, String> {
-    let cond = parse_webhook_cursor_cond(cursor).map_err(|error| {
-        format!("parsing webhook cursor: {error}")
-    })?;
+    let cond = parse_webhook_cursor_cond(cursor)
+        .map_err(|error| format!("parsing webhook cursor: {error}"))?;
     let mut wheres: Vec<String> = Vec::new();
     let mut query = format!("SELECT {WEBHOOK_COLUMNS} FROM webhooks");
     let mut count_query = String::from("SELECT COUNT(*) FROM webhooks");
@@ -1492,46 +1439,31 @@ fn new_source_configuration(kind: &str, url: &str, token: &str) -> Result<String
     // `token` omitted when empty (`omitempty`).
     let mut config = serde_json::Map::new();
     if !token.is_empty() {
-        config.insert("token".to_owned(), serde_json::Value::String(token.to_owned()));
+        config.insert(
+            "token".to_owned(),
+            serde_json::Value::String(token.to_owned()),
+        );
     }
     config.insert("url".to_owned(), serde_json::Value::String(url.to_owned()));
     Ok(serde_json::Value::Object(config).to_string())
 }
 
 async fn external_service_exists(pool: &PgPool, id: i64) -> Result<(), String> {
-    let found: Option<i64> = sqlx::query_scalar(
-        "SELECT id FROM external_services WHERE id = $1 AND deleted_at IS NULL",
-    )
-    .bind(id)
-    .fetch_optional(pool)
-    .await
-    .map_err(|error| error.to_string())?;
+    let found: Option<i64> =
+        sqlx::query_scalar("SELECT id FROM external_services WHERE id = $1 AND deleted_at IS NULL")
+            .bind(id)
+            .fetch_optional(pool)
+            .await
+            .map_err(|error| error.to_string())?;
     match found {
         Some(_) => Ok(()),
         None => Err(format!("external service not found: {id}")),
     }
 }
 
-/// `SyntectLanguageMap[strings.ToLower(fuzzyLanguage)]` subset.
+/// `SyntectLanguageMap[strings.ToLower(fuzzyLanguage)]`.
 fn syntect_language(language: &str) -> &'static str {
-    match language {
-        "txt" => "txt",
-        "go" => "go",
-        "python" => "py",
-        "javascript" => "js",
-        "typescript" => "ts",
-        "c" => "c",
-        "cpp" => "cpp",
-        "c#" | "cs" => "cs",
-        "java" => "java",
-        "json" => "json",
-        "rs" => "rs",
-        "bash" => "bash",
-        "sh" => "sh",
-        "yaml" => "yaml",
-        "yml" => "yml",
-        _ => "",
-    }
+    crate::markdown_graphql::syntect_language(language)
 }
 
 // ---------------------------------------------------------------------------
@@ -1559,7 +1491,11 @@ async fn prefetch_external_namespaces(
             lookups.insert(key, Err(MUST_BE_SITE_ADMIN.to_owned()));
             continue;
         }
-        let kind = field.arguments.string("kind").unwrap_or_default().to_owned();
+        let kind = field
+            .arguments
+            .string("kind")
+            .unwrap_or_default()
+            .to_owned();
         let url = field.arguments.string("url").unwrap_or_default().to_owned();
         let token = field
             .arguments
@@ -1568,9 +1504,8 @@ async fn prefetch_external_namespaces(
             .to_owned();
         let result = async {
             let config = new_source_configuration(&kind, &url, &token)?;
-            let external_service_id = try_unmarshal_external_service_id(
-                field.arguments.string("id"),
-            )?;
+            let external_service_id =
+                try_unmarshal_external_service_id(field.arguments.string("id"))?;
             if let Some(id) = external_service_id {
                 external_service_exists(pool, id).await?;
             }
@@ -1605,7 +1540,11 @@ async fn prefetch_external_repositories(
             lookups.insert(key, Err(MUST_BE_SITE_ADMIN.to_owned()));
             continue;
         }
-        let kind = field.arguments.string("kind").unwrap_or_default().to_owned();
+        let kind = field
+            .arguments
+            .string("kind")
+            .unwrap_or_default()
+            .to_owned();
         let url = field.arguments.string("url").unwrap_or_default().to_owned();
         let token = field
             .arguments
@@ -1630,9 +1569,8 @@ async fn prefetch_external_repositories(
         };
         let result = async {
             let config = new_source_configuration(&kind, &url, &token)?;
-            let external_service_id = try_unmarshal_external_service_id(
-                field.arguments.string("id"),
-            )?;
+            let external_service_id =
+                try_unmarshal_external_service_id(field.arguments.string("id"))?;
             if let Some(id) = external_service_id {
                 external_service_exists(pool, id).await?;
             }
@@ -1668,7 +1606,7 @@ fn prefetch_markdown(
     lookups
 }
 
-fn prefetch_highlight(
+async fn prefetch_highlight(
     fields: &[RootField],
     deps: &InventoryCDeps,
 ) -> HashMap<String, Result<String, String>> {
@@ -1691,7 +1629,9 @@ fn prefetch_highlight(
         let filepath = format!("file.{}", syntect_language(&fuzzy));
         lookups.insert(
             key,
-            deps.highlighter.highlight(code, &filepath, disable_timeout),
+            deps.highlighter
+                .highlight(code, &filepath, disable_timeout)
+                .await,
         );
     }
     lookups
@@ -1731,14 +1671,7 @@ async fn prefetch_webhooks(
         };
         let first = field.arguments.i64("first").map(|first| first as i32);
         let kind = field.arguments.string("kind").unwrap_or_default();
-        let result = load_webhooks(
-            pool,
-            kind,
-            cursor.as_ref(),
-            first,
-            &deps.external_url,
-        )
-        .await;
+        let result = load_webhooks(pool, kind, cursor.as_ref(), first, &deps.external_url).await;
         lookups.insert(key, result);
     }
     lookups
@@ -1761,9 +1694,7 @@ pub async fn prefetch_user_accounts(
         if accounts.contains_key(&uid) {
             continue;
         }
-        let can_administer = actor.is_internal()
-            || actor.uid() == Some(uid)
-            || viewer_site_admin;
+        let can_administer = actor.is_internal() || actor.uid() == Some(uid) || viewer_site_admin;
 
         let emails = if dotcom && !can_administer {
             Err(MUST_BE_SITE_ADMIN_OR_SAME_USER.to_owned())
@@ -1928,11 +1859,7 @@ fn bool_arg(field: &RootField, name: &str) -> bool {
 
 /// `dbutil.NullInt32Column`: a zero actor UID is stored as NULL.
 fn null_int32(uid: i32) -> Option<i32> {
-    if uid == 0 {
-        None
-    } else {
-        Some(uid)
-    }
+    if uid == 0 { None } else { Some(uid) }
 }
 
 fn required_string(field: &RootField, name: &str) -> Result<String, InventoryCOutcome> {
@@ -1960,9 +1887,7 @@ async fn change_cody_plan(
         Some(Err(message)) => return InventoryCOutcome::Error(message),
         None => return InventoryCOutcome::Error("invalid graphql.ID".to_owned()),
     };
-    if let Err(message) =
-        check_site_admin_or_same_user(actor, viewer_site_admin, user_id)
-    {
+    if let Err(message) = check_site_admin_or_same_user(actor, viewer_site_admin, user_id) {
         return InventoryCOutcome::Error(message);
     }
     let pro = bool_arg(field, "pro");
@@ -2013,7 +1938,9 @@ fn validate_code_host_kind_and_secret(kind: &str, secret: Option<&str>) -> Resul
                 Ok(())
             }
         }
-        _ => Err(format!("webhooks are not supported for code host kind {kind}")),
+        _ => Err(format!(
+            "webhooks are not supported for code host kind {kind}"
+        )),
     }
 }
 
@@ -2121,7 +2048,7 @@ async fn update_webhook(
         Ok(None) => {
             return InventoryCOutcome::Error(format!(
                 "update webhook: webhook with ID {id} not found"
-            ))
+            ));
         }
         Err(error) => return InventoryCOutcome::Error(format!("update webhook: {error}")),
     };
@@ -2154,7 +2081,7 @@ async fn update_webhook(
             match normalize_code_host_url(new_urn) {
                 Ok(normalized) => urn = normalized,
                 Err(message) => {
-                    return InventoryCOutcome::Error(format!("update webhook: {message}"))
+                    return InventoryCOutcome::Error(format!("update webhook: {message}"));
                 }
             }
         }
@@ -2166,7 +2093,8 @@ async fn update_webhook(
                 .string("codeHostKind")
                 .filter(|kind| !kind.is_empty())
                 .unwrap_or(kind.as_str());
-            if let Err(message) = validate_code_host_kind_and_secret(validate_kind, Some(new_secret))
+            if let Err(message) =
+                validate_code_host_kind_and_secret(validate_kind, Some(new_secret))
             {
                 return InventoryCOutcome::Error(format!("update webhook: {message}"));
             }
@@ -2258,11 +2186,7 @@ async fn check_mirror_repository_connection(
     if let Err(message) = check_current_user_is_site_admin(actor, viewer_site_admin) {
         return InventoryCOutcome::Error(message);
     }
-    let repository_id = match field
-        .arguments
-        .string("repository")
-        .map(unmarshal_relay_id)
-    {
+    let repository_id = match field.arguments.string("repository").map(unmarshal_relay_id) {
         Some(Ok(id)) => id,
         Some(Err(message)) => return InventoryCOutcome::Error(message),
         None => return InventoryCOutcome::Error("invalid graphql.ID".to_owned()),
@@ -2289,11 +2213,7 @@ async fn update_mirror_repository(
     if let Err(message) = check_current_user_is_site_admin(actor, viewer_site_admin) {
         return InventoryCOutcome::Error(message);
     }
-    let repository_id = match field
-        .arguments
-        .string("repository")
-        .map(unmarshal_relay_id)
-    {
+    let repository_id = match field.arguments.string("repository").map(unmarshal_relay_id) {
         Some(Ok(id)) => id,
         Some(Err(message)) => return InventoryCOutcome::Error(message),
         None => return InventoryCOutcome::Error("invalid graphql.ID".to_owned()),
@@ -2329,9 +2249,11 @@ async fn randomize_user_password(
     let user_id = match field.arguments.string("user").map(unmarshal_relay_id) {
         Some(Ok(id)) => id,
         Some(Err(message)) => {
-            return InventoryCOutcome::Error(format!("cannot parse user ID: {message}"))
+            return InventoryCOutcome::Error(format!("cannot parse user ID: {message}"));
         }
-        None => return InventoryCOutcome::Error("cannot parse user ID: invalid graphql.ID".to_owned()),
+        None => {
+            return InventoryCOutcome::Error("cannot parse user ID: invalid graphql.ID".to_owned());
+        }
     };
     let password = uuid::Uuid::new_v4().simple().to_string();
     let hash = match bcrypt::hash(password, bcrypt::DEFAULT_COST) {
@@ -2349,7 +2271,11 @@ async fn randomize_user_password(
     {
         return InventoryCOutcome::Error(error.to_string());
     }
-    let reset_url = match deps.password_reset_url.make_password_reset_url(user_id, "").await {
+    let reset_url = match deps
+        .password_reset_url
+        .make_password_reset_url(user_id, "")
+        .await
+    {
         Ok(url) => url,
         Err(message) => return InventoryCOutcome::Error(message),
     };
@@ -2378,7 +2304,10 @@ async fn randomize_user_password(
         }
         None
     } else {
-        Some(resolve_reference(&external_url_parsed(&deps.external_url), &reset_url))
+        Some(resolve_reference(
+            &external_url_parsed(&deps.external_url),
+            &reset_url,
+        ))
     };
     InventoryCOutcome::RandomizePassword {
         reset_url,
@@ -2412,8 +2341,7 @@ async fn set_tos_accepted(
             None => return InventoryCOutcome::Error("no current user".to_owned()),
         },
     };
-    if let Err(message) =
-        check_site_admin_or_same_user(actor, viewer_site_admin, affected_user_id)
+    if let Err(message) = check_site_admin_or_same_user(actor, viewer_site_admin, affected_user_id)
     {
         return InventoryCOutcome::Error(message);
     }
@@ -2520,9 +2448,7 @@ async fn resolve_phabricator_diff(
         .await;
     match repo_exists {
         Ok(Some(_)) => {}
-        Ok(None) => {
-            return InventoryCOutcome::Error(format!("repo not found: name={repo_name:?}"))
-        }
+        Ok(None) => return InventoryCOutcome::Error(format!("repo not found: name={repo_name:?}")),
         Err(error) => return InventoryCOutcome::Error(error.to_string()),
     }
     let diff_id = match phabricator_diff_id(field) {
@@ -2530,13 +2456,21 @@ async fn resolve_phabricator_diff(
         Err(message) => return InventoryCOutcome::Error(message),
     };
     let target_ref = format!("phabricator/diff/{diff_id}");
-    match deps.phabricator_git.resolve_revision(&repo_name, &target_ref).await {
+    match deps
+        .phabricator_git
+        .resolve_revision(&repo_name, &target_ref)
+        .await
+    {
         Ok(true) => {
-            return match deps.phabricator_git.commit_oid(&repo_name, &target_ref).await {
+            return match deps
+                .phabricator_git
+                .commit_oid(&repo_name, &target_ref)
+                .await
+            {
                 Ok(Some(oid)) => InventoryCOutcome::PhabricatorCommit { oid },
                 Ok(None) => InventoryCOutcome::Error("commit not found".to_owned()),
                 Err(message) => InventoryCOutcome::Error(message),
-            }
+            };
         }
         Ok(false) => {}
         Err(message) => return InventoryCOutcome::Error(message),
@@ -2556,7 +2490,7 @@ async fn resolve_phabricator_diff(
             None => {
                 return InventoryCOutcome::Error(format!(
                     "no phabricator was configured for: {origin}"
-                ))
+                ));
             }
         },
     };
@@ -2585,13 +2519,13 @@ async fn resolve_phabricator_diff(
                 Err(error) => {
                     return InventoryCOutcome::Error(format!(
                         "phabricator: could not parse date: {error}"
-                    ))
+                    ));
                 }
             },
             None => {
                 return InventoryCOutcome::Error(
                     "phabricator: could not parse date: missing date".to_owned(),
-                )
+                );
             }
         };
         PhabricatorDiffInfo {
@@ -2635,7 +2569,11 @@ async fn resolve_phabricator_diff(
     {
         return InventoryCOutcome::Error(message);
     }
-    match deps.phabricator_git.commit_oid(&repo_name, &target_ref).await {
+    match deps
+        .phabricator_git
+        .commit_oid(&repo_name, &target_ref)
+        .await
+    {
         Ok(Some(oid)) => InventoryCOutcome::PhabricatorCommit { oid },
         Ok(None) => InventoryCOutcome::Error("commit not found".to_owned()),
         Err(message) => InventoryCOutcome::Error(message),
@@ -2648,11 +2586,7 @@ async fn set_user_is_site_admin(
     actor: Actor,
     viewer_site_admin: bool,
 ) -> InventoryCOutcome {
-    let target_id = match field
-        .arguments
-        .string("userID")
-        .map(unmarshal_relay_id)
-    {
+    let target_id = match field.arguments.string("userID").map(unmarshal_relay_id) {
         Some(Ok(id)) => id,
         Some(Err(message)) => return InventoryCOutcome::Error(message),
         None => return InventoryCOutcome::Error("invalid graphql.ID".to_owned()),
@@ -2863,9 +2797,7 @@ fn package_filter_input(
             input_object_get(value, "packageName").and_then(InputValue::as_str),
             input_object_get(value, "versionGlob").and_then(InputValue::as_str),
         ) {
-            (Some(package), Some(version)) => {
-                Some((package.to_owned(), version.to_owned()))
-            }
+            (Some(package), Some(version)) => Some((package.to_owned(), version.to_owned())),
             _ => None,
         },
         None => None,
@@ -2934,15 +2866,15 @@ async fn add_package_repo_filter(
     .fetch_one(pool)
     .await
     {
-        Ok(row) => InventoryCOutcome::PackageFilter(
-            crate::package_repo_filters::PackageRepoFilterData {
+        Ok(row) => {
+            InventoryCOutcome::PackageFilter(crate::package_repo_filters::PackageRepoFilterData {
                 id: row.get("id"),
                 behaviour: behaviour.to_owned(),
                 package_scheme: scheme.to_owned(),
                 name_filter,
                 version_filter,
-            },
-        ),
+            })
+        }
         Err(error) => InventoryCOutcome::Error(error.to_string()),
     }
 }
@@ -3050,15 +2982,9 @@ async fn prefetch_mutations(
     let mut outcomes = Vec::new();
     for field in fields {
         let outcome = match field.name.as_str() {
-            "changeCodyPlan" => {
-                change_cody_plan(pool, field, actor, viewer_site_admin, deps).await
-            }
-            "createWebhook" => {
-                create_webhook(pool, field, actor, viewer_site_admin, deps).await
-            }
-            "updateWebhook" => {
-                update_webhook(pool, field, actor, viewer_site_admin, deps).await
-            }
+            "changeCodyPlan" => change_cody_plan(pool, field, actor, viewer_site_admin, deps).await,
+            "createWebhook" => create_webhook(pool, field, actor, viewer_site_admin, deps).await,
+            "updateWebhook" => update_webhook(pool, field, actor, viewer_site_admin, deps).await,
             "deleteWebhook" => delete_webhook(pool, field, actor, viewer_site_admin).await,
             "checkMirrorRepositoryConnection" => {
                 check_mirror_repository_connection(pool, field, actor, viewer_site_admin, deps)
@@ -3115,11 +3041,9 @@ pub struct InventoryCRoots {
     /// `Query.webhooks`, keyed by [`webhooks_key`].
     pub webhooks: HashMap<String, Result<WebhookConnectionData, String>>,
     /// `Query.externalServiceNamespaces`, keyed by [`external_namespaces_key`].
-    pub external_namespaces:
-        HashMap<String, Result<Vec<ExternalNamespaceData>, String>>,
+    pub external_namespaces: HashMap<String, Result<Vec<ExternalNamespaceData>, String>>,
     /// `Query.externalServiceRepositories`, keyed by [`external_repositories_key`].
-    pub external_repositories:
-        HashMap<String, Result<Vec<ExternalRepositoryData>, String>>,
+    pub external_repositories: HashMap<String, Result<Vec<ExternalRepositoryData>, String>>,
     /// `Query.renderMarkdown`, keyed by [`markdown_key`].
     pub markdown: HashMap<String, Result<String, String>>,
     /// `Query.highlightCode`, keyed by [`highlight_key`].
@@ -3137,9 +3061,7 @@ pub async fn prefetch_inventory_c(
     deps: &InventoryCDeps,
 ) -> InventoryCRoots {
     let mut mutations = HashMap::new();
-    for (field, outcome) in
-        prefetch_mutations(pool, fields, actor, viewer_site_admin, deps).await
-    {
+    for (field, outcome) in prefetch_mutations(pool, fields, actor, viewer_site_admin, deps).await {
         mutations.insert(field, outcome);
     }
     InventoryCRoots {
@@ -3161,7 +3083,7 @@ pub async fn prefetch_inventory_c(
         )
         .await,
         markdown: prefetch_markdown(fields, deps),
-        highlight: prefetch_highlight(fields, deps),
+        highlight: prefetch_highlight(fields, deps).await,
         mutations,
     }
 }
@@ -3200,13 +3122,13 @@ impl InventoryCRoots {
                 )
                 .with_nested(nested.clone()),
             )))),
-            InventoryCOutcome::Webhook(data) => Ok(Some(FieldValue::Object(Arc::new(
-                WebhookObject {
+            InventoryCOutcome::Webhook(data) => {
+                Ok(Some(FieldValue::Object(Arc::new(WebhookObject {
                     data: data.clone(),
                     viewer_site_admin,
                     nested: nested.clone(),
-                },
-            )))),
+                }))))
+            }
             InventoryCOutcome::PackageFilter(filter) => Ok(Some(FieldValue::Object(Arc::new(
                 crate::package_repo_filters::PackageRepoFilterObject {
                     filter: filter.clone(),
@@ -3226,15 +3148,12 @@ impl InventoryCRoots {
                     email_sent: *email_sent,
                 },
             )))),
-            InventoryCOutcome::PhabricatorCommit { oid } => Ok(Some(FieldValue::Object(
-                Arc::new(PhabricatorCommitObject { oid: oid.clone() }),
-            ))),
-            InventoryCOutcome::Text(text) => {
-                Ok(Some(FieldValue::Json(Json::Str(text.clone()))))
-            }
+            InventoryCOutcome::PhabricatorCommit { oid } => Ok(Some(FieldValue::Object(Arc::new(
+                PhabricatorCommitObject { oid: oid.clone() },
+            )))),
+            InventoryCOutcome::Text(text) => Ok(Some(FieldValue::Json(Json::Str(text.clone())))),
             InventoryCOutcome::Null => Ok(Some(FieldValue::Null)),
             InventoryCOutcome::Error(message) => Err(ExecError::new(message.clone())),
         }
     }
 }
-
