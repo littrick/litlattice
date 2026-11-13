@@ -15,13 +15,8 @@
 //! mirrors the baseline `StripPrefix` → `secureHeadersMiddleware` →
 //! `assetHandler` chain.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
-use std::time::{SystemTime, UNIX_EPOCH};
-
-use base64::Engine as _;
 use bytes::Bytes;
-use sha2::{Digest, Sha256};
 use http::header::{self, HeaderName, HeaderValue};
 use http::{Method, Request, Response, StatusCode};
 use http_body_util::Full;
@@ -1132,23 +1127,12 @@ fn repo_route_like(path: &str) -> bool {
     repo.is_match(path)
 }
 
-/// One `/githubapp/` subroute (`githubapp/httpapi.go:64-68`).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum GitHubAppRoute {
-    State,
-    NewAppState,
-    Redirect,
-    Setup,
-}
+/// One `/githubapp/` subroute (`githubapp/httpapi.go:64-68`), handled by
+/// [`crate::githubapp_http_api`].
+pub use crate::githubapp_http_api::GitHubAppRoute;
 
 fn github_app_route(path: &str) -> Option<GitHubAppRoute> {
-    match path {
-        "/githubapp/state" => Some(GitHubAppRoute::State),
-        "/githubapp/new-app-state" => Some(GitHubAppRoute::NewAppState),
-        "/githubapp/redirect" => Some(GitHubAppRoute::Redirect),
-        "/githubapp/setup" => Some(GitHubAppRoute::Setup),
-        _ => None,
-    }
+    crate::githubapp_http_api::route(path)
 }
 
 fn github_app_strict_slash(path: &str) -> Option<String> {
@@ -1255,165 +1239,11 @@ fn is_url_scheme(candidate: &str) -> bool {
     chars.all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '+' | '-' | '.'))
 }
 
-/// `githubapp.httpapi`'s offline-deterministic branches. Redis/DB-backed
-/// success paths are not reachable without those services (errata §4.4).
+/// `githubapp.httpapi`: delegate to the handler module. Without injected
+/// Redis/DB/HTTP seams the server keeps the offline-deterministic branches
+/// (validated before any external call), exactly as the UI tests expect.
 fn serve_github_app<B>(req: &Request<B>, route: GitHubAppRoute) -> Response<BoxBody> {
-    let query = req.uri().query();
-    match route {
-        // `stateHandler`: an empty `id` only writes the random state.
-        GitHubAppRoute::State => {
-            let gql_id = app_handlers::query_param(query, "id").unwrap_or_default();
-            if !gql_id.is_empty() {
-                if let Err(error) = unmarshal_github_app_id(&gql_id) {
-                    return http_error(
-                        StatusCode::BAD_REQUEST,
-                        &format!("Unexpected error while unmarshalling App ID: {error}"),
-                        http::HeaderMap::new(),
-                    );
-                }
-            }
-            body_response(
-                StatusCode::OK,
-                text_plain_headers(),
-                random_state().into_bytes(),
-            )
-        }
-        // `newAppStateHandler` without a `webhookURN` only needs a random
-        // state; creating a webhook needs the DB.
-        GitHubAppRoute::NewAppState => {
-            let webhook_urn =
-                app_handlers::query_param(query, "webhookURN").unwrap_or_default();
-            if !webhook_urn.is_empty() {
-                return http_error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "Unexpected error while setting up webhook endpoint: external service setup is not available",
-                    http::HeaderMap::new(),
-                );
-            }
-            let marshalled_user_id =
-                app_handlers::query_param(query, "userID").unwrap_or_default();
-            if !marshalled_user_id.is_empty() {
-                if let Err(error) = unmarshal_github_app_id(&marshalled_user_id) {
-                    return http_error(
-                        StatusCode::BAD_REQUEST,
-                        &format!("Unexpected error while unmarshalling user ID: {error}"),
-                        http::HeaderMap::new(),
-                    );
-                }
-            }
-            let state = random_state();
-            let body = format!(
-                "{}\n",
-                serde_json::json!({ "state": state })
-            );
-            body_response(
-                StatusCode::OK,
-                text_plain_headers(),
-                body.into_bytes(),
-            )
-        }
-        // `redirectHandler`: every check before the Redis lookup is
-        // deterministic; without a cache the state never matches.
-        GitHubAppRoute::Redirect => {
-            let state = app_handlers::query_param(query, "state").unwrap_or_default();
-            let code = app_handlers::query_param(query, "code").unwrap_or_default();
-            if state.is_empty() || code.is_empty() {
-                return http_error(
-                    StatusCode::BAD_REQUEST,
-                    "Bad request, code and state query params must be present",
-                    http::HeaderMap::new(),
-                );
-            }
-            if state.len() != 64 {
-                return http_error(
-                    StatusCode::BAD_REQUEST,
-                    "Bad request, state query param is wrong length",
-                    http::HeaderMap::new(),
-                );
-            }
-            http_error(
-                StatusCode::BAD_REQUEST,
-                "Bad request, state query param does not match",
-                http::HeaderMap::new(),
-            )
-        }
-        // `setupHandler`: a missing state/installation ID redirects to the
-        // site-admin apps page; a cache miss redirects with the error query.
-        GitHubAppRoute::Setup => {
-            let state = app_handlers::query_param(query, "state").unwrap_or_default();
-            let inst_id = app_handlers::query_param(query, "installation_id").unwrap_or_default();
-            if state.is_empty() || inst_id.is_empty() {
-                return app_handlers::redirect(req, "/site-admin/github-apps", 302);
-            }
-            if state.len() != 64 {
-                return http_error(
-                    StatusCode::BAD_REQUEST,
-                    "Bad request, state query param is wrong length",
-                    http::HeaderMap::new(),
-                );
-            }
-            let location = format!(
-                "/site-admin/github-apps?kind=&success=false&error={}",
-                query_escape("Bad request, state query param does not match")
-            );
-            app_handlers::redirect(req, &location, 302)
-        }
-    }
-}
-
-fn text_plain_headers() -> http::HeaderMap {
-    let mut headers = http::HeaderMap::new();
-    headers.insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("text/plain; charset=utf-8"),
-    );
-    headers
-}
-
-/// `randomState` (`httpapi.go:95-106`): 32 random bytes as 64 lowercase hex
-/// characters. The baseline reads `crypto/rand`; a monotonic counter plus the
-/// clock keeps the port dependency-free and collision-free per process.
-fn random_state() -> String {
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or_default();
-    let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let mut hasher = Sha256::new();
-    hasher.update(nanos.to_le_bytes());
-    hasher.update(counter.to_le_bytes());
-    hasher.update(std::process::id().to_le_bytes());
-    hasher
-        .finalize()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
-}
-
-/// `relay.UnmarshalSpec(graphql.ID, &int64)`.
-fn unmarshal_github_app_id(raw: &str) -> Result<i64, String> {
-    let decoded = base64::engine::general_purpose::URL_SAFE
-        .decode(raw)
-        .map_err(|error| error.to_string())?;
-    let text = String::from_utf8(decoded).map_err(|error| error.to_string())?;
-    text.parse::<i64>()
-        .map_err(|_| format!("json: cannot unmarshal {text} into Go value of type int64"))
-}
-
-/// Go's `url.QueryEscape`.
-fn query_escape(value: &str) -> String {
-    let mut escaped = String::new();
-    for byte in value.bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                escaped.push(byte as char)
-            }
-            b' ' => escaped.push('+'),
-            _ => escaped.push_str(&format!("%{byte:02X}")),
-        }
-    }
-    escaped
+    crate::githubapp_http_api::serve_offline(req, route)
 }
 
 /// The `/-/` subroutes of the repo route (`router.go:268-320`).
@@ -1513,6 +1343,7 @@ fn escape_html(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use http_body_util::BodyExt;
     use sg_ui::{MemoryAssets, UiAssets};
     use std::sync::Arc;
@@ -1558,8 +1389,7 @@ mod tests {
 
     impl TestDir {
         fn new(prefix: &str) -> Self {
-            use std::sync::atomic::{AtomicU64, Ordering};
-            static COUNTER: AtomicU64 = AtomicU64::new(0);
+                        static COUNTER: AtomicU64 = AtomicU64::new(0);
             let path = std::env::temp_dir().join(format!(
                 "{prefix}_{}_{}",
                 std::process::id(),
