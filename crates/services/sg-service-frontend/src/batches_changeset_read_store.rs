@@ -52,19 +52,21 @@ fn archived_in_batch_change(placeholder: &str) -> String {
     )
 }
 
-enum Param {
+pub(crate) enum Param {
+    Text(String),
     I64(i64),
     I64Array(Vec<i64>),
     TextArray(Vec<String>),
     Time(OffsetDateTime),
 }
 
-fn bind_all<'q>(
+pub(crate) fn bind_all<'q>(
     mut query: Query<'q, Postgres, PgArguments>,
     params: Vec<Param>,
 ) -> Query<'q, Postgres, PgArguments> {
     for param in params {
         query = match param {
+            Param::Text(value) => query.bind(value),
             Param::I64(value) => query.bind(value),
             Param::I64Array(value) => query.bind(value),
             Param::TextArray(value) => query.bind(value),

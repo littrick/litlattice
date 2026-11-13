@@ -3310,6 +3310,16 @@ impl ObjectValue for MutationRoot {
                 return crate::batches_mutations::mutation_field(batches, field, arguments, actor);
             }
         }
+        // M9.27c Batch Changes bulk operations (`detachChangesets`,
+        // `createChangesetComments`, `mergeChangesets`, `closeChangesets`,
+        // `publishChangesets`); `reenqueueChangesets` stays above.
+        if let Some(batches) = &self.batches {
+            if crate::batches_bulk_mutations::is_mutation_field(field) {
+                return crate::batches_bulk_mutations::mutation_field(
+                    batches, field, arguments, actor,
+                );
+            }
+        }
         // M9.26d GitHub Apps mutations: `deleteGitHubApp` / `refreshGitHubApp`.
         // `refreshGitHubApp` replays the GitHub REST sync through the injected
         // transport (production: `reqwest`).

@@ -1138,6 +1138,14 @@ pub struct BulkOperationObject {
     row: BulkOperationRow,
 }
 
+impl BulkOperationObject {
+    /// Build a `BulkOperation` resolver from a `store.GetBulkOperation` /
+    /// `ListBulkOperations` row (M9.27c node and mutation results).
+    pub fn from_row(db: BatchesHandle, row: BulkOperationRow) -> Self {
+        Self { db, row }
+    }
+}
+
 /// `changesetJobTypeToBulkOperationType`.
 fn bulk_operation_type(job_type: &str) -> Result<&'static str, ExecError> {
     match job_type {
