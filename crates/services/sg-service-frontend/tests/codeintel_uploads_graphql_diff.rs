@@ -34,7 +34,8 @@ use sg_graphql::schema::{
 };
 use sg_graphql::Json;
 use sg_service_frontend::codeintel_uploads_graphql::{
-    precise_indexes, CodeIntelUploadsHandle,
+    delete_precise_index, delete_precise_indexes, indexer_keys, precise_index_by_id,
+    precise_indexes, reindex_precise_index, reindex_precise_indexes, CodeIntelUploadsHandle,
 };
 use sg_service_frontend::codeintel_uploads_graphql_store::PgCodeIntelUploadsStore;
 
@@ -47,6 +48,8 @@ struct Corpus {
 struct Case {
     name: String,
     #[serde(default)]
+    kind: Option<String>,
+    #[serde(default)]
     repo: Option<String>,
     #[serde(default)]
     query: Option<String>,
@@ -58,6 +61,16 @@ struct Case {
     first: Option<i64>,
     #[serde(default)]
     after: Option<String>,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    repository: Option<String>,
+    #[serde(default)]
+    is_latest_for_repo: Option<bool>,
+}
+
+fn case_kind(case: &Case) -> &str {
+    case.kind.as_deref().unwrap_or("preciseIndexes")
 }
 
 fn arguments_for(case: &Case) -> Arguments {
@@ -65,26 +78,67 @@ fn arguments_for(case: &Case) -> Arguments {
     let mut push = |name: &str, value: InputValue| {
         entries.push((name.to_owned(), value));
     };
-    if let Some(repo) = &case.repo {
-        push("repo", InputValue::Str(repo.clone()));
-    }
-    if let Some(query) = &case.query {
-        push("query", InputValue::Str(query.clone()));
-    }
-    if let Some(states) = &case.states {
-        push(
-            "states",
-            InputValue::List(states.iter().cloned().map(InputValue::Str).collect()),
-        );
-    }
-    if let Some(indexer_key) = &case.indexer_key {
-        push("indexerKey", InputValue::Str(indexer_key.clone()));
-    }
-    if let Some(first) = case.first {
-        push("first", InputValue::Int(first));
-    }
-    if let Some(after) = &case.after {
-        push("after", InputValue::Str(after.clone()));
+    let kind = case_kind(case);
+    match kind {
+        "preciseIndexes" => {
+            if let Some(repo) = &case.repo {
+                push("repo", InputValue::Str(repo.clone()));
+            }
+            if let Some(query) = &case.query {
+                push("query", InputValue::Str(query.clone()));
+            }
+            if let Some(states) = &case.states {
+                push(
+                    "states",
+                    InputValue::List(states.iter().cloned().map(InputValue::Str).collect()),
+                );
+            }
+            if let Some(indexer_key) = &case.indexer_key {
+                push("indexerKey", InputValue::Str(indexer_key.clone()));
+            }
+            if let Some(first) = case.first {
+                push("first", InputValue::Int(first));
+            }
+            if let Some(after) = &case.after {
+                push("after", InputValue::Str(after.clone()));
+            }
+        }
+        "indexerKeys" => {
+            if let Some(repo) = &case.repo {
+                push("repo", InputValue::Str(repo.clone()));
+            }
+        }
+        "preciseIndexByID" => {
+            if let Some(id) = &case.id {
+                push("id", InputValue::Str(id.clone()));
+            }
+        }
+        "deletePreciseIndex" | "reindexPreciseIndex" => {
+            if let Some(id) = &case.id {
+                push("id", InputValue::Str(id.clone()));
+            }
+        }
+        "deletePreciseIndexes" | "reindexPreciseIndexes" => {
+            if let Some(query) = &case.query {
+                push("query", InputValue::Str(query.clone()));
+            }
+            if let Some(states) = &case.states {
+                push(
+                    "states",
+                    InputValue::List(states.iter().cloned().map(InputValue::Str).collect()),
+                );
+            }
+            if let Some(indexer_key) = &case.indexer_key {
+                push("indexerKey", InputValue::Str(indexer_key.clone()));
+            }
+            if let Some(is_latest) = case.is_latest_for_repo {
+                push("isLatestForRepo", InputValue::Bool(is_latest));
+            }
+            if let Some(repository) = &case.repository {
+                push("repository", InputValue::Str(repository.clone()));
+            }
+        }
+        _ => {}
     }
     Arguments::from_entries(entries)
 }
@@ -219,22 +273,266 @@ async fn codeintel_uploads_graphql_harness() {
         .connect(&dsn)
         .await
         .expect("connect");
-    let handle: CodeIntelUploadsHandle = Arc::new(PgCodeIntelUploadsStore::new(pool));
+    let handle: CodeIntelUploadsHandle = Arc::new(PgCodeIntelUploadsStore::new(pool.clone()));
 
     for case in &corpus.cases {
         let arguments = arguments_for(case);
-        let document = match precise_indexes(&handle, &arguments, Actor::Internal) {
-            Ok(value) => render_field(value).unwrap_or_else(|error| {
-                panic!("render {}: {error}", case.name);
-            }),
-            Err(error) => {
-                let mut map = Map::new();
-                map.insert("error".to_owned(), Value::String(error.message));
-                Value::Object(map)
+        let kind = case_kind(case);
+        let document = match kind {
+            "preciseIndexes" => match precise_indexes(&handle, &arguments, Actor::Internal) {
+                Ok(value) => render_field(value).unwrap_or_else(|error| {
+                    panic!("render {}: {error}", case.name);
+                }),
+                Err(error) => error_document(&error),
+            },
+            "indexerKeys" => match indexer_keys(&handle, &arguments, Actor::Internal) {
+                Ok(value) => {
+                    let mut map = Map::new();
+                    map.insert(
+                        "keys".to_owned(),
+                        render_field(value).unwrap_or_else(|error| {
+                            panic!("render {}: {error}", case.name);
+                        }),
+                    );
+                    Value::Object(map)
+                }
+                Err(error) => error_document(&error),
+            },
+            "preciseIndexByID" => match precise_index_by_id(
+                &handle,
+                case.id.as_deref().unwrap_or_default(),
+                Actor::Internal,
+            ) {
+                Ok(Some(value)) => {
+                    let mut map = Map::new();
+                    map.insert(
+                        "node".to_owned(),
+                        render_field(value).unwrap_or_else(|error| {
+                            panic!("render {}: {error}", case.name);
+                        }),
+                    );
+                    Value::Object(map)
+                }
+                Ok(None) => {
+                    let mut map = Map::new();
+                    map.insert("node".to_owned(), Value::Null);
+                    Value::Object(map)
+                }
+                Err(error) => error_document(&error),
+            },
+            "deletePreciseIndex" => {
+                let outcome = delete_precise_index(&handle, &arguments, Actor::Internal);
+                mutation_document(&pool, outcome.err()).await
             }
+            "deletePreciseIndexes" => {
+                let outcome = delete_precise_indexes(&handle, &arguments, Actor::Internal);
+                mutation_document(&pool, outcome.err()).await
+            }
+            "reindexPreciseIndex" => {
+                let outcome = reindex_precise_index(&handle, &arguments, Actor::Internal);
+                mutation_document(&pool, outcome.err()).await
+            }
+            "reindexPreciseIndexes" => {
+                let outcome = reindex_precise_indexes(&handle, &arguments, Actor::Internal);
+                mutation_document(&pool, outcome.err()).await
+            }
+            other => panic!("unknown case kind {other}"),
         };
         let body = serde_json::to_string(&document).expect("serialize");
         std::fs::write(Path::new(&out).join(format!("{}.json", case.name)), &body).expect("write");
         println!("RUST {} len={}", case.name, body.len());
     }
+}
+
+fn error_document(error: &sg_graphql::exec::ExecError) -> Value {
+    let mut map = Map::new();
+    map.insert("error".to_owned(), Value::String(error.message.clone()));
+    Value::Object(map)
+}
+
+async fn mutation_document(
+    pool: &sqlx::PgPool,
+    error: Option<sg_graphql::exec::ExecError>,
+) -> Value {
+    let mut map = Map::new();
+    match error {
+        Some(error) => {
+            map.insert("error".to_owned(), Value::String(error.message));
+        }
+        None => {
+            map.insert("result".to_owned(), Value::String("ok".to_owned()));
+        }
+    }
+    map.insert("uploads".to_owned(), upload_snapshot(pool).await);
+    map.insert("indexes".to_owned(), index_snapshot(pool).await);
+    map.insert("dirty".to_owned(), dirty_snapshot(pool).await);
+    Value::Object(map)
+}
+
+fn nullable_int(value: Option<i32>) -> Value {
+    value.map(Value::from).unwrap_or(Value::Null)
+}
+
+fn nullable_int64(value: Option<i64>) -> Value {
+    value.map(Value::from).unwrap_or(Value::Null)
+}
+
+fn nullable_string(value: Option<String>) -> Value {
+    value.map(Value::String).unwrap_or(Value::Null)
+}
+
+async fn upload_snapshot(pool: &sqlx::PgPool) -> Value {
+    use sqlx::Row as _;
+    let rows = sqlx::query(
+        "SELECT id, state, should_reindex, root, indexer, commit, repository_id, \
+         associated_index_id, uploaded_at::text AS uploaded_at, \
+         started_at::text AS started_at, finished_at::text AS finished_at \
+         FROM lsif_uploads WHERE id BETWEEN 927000 AND 927099 ORDER BY id",
+    )
+    .fetch_all(pool)
+    .await
+    .expect("upload snapshot");
+    Value::Array(
+        rows.iter()
+            .map(|row| {
+                let mut map = Map::new();
+                map.insert("id".to_owned(), Value::from(row.get::<i32, _>("id")));
+                map.insert(
+                    "state".to_owned(),
+                    Value::String(row.get::<String, _>("state")),
+                );
+                map.insert(
+                    "shouldReindex".to_owned(),
+                    Value::Bool(row.get::<bool, _>("should_reindex")),
+                );
+                map.insert(
+                    "root".to_owned(),
+                    Value::String(row.get::<String, _>("root")),
+                );
+                map.insert(
+                    "indexer".to_owned(),
+                    Value::String(row.get::<String, _>("indexer")),
+                );
+                map.insert(
+                    "commit".to_owned(),
+                    Value::String(row.get::<String, _>("commit")),
+                );
+                map.insert(
+                    "repositoryId".to_owned(),
+                    Value::from(row.get::<i32, _>("repository_id")),
+                );
+                map.insert(
+                    "associatedIndexId".to_owned(),
+                    nullable_int64(row.get::<Option<i64>, _>("associated_index_id")),
+                );
+                map.insert(
+                    "uploadedAt".to_owned(),
+                    Value::String(row.get::<String, _>("uploaded_at")),
+                );
+                map.insert(
+                    "startedAt".to_owned(),
+                    nullable_string(row.get::<Option<String>, _>("started_at")),
+                );
+                map.insert(
+                    "finishedAt".to_owned(),
+                    nullable_string(row.get::<Option<String>, _>("finished_at")),
+                );
+                Value::Object(map)
+            })
+            .collect(),
+    )
+}
+
+async fn index_snapshot(pool: &sqlx::PgPool) -> Value {
+    use sqlx::Row as _;
+    let rows = sqlx::query(
+        "SELECT id, state, should_reindex, root, indexer, commit, repository_id, \
+         (SELECT MAX(x.id) FROM lsif_uploads x WHERE x.associated_index_id = u.id) AS associated_upload_id, \
+         queued_at::text AS queued_at, started_at::text AS started_at, \
+         finished_at::text AS finished_at \
+         FROM lsif_indexes u WHERE id BETWEEN 927100 AND 927199 ORDER BY id",
+    )
+    .fetch_all(pool)
+    .await
+    .expect("index snapshot");
+    Value::Array(
+        rows.iter()
+            .map(|row| {
+                let mut map = Map::new();
+                map.insert("id".to_owned(), Value::from(row.get::<i64, _>("id")));
+                map.insert(
+                    "state".to_owned(),
+                    Value::String(row.get::<String, _>("state")),
+                );
+                map.insert(
+                    "shouldReindex".to_owned(),
+                    Value::Bool(row.get::<bool, _>("should_reindex")),
+                );
+                map.insert(
+                    "root".to_owned(),
+                    Value::String(row.get::<String, _>("root")),
+                );
+                map.insert(
+                    "indexer".to_owned(),
+                    Value::String(row.get::<String, _>("indexer")),
+                );
+                map.insert(
+                    "commit".to_owned(),
+                    Value::String(row.get::<String, _>("commit")),
+                );
+                map.insert(
+                    "repositoryId".to_owned(),
+                    Value::from(row.get::<i32, _>("repository_id")),
+                );
+                map.insert(
+                    "associatedUploadId".to_owned(),
+                    nullable_int(row.get::<Option<i32>, _>("associated_upload_id")),
+                );
+                map.insert(
+                    "queuedAt".to_owned(),
+                    Value::String(row.get::<String, _>("queued_at")),
+                );
+                map.insert(
+                    "startedAt".to_owned(),
+                    nullable_string(row.get::<Option<String>, _>("started_at")),
+                );
+                map.insert(
+                    "finishedAt".to_owned(),
+                    nullable_string(row.get::<Option<String>, _>("finished_at")),
+                );
+                Value::Object(map)
+            })
+            .collect(),
+    )
+}
+
+async fn dirty_snapshot(pool: &sqlx::PgPool) -> Value {
+    use sqlx::Row as _;
+    let rows = sqlx::query(
+        "SELECT repository_id, dirty_token, update_token FROM lsif_dirty_repositories \
+         WHERE repository_id IN (92700, 92701) ORDER BY repository_id",
+    )
+    .fetch_all(pool)
+    .await
+    .expect("dirty snapshot");
+    Value::Array(
+        rows.iter()
+            .map(|row| {
+                let mut map = Map::new();
+                map.insert(
+                    "repositoryId".to_owned(),
+                    Value::from(row.get::<i32, _>("repository_id")),
+                );
+                map.insert(
+                    "dirtyToken".to_owned(),
+                    Value::from(row.get::<i32, _>("dirty_token")),
+                );
+                map.insert(
+                    "updateToken".to_owned(),
+                    Value::from(row.get::<i32, _>("update_token")),
+                );
+                Value::Object(map)
+            })
+            .collect(),
+    )
 }

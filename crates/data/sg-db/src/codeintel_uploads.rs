@@ -1345,3 +1345,441 @@ pub async fn get_upload_by_id(pool: &PgPool, id: i32) -> Result<Option<UploadHea
     })
     .transpose()
 }
+
+// ---------------------------------------------------------------------------
+// Precise-index GraphQL mutations (M9.28a)
+//
+// Ports `store.DeleteUploadByID`, `store.DeleteUploads`,
+// `store.DeleteAutoIndexJobByID`, `store.DeleteAutoIndexJobs`,
+// `store.ReindexUploadByID`, `store.ReindexUploads`,
+// `store.SetRerunAutoIndexJobByID`, `store.SetRerunAutoIndexJobs` and
+// `store.GetIndexers` (`internal/codeintel/uploads/internal/store`). The
+// internal-actor `AuthzQueryConds` is `TRUE` and therefore omitted, exactly
+// like the read helpers above. No table/column is added.
+// ---------------------------------------------------------------------------
+
+/// `makeStateCondition`/`makeIndexStateCondition`: a requested `errored` or
+/// `failed` state expands to both database values.
+fn mutation_state_condition(states: &[String], params: &mut Vec<MutationParam>) -> Option<String> {
+    if states.is_empty() {
+        return None;
+    }
+    let mut expanded: Vec<String> = Vec::new();
+    for state in states {
+        if state == "errored" || state == "failed" {
+            for value in ["errored", "failed"] {
+                if !expanded.iter().any(|existing| existing == value) {
+                    expanded.push(value.to_owned());
+                }
+            }
+        } else if !expanded.iter().any(|existing| existing == state) {
+            expanded.push(state.clone());
+        }
+    }
+    expanded.sort();
+    if expanded.len() == 1 {
+        let value = expanded.remove(0);
+        params.push(MutationParam::Text(value));
+        Some(format!("u.state = ${}", params.len()))
+    } else {
+        params.push(MutationParam::TextArray(expanded));
+        Some(format!("u.state = ANY(${})", params.len()))
+    }
+}
+
+fn mutation_search_condition(
+    columns: &[&str],
+    term: &str,
+    params: &mut Vec<MutationParam>,
+) -> String {
+    let mut parts = Vec::new();
+    for column in columns {
+        params.push(MutationParam::Text(format!("%{term}%")));
+        parts.push(format!("{column} ILIKE ${}", params.len()));
+    }
+    format!("({})", parts.join(" OR "))
+}
+
+fn mutation_indexer_condition(
+    names: &[String],
+    params: &mut Vec<MutationParam>,
+) -> Option<String> {
+    if names.is_empty() {
+        return None;
+    }
+    let mut parts = Vec::new();
+    for name in names {
+        params.push(MutationParam::Text(format!("%{name}%")));
+        parts.push(format!("u.indexer ILIKE ${}", params.len()));
+    }
+    Some(format!("({})", parts.join(" OR ")))
+}
+
+enum MutationParam {
+    Text(String),
+    Int(i64),
+    TextArray(Vec<String>),
+}
+
+fn bind_mutation_params<'q>(
+    mut query: sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments>,
+    params: &'q [MutationParam],
+) -> sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments> {
+    for param in params {
+        query = match param {
+            MutationParam::Text(value) => query.bind(value.clone()),
+            MutationParam::Int(value) => query.bind(*value),
+            MutationParam::TextArray(values) => query.bind(values.clone()),
+        };
+    }
+    query
+}
+
+/// `store.DeleteUploads` (`uploads.go:689`): soft-delete matching uploads and
+/// mark every affected repository dirty.
+pub async fn delete_uploads_by_filter(
+    pool: &PgPool,
+    repository_id: i32,
+    states: &[String],
+    indexer_names: &[String],
+    term: &str,
+    visible_at_tip: bool,
+) -> Result<(), sqlx::Error> {
+    let mut conditions: Vec<String> = Vec::new();
+    let mut params: Vec<MutationParam> = Vec::new();
+    if repository_id != 0 {
+        params.push(MutationParam::Int(repository_id as i64));
+        conditions.push(format!("u.repository_id = ${}", params.len()));
+    }
+    conditions.push("repo.deleted_at IS NULL".to_owned());
+    conditions.push("u.state != 'deleted'".to_owned());
+    if !term.is_empty() {
+        conditions.push(mutation_search_condition(
+            &[
+                "u.commit",
+                "u.root",
+                "(u.state)::text",
+                "u.failure_message",
+                "repo.name",
+                "u.indexer",
+                "u.indexer_version",
+            ],
+            term,
+            &mut params,
+        ));
+    }
+    if let Some(condition) = mutation_state_condition(states, &mut params) {
+        conditions.push(condition);
+    }
+    if visible_at_tip {
+        conditions.push(
+            "EXISTS (SELECT 1 FROM lsif_uploads_visible_at_tip uvt \
+             WHERE uvt.repository_id = u.repository_id AND uvt.upload_id = u.id \
+             AND uvt.is_default_branch)"
+                .to_owned(),
+        );
+    }
+    if let Some(condition) = mutation_indexer_condition(indexer_names, &mut params) {
+        conditions.push(condition);
+    }
+
+    let sql = format!(
+        "UPDATE lsif_uploads u SET state = CASE WHEN u.state = 'completed' THEN 'deleting' ELSE 'deleted' END \
+         FROM repo WHERE repo.id = u.repository_id AND {} RETURNING u.repository_id",
+        conditions.join(" AND ")
+    );
+
+    let mut tx = pool.begin().await?;
+    set_audit_reason(&mut tx, "direct delete by filter criteria request").await?;
+    let rows = bind_mutation_params(sqlx::query(&sql), &params)
+        .fetch_all(&mut *tx)
+        .await?;
+    for row in rows {
+        let repo_id: i32 = row.try_get("repository_id")?;
+        sqlx::query(SET_REPOSITORY_AS_DIRTY_QUERY)
+            .bind(repo_id)
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await
+}
+
+/// `store.DeleteUploadByID` (`uploads.go:738`).
+pub async fn delete_upload_by_id(pool: &PgPool, id: i64) -> Result<bool, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    set_audit_reason(&mut tx, "direct delete by ID request").await?;
+    let repo_id: Option<i32> = sqlx::query_scalar(
+        "UPDATE lsif_uploads u SET state = CASE WHEN u.state = 'completed' THEN 'deleting' ELSE 'deleted' END \
+         WHERE id = $1 RETURNING repository_id",
+    )
+    .bind(id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if let Some(repo_id) = repo_id {
+        sqlx::query(SET_REPOSITORY_AS_DIRTY_QUERY)
+            .bind(repo_id)
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await?;
+    Ok(repo_id.is_some())
+}
+
+/// `store.DeleteAutoIndexJobByID` (`indexes.go:294`).
+pub async fn delete_auto_index_job_by_id(pool: &PgPool, id: i64) -> Result<bool, sqlx::Error> {
+    let row = sqlx::query_scalar::<_, i32>(
+        "DELETE FROM lsif_indexes WHERE id = $1 RETURNING repository_id",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.is_some())
+}
+
+fn index_mutation_conditions(
+    repository_id: i32,
+    states: &[String],
+    indexer_names: &[String],
+    term: &str,
+    without_upload: bool,
+    params: &mut Vec<MutationParam>,
+) -> Vec<String> {
+    let mut conditions: Vec<String> = Vec::new();
+    if repository_id != 0 {
+        params.push(MutationParam::Int(repository_id as i64));
+        conditions.push(format!("u.repository_id = ${}", params.len()));
+    }
+    if !term.is_empty() {
+        conditions.push(mutation_search_condition(
+            &[
+                "u.commit",
+                "(u.state)::text",
+                "u.failure_message",
+                "repo.name",
+                "u.root",
+                "u.indexer",
+            ],
+            term,
+            params,
+        ));
+    }
+    if let Some(condition) = mutation_state_condition(states, params) {
+        conditions.push(condition);
+    }
+    if without_upload {
+        conditions.push(
+            "NOT EXISTS (SELECT 1 FROM lsif_uploads u2 WHERE u2.associated_index_id = u.id)"
+                .to_owned(),
+        );
+    }
+    if let Some(condition) = mutation_indexer_condition(indexer_names, params) {
+        conditions.push(condition);
+    }
+    conditions
+}
+
+/// `store.DeleteAutoIndexJobs` (`indexes.go:303`).
+pub async fn delete_auto_index_jobs_by_filter(
+    pool: &PgPool,
+    repository_id: i32,
+    states: &[String],
+    indexer_names: &[String],
+    term: &str,
+    without_upload: bool,
+) -> Result<(), sqlx::Error> {
+    let mut params = Vec::new();
+    let conditions = index_mutation_conditions(
+        repository_id,
+        states,
+        indexer_names,
+        term,
+        without_upload,
+        &mut params,
+    );
+    let sql = if conditions.is_empty() {
+        "DELETE FROM lsif_indexes u USING repo WHERE u.repository_id = repo.id".to_owned()
+    } else {
+        format!(
+            "DELETE FROM lsif_indexes u USING repo WHERE u.repository_id = repo.id AND {}",
+            conditions.join(" AND ")
+        )
+    };
+    let mut tx = pool.begin().await?;
+    set_audit_reason(&mut tx, "direct delete by filter criteria request").await?;
+    bind_mutation_params(sqlx::query(&sql), &params)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await
+}
+
+/// `store.ReindexUploadByID` (`uploads.go:852`).
+pub async fn reindex_upload_by_id(pool: &PgPool, id: i64) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "WITH update_uploads AS (UPDATE lsif_uploads u SET should_reindex = true WHERE id = $1) \
+         UPDATE lsif_indexes u SET should_reindex = true \
+         WHERE id IN (SELECT associated_index_id FROM lsif_uploads WHERE id = $2)",
+    )
+    .bind(id)
+    .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// `store.ReindexUploads` (`uploads.go:778`).
+pub async fn reindex_uploads_by_filter(
+    pool: &PgPool,
+    repository_id: i32,
+    states: &[String],
+    indexer_names: &[String],
+    term: &str,
+    visible_at_tip: bool,
+) -> Result<(), sqlx::Error> {
+    let mut conditions: Vec<String> = Vec::new();
+    let mut params: Vec<MutationParam> = Vec::new();
+    if repository_id != 0 {
+        params.push(MutationParam::Int(repository_id as i64));
+        conditions.push(format!("u.repository_id = ${}", params.len()));
+    }
+    if !term.is_empty() {
+        conditions.push(mutation_search_condition(
+            &[
+                "u.commit",
+                "u.root",
+                "(u.state)::text",
+                "u.failure_message",
+                "repo.name",
+                "u.indexer",
+                "u.indexer_version",
+            ],
+            term,
+            &mut params,
+        ));
+    }
+    if let Some(condition) = mutation_state_condition(states, &mut params) {
+        conditions.push(condition);
+    }
+    if visible_at_tip {
+        conditions.push(
+            "EXISTS (SELECT 1 FROM lsif_uploads_visible_at_tip uvt \
+             WHERE uvt.repository_id = u.repository_id AND uvt.upload_id = u.id \
+             AND uvt.is_default_branch)"
+                .to_owned(),
+        );
+    }
+    if let Some(condition) = mutation_indexer_condition(indexer_names, &mut params) {
+        conditions.push(condition);
+    }
+    let where_clause = if conditions.is_empty() {
+        "TRUE".to_owned()
+    } else {
+        conditions.join(" AND ")
+    };
+    let sql = format!(
+        "WITH upload_candidates AS ( \
+             SELECT u.id, u.associated_index_id FROM lsif_uploads u \
+             JOIN repo ON repo.id = u.repository_id WHERE {where_clause} \
+             ORDER BY u.id FOR UPDATE \
+         ), update_uploads AS ( \
+             UPDATE lsif_uploads u SET should_reindex = true \
+             WHERE u.id IN (SELECT id FROM upload_candidates) \
+         ), index_candidates AS ( \
+             SELECT u.id FROM lsif_indexes u \
+             WHERE u.id IN (SELECT associated_index_id FROM upload_candidates) \
+             ORDER BY u.id FOR UPDATE \
+         ) \
+         UPDATE lsif_indexes u SET should_reindex = true \
+         WHERE u.id IN (SELECT id FROM index_candidates)"
+    );
+    let mut tx = pool.begin().await?;
+    set_audit_reason(&mut tx, "direct reindex by filter criteria request").await?;
+    bind_mutation_params(sqlx::query(&sql), &params)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await
+}
+
+/// `store.SetRerunAutoIndexJobByID` (`indexes.go:361`).
+pub async fn set_rerun_auto_index_job_by_id(pool: &PgPool, id: i64) -> Result<(), sqlx::Error> {
+    sqlx::query("UPDATE lsif_indexes u SET should_reindex = true WHERE id = $1")
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// `store.SetRerunAutoIndexJobs` (`indexes.go:377`).
+pub async fn set_rerun_auto_index_jobs_by_filter(
+    pool: &PgPool,
+    repository_id: i32,
+    states: &[String],
+    indexer_names: &[String],
+    term: &str,
+    without_upload: bool,
+) -> Result<(), sqlx::Error> {
+    let mut params = Vec::new();
+    let conditions = index_mutation_conditions(
+        repository_id,
+        states,
+        indexer_names,
+        term,
+        without_upload,
+        &mut params,
+    );
+    let where_clause = if conditions.is_empty() {
+        "TRUE".to_owned()
+    } else {
+        conditions.join(" AND ")
+    };
+    let sql = format!(
+        "WITH candidates AS ( \
+             SELECT u.id FROM lsif_indexes u JOIN repo ON repo.id = u.repository_id \
+             WHERE {where_clause} ORDER BY u.id FOR UPDATE \
+         ) \
+         UPDATE lsif_indexes u SET should_reindex = true \
+         WHERE u.id IN (SELECT id FROM candidates)"
+    );
+    let mut tx = pool.begin().await?;
+    set_audit_reason(&mut tx, "direct reindex by filter criteria request").await?;
+    bind_mutation_params(sqlx::query(&sql), &params)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await
+}
+
+/// `store.GetIndexers` (`summary.go:17`). Returns the distinct `indexer`
+/// filenames across uploads and indexes, ordered ascending.
+pub async fn get_indexer_names(
+    pool: &PgPool,
+    repository_id: i32,
+) -> Result<Vec<String>, sqlx::Error> {
+    if repository_id == 0 {
+        return sqlx::query_scalar(
+            "WITH combined_indexers AS ( \
+                 SELECT DISTINCT u.indexer FROM lsif_uploads u \
+                 UNION ALL \
+                 SELECT DISTINCT u.indexer FROM lsif_indexes u \
+             ) \
+             SELECT DISTINCT u.indexer FROM combined_indexers u ORDER BY u.indexer",
+        )
+        .fetch_all(pool)
+        .await;
+    }
+
+    sqlx::query_scalar(
+        "WITH repo_candidate AS ( \
+             SELECT repo.id FROM repo \
+             WHERE repo.id = $1 AND repo.deleted_at IS NULL AND repo.blocked IS NULL \
+         ), combined_indexers AS ( \
+             SELECT DISTINCT u.indexer FROM lsif_uploads u \
+             JOIN repo_candidate r ON r.id = u.repository_id \
+             UNION ALL \
+             SELECT DISTINCT u.indexer FROM lsif_indexes u \
+             JOIN repo_candidate r ON r.id = u.repository_id \
+         ) \
+         SELECT DISTINCT u.indexer FROM combined_indexers u ORDER BY u.indexer",
+    )
+    .bind(repository_id)
+    .fetch_all(pool)
+    .await
+}
