@@ -515,6 +515,9 @@ pub struct SchemaGraphqlDeps {
     /// `CodeIntelPoliciesResolver`'s database seam (M9.28c); `None`
     /// reproduces an absent resolver.
     codeintel_policies: Option<crate::codeintel_policies_graphql::CodeIntelPoliciesHandle>,
+    /// `NotebooksResolver`'s database seam (M9.29a); `None` reproduces an
+    /// absent optional resolver (`notebooks.graphql` not appended).
+    notebooks: Option<crate::notebooks_graphql::NotebooksHandle>,
     /// `Repository.embeddingExists`'s database seam (M9.14c); `None` keeps the
     /// field unported.
     embeddings: Option<Arc<dyn crate::embeddings_graphql::RepositoryEmbeddingsStore>>,
@@ -605,6 +608,7 @@ impl SchemaGraphqlDeps {
             codeintel_uploads: None,
             codeintel_autoindexing: None,
             codeintel_policies: None,
+            notebooks: None,
             embeddings: None,
             diagnostics: None,
             org_invitation_config: None,
@@ -682,6 +686,7 @@ impl SchemaGraphqlDeps {
             codeintel_uploads: None,
             codeintel_autoindexing: None,
             codeintel_policies: None,
+            notebooks: None,
             embeddings: None,
             diagnostics: None,
             org_invitation_config: None,
@@ -1075,6 +1080,26 @@ impl SchemaGraphqlDeps {
         Ok(self)
     }
 
+    /// Enable the Notebooks GraphQL surface (M9.29a): append
+    /// `notebooks.graphql` (as `NewSchema` does for a non-nil
+    /// `NotebooksResolver`) and hand the database seam to the executor.
+    ///
+    /// The default [`sg_graphql::schema::assemble_oss`] schema never includes
+    /// this document, so OSS introspection stays unchanged.
+    pub fn with_notebooks(
+        mut self,
+        db: crate::notebooks_graphql::NotebooksHandle,
+    ) -> Result<Self, sg_graphql::schema::SchemaError> {
+        if !self.schema.types.contains_key("Notebook") {
+            self.schema = Arc::new(sg_graphql::schema::assemble(&[
+                self.schema.schema_string.as_str(),
+                sg_graphql::schema::NOTEBOOKS_SCHEMA,
+            ])?);
+        }
+        self.notebooks = Some(db);
+        Ok(self)
+    }
+
     /// Enable the saved-searches GraphQL surface (M9.13a): append
     /// `saved_searches.graphql` and hand the database seam to the executor.
     pub fn with_saved_searches(
@@ -1379,6 +1404,7 @@ impl SchemaGraphqlDeps {
             codeintel_uploads: None,
             codeintel_autoindexing: None,
             codeintel_policies: None,
+            notebooks: None,
             embeddings: None,
             diagnostics: None,
             org_invitation_config: None,
@@ -2586,6 +2612,7 @@ impl GraphqlDeps for SchemaGraphqlDeps {
             .with_codeintel_uploads(self.codeintel_uploads.clone())
             .with_codeintel_autoindexing(self.codeintel_autoindexing.clone())
             .with_codeintel_policies(self.codeintel_policies.clone())
+            .with_notebooks(self.notebooks.clone())
             .with_ranking_roots(ranking_roots)
             .with_search_roots(search_root)
             .with_git(git)

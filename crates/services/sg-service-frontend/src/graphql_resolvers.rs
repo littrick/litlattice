@@ -2680,6 +2680,7 @@ impl FrontendRootResolver {
                 codeintel_uploads: None,
                 codeintel_autoindexing: None,
                 codeintel_policies: None,
+                notebooks: None,
                 batches: None,
                 github_apps: None,
                 teams: None,
@@ -2903,6 +2904,16 @@ impl FrontendRootResolver {
     ) -> Self {
         self.query.codeintel_policies = codeintel_policies.clone();
         self.mutation.codeintel_policies = codeintel_policies;
+        self
+    }
+
+    /// Attach the optional Notebooks surface (M9.29a).
+    pub fn with_notebooks(
+        mut self,
+        notebooks: Option<crate::notebooks_graphql::NotebooksHandle>,
+    ) -> Self {
+        self.query.notebooks = notebooks.clone();
+        self.mutation.notebooks = notebooks;
         self
     }
 
@@ -3249,6 +3260,9 @@ struct QueryRoot {
     /// Optional configuration-policy surface (M9.28c). `None` leaves the
     /// `codeintel.policies.graphql` fields unported.
     codeintel_policies: Option<crate::codeintel_policies_graphql::CodeIntelPoliciesHandle>,
+    /// Optional Notebooks surface (M9.29a). `None` leaves the
+    /// `notebooks.graphql` fields unported.
+    notebooks: Option<crate::notebooks_graphql::NotebooksHandle>,
     /// Optional outbound webhook surface (M9.27b). `None` leaves
     /// `Query.outboundWebhooks` / `outboundWebhookEventTypes` and
     /// `node(OutboundWebhook)` unported.
@@ -3311,6 +3325,8 @@ pub struct MutationRoot {
         Option<crate::codeintel_autoindexing_graphql::CodeIntelAutoindexingHandle>,
     /// Optional configuration-policy mutations (M9.28c).
     codeintel_policies: Option<crate::codeintel_policies_graphql::CodeIntelPoliciesHandle>,
+    /// Optional Notebooks mutations (M9.29a).
+    notebooks: Option<crate::notebooks_graphql::NotebooksHandle>,
 }
 
 impl MutationRoot {
@@ -3476,6 +3492,14 @@ impl ObjectValue for MutationRoot {
                     field,
                     arguments,
                     actor,
+                );
+            }
+        }
+        // M9.29a Notebooks mutations.
+        if let Some(notebooks) = &self.notebooks {
+            if crate::notebooks_graphql::is_mutation_field(field) {
+                return crate::notebooks_graphql::mutation_field(
+                    notebooks, field, arguments, actor,
                 );
             }
         }
@@ -4526,6 +4550,14 @@ impl ObjectValue for QueryRoot {
                             actor,
                         )
                     }
+                    // `NodeResolvers()["Notebook"]` → `NotebookByID` (M9.29a).
+                    "Notebook" if self.notebooks.is_some() => {
+                        crate::notebooks_graphql::node_field(
+                            self.notebooks.as_ref().expect("checked notebooks"),
+                            id,
+                            actor,
+                        )
+                    }
                     // `NodeResolvers()["GitCommit"]` → `gitCommitByID`
                     // (`git_commit.go:34-39`): `repositoryByID` then
                     // `repo.Commit(Rev: oid)`. A missing revision is `null`.
@@ -5056,6 +5088,17 @@ impl ObjectValue for QueryRoot {
                     self.codeintel_policies
                         .as_ref()
                         .expect("checked codeintel policies"),
+                    field,
+                    arguments,
+                    actor,
+                )
+            }
+            // Notebooks root fields (`Query.notebooks`, M9.29a).
+            _ if self.notebooks.is_some()
+                && crate::notebooks_graphql::is_root_field(field) =>
+            {
+                crate::notebooks_graphql::root_field(
+                    self.notebooks.as_ref().expect("checked notebooks"),
                     field,
                     arguments,
                     actor,
