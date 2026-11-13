@@ -490,6 +490,17 @@ pub trait BatchesGraphqlDatabase: Send + Sync {
     fn enqueue_batch_change_webhook(&self, event_type: &str, graphql_id: &str) {
         let _ = (event_type, graphql_id);
     }
+
+    // -------------------------------------------------------------------
+    // M9.26a spec surface
+    // -------------------------------------------------------------------
+
+    /// The batch-spec / changeset-spec store seam. Implemented by
+    /// `PgBatchesGraphqlStore` in `batches_specs_store.rs`; `None` leaves the
+    /// spec resolvers unregistered (e.g. stub stores in tests).
+    fn specs_database(&self) -> Option<&dyn crate::batches_specs_graphql::BatchesSpecsDatabase> {
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1336,8 +1347,18 @@ impl ObjectValue for BatchChangeObject {
                     ChangesetConnectionObject::new(self.db.clone(), filter, safe, actor),
                 ))))
             }
+            // M9.26a: `BatchChange.currentSpec` / `batchSpecs`.
+            "currentSpec" | "batchSpecs" => {
+                crate::batches_specs_graphql::batch_change_field(
+                    &self.db,
+                    &self.row,
+                    field,
+                    arguments,
+                    actor,
+                )
+            }
             // `ChangesetsStats`, `ChangesetCountsOverTime`, `DiffStat`,
-            // `CurrentSpec`, `BulkOperations`, `BatchSpecs`: unported.
+            // `BulkOperations`: unported.
             _ => Ok(None),
         }
     }

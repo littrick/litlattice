@@ -25,6 +25,8 @@ pub mod authz;
 pub mod batches_graphql;
 pub mod batches_graphql_store;
 pub mod batches_mutations;
+pub mod batches_specs_graphql;
+pub mod batches_specs_store;
 pub mod blame;
 pub mod chroma;
 pub mod client_configuration;

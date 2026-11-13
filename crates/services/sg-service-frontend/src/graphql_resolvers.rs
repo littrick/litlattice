@@ -3273,6 +3273,18 @@ impl ObjectValue for MutationRoot {
         arguments: &Arguments,
         actor: Actor,
     ) -> Result<Option<FieldValue>, ExecError> {
+        // M9.26a Batch Changes spec mutations (`createBatchSpec`,
+        // `createChangesetSpec`, `createChangesetSpecs`).
+        if let Some(batches) = &self.batches {
+            if crate::batches_specs_graphql::is_mutation_field(field) {
+                return crate::batches_specs_graphql::mutation_field(
+                    batches,
+                    field,
+                    arguments,
+                    actor,
+                );
+            }
+        }
         // M9.25b Batch Changes mutations. The resolver runs the enterprise
         // gate, RBAC check and database work directly (the store bridges with
         // `block_in_place`), matching the Go `Resolver` methods.
@@ -4463,6 +4475,18 @@ impl ObjectValue for QueryRoot {
                             actor,
                         )
                     }
+                    // `NodeResolvers()["BatchSpec"]` / `["ChangesetSpec"]` /
+                    // `["BatchSpecWorkspace"]` (M9.26a).
+                    _ if self.batches.is_some()
+                        && crate::batches_specs_graphql::is_node_kind(kind.as_str()) =>
+                    {
+                        crate::batches_specs_graphql::node_field(
+                            self.batches.as_ref().expect("checked batches"),
+                            kind.as_str(),
+                            id,
+                            actor,
+                        )
+                    }
                     // `NodeResolvers()["GitHubApp"]` (M9.25c): registered only
                     // when the optional resolver is present.
                     _ if self.github_apps.is_some()
@@ -4682,6 +4706,17 @@ impl ObjectValue for QueryRoot {
                     self.saved_searches
                         .as_ref()
                         .expect("checked saved searches"),
+                    field,
+                    arguments,
+                    actor,
+                )
+            }
+            // `Query.batchSpecs` (M9.26a).
+            _ if self.batches.is_some()
+                && crate::batches_specs_graphql::is_root_field(field) =>
+            {
+                crate::batches_specs_graphql::root_field(
+                    self.batches.as_ref().expect("checked batches"),
                     field,
                     arguments,
                     actor,
