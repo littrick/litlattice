@@ -24,6 +24,8 @@ pub mod auth_providers_graphql;
 pub mod authz;
 pub mod batches_graphql;
 pub mod batches_graphql_store;
+pub mod batches_changeset_read;
+pub mod batches_changeset_read_store;
 pub mod batches_mutations;
 pub mod batches_specs_graphql;
 pub mod batches_specs_store;
