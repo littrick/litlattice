@@ -39,7 +39,8 @@ use sg_extsvc::batches_state::{
 use sg_extsvc::batches_state_load::{parse_changeset_metadata, parse_event_metadata};
 use sg_graphql::exec::{Actor, Arguments, ExecError, FieldValue, InputValue, ObjectValue};
 use sg_graphql::json::Json;
-use sg_service_gitserver::diff::FileDiff;
+use sg_git::{DiffRangeType, RawDiffOptions};
+use sg_service_gitserver::diff::{parse_multi_file_diff, FileDiff};
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
@@ -53,6 +54,7 @@ use crate::git_commit_extra::{
     ComparisonData, FileDiffConnectionObject, RepositoryComparisonObject,
 };
 use crate::git_comparison_graphql::NewFileSource;
+use crate::git_graphql::GitObjectSource;
 use crate::graphql_resolvers::{
     datetime_rfc3339, PageInfoObject, RepositoryData, RepositoryObject,
 };
@@ -173,6 +175,159 @@ pub trait ChangesetDiffSource: Send + Sync {
         base_rev: &str,
         patch: &[u8],
     ) -> Result<PreviewComparisonObject, String>;
+}
+
+/// Production [`ChangesetDiffSource`] over the shared [`GitObjectSource`]
+/// (M9.32d).
+///
+/// `Changeset.diff` is resolved from the synchronous GraphQL `field` hook, so
+/// this adapter drives the async gitserver reads through
+/// [`crate::batches_graphql_store::block_on`]:
+///
+/// - `comparison` mirrors `graphqlbackend.NewRepositoryComparison`
+///   (`ResolveRevision` on head, `MergeBase`, `ResolveRevision` on the base /
+///   merge base, then `RawDiff`), including the `DevNullSHA` base and the
+///   empty-merge-base `..` fallback.
+/// - `preview` mirrors `NewPreviewRepositoryComparisonResolver`: it resolves
+///   `baseRev` through `ResolveRevision` (a missing revision yields the
+///   baseline's `revision not found: <repo>@<rev>`) and parses the changeset
+///   spec patch with the shared diff parser.
+///
+/// `GitserverGitObjects` implements `GitObjectSource`; its `commit_extra()`
+/// supplies `merge_base` and `raw_diff`.
+pub struct GitserverChangesetDiffSource {
+    objects: Arc<dyn GitObjectSource>,
+}
+
+impl GitserverChangesetDiffSource {
+    pub fn new(objects: Arc<dyn GitObjectSource>) -> Self {
+        Self { objects }
+    }
+
+    /// `backend.Repos().ResolveRev` / `RepoStore.ResolveRev`: `ResolveRevision`
+    /// with `EnsureRevision=true`. The missing-revision error text is the
+    /// baseline `gitdomain.RevisionNotFoundError`.
+    async fn resolve_revision(&self, repo: &MinimalRepo, rev: &str) -> Result<String, String> {
+        match self
+            .objects
+            .resolve_revision(repo.id, &repo.name, rev)
+            .await
+        {
+            Ok(oid) => Ok(oid),
+            Err(error) if error.revision_not_found => {
+                Err(format!("revision not found: {}@{}", repo.name, rev))
+            }
+            Err(error) => Err(error.message),
+        }
+    }
+
+    fn extra(&self) -> Result<&dyn crate::git_commit_extra::GitCommitExtraSource, String> {
+        self.objects
+            .commit_extra()
+            .ok_or_else(|| "raw diff is not available".to_owned())
+    }
+
+    async fn comparison_async(
+        &self,
+        repo: &MinimalRepo,
+        base_revspec: &str,
+        head_revspec: &str,
+    ) -> Result<ComparisonData, String> {
+        // `getCommit(head)`: resolve, then use the OID as the diff head.
+        let head_oid = self.resolve_revision(repo, head_revspec).await?;
+
+        let mut range_type = "..".to_owned();
+        let mut base_oid = None;
+        if base_revspec != sg_git::DEV_NULL_SHA {
+            range_type = "...".to_owned();
+            let merge_base = self
+                .extra()?
+                .merge_base(repo.id, &repo.name, base_revspec, head_revspec)
+                .await
+                .map_err(|error| error.message)?;
+            let base_commit = if merge_base.is_empty() {
+                // Fallback that works even without a merge base.
+                range_type = "..".to_owned();
+                base_revspec.to_owned()
+            } else {
+                merge_base
+            };
+            if base_commit != sg_git::DEV_NULL_SHA {
+                // `getCommit(base)`.
+                base_oid = Some(self.resolve_revision(repo, &base_commit).await?);
+            }
+        }
+
+        // `FileDiffConnectionResolver` diffs the resolved OIDs (the base
+        // revspec when the base commit is absent).
+        let options = RawDiffOptions {
+            base: base_oid.clone().unwrap_or_else(|| base_revspec.to_owned()),
+            head: head_oid.clone(),
+            range_type: Some(if range_type == ".." {
+                DiffRangeType::OnlyInHead
+            } else {
+                DiffRangeType::Intersection
+            }),
+            paths: Vec::new(),
+        };
+        let raw = self
+            .extra()?
+            .raw_diff(repo.id, &repo.name, &options)
+            .await
+            .map_err(|error| error.message)?;
+        let file_diffs = parse_multi_file_diff(&raw).map_err(|error| error.to_string())?;
+
+        Ok(ComparisonData {
+            base_revspec: base_revspec.to_owned(),
+            head_revspec: head_revspec.to_owned(),
+            range_type,
+            base_oid,
+            head_oid,
+            // The `Changeset.diff` GraphQL surface only reads `fileDiffs`; the
+            // commit connection is not prefetched (same as the M9.26c seam).
+            file_diffs: Some(Ok(file_diffs)),
+            commits: None,
+        })
+    }
+
+    async fn preview_async(
+        &self,
+        repo: &MinimalRepo,
+        base_rev: &str,
+        patch: &[u8],
+    ) -> Result<PreviewComparisonObject, String> {
+        // `NewPreviewRepositoryComparisonResolver` resolves the base revision
+        // (`repo.Commit`) and rejects a missing one.
+        let commit_oid = self.resolve_revision(repo, base_rev).await?;
+        let file_diffs = parse_multi_file_diff(patch).map_err(|error| error.to_string())?;
+        Ok(PreviewComparisonObject {
+            repo: repo.clone(),
+            commit_oid,
+            file_diffs,
+        })
+    }
+}
+
+impl ChangesetDiffSource for GitserverChangesetDiffSource {
+    fn comparison(
+        &self,
+        repo: &MinimalRepo,
+        base_revspec: &str,
+        head_revspec: &str,
+    ) -> Result<ComparisonData, String> {
+        crate::batches_graphql_store::block_on(
+            self.comparison_async(repo, base_revspec, head_revspec),
+        )
+    }
+
+    fn preview(
+        &self,
+        repo: &MinimalRepo,
+        base_rev: &str,
+        patch: &[u8],
+    ) -> Result<PreviewComparisonObject, String> {
+        crate::batches_graphql_store::block_on(self.preview_async(repo, base_rev, patch))
+    }
 }
 
 /// Synchronous read seam for the changeset deep-read surface.
@@ -653,8 +808,8 @@ fn changeset_commit_verification_field(
 // ---------------------------------------------------------------------------
 
 /// `PreviewRepositoryComparison`: `fileDiffs` are parsed from the changeset
-/// spec patch; `baseRepository` is the changeset's repository. The base commit
-/// object is not available without a gitserver client.
+/// spec patch; `baseRepository` is the changeset's repository and
+/// `commit_oid` is the gitserver-resolved `baseRev`.
 pub struct PreviewComparisonObject {
     pub repo: MinimalRepo,
     pub commit_oid: String,

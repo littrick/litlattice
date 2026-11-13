@@ -260,6 +260,19 @@ impl PgBatchesGraphqlStore {
         self
     }
 
+    /// M9.32d production wiring: back `Changeset.diff` and
+    /// `GitBranchChangesetDescription.diff` with the shared gitserver source
+    /// (`GitserverGitObjects`, i.e. `RawDiff`/`ResolveRevision`/`MergeBase`).
+    pub fn with_gitserver_changeset_diff_source(
+        mut self,
+        objects: std::sync::Arc<dyn crate::git_graphql::GitObjectSource>,
+    ) -> Self {
+        self.changeset_diff_source = Some(std::sync::Arc::new(
+            crate::batches_changeset_read::GitserverChangesetDiffSource::new(objects),
+        ));
+        self
+    }
+
     /// Test seam for the `batchChanges.enabled: false` site configuration.
     pub fn with_batch_changes_enabled(mut self, enabled: bool) -> Self {
         self.batch_changes_enabled = enabled;
