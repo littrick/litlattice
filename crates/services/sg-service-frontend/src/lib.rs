@@ -71,6 +71,7 @@ pub mod git_comparison_graphql;
 pub mod git_graphql;
 pub mod git_tree_entry_graphql;
 pub mod github_apps_graphql;
+pub mod githubapp_http_api;
 pub mod github_apps_graphql_store;
 pub mod gitlab_oauth;
 pub mod diagnostics_adapters;
