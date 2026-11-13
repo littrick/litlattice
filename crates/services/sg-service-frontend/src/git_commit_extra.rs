@@ -851,6 +851,7 @@ pub fn commit_extra_field(
                         repo: obj.repo.clone(),
                         data: data.clone(),
                         git: obj.git.clone(),
+                        commits_source: None,
                     },
                 )))),
                 Some(Err(message)) => Err(ExecError::new(message.clone())),
@@ -1142,6 +1143,42 @@ pub struct RepositoryComparisonObject {
     pub repo: MinimalRepo,
     pub data: ComparisonData,
     pub git: Option<Arc<GitPrefetch>>,
+    /// `RepositoryComparison.commits` is lazy in Go (`gitCommitConnectionResolver`
+    /// computes it on the first field access). The prefetch path fills
+    /// [`ComparisonData::commits`]; the batches `Changeset.diff` path only has
+    /// a synchronous field hook, so it carries the gitserver source here and
+    /// computes the connection on demand (M9.33d).
+    pub commits_source: Option<Arc<dyn GitObjectSource>>,
+}
+
+impl RepositoryComparisonObject {
+    /// Compute `RepositoryComparison.commits` exactly like
+    /// `gitCommitConnectionResolver.compute`: resolve the
+    /// `baseRevspec..headRevspec` range, then `Commits` with `first+1`
+    /// truncation for the next-page probe.
+    fn lazy_commits(
+        source: &Arc<dyn GitObjectSource>,
+        repo: &MinimalRepo,
+        data: &ComparisonData,
+        first: Option<i32>,
+        path: &str,
+    ) -> Result<Vec<CommitDetails>, String> {
+        let extra = source
+            .commit_extra()
+            .ok_or_else(|| "commit log is not available".to_owned())?;
+        let mut prefetch = GitPrefetch::default();
+        crate::batches_graphql_store::block_on(compute_comparison_commits(
+            extra,
+            source.as_ref(),
+            &mut prefetch,
+            repo,
+            data,
+            first,
+            path,
+            &[],
+            0,
+        ))
+    }
 }
 
 impl ObjectValue for RepositoryComparisonObject {
@@ -1166,17 +1203,28 @@ impl ObjectValue for RepositoryComparisonObject {
                 head_revspec: self.data.head_revspec.clone(),
                 git: self.git.clone(),
             })))),
-            "commits" => Ok(Some(FieldValue::Object(Arc::new(CommitConnectionObject {
-                repo: self.repo.clone(),
-                commits: self
-                    .data
-                    .commits
-                    .clone()
-                    .unwrap_or_else(|| Err("commits are not prefetched".to_owned())),
-                first: int_arg(arguments, "first"),
-                after_cursor: 0,
-                git: self.git.clone(),
-            })))),
+            "commits" => {
+                let commits = match &self.data.commits {
+                    Some(result) => result.clone(),
+                    None => match &self.commits_source {
+                        Some(source) => Self::lazy_commits(
+                            source,
+                            &self.repo,
+                            &self.data,
+                            int_arg(arguments, "first"),
+                            arguments.string("path").unwrap_or_default(),
+                        ),
+                        None => Err("commits are not prefetched".to_owned()),
+                    },
+                };
+                Ok(Some(FieldValue::Object(Arc::new(CommitConnectionObject {
+                    repo: self.repo.clone(),
+                    commits,
+                    first: int_arg(arguments, "first"),
+                    after_cursor: 0,
+                    git: self.git.clone(),
+                }))))
+            }
             "fileDiffs" => Ok(Some(FieldValue::Object(Arc::new(
                 FileDiffConnectionObject {
                     repo: self.repo.clone(),

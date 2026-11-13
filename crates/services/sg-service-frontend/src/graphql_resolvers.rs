@@ -7069,6 +7069,7 @@ impl ObjectValue for RepositoryObject {
                             repo: self.minimal_repo(),
                             data: data.clone(),
                             git: self.git.clone(),
+                            commits_source: None,
                         },
                     )))),
                     Some(Err(message)) => Err(ExecError::new(message.clone())),
