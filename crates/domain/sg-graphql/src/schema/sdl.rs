@@ -48,3 +48,9 @@ pub const CODEINTEL_AUTOINDEXING_SCHEMA: &str =
 /// document references `CodeIntelligenceConfigurationPolicy`, so the two are
 /// registered together, exactly like `NewSchema`'s `ReadDir` batch.
 pub const CODEINTEL_POLICIES_SCHEMA: &str = include_str!("sdl/codeintel.policies.graphql");
+
+/// `//go:embed notebooks.graphql` — `OptionalResolver.NotebooksResolver` SDL
+/// (M9.29a): `Query.notebooks`, the `Notebook`/`NotebookBlock` types and the
+/// notebook mutations. `NewSchema` appends it only when the notebooks
+/// resolver is present, so `assemble_oss` never includes it.
+pub const NOTEBOOKS_SCHEMA: &str = include_str!("sdl/notebooks.graphql");
