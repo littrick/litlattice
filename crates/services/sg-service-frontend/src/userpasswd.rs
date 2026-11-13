@@ -533,6 +533,12 @@ pub enum StoreError {
     AccessRequestEmailExists,
     /// `database.ErrPasswordResetRateLimit`.
     RateLimit,
+    /// `database.ErrCannotCreateUser{"site_already_initialized"}`
+    /// (`internal/database/users.go:342-344`).
+    SiteAlreadyInitialized,
+    /// `database.ErrCannotCreateUser{"initial_site_admin_must_be_first_user"}`
+    /// (`internal/database/users.go:370-373`).
+    InitialSiteAdminMustBeFirstUser,
     /// Any other database error.
     Other(String),
 }
@@ -540,6 +546,41 @@ pub enum StoreError {
 impl StoreError {
     pub fn other(message: impl Into<String>) -> Self {
         StoreError::Other(message.into())
+    }
+}
+
+/// `internal/database.ErrCannotCreateUser.Code()` as observed by callers.
+pub fn store_error_code(error: &StoreError) -> &'static str {
+    match error {
+        StoreError::UsernameExists => "err_username_exists",
+        StoreError::EmailExists => "err_email_exists",
+        StoreError::SiteAlreadyInitialized => "site_already_initialized",
+        StoreError::InitialSiteAdminMustBeFirstUser => "initial_site_admin_must_be_first_user",
+        StoreError::Presentation(_) => "presentation",
+        StoreError::NotFound => "not_found",
+        StoreError::UserEmailExists => "user_email_exists",
+        StoreError::AccessRequestEmailExists => "access_request_email_exists",
+        StoreError::RateLimit => "rate_limit",
+        StoreError::Other(_) => "other",
+    }
+}
+
+/// `unsafeSignUp`'s error → HTTP status/message switch
+/// (`cmd/frontend/internal/auth/userpasswd/handlers.go:260-283`). The two
+/// `ErrCannotCreateUser` codes this slice adds have no presentation message,
+/// so the baseline returns the generic 500 (`Signup failed unexpectedly.`).
+pub fn signup_error_status_message(error: &StoreError) -> (StatusCode, String) {
+    match error {
+        StoreError::UsernameExists => (
+            StatusCode::CONFLICT,
+            "Username is already in use. Try a different username.".to_owned(),
+        ),
+        StoreError::EmailExists => (
+            StatusCode::CONFLICT,
+            "Email address is already in use. Try signing into that account instead, or use a different email address.".to_owned(),
+        ),
+        StoreError::Presentation(message) => (StatusCode::CONFLICT, message.clone()),
+        _ => (StatusCode::INTERNAL_SERVER_ERROR, SIGNUP_FAILED.to_owned()),
     }
 }
 
@@ -1469,18 +1510,7 @@ async fn handle_sign_up_common<B>(
     let user = match deps.store.create_user(&new_user).await {
         Ok(user) => user,
         Err(error) => {
-            let (message, status) = match error {
-                StoreError::UsernameExists => (
-                    "Username is already in use. Try a different username.".to_owned(),
-                    StatusCode::CONFLICT,
-                ),
-                StoreError::EmailExists => (
-                    "Email address is already in use. Try signing into that account instead, or use a different email address.".to_owned(),
-                    StatusCode::CONFLICT,
-                ),
-                StoreError::Presentation(message) => (message, StatusCode::CONFLICT),
-                _ => (SIGNUP_FAILED.to_owned(), StatusCode::INTERNAL_SERVER_ERROR),
-            };
+            let (status, message) = signup_error_status_message(&error);
             return http_error(status, &message);
         }
     };
@@ -2200,43 +2230,15 @@ impl UserpasswdStore for PgUserpasswdStore {
     async fn create_user(&self, user: &NewUserData) -> Result<UserIdentity, StoreError> {
         let mut tx = self.pool.begin().await.map_err(db_error)?;
 
-        // `GlobalStateWith(tx).EnsureInitialized`: normalize/prune the row,
-        // read `alreadyInitialized`, then mark the site initialized.
-        sqlx::query(
-            "UPDATE global_state SET initialized = \
-                 (SELECT coalesce(bool_or(gs.initialized), false) FROM global_state gs)",
-        )
-        .execute(&mut *tx)
-        .await
-        .map_err(db_error)?;
-        sqlx::query(
-            "DELETE FROM global_state WHERE site_id NOT IN \
-                 (SELECT site_id FROM global_state ORDER BY ctid LIMIT 1)",
-        )
-        .execute(&mut *tx)
-        .await
-        .map_err(db_error)?;
-        sqlx::query(
-            "INSERT INTO global_state (site_id, initialized) \
-             SELECT gen_random_uuid(), EXISTS (SELECT 1 FROM users WHERE deleted_at IS NULL) \
-             WHERE NOT EXISTS (SELECT 1 FROM global_state)",
-        )
-        .execute(&mut *tx)
-        .await
-        .map_err(db_error)?;
-        let already_initialized: bool =
-            sqlx::query_scalar("SELECT coalesce(bool_or(gs.initialized), false) FROM global_state gs")
-                .fetch_one(&mut *tx)
-                .await
-                .map_err(db_error)?;
-        sqlx::query("UPDATE global_state SET initialized = true")
-            .execute(&mut *tx)
+        // `GlobalStateWith(tx).EnsureInitialized` (`internal/database/
+        // global_state.go:104-126`): normalize/prune the row, read
+        // `alreadyInitialized`, then mark the site initialized, all in the
+        // user-insert transaction.
+        let already_initialized = sg_db::global_state::ensure_initialized(&mut *tx)
             .await
             .map_err(db_error)?;
         if user.fail_if_not_initial_user && already_initialized {
-            return Err(StoreError::Other(
-                "cannot create user: site_already_initialized".to_owned(),
-            ));
+            return Err(StoreError::SiteAlreadyInitialized);
         }
 
         let row = sqlx::query(
@@ -2259,9 +2261,7 @@ impl UserpasswdStore for PgUserpasswdStore {
         let site_admin: bool = sqlx::Row::get(&row, "site_admin");
         let created_at: OffsetDateTime = sqlx::Row::get(&row, "created_at");
         if user.fail_if_not_initial_user && !site_admin {
-            return Err(StoreError::Other(
-                "cannot create user: initial_site_admin_must_be_first_user".to_owned(),
-            ));
+            return Err(StoreError::InitialSiteAdminMustBeFirstUser);
         }
 
         sqlx::query("INSERT INTO names(name, user_id) VALUES($1, $2)")

@@ -1,11 +1,16 @@
-//! `internal/database/global_state.go` (`Get`) and the `users.Count` query
-//! licensed-instance user counting needs (`licensing.maxusercount`).
+//! `internal/database/global_state.go` (`Get`, `EnsureInitialized`) and the
+//! `users.Count` query licensed-instance user counting needs
+//! (`licensing.maxusercount`).
 //!
-//! Only the paths the license check job uses are ported:
+//! Ported paths:
 //!
 //! - [`get`]: `globalStateStore.Get`, including its `initializeDBState`
 //!   preamble (normalize `initialized`, prune extra rows, insert a single row
 //!   with a fresh site ID when the table is empty) and the site ID row read;
+//! - [`ensure_initialized`]: `globalStateStore.EnsureInitialized`, the
+//!   security-critical "make the first user the site admin exactly once" step
+//!   that must run in the same transaction as the user insert
+//!   (`internal/database/users.go:338-345`);
 //! - [`users_count_excluding_sourcegraph_operators`]:
 //!   `users.Count(ctx, &UsersListOptions{ExcludeSourcegraphOperators: true})`,
 //!   i.e. soft-deleted users excluded and users with a
@@ -16,7 +21,7 @@
 //! (`gen_random_uuid()`, a v4 UUID) instead of Go's `uuid.NewRandom`, which is
 //! the same value shape the baseline stores.
 
-use sqlx::postgres::PgPool;
+use sqlx::postgres::{PgConnection, PgPool};
 use sqlx::Row;
 
 /// `database.GlobalState`.
@@ -26,36 +31,65 @@ pub struct GlobalState {
     pub initialized: bool,
 }
 
-/// `globalStateStore.Get`: ensure the single row exists, then return the first
-/// `global_state` row (`ORDER BY ctid`) and whether the instance was
-/// initialized.
-pub async fn get(pool: &PgPool) -> Result<GlobalState, sqlx::Error> {
-    let mut tx = pool.begin().await?;
-
-    // `initializeDBState`:
-    //   1. rewrite `initialized` to the OR of all rows;
-    //   2. keep only the first row (`ORDER BY ctid`);
-    //   3. insert one row when the table is empty, marked initialized exactly
-    //      when a live user exists (the baseline's first-site-admin rule).
+/// `globalStateStore.initializeDBState`: normalize/prune the single
+/// `global_state` row and insert one when the table is empty. The inserted
+/// row is initialized exactly when a live (non-deleted) user exists.
+async fn initialize_db_state(conn: &mut PgConnection) -> Result<(), sqlx::Error> {
     sqlx::query(
         "UPDATE global_state SET initialized = \
              (SELECT coalesce(bool_or(gs.initialized), false) FROM global_state gs)",
     )
-    .execute(&mut *tx)
+    .execute(&mut *conn)
     .await?;
     sqlx::query(
         "DELETE FROM global_state WHERE site_id NOT IN \
              (SELECT site_id FROM global_state ORDER BY ctid LIMIT 1)",
     )
-    .execute(&mut *tx)
+    .execute(&mut *conn)
     .await?;
     sqlx::query(
         "INSERT INTO global_state (site_id, initialized) \
          SELECT gen_random_uuid(), EXISTS (SELECT 1 FROM users WHERE deleted_at IS NULL) \
          WHERE NOT EXISTS (SELECT 1 FROM global_state)",
     )
-    .execute(&mut *tx)
+    .execute(&mut *conn)
     .await?;
+    Ok(())
+}
+
+/// `globalStateStore.SiteInitialized`: `bool_or(initialized)` over
+/// `global_state`.
+pub async fn site_initialized(conn: &mut PgConnection) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar("SELECT coalesce(bool_or(gs.initialized), false) FROM global_state gs")
+        .fetch_one(&mut *conn)
+        .await
+}
+
+/// `globalStateStore.EnsureInitialized`
+/// (`internal/database/global_state.go:104-126`): run `initializeDBState`,
+/// report whether the site was already initialized, then mark it initialized.
+///
+/// 🚨 SECURITY: must run in the same transaction as the user insert. The
+/// `true` return means a new account must not become a site admin (even when
+/// every other user has been deleted), guarding both against an admin
+/// accidentally deleting all users and against a user-creation bug minting
+/// site admins.
+pub async fn ensure_initialized(conn: &mut PgConnection) -> Result<bool, sqlx::Error> {
+    initialize_db_state(conn).await?;
+    let already_initialized = site_initialized(conn).await?;
+    sqlx::query("UPDATE global_state SET initialized = true")
+        .execute(&mut *conn)
+        .await?;
+    Ok(already_initialized)
+}
+
+/// `globalStateStore.Get`: ensure the single row exists, then return the first
+/// `global_state` row (`ORDER BY ctid`) and whether the instance was
+/// initialized.
+pub async fn get(pool: &PgPool) -> Result<GlobalState, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+
+    initialize_db_state(&mut *tx).await?;
 
     let row = sqlx::query(
         "SELECT (SELECT site_id::text FROM global_state ORDER BY ctid LIMIT 1) AS site_id, \
