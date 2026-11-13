@@ -44,6 +44,7 @@ use crate::batches_mutations::BATCH_CHANGES_DISABLED_FOR_USER;
 use crate::graphql_resolvers::{
     datetime_rfc3339, PageInfoObject, RepositoryData, RepositoryObject, UserObject,
 };
+use crate::search_stream::convert::MinimalRepo;
 
 /// `resolvers.batchSpecIDKind`.
 pub const BATCH_SPEC_KIND: &str = "BatchSpec";
@@ -1631,7 +1632,30 @@ impl ObjectValue for GitBranchChangesetDescriptionObject {
                 Some(value) => FieldValue::Json(Json::from_serde(value).map_err(ExecError::new)?),
                 None => FieldValue::Null,
             })),
-            // `diff` requires a gitserver-backed preview comparison.
+            // `changesetDescriptionResolver.Diff`: an M9.32d production
+            // gitserver-backed preview comparison over `baseRev` + the spec
+            // patch. Like the `Changeset.diff` preview path, the patch is
+            // parsed by the shared diff parser.
+            "diff" => {
+                let Some(read_db) = self.db.changeset_read() else {
+                    return Ok(Some(FieldValue::Null));
+                };
+                let Some(source) = read_db.changeset_diff_source() else {
+                    return Ok(Some(FieldValue::Null));
+                };
+                let repo = MinimalRepo {
+                    id: self.repo.id,
+                    name: self.repo.name.clone(),
+                };
+                let preview = source
+                    .preview(
+                        &repo,
+                        self.row.base_rev.as_deref().unwrap_or_default(),
+                        &self.row.diff,
+                    )
+                    .map_err(ExecError::new)?;
+                Ok(Some(FieldValue::Object(Arc::new(preview))))
+            }
             _ => Ok(None),
         }
     }
