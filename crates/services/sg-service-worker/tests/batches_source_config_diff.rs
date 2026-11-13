@@ -56,6 +56,20 @@ fn auth_json(auth: &SourceAuth) -> Value {
             );
             out.insert("token".to_owned(), Value::String(token.clone()));
         }
+        SourceAuth::GitHubAppInstallation(auth) => {
+            out.insert(
+                "type".to_owned(),
+                Value::String("github_app_installation".to_owned()),
+            );
+            out.insert(
+                "installation_id".to_owned(),
+                Value::Number(auth.installation_id().into()),
+            );
+            out.insert(
+                "base_url".to_owned(),
+                Value::String(auth.base_url().to_string()),
+            );
+        }
     }
     Value::Object(out)
 }
