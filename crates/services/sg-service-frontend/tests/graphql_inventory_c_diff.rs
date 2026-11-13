@@ -24,7 +24,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use sqlx::PgPool;
 
 use sg_graphql::schema::assemble_oss;
@@ -104,8 +104,9 @@ impl ExternalServiceDiscovery for M9Discovery {
 /// `disableTimeout` flag, and fails for the sentinel code `boom`.
 struct M9Highlighter;
 
+#[async_trait::async_trait]
 impl CodeHighlighter for M9Highlighter {
-    fn highlight(
+    async fn highlight(
         &self,
         code: &str,
         filepath: &str,

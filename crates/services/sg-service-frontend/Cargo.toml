@@ -43,6 +43,7 @@ http = { workspace = true }
 http-body-util = { workspace = true }
 hyper = { workspace = true }
 prost-types = { workspace = true }
+pulldown-cmark = { workspace = true }
 quick-xml = "0.29"
 regex = { workspace = true }
 reqwest = { workspace = true }
