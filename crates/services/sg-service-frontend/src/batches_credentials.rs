@@ -28,8 +28,13 @@
 //! - Network verification (`service.ValidateAuthenticator`) is a seam
 //!   ([`BatchesCredentialsDatabase::validate_authenticator`]) that defaults to
 //!   success. The real code host clients are out of scope for this slice.
-//! - `gitHubApp` always resolves to `null`; the GitHub Apps resolvers live in
-//!   `github_apps_graphql` and are not yet threaded into this object.
+//! - `sshPublicKey` on a GitHub App credential short-circuits to `null`
+//!   without loading the app (M9.31b): Go instead errors when the app row is
+//!   missing or its private key is not a valid RSA PEM. The differential
+//!   corpus avoids that edge.
+//! - `gitHubApp` requires the `github_apps` read handle
+//!   ([`BatchesCredentialsDatabase::github_apps_handle`]); when it is not
+//!   wired (stub stores), the field renders `null`.
 //! - Bitbucket Server's username lookup during credential creation performs a
 //!   network call in the baseline; here the provided `username` is used.
 
@@ -272,6 +277,15 @@ pub trait BatchesCredentialsDatabase: Send + Sync {
     fn external_url_host(&self) -> String {
         "example.com".to_owned()
     }
+
+    /// M9.31b: the `github_apps` read handle used by
+    /// `BatchChangesCredential.gitHubApp` and
+    /// `BatchChangesCodeHost.commitSigningConfiguration`. Implemented by
+    /// `PgBatchesGraphqlStore` in `batches_credentials_store.rs`; `None`
+    /// leaves both fields `null` (the pre-M9.31b behaviour).
+    fn github_apps_handle(&self) -> Option<crate::github_apps_graphql::GitHubAppsHandle> {
+        None
+    }
 }
 
 fn credentials_database(
@@ -279,6 +293,13 @@ fn credentials_database(
 ) -> Result<&dyn BatchesCredentialsDatabase, String> {
     db.credentials_database()
         .ok_or_else(|| "batch changes credentials are not wired".to_owned())
+}
+
+/// M9.31b: the `github_apps` handle for a batches store, if wired.
+pub fn github_apps_handle(db: &BatchesHandle) -> Option<crate::github_apps_graphql::GitHubAppsHandle> {
+    credentials_database(db)
+        .ok()
+        .and_then(|store| store.github_apps_handle())
 }
 
 // ---------------------------------------------------------------------------
@@ -424,6 +445,25 @@ impl BatchChangesCredentialObject {
             .unwrap_or_default();
         Ok(Some(comment_ssh_key(&key, &host)))
     }
+
+    /// `credential.go` `batchChanges{User,Site}CredentialResolver.GitHubApp`:
+    /// only a GitHub-kind credential with a positive `github_app_id` resolves,
+    /// and a missing app (`ErrNoGitHubAppFound`) renders `null`.
+    fn github_app_value(&self) -> Result<FieldValue, String> {
+        if !self.is_github_app() || self.resolved.row.external_service_type != "github" {
+            return Ok(FieldValue::Null);
+        }
+        let Some(handle) = github_apps_handle(&self.db) else {
+            return Ok(FieldValue::Null);
+        };
+        let app_id = self.resolved.row.github_app_id.unwrap_or(0);
+        match handle.get_app_by_id(app_id)? {
+            Some(app) => Ok(FieldValue::Object(Arc::new(
+                crate::github_apps_graphql::GitHubAppObject::new(app, handle),
+            ))),
+            None => Ok(FieldValue::Null),
+        }
+    }
 }
 
 impl ObjectValue for BatchChangesCredentialObject {
@@ -456,9 +496,7 @@ impl ObjectValue for BatchChangesCredentialObject {
                 crate::graphql_resolvers::datetime_rfc3339(row.created_at),
             )))),
             "isSiteCredential" => Ok(Some(FieldValue::Json(Json::Bool(self.resolved.is_site)))),
-            // GitHub Apps resolvers are not threaded into this object (see the
-            // module-level known gaps).
-            "gitHubApp" => Ok(Some(FieldValue::Null)),
+            "gitHubApp" => Ok(Some(self.github_app_value().map_err(ExecError::new)?)),
             _ => Ok(None),
         }
     }

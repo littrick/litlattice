@@ -182,6 +182,28 @@ impl GitHubAppsPgDatabase {
         .map_err(|err| err.to_string())?;
         row.as_ref().map(|row| self.scan_app(row)).transpose()
     }
+
+    fn query_app_by_domain_and_kind(
+        &self,
+        domain: &str,
+        kind: &str,
+        base_url: &str,
+    ) -> Result<Option<GitHubAppData>, String> {
+        let query = format!(
+            "SELECT {SELECT_APP_COLUMNS} FROM github_apps \
+             WHERE domain = $1 AND kind = $2::github_app_kind \
+             AND trim(trailing '/' from base_url) = $3"
+        );
+        let row = block_on(
+            sqlx::query(&query)
+                .bind(domain)
+                .bind(kind)
+                .bind(base_url.trim_end_matches('/'))
+                .fetch_optional(&self.pool),
+        )
+        .map_err(|err| err.to_string())?;
+        row.as_ref().map(|row| self.scan_app(row)).transpose()
+    }
 }
 
 impl GitHubAppsGraphqlDatabase for GitHubAppsPgDatabase {
@@ -201,6 +223,15 @@ impl GitHubAppsGraphqlDatabase for GitHubAppsPgDatabase {
 
     fn get_app_by_id(&self, id: i64) -> Result<Option<GitHubAppData>, String> {
         self.query_app_by_id(id)
+    }
+
+    fn get_app_by_domain_and_kind(
+        &self,
+        domain: &str,
+        kind: &str,
+        base_url: &str,
+    ) -> Result<Option<GitHubAppData>, String> {
+        self.query_app_by_domain_and_kind(domain, kind, base_url)
     }
 
     fn get_app_by_app_id(

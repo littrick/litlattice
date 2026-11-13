@@ -1464,6 +1464,31 @@ impl BatchChangesCodeHostObject {
             credential,
         }
     }
+
+    /// `code_host.go` `CommitSigningConfiguration`: only GitHub code hosts
+    /// resolve, via `GetByDomainAndKind("batches", "COMMIT_SIGNING", baseURL)`
+    /// where the URL match trims a trailing `/`. A missing app is `null`.
+    fn commit_signing_configuration(&self) -> Result<FieldValue, String> {
+        if self.host.external_service_type != "github" {
+            return Ok(FieldValue::Null);
+        }
+        let Some(db) = &self.db else {
+            return Ok(FieldValue::Null);
+        };
+        let Some(handle) = crate::batches_credentials::github_apps_handle(db) else {
+            return Ok(FieldValue::Null);
+        };
+        match handle.get_app_by_domain_and_kind(
+            "batches",
+            "COMMIT_SIGNING",
+            &self.host.external_service_id,
+        )? {
+            Some(app) => Ok(FieldValue::Object(Arc::new(
+                crate::github_apps_graphql::GitHubAppObject::new(app, handle),
+            ))),
+            None => Ok(FieldValue::Null),
+        }
+    }
 }
 
 impl ObjectValue for BatchChangesCodeHostObject {
@@ -1491,8 +1516,9 @@ impl ObjectValue for BatchChangesCodeHostObject {
                 )),
                 _ => FieldValue::Null,
             })),
-            // GitHub App commit signing is out of scope for this slice.
-            "commitSigningConfiguration" => Ok(Some(FieldValue::Null)),
+            "commitSigningConfiguration" => Ok(Some(
+                self.commit_signing_configuration().map_err(ExecError::new)?,
+            )),
             "requiresSSH" => Ok(Some(json_bool(self.host.requires_ssh))),
             "requiresUsername" => Ok(Some(json_bool(matches!(
                 self.host.external_service_type.as_str(),
