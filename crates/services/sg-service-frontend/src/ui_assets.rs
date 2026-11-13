@@ -1250,7 +1250,13 @@ fn serve_github_app<B>(
     deps: &AppDeps,
 ) -> Response<BoxBody> {
     match deps.github_app.as_deref() {
-        Some(server) => server.serve(req, route),
+        // The session middleware fills `AppDeps.more.actor` per request; the
+        // GitHub App middleware is now a real site-admin check, not allow-all.
+        Some(server) => server.serve_with_actor(
+            req,
+            route,
+            crate::githubapp_http_api::ActorIdentity::from_actor(deps.more.actor),
+        ),
         None => crate::githubapp_http_api::serve_offline(req, route),
     }
 }
