@@ -2677,6 +2677,7 @@ impl FrontendRootResolver {
                 code_monitors: None,
                 batches: None,
                 github_apps: None,
+                outbound_webhooks: None,
             },
             mutation: MutationRoot {
                 inventory: Arc::new(InventoryRoots::default()),
@@ -2812,6 +2813,16 @@ impl FrontendRootResolver {
     ) -> Self {
         self.query.github_apps = github_apps.clone();
         self.mutation.github_apps = github_apps;
+        self
+    }
+
+    /// Attach the optional outbound webhook surface (M9.27b).
+    pub fn with_outbound_webhooks(
+        mut self,
+        outbound_webhooks: Option<crate::outbound_webhooks_graphql::OutboundWebhooksHandle>,
+    ) -> Self {
+        self.query.outbound_webhooks = outbound_webhooks.clone();
+        self.mutation.outbound_webhooks = outbound_webhooks;
         self
     }
 
@@ -3167,6 +3178,10 @@ struct QueryRoot {
     github_apps: Option<crate::github_apps_graphql::GitHubAppsHandle>,
     /// Optional code-monitor resolver (M9.13a).
     code_monitors: Option<Arc<crate::code_monitors_graphql::CodeMonitorsResolver>>,
+    /// Optional outbound webhook surface (M9.27b). `None` leaves
+    /// `Query.outboundWebhooks` / `outboundWebhookEventTypes` and
+    /// `node(OutboundWebhook)` unported.
+    outbound_webhooks: Option<crate::outbound_webhooks_graphql::OutboundWebhooksHandle>,
 }
 
 /// `Mutation` root: `settingsMutation`/log events/temporary settings/feature
@@ -3210,6 +3225,8 @@ pub struct MutationRoot {
     /// Injectable GitHub REST transport for `refreshGitHubApp`; `None` uses
     /// the production `reqwest` client.
     github_apps_http: Option<Arc<dyn crate::github_oauth::GithubHttpTransport>>,
+    /// Optional outbound webhook mutations (M9.27b).
+    outbound_webhooks: Option<crate::outbound_webhooks_graphql::OutboundWebhooksHandle>,
 }
 
 impl MutationRoot {
@@ -3318,6 +3335,17 @@ impl ObjectValue for MutationRoot {
                 return crate::github_apps_graphql::mutation_field(
                     github_apps,
                     self.github_apps_http.as_deref(),
+                    field,
+                    arguments,
+                    actor,
+                );
+            }
+        }
+        // M9.27b outbound webhook mutations.
+        if let Some(outbound_webhooks) = &self.outbound_webhooks {
+            if crate::outbound_webhooks_graphql::is_mutation_field(field) {
+                return crate::outbound_webhooks_graphql::mutation_field(
+                    outbound_webhooks,
                     field,
                     arguments,
                     actor,
@@ -4530,6 +4558,20 @@ impl ObjectValue for QueryRoot {
                             actor,
                         )
                     }
+                    // `NodeResolvers()["OutboundWebhook"]` (M9.27b): registered
+                    // only when the optional resolver is present.
+                    _ if self.outbound_webhooks.is_some()
+                        && crate::outbound_webhooks_graphql::is_node_kind(kind.as_str()) =>
+                    {
+                        crate::outbound_webhooks_graphql::node_field(
+                            self.outbound_webhooks
+                                .as_ref()
+                                .expect("checked outbound webhooks"),
+                            kind.as_str(),
+                            id,
+                            actor,
+                        )
+                    }
                     _ => self.node_int32(kind.as_str(), id),
                 }
             }
@@ -4772,6 +4814,20 @@ impl ObjectValue for QueryRoot {
             {
                 crate::github_apps_graphql::root_field(
                     self.github_apps.as_ref().expect("checked github apps"),
+                    field,
+                    arguments,
+                    actor,
+                )
+            }
+            // Outbound webhook root fields (`Query.outboundWebhooks` /
+            // `Query.outboundWebhookEventTypes`, M9.27b).
+            _ if self.outbound_webhooks.is_some()
+                && crate::outbound_webhooks_graphql::is_root_field(field) =>
+            {
+                crate::outbound_webhooks_graphql::root_field(
+                    self.outbound_webhooks
+                        .as_ref()
+                        .expect("checked outbound webhooks"),
                     field,
                     arguments,
                     actor,
