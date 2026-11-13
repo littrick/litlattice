@@ -12,6 +12,8 @@
 //! query-engine reads (timeseries points / query status) are explicitly out
 //! of scope; see `dev/rs/docs/overviews/m9_29b_insights_overview.md`.
 
+use std::collections::{BTreeSet, HashMap};
+
 use sqlx::{PgPool, Row};
 
 use sg_graphql::exec::Actor;
@@ -20,9 +22,9 @@ use crate::codeintel_uploads_graphql_store::block_on;
 use crate::insights_graphql::{
     DashboardData, DashboardGrant, DashboardQueryOptions, InsightQueryOptions,
     InsightSeriesData, InsightSeriesMetadataData, InsightSeriesQueryStatusData,
-    InsightsDatabase, InsightsWriteDatabase, InsightViewData, InsightViewFilters,
-    LineChartMutationInput, PieChartCreateInput, PieChartUpdateInput,
-    SaveAsNewViewInput, SeriesMutationInput,
+    InsightSeriesStatusData, InsightsDatabase, InsightsWriteDatabase, InsightViewData,
+    InsightViewFilters, LineChartMutationInput, PieChartCreateInput, PieChartUpdateInput,
+    SaveAsNewViewInput, SeriesMutationInput, SeriesPointData,
 };
 use time::{Date, Duration, Month, OffsetDateTime, PrimitiveDateTime, Time};
 
@@ -104,7 +106,10 @@ SELECT iv.id AS view_id,
        iv.series_limit,
        iv.series_num_samples,
        i.group_by,
-       i.repository_criteria
+       i.repository_criteria,
+       i.id AS insight_series_id,
+       i.backfill_queued_at,
+       i.supports_augmentation
 "#;
 
 struct SeriesRow {
@@ -134,6 +139,9 @@ struct SeriesRow {
     series_num_samples: Option<i32>,
     group_by: Option<String>,
     repository_criteria: Option<String>,
+    insight_series_id: i32,
+    backfill_queued_at: Option<PrimitiveDateTime>,
+    supports_augmentation: bool,
 }
 
 impl SeriesRow {
@@ -165,11 +173,15 @@ impl SeriesRow {
             series_num_samples: row.try_get("series_num_samples")?,
             group_by: row.try_get("group_by")?,
             repository_criteria: row.try_get("repository_criteria")?,
+            insight_series_id: row.try_get("insight_series_id")?,
+            backfill_queued_at: row.try_get("backfill_queued_at")?,
+            supports_augmentation: row.try_get("supports_augmentation")?,
         })
     }
 
     fn series(&self) -> InsightSeriesData {
         InsightSeriesData {
+            insight_series_id: self.insight_series_id,
             series_id: self.series_id.clone(),
             query: self.query.clone(),
             label: self.label.clone(),
@@ -182,6 +194,8 @@ impl SeriesRow {
             generation_method: self.generation_method.clone(),
             group_by: self.group_by.clone(),
             repository_criteria: self.repository_criteria.clone(),
+            backfill_queued_at: self.backfill_queued_at,
+            supports_augmentation: self.supports_augmentation,
         }
     }
 
@@ -416,6 +430,219 @@ LIMIT $6::int
             .await
         })
         .map_err(|err| err.to_string())
+    }
+
+    // -- M9.31a recorded data series. -------------------------------------
+
+    fn load_series_points(
+        &self,
+        series: &InsightSeriesData,
+        filters: &InsightViewFilters,
+        num_samples: Option<i32>,
+    ) -> Result<Vec<SeriesPointData>, String> {
+        // `getRecordedSeriesPointOpts` sets at most `n < 90` samples.
+        let num_samples = match num_samples {
+            Some(value) if value > 0 && value < 90 => value,
+            _ => 90,
+        };
+        block_on(async {
+            // `GetOffsetNRecordingTime(..., excludeSnapshot=false)`: no
+            // snapshot predicate; offset is `n` (not `n - 1`).
+            let after: Option<OffsetDateTime> = sqlx::query_scalar(
+                "SELECT recording_time FROM insight_series_recording_times \
+                 WHERE insight_series_id = $1 \
+                 ORDER BY recording_time DESC OFFSET $2 LIMIT 1",
+            )
+            .bind(series.insight_series_id)
+            .bind(i64::from(num_samples))
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|err| err.to_string())?;
+
+            let mut includes: Vec<String> = Vec::new();
+            let mut excludes: Vec<String> = Vec::new();
+            if let Some(regex) = &filters.include_repo_regex {
+                if !regex.is_empty() {
+                    includes.push(regex.clone());
+                }
+            }
+            if let Some(regex) = &filters.exclude_repo_regex {
+                if !regex.is_empty() {
+                    excludes.push(regex.clone());
+                }
+            }
+            let needs_repo_names = !includes.is_empty() || !excludes.is_empty();
+
+            // `fullVectorSeriesAggregation`.
+            let mut query = sqlx::QueryBuilder::<sqlx::Postgres>::new(
+                "SELECT sub.series_id, sub.interval_time, SUM(sub.value) AS value, sub.capture FROM (\
+                 SELECT sp.repo_name_id, sp.series_id, date_trunc('seconds', sp.time) AS interval_time, \
+                 MAX(value) AS value, capture \
+                 FROM (SELECT * FROM series_points UNION ALL SELECT * FROM series_points_snapshots) AS sp",
+            );
+            if needs_repo_names {
+                query.push(" JOIN repo_names rn ON sp.repo_name_id = rn.id");
+            }
+            query.push(" WHERE sp.series_id = ");
+            query.push_bind(series.series_id.clone());
+            if let Some(after) = after {
+                query.push(" AND sp.time > ");
+                query.push_bind(after);
+            }
+            for include in &includes {
+                query.push(" AND rn.name ~ ");
+                query.push_bind(include.clone());
+            }
+            for exclude in &excludes {
+                query.push(" AND rn.name !~ ");
+                query.push_bind(exclude.clone());
+            }
+            query.push(
+                " GROUP BY sp.series_id, interval_time, sp.repo_name_id, capture \
+                 ORDER BY sp.series_id, interval_time, sp.repo_name_id) sub \
+                 GROUP BY sub.series_id, sub.interval_time, sub.capture \
+                 ORDER BY sub.series_id, sub.interval_time ASC",
+            );
+
+            let rows = query
+                .build_query_as::<(String, OffsetDateTime, f64, Option<String>)>()
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|err| err.to_string())?;
+            let mut points: Vec<SeriesPointData> = rows
+                .into_iter()
+                .map(|(series_id, time, value, capture)| SeriesPointData {
+                    series_id,
+                    time,
+                    value,
+                    capture,
+                })
+                .collect();
+
+            if series.supports_augmentation && series.insight_series_id != 0 {
+                // `augmentSeriesPoints` → `GetInsightSeriesRecordingTimes`
+                // (respecting the same `after` bound).
+                let mut times_query = sqlx::QueryBuilder::<sqlx::Postgres>::new(
+                    "SELECT date_trunc('seconds', recording_time) FROM insight_series_recording_times \
+                     WHERE insight_series_id = ",
+                );
+                times_query.push_bind(series.insight_series_id);
+                if let Some(after) = after {
+                    times_query.push(" AND recording_time > ");
+                    times_query.push_bind(after);
+                }
+                times_query.push(" ORDER BY recording_time ASC");
+                let recording_times = times_query
+                    .build_query_scalar::<OffsetDateTime>()
+                    .fetch_all(&self.pool)
+                    .await
+                    .map_err(|err| err.to_string())?;
+
+                if !recording_times.is_empty() {
+                    // `coalesceZeroValues`. Capture values are enumerated in
+                    // sorted order (the baseline uses randomized Go map order;
+                    // callers/tests keep that observable input ≤ 1 capture).
+                    let mut point_map: HashMap<(OffsetDateTime, String), SeriesPointData> =
+                        HashMap::new();
+                    let mut capture_values: BTreeSet<String> = BTreeSet::new();
+                    for point in &points {
+                        let capture = point.capture.clone().unwrap_or_default();
+                        capture_values.insert(capture.clone());
+                        point_map.insert((point.time, capture), point.clone());
+                    }
+                    let mut augmented = Vec::new();
+                    for timestamp in &recording_times {
+                        for capture_value in &capture_values {
+                            if let Some(point) =
+                                point_map.get(&(*timestamp, capture_value.clone()))
+                            {
+                                augmented.push(point.clone());
+                            } else {
+                                augmented.push(SeriesPointData {
+                                    series_id: series.series_id.clone(),
+                                    time: *timestamp,
+                                    value: 0.0,
+                                    capture: if capture_value.is_empty() {
+                                        None
+                                    } else {
+                                        Some(capture_value.clone())
+                                    },
+                                });
+                            }
+                        }
+                    }
+                    if !augmented.is_empty() {
+                        points = augmented;
+                    }
+                }
+            }
+
+            Ok(points)
+        })
+    }
+
+    fn load_series_status(
+        &self,
+        series: &InsightSeriesData,
+    ) -> Result<InsightSeriesStatusData, String> {
+        let frontend = self
+            .frontend_pool
+            .as_ref()
+            .ok_or_else(|| "frontend pool not configured".to_owned())?;
+        block_on(async {
+            let rows = sqlx::query(
+                "SELECT state, COUNT(*) FROM insights_query_runner_jobs \
+                 WHERE series_id = $1 GROUP BY state",
+            )
+            .bind(&series.series_id)
+            .fetch_all(frontend)
+            .await
+            .map_err(|err| err.to_string())?;
+            let mut queued = 0i32;
+            let mut processing = 0i32;
+            let mut completed = 0i32;
+            let mut errored = 0i32;
+            let mut failed = 0i32;
+            for row in rows {
+                let state: String = row.try_get("state").map_err(|err| err.to_string())?;
+                let count: i64 = row.try_get("count").map_err(|err| err.to_string())?;
+                let count = count as i32;
+                match state.as_str() {
+                    "queued" => queued = count,
+                    "processing" => processing = count,
+                    "completed" => completed = count,
+                    "errored" => errored = count,
+                    "failed" => failed = count,
+                    _ => {}
+                }
+            }
+
+            let backfill_states: Vec<String> = sqlx::query_scalar(
+                "SELECT state FROM insight_series_backfill WHERE series_id = $1",
+            )
+            .bind(series.insight_series_id)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|err| err.to_string())?;
+            let backfill_in_progress = backfill_states
+                .iter()
+                .any(|state| state != "completed" && state != "failed");
+
+            let pending_jobs = queued + processing + errored;
+            let is_loading = series.backfill_queued_at.is_none()
+                || pending_jobs > 0
+                || backfill_in_progress;
+
+            Ok(InsightSeriesStatusData {
+                // The baseline never assigns `totalPoints`; stay at zero.
+                total_points: 0,
+                pending_jobs,
+                completed_jobs: completed,
+                failed_jobs: failed,
+                backfill_queued_at: series.backfill_queued_at,
+                is_loading,
+            })
+        })
     }
 
     // -- M9.30a dashboard writes. -----------------------------------------
@@ -821,6 +1048,7 @@ struct MappedSeries {
 impl MappedSeries {
     fn data(&self) -> InsightSeriesData {
         InsightSeriesData {
+            insight_series_id: self.series_pk,
             series_id: self.series_id.clone(),
             query: self.query.clone(),
             label: self.label.clone(),
@@ -833,6 +1061,8 @@ impl MappedSeries {
             generation_method: self.generation_method.clone(),
             group_by: self.group_by.clone(),
             repository_criteria: self.repository_criteria.clone(),
+            backfill_queued_at: None,
+            supports_augmentation: true,
         }
     }
 }
