@@ -644,7 +644,7 @@ impl Variant {
 
 /// `jsonc.Unmarshal` on an external service config: comments and trailing
 /// commas are accepted; syntax errors and an empty document are errors.
-fn parse_config(config: &str) -> Result<JsonValue, String> {
+pub(crate) fn parse_config(config: &str) -> Result<JsonValue, String> {
     let (value, errors) = parse(
         config,
         ParseOptions {
@@ -702,7 +702,7 @@ fn normalize_base_url(raw: &str) -> String {
 }
 
 /// `extsvc.UniqueCodeHostIdentifier` (`internal/extsvc/types.go:796-856`).
-fn unique_code_host_identifier(kind: &str, config: &str) -> Result<String, String> {
+pub(crate) fn unique_code_host_identifier(kind: &str, config: &str) -> Result<String, String> {
     let Some(variant) = Variant::from_kind(kind) else {
         return Err(format!("unknown external service kind {kind:?}"));
     };

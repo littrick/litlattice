@@ -488,6 +488,13 @@ pub struct SchemaGraphqlDeps {
     /// `BatchChangesResolver`'s database seam (M9.24c); `None` reproduces an
     /// absent optional resolver (SDL not appended, root fields/types absent).
     batches: Option<crate::batches_graphql::BatchesHandle>,
+    /// `GitHubAppsResolver`'s database seam (M9.25c); `None` reproduces an
+    /// absent optional resolver (SDL not appended, root fields/types absent).
+    github_apps: Option<crate::github_apps_graphql::GitHubAppsHandle>,
+    /// Whether `githubapps.graphql` is already part of `schema` (appended by
+    /// `with_batches` or by `with_github_apps`; the document must not be
+    /// registered twice).
+    github_apps_schema: bool,
     /// `CodeMonitorsResolver`'s resolver (M9.13a); `None` reproduces an absent
     /// optional resolver.
     code_monitors: Option<Arc<crate::code_monitors_graphql::CodeMonitorsResolver>>,
@@ -574,6 +581,8 @@ impl SchemaGraphqlDeps {
             rbac: None,
             saved_searches: None,
             batches: None,
+            github_apps: None,
+            github_apps_schema: false,
             code_monitors: None,
             embeddings: None,
             diagnostics: None,
@@ -645,6 +654,8 @@ impl SchemaGraphqlDeps {
             rbac: None,
             saved_searches: None,
             batches: None,
+            github_apps: None,
+            github_apps_schema: false,
             code_monitors: None,
             embeddings: None,
             diagnostics: None,
@@ -1009,6 +1020,28 @@ impl SchemaGraphqlDeps {
             sg_graphql::schema::GITHUB_APPS_SCHEMA,
         ])?);
         self.batches = Some(db);
+        self.github_apps_schema = true;
+        Ok(self)
+    }
+
+    /// Enable the GitHub Apps read surface (M9.25c): append `githubapps.graphql`
+    /// (as `NewSchema` does for a non-nil `GitHubAppsResolver`) and hand the
+    /// database seam to the executor.
+    ///
+    /// The SDL is appended at most once; `with_batches` already registers it
+    /// for its `GitHubApp` reference, so calling both in either order works.
+    pub fn with_github_apps(
+        mut self,
+        db: crate::github_apps_graphql::GitHubAppsHandle,
+    ) -> Result<Self, sg_graphql::schema::SchemaError> {
+        if !self.github_apps_schema {
+            self.schema = Arc::new(sg_graphql::schema::assemble(&[
+                self.schema.schema_string.as_str(),
+                sg_graphql::schema::GITHUB_APPS_SCHEMA,
+            ])?);
+            self.github_apps_schema = true;
+        }
+        self.github_apps = Some(db);
         Ok(self)
     }
 
@@ -1235,6 +1268,8 @@ impl SchemaGraphqlDeps {
             rbac: None,
             saved_searches: None,
             batches: None,
+            github_apps: None,
+            github_apps_schema: false,
             code_monitors: None,
             embeddings: None,
             diagnostics: None,
@@ -2437,6 +2472,7 @@ impl GraphqlDeps for SchemaGraphqlDeps {
             .with_search_contexts(self.search_contexts.clone())
             .with_saved_searches(self.saved_searches.clone())
             .with_batches(self.batches.clone())
+            .with_github_apps(self.github_apps.clone())
             .with_code_monitors(self.code_monitors.clone())
             .with_ranking_roots(ranking_roots)
             .with_search_roots(search_root)
