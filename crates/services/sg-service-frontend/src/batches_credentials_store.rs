@@ -120,6 +120,23 @@ impl BatchesCredentialsDatabase for PgBatchesGraphqlStore {
         rows.iter().map(scan_site_row).collect()
     }
 
+    /// M9.31b: the `github_apps` read handle. The batches credential store and
+    /// the GitHub Apps GraphQL store share the same pool and keyring, so
+    /// `GetByID` / `GetByDomainAndKind` return the same rows the Go baseline's
+    /// `store.GitHubAppsStore()` sees (plaintext when no key is configured).
+    fn github_apps_handle(&self) -> Option<crate::github_apps_graphql::GitHubAppsHandle> {
+        let keyring = self
+            .credential_keyring
+            .clone()
+            .unwrap_or_else(|| Arc::new(sg_keyring::Keyring::default()));
+        Some(Arc::new(
+            crate::github_apps_graphql_store::GitHubAppsPgDatabase::new(
+                self.pool.clone(),
+                keyring,
+            ),
+        ))
+    }
+
     fn get_user_credential(
         &self,
         id: i64,

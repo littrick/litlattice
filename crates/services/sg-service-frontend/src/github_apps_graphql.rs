@@ -167,6 +167,18 @@ pub trait GitHubAppsGraphqlDatabase: Send + Sync {
         base_url: &str,
     ) -> Result<Option<GitHubAppData>, String>;
 
+    /// `gitHubAppsStore.GetByDomainAndKind` (`domain = ? AND kind = ? AND
+    /// trim(trailing '/' from base_url) = ?`): `None` when no row matches.
+    fn get_app_by_domain_and_kind(
+        &self,
+        domain: &str,
+        kind: &str,
+        base_url: &str,
+    ) -> Result<Option<GitHubAppData>, String> {
+        let _ = (domain, kind, base_url);
+        Err("get_app_by_domain_and_kind is not wired".to_owned())
+    }
+
     /// `gitHubAppsStore.GetInstallations`: all rows for the database app ID.
     fn get_installations(
         &self,
