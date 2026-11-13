@@ -820,14 +820,25 @@ impl AdminStore for PgAdminStore {
         creator_uid: i32,
     ) -> Result<UserRow, String> {
         let mut tx = self.pool.begin().await.map_err(|e| e.to_string())?;
+        // `CreateInTransaction` initializes the site in the same transaction
+        // (`internal/database/users.go:338-345`) and makes the insert a site
+        // admin only when the site was uninitialized and no user row exists
+        // yet (`users.go:357-360`). GraphQL `createUser` uses `Users().Create`
+        // (`cmd/frontend/graphqlbackend/users_create.go:63`), which has the
+        // same semantics.
+        let already_initialized = sg_db::global_state::ensure_initialized(&mut *tx)
+            .await
+            .map_err(|e| e.to_string())?;
         let row = sqlx::query(&format!(
             "INSERT INTO users (username, display_name, avatar_url, site_admin, tos_accepted, \
              created_at, updated_at) \
-             VALUES ($1, NULL, NULL, FALSE, FALSE, now(), now()) RETURNING {USER_COLUMNS}, \
+             VALUES ($1, NULL, NULL, $2 AND NOT EXISTS(SELECT 1 FROM users), FALSE, now(), now()) \
+             RETURNING {USER_COLUMNS}, \
              (EXISTS (SELECT 1 FROM user_external_accounts uea WHERE uea.service_type='scim' \
              AND uea.user_id=users.id AND uea.deleted_at IS NULL)) AS scim_controlled"
         ))
         .bind(&new.username)
+        .bind(!already_initialized)
         .fetch_one(&mut *tx)
         .await
         .map_err(|e| {

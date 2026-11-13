@@ -1122,10 +1122,12 @@ where
 /// transaction it inserts the `users`, `names`, `user_emails`,
 /// `user_roles` and `user_external_accounts` rows.
 ///
-/// The initial-site-admin calculation from `CreateInTransaction` is not
-/// reproduced (OAuth signups never create the initial site admin); the
-/// baseline's unverified-email verification-code requirement is likewise
-/// unreachable here because every provider passes a verified email.
+/// As in Go's `CreateInTransaction` (`internal/database/users.go:338-370`),
+/// the transaction first calls `GlobalState.EnsureInitialized` and then sets
+/// `site_admin = !alreadyInitialized AND NOT EXISTS(SELECT * FROM users)`:
+/// the first account on an uninitialized site becomes the site admin. The
+/// OAuth call sites never pass `FailIfNotInitialUser`
+/// (`cmd/frontend/auth/user.go:157`), so no extra refusal applies.
 pub async fn create_with_external_account_for_auth(
     pool: &PgPool,
     new_user: &NewAuthUser<'_>,
@@ -1133,18 +1135,24 @@ pub async fn create_with_external_account_for_auth(
 ) -> Result<i32, CreateUserError> {
     let mut tx = pool.begin().await.map_err(CreateUserError::other)?;
 
+    // Same-transaction initialization (`users.go:338-345`).
+    let already_initialized = crate::global_state::ensure_initialized(&mut *tx)
+        .await
+        .map_err(CreateUserError::other)?;
+
     let display_name = (!new_user.display_name.is_empty()).then_some(new_user.display_name);
     let avatar_url = (!new_user.avatar_url.is_empty()).then_some(new_user.avatar_url);
     let row = sqlx::query(
         r#"
 INSERT INTO users (username, display_name, avatar_url, created_at, updated_at, invalidated_sessions_at, tos_accepted, site_admin)
-VALUES ($1, $2, $3, now(), now(), now(), false, false)
+VALUES ($1, $2, $3, now(), now(), now(), false, $4 AND NOT EXISTS(SELECT 1 FROM users))
 RETURNING id, site_admin
 "#,
     )
     .bind(new_user.username)
     .bind(display_name)
     .bind(avatar_url)
+    .bind(!already_initialized)
     .fetch_one(&mut *tx)
     .await;
     let (id, site_admin): (i32, bool) = match row {
