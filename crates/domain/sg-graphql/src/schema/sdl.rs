@@ -25,3 +25,14 @@ pub const CODE_MONITORS_SCHEMA: &str = include_str!("sdl/code_monitors.graphql")
 /// `//go:embed saved_searches.graphql` — `OptionalResolver.SavedSearchesResolver`
 /// SDL, appended directly after the code-monitors document.
 pub const SAVED_SEARCHES_SCHEMA: &str = include_str!("sdl/saved_searches.graphql");
+
+/// `//go:embed batches.graphql` — `OptionalResolver.BatchChangesResolver` SDL
+/// (M9.24c). `NewSchema` appends it when the batches resolver is present.
+pub const BATCHES_SCHEMA: &str = include_str!("sdl/batches.graphql");
+
+/// `//go:embed githubapps.graphql` — `OptionalResolver.GitHubAppsResolver`
+/// SDL. `batches.graphql` references `GitHubApp` (`BatchChangesCredential.
+/// gitHubApp`, `CommitSigningConfiguration`), so `NewSchemaWithBatchChanges
+/// Resolver` registers this document alongside it; the vendored copy is
+/// byte-identical to the baseline.
+pub const GITHUB_APPS_SCHEMA: &str = include_str!("sdl/githubapps.graphql");

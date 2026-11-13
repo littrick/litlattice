@@ -1076,6 +1076,8 @@ pub struct NestedPrefetch {
         HashMap<i32, crate::executor_secrets_graphql::AccessLogUserLookup>,
     /// `Query.savedSearches` surface (M9.13a).
     pub saved_searches: Option<crate::saved_searches_graphql::SavedSearchesHandleWrapper>,
+    /// `Query.batchChanges` surface (M9.24c).
+    pub batches: Option<crate::batches_graphql::BatchesHandleWrapper>,
     /// `User.monitors` surface (M9.13a).
     pub code_monitors: Option<crate::code_monitors_graphql::CodeMonitorsHandleWrapper>,
     /// `User.emails` / `primaryEmail` / `accessTokens` / `session` /
@@ -2673,6 +2675,7 @@ impl FrontendRootResolver {
                     crate::executor_secrets_graphql::ExecutorSecretRoots::default(),
                 saved_searches: None,
                 code_monitors: None,
+                batches: None,
             },
             mutation: MutationRoot {
                 inventory: Arc::new(InventoryRoots::default()),
@@ -2784,6 +2787,17 @@ impl FrontendRootResolver {
         let nested = Arc::make_mut(&mut self.query.nested);
         nested.saved_searches =
             saved_searches.map(crate::saved_searches_graphql::SavedSearchesHandleWrapper);
+        self
+    }
+
+    /// Attach the optional Batch Changes read surface (M9.24c).
+    pub fn with_batches(
+        mut self,
+        batches: Option<crate::batches_graphql::BatchesHandle>,
+    ) -> Self {
+        self.query.batches = batches.clone();
+        let nested = Arc::make_mut(&mut self.query.nested);
+        nested.batches = batches.map(crate::batches_graphql::BatchesHandleWrapper);
         self
     }
 
@@ -3119,6 +3133,9 @@ struct QueryRoot {
     /// Optional saved-searches database (M9.13a). `None` means the SDL was not
     /// appended and the root field is absent.
     saved_searches: Option<crate::saved_searches_graphql::SavedSearchesHandle>,
+    /// Optional Batch Changes database (M9.24c). `None` means the SDL was not
+    /// appended and the root fields are absent.
+    batches: Option<crate::batches_graphql::BatchesHandle>,
     /// Optional code-monitor resolver (M9.13a).
     code_monitors: Option<Arc<crate::code_monitors_graphql::CodeMonitorsResolver>>,
 }
@@ -3979,12 +3996,20 @@ impl ObjectValue for QueryRoot {
             // repository is `null`; a blocked repository is an error.
             "repository" => match repository_arg(arguments) {
                 RepositoryArg::Key(key) => match self.repositories.get(&key) {
-                    Some(RepoLookup::Found(data)) => Ok(Some(FieldValue::Object(Arc::new(
-                        RepositoryObject::from_data(data.clone())
+                    Some(RepoLookup::Found(data)) => {
+                        let mut object = RepositoryObject::from_data(data.clone())
                             .with_git(self.git.clone())
                             .with_embeddings(self.nested.repo_embeddings.clone())
-                            .with_inventory_d(Some(self.inventory.graphql_d.clone())),
-                    )))),
+                            .with_inventory_d(Some(self.inventory.graphql_d.clone()));
+                        // `Repository.batchChanges` (M9.24c): the batch-changes
+                        // resolver is attached to the object, like the
+                        // `User`/`Org` root fields which get it through
+                        // `NestedPrefetch::batches`.
+                        if let Some(batches) = self.batches.clone() {
+                            object = object.with_batches(batches);
+                        }
+                        Ok(Some(FieldValue::Object(Arc::new(object))))
+                    }
                     Some(RepoLookup::NotFound) => Ok(Some(FieldValue::Null)),
                     Some(RepoLookup::Blocked { name, reason }) => Err(ExecError::new(format!(
                         "repository {name} has been blocked. reason: {reason}"
@@ -3996,12 +4021,16 @@ impl ObjectValue for QueryRoot {
                 },
                 RepositoryArg::CloneUrl(clone_url) => {
                     match self.repositories.get(&RepoKey::CloneUrl(clone_url)) {
-                        Some(RepoLookup::Found(data)) => Ok(Some(FieldValue::Object(Arc::new(
-                            RepositoryObject::from_data(data.clone())
+                        Some(RepoLookup::Found(data)) => {
+                            let mut object = RepositoryObject::from_data(data.clone())
                                 .with_git(self.git.clone())
                                 .with_embeddings(self.nested.repo_embeddings.clone())
-                                .with_inventory_d(Some(self.inventory.graphql_d.clone())),
-                        )))),
+                                .with_inventory_d(Some(self.inventory.graphql_d.clone()));
+                            if let Some(batches) = self.batches.clone() {
+                                object = object.with_batches(batches);
+                            }
+                            Ok(Some(FieldValue::Object(Arc::new(object))))
+                        }
                         Some(RepoLookup::NotFound) => Ok(Some(FieldValue::Null)),
                         Some(RepoLookup::Blocked { name, reason }) => Err(ExecError::new(format!(
                             "repository {name} has been blocked. reason: {reason}"
@@ -4394,6 +4423,19 @@ impl ObjectValue for QueryRoot {
                             id,
                         )
                     }
+                    // `NodeResolvers()["BatchChange"]` / `["Changeset"]`
+                    // (M9.24c): registered only when the optional resolver is
+                    // present.
+                    _ if self.batches.is_some()
+                        && crate::batches_graphql::is_node_kind(kind.as_str()) =>
+                    {
+                        crate::batches_graphql::node_field(
+                            self.batches.as_ref().expect("checked batches"),
+                            kind.as_str(),
+                            id,
+                            actor,
+                        )
+                    }
                     _ => self.node_int32(kind.as_str(), id),
                 }
             }
@@ -4601,6 +4643,18 @@ impl ObjectValue for QueryRoot {
                     self.saved_searches
                         .as_ref()
                         .expect("checked saved searches"),
+                    field,
+                    arguments,
+                    actor,
+                )
+            }
+            // `BatchChangesResolver` root fields (`Query.batchChanges` /
+            // `Query.batchChange`, M9.24c).
+            _ if self.batches.is_some()
+                && crate::batches_graphql::is_root_field(field) =>
+            {
+                crate::batches_graphql::root_field(
+                    self.batches.as_ref().expect("checked batches"),
                     field,
                     arguments,
                     actor,
@@ -4991,6 +5045,21 @@ impl ObjectValue for UserObject {
                     Err(message) => Err(ExecError::new(message.clone())),
                     Ok(verified) => Ok(Some(FieldValue::Json(Json::Bool(*verified)))),
                 },
+            },
+            // `UserResolver.BatchChanges` (M9.24c): the extension resolver
+            // supplies the namespace and delegates.
+            "batchChanges" => match &self.nested.batches {
+                Some(batches) => crate::batches_graphql::namespace_batch_changes(
+                    &batches.0,
+                    crate::batches_graphql::NamespaceIds {
+                        user: self.data.id,
+                        org: 0,
+                    },
+                    arguments,
+                    actor,
+                )
+                .map(Some),
+                None => Ok(None),
             },
             _ => Ok(None),
         }
@@ -5769,6 +5838,21 @@ impl ObjectValue for OrgObject {
                     None => Ok(None),
                 }
             }
+            // `OrgResolver.BatchChanges` (M9.24c): the extension resolver
+            // supplies the namespace and delegates.
+            "batchChanges" => match &self.nested.batches {
+                Some(batches) => crate::batches_graphql::namespace_batch_changes(
+                    &batches.0,
+                    crate::batches_graphql::NamespaceIds {
+                        user: 0,
+                        org: self.data.id,
+                    },
+                    arguments,
+                    actor,
+                )
+                .map(Some),
+                None => Ok(None),
+            },
             _ => Ok(None),
         }
     }
@@ -6199,6 +6283,9 @@ pub struct RepositoryObject {
     embeddings: Option<Arc<crate::embeddings_graphql::EmbeddingsPrefetch>>,
     /// The request's M9.19a repository object-type snapshot.
     inventory_d: Option<Arc<crate::graphql_inventory_d::InventoryDRoots>>,
+    /// The Batch Changes read surface (M9.24c); `None` leaves
+    /// `Repository.batchChanges` unported.
+    batches: Option<crate::batches_graphql::BatchesHandleWrapper>,
 }
 
 impl RepositoryObject {
@@ -6208,7 +6295,14 @@ impl RepositoryObject {
             git: None,
             embeddings: None,
             inventory_d: None,
+            batches: None,
         }
+    }
+
+    /// Attach the Batch Changes read surface (M9.24c).
+    pub fn with_batches(mut self, batches: crate::batches_graphql::BatchesHandle) -> Self {
+        self.batches = Some(crate::batches_graphql::BatchesHandleWrapper(batches));
+        self
     }
 
     /// Attach the request's prefetched git data (M9.8ix).
@@ -6259,9 +6353,20 @@ impl ObjectValue for RepositoryObject {
         &self,
         field: &str,
         arguments: &Arguments,
-        _actor: Actor,
+        actor: Actor,
     ) -> Result<Option<FieldValue>, ExecError> {
         match field {
+            // `RepositoryResolver.BatchChanges` (M9.24c).
+            "batchChanges" => match &self.batches {
+                Some(batches) => crate::batches_graphql::repository_batch_changes(
+                    &batches.0,
+                    self.data.id,
+                    arguments,
+                    actor,
+                )
+                .map(Some),
+                None => Ok(None),
+            },
             // `RepositoryResolver.EmbeddingExists` (`repository.go:116-122`):
             // the gate and the per-repo lookup are prefetched (M9.14c).
             "embeddingExists" => {
