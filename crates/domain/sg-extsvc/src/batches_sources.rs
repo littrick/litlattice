@@ -19,11 +19,15 @@
 //!   base merge request is loaded and events are reported as not-ported.
 //! * `bitbucketserver.go` — REST pull-request operations. Activity/commit/
 //!   build-status decoration is likewise a seam.
+//! * `azuredevops.go` — REST pull-request operations through
+//!   [`crate::azuredevops::Client`] (load/create/create-draft/update/undraft/
+//!   close/reopen/comment/merge/fork), including the build-status annotation
+//!   the metadata carries.
 //!
 //! Explicit not-ported (enterprise / credential-store boundaries): GitHub App
-//! authenticators and commit signing, AzureDevOps / Gerrit / Perforce /
-//! Bitbucket Cloud sources, outbound webhook GraphQL payloads, and
-//! `state.SetDerivedState` (gitserver).
+//! authenticators and commit signing, Gerrit / Perforce / Bitbucket Cloud
+//! sources, outbound webhook GraphQL payloads, and `state.SetDerivedState`
+//! (gitserver).
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -34,6 +38,7 @@ use serde_json::{json, Value};
 use url::Url;
 
 use crate::auth::Authenticator as _;
+use crate::azuredevops::{self, AzureDevOpsAuth, BaseUrl};
 use crate::github;
 use crate::gitlab::GitLabAuth;
 use crate::HttpDoer;
@@ -1891,6 +1896,614 @@ impl ChangesetSource for BitbucketServerSource {
 }
 
 // ---------------------------------------------------------------------------
+// Azure DevOps (REST)
+// ---------------------------------------------------------------------------
+
+/// `sources.AzureDevOpsSource` backed by the [`azuredevops::Client`] REST
+/// surface.
+pub struct AzureDevOpsSource {
+    client: azuredevops::Client,
+    auto_delete_branch: bool,
+}
+
+impl AzureDevOpsSource {
+    /// `sources.NewAzureDevOpsSource` after the config/authenticator
+    /// resolution: `azuredevops.NewClient(urn, url, BasicAuth{username,
+    /// token}, doer)`.
+    pub fn new(
+        base_url: &Url,
+        auth: SourceAuth,
+        http: Arc<dyn HttpDoer>,
+    ) -> Result<Self, SourceError> {
+        let parsed = BaseUrl::parse(base_url.as_str())
+            .map_err(|err| SourceError::other(format!("creating Azure DevOps client: {err}")))?;
+        let auth = match auth {
+            SourceAuth::Basic { username, password } => AzureDevOpsAuth::Basic(
+                crate::auth::BasicAuth { username, password },
+            ),
+            other => {
+                return Err(unsupported_authenticator_error(
+                    "Azure DevOps",
+                    &format!("{other:?}"),
+                ))
+            }
+        };
+        Ok(Self {
+            client: azuredevops::Client::new(parsed, auth, http),
+            auto_delete_branch: false,
+        })
+    }
+
+    pub fn with_client(client: azuredevops::Client) -> Self {
+        Self {
+            client,
+            auto_delete_branch: false,
+        }
+    }
+
+    pub fn with_auto_delete_branch(mut self, enabled: bool) -> Self {
+        self.auto_delete_branch = enabled;
+        self
+    }
+
+    /// `AzureDevOpsSource.ValidateAuthenticator` (`GetAuthorizedProfile`).
+    pub async fn validate_authenticator(&self) -> Result<(), SourceError> {
+        self.client
+            .get_authorized_profile()
+            .await
+            .map(|_| ())
+            .map_err(|err| SourceError::other(err.to_string()))
+    }
+
+    /// `Repository.GetOrganization` with the source's wrapping text.
+    fn organization(repo: &azuredevops::Repository) -> Result<String, SourceError> {
+        repo.get_organization().map_err(|err| SourceError::other(err).with_prefix(
+            "getting Azure DevOps organization from project",
+        ))
+    }
+
+    fn repo_metadata(repo: &Repo) -> Result<azuredevops::Repository, SourceError> {
+        serde_json::from_value(repo.metadata.clone()).map_err(|err| {
+            SourceError::other(format!("decoding Azure DevOps repository metadata: {err}"))
+        })
+    }
+
+    /// `createCommonPullRequestArgs`.
+    fn common_args(
+        repo: &azuredevops::Repository,
+        cs: &SourceChangeset,
+    ) -> Result<(String, String, String, String), SourceError> {
+        let org = Self::organization(repo)?;
+        Ok((
+            cs.changeset.external_id.clone(),
+            org,
+            repo.project.name.clone(),
+            repo.name.clone(),
+        ))
+    }
+
+    /// `annotatePullRequest`: always fetch the PR build statuses.
+    async fn annotate_pull_request(
+        &self,
+        repo: &azuredevops::Repository,
+        pr: &azuredevops::PullRequest,
+    ) -> Result<Vec<azuredevops::PullRequestBuildStatus>, SourceError> {
+        let org = Self::organization(repo)?;
+        self.client
+            .get_pull_request_statuses(
+                &org,
+                &repo.project.name,
+                &repo.name,
+                &pr.id.to_string(),
+            )
+            .await
+            .map_err(|err| {
+                SourceError::other(err.to_string())
+                    .with_prefix("getting pull request statuses")
+            })
+    }
+
+    /// `setChangesetMetadata`.
+    async fn set_changeset_metadata(
+        &self,
+        repo: &azuredevops::Repository,
+        pr: &azuredevops::PullRequest,
+        cs: &mut SourceChangeset,
+    ) -> Result<(), SourceError> {
+        let statuses = self
+            .annotate_pull_request(repo, pr)
+            .await
+            .map_err(|err| err.with_prefix("annotating pull request"))?;
+
+        cs.changeset.external_id = pr.id.to_string();
+        cs.changeset.external_branch = ensure_ref_prefix(&pr.source_ref_name);
+        if let Some(fork) = &pr.fork_source {
+            cs.changeset.external_fork_namespace = fork.repository.namespace();
+            cs.changeset.external_fork_name = fork.repository.name.clone();
+        } else {
+            cs.changeset.external_fork_namespace.clear();
+            cs.changeset.external_fork_name.clear();
+        }
+        cs.changeset.metadata = azure_devops_metadata(pr, &statuses);
+        Ok(())
+    }
+
+    /// `changesetToPullRequestInput`.
+    fn changeset_to_pull_request_input(
+        &self,
+        cs: &SourceChangeset,
+    ) -> Result<azuredevops::CreatePullRequestInput, SourceError> {
+        let completion_options = azuredevops::PullRequestCompletionOptions {
+            delete_source_branch: self.auto_delete_branch,
+            ..Default::default()
+        };
+        // The baseline compares the `*types.Repo` pointers: equal when no fork
+        // is in use, different when a fork repo was resolved.
+        let fork_source = if cs.remote_repo != cs.target_repo {
+            Some(azuredevops::ForkRef {
+                repository: Self::repo_metadata(&cs.remote_repo)?,
+                name: String::new(),
+                url: String::new(),
+            })
+        } else {
+            None
+        };
+        Ok(azuredevops::CreatePullRequestInput {
+            source_ref_name: cs.head_ref.clone(),
+            target_ref_name: cs.base_ref.clone(),
+            title: cs.title.clone(),
+            description: cs.body.clone(),
+            reviewers: None,
+            fork_source,
+            is_draft: false,
+            completion_options: Some(completion_options),
+        })
+    }
+
+    /// `changesetToUpdatePullRequestInput`.
+    fn changeset_to_update_pull_request_input(
+        &self,
+        cs: &SourceChangeset,
+        target_ref_changed: bool,
+    ) -> azuredevops::PullRequestUpdateInput {
+        if target_ref_changed {
+            return azuredevops::PullRequestUpdateInput {
+                target_ref_name: Some(ensure_ref_prefix(&cs.base_ref)),
+                ..Default::default()
+            };
+        }
+        azuredevops::PullRequestUpdateInput {
+            title: Some(cs.title.clone()),
+            description: Some(cs.body.clone()),
+            completion_options: Some(azuredevops::PullRequestCompletionOptions {
+                delete_source_branch: self.auto_delete_branch,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// `createChangeset` (also used by `CreateDraftChangeset`).
+    async fn create_changeset_with(
+        &self,
+        cs: &mut SourceChangeset,
+        input: azuredevops::CreatePullRequestInput,
+    ) -> Result<bool, SourceError> {
+        let repo = Self::repo_metadata(&cs.target_repo)?;
+        let org = Self::organization(&repo)?;
+        let pr = self
+            .client
+            .create_pull_request(&org, &repo.project.name, &repo.name, &input)
+            .await
+            .map_err(|err| {
+                SourceError::other(err.to_string()).with_prefix("creating pull request")
+            })?;
+        self.set_changeset_metadata(&repo, &pr, cs)
+            .await
+            .map_err(|err| err.with_prefix("setting Azure DevOps changeset metadata"))?;
+        Ok(true)
+    }
+
+    /// `checkAndCopy`.
+    fn check_and_copy(target_repo: &Repo, fork: azuredevops::Repository) -> Result<Repo, SourceError> {
+        if !fork.is_fork {
+            return Err(SourceError::other("repo is not a fork"));
+        }
+        let fork_namespace = fork.namespace();
+        let fork_name = fork.name.clone();
+        copy_azure_devops_repo_as_fork(target_repo, fork, &fork_namespace, &fork_name)
+            .map_err(|err| err.with_prefix("updating target repo sources"))
+    }
+}
+
+/// `azureDevOpsMetadata` normalised projection used by this port's
+/// [`ChangesetMetadata`]-style `changeset.metadata` slot.
+fn azure_devops_metadata(
+    pr: &azuredevops::PullRequest,
+    statuses: &[azuredevops::PullRequestBuildStatus],
+) -> Value {
+    let statuses: Vec<Value> = statuses
+        .iter()
+        .map(|status| {
+            json!({
+                "id": status.id,
+                "state": status.state,
+                "description": status.description,
+            })
+        })
+        .collect();
+    let fork_source = match &pr.fork_source {
+        Some(fork) => json!({
+            "repository": {
+                "id": fork.repository.id,
+                "name": fork.repository.name,
+                "project": {
+                    "id": fork.repository.project.id,
+                    "name": fork.repository.project.name,
+                },
+            },
+            "name": fork.name,
+            "url": fork.url,
+        }),
+        None => Value::Null,
+    };
+    json!({
+        "kind": "azuredevops",
+        "id": pr.id,
+        "codeReviewId": pr.code_review_id,
+        "status": pr.status,
+        "title": pr.title,
+        "description": pr.description,
+        "sourceRefName": pr.source_ref_name,
+        "targetRefName": pr.target_ref_name,
+        "mergeStatus": pr.merge_status,
+        "isDraft": pr.is_draft,
+        "url": pr.url,
+        "lastMergeSourceCommit": {
+            "commitId": pr.last_merge_source_commit.commit_id,
+            "url": pr.last_merge_source_commit.url,
+        },
+        "lastMergeTargetCommit": {
+            "commitId": pr.last_merge_target_commit.commit_id,
+            "url": pr.last_merge_target_commit.url,
+        },
+        "createdBy": {
+            "id": pr.created_by.id,
+            "displayName": pr.created_by.display_name,
+            "uniqueName": pr.created_by.unique_name,
+        },
+        "forkSource": fork_source,
+        "statuses": statuses,
+    })
+}
+
+/// `copyAzureDevOpsRepoAsFork`: rewrite the clone URL path
+/// `/org/project/_git/repo` (`project` is the namespace) and store the fork
+/// repository as metadata. Unlike the generic `CopyRepoAsFork`, this also
+/// keeps `Name` unchanged, like the baseline.
+pub fn copy_azure_devops_repo_as_fork(
+    repo: &Repo,
+    fork: azuredevops::Repository,
+    fork_namespace: &str,
+    fork_name: &str,
+) -> Result<Repo, SourceError> {
+    if repo.sources.is_empty() {
+        return Err(SourceError::other("repo has no sources"));
+    }
+    let mut fork_repo = repo.clone();
+    let mut sources = BTreeMap::new();
+    for (urn, source) in &repo.sources {
+        if source.clone_url.is_empty() {
+            continue;
+        }
+        let mut url = Url::parse(&source.clone_url)
+            .map_err(|err| SourceError::other(err.to_string()))?;
+        // Will look like: /org/project/_git/repo, project is our namespace.
+        let parts: Vec<&str> = url.path().splitn(5, '/').collect();
+        if parts.len() < 5 {
+            return Err(SourceError::other(format!(
+                "repo has malformed clone url: {}",
+                source.clone_url
+            )));
+        }
+        let mut rewritten = parts.clone();
+        rewritten[2] = fork_namespace;
+        rewritten[4] = fork_name;
+        url.set_path(&rewritten.join("/"));
+        sources.insert(
+            urn.clone(),
+            RepoSource {
+                id: source.id.clone(),
+                clone_url: url.to_string(),
+            },
+        );
+    }
+    fork_repo.sources = sources;
+    fork_repo.metadata = serde_json::to_value(&fork).unwrap_or(Value::Null);
+    Ok(fork_repo)
+}
+
+#[async_trait]
+impl ChangesetSource for AzureDevOpsSource {
+    fn kind(&self) -> &'static str {
+        "azuredevops"
+    }
+
+    async fn load_changeset(&self, cs: &mut SourceChangeset) -> Result<(), SourceError> {
+        let repo = Self::repo_metadata(&cs.target_repo)?;
+        let (id, org, project, repo_name) = Self::common_args(&repo, cs)?;
+        let pr = match self
+            .client
+            .get_pull_request(&org, &project, &repo_name, &id)
+            .await
+        {
+            Ok(pr) => pr,
+            Err(err) if err.is_not_found() => {
+                return Err(SourceError::not_found(&cs.changeset.external_id))
+            }
+            Err(err) => {
+                return Err(
+                    SourceError::other(err.to_string()).with_prefix("getting pull request")
+                )
+            }
+        };
+        self.set_changeset_metadata(&repo, &pr, cs)
+            .await
+            .map_err(|err| err.with_prefix("setting Azure DevOps changeset metadata"))
+    }
+
+    async fn create_changeset(&self, cs: &mut SourceChangeset) -> Result<bool, SourceError> {
+        let input = self.changeset_to_pull_request_input(cs)?;
+        self.create_changeset_with(cs, input).await
+    }
+
+    async fn create_draft_changeset(
+        &self,
+        cs: &mut SourceChangeset,
+    ) -> Result<bool, SourceError> {
+        let mut input = self.changeset_to_pull_request_input(cs)?;
+        input.is_draft = true;
+        self.create_changeset_with(cs, input).await
+    }
+
+    async fn update_changeset(&self, cs: &mut SourceChangeset) -> Result<(), SourceError> {
+        let repo = Self::repo_metadata(&cs.target_repo)?;
+        let (id, org, project, repo_name) = Self::common_args(&repo, cs)?;
+        let pr = match self
+            .client
+            .get_pull_request(&org, &project, &repo_name, &id)
+            .await
+        {
+            Ok(pr) => pr,
+            Err(err) if err.is_not_found() => {
+                return Err(SourceError::not_found(&cs.changeset.external_id))
+            }
+            Err(err) => {
+                return Err(
+                    SourceError::other(err.to_string()).with_prefix("getting pull request")
+                )
+            }
+        };
+
+        // ADO does not support updating the target branch alongside other
+        // fields, so check it separately and make a second call.
+        if pr.target_ref_name != cs.base_ref {
+            let input = self.changeset_to_update_pull_request_input(cs, true);
+            self.client
+                .update_pull_request(&org, &project, &repo_name, &id, &input)
+                .await
+                .map_err(|err| {
+                    SourceError::other(err.to_string()).with_prefix("updating pull request")
+                })?;
+        }
+
+        let input = self.changeset_to_update_pull_request_input(cs, false);
+        let updated = self
+            .client
+            .update_pull_request(&org, &project, &repo_name, &id, &input)
+            .await
+            .map_err(|err| {
+                SourceError::other(err.to_string()).with_prefix("updating pull request")
+            })?;
+        self.set_changeset_metadata(&repo, &updated, cs)
+            .await
+            .map_err(|err| err.with_prefix("setting Azure DevOps changeset metadata"))
+    }
+
+    async fn close_changeset(&self, cs: &mut SourceChangeset) -> Result<(), SourceError> {
+        let repo = Self::repo_metadata(&cs.target_repo)?;
+        let (id, org, project, repo_name) = Self::common_args(&repo, cs)?;
+        let updated = self
+            .client
+            .abandon_pull_request(&org, &project, &repo_name, &id)
+            .await
+            .map_err(|err| {
+                SourceError::other(err.to_string()).with_prefix("abandoning pull request")
+            })?;
+        self.set_changeset_metadata(&repo, &updated, cs)
+            .await
+            .map_err(|err| err.with_prefix("setting Azure DevOps changeset metadata"))
+    }
+
+    async fn reopen_changeset(&self, cs: &mut SourceChangeset) -> Result<(), SourceError> {
+        let repo = Self::repo_metadata(&cs.target_repo)?;
+        let (id, org, project, repo_name) = Self::common_args(&repo, cs)?;
+        let input = azuredevops::PullRequestUpdateInput {
+            status: Some(azuredevops::PULL_REQUEST_STATUS_ACTIVE.to_owned()),
+            completion_options: Some(azuredevops::PullRequestCompletionOptions {
+                delete_source_branch: self.auto_delete_branch,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let updated = self
+            .client
+            .update_pull_request(&org, &project, &repo_name, &id, &input)
+            .await
+            .map_err(|err| {
+                SourceError::other(err.to_string()).with_prefix("updating pull request")
+            })?;
+        self.set_changeset_metadata(&repo, &updated, cs)
+            .await
+            .map_err(|err| err.with_prefix("setting Azure DevOps changeset metadata"))
+    }
+
+    async fn undraft_changeset(&self, cs: &mut SourceChangeset) -> Result<(), SourceError> {
+        let repo = Self::repo_metadata(&cs.target_repo)?;
+        let (id, org, project, repo_name) = Self::common_args(&repo, cs)?;
+        let mut input = self.changeset_to_update_pull_request_input(cs, false);
+        input.is_draft = Some(false);
+        let updated = self
+            .client
+            .update_pull_request(&org, &project, &repo_name, &id, &input)
+            .await
+            .map_err(|err| {
+                SourceError::other(err.to_string()).with_prefix("updating pull request")
+            })?;
+        self.set_changeset_metadata(&repo, &updated, cs)
+            .await
+            .map_err(|err| err.with_prefix("setting Azure DevOps changeset metadata"))
+    }
+
+    async fn create_comment(
+        &self,
+        cs: &SourceChangeset,
+        text: &str,
+    ) -> Result<(), SourceError> {
+        let repo = Self::repo_metadata(&cs.target_repo)?;
+        let (id, org, project, repo_name) = Self::common_args(&repo, cs)?;
+        let input = azuredevops::PullRequestCommentInput {
+            comments: vec![azuredevops::PullRequestCommentForInput {
+                parent_comment_id: 0,
+                content: text.to_owned(),
+                comment_type: 1,
+            }],
+        };
+        self.client
+            .create_pull_request_comment_thread(&org, &project, &repo_name, &id, &input)
+            .await
+            .map(|_| ())
+            .map_err(|err| SourceError::other(err.to_string()))
+    }
+
+    async fn merge_changeset(
+        &self,
+        cs: &mut SourceChangeset,
+        squash: bool,
+    ) -> Result<(), SourceError> {
+        let repo = Self::repo_metadata(&cs.target_repo)?;
+        let (id, org, project, repo_name) = Self::common_args(&repo, cs)?;
+        let merge_strategy = if squash {
+            Some(azuredevops::PULL_REQUEST_MERGE_STRATEGY_SQUASH.to_owned())
+        } else {
+            None
+        };
+        // `btypes.Changeset.SyncState.HeadRefOid`: the reduced changeset in
+        // this port carries the code-host metadata, whose
+        // `lastMergeSourceCommit.commitId` is what the syncer stores there.
+        let commit_id = nested(&cs.changeset.metadata, &["lastMergeSourceCommit", "commitId"])
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        let input = azuredevops::PullRequestCompleteInput {
+            commit_id,
+            merge_strategy,
+            delete_source_branch: self.auto_delete_branch,
+        };
+        let updated = match self
+            .client
+            .complete_pull_request(&org, &project, &repo_name, &id, &input)
+            .await
+        {
+            Ok(updated) => updated,
+            Err(err) if err.is_not_found() => {
+                return Err(
+                    SourceError::other(err.to_string()).with_prefix("merging pull request")
+                )
+            }
+            Err(err) => return Err(SourceError::not_mergeable(err.to_string())),
+        };
+        self.set_changeset_metadata(&repo, &updated, cs)
+            .await
+            .map_err(|err| err.with_prefix("setting Azure DevOps changeset metadata"))
+    }
+
+    fn supports_draft(&self) -> bool {
+        true
+    }
+
+    fn supports_fork(&self) -> bool {
+        true
+    }
+
+    async fn get_fork(
+        &self,
+        target_repo: &Repo,
+        namespace: Option<&String>,
+        name: Option<&String>,
+    ) -> Result<Repo, SourceError> {
+        let repo = Self::repo_metadata(target_repo)?;
+        let namespace = namespace
+            .cloned()
+            .unwrap_or_else(|| repo.namespace());
+        let target_namespace = repo.namespace();
+        let fork_name = name
+            .cloned()
+            .unwrap_or_else(|| default_fork_name(&target_namespace, &repo.name));
+        let org = Self::organization(&repo)?;
+
+        // Figure out if we already have a fork of the repo in the namespace.
+        match self
+            .client
+            .get_repo(&org, &namespace, &fork_name)
+            .await
+        {
+            Ok(fork) => return Self::check_and_copy(target_repo, fork),
+            Err(err) if err.is_not_found() => {}
+            Err(err) => {
+                return Err(SourceError::other(err.to_string())
+                    .with_prefix("checking for fork existence"))
+            }
+        }
+
+        let mut project = repo.project.clone();
+        // If the fork is in a different namespace (project), fetch it so we
+        // have its ID.
+        if namespace != repo.namespace() {
+            project = self
+                .client
+                .get_project(&org, &namespace)
+                .await
+                .map_err(|err| SourceError::other(err.to_string()))?;
+        }
+
+        let fork = self
+            .client
+            .fork_repository(
+                &org,
+                &azuredevops::ForkRepositoryInput {
+                    name: fork_name,
+                    project: azuredevops::ForkRepositoryInputProject {
+                        id: project.id.clone(),
+                    },
+                    parent_repository: azuredevops::ForkRepositoryInputParentRepository {
+                        id: repo.id.clone(),
+                        project: azuredevops::ForkRepositoryInputProject {
+                            id: repo.project.id.clone(),
+                        },
+                    },
+                },
+            )
+            .await
+            .map_err(|err| {
+                SourceError::other(err.to_string()).with_prefix("forking repository")
+            })?;
+
+        Self::check_and_copy(target_repo, fork)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Factory (`buildChangesetSource`)
 // ---------------------------------------------------------------------------
 
@@ -1900,6 +2513,7 @@ pub enum SourceKind {
     GitHub,
     GitLab,
     BitbucketServer,
+    AzureDevOps,
 }
 
 impl SourceKind {
@@ -1908,6 +2522,7 @@ impl SourceKind {
             "GITHUB" => Some(Self::GitHub),
             "GITLAB" => Some(Self::GitLab),
             "BITBUCKETSERVER" => Some(Self::BitbucketServer),
+            "AZUREDEVOPS" => Some(Self::AzureDevOps),
             _ => None,
         }
     }
@@ -1931,10 +2546,13 @@ pub fn new_source(
         Some(SourceKind::BitbucketServer) => {
             Ok(Arc::new(BitbucketServerSource::new(base_url, auth, http)))
         }
+        Some(SourceKind::AzureDevOps) => Ok(Arc::new(AzureDevOpsSource::new(
+            base_url, auth, http,
+        )?)),
         None => {
             if is_batches_source_kind(kind) {
-                // AzureDevOps / Gerrit / Perforce / Bitbucket Cloud are OSS
-                // kinds whose source constructors are still not ported.
+                // Gerrit / Perforce / Bitbucket Cloud are OSS kinds whose
+                // source constructors are still not ported.
                 Err(SourceError::non_retryable(format!(
                     "building changeset source: code-host source for kind {kind} is not ported"
                 )))
@@ -1968,7 +2586,9 @@ pub struct SourceConnection {
 /// * `gitlab.go:37-82` (`token.type == "oauth"` → OAuth bearer, otherwise
 ///   `gitlab.SudoableToken`; no token → no authenticator),
 /// * `gitbucketserver/client.go:66-92` (`token` → OAuth bearer, otherwise
-///   `BasicAuth` with `username`/`password`; OAuth 1 is a seam).
+///   `BasicAuth` with `username`/`password`; OAuth 1 is a seam),
+/// * `azuredevops.go:31-54` (`urlx.Parse` on `url`; `BasicAuth` with
+///   `username`/`token` — the PAT is the password).
 ///
 /// GitHub App connections and Bitbucket Server OAuth 1 are not ported and are
 /// reported as non-retryable errors (see the slice overview §4).
@@ -1990,8 +2610,10 @@ pub fn source_connection_from_config(
         .get("url")
         .and_then(Value::as_str)
         .unwrap_or_default();
-    let parsed = Url::parse(raw_url)
-        .map_err(|err| SourceError::other(format!("parsing external service url: {err}")))?;
+    let parse_std = |raw: &str| {
+        Url::parse(raw)
+            .map_err(|err| SourceError::other(format!("parsing external service url: {err}")))
+    };
 
     let (base_url, auth) = match source_kind {
         SourceKind::GitHub => {
@@ -2009,7 +2631,7 @@ pub fn source_connection_from_config(
                 .and_then(Value::as_str)
                 .unwrap_or_default();
             (
-                github::normalize_base_url(&parsed),
+                github::normalize_base_url(&parse_std(raw_url)?),
                 SourceAuth::OAuthToken(token.to_owned()),
             )
         }
@@ -2025,7 +2647,7 @@ pub fn source_connection_from_config(
             } else {
                 SourceAuth::GitLabPrivateToken(token.to_owned())
             };
-            (github::normalize_base_url(&parsed), auth)
+            (github::normalize_base_url(&parse_std(raw_url)?), auth)
         }
         SourceKind::BitbucketServer => {
             let authorization = config.get("authorization").filter(|value| !value.is_null());
@@ -2068,7 +2690,31 @@ pub fn source_connection_from_config(
                 SourceAuth::None
             };
             // `newClient` parses `config.Url` without `NormalizeBaseURL`.
-            (parsed, auth)
+            (parse_std(raw_url)?, auth)
+        }
+        SourceKind::AzureDevOps => {
+            // `sources.NewAzureDevOpsSource` parses `config.Url` with
+            // `urlx.Parse` and authenticates with
+            // `auth.BasicAuth{Username: config.username, Password: config.token}`
+            // (the PAT is the password).
+            let parsed = BaseUrl::parse(raw_url).map_err(|err| {
+                SourceError::other(format!("parsing external service url: {err}"))
+            })?;
+            (
+                parsed.url,
+                SourceAuth::Basic {
+                    username: config
+                        .get("username")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned(),
+                    password: config
+                        .get("token")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned(),
+                },
+            )
         }
     };
 
