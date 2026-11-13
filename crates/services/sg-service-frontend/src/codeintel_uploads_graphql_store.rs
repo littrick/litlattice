@@ -26,8 +26,10 @@ use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
 use sg_db::codeintel_policies::{self, ConfigurationPolicy, GetConfigurationPoliciesOptions};
-use sg_git::RefType;
 
+use crate::codeintel_policies_matcher::{
+    Extractor, GitObjectSourceMatcher, PolicyMatch, PolicyMatcher, GIT_OBJECT_TYPE_COMMIT,
+};
 use crate::codeintel_uploads_graphql::{
     AuditLogRow, AutoIndexJobRow, CodeIntelUploadsDatabase, DeleteAutoIndexJobsOptions,
     DeleteUploadsOptions, DockerStep, ExecutionLogEntry, GetAutoIndexJobsOptions,
@@ -878,21 +880,27 @@ impl CodeIntelUploadsDatabase for PgCodeIntelUploadsStore {
         let Some(repo_name) = self.repository_name(upload.repository_id)? else {
             return Err(format!("repository not found: {}", upload.repository_id));
         };
-        let matching =
-            self.commits_described_by_policy(upload.repository_id, &repo_name, &policies)?;
+        // `GetRetentionPolicyOverview` passes `time.Now()` to the matcher and
+        // the request `now` to `populateMatchingCommits`; the port uses one
+        // clock for both.
+        let now = OffsetDateTime::now_utc();
+        let matching = self.commits_described_by_policy(
+            upload.repository_id,
+            &repo_name,
+            &policies,
+            &visible_commits,
+            now,
+        )?;
 
         // `populateMatchingCommits` (`service.go:301-363`).
-        let now = OffsetDateTime::now_utc();
         let mut potential_matches: Vec<RetentionPolicyMatchRow> = Vec::new();
         let mut index_set: std::collections::HashMap<i32, usize> =
             std::collections::HashMap::new();
         if let Some(policy_matches) = matching.get(&upload.commit) {
             for policy_match in policy_matches {
-                if policy_match.duration_hours.is_none()
-                    || now - upload.uploaded_at
-                        < time::Duration::hours(i64::from(
-                            policy_match.duration_hours.unwrap_or_default(),
-                        ))
+                if policy_match
+                    .policy_duration
+                    .is_none_or(|duration| now - upload.uploaded_at < duration)
                 {
                     let policy_id = policy_match.policy_id.unwrap_or(-1);
                     potential_matches.push(RetentionPolicyMatchRow {
@@ -910,11 +918,9 @@ impl CodeIntelUploadsDatabase for PgCodeIntelUploadsStore {
             }
             if let Some(policy_matches) = matching.get(commit) {
                 for policy_match in policy_matches {
-                    if policy_match.duration_hours.is_none()
-                        || now - upload.uploaded_at
-                            < time::Duration::hours(i64::from(
-                                policy_match.duration_hours.unwrap_or_default(),
-                            ))
+                    if policy_match
+                        .policy_duration
+                        .is_none_or(|duration| now - upload.uploaded_at < duration)
                     {
                         let policy_id = policy_match.policy_id.unwrap_or(-1);
                         match index_set.get(&policy_id) {
@@ -1044,100 +1050,46 @@ impl CodeIntelUploadsDatabase for PgCodeIntelUploadsStore {
     }
 }
 
-/// One `policies.PolicyMatch` (`matcher.go:26-32`) reduced to the fields
-/// retention uses.
-struct PolicyMatchRow {
-    policy_id: Option<i32>,
-    duration_hours: Option<i32>,
-}
-
 impl PgCodeIntelUploadsStore {
-    /// `Matcher.CommitsDescribedByPolicy` (`policies/matcher.go:61-117`).
+    /// `Matcher.CommitsDescribedByPolicy` (`policies/matcher.go:61-117`),
+    /// delegating to the shared [`PolicyMatcher`] with the retention extractor
+    /// (`includeTipOfDefaultBranch=true`, `filterByCreatedDate=false`).
     ///
-    /// The tag/branch ref matching is ported; intermediate branch commits
-    /// (`gitserver.Commits`) and `GIT_COMMIT` policies need a commit reader
-    /// that [`GitObjectSource`] does not expose, so they are rejected rather
-    /// than silently mis-matched (documented gap).
+    /// `filter_commits` is the upload's visible-commit list, forwarded to
+    /// `ListRefs.PointsAtCommit`. When no git seam is configured the matcher
+    /// cannot resolve refs or `GIT_COMMIT` patterns: refs contribute nothing
+    /// and a `GIT_COMMIT` policy is rejected rather than fabricated.
     fn commits_described_by_policy(
         &self,
         repository_id: i32,
         repo_name: &str,
         policies: &[ConfigurationPolicy],
-    ) -> Result<std::collections::HashMap<String, Vec<PolicyMatchRow>>, String> {
-        let mut commit_map: std::collections::HashMap<String, Vec<PolicyMatchRow>> =
-            std::collections::HashMap::new();
-        if policies.is_empty() {
-            return Ok(commit_map);
-        }
-        let mut patterns: std::collections::HashMap<String, sg_codeintel::glob::Glob> =
-            std::collections::HashMap::new();
-        for policy in policies {
-            if policy.policy_type == "GIT_COMMIT" || patterns.contains_key(&policy.pattern) {
-                continue;
+        filter_commits: &[String],
+        now: OffsetDateTime,
+    ) -> Result<std::collections::BTreeMap<String, Vec<PolicyMatch>>, String> {
+        let Some(git) = &self.git else {
+            if policies
+                .iter()
+                .any(|policy| policy.policy_type == GIT_OBJECT_TYPE_COMMIT)
+            {
+                return Err(
+                    "GIT_COMMIT configuration policies require the gitserver commit reader, but \
+                     the git seam is unavailable"
+                        .to_owned(),
+                );
             }
-            let glob = sg_codeintel::glob::Glob::compile(&policy.pattern).map_err(|_| {
-                format!(
-                    "failed to compile glob pattern `{}` in configuration policy {}",
-                    policy.pattern, policy.id
-                )
-            })?;
-            patterns.insert(policy.pattern.clone(), glob);
-        }
-
-        let refs = match &self.git {
-            Some(git) => block_on(git.list_refs(repository_id, repo_name, true, true))
-                .map_err(|error| error.message)?,
-            None => Vec::new(),
+            return Ok(std::collections::BTreeMap::new());
         };
-        for git_ref in &refs {
-            match git_ref.ref_type {
-                RefType::Tag => {
-                    for policy in policies.iter().filter(|p| p.policy_type == "GIT_TAG") {
-                        if patterns[&policy.pattern].matches(&git_ref.short_name) {
-                            commit_map
-                                .entry(git_ref.target_commit.clone())
-                                .or_default()
-                                .push(PolicyMatchRow {
-                                    policy_id: Some(policy.id),
-                                    duration_hours: policy.retention_duration_hours,
-                                });
-                        }
-                    }
-                }
-                RefType::Branch => {
-                    // `includeTipOfDefaultBranch` (`matchBranchHeads`).
-                    if git_ref.is_head {
-                        commit_map
-                            .entry(git_ref.target_commit.clone())
-                            .or_default()
-                            .push(PolicyMatchRow {
-                                policy_id: None,
-                                duration_hours: None,
-                            });
-                    }
-                    for policy in policies.iter().filter(|p| p.policy_type == "GIT_TREE") {
-                        if patterns[&policy.pattern].matches(&git_ref.short_name) {
-                            commit_map
-                                .entry(git_ref.target_commit.clone())
-                                .or_default()
-                                .push(PolicyMatchRow {
-                                    policy_id: Some(policy.id),
-                                    duration_hours: policy.retention_duration_hours,
-                                });
-                        }
-                    }
-                }
-                RefType::Unknown => {}
-            }
-        }
-        if policies.iter().any(|policy| policy.policy_type == "GIT_COMMIT") {
-            return Err(
-                "GIT_COMMIT configuration policies are not supported: the gitserver seam has no \
-                 commit reader"
-                    .to_owned(),
-            );
-        }
-        Ok(commit_map)
+
+        let source = GitObjectSourceMatcher::new(git.as_ref());
+        let matcher = PolicyMatcher::new(&source, Extractor::Retention, true, false);
+        block_on(matcher.commits_described_by_policy(
+            repository_id,
+            repo_name,
+            policies,
+            now,
+            filter_commits,
+        ))
     }
 }
 
