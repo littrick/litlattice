@@ -419,7 +419,10 @@ pub fn parse_configuration(data: &str) -> Result<ConfigurationList, String> {
         },
     );
     if !codes.is_empty() {
-        let formatted: Vec<String> = codes.iter().map(|code| format!("{}", *code as usize)).collect();
+        let formatted: Vec<String> = codes
+            .iter()
+            .map(|code| sg_jsonx::parse::code_name(*code).to_owned())
+            .collect();
         return Err(format!(
             "invalid JSON: failed to parse JSON: [{}]",
             formatted.join(" ")
@@ -901,7 +904,7 @@ mod tests {
     fn parse_rejects_invalid_json_like_go() {
         assert_eq!(
             parse_configuration("{").unwrap_err(),
-            "invalid JSON: failed to parse JSON: [6]"
+            "invalid JSON: failed to parse JSON: [CloseBraceExpected]"
         );
     }
 
