@@ -389,6 +389,9 @@ pub struct AppDeps {
     /// the hashed bundles it names. `None` keeps the UI route at the mux 404
     /// that M9.8iu measured.
     pub ui_assets: Option<Arc<dyn sg_ui::AssetsProvider>>,
+    /// `/githubapp/*` production wiring (real Redis/Postgres/HTTP). `None`
+    /// keeps the offline-deterministic M9.31d branches used by the UI tests.
+    pub github_app: Option<Arc<crate::githubapp_http_api::GitHubAppServer>>,
 }
 
 impl AppDeps {
@@ -409,6 +412,7 @@ impl AppDeps {
             userpasswd: None,
             more: crate::app_handlers_more::MoreDeps::default(),
             ui_assets: Some(sg_ui::provider()),
+            github_app: None,
         }
     }
 
@@ -420,6 +424,7 @@ impl AppDeps {
             userpasswd: None,
             more: crate::app_handlers_more::MoreDeps::default(),
             ui_assets: None,
+            github_app: None,
         }
     }
 
@@ -438,6 +443,15 @@ impl AppDeps {
     /// Attach the per-generation built-in auth wiring.
     pub fn with_userpasswd(mut self, wiring: crate::userpasswd::UserpasswdWiring) -> Self {
         self.userpasswd = Some(Arc::new(wiring));
+        self
+    }
+
+    /// Attach the production `/githubapp/*` wiring.
+    pub fn with_github_app(
+        mut self,
+        server: Arc<crate::githubapp_http_api::GitHubAppServer>,
+    ) -> Self {
+        self.github_app = Some(server);
         self
     }
 }

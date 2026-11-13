@@ -454,6 +454,9 @@ pub fn external_handler_with_live(
     // PostgreSQL pool for the per-request verify-email store (its
     // `conf.Get()` values are read from the live configuration).
     verify_email_pool: Option<sqlx::PgPool>,
+    // Production `/githubapp/*` wiring (real Redis/Postgres/HTTP), built once
+    // by the caller; `None` keeps the offline M9.31d branches.
+    github_app: Option<Arc<crate::githubapp_http_api::GitHubAppServer>>,
     version: Bytes,
     blame_deps: Arc<dyn BlameDeps>,
     search_deps: Arc<dyn SearchDeps>,
@@ -467,7 +470,13 @@ pub fn external_handler_with_live(
         Arc::new(crate::repo_refresh::UnavailableRepoRefreshDeps);
     let llm_deps = Arc::new(crate::llm_api::LlmDeps::production(Arc::clone(&api_live)));
     let app_env = Arc::new(AppEnv::from_env());
-    let app_deps = Arc::new(AppDeps::production());
+    let app_deps = {
+        let deps = AppDeps::production();
+        Arc::new(match github_app {
+            Some(server) => deps.with_github_app(server),
+            None => deps,
+        })
+    };
     let middleware = Arc::new(LiveMiddleware::new(
         live,
         allowlist_env,

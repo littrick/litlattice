@@ -494,7 +494,7 @@ pub fn serve_ui<B>(
             method_mismatch = true;
             continue;
         }
-        return candidate.serve(req, env, config, assets);
+        return candidate.serve(req, env, config, assets, deps);
     }
     if method_mismatch {
         // `gorilla/mux`'s `methodNotAllowedHandler`: an empty 405.
@@ -554,6 +554,7 @@ impl UiCandidate {
         env: &AppEnv,
         config: &AppConfig,
         assets: &dyn sg_ui::AssetsProvider,
+        deps: &AppDeps,
     ) -> Response<BoxBody> {
         match &self.action {
             UiAction::Home => serve_home(req, env, config, assets),
@@ -571,7 +572,7 @@ impl UiCandidate {
             ),
             UiAction::Embed => empty_response(StatusCode::NOT_FOUND),
             UiAction::PingSelfHosted => serve_ping_from_self_hosted(req, env, config, assets),
-            UiAction::GitHubApp(route) => serve_github_app(req, *route),
+            UiAction::GitHubApp(route) => serve_github_app(req, *route, deps),
             UiAction::RepoUnavailable => ui_not_found(env, config, assets),
             UiAction::Redirect {
                 location,
@@ -1239,11 +1240,19 @@ fn is_url_scheme(candidate: &str) -> bool {
     chars.all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '+' | '-' | '.'))
 }
 
-/// `githubapp.httpapi`: delegate to the handler module. Without injected
-/// Redis/DB/HTTP seams the server keeps the offline-deterministic branches
+/// `githubapp.httpapi`: delegate to the handler module. With the production
+/// wiring injected through [`AppDeps::github_app`] the handlers use the real
+/// Redis/Postgres/HTTP; otherwise they keep the offline-deterministic branches
 /// (validated before any external call), exactly as the UI tests expect.
-fn serve_github_app<B>(req: &Request<B>, route: GitHubAppRoute) -> Response<BoxBody> {
-    crate::githubapp_http_api::serve_offline(req, route)
+fn serve_github_app<B>(
+    req: &Request<B>,
+    route: GitHubAppRoute,
+    deps: &AppDeps,
+) -> Response<BoxBody> {
+    match deps.github_app.as_deref() {
+        Some(server) => server.serve(req, route),
+        None => crate::githubapp_http_api::serve_offline(req, route),
+    }
 }
 
 /// The `/-/` subroutes of the repo route (`router.go:268-320`).
