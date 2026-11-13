@@ -27,6 +27,7 @@
 //!
 //! No table, column or Redis key is added.
 
+use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 
 use base64::Engine as _;
@@ -1288,13 +1289,25 @@ impl ObjectValue for ChangesetJobErrorObject {
 
 pub struct BatchChangesCodeHostConnectionObject {
     db: BatchesHandle,
+    /// `nil` for `Query.batchChangesCodeHosts`; the user for
+    /// `User.batchChangesCodeHosts` / `viewerBatchChangesCodeHosts`.
+    user_id: Option<i32>,
+    only_without_credential: bool,
     all: OnceLock<Result<Vec<CodeHostRow>, String>>,
+    credentials: OnceLock<
+        Result<HashMap<(String, String), crate::batches_credentials::ResolvedCredential>, String>,
+    >,
     first: i64,
     offset: usize,
 }
 
 impl BatchChangesCodeHostConnectionObject {
-    fn new(db: BatchesHandle, arguments: &Arguments) -> Result<Self, ExecError> {
+    pub fn new(
+        db: BatchesHandle,
+        user_id: Option<i32>,
+        only_without_credential: bool,
+        arguments: &Arguments,
+    ) -> Result<Self, ExecError> {
         let first = arguments.i64("first").unwrap_or(DEFAULT_FIRST);
         validate_first_param(first).map_err(ExecError::new)?;
         let offset = match arguments.string("after") {
@@ -1305,15 +1318,45 @@ impl BatchChangesCodeHostConnectionObject {
         };
         Ok(Self {
             db,
+            user_id,
+            only_without_credential,
             all: OnceLock::new(),
+            credentials: OnceLock::new(),
             first,
             offset,
         })
     }
 
+    fn credentials(
+        &self,
+    ) -> Result<&HashMap<(String, String), crate::batches_credentials::ResolvedCredential>, String>
+    {
+        self.credentials
+            .get_or_init(|| crate::batches_credentials::resolve_credentials(&self.db, self.user_id))
+            .as_ref()
+            .map_err(Clone::clone)
+    }
+
     fn all(&self) -> Result<&Vec<CodeHostRow>, String> {
         self.all
-            .get_or_init(|| read(&self.db)?.code_hosts())
+            .get_or_init(|| {
+                let hosts = read(&self.db)?.code_hosts()?;
+                if !self.only_without_credential {
+                    return Ok(hosts);
+                }
+                // `code_host_connection.go:121-133`: keep hosts without a
+                // credential for the resolved `(type, url)`.
+                let credentials = self.credentials()?;
+                Ok(hosts
+                    .into_iter()
+                    .filter(|host| {
+                        !credentials.contains_key(&(
+                            host.external_service_type.clone(),
+                            host.external_service_id.clone(),
+                        ))
+                    })
+                    .collect())
+            })
             .as_ref()
             .map_err(Clone::clone)
     }
@@ -1347,19 +1390,30 @@ impl ObjectValue for BatchChangesCodeHostConnectionObject {
         _actor: Actor,
     ) -> Result<Option<FieldValue>, ExecError> {
         match field {
-            "nodes" => Ok(Some(FieldValue::List {
-                items: self
-                    .page()
-                    .map_err(ExecError::new)?
-                    .iter()
-                    .map(|host| {
-                        FieldValue::Object(Arc::new(BatchChangesCodeHostObject {
-                            host: host.clone(),
-                        }))
-                    })
-                    .collect(),
-                element_type: Some("BatchChangesCodeHost"),
-            })),
+            "nodes" => {
+                let credentials = self.credentials().map_err(ExecError::new)?;
+                Ok(Some(FieldValue::List {
+                    items: self
+                        .page()
+                        .map_err(ExecError::new)?
+                        .iter()
+                        .map(|host| {
+                            let credential = credentials
+                                .get(&(
+                                    host.external_service_type.clone(),
+                                    host.external_service_id.clone(),
+                                ))
+                                .cloned();
+                            FieldValue::Object(Arc::new(BatchChangesCodeHostObject {
+                                host: host.clone(),
+                                db: Some(self.db.clone()),
+                                credential,
+                            }))
+                        })
+                        .collect(),
+                    element_type: Some("BatchChangesCodeHost"),
+                }))
+            }
             "totalCount" => Ok(Some(json_i64(
                 self.all().map_err(ExecError::new)?.len() as i64
             ))),
@@ -1383,11 +1437,32 @@ impl ObjectValue for BatchChangesCodeHostConnectionObject {
 
 pub struct BatchChangesCodeHostObject {
     host: CodeHostRow,
+    db: Option<BatchesHandle>,
+    credential: Option<crate::batches_credentials::ResolvedCredential>,
 }
 
 impl BatchChangesCodeHostObject {
+    /// A code host without credential resolution (used by call sites that do
+    /// not have the batches handle at hand).
     pub fn new(host: CodeHostRow) -> Self {
-        Self { host }
+        Self {
+            host,
+            db: None,
+            credential: None,
+        }
+    }
+
+    /// A code host carrying the credential resolved for its `(type, url)`.
+    pub fn with_credential(
+        db: BatchesHandle,
+        host: CodeHostRow,
+        credential: Option<crate::batches_credentials::ResolvedCredential>,
+    ) -> Self {
+        Self {
+            host,
+            db: Some(db),
+            credential,
+        }
     }
 }
 
@@ -1407,9 +1482,16 @@ impl ObjectValue for BatchChangesCodeHostObject {
                 &self.host.external_service_type,
             )))),
             "externalServiceURL" => Ok(Some(json_string(self.host.external_service_id.clone()))),
-            // Site/user credentials (encrypted) and GitHub App commit signing
-            // are out of scope for this slice.
-            "credential" => Ok(Some(FieldValue::Null)),
+            "credential" => Ok(Some(match (&self.db, &self.credential) {
+                (Some(db), Some(resolved)) => FieldValue::Object(Arc::new(
+                    crate::batches_credentials::BatchChangesCredentialObject::new(
+                        db.clone(),
+                        resolved.clone(),
+                    ),
+                )),
+                _ => FieldValue::Null,
+            })),
+            // GitHub App commit signing is out of scope for this slice.
             "commitSigningConfiguration" => Ok(Some(FieldValue::Null)),
             "requiresSSH" => Ok(Some(json_bool(self.host.requires_ssh))),
             "requiresUsername" => Ok(Some(json_bool(matches!(
@@ -1508,13 +1590,49 @@ pub fn root_field(
             ))))
         }
         "batchChangesCodeHosts" => {
-            require_batch_changes_enabled(db, actor)?;
-            Ok(Some(FieldValue::Object(Arc::new(
-                BatchChangesCodeHostConnectionObject::new(db.clone(), arguments)?,
-            ))))
+            code_hosts_connection_field(db, None, false, arguments, actor)
         }
         _ => Ok(None),
     }
+}
+
+/// `User.batchChangesCodeHosts`: the resolver passes `args.UserID = user.ID`
+/// (`graphqlbackend/user.go:761-764`).
+pub fn user_batch_changes_code_hosts(
+    db: &BatchesHandle,
+    user_id: i32,
+    arguments: &Arguments,
+    actor: Actor,
+) -> Result<FieldValue, ExecError> {
+    code_hosts_connection_field(db, Some(user_id), false, arguments, actor)?
+        .ok_or_else(|| ExecError::new("batchChangesCodeHosts is not wired"))
+}
+
+/// `Resolver.BatchChangesCodeHosts` (`resolver.go:874-897`), shared by the
+/// `Query`, `User` and viewer entrypoints.
+pub fn code_hosts_connection_field(
+    db: &BatchesHandle,
+    user_id: Option<i32>,
+    only_without_credential: bool,
+    arguments: &Arguments,
+    actor: Actor,
+) -> Result<Option<FieldValue>, ExecError> {
+    require_batch_changes_enabled(db, actor)?;
+    if let Some(user_id) = user_id {
+        // 🚨 SECURITY: Only viewable for self or by site admins.
+        crate::batches_credentials::check_site_admin_or_same_user(
+            &**db, actor, user_id,
+        )
+        .map_err(ExecError::new)?;
+    }
+    Ok(Some(FieldValue::Object(Arc::new(
+        BatchChangesCodeHostConnectionObject::new(
+            db.clone(),
+            user_id,
+            only_without_credential,
+            arguments,
+        )?,
+    ))))
 }
 
 /// Whether `field` is a root field owned by this module.
