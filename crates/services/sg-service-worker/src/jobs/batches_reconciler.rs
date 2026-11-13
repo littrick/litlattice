@@ -880,6 +880,29 @@ pub trait ChangesetSource: Send + Sync {
     async fn run_after_commit(&self, _resp: &PushResult) -> Result<(), SourceError> {
         Ok(())
     }
+
+    /// `sources.GitHubSource.DuplicateCommit`: re-create the pushed commit via
+    /// the GitHub REST API so the App installation signs it, then move the ref.
+    ///
+    /// The three REST calls (`GetRef` / `CreateCommit` / `UpdateRef`) are not
+    /// ported yet; the signing source resolution above is wired, this step is
+    /// an explicit seam.
+    async fn duplicate_commit(
+        &self,
+        _remote: &Repo,
+        _resp: &PushResult,
+    ) -> Result<CommitVerification, SourceError> {
+        Err(SourceError::non_retryable(
+            "duplicating a commit requires the GitHub REST API, which is not ported",
+        ))
+    }
+}
+
+/// `github.RestCommit`'s verification projection written back to the changeset.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CommitVerification {
+    pub sha: String,
+    pub verified: bool,
 }
 
 /// `sources.Sourcer`.
@@ -890,6 +913,28 @@ pub trait ChangesetSourceFactory: Send + Sync {
         changeset: &Changeset,
         target_repo: &Repo,
     ) -> Result<Arc<dyn ChangesetSource>, SourceError>;
+
+    /// `executor.runAfterCommit`'s second `ForChangeset`:
+    /// `AuthenticationStrategyGitHubApp` + `CommitSigningGitHubAppKind`.
+    ///
+    /// `original_strategy` is the strategy used for the initial push; when it
+    /// was not `GITHUB_APP` the signing source is credentialless. Returns
+    /// `None` when no signing App is configured (and verification is not
+    /// required). The duplicate commit itself remains the gitserver/REST seam.
+    async fn commit_signing_source(
+        &self,
+        _changeset: &Changeset,
+        _target_repo: &Repo,
+        _original_strategy: &str,
+        _reject_unverified: bool,
+    ) -> Result<Option<Arc<dyn ChangesetSource>>, SourceError> {
+        Ok(None)
+    }
+
+    /// `conf.RejectUnverifiedCommit()`.
+    fn reject_unverified_commit(&self) -> bool {
+        false
+    }
 }
 
 /// Production seam: every source call is explicitly not ported.
@@ -1472,6 +1517,54 @@ pub struct PgSourceService {
     pub connection: Result<extsvc::SourceConnection, SourceError>,
 }
 
+/// `github_apps.Store` adapter for the runtime GitHub App authenticator.
+///
+/// Reads the existing `github_apps`/`github_app_installs` rows and decrypts
+/// the App private key with the site `GitHubAppKey`, like
+/// `gitHubAppsStore.decrypt`. No table/column/key is added.
+pub struct PgBatchesGitHubAppStore {
+    pool: PgPool,
+    keyring: Arc<sg_keyring::Keyring>,
+}
+
+impl PgBatchesGitHubAppStore {
+    pub fn new(pool: PgPool, keyring: Arc<sg_keyring::Keyring>) -> Self {
+        Self { pool, keyring }
+    }
+}
+
+#[async_trait]
+impl extsvc::BatchesGitHubAppStore for PgBatchesGitHubAppStore {
+    async fn get_by_domain_and_kind(
+        &self,
+        domain: &str,
+        kind: &str,
+        base_url: &str,
+    ) -> Result<extsvc::BatchesGitHubApp, String> {
+        let app = sg_db::github_apps::get_by_domain_and_kind(&self.pool, domain, kind, base_url)
+            .await?
+            .ok_or_else(|| "no app exists matching criteria".to_owned())?;
+        let private_key = sg_encryption::maybe_decrypt(
+            self.keyring.github_app_key().as_deref(),
+            &app.private_key,
+            &app.encryption_key_id,
+        )
+        .await
+        .map_err(|err| err.to_string())?;
+        Ok(extsvc::BatchesGitHubApp {
+            app_id: app.app_id,
+            private_key,
+            base_url: app.base_url,
+        })
+    }
+
+    async fn get_install_id(&self, app_id: i32, account: &str) -> Result<i32, String> {
+        sg_db::github_apps::get_install_id(&self.pool, app_id, account)
+            .await?
+            .ok_or_else(|| "no installation found".to_owned())
+    }
+}
+
 /// Production provider: decrypts live `external_services` configs with the
 /// external-service key and caches the resolved connections. The cache is a
 /// `OnceCell` so a failed load is retried (like `internal/object`'s
@@ -1480,15 +1573,45 @@ pub struct PgSourceConfigProvider {
     pool: PgPool,
     keyring: Arc<sg_keyring::Keyring>,
     cache: tokio::sync::OnceCell<Vec<PgSourceService>>,
+    /// `github_apps`/`github_app_installs` store for `GITHUB_APP` runtime
+    /// selection; `None` keeps the config/PAT connection.
+    github_app_store: Option<Arc<dyn extsvc::BatchesGitHubAppStore>>,
+    /// Installation-token cache + HTTP doer.
+    github_app_seams: extsvc::GitHubAppTokenSeams,
+    /// `conf.RejectUnverifiedCommit()`.
+    reject_unverified_commit: bool,
 }
 
 impl PgSourceConfigProvider {
-    pub fn new(pool: PgPool, keyring: Arc<sg_keyring::Keyring>) -> Self {
+    pub fn new(
+        pool: PgPool,
+        keyring: Arc<sg_keyring::Keyring>,
+        http: Arc<dyn sg_extsvc::HttpDoer>,
+    ) -> Self {
         Self {
             pool,
             keyring,
             cache: tokio::sync::OnceCell::new(),
+            github_app_store: None,
+            github_app_seams: extsvc::GitHubAppTokenSeams::offline(http),
+            reject_unverified_commit: false,
         }
+    }
+
+    /// Enable `GITHUB_APP` runtime authentication (source construction and
+    /// commit signing) through the existing App tables.
+    pub fn with_github_app_store(
+        mut self,
+        store: Arc<dyn extsvc::BatchesGitHubAppStore>,
+    ) -> Self {
+        self.github_app_store = Some(store);
+        self
+    }
+
+    /// `conf.RejectUnverifiedCommit()`.
+    pub fn with_reject_unverified_commit(mut self, reject: bool) -> Self {
+        self.reject_unverified_commit = reject;
+        self
     }
 
     async fn load(&self) -> Result<Vec<PgSourceService>, SourceError> {
@@ -1530,8 +1653,20 @@ impl PgSourceConfigProvider {
                 .and_then(|raw| url::Url::parse(raw).ok())
                 .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
                 .unwrap_or_default();
-            let connection = extsvc::source_connection_from_config(&service.kind, &value)
-                .map_err(map_source_error);
+            let connection = extsvc::resolve_runtime_changeset_source_connection(
+                extsvc::RuntimeSourceRequest {
+                    external_service_kind: &service.kind,
+                    config: &value,
+                    strategy: extsvc::AUTHENTICATION_STRATEGY_USER_CREDENTIAL,
+                    github_app_kind: None,
+                    account: "",
+                    as_non_credential: false,
+                },
+                self.github_app_store.as_deref(),
+                self.github_app_seams.clone(),
+            )
+            .await
+            .map_err(map_source_error);
             resolved.push(PgSourceService {
                 id: service.id,
                 kind: service.kind,
@@ -1635,6 +1770,13 @@ pub struct ConfigSourceFactory {
     configs: Arc<dyn SourceConfigProvider>,
     http: Arc<dyn sg_extsvc::HttpDoer>,
     repo_metadata: Arc<dyn RepoMetadataProvider>,
+    /// `github_apps`/`github_app_installs` store for `GITHUB_APP` commit
+    /// signing; `None` keeps the signing resolution a no-op.
+    github_app_store: Option<Arc<dyn extsvc::BatchesGitHubAppStore>>,
+    /// Installation-token cache + HTTP doer.
+    github_app_seams: extsvc::GitHubAppTokenSeams,
+    /// `conf.RejectUnverifiedCommit()`.
+    reject_unverified_commit: bool,
 }
 
 impl ConfigSourceFactory {
@@ -1645,9 +1787,36 @@ impl ConfigSourceFactory {
     ) -> Self {
         Self {
             configs,
-            http,
+            http: Arc::clone(&http),
             repo_metadata,
+            github_app_store: None,
+            github_app_seams: extsvc::GitHubAppTokenSeams::offline(http),
+            reject_unverified_commit: false,
         }
+    }
+
+    /// Enable GitHub App commit signing through the existing App tables.
+    pub fn with_github_app_store(
+        mut self,
+        store: Arc<dyn extsvc::BatchesGitHubAppStore>,
+    ) -> Self {
+        self.github_app_store = Some(store);
+        self
+    }
+
+    /// Inject the installation-token cache (existing Redis-backed cache).
+    pub fn with_github_app_cache(
+        mut self,
+        cache: Arc<dyn sg_extsvc::auth::InstallationTokenCache>,
+    ) -> Self {
+        self.github_app_seams.cache = Some(cache);
+        self
+    }
+
+    /// `conf.RejectUnverifiedCommit()`.
+    pub fn with_reject_unverified_commit(mut self, reject: bool) -> Self {
+        self.reject_unverified_commit = reject;
+        self
     }
 }
 
@@ -1674,6 +1843,78 @@ impl ChangesetSourceFactory for ConfigSourceFactory {
             Arc::clone(&self.repo_metadata),
         );
         factory.for_changeset(changeset, target_repo).await
+    }
+
+    async fn commit_signing_source(
+        &self,
+        changeset: &Changeset,
+        target_repo: &Repo,
+        original_strategy: &str,
+        reject_unverified: bool,
+    ) -> Result<Option<Arc<dyn ChangesetSource>>, SourceError> {
+        // `runAfterCommit` only runs for `*sources.GitHubSource`.
+        if !changeset.external_service_type.eq_ignore_ascii_case("GITHUB") {
+            return Ok(None);
+        }
+        let connection = self
+            .configs
+            .config_for(&changeset.external_service_type, &target_repo.name)
+            .await
+            .map_err(|err| SourceError {
+                message: format!("loading external service: {}", err.message),
+                ..err
+            })?;
+
+        // The App path only reads the connection URL; the authenticator is
+        // replaced by the installation token.
+        let config = serde_json::json!({ "url": connection.base_url.as_str() });
+        let target_metadata = self
+            .repo_metadata
+            .metadata(&connection.kind, target_repo)
+            .await?;
+        let target_ext = ext_repo(&connection.kind, target_repo, target_metadata);
+        // The worker's reduced spec has no fork namespace, so the owner comes
+        // from the repo metadata (the non-fork branch of
+        // `getOwnerFromChangeset`). Fork owner derivation is an explicit gap.
+        let spec = extsvc::ChangesetSpec {
+            fork_namespace: None,
+            ..Default::default()
+        };
+        let account = extsvc::changeset_owner_from_changeset(&target_ext, Some(&spec))
+            .map_err(map_source_error)?;
+
+        let resolution = extsvc::resolve_commit_signing_source(
+            extsvc::CommitSigningRequest {
+                external_service_kind: &connection.kind,
+                config: &config,
+                account: &account,
+                original_strategy,
+                reject_unverified,
+            },
+            self.github_app_store.as_deref(),
+            self.github_app_seams.clone(),
+        )
+        .await
+        .map_err(map_source_error)?;
+
+        match resolution {
+            extsvc::CommitSigningResolution::UseSource(signing) => {
+                let factory = ExtsvcSourceFactory::new(
+                    signing.kind,
+                    signing.base_url,
+                    signing.auth,
+                    Arc::clone(&self.http),
+                    Arc::clone(&self.repo_metadata),
+                );
+                Ok(Some(factory.for_changeset(changeset, target_repo).await?))
+            }
+            extsvc::CommitSigningResolution::SkipNoApp
+            | extsvc::CommitSigningResolution::SkipError(_) => Ok(None),
+        }
+    }
+
+    fn reject_unverified_commit(&self) -> bool {
+        self.reject_unverified_commit
     }
 }
 
@@ -2143,6 +2384,46 @@ impl<'a> Executor<'a> {
             Ok(resp) => {
                 if let Some(changelist_id) = resp.changelist_id.clone() {
                     self.ch.external_id = changelist_id;
+                }
+                // `runAfterCommit`: resolve the `COMMIT_SIGNING` GitHub App
+                // source and duplicate the pushed commit through it. The
+                // resolution/error/reject semantics are ported; the REST
+                // duplicate itself is still a seam.
+                let reject_unverified = self.factory.reject_unverified_commit();
+                match self
+                    .factory
+                    .commit_signing_source(
+                        &self.ch,
+                        &target,
+                        extsvc::AUTHENTICATION_STRATEGY_USER_CREDENTIAL,
+                        reject_unverified,
+                    )
+                    .await
+                {
+                    Ok(Some(signing)) => {
+                        if let Err(err) = signing.duplicate_commit(&remote, &resp).await {
+                            return (
+                                after_done,
+                                Err(ReconcilerError::from_source(
+                                    "running after commit routine",
+                                    err,
+                                )),
+                            );
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(err) => {
+                        return (
+                            after_done,
+                            Err(ReconcilerError {
+                                message: format!(
+                                    "running after commit routine: {}",
+                                    err.message
+                                ),
+                                non_retryable: err.non_retryable,
+                            }),
+                        )
+                    }
                 }
                 if let Err(err) = css.run_after_commit(&resp).await {
                     return (
@@ -3070,6 +3351,7 @@ impl Job for BatchesReconcilerJob {
         let configs: Arc<dyn SourceConfigProvider> = Arc::new(PgSourceConfigProvider::new(
             deps.frontend.clone(),
             Arc::clone(&deps.keyring),
+            Arc::new(ReqwestHttpDoer::new()),
         ));
         let source_factory: Arc<dyn ChangesetSourceFactory> = Arc::new(ConfigSourceFactory::new(
             configs,
