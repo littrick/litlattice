@@ -152,6 +152,8 @@ pub mod slow_requests_tracer;
 pub mod survey_responses;
 pub mod symbol_search;
 pub mod symbols_client;
+pub mod teams_graphql;
+pub mod teams_store;
 pub mod temporary_settings;
 pub mod tenant;
 pub mod trace_headers;

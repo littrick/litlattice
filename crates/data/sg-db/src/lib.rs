@@ -54,6 +54,7 @@ pub mod security_event_logs;
 pub mod settings;
 pub mod sub_repo_perms;
 pub mod syntactic_indexing_jobs;
+pub mod teams;
 pub mod telemetry_events;
 pub mod temporary_settings;
 pub mod user_emails;
