@@ -418,6 +418,13 @@ pub trait BatchesGraphqlDatabase: Send + Sync {
         false
     }
 
+    /// M9.26c changeset deep-read surface; `None` leaves the fields unported.
+    fn changeset_read(
+        &self,
+    ) -> Option<&dyn crate::batches_changeset_read::ChangesetReadDatabase> {
+        None
+    }
+
     /// `rbac.CheckCurrentUserHasPermission(..., BatchChangesWritePermission)`.
     fn current_user_has_batch_changes_write(&self, actor: Actor) -> Result<(), String>;
 
@@ -1336,9 +1343,8 @@ impl ObjectValue for BatchChangeObject {
                     ChangesetConnectionObject::new(self.db.clone(), filter, safe, actor),
                 ))))
             }
-            // `ChangesetsStats`, `ChangesetCountsOverTime`, `DiffStat`,
-            // `CurrentSpec`, `BulkOperations`, `BatchSpecs`: unported.
-            _ => Ok(None),
+            // `CurrentSpec`, `BatchSpecs`: unported.
+            _ => crate::batches_changeset_read::batch_change_field(self, field, arguments, actor),
         }
     }
 }
@@ -1511,16 +1517,10 @@ impl ObjectValue for ChangesetObject {
         match field {
             // Interface fields (`batches.graphql`, `HiddenExternalChangeset`).
             "id" => Ok(Some(json_str(marshal_changeset_id(self.row.id)))),
+            // `changesetResolver.BatchChanges` does not exclude drafts (see
+            // `batches_changeset_read::changeset_field`).
             "batchChanges" => {
-                let scope = BatchChangeScope {
-                    changeset_id: self.row.id,
-                    ..BatchChangeScope::default()
-                };
-                let filter =
-                    parse_batch_change_filter(self.db.as_ref(), arguments, actor, scope)?;
-                Ok(Some(FieldValue::Object(Arc::new(
-                    BatchChangeConnectionObject::new(self.db.clone(), filter, actor),
-                ))))
+                crate::batches_changeset_read::changeset_field(self, field, arguments, actor)
             }
             "state" => Ok(Some(json_str(self.row.computed_state.clone()))),
             "createdAt" => Ok(Some(json_str(datetime_rfc3339(self.row.created_at)))),
@@ -1528,7 +1528,7 @@ impl ObjectValue for ChangesetObject {
             "nextSyncAt" => Ok(Some(optional_json_str(
                 self.next_sync_at()?.map(datetime_rfc3339),
             ))),
-            _ => self.external_field(field, arguments),
+            _ => self.external_field(field, arguments, actor),
         }
     }
 }
@@ -1537,7 +1537,8 @@ impl ChangesetObject {
     fn external_field(
         &self,
         field: &str,
-        _arguments: &Arguments,
+        arguments: &Arguments,
+        actor: Actor,
     ) -> Result<Option<FieldValue>, ExecError> {
         // Hidden changesets only expose the interface fields.
         let Some(repo) = &self.repo else {
@@ -1554,10 +1555,12 @@ impl ChangesetObject {
                 (self.row.owned_by_batch_change_id != 0)
                     .then(|| marshal_batch_change_id(self.row.owned_by_batch_change_id)),
             ))),
-            // Events are out of scope for phase 1; the connection is empty.
-            "events" => Ok(Some(FieldValue::Object(Arc::new(EmptyConnectionObject {
-                type_name: "ChangesetEventConnection",
-            })))),
+            "events" => crate::batches_changeset_read::changeset_field(
+                self,
+                field,
+                arguments,
+                actor,
+            ),
             "title" => {
                 if self.row.is_importing() {
                     return Ok(Some(FieldValue::Null));
@@ -1607,13 +1610,23 @@ impl ChangesetObject {
                 (!self.row.external_fork_name.is_empty())
                     .then(|| self.row.external_fork_name.clone()),
             ))),
-            "commitVerification" => Ok(Some(FieldValue::Null)),
+            "commitVerification" => crate::batches_changeset_read::changeset_field(
+                self,
+                field,
+                arguments,
+                actor,
+            ),
             "reviewState" => Ok(Some(optional_json_str(
                 self.row
                     .published()
                     .then(|| self.row.external_review_state.clone()),
             ))),
-            "diff" => Ok(Some(FieldValue::Null)),
+            "diff" => crate::batches_changeset_read::changeset_field(
+                self,
+                field,
+                arguments,
+                actor,
+            ),
             "diffStat" => Ok(Some(match self.row.diff_stat() {
                 Some((added, deleted)) => FieldValue::Object(Arc::new(DiffStatObject {
                     added,
@@ -1923,7 +1936,7 @@ pub fn root_field(
     let value = match field {
         "batchChanges" => batch_changes(db, arguments, actor, BatchChangeScope::default())?,
         "batchChange" => batch_change(db, arguments, actor)?,
-        _ => return Ok(None),
+        _ => return crate::batches_changeset_read::root_field(db, field, arguments, actor),
     };
     Ok(Some(value))
 }
@@ -1931,6 +1944,7 @@ pub fn root_field(
 /// Whether `field` is owned by this surface.
 pub fn is_root_field(field: &str) -> bool {
     matches!(field, "batchChanges" | "batchChange")
+        || crate::batches_changeset_read::is_root_field(field)
 }
 
 /// `User.batchChanges` / `Org.batchChanges`.

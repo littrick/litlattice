@@ -27,7 +27,7 @@ use crate::batches_graphql::{
 use crate::graphql_resolvers::{OrgData, RepositoryData, UserData};
 use sg_graphql::exec::Actor;
 
-fn block_on<F: Future>(future: F) -> F::Output {
+pub(crate) fn block_on<F: Future>(future: F) -> F::Output {
     match tokio::runtime::Handle::try_current() {
         Ok(handle) => tokio::task::block_in_place(|| handle.block_on(future)),
         Err(_) => tokio::runtime::Builder::new_current_thread()
@@ -151,7 +151,7 @@ fn scan_repo(row: &PgRow) -> Result<RepositoryData, sqlx::Error> {
     })
 }
 
-fn error(error: sqlx::Error) -> String {
+pub(crate) fn error(error: sqlx::Error) -> String {
     error.to_string()
 }
 
@@ -218,13 +218,17 @@ impl Binds {
 // ---------------------------------------------------------------------------
 
 pub struct PgBatchesGraphqlStore {
-    pool: PgPool,
+    pub(crate) pool: PgPool,
     /// `conf.BatchChangesEnabled`. Only the differential harness disables it
     /// to exercise `ErrBatchChangesDisabled`; production keeps the default.
     batch_changes_enabled: bool,
     /// `conf.BatchChangesRestrictToAdmins`. Test seam only; production keeps
     /// the default (`false`).
     batch_changes_restricted_to_admins: bool,
+    /// M9.26c gitserver seam for `Changeset.diff`; `None` until a gitserver
+    /// client is wired into the store.
+    pub(crate) changeset_diff_source:
+        Option<std::sync::Arc<dyn crate::batches_changeset_read::ChangesetDiffSource>>,
 }
 
 impl PgBatchesGraphqlStore {
@@ -233,7 +237,17 @@ impl PgBatchesGraphqlStore {
             pool,
             batch_changes_enabled: true,
             batch_changes_restricted_to_admins: false,
+            changeset_diff_source: None,
         }
+    }
+
+    /// Test seam for the M9.26c `Changeset.diff` gitserver access.
+    pub fn with_changeset_diff_source(
+        mut self,
+        source: std::sync::Arc<dyn crate::batches_changeset_read::ChangesetDiffSource>,
+    ) -> Self {
+        self.changeset_diff_source = Some(source);
+        self
     }
 
     /// Test seam for the `batchChanges.enabled: false` site configuration.
@@ -303,7 +317,7 @@ use crate::batches_mutations::{
 
 /// `btypes.GetSupportedExternalServices` (`types/util.go:24-38`), without the
 /// experimental perforce toggle (no site configuration seam in this slice).
-const SUPPORTED_CODE_HOSTS: &[&str] = &[
+pub(crate) const SUPPORTED_CODE_HOSTS: &[&str] = &[
     "github",
     "bitbucketServer",
     "gitlab",
@@ -337,7 +351,7 @@ async fn site_admin_async(pool: &PgPool, actor: Actor) -> Result<Option<bool>, S
 }
 
 /// `database.AuthzQueryConds` for a raw `repo` table reference.
-async fn authz_conds_async(pool: &PgPool, actor: Actor) -> Result<String, String> {
+pub(crate) async fn authz_conds_async(pool: &PgPool, actor: Actor) -> Result<String, String> {
     if actor.is_internal() || site_admin_async(pool, actor).await? == Some(true) {
         return Ok("TRUE".to_owned());
     }
@@ -1958,6 +1972,12 @@ impl BatchesGraphqlDatabase for PgBatchesGraphqlStore {
 
     fn batch_changes_restricted_to_admins(&self) -> bool {
         self.batch_changes_restricted_to_admins
+    }
+
+    fn changeset_read(
+        &self,
+    ) -> Option<&dyn crate::batches_changeset_read::ChangesetReadDatabase> {
+        Some(self)
     }
 
     fn current_user_site_admin(&self, actor: Actor) -> Result<Option<bool>, String> {
