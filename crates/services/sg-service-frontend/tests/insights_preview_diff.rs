@@ -22,6 +22,11 @@ use sg_insights::timeseries::TimeInterval;
 use sg_insights::types::IntervalUnit;
 use sg_insights_query::new_pattern_replacer;
 use sg_search_query::SearchType;
+use sg_service_frontend::insights_aggregations::{
+    mode_availability, search_aggregations, AggregationMatchResult, AggregationResult,
+    AggregationSearchOutcome, AggregationSearchSeam, SearchAggregationMode,
+    SearchAggregationsInput,
+};
 use sg_service_frontend::insights_preview::{
     execute_capture_group, execute_compute, format_rfc3339, preview_repositories_from_query,
     preview_series, search_insight_live_preview, search_insight_preview,
@@ -115,6 +120,105 @@ struct Case {
     search_error: Option<String>,
     #[serde(default, rename = "maskDateTime")]
     mask_date_time: bool,
+
+    // Aggregation (`searchQueryAggregate`).
+    #[serde(default, rename = "patternType")]
+    pattern_type: String,
+    #[serde(default)]
+    mode: Option<String>,
+    #[serde(default = "default_agg_limit")]
+    limit: i32,
+    #[serde(default, rename = "extendedTimeout")]
+    extended_timeout: bool,
+    #[serde(default, rename = "bufferSize")]
+    buffer_size: i32,
+    #[serde(default, rename = "proactiveResultLimit")]
+    proactive_result_limit: i64,
+    #[serde(default = "default_extended_seconds", rename = "extendedTimeoutSeconds")]
+    extended_timeout_seconds: i32,
+    #[serde(default, rename = "aggregationMatches")]
+    aggregation_matches: Vec<GroupFixture>,
+    #[serde(default, rename = "shardTimeout")]
+    shard_timeout: bool,
+    #[serde(default, rename = "resultCount")]
+    result_count: i32,
+    #[serde(default, rename = "timedOut")]
+    timed_out: bool,
+}
+
+fn default_agg_limit() -> i32 {
+    50
+}
+
+fn default_extended_seconds() -> i32 {
+    55
+}
+
+struct FakeAggregationSeam {
+    matches: Vec<AggregationMatchResult>,
+    shard_timeout: bool,
+    result_count: i32,
+    timed_out: bool,
+    error: Option<String>,
+    buffer_size: i32,
+    proactive_result_limit: i64,
+    extended_timeout_seconds: i32,
+}
+
+impl std::fmt::Debug for FakeAggregationSeam {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("FakeAggregationSeam")
+    }
+}
+
+impl FakeAggregationSeam {
+    fn from_case(case: &Case) -> Self {
+        Self {
+            matches: case
+                .aggregation_matches
+                .iter()
+                .map(|group| AggregationMatchResult {
+                    group: group.value.clone(),
+                    count: group.count as i32,
+                })
+                .collect(),
+            shard_timeout: case.shard_timeout,
+            result_count: case.result_count,
+            timed_out: case.timed_out,
+            error: case.search_error.clone(),
+            buffer_size: case.buffer_size,
+            proactive_result_limit: case.proactive_result_limit,
+            extended_timeout_seconds: case.extended_timeout_seconds,
+        }
+    }
+}
+
+impl AggregationSearchSeam for FakeAggregationSeam {
+    fn search(
+        &self,
+        _modified_query: &str,
+        _mode: SearchAggregationMode,
+    ) -> AggregationSearchOutcome {
+        AggregationSearchOutcome {
+            matches: self.matches.clone(),
+            shard_timeout: self.shard_timeout,
+            result_count: self.result_count,
+            timed_out: self.timed_out,
+            error: self.error.clone(),
+        }
+    }
+
+    fn buffer_size(&self) -> i32 {
+        self.buffer_size
+    }
+
+    fn proactive_result_limit(&self) -> i64 {
+        self.proactive_result_limit
+    }
+
+    fn extended_timeout_seconds(&self) -> i32 {
+        self.extended_timeout_seconds
+    }
 }
 
 struct FakeSeam {
@@ -393,6 +497,79 @@ fn run_case(case: &Case) -> Value {
             }
         }
         "series" => run_series(case, &seam),
+        "modeAvailability" => {
+            let modes: Vec<Value> = mode_availability(&case.query, &case.pattern_type)
+                .into_iter()
+                .map(|item| {
+                    json!({
+                        "mode": item.mode.as_str(),
+                        "available": item.available,
+                        "reasonUnavailable": item.reason_unavailable,
+                    })
+                })
+                .collect();
+            json!({"modes": modes})
+        }
+        "aggregation" => {
+            let seam = FakeAggregationSeam::from_case(case);
+            let input = SearchAggregationsInput {
+                query: case.query.clone(),
+                pattern_type: case.pattern_type.clone(),
+                mode: case
+                    .mode
+                    .as_deref()
+                    .and_then(SearchAggregationMode::from_raw),
+                limit: case.limit,
+                extended_timeout: case.extended_timeout,
+            };
+            match search_aggregations(&seam, &input) {
+                Err(err) => json!({"error": err}),
+                Ok(AggregationResult::NotAvailable {
+                    reason,
+                    reason_type,
+                    mode,
+                }) => json!({
+                    "notAvailable": {
+                        "reason": reason,
+                        "reasonType": reason_type.as_str(),
+                        "mode": mode.as_str(),
+                    }
+                }),
+                Ok(result) => {
+                    let (results, mode, exhaustive) = match result {
+                        AggregationResult::Exhaustive { results, mode } => (results, mode, true),
+                        AggregationResult::NonExhaustive { results, mode } => {
+                            (results, mode, false)
+                        }
+                        AggregationResult::NotAvailable { .. } => unreachable!(),
+                    };
+                    let groups: Vec<Value> = results
+                        .groups
+                        .iter()
+                        .map(|group| {
+                            json!({
+                                "label": group.label,
+                                "count": group.count,
+                                "query": group.query,
+                            })
+                        })
+                        .collect();
+                    let mut doc = json!({
+                        "mode": mode.as_str(),
+                        "exhaustive": exhaustive,
+                        "groups": groups,
+                        "otherResultCount": results.other_result_count,
+                        "totalCount": results.total_count,
+                    });
+                    if exhaustive {
+                        doc["otherGroupCount"] = json!(results.other_group_count);
+                    } else {
+                        doc["approximateOtherGroupCount"] = json!(results.other_group_count);
+                    }
+                    doc
+                }
+            }
+        }
         other => panic!("unknown kind {other}"),
     }
 }

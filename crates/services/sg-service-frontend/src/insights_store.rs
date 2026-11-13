@@ -13,6 +13,7 @@
 //! of scope; see `dev/rs/docs/overviews/m9_29b_insights_overview.md`.
 
 use std::collections::{BTreeSet, HashMap};
+use std::sync::Arc;
 
 use sqlx::{PgPool, Row};
 
@@ -41,6 +42,10 @@ pub struct PgInsightsStore {
     /// `licensing.Check(FeatureCodeInsights) == nil`; `false` drives the
     /// Limited Access Mode branches of the create mutations.
     code_insights_licensed: bool,
+    /// M9.33a: the live-preview search/repository/gitserver seam assembled by
+    /// the frontend combination root. `None` keeps the explicit
+    /// `search execution is not connected` errors.
+    preview_seam: Option<Arc<dyn crate::insights_preview::PreviewSearchSeam>>,
 }
 
 impl std::fmt::Debug for PgInsightsStore {
@@ -58,7 +63,19 @@ impl PgInsightsStore {
             frontend_pool: None,
             limited_access_mode: false,
             code_insights_licensed: true,
+            preview_seam: None,
         }
+    }
+
+    /// Wire the production search combination root's live-preview seam
+    /// (M9.33a). Without it the preview fields keep the explicit
+    /// `search execution is not connected` errors.
+    pub fn with_preview_seam(
+        mut self,
+        seam: Arc<dyn crate::insights_preview::PreviewSearchSeam>,
+    ) -> Self {
+        self.preview_seam = Some(seam);
+        self
     }
 
     pub fn with_frontend_pool(mut self, pool: PgPool) -> Self {
@@ -235,6 +252,12 @@ fn group_rows(rows: Vec<SeriesRow>) -> Vec<InsightViewData> {
 }
 
 impl InsightsDatabase for PgInsightsStore {
+    fn preview_seam(&self) -> &dyn crate::insights_preview::PreviewSearchSeam {
+        self.preview_seam
+            .as_deref()
+            .unwrap_or(&crate::insights_preview::UnavailablePreviewSeam)
+    }
+
     fn user_permission_ids(&self, actor: Actor) -> Result<(Vec<i32>, Vec<i32>), String> {
         // `getUserPermissions`: an actor with UID 0 (anonymous or internal)
         // gets neither user nor org grants, leaving only `global is true`.

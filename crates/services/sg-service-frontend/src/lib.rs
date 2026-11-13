@@ -88,6 +88,7 @@ pub mod graphql_inventory_d;
 pub mod graphql_metrics;
 pub mod graphql_resolvers;
 pub mod health;
+pub mod insights_aggregations;
 pub mod insights_graphql;
 pub mod insights_preview;
 pub mod insights_store;
