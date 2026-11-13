@@ -27,7 +27,7 @@ use crate::batches_graphql::{
 use crate::graphql_resolvers::{OrgData, RepositoryData, UserData};
 use sg_graphql::exec::Actor;
 
-fn block_on<F: Future>(future: F) -> F::Output {
+pub(crate) fn block_on<F: Future>(future: F) -> F::Output {
     match tokio::runtime::Handle::try_current() {
         Ok(handle) => tokio::task::block_in_place(|| handle.block_on(future)),
         Err(_) => tokio::runtime::Builder::new_current_thread()
@@ -246,6 +246,11 @@ impl PgBatchesGraphqlStore {
     pub fn with_batch_changes_restricted_to_admins(mut self, restricted: bool) -> Self {
         self.batch_changes_restricted_to_admins = restricted;
         self
+    }
+
+    /// The connection pool, for the M9.26a spec store seam.
+    pub(crate) fn pool(&self) -> &PgPool {
+        &self.pool
     }
 
     /// `AuthzQueryConds` for the actor (`repos_perm.go:25-133`). The returned
@@ -1958,6 +1963,10 @@ impl BatchesGraphqlDatabase for PgBatchesGraphqlStore {
 
     fn batch_changes_restricted_to_admins(&self) -> bool {
         self.batch_changes_restricted_to_admins
+    }
+
+    fn specs_database(&self) -> Option<&dyn crate::batches_specs_graphql::BatchesSpecsDatabase> {
+        Some(self)
     }
 
     fn current_user_site_admin(&self, actor: Actor) -> Result<Option<bool>, String> {
