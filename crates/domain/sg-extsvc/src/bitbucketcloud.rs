@@ -180,6 +180,252 @@ pub struct Repo {
     pub owner: Option<Account>,
 }
 
+impl Repo {
+    /// `Repo.Namespace`: the segment before the first `/` in `FullName`.
+    pub fn namespace(&self) -> Result<String, String> {
+        match self.full_name.split_once('/') {
+            Some((namespace, _)) => Ok(namespace.to_owned()),
+            None => Err("cannot split namespace from repo name".to_owned()),
+        }
+    }
+}
+
+/// `bitbucketcloud.RenderedMarkup`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RenderedMarkup {
+    #[serde(default)]
+    pub raw: String,
+    #[serde(default)]
+    pub markup: String,
+    #[serde(default)]
+    pub html: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub r#type: String,
+}
+
+/// `bitbucketcloud.PullRequestCommit`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PullRequestCommit {
+    #[serde(default)]
+    pub hash: String,
+}
+
+/// `bitbucketcloud.PullRequestBranch`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PullRequestBranch {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub merge_strategies: Option<Vec<String>>,
+    #[serde(default)]
+    pub default_merge_strategy: String,
+}
+
+/// `bitbucketcloud.PullRequestEndpoint`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct PullRequestEndpoint {
+    #[serde(rename = "repository", default)]
+    pub repo: Repo,
+    #[serde(default)]
+    pub branch: PullRequestBranch,
+    #[serde(default)]
+    pub commit: PullRequestCommit,
+}
+
+/// `bitbucketcloud.PullRequest` (the fields the changeset source reads).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct PullRequest {
+    #[serde(default)]
+    pub links: Option<Links>,
+    #[serde(default)]
+    pub id: i64,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub state: String,
+    #[serde(default)]
+    pub author: Account,
+    #[serde(default)]
+    pub source: PullRequestEndpoint,
+    #[serde(default)]
+    pub destination: PullRequestEndpoint,
+    #[serde(rename = "merge_commit", default)]
+    pub merge_commit: Option<PullRequestCommit>,
+    #[serde(default)]
+    pub comment_count: i64,
+    #[serde(default)]
+    pub task_count: i64,
+    #[serde(rename = "close_source_branch", default)]
+    pub close_source_branch: bool,
+    #[serde(rename = "created_on", default)]
+    pub created_on: String,
+    #[serde(rename = "updated_on", default)]
+    pub updated_on: String,
+    #[serde(default)]
+    pub reviewers: Option<Vec<Account>>,
+}
+
+/// `bitbucketcloud.PullRequestStatus`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PullRequestStatus {
+    #[serde(default)]
+    pub links: Option<Links>,
+    #[serde(default)]
+    pub uuid: String,
+    #[serde(rename = "key", default)]
+    pub status_key: String,
+    #[serde(default)]
+    pub refname: String,
+    #[serde(rename = "url", default)]
+    pub url: String,
+    #[serde(default)]
+    pub state: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(rename = "created_on", default)]
+    pub created_on: String,
+    #[serde(rename = "updated_on", default)]
+    pub updated_on: String,
+}
+
+/// `bitbucketcloud.User`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct User {
+    #[serde(flatten)]
+    pub account: Account,
+    #[serde(rename = "is_staff", default)]
+    pub is_staff: bool,
+    #[serde(rename = "account_id", default)]
+    pub account_id: String,
+}
+
+/// `bitbucketcloud.Comment`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Comment {
+    #[serde(default)]
+    pub id: i64,
+    #[serde(default)]
+    pub content: RenderedMarkup,
+    #[serde(default)]
+    pub deleted: bool,
+}
+
+/// `bitbucketcloud.PullRequestInput`; only the fields the source sets.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PullRequestInput {
+    pub title: String,
+    pub description: String,
+    pub source_branch: String,
+    pub reviewers: Vec<Account>,
+    pub source_repo: Option<Repo>,
+    pub destination_branch: Option<String>,
+    pub close_source_branch: bool,
+}
+
+impl PullRequestInput {
+    /// `(*PullRequestInput).MarshalJSON`.
+    pub fn to_json(&self) -> serde_json::Value {
+        let mut source = serde_json::Map::new();
+        source.insert(
+            "branch".to_owned(),
+            serde_json::json!({"name": self.source_branch}),
+        );
+        if let Some(repo) = &self.source_repo {
+            source.insert(
+                "repository".to_owned(),
+                serde_json::json!({"full_name": repo.full_name}),
+            );
+        }
+        let mut request = serde_json::Map::new();
+        request.insert("title".to_owned(), serde_json::json!(self.title));
+        if !self.description.is_empty() {
+            request.insert(
+                "description".to_owned(),
+                serde_json::json!(self.description),
+            );
+        }
+        request.insert("source".to_owned(), serde_json::Value::Object(source));
+        if let Some(branch) = &self.destination_branch {
+            request.insert(
+                "destination".to_owned(),
+                serde_json::json!({"branch": {"name": branch}}),
+            );
+        }
+        if self.close_source_branch {
+            request.insert(
+                "close_source_branch".to_owned(),
+                serde_json::json!(true),
+            );
+        }
+        serde_json::Value::Object(request)
+    }
+}
+
+/// `bitbucketcloud.CommentInput`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CommentInput {
+    pub content: String,
+}
+
+impl CommentInput {
+    /// `(*CommentInput).MarshalJSON`.
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({"content": {"raw": self.content}})
+    }
+}
+
+/// `bitbucketcloud.MergePullRequestOpts`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MergePullRequestOpts {
+    pub message: Option<String>,
+    pub close_source_branch: Option<bool>,
+    pub merge_strategy: Option<String>,
+}
+
+impl MergePullRequestOpts {
+    /// `json.Marshal` with `omitempty` on every field.
+    pub fn to_json(&self) -> serde_json::Value {
+        let mut out = serde_json::Map::new();
+        if let Some(message) = &self.message {
+            out.insert("message".to_owned(), serde_json::json!(message));
+        }
+        if let Some(close) = self.close_source_branch {
+            out.insert("close_source_branch".to_owned(), serde_json::json!(close));
+        }
+        if let Some(strategy) = &self.merge_strategy {
+            out.insert("merge_strategy".to_owned(), serde_json::json!(strategy));
+        }
+        serde_json::Value::Object(out)
+    }
+}
+
+/// `bitbucketcloud.MergeStrategySquash`.
+pub const MERGE_STRATEGY_SQUASH: &str = "squash";
+
+/// `bitbucketcloud.ForkInput`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ForkInput {
+    pub name: Option<String>,
+    pub workspace: String,
+}
+
+impl ForkInput {
+    /// `json.Marshal` with the custom `ForkInputWorkspace` shape.
+    pub fn to_json(&self) -> serde_json::Value {
+        let mut out = serde_json::Map::new();
+        if let Some(name) = &self.name {
+            out.insert("name".to_owned(), serde_json::json!(name));
+        }
+        out.insert(
+            "workspace".to_owned(),
+            serde_json::json!({"slug": self.workspace}),
+        );
+        serde_json::Value::Object(out)
+    }
+}
+
 /// `bitbucketcloud.PageToken`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PageToken {
@@ -360,6 +606,21 @@ impl Client {
         &self.auth
     }
 
+    /// `NewClient` after `UrlFromConfig`/`NormalizeBaseURL`, for callers that
+    /// resolved the API URL and authenticator themselves (the Batch Changes
+    /// factory).
+    pub fn with_base_url_and_auth(
+        base_url: Url,
+        auth: BitbucketCloudAuth,
+        http: Arc<dyn HttpDoer>,
+    ) -> Self {
+        Self {
+            url: base_url,
+            auth,
+            http,
+        }
+    }
+
     /// `client.do`: resolve the URL, add `Content-Type` only for a body,
     /// authenticate, retry 429 with exponential backoff, then turn non-2xx/3xx
     /// into `httpError`.
@@ -423,6 +684,16 @@ impl Client {
         Ok(response)
     }
 
+    /// `client.Ping`: `GET /2.0/`, where a 404 still means the credentials
+    /// were accepted (Bitbucket checks auth before routing).
+    pub async fn ping(&self) -> Result<(), BitbucketError> {
+        match self.do_request("GET", "/2.0/", &[]).await {
+            Ok(_) => Ok(()),
+            Err(err) if err.is_not_found() => Ok(()),
+            Err(err) => Err(err),
+        }
+    }
+
     /// `client.Repo`: `/2.0/repositories/{namespace}/{slug}` (the baseline
     /// does not escape either component here).
     pub async fn repo(&self, namespace: &str, slug: &str) -> Result<Repo, BitbucketError> {
@@ -474,6 +745,141 @@ impl Client {
         let response = self.do_request("GET", &request_uri, &[]).await?;
         decode_page(&response.body)
     }
+
+    /// `client.GetPullRequest`.
+    pub async fn get_pull_request(
+        &self,
+        repo_full_name: &str,
+        id: i64,
+    ) -> Result<PullRequest, BitbucketError> {
+        let request_uri = format!("/2.0/repositories/{repo_full_name}/pullrequests/{id}");
+        self.json_request("GET", &request_uri, None).await
+    }
+
+    /// `client.CreatePullRequest`.
+    pub async fn create_pull_request(
+        &self,
+        repo_full_name: &str,
+        input: &PullRequestInput,
+    ) -> Result<PullRequest, BitbucketError> {
+        let request_uri = format!("/2.0/repositories/{repo_full_name}/pullrequests");
+        self.json_request("POST", &request_uri, Some(input.to_json()))
+            .await
+    }
+
+    /// `client.DeclinePullRequest`.
+    pub async fn decline_pull_request(
+        &self,
+        repo_full_name: &str,
+        id: i64,
+    ) -> Result<PullRequest, BitbucketError> {
+        let request_uri =
+            format!("/2.0/repositories/{repo_full_name}/pullrequests/{id}/decline");
+        self.json_request("POST", &request_uri, None).await
+    }
+
+    /// `client.UpdatePullRequest`.
+    pub async fn update_pull_request(
+        &self,
+        repo_full_name: &str,
+        id: i64,
+        input: &PullRequestInput,
+    ) -> Result<PullRequest, BitbucketError> {
+        let request_uri = format!("/2.0/repositories/{repo_full_name}/pullrequests/{id}");
+        self.json_request("PUT", &request_uri, Some(input.to_json()))
+            .await
+    }
+
+    /// `client.CreatePullRequestComment`.
+    pub async fn create_pull_request_comment(
+        &self,
+        repo_full_name: &str,
+        id: i64,
+        input: &CommentInput,
+    ) -> Result<Comment, BitbucketError> {
+        let request_uri =
+            format!("/2.0/repositories/{repo_full_name}/pullrequests/{id}/comments");
+        self.json_request("POST", &request_uri, Some(input.to_json()))
+            .await
+    }
+
+    /// `client.MergePullRequest`.
+    pub async fn merge_pull_request(
+        &self,
+        repo_full_name: &str,
+        id: i64,
+        opts: &MergePullRequestOpts,
+    ) -> Result<PullRequest, BitbucketError> {
+        let request_uri =
+            format!("/2.0/repositories/{repo_full_name}/pullrequests/{id}/merge");
+        self.json_request("POST", &request_uri, Some(opts.to_json()))
+            .await
+    }
+
+    /// `client.CurrentUser`.
+    pub async fn current_user(&self) -> Result<User, BitbucketError> {
+        self.json_request("GET", "/2.0/user", None).await
+    }
+
+    /// `client.ForkRepository`.
+    pub async fn fork_repository(
+        &self,
+        upstream: &Repo,
+        input: &ForkInput,
+    ) -> Result<Repo, BitbucketError> {
+        let request_uri = format!("/2.0/repositories/{}/forks", upstream.full_name);
+        self.json_request("POST", &request_uri, Some(input.to_json()))
+            .await
+    }
+
+    /// `client.GetPullRequestStatuses(...).All(ctx)`: walks every page.
+    pub async fn get_pull_request_statuses(
+        &self,
+        repo_full_name: &str,
+        id: i64,
+    ) -> Result<Vec<PullRequestStatus>, BitbucketError> {
+        let mut request_uri =
+            format!("/2.0/repositories/{repo_full_name}/pullrequests/{id}/statuses");
+        let mut statuses = Vec::new();
+        loop {
+            let response = self.do_request("GET", &request_uri, &[]).await?;
+            let page: StatusesPage = serde_json::from_slice(&response.body)
+                .map_err(|err| BitbucketError::Json(err.to_string()))?;
+            statuses.extend(page.values);
+            if page.next.is_empty() {
+                return Ok(statuses);
+            }
+            request_uri = page.next;
+        }
+    }
+
+    /// `client.do` + JSON decode, with the baseline's `sending request` wrap.
+    async fn json_request<T: serde::de::DeserializeOwned>(
+        &self,
+        method: &str,
+        request_uri: &str,
+        body: Option<serde_json::Value>,
+    ) -> Result<T, BitbucketError> {
+        let body = match body {
+            Some(value) => serde_json::to_vec(&value)
+                .map_err(|err| BitbucketError::Json(err.to_string()))?,
+            None => Vec::new(),
+        };
+        let response = self
+            .do_request(method, request_uri, &body)
+            .await
+            .map_err(|err| err.with_prefix("sending request"))?;
+        serde_json::from_slice(&response.body)
+            .map_err(|err| BitbucketError::Json(err.to_string()).with_prefix("sending request"))
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct StatusesPage {
+    #[serde(default)]
+    next: String,
+    #[serde(default)]
+    values: Vec<PullRequestStatus>,
 }
 
 /// `url.URL{Path: p}.String()`'s path escaping. Bitbucket builds a path with

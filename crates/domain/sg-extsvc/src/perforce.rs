@@ -24,6 +24,25 @@ pub struct Depot {
     pub depot: String,
 }
 
+/// `perforce.Changelist`. The Go type has no JSON tags, so the metadata blob
+/// uses the capitalised field names; `CreationDate` is a `time.Time` in the
+/// baseline and is carried here as its RFC3339 rendering.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Changelist {
+    #[serde(rename = "ID", default)]
+    pub id: String,
+    #[serde(rename = "CreationDate", default)]
+    pub creation_date: String,
+    #[serde(rename = "State", default)]
+    pub state: String,
+    #[serde(rename = "Author", default)]
+    pub author: String,
+    #[serde(rename = "Title", default)]
+    pub title: String,
+    #[serde(rename = "Message", default)]
+    pub message: String,
+}
+
 /// `protocol.PerforceConnectionDetails`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PerforceConnectionDetails {

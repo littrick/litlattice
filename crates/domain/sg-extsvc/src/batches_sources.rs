@@ -39,8 +39,12 @@ use url::Url;
 
 use crate::auth::Authenticator as _;
 use crate::azuredevops::{self, AzureDevOpsAuth, BaseUrl};
+use crate::bitbucketcloud as bbc;
+use crate::gerrit;
 use crate::github;
 use crate::gitlab::GitLabAuth;
+use crate::perforce;
+use crate::perforce_source::PerforceConnection;
 use crate::HttpDoer;
 
 // ---------------------------------------------------------------------------
@@ -2504,6 +2508,1059 @@ impl ChangesetSource for AzureDevOpsSource {
 }
 
 // ---------------------------------------------------------------------------
+// Gerrit (REST)
+// ---------------------------------------------------------------------------
+
+/// `sources.GerritSource`.
+pub struct GerritSource {
+    client: gerrit::Client,
+    /// `conf.Get().BatchChangesAutoDeleteBranch`.
+    auto_delete_branch: bool,
+}
+
+impl GerritSource {
+    /// `sources.NewGerritSource` after config decoding: `gerrit.NewClient`
+    /// with `BasicAuth{username, password}`.
+    pub fn new(
+        base_url: &Url,
+        auth: SourceAuth,
+        http: Arc<dyn HttpDoer>,
+    ) -> Result<Self, SourceError> {
+        let (username, password) = match auth {
+            SourceAuth::Basic { username, password } => (username, password),
+            other => {
+                return Err(unsupported_authenticator_error(
+                    "Gerrit",
+                    &format!("{other:?}"),
+                ))
+            }
+        };
+        Ok(Self {
+            client: gerrit::Client::new(
+                base_url.clone(),
+                &gerrit::AccountCredentials { username, password },
+                http,
+            ),
+            auto_delete_branch: false,
+        })
+    }
+
+    pub fn with_client(client: gerrit::Client) -> Self {
+        Self {
+            client,
+            auto_delete_branch: false,
+        }
+    }
+
+    pub fn with_auto_delete_branch(mut self, enabled: bool) -> Self {
+        self.auto_delete_branch = enabled;
+        self
+    }
+
+    /// `GerritSource.ValidateAuthenticator` (`GetAuthenticatedUserAccount`).
+    pub async fn validate_authenticator(&self) -> Result<(), SourceError> {
+        self.client
+            .get_authenticated_user_account()
+            .await
+            .map(|_| ())
+            .map_err(|err| SourceError::other(err.to_string()))
+    }
+
+    /// `annotateChange`: fetch the reviewers and build the metadata blob.
+    async fn annotate_change(
+        &self,
+        change: &gerrit::Change,
+    ) -> Result<Value, SourceError> {
+        let reviewers = self
+            .client
+            .get_change_reviews(&change.change_id)
+            .await
+            .map_err(|err| SourceError::other(err.to_string()))?;
+        Ok(gerrit_metadata(change, &reviewers, self.client.url()))
+    }
+
+    /// `setChangesetMetadata`.
+    async fn set_changeset_metadata(
+        &self,
+        change: &gerrit::Change,
+        cs: &mut SourceChangeset,
+    ) -> Result<(), SourceError> {
+        let metadata = self
+            .annotate_change(change)
+            .await
+            .map_err(|err| err.with_prefix("annotating Change"))?;
+        cs.changeset.external_id = change.change_id.clone();
+        cs.changeset.external_branch = ensure_ref_prefix(&change.branch);
+        cs.changeset.metadata = metadata;
+        Ok(())
+    }
+}
+
+/// The canonical Gerrit metadata projection (`gerritbatches.AnnotatedChange`).
+///
+/// `Change.Created`/`Updated` carry `json:"-"` in the Go type, so they are
+/// absent here; `CodeHostURL` is a `url.URL`, which marshals as its exported
+/// struct fields rather than as a string.
+fn gerrit_metadata(
+    change: &gerrit::Change,
+    reviewers: &[gerrit::Reviewer],
+    code_host_url: &Url,
+) -> Value {
+    json!({
+        "change": {
+            "id": change.id,
+            "project": change.project,
+            "branch": change.branch,
+            "change_id": change.change_id,
+            "topic": change.topic,
+            "subject": change.subject,
+            "status": change.status,
+            "created": gerrit::format_change_time(&change.created),
+            "updated": gerrit::format_change_time(&change.updated),
+            "reviewed": change.reviewed,
+            "work_in_progress": change.work_in_progress,
+            "hashtags": change.hashtags,
+            "_number": change.change_number,
+            "owner": {
+                "name": change.owner.name,
+                "email": change.owner.email,
+                "username": change.owner.username,
+            },
+        },
+        "reviewers": reviewers.iter().map(|reviewer| {
+            let mut value = json!({
+                "approvals": reviewer.approvals,
+                "_account_id": reviewer.account_id,
+                "name": reviewer.name,
+                "email": reviewer.email,
+            });
+            if !reviewer.username.is_empty() {
+                value["username"] = json!(reviewer.username);
+            }
+            value
+        }).collect::<Vec<_>>(),
+        "codeHostURL": go_url_json(code_host_url),
+    })
+}
+
+/// `json.Marshal` of a Go `url.URL`. `Userinfo` has no exported fields, so a
+/// non-nil user marshals as `{}`.
+pub fn go_url_json(url: &Url) -> Value {
+    let user = if url.username().is_empty() && url.password().is_none() {
+        Value::Null
+    } else {
+        json!({})
+    };
+    json!({
+        "Scheme": url.scheme(),
+        "Opaque": "",
+        "User": user,
+        "Host": url.host_str().map(|host| match url.port() {
+            Some(port) => format!("{host}:{port}"),
+            None => host.to_owned(),
+        }).unwrap_or_default(),
+        "Path": url.path(),
+        "RawPath": "",
+        "OmitHost": false,
+        "ForceQuery": false,
+        "RawQuery": url.query().unwrap_or_default(),
+        "Fragment": url.fragment().unwrap_or_default(),
+        "RawFragment": "",
+    })
+}
+
+/// `sources.GenerateGerritChangeID`: sha256 over the JSON encoding of the Go
+/// `btypes.Changeset` (see the overview for the exact field set), truncated to
+/// 40 hex characters and prefixed with `I`.
+pub fn generate_gerrit_change_id(cs: &SourceChangeset) -> String {
+    use sha2::{Digest, Sha256};
+    let quote = |value: &str| serde_json::to_string(value).expect("string serialises");
+    let metadata =
+        serde_json::to_string(&cs.changeset.metadata).expect("metadata serialises");
+    let json = format!(
+        concat!(
+            "{{\"ID\":{},\"RepoID\":0,",
+            "\"CreatedAt\":\"0001-01-01T00:00:00Z\",",
+            "\"UpdatedAt\":\"0001-01-01T00:00:00Z\",",
+            "\"Metadata\":{},\"BatchChanges\":null,",
+            "\"ExternalID\":{},\"ExternalServiceType\":\"\",",
+            "\"ExternalBranch\":{},\"ExternalForkName\":{},",
+            "\"ExternalForkNamespace\":{},\"ExternalDeletedAt\":",
+            "\"0001-01-01T00:00:00Z\",\"ExternalUpdatedAt\":",
+            "\"0001-01-01T00:00:00Z\",\"ExternalState\":\"\",",
+            "\"ExternalReviewState\":\"\",\"ExternalCheckState\":\"\",",
+            "\"CommitVerification\":null,\"DiffStatAdded\":null,",
+            "\"DiffStatDeleted\":null,",
+            "\"SyncState\":{{\"BaseRefOid\":\"\",\"HeadRefOid\":\"\",",
+            "\"IsComplete\":false}},",
+            "\"OwnedByBatchChangeID\":0,\"CurrentSpecID\":0,",
+            "\"PreviousSpecID\":0,\"PublicationState\":\"\",",
+            "\"UiPublicationState\":null,\"State\":\"\",",
+            "\"ReconcilerState\":\"\",\"FailureMessage\":null,",
+            "\"StartedAt\":\"0001-01-01T00:00:00Z\",",
+            "\"FinishedAt\":\"0001-01-01T00:00:00Z\",",
+            "\"ProcessAfter\":\"0001-01-01T00:00:00Z\",",
+            "\"NumResets\":0,\"NumFailures\":0,",
+            "\"SyncErrorMessage\":null,\"PreviousFailureMessage\":null,",
+            "\"Closing\":false,\"DetachedAt\":\"0001-01-01T00:00:00Z\"}}"
+        ),
+        cs.changeset.id,
+        metadata,
+        quote(&cs.changeset.external_id),
+        quote(&cs.changeset.external_branch),
+        quote(&cs.changeset.external_fork_name),
+        quote(&cs.changeset.external_fork_namespace),
+    );
+    let hash = Sha256::digest(json.as_bytes());
+    let hex: String = hash.iter().map(|byte| format!("{byte:02x}")).collect();
+    format!("I{}", &hex[..40])
+}
+
+#[async_trait]
+impl ChangesetSource for GerritSource {
+    fn kind(&self) -> &'static str {
+        "gerrit"
+    }
+
+    async fn load_changeset(&self, cs: &mut SourceChangeset) -> Result<(), SourceError> {
+        let change = match self.client.get_change(&cs.changeset.external_id).await {
+            Ok(change) => change,
+            Err(gerrit::ClientError::Http(err)) if err.not_found() => {
+                return Err(SourceError::not_found(&cs.changeset.external_id))
+            }
+            Err(err) => {
+                return Err(SourceError::other(err.to_string()).with_prefix("getting change"))
+            }
+        };
+        self.set_changeset_metadata(&change, cs)
+            .await
+            .map_err(|err| err.with_prefix("setting Gerrit changeset metadata"))
+    }
+
+    async fn create_changeset(
+        &self,
+        cs: &mut SourceChangeset,
+    ) -> Result<bool, SourceError> {
+        let change_id = generate_gerrit_change_id(cs);
+        let change = match self.client.get_change(&change_id).await {
+            Ok(change) => change,
+            Err(gerrit::ClientError::Http(err)) if err.not_found() => {
+                return Err(SourceError::not_found(&cs.changeset.external_id))
+            }
+            Err(err) => {
+                return Err(SourceError::other(err.to_string()).with_prefix("getting change"))
+            }
+        };
+        // The change exists at push time, but the baseline reports `false` so
+        // the publish event is emitted instead of an update event.
+        self.set_changeset_metadata(&change, cs)
+            .await
+            .map_err(|err| err.with_prefix("setting Gerrit changeset metadata"))?;
+        Ok(false)
+    }
+
+    async fn create_draft_changeset(
+        &self,
+        cs: &mut SourceChangeset,
+    ) -> Result<bool, SourceError> {
+        let change_id = generate_gerrit_change_id(cs);
+        if let Err(err) = self.client.set_wip(&change_id).await {
+            return match err {
+                gerrit::ClientError::Http(err) if err.not_found() => {
+                    Err(SourceError::not_found(&cs.changeset.external_id))
+                }
+                err => Err(
+                    SourceError::other(err.to_string()).with_prefix("making change WIP")
+                ),
+            };
+        }
+        let change = match self.client.get_change(&change_id).await {
+            Ok(change) => change,
+            Err(gerrit::ClientError::Http(err)) if err.not_found() => {
+                return Err(SourceError::not_found(&cs.changeset.external_id))
+            }
+            Err(err) => {
+                return Err(SourceError::other(err.to_string()).with_prefix("getting change"))
+            }
+        };
+        self.set_changeset_metadata(&change, cs)
+            .await
+            .map_err(|err| err.with_prefix("setting Gerrit changeset metadata"))?;
+        Ok(false)
+    }
+
+    async fn undraft_changeset(&self, cs: &mut SourceChangeset) -> Result<(), SourceError> {
+        if let Err(err) = self
+            .client
+            .set_ready_for_review(&cs.changeset.external_id)
+            .await
+        {
+            return match err {
+                gerrit::ClientError::Http(err) if err.not_found() => {
+                    Err(SourceError::not_found(&cs.changeset.external_id))
+                }
+                err => Err(SourceError::other(err.to_string())
+                    .with_prefix("setting change as ready")),
+            };
+        }
+        self.load_changeset(cs)
+            .await
+            .map_err(|err| err.with_prefix("getting change"))
+    }
+
+    async fn close_changeset(&self, cs: &mut SourceChangeset) -> Result<(), SourceError> {
+        let updated = self
+            .client
+            .abandon_change(&cs.changeset.external_id)
+            .await
+            .map_err(|err| {
+                SourceError::other(err.to_string()).with_prefix("abandoning change")
+            })?;
+        if self.auto_delete_branch {
+            self.client
+                .delete_change(&cs.changeset.external_id)
+                .await
+                .map_err(|err| {
+                    SourceError::other(err.to_string()).with_prefix("deleting change")
+                })?;
+        }
+        self.set_changeset_metadata(&updated, cs)
+            .await
+            .map_err(|err| err.with_prefix("setting Gerrit changeset metadata"))
+    }
+
+    async fn update_changeset(&self, cs: &mut SourceChangeset) -> Result<(), SourceError> {
+        let change = match self.client.get_change(&cs.changeset.external_id).await {
+            Ok(change) => change,
+            Err(gerrit::ClientError::MultipleChanges { .. }) => {
+                // A push created two changes with the same Change-Id. Delete
+                // the original one, keep WIP state, then reload.
+                let original = &cs.changeset.metadata["change"];
+                let original_id = original
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned();
+                let work_in_progress = value_bool(original, "work_in_progress");
+                self.client.delete_change(&original_id).await.map_err(|err| {
+                    SourceError::other(err.to_string()).with_prefix("deleting change")
+                })?;
+                if work_in_progress {
+                    self.client
+                        .set_wip(&cs.changeset.external_id)
+                        .await
+                        .map_err(|err| {
+                            SourceError::other(err.to_string())
+                                .with_prefix("setting updated change as WIP")
+                        })?;
+                }
+                return self.load_changeset(cs).await;
+            }
+            Err(gerrit::ClientError::Http(err)) if err.not_found() => {
+                return Err(SourceError::not_found(&cs.changeset.external_id))
+            }
+            Err(err) => {
+                return Err(
+                    SourceError::other(err.to_string()).with_prefix("getting newer change")
+                )
+            }
+        };
+
+        if change.branch != cs.base_ref {
+            self.client
+                .move_change(
+                    &cs.changeset.external_id,
+                    &gerrit::MoveChangePayload {
+                        destination_branch: cs.base_ref.clone(),
+                    },
+                )
+                .await
+                .map_err(|err| {
+                    SourceError::other(err.to_string()).with_prefix("moving change")
+                })?;
+        }
+        if change.subject != cs.title {
+            self.client
+                .set_commit_message(
+                    &cs.changeset.external_id,
+                    &gerrit::SetCommitMessagePayload {
+                        message: format!(
+                            "{}\n\nChange-Id: {}\n",
+                            cs.title, cs.changeset.external_id
+                        ),
+                    },
+                )
+                .await
+                .map_err(|err| {
+                    SourceError::other(err.to_string())
+                        .with_prefix("setting change commit message")
+                })?;
+        }
+        self.load_changeset(cs).await
+    }
+
+    async fn reopen_changeset(&self, cs: &mut SourceChangeset) -> Result<(), SourceError> {
+        let updated = self
+            .client
+            .restore_change(&cs.changeset.external_id)
+            .await
+            .map_err(|err| {
+                SourceError::other(err.to_string()).with_prefix("restoring change")
+            })?;
+        self.set_changeset_metadata(&updated, cs)
+            .await
+            .map_err(|err| err.with_prefix("setting Gerrit changeset metadata"))
+    }
+
+    async fn create_comment(
+        &self,
+        cs: &SourceChangeset,
+        text: &str,
+    ) -> Result<(), SourceError> {
+        self.client
+            .write_review_comment(
+                &cs.changeset.external_id,
+                &gerrit::ChangeReviewComment {
+                    message: text.to_owned(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .map_err(|err| SourceError::other(err.to_string()))
+    }
+
+    async fn merge_changeset(
+        &self,
+        cs: &mut SourceChangeset,
+        _squash: bool,
+    ) -> Result<(), SourceError> {
+        let updated = match self.client.submit_change(&cs.changeset.external_id).await {
+            Ok(updated) => updated,
+            Err(gerrit::ClientError::Http(err)) if err.not_found() => {
+                return Err(
+                    SourceError::other(err.to_string()).with_prefix("submitting change")
+                )
+            }
+            Err(err) => return Err(SourceError::not_mergeable(err.to_string())),
+        };
+        self.set_changeset_metadata(&updated, cs)
+            .await
+            .map_err(|err| err.with_prefix("setting Gerrit changeset metadata"))
+    }
+
+    fn supports_draft(&self) -> bool {
+        true
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Bitbucket Cloud (REST)
+// ---------------------------------------------------------------------------
+
+/// `sources.BitbucketCloudSource`.
+pub struct BitbucketCloudSource {
+    client: bbc::Client,
+    auto_delete_branch: bool,
+}
+
+impl BitbucketCloudSource {
+    /// `sources.NewBitbucketCloudSource` after config decoding.
+    pub fn new(
+        base_url: &Url,
+        auth: SourceAuth,
+        http: Arc<dyn HttpDoer>,
+    ) -> Result<Self, SourceError> {
+        let auth = match auth {
+            SourceAuth::Basic { username, password } => {
+                bbc::BitbucketCloudAuth::Basic { username, password }
+            }
+            SourceAuth::BearerToken(token) => {
+                bbc::BitbucketCloudAuth::OAuthBearerToken(token)
+            }
+            other => {
+                return Err(unsupported_authenticator_error(
+                    "BitbucketCloud",
+                    &format!("{other:?}"),
+                ))
+            }
+        };
+        Ok(Self {
+            client: bbc::Client::with_base_url_and_auth(base_url.clone(), auth, http),
+            auto_delete_branch: false,
+        })
+    }
+
+    pub fn with_client(client: bbc::Client) -> Self {
+        Self {
+            client,
+            auto_delete_branch: false,
+        }
+    }
+
+    pub fn with_auto_delete_branch(mut self, enabled: bool) -> Self {
+        self.auto_delete_branch = enabled;
+        self
+    }
+
+    /// `BitbucketCloudSource.ValidateAuthenticator` (`Ping`).
+    pub async fn validate_authenticator(&self) -> Result<(), SourceError> {
+        self.client
+            .ping()
+            .await
+            .map_err(|err| SourceError::other(err.to_string()))
+    }
+
+    fn repo_metadata(repo: &Repo) -> Result<bbc::Repo, SourceError> {
+        serde_json::from_value(repo.metadata.clone()).map_err(|err| {
+            SourceError::other(format!("decoding Bitbucket Cloud repository metadata: {err}"))
+        })
+    }
+
+    /// `changesetToPullRequestInput`.
+    fn changeset_to_pull_request_input(&self, cs: &SourceChangeset) -> bbc::PullRequestInput {
+        let destination_branch = abbreviate_ref(&cs.base_ref);
+        let mut opts = bbc::PullRequestInput {
+            title: cs.title.clone(),
+            description: cs.body.clone(),
+            source_branch: abbreviate_ref(&cs.head_ref),
+            reviewers: Vec::new(),
+            source_repo: None,
+            destination_branch: Some(destination_branch),
+            close_source_branch: self.auto_delete_branch,
+        };
+        if cs.remote_repo != cs.target_repo {
+            if let Ok(remote) = Self::repo_metadata(&cs.remote_repo) {
+                opts.source_repo = Some(remote);
+            }
+        }
+        opts
+    }
+
+    /// The stored metadata's pull-request id (the baseline reads
+    /// `cs.Metadata.(*bbcs.AnnotatedPullRequest).ID`).
+    fn metadata_pr_id(cs: &SourceChangeset) -> Result<i64, SourceError> {
+        if let Some(id) = cs.changeset.metadata.get("id").and_then(Value::as_i64) {
+            return Ok(id);
+        }
+        cs.changeset
+            .external_id
+            .parse::<i64>()
+            .map_err(|err| SourceError::other(format!("converting external ID: {err}")))
+    }
+
+    /// `annotatePullRequest`.
+    async fn annotate_pull_request(
+        &self,
+        repo: &bbc::Repo,
+        pr: &bbc::PullRequest,
+    ) -> Result<Value, SourceError> {
+        let statuses = match self
+            .client
+            .get_pull_request_statuses(&repo.full_name, pr.id)
+            .await
+        {
+            Ok(statuses) => statuses,
+            Err(err) => {
+                return Err(SourceError::other(err.to_string())
+                    .with_prefix("getting pull request statuses as slice"))
+            }
+        };
+        Ok(bitbucket_cloud_metadata(pr, &statuses))
+    }
+
+    /// `setChangesetMetadata`.
+    async fn set_changeset_metadata(
+        &self,
+        repo: &bbc::Repo,
+        pr: &bbc::PullRequest,
+        cs: &mut SourceChangeset,
+    ) -> Result<(), SourceError> {
+        let metadata = self
+            .annotate_pull_request(repo, pr)
+            .await
+            .map_err(|err| err.with_prefix("annotating pull request"))?;
+
+        cs.changeset.external_id = pr.id.to_string();
+        cs.changeset.external_branch = ensure_ref_prefix(&pr.source.branch.name);
+        cs.changeset.metadata = metadata;
+
+        if pr.source.repo.uuid != pr.destination.repo.uuid {
+            let namespace = pr
+                .source
+                .repo
+                .namespace()
+                .map_err(|err| SourceError::other(err).with_prefix("determining fork namespace"))?;
+            cs.changeset.external_fork_namespace = namespace;
+            cs.changeset.external_fork_name = pr.source.repo.name.clone();
+        } else {
+            cs.changeset.external_fork_namespace.clear();
+            cs.changeset.external_fork_name.clear();
+        }
+        Ok(())
+    }
+
+    /// `checkAndCopy`.
+    fn check_and_copy(target_repo: &Repo, fork: bbc::Repo) -> Result<Repo, SourceError> {
+        let target = Self::repo_metadata(target_repo)?;
+        let Some(parent) = &fork.parent else {
+            return Err(SourceError::other("repo is not a fork"));
+        };
+        if parent.uuid != target.uuid {
+            return Err(SourceError::other(
+                "repo was not forked from the given parent",
+            ));
+        }
+        copy_repo_as_fork(target_repo, serde_json::to_value(&fork).unwrap_or(Value::Null), &target.full_name, &fork.full_name)
+            .map_err(|err| err.with_prefix("updating target repo sources and metadata"))
+    }
+}
+
+/// The canonical Bitbucket Cloud metadata projection
+/// (`bbcs.AnnotatedPullRequest`).
+fn bitbucket_cloud_metadata(
+    pr: &bbc::PullRequest,
+    statuses: &[bbc::PullRequestStatus],
+) -> Value {
+    json!({
+        "kind": "bitbucketcloud",
+        "id": pr.id,
+        "title": pr.title,
+        "state": pr.state,
+        "source": {
+            "branch": pr.source.branch.name,
+            "repo": {
+                "fullName": pr.source.repo.full_name,
+                "uuid": pr.source.repo.uuid,
+                "name": pr.source.repo.name,
+            },
+        },
+        "destination": {
+            "branch": pr.destination.branch.name,
+            "repo": {
+                "fullName": pr.destination.repo.full_name,
+                "uuid": pr.destination.repo.uuid,
+                "name": pr.destination.repo.name,
+            },
+        },
+        "closeSourceBranch": pr.close_source_branch,
+        "reviewers": pr.reviewers.as_deref().unwrap_or_default().iter().map(|reviewer| {
+            json!({
+                "displayName": reviewer.display_name,
+                "uuid": reviewer.uuid,
+                "nickname": reviewer.nickname,
+            })
+        }).collect::<Vec<_>>(),
+        "statuses": statuses.iter().map(|status| {
+            json!({
+                "uuid": status.uuid,
+                "key": status.status_key,
+                "state": status.state,
+                "name": status.name,
+                "description": status.description,
+            })
+        }).collect::<Vec<_>>(),
+    })
+}
+
+#[async_trait]
+impl ChangesetSource for BitbucketCloudSource {
+    fn kind(&self) -> &'static str {
+        "bitbucketCloud"
+    }
+
+    async fn load_changeset(&self, cs: &mut SourceChangeset) -> Result<(), SourceError> {
+        let repo = Self::repo_metadata(&cs.target_repo)?;
+        let number = cs.changeset.external_id.parse::<i64>().map_err(|err| {
+            SourceError::other(format!(
+                "converting external ID {:?}: {err}",
+                cs.changeset.external_id
+            ))
+        })?;
+        let pr = match self.client.get_pull_request(&repo.full_name, number).await {
+            Ok(pr) => pr,
+            Err(err) if err.is_not_found() => {
+                return Err(SourceError::not_found(&cs.changeset.external_id))
+            }
+            Err(err) => {
+                return Err(
+                    SourceError::other(err.to_string()).with_prefix("getting pull request")
+                )
+            }
+        };
+        self.set_changeset_metadata(&repo, &pr, cs).await
+    }
+
+    async fn create_changeset(
+        &self,
+        cs: &mut SourceChangeset,
+    ) -> Result<bool, SourceError> {
+        let opts = self.changeset_to_pull_request_input(cs);
+        let repo = Self::repo_metadata(&cs.target_repo)?;
+        let pr = self
+            .client
+            .create_pull_request(&repo.full_name, &opts)
+            .await
+            .map_err(|err| {
+                SourceError::other(err.to_string()).with_prefix("creating pull request")
+            })?;
+        self.set_changeset_metadata(&repo, &pr, cs).await?;
+        // Bitbucket silently updates an existing PR, so the baseline reports
+        // that it existed.
+        Ok(true)
+    }
+
+    async fn update_changeset(&self, cs: &mut SourceChangeset) -> Result<(), SourceError> {
+        let opts = self.changeset_to_pull_request_input(cs);
+        let repo = Self::repo_metadata(&cs.target_repo)?;
+        let id = Self::metadata_pr_id(cs)?;
+        let updated = self
+            .client
+            .update_pull_request(&repo.full_name, id, &opts)
+            .await
+            .map_err(|err| {
+                SourceError::other(err.to_string()).with_prefix("updating pull request")
+            })?;
+        self.set_changeset_metadata(&repo, &updated, cs).await
+    }
+
+    async fn close_changeset(&self, cs: &mut SourceChangeset) -> Result<(), SourceError> {
+        let repo = Self::repo_metadata(&cs.target_repo)?;
+        let id = Self::metadata_pr_id(cs)?;
+        let updated = self
+            .client
+            .decline_pull_request(&repo.full_name, id)
+            .await
+            .map_err(|err| {
+                SourceError::other(err.to_string()).with_prefix("declining pull request")
+            })?;
+        self.set_changeset_metadata(&repo, &updated, cs).await
+    }
+
+    async fn reopen_changeset(&self, cs: &mut SourceChangeset) -> Result<(), SourceError> {
+        // Bitbucket Cloud cannot reopen a declined PR; recreating it is the
+        // baseline's behaviour (and a no-op for open PRs).
+        self.create_changeset(cs).await.map(|_| ())
+    }
+
+    async fn create_comment(
+        &self,
+        cs: &SourceChangeset,
+        text: &str,
+    ) -> Result<(), SourceError> {
+        let repo = Self::repo_metadata(&cs.target_repo)?;
+        let id = Self::metadata_pr_id(cs)?;
+        self.client
+            .create_pull_request_comment(
+                &repo.full_name,
+                id,
+                &bbc::CommentInput {
+                    content: text.to_owned(),
+                },
+            )
+            .await
+            .map(|_| ())
+            .map_err(|err| SourceError::other(err.to_string()))
+    }
+
+    async fn merge_changeset(
+        &self,
+        cs: &mut SourceChangeset,
+        squash: bool,
+    ) -> Result<(), SourceError> {
+        let repo = Self::repo_metadata(&cs.target_repo)?;
+        let id = Self::metadata_pr_id(cs)?;
+        let merge_strategy = if squash {
+            Some(bbc::MERGE_STRATEGY_SQUASH.to_owned())
+        } else {
+            None
+        };
+        let updated = match self
+            .client
+            .merge_pull_request(
+                &repo.full_name,
+                id,
+                &bbc::MergePullRequestOpts {
+                    merge_strategy,
+                    ..Default::default()
+                },
+            )
+            .await
+        {
+            Ok(updated) => updated,
+            Err(err) if err.is_not_found() => {
+                return Err(
+                    SourceError::other(err.to_string()).with_prefix("merging pull request")
+                )
+            }
+            Err(err) => return Err(SourceError::not_mergeable(err.to_string())),
+        };
+        self.set_changeset_metadata(&repo, &updated, cs).await
+    }
+
+    fn supports_fork(&self) -> bool {
+        true
+    }
+
+    async fn get_fork(
+        &self,
+        target_repo: &Repo,
+        namespace: Option<&String>,
+        name: Option<&String>,
+    ) -> Result<Repo, SourceError> {
+        let namespace = match namespace {
+            Some(namespace) => namespace.clone(),
+            None => {
+                let user = self
+                    .client
+                    .current_user()
+                    .await
+                    .map_err(|err| {
+                        SourceError::other(err.to_string())
+                            .with_prefix("getting the current user")
+                    })?;
+                user.account.username
+            }
+        };
+        let target = Self::repo_metadata(target_repo)?;
+        let target_namespace = target
+            .namespace()
+            .map_err(|err| {
+                SourceError::other(err).with_prefix("getting target repo namespace")
+            })?;
+        let fork_name = name
+            .cloned()
+            .unwrap_or_else(|| default_fork_name(&target_namespace, &target.slug));
+
+        match self.client.repo(&namespace, &fork_name).await {
+            Ok(fork) => return Self::check_and_copy(target_repo, fork),
+            Err(err) if err.is_not_found() => {}
+            Err(err) => {
+                return Err(SourceError::other(err.to_string())
+                    .with_prefix("checking for fork existence"))
+            }
+        }
+
+        let fork = self
+            .client
+            .fork_repository(
+                &target,
+                &bbc::ForkInput {
+                    name: Some(fork_name),
+                    workspace: namespace,
+                },
+            )
+            .await
+            .map_err(|err| {
+                SourceError::other(err.to_string()).with_prefix("forking repository")
+            })?;
+        Self::check_and_copy(target_repo, fork)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Perforce (gitserver RPC seam)
+// ---------------------------------------------------------------------------
+
+/// `no credentials set for Perforce Source` (the baseline's sentinel).
+pub const PERFORCE_NO_CREDENTIALS: &str = "no credentials set for Perforce Source";
+/// The baseline's placeholder for the unimplemented Perforce operations.
+pub const PERFORCE_NOT_IMPLEMENTED: &str = "not implemented";
+/// Explicit not-ported text for the missing `PerforceGetChangelist` RPC.
+pub const PERFORCE_NOT_PORTED_GET_CHANGELIST: &str =
+    "perforce gitserver RPC PerforceGetChangelist is not ported to the Rust gitserver";
+/// Explicit not-ported text for the missing `CheckPerforceCredentials` RPC.
+pub const PERFORCE_NOT_PORTED_CHECK_CREDENTIALS: &str =
+    "perforce gitserver RPC CheckPerforceCredentials is not ported to the Rust gitserver";
+
+/// The gitserver RPC boundary the Perforce changeset source needs. The Rust
+/// gitserver does not expose these RPCs; the source accepts an injected
+/// implementation so the gitserver-backed paths are testable.
+#[async_trait]
+pub trait PerforceChangesetGitserver: Send + Sync {
+    /// `gitserver.Client.PerforceGetChangelist`.
+    async fn perforce_get_changelist(
+        &self,
+        connection: &perforce::PerforceConnectionDetails,
+        changelist: &str,
+    ) -> Result<perforce::Changelist, String>;
+
+    /// `gitserver.Client.CheckPerforceCredentials`.
+    async fn check_perforce_credentials(
+        &self,
+        connection: &perforce::PerforceConnectionDetails,
+    ) -> Result<(), String>;
+}
+
+/// `sources.PerforceSource`.
+pub struct PerforceSource {
+    conn: PerforceConnection,
+    gitserver: Option<Arc<dyn PerforceChangesetGitserver>>,
+    perforce_creds: Option<perforce::PerforceConnectionDetails>,
+}
+
+impl PerforceSource {
+    /// `sources.NewPerforceSource` config decoding, without the gitserver
+    /// client (see the module docs and the slice overview).
+    pub fn from_config(config: &Value) -> Result<Self, SourceError> {
+        let conn: PerforceConnection = serde_json::from_value(config.clone()).map_err(|err| {
+            SourceError::other(format!("decoding Perforce configuration: {err}"))
+        })?;
+        Ok(Self {
+            conn,
+            gitserver: None,
+            perforce_creds: None,
+        })
+    }
+
+    /// A source with the default (empty) configuration, used by the Batch
+    /// Changes factory, which does not receive the decoded config.
+    pub fn new_empty() -> Self {
+        Self {
+            conn: PerforceConnection::default(),
+            gitserver: None,
+            perforce_creds: None,
+        }
+    }
+
+    pub fn with_gitserver(mut self, gitserver: Arc<dyn PerforceChangesetGitserver>) -> Self {
+        self.gitserver = Some(gitserver);
+        self
+    }
+
+    pub fn config(&self) -> &PerforceConnection {
+        &self.conn
+    }
+
+    /// `PerforceSource.WithAuthenticator`: both basic variants install the
+    /// same credentials; any other authenticator conflicts.
+    pub fn with_authenticator(mut self, auth: SourceAuth) -> Result<Self, SourceError> {
+        match auth {
+            SourceAuth::Basic { username, password } => {
+                self.perforce_creds = Some(perforce::PerforceConnectionDetails {
+                    p4_port: self.conn.p4_port.clone(),
+                    p4_user: username,
+                    p4_passwd: password,
+                });
+                Ok(self)
+            }
+            _ => Err(SourceError::other(
+                "unexpected auther type for Perforce Source",
+            )),
+        }
+    }
+
+    pub fn with_credentials(mut self, username: &str, password: &str) -> Self {
+        self.perforce_creds = Some(perforce::PerforceConnectionDetails {
+            p4_port: self.conn.p4_port.clone(),
+            p4_user: username.to_owned(),
+            p4_passwd: password.to_owned(),
+        });
+        self
+    }
+
+    /// `PerforceSource.ValidateAuthenticator`.
+    pub async fn validate_authenticator(&self) -> Result<(), SourceError> {
+        let Some(creds) = &self.perforce_creds else {
+            return Err(SourceError::other(PERFORCE_NO_CREDENTIALS));
+        };
+        match &self.gitserver {
+            Some(gitserver) => gitserver
+                .check_perforce_credentials(creds)
+                .await
+                .map_err(SourceError::other),
+            None => Err(SourceError::other(PERFORCE_NOT_PORTED_CHECK_CREDENTIALS)),
+        }
+    }
+
+    fn set_changeset_metadata(
+        changelist: &perforce::Changelist,
+        cs: &mut SourceChangeset,
+    ) -> Result<(), SourceError> {
+        cs.changeset.external_id = changelist.id.clone();
+        cs.changeset.metadata =
+            serde_json::to_value(changelist).unwrap_or(Value::Null);
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl ChangesetSource for PerforceSource {
+    fn kind(&self) -> &'static str {
+        "perforce"
+    }
+
+    async fn load_changeset(&self, cs: &mut SourceChangeset) -> Result<(), SourceError> {
+        let Some(creds) = &self.perforce_creds else {
+            return Err(SourceError::other(PERFORCE_NO_CREDENTIALS));
+        };
+        let Some(gitserver) = &self.gitserver else {
+            return Err(SourceError::other(format!(
+                "getting changelist: {PERFORCE_NOT_PORTED_GET_CHANGELIST}"
+            )));
+        };
+        let changelist = gitserver
+            .perforce_get_changelist(creds, &cs.changeset.external_id)
+            .await
+            .map_err(|err| {
+                SourceError::other(err).with_prefix("getting changelist")
+            })?;
+        Self::set_changeset_metadata(&changelist, cs)
+            .map_err(|err| err.with_prefix("setting perforce changeset metadata"))?;
+        Ok(())
+    }
+
+    async fn create_changeset(
+        &self,
+        cs: &mut SourceChangeset,
+    ) -> Result<bool, SourceError> {
+        self.load_changeset(cs).await.map(|_| false)
+    }
+
+    async fn create_draft_changeset(
+        &self,
+        _cs: &mut SourceChangeset,
+    ) -> Result<bool, SourceError> {
+        Err(SourceError::other(PERFORCE_NOT_IMPLEMENTED))
+    }
+
+    async fn undraft_changeset(&self, _cs: &mut SourceChangeset) -> Result<(), SourceError> {
+        Err(SourceError::other(PERFORCE_NOT_IMPLEMENTED))
+    }
+
+    async fn close_changeset(&self, _cs: &mut SourceChangeset) -> Result<(), SourceError> {
+        Err(SourceError::other(PERFORCE_NOT_IMPLEMENTED))
+    }
+
+    async fn update_changeset(&self, _cs: &mut SourceChangeset) -> Result<(), SourceError> {
+        Err(SourceError::other(PERFORCE_NOT_IMPLEMENTED))
+    }
+
+    async fn reopen_changeset(&self, _cs: &mut SourceChangeset) -> Result<(), SourceError> {
+        Err(SourceError::other(PERFORCE_NOT_IMPLEMENTED))
+    }
+
+    async fn create_comment(
+        &self,
+        _cs: &SourceChangeset,
+        _text: &str,
+    ) -> Result<(), SourceError> {
+        Err(SourceError::other(PERFORCE_NOT_IMPLEMENTED))
+    }
+
+    async fn merge_changeset(
+        &self,
+        _cs: &mut SourceChangeset,
+        _squash: bool,
+    ) -> Result<(), SourceError> {
+        Err(SourceError::other(PERFORCE_NOT_IMPLEMENTED))
+    }
+
+    fn supports_draft(&self) -> bool {
+        true
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Factory (`buildChangesetSource`)
 // ---------------------------------------------------------------------------
 
@@ -2514,6 +3571,9 @@ pub enum SourceKind {
     GitLab,
     BitbucketServer,
     AzureDevOps,
+    BitbucketCloud,
+    Gerrit,
+    Perforce,
 }
 
 impl SourceKind {
@@ -2523,6 +3583,9 @@ impl SourceKind {
             "GITLAB" => Some(Self::GitLab),
             "BITBUCKETSERVER" => Some(Self::BitbucketServer),
             "AZUREDEVOPS" => Some(Self::AzureDevOps),
+            "BITBUCKETCLOUD" => Some(Self::BitbucketCloud),
+            "GERRIT" => Some(Self::Gerrit),
+            "PERFORCE" => Some(Self::Perforce),
             _ => None,
         }
     }
@@ -2549,6 +3612,14 @@ pub fn new_source(
         Some(SourceKind::AzureDevOps) => Ok(Arc::new(AzureDevOpsSource::new(
             base_url, auth, http,
         )?)),
+        Some(SourceKind::BitbucketCloud) => Ok(Arc::new(BitbucketCloudSource::new(
+            base_url, auth, http,
+        )?)),
+        Some(SourceKind::Gerrit) => Ok(Arc::new(GerritSource::new(base_url, auth, http)?)),
+        // The Perforce source needs the gitserver client and the decoded
+        // config, neither of which this factory receives; callers that have
+        // them construct the source with `PerforceSource::from_config`.
+        Some(SourceKind::Perforce) => Ok(Arc::new(PerforceSource::new_empty())),
         None => {
             if is_batches_source_kind(kind) {
                 // Gerrit / Perforce / Bitbucket Cloud are OSS kinds whose
@@ -2691,6 +3762,61 @@ pub fn source_connection_from_config(
             };
             // `newClient` parses `config.Url` without `NormalizeBaseURL`.
             (parse_std(raw_url)?, auth)
+        }
+        SourceKind::BitbucketCloud => {
+            // `bitbucketcloud.NewClient` reads `apiURL` (default
+            // `https://api.bitbucket.org`), normalizes it, and authenticates
+            // with the access token when set, else username/app password.
+            let raw_api_url = config
+                .get("apiURL")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .unwrap_or("https://api.bitbucket.org");
+            let auth = match config.get("accessToken").and_then(Value::as_str) {
+                Some(token) if !token.is_empty() => SourceAuth::BearerToken(token.to_owned()),
+                _ => SourceAuth::Basic {
+                    username: config
+                        .get("username")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned(),
+                    password: config
+                        .get("appPassword")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned(),
+                },
+            };
+            (github::normalize_base_url(&parse_std(raw_api_url)?), auth)
+        }
+        SourceKind::Gerrit => {
+            // `sources.NewGerritSource` parses `config.Url` and uses
+            // `BasicAuth{username, password}`.
+            (
+                parse_std(raw_url)?,
+                SourceAuth::Basic {
+                    username: config
+                        .get("username")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned(),
+                    password: config
+                        .get("password")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned(),
+                },
+            )
+        }
+        SourceKind::Perforce => {
+            // Perforce has no HTTP API. Its `p4.port` (e.g. `ssl:host:1666`)
+            // is not a URL authority, so the connection carries a fixed
+            // placeholder URL; the source reads the depot connection from
+            // `config` instead.
+            (
+                Url::parse("perforce://perforce.invalid/").expect("static URL parses"),
+                SourceAuth::None,
+            )
         }
         SourceKind::AzureDevOps => {
             // `sources.NewAzureDevOpsSource` parses `config.Url` with

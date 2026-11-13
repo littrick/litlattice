@@ -20,7 +20,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use url::Url;
 
-use crate::auth::{Authenticator, BasicAuth, BasicAuthWithSSH};
+use crate::auth::{set_header, Authenticator, BasicAuth, BasicAuthWithSSH};
 use crate::{HttpDoer, HttpRequest, HttpResponse};
 
 /// `extsvc.TypeGerrit` (stored in `repo.external_service_type`).
@@ -144,6 +144,95 @@ pub struct Account {
     pub username: String,
 }
 
+/// `gerrit.Change`. `created`/`updated` are decoded from the wire strings and
+/// re-emitted with the baseline's `2006-01-02 15:04:05.000000000` layout (see
+/// [`format_change_time`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Change {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub project: String,
+    #[serde(default)]
+    pub branch: String,
+    #[serde(rename = "change_id", default)]
+    pub change_id: String,
+    #[serde(default)]
+    pub topic: String,
+    #[serde(default)]
+    pub subject: String,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub reviewed: bool,
+    #[serde(rename = "work_in_progress", default)]
+    pub work_in_progress: bool,
+    #[serde(default)]
+    pub hashtags: Option<Vec<String>>,
+    #[serde(rename = "_number", default)]
+    pub change_number: i64,
+    #[serde(default)]
+    pub owner: ChangeOwner,
+    #[serde(default)]
+    pub created: String,
+    #[serde(default)]
+    pub updated: String,
+}
+
+/// `gerrit.Change.Owner`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChangeOwner {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub email: String,
+    #[serde(default)]
+    pub username: String,
+}
+
+/// `gerrit.Reviewer`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Reviewer {
+    #[serde(default)]
+    pub approvals: Option<BTreeMap<String, String>>,
+    #[serde(rename = "_account_id", default)]
+    pub account_id: i64,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub email: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub username: String,
+}
+
+/// `gerrit.ChangeReviewComment`; only `message` is ever set by the source.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct ChangeReviewComment {
+    pub message: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub tag: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub labels: Option<BTreeMap<String, i64>>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub notify: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub on_behalf_of: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comments: Option<BTreeMap<String, String>>,
+}
+
+/// `gerrit.MoveChangePayload`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct MoveChangePayload {
+    pub destination_branch: String,
+}
+
+/// `gerrit.SetCommitMessagePayload`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct SetCommitMessagePayload {
+    pub message: String,
+}
+
 /// `gerrit.Pagination`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Pagination {
@@ -198,6 +287,8 @@ impl std::error::Error for HttpError {}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClientError {
     Http(HttpError),
+    /// `gerrit.MultipleChangesError`.
+    MultipleChanges { id: String },
     Other(String),
 }
 
@@ -205,6 +296,9 @@ impl std::fmt::Display for ClientError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Http(err) => err.fmt(f),
+            Self::MultipleChanges { id } => {
+                write!(f, "Multiple changes found with ID {id} not found")
+            }
             Self::Other(err) => f.write_str(err),
         }
     }
@@ -267,6 +361,17 @@ impl Client {
     /// `doHTTP`: resolve the relative request against the instance URL,
     /// authenticate, and turn non-2xx/3xx responses into [`HttpError`].
     async fn do_http(&self, method: &str, relative: &str) -> Result<(Url, HttpResponse), ClientError> {
+        self.do_http_full(method, relative, &[], &[]).await
+    }
+
+    /// `doHTTP` with a request body and extra headers (the change writes).
+    async fn do_http_full(
+        &self,
+        method: &str,
+        relative: &str,
+        body: &[u8],
+        extra_headers: &[(&str, &str)],
+    ) -> Result<(Url, HttpResponse), ClientError> {
         let url = self
             .base_url
             .join(relative)
@@ -277,6 +382,9 @@ impl Client {
         self.auth
             .authenticate(method, &url_string, &mut headers)
             .map_err(ClientError::Other)?;
+        for (name, value) in extra_headers {
+            set_header(&mut headers, name, value);
+        }
 
         let response = self
             .http
@@ -284,7 +392,7 @@ impl Client {
                 method: method.to_owned(),
                 url: url_string.clone(),
                 headers,
-                body: Vec::new(),
+                body: body.to_vec(),
             })
             .await
             .map_err(ClientError::Other)?;
@@ -305,6 +413,169 @@ impl Client {
         let (_, response) = self.do_http("GET", relative).await?;
         let body = strip_xssi_prefix(&response.body);
         serde_json::from_slice(body).map_err(|err| ClientError::Other(err.to_string()))
+    }
+
+    /// `do` for a non-GET request with an optional JSON body and headers.
+    async fn do_json_full<T: DeserializeOwned>(
+        &self,
+        method: &str,
+        relative: &str,
+        body: &[u8],
+        extra_headers: &[(&str, &str)],
+    ) -> Result<T, ClientError> {
+        let (_, response) = self
+            .do_http_full(method, relative, body, extra_headers)
+            .await?;
+        let body = strip_xssi_prefix(&response.body);
+        serde_json::from_slice(body).map_err(|err| ClientError::Other(err.to_string()))
+    }
+
+    /// `GetChange`.
+    pub async fn get_change(&self, change_id: &str) -> Result<Change, ClientError> {
+        match self
+            .do_json_full::<Change>("GET", &change_path(change_id), &[], &[])
+            .await
+        {
+            Ok(change) => Ok(change),
+            Err(err) => {
+                // `GetChange` maps the fringe "multiple changes" body to
+                // `MultipleChangesError`.
+                if err.to_string().contains("changes found for") {
+                    Err(ClientError::MultipleChanges {
+                        id: change_id.to_owned(),
+                    })
+                } else {
+                    Err(err)
+                }
+            }
+        }
+    }
+
+    /// `AbandonChange`.
+    pub async fn abandon_change(&self, change_id: &str) -> Result<Change, ClientError> {
+        self.do_json_full(
+            "POST",
+            &format!("{}/abandon", change_path(change_id)),
+            &[],
+            &[],
+        )
+        .await
+    }
+
+    /// `DeleteChange`.
+    pub async fn delete_change(&self, change_id: &str) -> Result<(), ClientError> {
+        self.do_http_full("DELETE", &change_path(change_id), &[], &[])
+            .await
+            .map(|_| ())
+    }
+
+    /// `SubmitChange`.
+    pub async fn submit_change(&self, change_id: &str) -> Result<Change, ClientError> {
+        self.do_json_full(
+            "POST",
+            &format!("{}/submit", change_path(change_id)),
+            &[],
+            &[],
+        )
+        .await
+    }
+
+    /// `RestoreChange`.
+    pub async fn restore_change(&self, change_id: &str) -> Result<Change, ClientError> {
+        self.do_json_full(
+            "POST",
+            &format!("{}/restore", change_path(change_id)),
+            &[],
+            &[],
+        )
+        .await
+    }
+
+    /// `SetReadyForReview`.
+    pub async fn set_ready_for_review(&self, change_id: &str) -> Result<(), ClientError> {
+        self.do_http_full(
+            "POST",
+            &format!("{}/ready", change_path(change_id)),
+            &[],
+            &[],
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// `SetWIP`.
+    pub async fn set_wip(&self, change_id: &str) -> Result<(), ClientError> {
+        self.do_http_full("POST", &format!("{}/wip", change_path(change_id)), &[], &[])
+            .await
+            .map(|_| ())
+    }
+
+    /// `WriteReviewComment`. The baseline sets
+    /// `Content-Type: text/plain; charset=UTF-8` even though the body is JSON.
+    pub async fn write_review_comment(
+        &self,
+        change_id: &str,
+        comment: &ChangeReviewComment,
+    ) -> Result<(), ClientError> {
+        let body = serde_json::to_vec(comment)
+            .map_err(|err| ClientError::Other(err.to_string()))?;
+        self.do_http_full(
+            "POST",
+            &format!("{}/revisions/current/review", change_path(change_id)),
+            &body,
+            &[("Content-Type", "text/plain; charset=UTF-8")],
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// `GetChangeReviews`.
+    pub async fn get_change_reviews(
+        &self,
+        change_id: &str,
+    ) -> Result<Vec<Reviewer>, ClientError> {
+        self.do_json_full(
+            "GET",
+            &format!("{}/revisions/current/reviewers", change_path(change_id)),
+            &[],
+            &[("Content-Type", "text/plain; charset=UTF-8")],
+        )
+        .await
+    }
+
+    /// `MoveChange`.
+    pub async fn move_change(
+        &self,
+        change_id: &str,
+        input: &MoveChangePayload,
+    ) -> Result<Change, ClientError> {
+        let body =
+            serde_json::to_vec(input).map_err(|err| ClientError::Other(err.to_string()))?;
+        self.do_json_full(
+            "POST",
+            &format!("{}/move", change_path(change_id)),
+            &body,
+            &[("Content-Type", "application/json")],
+        )
+        .await
+    }
+
+    /// `SetCommitMessage`.
+    pub async fn set_commit_message(
+        &self,
+        change_id: &str,
+        input: &SetCommitMessagePayload,
+    ) -> Result<(), ClientError> {
+        let body =
+            serde_json::to_vec(input).map_err(|err| ClientError::Other(err.to_string()))?;
+        self.do_http_full(
+            "PUT",
+            &format!("{}/message", change_path(change_id)),
+            &body,
+            &[("Content-Type", "application/json")],
+        )
+        .await
+        .map(|_| ())
     }
 
     /// `GetSSHInfo`. A body that does not split into exactly two fields is
@@ -398,6 +669,54 @@ impl Client {
 /// `bytes.CutPrefix(bs, []byte(")]}'"))`.
 pub fn strip_xssi_prefix(body: &[u8]) -> &[u8] {
     body.strip_prefix(b")]}'").unwrap_or(body)
+}
+
+/// `net/url.PathEscape` (`encodePathSegment`): leaves alphanumerics and
+/// `-_.~$&+:=@` untouched, escapes every other byte.
+pub fn path_escape_segment(value: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut out = String::with_capacity(value.len());
+    for &byte in value.as_bytes() {
+        let keep = byte.is_ascii_alphanumeric()
+            || matches!(
+                byte,
+                b'-' | b'_'
+                    | b'.'
+                    | b'~'
+                    | b'$'
+                    | b'&'
+                    | b'+'
+                    | b':'
+                    | b'='
+                    | b'@'
+            );
+        if keep {
+            out.push(byte as char);
+        } else {
+            out.push('%');
+            out.push(HEX[usize::from(byte >> 4)] as char);
+            out.push(HEX[usize::from(byte & 0xf)] as char);
+        }
+    }
+    out
+}
+
+/// `url.JoinPath("a/changes", url.PathEscape(id))` followed by
+/// `url.URL{Path: …}.String()`. Go's `URL.String` re-encodes the already
+/// escaped segment with `encodePath`, so `%` becomes `%25`.
+pub fn change_path(change_id: &str) -> String {
+    let raw = format!("a/changes/{}", path_escape_segment(change_id));
+    crate::bitbucketcloud::encode_go_path(&raw)
+}
+
+/// `Change.Created`/`Change.Updated` are re-emitted with the baseline's
+/// timestamp layout; an absent/invalid value is the zero time.
+pub fn format_change_time(raw: &str) -> String {
+    if raw.is_empty() {
+        "0001-01-01 00:00:00.000000000".to_owned()
+    } else {
+        raw.to_owned()
+    }
 }
 
 #[cfg(test)]
