@@ -2804,12 +2804,24 @@ impl FrontendRootResolver {
         self
     }
 
-    /// Attach the optional GitHub Apps read surface (M9.25c).
+    /// Attach the optional GitHub Apps read surface (M9.25c) and write
+    /// mutations (M9.26d).
     pub fn with_github_apps(
         mut self,
         github_apps: Option<crate::github_apps_graphql::GitHubAppsHandle>,
     ) -> Self {
-        self.query.github_apps = github_apps;
+        self.query.github_apps = github_apps.clone();
+        self.mutation.github_apps = github_apps;
+        self
+    }
+
+    /// Attach the injectable GitHub REST transport used by
+    /// `Mutation.refreshGitHubApp` (M9.26d). `None` uses `reqwest`.
+    pub fn with_github_apps_http(
+        mut self,
+        http: Option<Arc<dyn crate::github_oauth::GithubHttpTransport>>,
+    ) -> Self {
+        self.mutation.github_apps_http = http;
         self
     }
 
@@ -3193,6 +3205,11 @@ pub struct MutationRoot {
     code_monitors: Option<Arc<crate::code_monitors_graphql::CodeMonitorsResolver>>,
     /// Optional Batch Changes write surface (M9.25b).
     batches: Option<crate::batches_graphql::BatchesHandle>,
+    /// Optional GitHub Apps write surface (M9.26d).
+    github_apps: Option<crate::github_apps_graphql::GitHubAppsHandle>,
+    /// Injectable GitHub REST transport for `refreshGitHubApp`; `None` uses
+    /// the production `reqwest` client.
+    github_apps_http: Option<Arc<dyn crate::github_oauth::GithubHttpTransport>>,
 }
 
 impl MutationRoot {
@@ -3291,6 +3308,20 @@ impl ObjectValue for MutationRoot {
         if let Some(batches) = &self.batches {
             if crate::batches_mutations::is_mutation_field(field) {
                 return crate::batches_mutations::mutation_field(batches, field, arguments, actor);
+            }
+        }
+        // M9.26d GitHub Apps mutations: `deleteGitHubApp` / `refreshGitHubApp`.
+        // `refreshGitHubApp` replays the GitHub REST sync through the injected
+        // transport (production: `reqwest`).
+        if let Some(github_apps) = &self.github_apps {
+            if crate::github_apps_graphql::is_mutation_field(field) {
+                return crate::github_apps_graphql::mutation_field(
+                    github_apps,
+                    self.github_apps_http.as_deref(),
+                    field,
+                    arguments,
+                    actor,
+                );
             }
         }
         if self.search_contexts.is_some()
