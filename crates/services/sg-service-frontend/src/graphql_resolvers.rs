@@ -1080,6 +1080,8 @@ pub struct NestedPrefetch {
     pub batches: Option<crate::batches_graphql::BatchesHandleWrapper>,
     /// `User.monitors` surface (M9.13a).
     pub code_monitors: Option<crate::code_monitors_graphql::CodeMonitorsHandleWrapper>,
+    /// `User.teams` / `Team` surface (M9.27a).
+    pub teams: Option<crate::teams_graphql::TeamsHandleWrapper>,
     /// `User.emails` / `primaryEmail` / `accessTokens` / `session` /
     /// `hasVerifiedEmail` per-user account data (M9.18a).
     pub user_accounts: HashMap<i32, crate::graphql_inventory_c::UserAccountsData>,
@@ -2677,9 +2679,11 @@ impl FrontendRootResolver {
                 code_monitors: None,
                 batches: None,
                 github_apps: None,
+                teams: None,
             },
             mutation: MutationRoot {
                 inventory: Arc::new(InventoryRoots::default()),
+                teams_viewer_site_admin: viewer_site_admin,
                 ..MutationRoot::default()
             },
         }
@@ -2822,6 +2826,23 @@ impl FrontendRootResolver {
         http: Option<Arc<dyn crate::github_oauth::GithubHttpTransport>>,
     ) -> Self {
         self.mutation.github_apps_http = http;
+        self
+    }
+
+    /// Attach the optional Teams surface (M9.27a).
+    pub fn with_teams(
+        mut self,
+        teams: Option<crate::teams_graphql::TeamsHandle>,
+    ) -> Self {
+        self.query.teams = teams.clone();
+        self.mutation.teams = teams.clone();
+        let user_handle = teams.clone();
+        self.query.user = self
+            .query
+            .user
+            .map(|user| user.with_teams(user_handle.clone()));
+        let nested = Arc::make_mut(&mut self.query.nested);
+        nested.teams = teams.map(crate::teams_graphql::TeamsHandleWrapper);
         self
     }
 
@@ -3167,6 +3188,9 @@ struct QueryRoot {
     github_apps: Option<crate::github_apps_graphql::GitHubAppsHandle>,
     /// Optional code-monitor resolver (M9.13a).
     code_monitors: Option<Arc<crate::code_monitors_graphql::CodeMonitorsResolver>>,
+    /// Optional Teams surface (M9.27a). `None` keeps `Query.team`/`teams` and
+    /// `node(Team)` unported.
+    teams: Option<crate::teams_graphql::TeamsHandle>,
 }
 
 /// `Mutation` root: `settingsMutation`/log events/temporary settings/feature
@@ -3207,6 +3231,11 @@ pub struct MutationRoot {
     batches: Option<crate::batches_graphql::BatchesHandle>,
     /// Optional GitHub Apps write surface (M9.26d).
     github_apps: Option<crate::github_apps_graphql::GitHubAppsHandle>,
+    /// Optional Teams mutation surface (M9.27a).
+    teams: Option<crate::teams_graphql::TeamsHandle>,
+    /// The viewer's `users.site_admin` for `createTeam(readonly: true)` and
+    /// `canModifyTeam`.
+    teams_viewer_site_admin: bool,
     /// Injectable GitHub REST transport for `refreshGitHubApp`; `None` uses
     /// the production `reqwest` client.
     github_apps_http: Option<Arc<dyn crate::github_oauth::GithubHttpTransport>>,
@@ -3461,6 +3490,18 @@ impl ObjectValue for MutationRoot {
                     field,
                     arguments,
                     actor,
+                );
+            }
+        }
+        // M9.27a Teams mutations.
+        if let Some(teams) = &self.teams {
+            if crate::teams_graphql::is_mutation_field(field) {
+                return crate::teams_graphql::mutation_field(
+                    teams,
+                    field,
+                    arguments,
+                    actor,
+                    self.teams_viewer_site_admin,
                 );
             }
         }
@@ -4540,6 +4581,16 @@ impl ObjectValue for QueryRoot {
                             actor,
                         )
                     }
+                    // `NodeResolvers()["Team"]` (M9.27a).
+                    _ if self.teams.is_some()
+                        && crate::teams_graphql::is_node_kind(kind.as_str()) =>
+                    {
+                        crate::teams_graphql::node_field(
+                            self.teams.as_ref().expect("checked teams"),
+                            id,
+                            self.viewer_site_admin,
+                        )
+                    }
                     _ => self.node_int32(kind.as_str(), id),
                 }
             }
@@ -4798,6 +4849,15 @@ impl ObjectValue for QueryRoot {
                     actor,
                 )
             }
+            // `schemaResolver.Team` / `Teams` (M9.27a).
+            _ if self.teams.is_some() && crate::teams_graphql::is_root_field(field) => {
+                crate::teams_graphql::root_field(
+                    self.teams.as_ref().expect("checked teams"),
+                    field,
+                    arguments,
+                    self.viewer_site_admin,
+                )
+            }
             _ => Ok(None),
         }
     }
@@ -4820,6 +4880,9 @@ pub struct UserObject {
     /// Nested resolver data prefetched for this request (initially empty for
     /// objects built by unit tests/transport tests).
     nested: Arc<NestedPrefetch>,
+    /// `User.teams` handle (M9.27a). Also available through
+    /// `nested.teams` for objects built by the request prefetch.
+    teams: Option<crate::teams_graphql::TeamsHandleWrapper>,
 }
 
 impl UserObject {
@@ -4828,6 +4891,7 @@ impl UserObject {
             data,
             viewer_site_admin: false,
             nested: Arc::new(NestedPrefetch::default()),
+            teams: None,
         }
     }
 
@@ -4836,7 +4900,17 @@ impl UserObject {
             data,
             viewer_site_admin,
             nested: Arc::new(NestedPrefetch::default()),
+            teams: None,
         }
+    }
+
+    /// Attach the Teams handle so `User.teams` resolves (M9.27a).
+    pub fn with_teams(
+        mut self,
+        teams: Option<crate::teams_graphql::TeamsHandle>,
+    ) -> Self {
+        self.teams = teams.map(crate::teams_graphql::TeamsHandleWrapper);
+        self
     }
 
     /// Attach the request's nested prefetch data (see [`prefetch_nested`]).
@@ -4960,6 +5034,20 @@ impl ObjectValue for UserObject {
                     }
                     None => Ok(None),
                 }
+            }
+            // `UserResolver.Teams` (M9.27a): `areTeamEndpointsAvailable` then
+            // a root-only `TeamConnection`. The Go resolver never sets
+            // `ForUserMember`, so membership is ignored.
+            "teams" => {
+                let handle = self
+                    .teams
+                    .as_ref()
+                    .map(|wrapper| &wrapper.0)
+                    .or_else(|| self.nested.teams.as_ref().map(|wrapper| &wrapper.0));
+                let Some(handle) = handle else {
+                    return Ok(None);
+                };
+                crate::teams_graphql::user_teams(handle, arguments, self.viewer_site_admin)
             }
             // `UserResolver.Roles` / `Permissions` (M9.13b; the authorization
             // results are prefetched per viewer).
