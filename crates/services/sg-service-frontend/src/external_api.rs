@@ -1183,7 +1183,11 @@ impl GitHubWebhookDeps for EmptyGitHubWebhookDeps {
 
 /// `github.ValidateSignature` (go-github `messages.go`): `sha1=`/`sha256=`/
 /// `sha512=` hex HMAC over the raw body.
-fn validate_github_signature(signature: &str, body: &[u8], secret: &[u8]) -> Result<(), String> {
+pub(crate) fn validate_github_signature(
+    signature: &str,
+    body: &[u8],
+    secret: &[u8],
+) -> Result<(), String> {
     if signature.is_empty() {
         return Err("missing signature".to_owned());
     }
@@ -1433,7 +1437,7 @@ fn webhook_uuid_response(uuid: &str) -> Response<BoxBody> {
 }
 
 /// Go's `fmt.Sprintf("%q", value)` for the ASCII path segments seen here.
-fn go_quote(value: &str) -> String {
+pub(crate) fn go_quote(value: &str) -> String {
     let mut quoted = String::with_capacity(value.len() + 2);
     quoted.push('"');
     for ch in value.chars() {

@@ -193,9 +193,45 @@ pub enum SiteAdminOutcome {
     Error,
 }
 
+/// The request actor `siteAdminMiddleware` reads. The Go middleware runs after
+/// the session middleware has put `actor.FromContext` on the request; the
+/// synchronous port carries the same information explicitly. An internal actor
+/// bypasses the check (`auth.CheckCurrentUserIsSiteAdmin`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum ActorIdentity {
+    /// `actor.FromContext(ctx)` with no user (`UID == 0`).
+    #[default]
+    Anonymous,
+    /// `actor.Actor{Internal: true}`.
+    Internal,
+    /// An authenticated user (`UID`).
+    User(i32),
+}
+
+impl ActorIdentity {
+    /// `actor.FromContext(ctx)` (as exposed to the app router) reduced to the
+    /// fields the middleware reads.
+    pub fn from_actor(actor: sg_graphql::exec::Actor) -> Self {
+        if actor.is_internal() {
+            Self::Internal
+        } else if let Some(uid) = actor.uid() {
+            Self::User(uid)
+        } else {
+            Self::Anonymous
+        }
+    }
+}
+
 /// `siteAdminMiddleware` (`httpapi.go:37-58`).
 pub trait SiteAdminCheck: Send + Sync {
+    /// Actor-less outcome (offline / allow-all seams).
     fn check(&self) -> SiteAdminOutcome;
+
+    /// Actor-aware outcome. The default ignores the actor so the historical
+    /// seams keep their behavior.
+    fn check_actor(&self, _actor: ActorIdentity) -> SiteAdminOutcome {
+        self.check()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1291,8 +1327,9 @@ impl GitHubAppServer {
 
     /// `siteAdminMiddleware`: returns `Some(response)` when the request is
     /// rejected.
-    fn site_admin_gate(&self) -> Option<Response<BoxBody>> {
-        match self.site_admin.check() {
+    /// `siteAdminMiddleware` for an explicit request actor.
+    pub fn site_admin_gate_for(&self, actor: ActorIdentity) -> Option<Response<BoxBody>> {
+        match self.site_admin.check_actor(actor) {
             SiteAdminOutcome::Allowed => None,
             SiteAdminOutcome::Forbidden => Some(http_error(
                 StatusCode::FORBIDDEN,
@@ -1310,7 +1347,17 @@ impl GitHubAppServer {
 
     /// `registerRoutes` + `router.Use(siteAdminMiddleware)`.
     pub fn serve<B>(&self, req: &Request<B>, route: GitHubAppRoute) -> Response<BoxBody> {
-        if let Some(response) = self.site_admin_gate() {
+        self.serve_with_actor(req, route, ActorIdentity::Anonymous)
+    }
+
+    /// Same routes with the request actor from the session middleware.
+    pub fn serve_with_actor<B>(
+        &self,
+        req: &Request<B>,
+        route: GitHubAppRoute,
+        actor: ActorIdentity,
+    ) -> Response<BoxBody> {
+        if let Some(response) = self.site_admin_gate_for(actor) {
             return response;
         }
         match route {
@@ -1621,6 +1668,54 @@ impl GitHubAppStore for PgGitHubAppStore {
     }
 }
 
+/// `authcheck.CheckCurrentUserIsSiteAdmin` behind [`SiteAdminCheck`], reading
+/// `users.site_admin` for the request actor.
+pub struct PgSiteAdminCheck {
+    pool: sqlx::PgPool,
+    /// Actor used by the actor-less [`SiteAdminCheck::check`]
+    /// (`production_with_actor` bakes the launch actor; per-request callers
+    /// use [`SiteAdminCheck::check_actor`] via `serve_with_actor`).
+    actor: ActorIdentity,
+}
+
+impl PgSiteAdminCheck {
+    pub fn new(pool: sqlx::PgPool, actor: ActorIdentity) -> Self {
+        Self { pool, actor }
+    }
+
+    /// `internal/auth/site_admin.go` `CheckCurrentUserIsSiteAdmin`: internal
+    /// actor passes; an unauthenticated actor or a missing/soft-deleted user is
+    /// `ErrNotAuthenticated` (401); a real non-admin is `ErrMustBeSiteAdmin`
+    /// (403); other lookup failures are 500.
+    fn evaluate(&self, actor: ActorIdentity) -> SiteAdminOutcome {
+        match actor {
+            ActorIdentity::Internal => SiteAdminOutcome::Allowed,
+            ActorIdentity::Anonymous => SiteAdminOutcome::Unauthenticated,
+            ActorIdentity::User(uid) if uid <= 0 => SiteAdminOutcome::Unauthenticated,
+            ActorIdentity::User(uid) => {
+                // `db.Users().GetByID(...).GetByCurrentAuthUser` filters
+                // `deleted_at IS NULL`; `CurrentUser` maps not-found to nil.
+                match block_on(sg_db::users::get_site_admin(&self.pool, uid)) {
+                    Ok(Some(true)) => SiteAdminOutcome::Allowed,
+                    Ok(Some(false)) => SiteAdminOutcome::Forbidden,
+                    Ok(None) => SiteAdminOutcome::Unauthenticated,
+                    Err(_) => SiteAdminOutcome::Error,
+                }
+            }
+        }
+    }
+}
+
+impl SiteAdminCheck for PgSiteAdminCheck {
+    fn check(&self) -> SiteAdminOutcome {
+        self.evaluate(self.actor)
+    }
+
+    fn check_actor(&self, actor: ActorIdentity) -> SiteAdminOutcome {
+        self.evaluate(actor)
+    }
+}
+
 /// `webhookStore` behind [`WebhookBackend`] (`internal/database/webhooks.go`)
 /// plus `backend.NewWebhookService`'s kind/URN validation.
 pub struct PgWebhookBackend {
@@ -1858,17 +1953,38 @@ impl GitHubAppServer {
         keyring: std::sync::Arc<sg_keyring::Keyring>,
         kv: sg_redis::KeyValue,
     ) -> Self {
+        // Deny-by-default: the routes are only reachable with a site-admin
+        // actor (`serve_with_actor`). The launch server carries no actor, so
+        // the actor-less `serve` path answers 401 until the session middleware
+        // supplies `AppDeps.more.actor`.
+        Self::production_with_actor(pool, keyring, kv, ActorIdentity::Anonymous)
+    }
+
+    /// Production wiring with the request actor that writes the `webhooks`
+    /// audit columns (`created_by_user_id` / `updated_by_user_id`) and backs
+    /// the site-admin gate.
+    pub fn production_with_actor(
+        pool: sqlx::PgPool,
+        keyring: std::sync::Arc<sg_keyring::Keyring>,
+        kv: sg_redis::KeyValue,
+        actor: ActorIdentity,
+    ) -> Self {
+        let actor_uid = match actor {
+            ActorIdentity::User(uid) => uid,
+            ActorIdentity::Anonymous | ActorIdentity::Internal => 0,
+        };
         Self {
             cache: std::sync::Arc::new(RcacheStateStore::with_kv(kv)),
             apps: std::sync::Arc::new(PgGitHubAppStore::new(pool.clone(), keyring.clone())),
-            webhooks: std::sync::Arc::new(PgWebhookBackend::new(pool, keyring, 0)),
+            webhooks: std::sync::Arc::new(PgWebhookBackend::new(
+                pool.clone(),
+                keyring,
+                actor_uid,
+            )),
             http: std::sync::Arc::new(ReqwestHttpDoer::new()),
             sleeper: std::sync::Arc::new(RealSleeper),
             state: std::sync::Arc::new(SystemStateGenerator),
-            // The site-admin gate is not plumbed to the actor chain for this
-            // synchronous route (documented gap); the production wiring keeps
-            // the seam's allow-all policy.
-            site_admin: std::sync::Arc::new(AllowAllSiteAdmin),
+            site_admin: std::sync::Arc::new(PgSiteAdminCheck::new(pool, actor)),
         }
     }
 }
