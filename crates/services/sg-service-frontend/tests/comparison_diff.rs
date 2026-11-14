@@ -31,6 +31,9 @@ use sg_graphql::exec::{execute_with, root_fields, Actor, ExecRequest};
 use sg_graphql::schema::assemble_sdl;
 
 use sg_service_frontend::git_commit_extra::GitCommitExtraSource;
+use sg_service_frontend::git_comparison_graphql::{
+    CodeHighlighterSource, HighlightSource,
+};
 use sg_service_frontend::git_graphql::{prefetch_git, GitObjectSource, GitSourceError};
 use sg_service_frontend::graphql_resolvers::{
     FrontendRootResolver, NodeRoots, RepoKey, RepoLookup, RepositoryData,
@@ -291,6 +294,10 @@ struct FakeGit {
     diffs: HashMap<String, String>,
     commits_log: HashMap<String, Vec<CommitFixture>>,
     contents: HashMap<String, String>,
+    /// M9.36d: production `highlight.CodeAsLines` adapter. `HTML_PLAINTEXT`
+    /// cases still resolve offline; `HTML_HIGHLIGHT` cases use the syntect
+    /// client (`SRC_SYNTECT_SERVER`).
+    highlighter: Arc<CodeHighlighterSource>,
 }
 
 fn commits_key(repo: &str, options: &CommitsOptions) -> String {
@@ -385,6 +392,10 @@ impl GitObjectSource for FakeGit {
         }
     }
 
+    fn highlighter(&self) -> Option<&dyn HighlightSource> {
+        Some(self.highlighter.as_ref())
+    }
+
     fn commit_extra(&self) -> Option<&dyn GitCommitExtraSource> {
         Some(self)
     }
@@ -463,6 +474,7 @@ async fn comparison_harness() {
         diffs: corpus.diffs.clone(),
         commits_log: corpus.commits_log.clone(),
         contents: corpus.contents.clone(),
+        highlighter: Arc::new(CodeHighlighterSource::production()),
     };
 
     let mut repositories: HashMap<RepoKey, RepoLookup> = HashMap::new();
