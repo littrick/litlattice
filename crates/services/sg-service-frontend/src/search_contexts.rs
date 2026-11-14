@@ -331,6 +331,32 @@ impl RequestContext {
         }
     }
 
+    /// `actor.FromContext(ctx)` for the GraphQL executor's reduced actor
+    /// (`sg_graphql::exec::Actor`): anonymous, internal or a user UID.
+    /// `sourcegraph_dot_com_mode` mirrors `dotcom.SourcegraphDotComMode()`.
+    pub fn from_graphql_actor(
+        actor: sg_graphql::exec::Actor,
+        sourcegraph_dot_com_mode: bool,
+    ) -> Self {
+        match actor {
+            sg_graphql::exec::Actor::Anonymous => Self {
+                actor_uid: 0,
+                internal: false,
+                sourcegraph_dot_com_mode,
+            },
+            sg_graphql::exec::Actor::Internal => Self {
+                actor_uid: 0,
+                internal: true,
+                sourcegraph_dot_com_mode,
+            },
+            sg_graphql::exec::Actor::User { uid } => Self {
+                actor_uid: uid,
+                internal: false,
+                sourcegraph_dot_com_mode,
+            },
+        }
+    }
+
     /// The zero actor (anonymous, non-internal), matching the actor in
     /// `context.Background()`.
     pub fn anonymous() -> Self {
@@ -569,15 +595,18 @@ pub fn resolve_search_context_spec(
 
         // Only members of the organization can use search contexts under the
         // organization namespace on Sourcegraph Cloud.
-        if ctx.sourcegraph_dot_com_mode
-            && namespace.organization > 0
-            && db
-                .get_org_member_by_org_id_and_user_id(namespace.organization, ctx.actor_uid)
-                .is_err()
-        {
-            // Every failure path returns `database.ErrNamespaceNotFound` so the
-            // lookup does not leak whether a hidden namespace exists.
-            return Err(Error::namespace_not_found());
+        if ctx.sourcegraph_dot_com_mode && namespace.organization > 0 {
+            // `GetByOrgIDAndUserID` returns `ErrNotFound` for a non-member;
+            // every failure path (including a DB error) returns
+            // `database.ErrNamespaceNotFound` so the lookup does not leak
+            // whether a hidden namespace exists.
+            let is_member = matches!(
+                db.get_org_member_by_org_id_and_user_id(namespace.organization, ctx.actor_uid),
+                Ok(Some(_))
+            );
+            if !is_member {
+                return Err(Error::namespace_not_found());
+            }
         }
 
         if has_search_context_name {

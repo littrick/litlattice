@@ -479,6 +479,81 @@ pub fn configure_from_site(
     }
 }
 
+/// Production `database.SubRepoPermsStore`-backed getter.
+///
+/// Go's store is synchronous and reads `conf.Get()` on every query
+/// (`sub_repo_perms_store.go:295`); the Rust DB helpers are async and the job
+/// tree runs synchronously, so this bridges with `block_in_place` (the same
+/// approach as [`crate::saved_searches_store`]). `enforce_for_site_admins` is
+/// evaluated per call so `authz.enforceForSiteAdmins` changes are observed
+/// without rebuilding the checker.
+pub struct PgSubRepoPermissionsGetter {
+    pool: sqlx::PgPool,
+    enforce_for_site_admins: Arc<dyn Fn() -> bool + Send + Sync>,
+}
+
+impl PgSubRepoPermissionsGetter {
+    pub fn new(
+        pool: sqlx::PgPool,
+        enforce_for_site_admins: impl Fn() -> bool + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            pool,
+            enforce_for_site_admins: Arc::new(enforce_for_site_admins),
+        }
+    }
+}
+
+fn block_on<F: std::future::Future>(future: F) -> F::Output {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => tokio::task::block_in_place(|| handle.block_on(future)),
+        Err(_) => tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("sub-repo permissions blocking runtime")
+            .block_on(future),
+    }
+}
+
+impl SubRepoPermissionsGetter for PgSubRepoPermissionsGetter {
+    fn get_by_user_with_ips(
+        &self,
+        user_id: i32,
+        backfill_with_wildcard_ip: bool,
+    ) -> Result<BTreeMap<String, RepoRules>, String> {
+        let enforce = (self.enforce_for_site_admins)();
+        let rows = block_on(sg_db::sub_repo_perms::get_by_user_with_ips(
+            &self.pool,
+            user_id,
+            enforce,
+            backfill_with_wildcard_ip,
+        ))
+        .map_err(|error| error.to_string())?;
+        Ok(rows
+            .into_iter()
+            .map(|(repo, perms)| {
+                (
+                    repo,
+                    perms.paths.into_iter().map(|path| path.path).collect(),
+                )
+            })
+            .collect())
+    }
+
+    fn repo_id_supported(&self, repo_id: i32) -> Result<bool, String> {
+        block_on(sg_db::sub_repo_perms::repo_id_supported(
+            &self.pool,
+            repo_id,
+        ))
+        .map_err(|error| error.to_string())
+    }
+
+    fn repo_supported(&self, repo: &str) -> Result<bool, String> {
+        block_on(sg_db::sub_repo_perms::repo_supported(&self.pool, repo))
+            .map_err(|error| error.to_string())
+    }
+}
+
 /// A fixed in-memory getter, used by tests and the differential harness.
 #[derive(Debug, Clone, Default)]
 pub struct FixtureGetter {

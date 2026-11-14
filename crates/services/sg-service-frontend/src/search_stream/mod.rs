@@ -347,6 +347,20 @@ pub trait SearchDeps: Send + Sync {
         query: &str,
     ) -> Pin<Box<dyn Stream<Item = ExecuteItem> + Send>>;
 
+    /// `searchClient.Execute` with the request actor
+    /// (`actor.FromContext(ctx)`), injected into
+    /// [`tree_inputs_with_context`]. Defaults to [`SearchDeps::execute`]
+    /// (anonymous) so existing implementations are unchanged.
+    async fn execute_with_context(
+        &self,
+        inputs: &SearchInputs,
+        query: &str,
+        request_context: crate::search_contexts::RequestContext,
+    ) -> Pin<Box<dyn Stream<Item = ExecuteItem> + Send>> {
+        let _ = request_context;
+        self.execute(inputs, query).await
+    }
+
     /// `db.Repos().Metadata(ids...)` (`getEventRepoMetadata`).
     async fn repo_metadata(&self, ids: &[i32]) -> Result<HashMap<i32, RepoMetadata>, String>;
 
@@ -551,7 +565,22 @@ pub fn run_inputs(
     runner: &dyn JobRunner,
     inputs: &SearchInputs,
 ) -> Result<TreeRunOutcome, JobError> {
-    let mut job = search_jobutil_tree::new_plan_job(&tree_inputs(inputs), &inputs.plan)?;
+    run_inputs_with_context(
+        runner,
+        inputs,
+        crate::search_contexts::RequestContext::anonymous(),
+    )
+}
+
+/// [`run_inputs`] with the request actor (`actor.FromContext(ctx)`), injected
+/// through [`tree_inputs_with_context`].
+pub fn run_inputs_with_context(
+    runner: &dyn JobRunner,
+    inputs: &SearchInputs,
+    request_context: crate::search_contexts::RequestContext,
+) -> Result<TreeRunOutcome, JobError> {
+    let mut job =
+        search_jobutil_tree::new_plan_job(&tree_inputs_with_context(inputs, request_context), &inputs.plan)?;
     let mut events = Vec::new();
     let output = {
         let mut sender = |event: SearchEvent| events.push(event);
@@ -656,9 +685,23 @@ impl SearchDeps for BackendDeps {
     async fn execute(
         &self,
         inputs: &SearchInputs,
-        _query: &str,
+        query: &str,
     ) -> Pin<Box<dyn Stream<Item = ExecuteItem> + Send>> {
-        let outcome = match run_inputs(self.runner.as_ref(), inputs) {
+        self.execute_with_context(
+            inputs,
+            query,
+            crate::search_contexts::RequestContext::anonymous(),
+        )
+        .await
+    }
+
+    async fn execute_with_context(
+        &self,
+        inputs: &SearchInputs,
+        _query: &str,
+        request_context: crate::search_contexts::RequestContext,
+    ) -> Pin<Box<dyn Stream<Item = ExecuteItem> + Send>> {
+        let outcome = match run_inputs_with_context(self.runner.as_ref(), inputs, request_context) {
             Ok(outcome) => outcome,
             Err(JobError(message)) => {
                 return Box::pin(tokio_stream::iter(vec![ExecuteItem::Error {
@@ -786,7 +829,13 @@ fn convert_key_value_pairs(
 /// [`crate::external_api`].
 pub async fn search_response<B>(req: &Request<B>, deps: Arc<dyn SearchDeps>) -> Response<BoxBody> {
     let gzip = accepts_gzip(req);
-    let body = serve_http(req, deps).await;
+    // `actor.FromContext(ctx)`: the external chain and the internal listener
+    // both resolve the request actor and insert it as `ChainActor`.
+    let actor = req
+        .extensions()
+        .get::<crate::actor_chain::ChainActor>()
+        .map(|chain_actor| chain_actor.0.clone());
+    let body = serve_http(req, deps, actor).await;
     let body = if gzip {
         Bytes::from(gzip_bytes(&body))
     } else {
@@ -1109,7 +1158,11 @@ impl DisplayFilter {
 }
 
 /// `serveHTTP` (`search.go:115-200`): returns the complete event stream body.
-async fn serve_http<B>(req: &Request<B>, deps: Arc<dyn SearchDeps>) -> Vec<u8> {
+async fn serve_http<B>(
+    req: &Request<B>,
+    deps: Arc<dyn SearchDeps>,
+    request_actor: Option<crate::actor_middleware::Actor>,
+) -> Vec<u8> {
     let start = Instant::now();
     let mut writer = SseWriter::new();
 
@@ -1163,7 +1216,21 @@ async fn serve_http<B>(req: &Request<B>, deps: Arc<dyn SearchDeps>) -> Vec<u8> {
     let mut flush_timer = TokioInstant::now() + Duration::from_millis(200);
     let mut progress_timer = TokioInstant::now() + Duration::from_secs(5);
 
-    let mut stream = deps.execute(&inputs, &args.query).await;
+    // `actor.FromContext(ctx)`; anonymous when the request had no resolved
+    // actor (direct callers/tests).
+    let request_context = match request_actor {
+        Some(actor) => crate::search_contexts::RequestContext::from_actor(
+            &actor,
+            inputs.on_sourcegraph_dot_com,
+        ),
+        None => crate::search_contexts::RequestContext {
+            sourcegraph_dot_com_mode: inputs.on_sourcegraph_dot_com,
+            ..crate::search_contexts::RequestContext::anonymous()
+        },
+    };
+    let mut stream = deps
+        .execute_with_context(&inputs, &args.query, request_context)
+        .await;
     let mut tail_alert: Option<EventAlert> = None;
     let mut tail_error: Option<(String, bool)> = None;
 
