@@ -10,7 +10,7 @@
 //!
 //! Env:
 //!
-//! * `SG_M930C_BATCHES_CREDENTIALS_DIFF=1`
+//! * `SG_M937D_BATCHES_CREDENTIALS_DIFF=1`
 //! * `SG_QTEST_DSN` — scratch database
 //! * `M930C_CORPUS` — corpus JSON path
 //! * `M930C_OUT` — output directory (one `<name>.json` per case)
@@ -19,12 +19,14 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use serde::Deserialize;
 use serde_json::{Map, Value};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{Column, Row};
+
+use sg_extsvc::{HttpDoer, HttpRequest, HttpResponse};
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
@@ -65,10 +67,66 @@ struct Case {
     batch_changes_enabled: bool,
     #[serde(default)]
     restrict_to_admins: bool,
+    /// M9.37d: the scripted response `checkBatchChangesCredential` sees through
+    /// the injected `HttpDoer` (the Go oracle serves it from `httptest`).
+    #[serde(default)]
+    http: Option<HttpCase>,
+}
+
+#[derive(Deserialize, Clone)]
+struct HttpCase {
+    #[serde(default)]
+    status: u16,
+    #[serde(default)]
+    body: String,
+    #[serde(default)]
+    headers: HashMap<String, String>,
 }
 
 fn default_enabled() -> bool {
     true
+}
+
+/// Serves one scripted response and records the request the credential
+/// validation path sent. The GitHub base URL is the database placeholder, so
+/// the host is never resolved.
+struct ScriptedDoer {
+    response: HttpResponse,
+    seen: Mutex<Option<HttpRequest>>,
+}
+
+impl ScriptedDoer {
+    fn new(case: &HttpCase) -> Self {
+        let status = if case.status == 0 { 200 } else { case.status };
+        Self {
+            response: HttpResponse {
+                status,
+                headers: case
+                    .headers
+                    .iter()
+                    .map(|(name, value)| (name.clone(), value.clone()))
+                    .collect(),
+                body: case.body.clone().into_bytes(),
+            },
+            seen: Mutex::new(None),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl HttpDoer for ScriptedDoer {
+    async fn do_request(&self, request: HttpRequest) -> Result<HttpResponse, String> {
+        *self.seen.lock().unwrap() = Some(request);
+        Ok(self.response.clone())
+    }
+}
+
+fn default_http_case() -> HttpCase {
+    HttpCase {
+        status: 200,
+        body: "{}".to_owned(),
+        headers: HashMap::new(),
+    }
 }
 
 fn parse_time(value: &str) -> OffsetDateTime {
@@ -120,7 +178,7 @@ fn normalized(response: &sg_graphql::exec::ExecResponse) -> Value {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn batches_credentials_harness() {
-    if std::env::var("SG_M930C_BATCHES_CREDENTIALS_DIFF").as_deref() != Ok("1") {
+    if std::env::var("SG_M937D_BATCHES_CREDENTIALS_DIFF").as_deref() != Ok("1") {
         return;
     }
     let corpus_path = std::env::var("M930C_CORPUS").expect("M930C_CORPUS");
@@ -158,9 +216,11 @@ async fn batches_credentials_harness() {
                 (Actor::User { uid: case.uid }, Some(object))
             }
         };
+        let http = ScriptedDoer::new(case.http.as_ref().unwrap_or(&default_http_case()));
         let store = PgBatchesGraphqlStore::new(pool.clone())
             .with_batch_changes_enabled(case.batch_changes_enabled)
-            .with_batch_changes_restricted_to_admins(case.restrict_to_admins);
+            .with_batch_changes_restricted_to_admins(case.restrict_to_admins)
+            .with_credential_http_doer(Arc::new(http));
         let batches: BatchesHandle = Arc::new(store);
         let nodes = NodeRoots {
             users: users.clone(),

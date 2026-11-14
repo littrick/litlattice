@@ -26,8 +26,10 @@
 //! ## Known gaps (documented, not silently faked)
 //!
 //! - Network verification (`service.ValidateAuthenticator`) is a seam
-//!   ([`BatchesCredentialsDatabase::validate_authenticator`]) that defaults to
-//!   success. The real code host clients are out of scope for this slice.
+//!   ([`BatchesCredentialsDatabase::validate_authenticator`]). M9.37d wires the
+//!   GitHub path to the real `sources.GitHubSource.ValidateAuthenticator`
+//!   through an injectable `HttpDoer`; other code hosts still default to
+//!   success (their clients are outside this slice).
 //! - `sshPublicKey` on a GitHub App credential short-circuits to `null`
 //!   without loading the app (M9.31b): Go instead errors when the app row is
 //!   missing or its private key is not a valid RSA PEM. The differential
@@ -65,6 +67,12 @@ pub const INVALID_EXTERNAL_SERVICE_KIND: &str = "invalid external service kind";
 pub const USER_CREDENTIAL_NOT_FOUND: &str = "user credential not found: ";
 /// `store.ErrNoResults`.
 pub const NO_RESULTS: &str = "no results";
+
+/// `service.ErrVerifyCredentialFailed.Error`
+/// (`internal/batches/service/errors.go:23`).
+pub fn verify_credential_failed(source_error: &str) -> String {
+    format!("Failed to verify the credential:\n```\n{source_error}\n```\n")
+}
 
 // ---------------------------------------------------------------------------
 // Relay IDs
@@ -726,7 +734,7 @@ fn create_batch_changes_credential(
                 external_service_url,
                 &authenticator,
             )
-            .map_err(ExecError::new)?;
+            .map_err(|error| ExecError::new(verify_credential_failed(&error)))?;
         let (bytes, key_id) = store.encrypt_credential(&authenticator).map_err(ExecError::new)?;
         store
             .create_user_credential(
@@ -760,7 +768,7 @@ fn create_batch_changes_credential(
                 external_service_url,
                 &authenticator,
             )
-            .map_err(ExecError::new)?;
+            .map_err(|error| ExecError::new(verify_credential_failed(&error)))?;
         let (bytes, key_id) = store.encrypt_credential(&authenticator).map_err(ExecError::new)?;
         store
             .create_site_credential(
@@ -855,6 +863,6 @@ fn check_batch_changes_credential(
             &credential.resolved.row.external_service_id,
             &authenticator,
         )
-        .map_err(ExecError::new)?;
+        .map_err(|error| ExecError::new(verify_credential_failed(&error)))?;
     Ok(empty_response())
 }

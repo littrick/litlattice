@@ -16,6 +16,8 @@ use rsa::traits::PublicKeyParts as _;
 use sqlx::Row;
 
 use sg_graphql::exec::Actor;
+use sg_extsvc::batches_sources::{GitHubSource, SourceAuth};
+use sg_extsvc::github::api_root;
 use time::OffsetDateTime;
 
 use crate::batches_credentials::{
@@ -316,6 +318,35 @@ impl BatchesCredentialsDatabase for PgBatchesGraphqlStore {
         .map_err(|e| e.to_string())
     }
 
+    /// M9.37d: `service.ValidateAuthenticator` → `sources.GitHubSource.
+    /// ValidateAuthenticator` (`V4Client.GetAuthenticatedUser`). The credential
+    /// URL is the code host base URL; `NewGitHubSource` derives the API root
+    /// from it exactly like `github.APIRoot`. Non-GitHub code hosts keep the
+    /// previous success default (their clients are outside this slice).
+    ///
+    /// The trait is synchronous while HTTP is async; [`block_on`] bridges them
+    /// the same way the other store adapters do (`block_in_place` under the
+    /// GraphQL runtime, a throwaway current-thread runtime otherwise).
+    fn validate_authenticator(
+        &self,
+        external_service_type: &str,
+        external_service_url: &str,
+        authenticator: &str,
+    ) -> Result<(), String> {
+        if external_service_type != "github" {
+            return Ok(());
+        }
+        // `httpcli.Doer` seam: without one, keep the pre-M9.37d default.
+        let Some(http) = self.credential_http_doer.clone() else {
+            return Ok(());
+        };
+        let base_url = url::Url::parse(external_service_url).map_err(|e| e.to_string())?;
+        let (api_url, _) = api_root(&base_url);
+        let auth = github_source_auth(authenticator)?;
+        let source = GitHubSource::new(api_url, auth, http);
+        block_on(source.validate_authenticator()).map_err(|e| e.to_string())
+    }
+
     fn generate_ssh_keypair(&self) -> Result<SshKeyPair, String> {
         // `encryption.GenerateRSAKey`: 4096-bit RSA, UUID passphrase, OpenSSH
         // authorized_keys public key.
@@ -333,6 +364,99 @@ impl BatchesCredentialsDatabase for PgBatchesGraphqlStore {
             private_key: private_pem,
             public_key,
             passphrase,
+        })
+    }
+}
+
+/// Decode the stored `{"Type":...,"Auth":...}` authenticator into the
+/// `SourceAuth` a `GitHubSource` installs (`ghauth.FromConnection`). The GitHub
+/// credential JSON path only ever stores the OAuth/basic variants.
+fn github_source_auth(authenticator: &str) -> Result<SourceAuth, String> {
+    let value: serde_json::Value =
+        serde_json::from_str(authenticator).map_err(|e| e.to_string())?;
+    let kind = value
+        .get("Type")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    let auth = value.get("Auth").cloned().unwrap_or(serde_json::Value::Null);
+    let text = |key: &str| {
+        auth.get(key)
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_owned()
+    };
+    match kind {
+        "OAuthBearerTokenWithSSH" | "OAuthBearerToken" => Ok(SourceAuth::OAuthToken(text("token"))),
+        "BasicAuthWithSSH" | "BasicAuth" => Ok(SourceAuth::Basic {
+            username: text("Username"),
+            password: text("Password"),
+        }),
+        other => Err(format!(
+            "unknown authenticator type {other:?} for GitHub source"
+        )),
+    }
+}
+
+/// Production [`sg_extsvc::HttpDoer`] backed by `reqwest`
+/// (`httpcli.ExternalClient`). The differential harness injects a recording
+/// fake instead, so it never contacts a code host.
+pub struct ReqwestCredentialHttpDoer {
+    client: reqwest::Client,
+}
+
+impl ReqwestCredentialHttpDoer {
+    pub fn new() -> Self {
+        Self {
+            client: reqwest::Client::new(),
+        }
+    }
+}
+
+impl Default for ReqwestCredentialHttpDoer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait::async_trait]
+impl sg_extsvc::HttpDoer for ReqwestCredentialHttpDoer {
+    async fn do_request(
+        &self,
+        request: sg_extsvc::HttpRequest,
+    ) -> Result<sg_extsvc::HttpResponse, String> {
+        let method = reqwest::Method::from_bytes(request.method.as_bytes())
+            .map_err(|err| format!("invalid HTTP method: {err}"))?;
+        let mut builder = self.client.request(method, &request.url);
+        for (name, value) in &request.headers {
+            builder = builder.header(name, value);
+        }
+        if !request.body.is_empty() {
+            builder = builder.body(request.body);
+        }
+        let response = builder
+            .send()
+            .await
+            .map_err(|err| format!("request failed: {err}"))?;
+        let status = response.status().as_u16();
+        let headers = response
+            .headers()
+            .iter()
+            .map(|(name, value)| {
+                (
+                    name.as_str().to_owned(),
+                    value.to_str().unwrap_or_default().to_owned(),
+                )
+            })
+            .collect();
+        let body = response
+            .bytes()
+            .await
+            .map_err(|err| format!("reading response: {err}"))?
+            .to_vec();
+        Ok(sg_extsvc::HttpResponse {
+            status,
+            headers,
+            body,
         })
     }
 }
