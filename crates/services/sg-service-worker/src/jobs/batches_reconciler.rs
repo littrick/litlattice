@@ -67,6 +67,9 @@ pub const SYNC_SLEEP: Duration = Duration::from_secs(3);
 
 /// `errCannotPushToArchivedRepo`.
 pub const CANNOT_PUSH_TO_ARCHIVED_REPO: &str = "cannot push to an archived repo";
+/// `runAfterCommit` when a GitHub-App-signed commit came back unverified.
+pub const REJECT_UNSIGNED_COMMIT: &str =
+    "commit created with GitHub App was not signed, rejecting unverified commit";
 /// `errPublishSameBranch`.
 pub const PUBLISH_SAME_BRANCH: &str =
     "cannot create changeset on the same branch in multiple batch changes";
@@ -759,6 +762,12 @@ pub struct SourceError {
 }
 
 impl SourceError {
+    /// `errors.Wrap`: `"<prefix>: <message>"`, preserving the classification.
+    pub fn with_prefix(mut self, prefix: &str) -> Self {
+        self.message = format!("{prefix}: {}", self.message);
+        self
+    }
+
     pub fn other(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
@@ -823,6 +832,12 @@ pub struct SourceChangeset {
 pub struct PushResult {
     pub changelist_id: Option<String>,
     pub rev: Option<String>,
+    /// The request used for the push. `runAfterCommit`'s `DuplicateCommit`
+    /// reads `CommitInfo.Messages` from it (`executor.go:650-710`).
+    pub request: Option<extsvc::CreateCommitFromPatchRequest>,
+    /// `remoteRepo` as seen by the push: for forks this carries the fork's
+    /// clone URLs/name, unlike a fresh lookup by the target repo id.
+    pub remote_repo: Option<extsvc::Repo>,
 }
 
 /// `sources.ChangesetSource`. Every method corresponds to one code-host call;
@@ -883,10 +898,8 @@ pub trait ChangesetSource: Send + Sync {
 
     /// `sources.GitHubSource.DuplicateCommit`: re-create the pushed commit via
     /// the GitHub REST API so the App installation signs it, then move the ref.
-    ///
-    /// The three REST calls (`GetRef` / `CreateCommit` / `UpdateRef`) are not
-    /// ported yet; the signing source resolution above is wired, this step is
-    /// an explicit seam.
+    /// The request comes from [`PushResult::request`]; failures use the
+    /// baseline's `failed to duplicate commit` wrapper at the call site.
     async fn duplicate_commit(
         &self,
         _remote: &Repo,
@@ -959,6 +972,15 @@ impl ChangesetSourceFactory for NotPortedSourceFactory {
 #[async_trait]
 pub trait RepoMetadataProvider: Send + Sync {
     async fn metadata(&self, kind: &str, repo: &Repo) -> Result<serde_json::Value, SourceError>;
+
+    /// The full `types.Repo` projection used by push config construction:
+    /// metadata plus the clone URLs (`repo.Sources`) that
+    /// `GitserverPushConfig` reads. The default keeps the reduced metadata-only
+    /// behaviour; production overrides it from the existing `repo` row.
+    async fn repo(&self, kind: &str, repo: &Repo) -> Result<extsvc::Repo, SourceError> {
+        let metadata = self.metadata(kind, repo).await?;
+        Ok(ext_repo(kind, repo, metadata))
+    }
 }
 
 /// Default provider: derive the code-host identity from `repo.name`.
@@ -1060,6 +1082,60 @@ impl RepoMetadataProvider for PgRepoMetadataProvider {
             None => NameRepoMetadataProvider.metadata(kind, repo).await,
         }
     }
+
+    async fn repo(&self, kind: &str, repo: &Repo) -> Result<extsvc::Repo, SourceError> {
+        let row = sg_db::repos::RepoStore::new(self.pool.clone())
+            .get_by_id(repo.id)
+            .await
+            .map_err(|err| SourceError::other(format!("loading repository metadata: {err}")))?;
+        let Some(row) = row else {
+            return self.default_repo(kind, repo).await;
+        };
+        let metadata = if row.metadata.is_null() {
+            NameRepoMetadataProvider.metadata(kind, repo).await?
+        } else {
+            row.metadata
+        };
+        // `getCloneURL` reads `repo.Sources`; the reduced reconciler `Repo`
+        // carries no clone URLs, so they come from the existing row. The map
+        // key is only an identity here.
+        let sources = row
+            .sources
+            .into_iter()
+            .enumerate()
+            .map(|(index, source)| {
+                (
+                    format!("{}:{index}", source.external_service_id),
+                    extsvc::RepoSource {
+                        id: source.external_service_id.to_string(),
+                        clone_url: source.clone_url,
+                    },
+                )
+            })
+            .collect();
+        Ok(extsvc::Repo {
+            id: repo.id,
+            name: repo.name.clone(),
+            external_repo: extsvc::ExternalRepoSpec {
+                id: row.external_id.unwrap_or_default(),
+                service_type: extsvc::kind_to_type(kind),
+                service_id: row.external_service_id.unwrap_or_default(),
+            },
+            sources,
+            metadata,
+        })
+    }
+}
+
+impl PgRepoMetadataProvider {
+    async fn default_repo(
+        &self,
+        kind: &str,
+        repo: &Repo,
+    ) -> Result<extsvc::Repo, SourceError> {
+        let metadata = NameRepoMetadataProvider.metadata(kind, repo).await?;
+        Ok(ext_repo(kind, repo, metadata))
+    }
 }
 
 /// Production [`ChangesetSourceFactory`] backed by `sg-extsvc`'s code-host
@@ -1077,6 +1153,9 @@ pub struct ExtsvcSourceFactory {
     repo_metadata: Arc<dyn RepoMetadataProvider>,
     metadata_cache: Arc<Mutex<HashMap<i64, serde_json::Value>>>,
     remote_cache: Arc<Mutex<HashMap<i64, extsvc::Repo>>>,
+    /// `gitserver.Client.CreateCommitFromPatch` (M9.34b production client).
+    /// `None` keeps the explicit not-ported push error.
+    gitserver_commit: Option<Arc<dyn extsvc::GitserverCommitClient>>,
 }
 
 impl ExtsvcSourceFactory {
@@ -1095,7 +1174,18 @@ impl ExtsvcSourceFactory {
             repo_metadata,
             metadata_cache: Arc::new(Mutex::new(HashMap::new())),
             remote_cache: Arc::new(Mutex::new(HashMap::new())),
+            gitserver_commit: None,
         }
+    }
+
+    /// Inject the M9.34b `gitserver.Client.CreateCommitFromPatch` production
+    /// client.
+    pub fn with_gitserver_commit_client(
+        mut self,
+        client: Arc<dyn extsvc::GitserverCommitClient>,
+    ) -> Self {
+        self.gitserver_commit = Some(client);
+        self
     }
 
     /// Convenience constructor with the name-derived metadata provider.
@@ -1366,17 +1456,90 @@ impl ChangesetSource for ExtsvcReconcilerSource {
 
     async fn push_commit(
         &self,
-        _target: &Repo,
-        _ch: &Changeset,
-        _spec: Option<&ChangesetSpec>,
-        _remote: &Repo,
+        target: &Repo,
+        ch: &Changeset,
+        spec: Option<&ChangesetSpec>,
+        remote: &Repo,
     ) -> Result<PushResult, SourceError> {
-        // `GitserverPushConfig`/`BuildCommitOpts` are ported in `sg-extsvc`,
-        // but `CreateCommitFromPatch` needs gitserver, which is not part of
-        // this slice.
-        Err(SourceError::not_ported().with_message(
-            "pushing commits requires gitserver, which is not ported",
-        ))
+        let Some(client) = self.factory.gitserver_commit.as_ref() else {
+            // `CreateCommitFromPatch` needs the production gitserver client;
+            // the composition root injects it (`with_gitserver_commit_client`).
+            return Err(SourceError::not_ported().with_message(
+                "pushing commits requires gitserver, which is not ported",
+            ));
+        };
+        let Some(spec) = spec else {
+            return Err(SourceError::other("changeset has no current spec"));
+        };
+
+        // `pushChangesetPatch`: `GitserverPushConfig(ctx, remoteRepo)` then
+        // `BuildCommitOpts(targetRepo, ch, spec, pushConf)`.
+        // `remoteRepo()` cached the real (possibly forked) projection; prefer
+        // it so a fork push authenticates against the fork's clone URL.
+        let cached_remote = self
+            .factory
+            .remote_cache
+            .lock()
+            .ok()
+            .and_then(|cache| cache.get(&ch.id).cloned());
+        let remote_repo = match cached_remote {
+            Some(remote_repo) => remote_repo,
+            None => self.factory.repo_metadata.repo(&self.factory.kind, remote).await?,
+        };
+        let authenticator = extsvc::push_authenticator_for_source_auth(&self.factory.auth);
+        let push_conf = extsvc::gitserver_push_config(&remote_repo, authenticator.as_ref())
+            .map_err(map_source_error)?;
+        let target_repo = self
+            .factory
+            .repo_metadata
+            .repo(&self.factory.kind, target)
+            .await?;
+        let request =
+            extsvc::build_commit_opts_common(&target_repo, &ext_spec(spec), &push_conf);
+
+        // `executor.pushCommit`: the typed protocol error is wrapped in
+        // `pushCommitError`; `patch does not apply` is non-retryable.
+        let response = extsvc::push_commit(client.as_ref(), request.clone())
+            .await
+            .map_err(map_source_error)?;
+        Ok(PushResult {
+            changelist_id: (!response.changelist_id.is_empty())
+                .then_some(response.changelist_id),
+            rev: Some(response.rev),
+            request: Some(request),
+            remote_repo: Some(remote_repo),
+        })
+    }
+
+    async fn duplicate_commit(
+        &self,
+        remote: &Repo,
+        resp: &PushResult,
+    ) -> Result<CommitVerification, SourceError> {
+        let request = resp.request.as_ref().ok_or_else(|| {
+            SourceError::other("no request from CreateCommitFromPatch response")
+        })?;
+        let rev = resp.rev.as_deref().unwrap_or_default();
+        let remote_repo = match resp.remote_repo.clone() {
+            Some(remote_repo) => remote_repo,
+            None => self.factory.repo_metadata.repo(&self.factory.kind, remote).await?,
+        };
+        // `sources.GitHubSource.DuplicateCommit`'s client API root.
+        let (api_url, _) = sg_extsvc::github::api_root(&self.factory.base_url);
+        let commit = extsvc::duplicate_commit(
+            &api_url,
+            &self.factory.auth,
+            Arc::clone(&self.factory.http),
+            request,
+            &remote_repo,
+            rev,
+        )
+        .await
+        .map_err(map_source_error)?;
+        Ok(CommitVerification {
+            sha: commit.sha,
+            verified: commit.verification.verified,
+        })
     }
 }
 
@@ -1416,6 +1579,7 @@ impl ChangesetSourceFactory for ExtsvcSourceFactory {
                 repo_metadata: self.repo_metadata.clone(),
                 metadata_cache: Arc::clone(&self.metadata_cache),
                 remote_cache: Arc::clone(&self.remote_cache),
+                gitserver_commit: self.gitserver_commit.clone(),
             }),
             source,
         }))
@@ -1777,6 +1941,8 @@ pub struct ConfigSourceFactory {
     github_app_seams: extsvc::GitHubAppTokenSeams,
     /// `conf.RejectUnverifiedCommit()`.
     reject_unverified_commit: bool,
+    /// `gitserver.Client.CreateCommitFromPatch`; see [`ExtsvcSourceFactory`].
+    gitserver_commit: Option<Arc<dyn extsvc::GitserverCommitClient>>,
 }
 
 impl ConfigSourceFactory {
@@ -1792,7 +1958,17 @@ impl ConfigSourceFactory {
             github_app_store: None,
             github_app_seams: extsvc::GitHubAppTokenSeams::offline(http),
             reject_unverified_commit: false,
+            gitserver_commit: None,
         }
+    }
+
+    /// Inject the M9.34b gitserver `CreateCommitFromPatch` production client.
+    pub fn with_gitserver_commit_client(
+        mut self,
+        client: Arc<dyn extsvc::GitserverCommitClient>,
+    ) -> Self {
+        self.gitserver_commit = Some(client);
+        self
     }
 
     /// Enable GitHub App commit signing through the existing App tables.
@@ -1835,13 +2011,14 @@ impl ChangesetSourceFactory for ConfigSourceFactory {
                 message: format!("loading external service: {}", err.message),
                 ..err
             })?;
-        let factory = ExtsvcSourceFactory::new(
+        let mut factory = ExtsvcSourceFactory::new(
             connection.kind,
             connection.base_url,
             connection.auth,
             Arc::clone(&self.http),
             Arc::clone(&self.repo_metadata),
         );
+        factory.gitserver_commit = self.gitserver_commit.clone();
         factory.for_changeset(changeset, target_repo).await
     }
 
@@ -1899,13 +2076,14 @@ impl ChangesetSourceFactory for ConfigSourceFactory {
 
         match resolution {
             extsvc::CommitSigningResolution::UseSource(signing) => {
-                let factory = ExtsvcSourceFactory::new(
+                let mut factory = ExtsvcSourceFactory::new(
                     signing.kind,
                     signing.base_url,
                     signing.auth,
                     Arc::clone(&self.http),
                     Arc::clone(&self.repo_metadata),
                 );
+                factory.gitserver_commit = self.gitserver_commit.clone();
                 Ok(Some(factory.for_changeset(changeset, target_repo).await?))
             }
             extsvc::CommitSigningResolution::SkipNoApp
@@ -2386,9 +2564,7 @@ impl<'a> Executor<'a> {
                     self.ch.external_id = changelist_id;
                 }
                 // `runAfterCommit`: resolve the `COMMIT_SIGNING` GitHub App
-                // source and duplicate the pushed commit through it. The
-                // resolution/error/reject semantics are ported; the REST
-                // duplicate itself is still a seam.
+                // source and duplicate the pushed commit through it.
                 let reject_unverified = self.factory.reject_unverified_commit();
                 match self
                     .factory
@@ -2400,17 +2576,31 @@ impl<'a> Executor<'a> {
                     )
                     .await
                 {
-                    Ok(Some(signing)) => {
-                        if let Err(err) = signing.duplicate_commit(&remote, &resp).await {
+                    Ok(Some(signing)) => match signing.duplicate_commit(&remote, &resp).await {
+                        Ok(verification) => {
+                            if !verification.verified && reject_unverified {
+                                // `errors.New` (retryable), wrapped by the caller.
+                                return (
+                                    after_done,
+                                    Err(ReconcilerError::retryable(format!(
+                                        "running after commit routine: {REJECT_UNSIGNED_COMMIT}"
+                                    ))),
+                                );
+                            }
+                            // `newCommit.Verification.Verified` →
+                            // `UpdateChangesetCommitVerification` needs the
+                            // store transaction; see overview gap.
+                        }
+                        Err(err) => {
                             return (
                                 after_done,
                                 Err(ReconcilerError::from_source(
                                     "running after commit routine",
-                                    err,
+                                    err.with_prefix("failed to duplicate commit"),
                                 )),
                             );
                         }
-                    }
+                    },
                     Ok(None) => {}
                     Err(err) => {
                         return (
