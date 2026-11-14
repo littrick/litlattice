@@ -50,6 +50,7 @@ pub trait CodeIntelPoliciesDatabase: Send + Sync + std::fmt::Debug {
     fn get_configuration_policy_by_id(
         &self,
         id: i32,
+        actor: Actor,
     ) -> Result<Option<ConfigurationPolicy>, String>;
     fn create_configuration_policy(
         &self,
@@ -68,6 +69,7 @@ pub trait CodeIntelPoliciesDatabase: Send + Sync + std::fmt::Debug {
         patterns: &[String],
         limit: i64,
         offset: i64,
+        actor: Actor,
     ) -> Result<(Vec<i32>, i64), String>;
     fn repo_count(&self) -> Result<i64, String>;
     fn get_repository(&self, id: i32) -> Result<RepositoryRow, String>;
@@ -187,7 +189,7 @@ pub fn root_field(
             code_intelligence_configuration_policies(database, arguments, actor)?,
         )),
         "previewRepositoryFilter" => {
-            Ok(Some(preview_repository_filter(database, arguments)?))
+            Ok(Some(preview_repository_filter(database, arguments, actor)?))
         }
         _ => Ok(None),
     }
@@ -235,11 +237,11 @@ pub fn is_node_kind(kind: &str) -> bool {
 pub fn node_field(
     database: &CodeIntelPoliciesHandle,
     id: &str,
-    _actor: Actor,
+    actor: Actor,
 ) -> Result<Option<FieldValue>, ExecError> {
     let policy_id = unmarshal_policy_id(id).map_err(ExecError::new)?;
     match database
-        .get_configuration_policy_by_id(policy_id)
+        .get_configuration_policy_by_id(policy_id, actor)
         .map_err(ExecError::new)?
     {
         Some(policy) => Ok(Some(FieldValue::Object(Arc::new(
@@ -303,6 +305,7 @@ pub fn code_intelligence_configuration_policies(
 pub fn preview_repository_filter(
     database: &CodeIntelPoliciesHandle,
     arguments: &Arguments,
+    actor: Actor,
 ) -> Result<FieldValue, ExecError> {
     let mut page_size =
         int_arg(arguments, "first").unwrap_or(DEFAULT_REPOSITORY_FILTER_PREVIEW_PAGE_SIZE);
@@ -318,7 +321,7 @@ pub fn preview_repository_filter(
     }
 
     let (ids, total_matches) = database
-        .get_repo_ids_by_glob_patterns(&patterns, i64::from(page_size), 0)
+        .get_repo_ids_by_glob_patterns(&patterns, i64::from(page_size), 0, actor)
         .map_err(ExecError::new)?;
     let total_matches = total_matches as i32;
     let total_repo_count = database.repo_count().map_err(ExecError::new)?;

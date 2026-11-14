@@ -1748,10 +1748,13 @@ pub async fn set_rerun_auto_index_jobs_by_filter(
 }
 
 /// `store.GetIndexers` (`summary.go:17`). Returns the distinct `indexer`
-/// filenames across uploads and indexes, ordered ascending.
+/// filenames across uploads and indexes, ordered ascending. The
+/// repository-scoped branch applies `database.AuthzQueryConds` (passed in as
+/// `authz`); the global branch does not reference `repo`.
 pub async fn get_indexer_names(
     pool: &PgPool,
     repository_id: i32,
+    authz: &str,
 ) -> Result<Vec<String>, sqlx::Error> {
     if repository_id == 0 {
         return sqlx::query_scalar(
@@ -1766,10 +1769,10 @@ pub async fn get_indexer_names(
         .await;
     }
 
-    sqlx::query_scalar(
+    sqlx::query_scalar(&format!(
         "WITH repo_candidate AS ( \
              SELECT repo.id FROM repo \
-             WHERE repo.id = $1 AND repo.deleted_at IS NULL AND repo.blocked IS NULL \
+             WHERE repo.id = $1 AND {authz} AND repo.deleted_at IS NULL AND repo.blocked IS NULL \
          ), combined_indexers AS ( \
              SELECT DISTINCT u.indexer FROM lsif_uploads u \
              JOIN repo_candidate r ON r.id = u.repository_id \
@@ -1777,8 +1780,8 @@ pub async fn get_indexer_names(
              SELECT DISTINCT u.indexer FROM lsif_indexes u \
              JOIN repo_candidate r ON r.id = u.repository_id \
          ) \
-         SELECT DISTINCT u.indexer FROM combined_indexers u ORDER BY u.indexer",
-    )
+         SELECT DISTINCT u.indexer FROM combined_indexers u ORDER BY u.indexer"
+    ))
     .bind(repository_id)
     .fetch_all(pool)
     .await

@@ -99,6 +99,11 @@ struct Case {
     repo: Option<i32>,
     #[serde(default)]
     args: ArgumentsFixture,
+    /// M9.42b: per-case actor. Absent/empty = internal (baseline default).
+    #[serde(default)]
+    viewer: String,
+    #[serde(default)]
+    uid: i32,
 }
 
 fn arguments_from_fixture(fixture: &ArgumentsFixture, include_id: bool) -> Arguments {
@@ -456,7 +461,11 @@ async fn codeintel_policies_graphql_harness() {
     let handle: CodeIntelPoliciesHandle = store;
 
     for case in &corpus.cases {
-        let actor = Actor::Internal;
+        let actor = match case.viewer.as_str() {
+            "anonymous" => Actor::Anonymous,
+            "user" => Actor::User { uid: case.uid },
+            _ => Actor::Internal,
+        };
         let document = match case.op.as_str() {
             "connection" => {
                 let arguments = arguments_from_fixture(&case.args, false);
@@ -530,7 +539,7 @@ async fn codeintel_policies_graphql_harness() {
             }
             "preview_repo" => {
                 let arguments = arguments_from_fixture(&case.args, false);
-                match preview_repository_filter(&handle, &arguments) {
+                match preview_repository_filter(&handle, &arguments, actor) {
                     Ok(value) => render_field(value).expect("render preview"),
                     Err(error) => error_document(error.message),
                 }

@@ -195,7 +195,8 @@ impl ChangesetReadDatabase for PgBatchesGraphqlStore {
         let row = block_on(
             sqlx::query(
                 "SELECT changeset_specs.type, COALESCE(changeset_specs.base_rev, ''), \
-                 COALESCE(changeset_specs.diff, ''::bytea) \
+                 COALESCE(changeset_specs.diff, ''::bytea), \
+                 COALESCE(changeset_specs.title, ''), COALESCE(changeset_specs.body, '') \
                  FROM changeset_specs INNER JOIN repo ON repo.id = changeset_specs.repo_id \
                  WHERE repo.deleted_at IS NULL AND changeset_specs.id = $1 LIMIT 1",
             )
@@ -210,6 +211,8 @@ impl ChangesetReadDatabase for PgBatchesGraphqlStore {
             spec_type: row.try_get(0).map_err(error)?,
             base_rev: row.try_get(1).map_err(error)?,
             diff: row.try_get(2).map_err(error)?,
+            title: row.try_get(3).map_err(error)?,
+            body: row.try_get(4).map_err(error)?,
         }))
     }
 
