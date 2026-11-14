@@ -359,6 +359,43 @@ LIMIT 1"#,
             .ok_or_else(Error::search_context_not_found)
     }
 
+    fn get_search_context_for_actor(
+        &self,
+        ctx: &RequestContext,
+        opts: &GetSearchContextOptions,
+    ) -> Result<SearchContext, Error> {
+        let uid = ctx.actor_uid;
+        let mut conds = Vec::new();
+        if opts.namespace_user_id == 0 && opts.namespace_org_id == 0 {
+            conds.push("namespace_user_id IS NULL".to_owned());
+            conds.push("namespace_org_id IS NULL".to_owned());
+        } else if opts.namespace_user_id != 0 {
+            conds.push(format!("namespace_user_id = {}", opts.namespace_user_id));
+        } else {
+            conds.push(format!("namespace_org_id = {}", opts.namespace_org_id));
+        }
+        let sql = format!(
+            r#"SELECT
+    id, context_name, description, public, autodefined,
+    namespace_user_id, namespace_org_id, updated_at, query,
+    namespace_username, namespace_org_name, user_default, user_starred
+FROM (
+{}
+) AS t
+WHERE ({}) AND {} AND context_name = $1
+ORDER BY id ASC
+LIMIT 1"#,
+            self.search_context_query(uid),
+            Self::permissions_condition(ctx),
+            conds.join(" AND "),
+        );
+        let rows = self.fetch_records(&sql, std::slice::from_ref(&opts.name))?;
+        rows.into_iter()
+            .next()
+            .map(record_to_search_context)
+            .ok_or_else(Error::search_context_not_found)
+    }
+
     fn create_search_context_with_repository_revisions(
         &self,
         search_context: &SearchContext,

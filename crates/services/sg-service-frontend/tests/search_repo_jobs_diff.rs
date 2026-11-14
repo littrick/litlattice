@@ -173,6 +173,51 @@ impl PrivateRepoLister for FakeDb {
         self.calls.borrow_mut().push(options.clone());
         Ok(count)
     }
+
+    /// `searchcontexts.ResolveSearchContextSpec`. Global/empty needs no
+    /// database; other specs resolve against `SG_QTEST_DSN` exactly like the
+    /// Go oracle (`search_contexts`/`names`, anonymous actor).
+    fn resolve_search_context(
+        &self,
+        spec: &str,
+    ) -> Result<sg_service_frontend::search_contexts::SearchContext, JobError> {
+        use sg_service_frontend::search_contexts::{
+            get_global_search_context, is_global_search_context_spec,
+            resolve_search_context_spec, RequestContext,
+        };
+        if is_global_search_context_spec(spec) {
+            return Ok(get_global_search_context());
+        }
+        let dsn = std::env::var("SG_QTEST_DSN")
+            .map_err(|_| JobError("SG_QTEST_DSN is not set".to_owned()))?;
+        // sqlx pools need a Tokio context; the store's synchronous bridge uses
+        // `block_in_place`, which requires a multi-thread runtime.
+        static RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> =
+            std::sync::OnceLock::new();
+        let runtime = RUNTIME.get_or_init(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .build()
+                .expect("search context diff runtime")
+        });
+        let pool = runtime
+            .block_on(async {
+                sqlx::postgres::PgPoolOptions::new()
+                    .max_connections(2)
+                    .connect(&dsn)
+                    .await
+            })
+            .map_err(|error| JobError(error.to_string()))?;
+        let _guard = runtime.enter();
+        let store = sg_service_frontend::search_contexts_store::PgSearchContextsStore::new(pool);
+        resolve_search_context_spec(
+            &store,
+            &RequestContext::default(),
+            spec,
+        )
+        .map_err(|error| JobError(error.to_string()))
+    }
 }
 
 struct FakePages {
@@ -501,19 +546,28 @@ fn run_case(case: &Case) -> Value {
     })
 }
 
+fn load_cases(path: &str) -> Vec<Case> {
+    let raw = std::fs::read_to_string(path).unwrap_or_else(|error| panic!("read {path}: {error}"));
+    serde_json::from_str(&raw).unwrap_or_else(|error| panic!("parse {path}: {error}"))
+}
+
 #[test]
 fn search_repo_jobs_diff() {
-    if std::env::var("SG_M937A_DIFF").as_deref() != Ok("1") {
-        eprintln!("SG_M937A_DIFF not set; skipping");
+    if std::env::var("SG_M937A_DIFF").as_deref() != Ok("1")
+        && std::env::var("SG_M938A_DIFF").as_deref() != Ok("1")
+    {
+        eprintln!("SG_M937A_DIFF/SG_M938A_DIFF not set; skipping");
         return;
     }
     let corpus_path = std::env::var("M937A_CORPUS").expect("M937A_CORPUS must be set");
     let out_path = std::env::var("M937A_OUT").expect("M937A_OUT must be set");
 
-    let raw = std::fs::read_to_string(&corpus_path)
-        .unwrap_or_else(|error| panic!("read {corpus_path}: {error}"));
-    let cases: Vec<Case> =
-        serde_json::from_str(&raw).unwrap_or_else(|error| panic!("parse {corpus_path}: {error}"));
+    let mut cases = load_cases(&corpus_path);
+    // M9.38a appends the search-context corpus in the same order as the Go
+    // oracle's concatenated output.
+    if let Ok(context_corpus) = std::env::var("M938A_CORPUS") {
+        cases.extend(load_cases(&context_corpus));
+    }
 
     let output: Vec<Value> = cases.iter().map(run_case).collect();
     let encoded = serde_json::to_string(&output).expect("encode output");

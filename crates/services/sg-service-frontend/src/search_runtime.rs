@@ -723,13 +723,34 @@ impl PrivateRepoLister for PgPrivateRepoLister {
         run_to_completion(async move { count_repos(&pool, &options).await })
             .map_err(|error| JobError(error.to_string()))
     }
+
+    /// `searchcontexts.ResolveSearchContextSpec` for `computeExcludedRepos`.
+    /// Uses the shared Postgres store and the anonymous actor, matching the
+    /// `context.Background()` oracle.
+    fn resolve_search_context(
+        &self,
+        spec: &str,
+    ) -> Result<crate::search_contexts::SearchContext, JobError> {
+        let store = PgSearchContextsStore::new(self.pool.clone());
+        crate::search_contexts::resolve_search_context_spec(
+            &store,
+            &crate::search_contexts::RequestContext::default(),
+            spec,
+        )
+        .map_err(|error| JobError(error.to_string()))
+    }
 }
 
 async fn count_repos(pool: &PgPool, options: &ReposListOptions) -> Result<i64, sqlx::Error> {
-    let mut sql = String::from(
-        "SELECT count(*) FROM repo \
-         WHERE repo.deleted_at IS NULL AND repo.blocked IS NULL",
-    );
+    let mut sql = String::from("SELECT count(*) FROM repo");
+    if options.search_context_id != 0 {
+        // `repos.go:1198-1202`: join the context's repo list when set.
+        sql.push_str(
+            " JOIN (SELECT DISTINCT repo_id, search_context_id FROM search_context_repos) dscr \
+             ON repo.id = dscr.repo_id",
+        );
+    }
+    sql.push_str(" WHERE repo.deleted_at IS NULL AND repo.blocked IS NULL");
     let mut arguments: Vec<String> = Vec::new();
 
     if options.only_private {
@@ -757,6 +778,12 @@ async fn count_repos(pool: &PgPool, options: &ReposListOptions) -> Result<i64, s
     if !options.exclude_pattern.is_empty() {
         arguments.push(options.exclude_pattern.clone());
         sql.push_str(&format!(" AND lower(repo.name) !~* ${}", arguments.len()));
+    }
+    if options.search_context_id != 0 {
+        sql.push_str(&format!(
+            " AND dscr.search_context_id = {}",
+            options.search_context_id
+        ));
     }
     sql.push_str(" AND ");
     sql.push_str(AUTHZ_CONDITION);
