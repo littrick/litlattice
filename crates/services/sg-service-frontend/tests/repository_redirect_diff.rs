@@ -14,13 +14,16 @@
 
 use std::path::Path;
 
+use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use sqlx::PgPool;
 
 use sg_graphql::exec::{execute_with, root_fields, Actor, ExecRequest};
 use sg_graphql::schema::assemble_sdl;
-use sg_service_frontend::graphql_resolvers::{prefetch_repository_redirects, FrontendRootResolver};
+use sg_service_frontend::graphql_resolvers::{
+    prefetch_repository_redirects, FrontendRootResolver, RepoLookup, RepositoryLookup,
+};
 use sg_service_frontend::repository_store::PgRepositoryStore;
 
 const SDL: &str = "
@@ -59,6 +62,61 @@ struct Case {
     variables: Map<String, Value>,
     #[serde(default)]
     uid: i32,
+    /// M9.43b: simulate `backend.ErrRepoSeeOther` for this repo name (the Go
+    /// oracle installs `backend.Mocks.Repos.GetByName`).
+    #[serde(default)]
+    see_other_name: Option<String>,
+    #[serde(default)]
+    see_other_url: Option<String>,
+}
+
+/// `backend.ErrRepoSeeOther` at the repo-store seam: a matching name is a
+/// `Redirect` union value, everything else delegates to Postgres.
+struct SeeOtherStore<'a> {
+    inner: &'a PgRepositoryStore,
+    name: Option<&'a str>,
+    url: Option<&'a str>,
+}
+
+#[async_trait]
+impl RepositoryLookup for SeeOtherStore<'_> {
+    async fn lookup(
+        &self,
+        name_or_uri: &str,
+        authenticated_user_id: i32,
+        bypass_authz: bool,
+    ) -> Result<RepoLookup, String> {
+        if self.name == Some(name_or_uri) {
+            return Ok(RepoLookup::Redirect {
+                url: self.url.unwrap_or_default().to_owned(),
+            });
+        }
+        self.inner
+            .lookup(name_or_uri, authenticated_user_id, bypass_authz)
+            .await
+    }
+
+    async fn by_id(
+        &self,
+        repo_id: i32,
+        authenticated_user_id: i32,
+        bypass_authz: bool,
+    ) -> Result<RepoLookup, String> {
+        self.inner
+            .by_id(repo_id, authenticated_user_id, bypass_authz)
+            .await
+    }
+
+    async fn by_hashed_name(
+        &self,
+        hashed_name: &str,
+        authenticated_user_id: i32,
+        bypass_authz: bool,
+    ) -> Result<RepoLookup, String> {
+        self.inner
+            .by_hashed_name(hashed_name, authenticated_user_id, bypass_authz)
+            .await
+    }
 }
 
 /// `{"message": "error"}` for every GraphQL error.
@@ -113,7 +171,13 @@ async fn repository_redirect_harness() {
             actor,
         };
         let fields = root_fields(&schema, &request);
-        let redirects = prefetch_repository_redirects(&store, None, &fields, actor, admin).await;
+        let case_store = SeeOtherStore {
+            inner: &store,
+            name: case.see_other_name.as_deref(),
+            url: case.see_other_url.as_deref(),
+        };
+        let redirects =
+            prefetch_repository_redirects(&case_store, None, &fields, actor, admin).await;
         let roots = FrontendRootResolver::new().with_repository_redirects(redirects);
         let response = execute_with(&schema, request, Some(&roots));
 

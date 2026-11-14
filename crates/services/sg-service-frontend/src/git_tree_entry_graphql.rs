@@ -13,8 +13,11 @@
 //! service call stays at execution time because [`SymbolsClient::search`] is
 //! itself synchronous (it drives the gRPC call with `run_to_completion`).
 //!
+//! `GitTree.entries`/`files`/`directories` are ported (M9.43b): their
+//! `ReadDir` results are prefetched in [`prefetch_commit_entries`].
+//!
 //! Out of scope: `history`/`languages`/`ownership`/`blame`/`highlight`/
-//! `richHTML`/`rawZipArchiveURL`/`directories`/`files`/`entries` and the
+//! `richHTML`/`rawZipArchiveURL` and the
 //! zoekt symbol index branch (`search.ListAllIndexed`, not ported — the
 //! baseline falls back to the symbols service when it returns nothing).
 //! `Location.resource` (`CodeIntelGitBlob`) is ported as a thin wrapper over
@@ -34,8 +37,8 @@ use crate::git_comparison_graphql::{
     HighlightError, HighlightKey, HighlightRequest, HighlightedFile,
 };
 use crate::git_graphql::{
-    ContentLookup, DirLookup, GitCommitResolverObject, GitObjectSource, GitPrefetch,
-    TreeEntryLookup,
+    ContentLookup, DirEntriesLookup, DirLookup, GitCommitResolverObject, GitObjectSource,
+    GitPrefetch, TreeEntryLookup,
 };
 use crate::graphql_resolvers::{CloneUrlResolver, PageInfoObject, RepositoryObject};
 use crate::search_searcher_client::{SymbolsParameters, SymbolsResponse};
@@ -104,6 +107,33 @@ fn submodule_clone_url(repo_name: &str, submodule_url: &str) -> String {
     } else {
         submodule_url.to_owned()
     }
+}
+
+/// `GitTreeEntryResolver.entries`'s `ReadDir` (`git_tree.go:51-72`): a
+/// `file does not exist` error is an empty tree, everything else is surfaced.
+async fn prefetch_dir_entries(
+    source: &dyn GitObjectSource,
+    prefetch: &mut GitPrefetch,
+    repo: &MinimalRepo,
+    oid: &str,
+    path: &str,
+    recursive: bool,
+) {
+    let key = (repo.id, oid.to_owned(), path.to_owned(), recursive);
+    if prefetch.dir_entries.contains_key(&key) {
+        return;
+    }
+    let lookup = match source
+        .read_dir_stats(repo.id, &repo.name, oid, path, recursive)
+        .await
+    {
+        Ok(entries) => DirEntriesLookup::Found(entries),
+        Err(error) if error.not_exist || error.message.contains("file does not exist") => {
+            DirEntriesLookup::Found(Vec::new())
+        }
+        Err(error) => DirEntriesLookup::Error(error.message),
+    };
+    prefetch.dir_entries.insert(key, lookup);
 }
 
 /// Prefetch `Stat`/`NewFileReader`/`ReadDir`/`GetCommit` for every
@@ -213,6 +243,32 @@ pub async fn prefetch_commit_entries(
                     .tree_highlights
                     .entry(highlight_key)
                     .or_insert(result);
+            }
+        }
+
+        // M9.43b: `GitTree.entries`/`files`/`directories`. `ObjectValue::field`
+        // is synchronous, so every listing (including the ancestor chain) is
+        // read here.
+        if stat.is_dir() {
+            for selection in flattened_selections(field) {
+                if !matches!(selection.name.as_str(), "entries" | "files" | "directories") {
+                    continue;
+                }
+                let recursive = selection.arguments.bool("recursive").unwrap_or(false);
+                prefetch_dir_entries(source, prefetch, repo, oid, path, recursive).await;
+                if selection.name == "entries"
+                    && selection.arguments.bool("ancestors").unwrap_or(false)
+                    && !is_root_path(path)
+                {
+                    let mut parent = path.to_owned();
+                    loop {
+                        parent = go_path_dir(&parent);
+                        prefetch_dir_entries(source, prefetch, repo, oid, &parent, false).await;
+                        if is_root_path(&parent) {
+                            break;
+                        }
+                    }
+                }
             }
         }
 
@@ -684,6 +740,14 @@ fn match_at_line_character(
 // Resolvers
 // ---------------------------------------------------------------------------
 
+/// Which `GitTreeEntryResolver.entries` filter to apply.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EntryKind {
+    All,
+    Files,
+    Directories,
+}
+
 /// `GitTreeEntryResolver` (`git_tree_entry.go:42-53`).
 #[derive(Clone)]
 pub struct GitTreeEntryObject {
@@ -802,6 +866,128 @@ impl GitTreeEntryObject {
         Ok(Some(FieldValue::Json(Json::Bool(is_binary(
             self.content_bytes()?,
         )))))
+    }
+
+    /// `GitTreeEntryResolver.entries`/`files`/`directories`
+    /// (`git_tree.go:31-128`).
+    fn entries_field(
+        &self,
+        kind: EntryKind,
+        arguments: &Arguments,
+    ) -> Result<Option<FieldValue>, ExecError> {
+        let first = arguments.i64("first").map(|value| value as i32);
+        if first.is_some_and(|first| first < 0) {
+            return Err(ExecError::new(
+                "invalid argument for first, must be non-negative",
+            ));
+        }
+        let recursive = arguments.bool("recursive").unwrap_or(false);
+        let ancestors = kind == EntryKind::All && arguments.bool("ancestors").unwrap_or(false);
+        let resolvers = self.entries_resolve(recursive, ancestors, first, kind)?;
+        let element_type = match kind {
+            EntryKind::All => "TreeEntry",
+            EntryKind::Files => "File",
+            EntryKind::Directories => "GitTree",
+        };
+        Ok(Some(FieldValue::List {
+            items: resolvers
+                .into_iter()
+                .map(|entry| {
+                    let object: Arc<dyn ObjectValue> = if kind == EntryKind::Files {
+                        // `files` is declared `[File!]!` (a concrete schema
+                        // type), so `__typename` is "File" in the baseline.
+                        Arc::new(FileObject(entry))
+                    } else {
+                        Arc::new(entry)
+                    };
+                    FieldValue::Object(object)
+                })
+                .collect(),
+            element_type: Some(element_type),
+        }))
+    }
+
+    fn entries_resolve(
+        &self,
+        recursive: bool,
+        ancestors: bool,
+        first: Option<i32>,
+        kind: EntryKind,
+    ) -> Result<Vec<GitTreeEntryObject>, ExecError> {
+        let Some(git) = &self.git else {
+            return Err(ExecError::new(
+                "tree entries require the gitserver GitSource (not wired for this request)",
+            ));
+        };
+        let mut entries =
+            match git.dir_entries(self.repo.id, &self.oid, self.path(), recursive) {
+                Some(DirEntriesLookup::Found(entries)) => entries.clone(),
+                Some(DirEntriesLookup::Error(message)) => {
+                    return Err(ExecError::new(message.clone()))
+                }
+                None => return Err(ExecError::new("tree entries are not prefetched")),
+            };
+
+        // `recursive: true` returns the parent trees too (`ls-tree -r -t`);
+        // drop one entry per level of nesting below the root.
+        if recursive && !self.is_root() {
+            let depth = self.path().trim_matches('/').split('/').count();
+            if depth >= entries.len() {
+                entries.clear();
+            } else {
+                entries.drain(..depth);
+            }
+        }
+
+        entries.sort_by(|left, right| match (left.is_dir(), right.is_dir()) {
+            (true, false) => std::cmp::Ordering::Less,
+            (false, true) => std::cmp::Ordering::Greater,
+            _ => left.name.cmp(&right.name),
+        });
+
+        let max_resolvers = match first {
+            Some(first) => (entries.len() as i32).min(first).max(0) as usize,
+            None => entries.len(),
+        };
+        let mut resolvers = Vec::with_capacity(max_resolvers);
+        for entry in entries {
+            if resolvers.len() >= max_resolvers {
+                break;
+            }
+            let keep = match kind {
+                EntryKind::All => true,
+                EntryKind::Files => !entry.is_dir(),
+                EntryKind::Directories => entry.is_dir(),
+            };
+            if keep {
+                resolvers.push(GitTreeEntryObject {
+                    repo: self.repo.clone(),
+                    oid: self.oid.clone(),
+                    input_rev: self.input_rev.clone(),
+                    stat: entry,
+                    git: self.git.clone(),
+                });
+            }
+        }
+
+        if ancestors && !self.is_root() {
+            let parent_path = go_path_dir(self.path().trim_matches('/'));
+            let parent = GitTreeEntryObject {
+                repo: self.repo.clone(),
+                oid: self.oid.clone(),
+                input_rev: self.input_rev.clone(),
+                stat: sg_git::FileStat::synthetic(&parent_path, true),
+                git: self.git.clone(),
+            };
+            // The baseline recurses with `{Ancestors: true}` only: no `first`,
+            // no `recursive`, no filter.
+            let mut ancestors_entries =
+                parent.entries_resolve(false, true, None, EntryKind::All)?;
+            ancestors_entries.extend(resolvers);
+            return Ok(ancestors_entries);
+        }
+
+        Ok(resolvers)
     }
 
     fn is_single_child_field(&self) -> Result<Option<FieldValue>, ExecError> {
@@ -942,6 +1128,9 @@ impl ObjectValue for GitTreeEntryObject {
                 None => FieldValue::Null,
             })),
             "isSingleChild" => self.is_single_child_field(),
+            "entries" => self.entries_field(EntryKind::All, arguments),
+            "files" => self.entries_field(EntryKind::Files, arguments),
+            "directories" => self.entries_field(EntryKind::Directories, arguments),
             "commit" => Ok(Some(FieldValue::Object(Arc::new(self.commit_object())))),
             "repository" => Ok(Some(FieldValue::Object(Arc::new(self.repository_object())))),
             "content" => self.content_field(arguments),
@@ -953,6 +1142,26 @@ impl ObjectValue for GitTreeEntryObject {
             "symbol" => self.symbol_field(arguments),
             _ => Ok(None),
         }
+    }
+}
+
+/// `GitTree.files` elements are declared as the concrete schema type `File`
+/// (`schema.graphql:5482-5491`), so `__typename` must be "File" even though
+/// the entry is a blob. Every field delegates to the entry resolver.
+pub struct FileObject(pub GitTreeEntryObject);
+
+impl ObjectValue for FileObject {
+    fn type_name(&self) -> &'static str {
+        "File"
+    }
+
+    fn field(
+        &self,
+        field: &str,
+        arguments: &Arguments,
+        actor: Actor,
+    ) -> Result<Option<FieldValue>, ExecError> {
+        self.0.field(field, arguments, actor)
     }
 }
 

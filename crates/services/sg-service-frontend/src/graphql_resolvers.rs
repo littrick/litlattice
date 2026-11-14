@@ -2130,8 +2130,22 @@ pub enum RepoLookup {
         name: String,
         reason: String,
     },
+    /// `backend.ErrRepoSeeOther`: the `repositoryRedirect` `Redirect` union
+    /// member. Other lookup consumers surface
+    /// `repo not found at this location, but might exist at <url>`.
+    Redirect { url: String },
     /// A database failure, surfaced as the resolver error.
     Error(String),
+}
+
+impl RepoLookup {
+    /// `backend.ErrRepoSeeOther.Error()`, used where a see-other result is
+    /// not a valid union member (`Query.repository`, `Query.node`).
+    fn see_other_error(url: &str) -> ExecError {
+        ExecError::new(format!(
+            "repo not found at this location, but might exist at {url}"
+        ))
+    }
 }
 
 /// `Query.repository`'s lookup key. Name and URI are queried separately so a
@@ -3820,11 +3834,37 @@ impl QueryRoot {
                     Some(RepoLookup::Blocked { name, reason }) => Err(ExecError::new(format!(
                         "repository {name} has been blocked. reason: {reason}"
                     ))),
+                    Some(RepoLookup::Redirect { url }) => Err(RepoLookup::see_other_error(&url)),
                     Some(RepoLookup::Error(message)) => Err(ExecError::new(message.clone())),
                     None => Ok(None),
                 }
             }
             _ => Err(ExecError::new("invalid id")),
+        }
+    }
+}
+
+/// `RedirectResolver` (`graphqlbackend.go:934-940`): the `Redirect` union
+/// member returned when the repo store reports `backend.ErrRepoSeeOther`
+/// (M9.43b).
+pub struct RedirectObject {
+    pub url: String,
+}
+
+impl ObjectValue for RedirectObject {
+    fn type_name(&self) -> &'static str {
+        "Redirect"
+    }
+
+    fn field(
+        &self,
+        field: &str,
+        _arguments: &Arguments,
+        _actor: Actor,
+    ) -> Result<Option<FieldValue>, ExecError> {
+        match field {
+            "url" => Ok(Some(FieldValue::Json(Json::Str(self.url.clone())))),
+            _ => Ok(None),
         }
     }
 }
@@ -4330,6 +4370,9 @@ impl ObjectValue for QueryRoot {
                     Some(RepoLookup::Blocked { name, reason }) => Err(ExecError::new(format!(
                         "repository {name} has been blocked. reason: {reason}"
                     ))),
+                    // `Query.repository` does not expose the union member:
+                    // `ErrRepoSeeOther` surfaces as its own error text.
+                    Some(RepoLookup::Redirect { url }) => Err(RepoLookup::see_other_error(&url)),
                     Some(RepoLookup::Error(message)) => Err(ExecError::new(message.clone())),
                     // No prefetch was performed for this request (e.g. the
                     // transport-only resolver); report the field as unported.
@@ -4354,6 +4397,9 @@ impl ObjectValue for QueryRoot {
                         Some(RepoLookup::Blocked { name, reason }) => Err(ExecError::new(format!(
                             "repository {name} has been blocked. reason: {reason}"
                         ))),
+                        Some(RepoLookup::Redirect { url }) => {
+                            Err(RepoLookup::see_other_error(&url))
+                        }
                         Some(RepoLookup::Error(message)) => Err(ExecError::new(message.clone())),
                         // No prefetch (transport-only resolver).
                         None => Ok(None),
@@ -4363,9 +4409,9 @@ impl ObjectValue for QueryRoot {
             },
             // `schemaResolver.RepositoryRedirect`
             // (`graphqlbackend.go:961-1001`): `hashedName` misses are errors,
-            // `name` misses are `null`; the `Redirect` union member is
-            // unreachable in this snapshot (`ErrRepoSeeOther` is never
-            // constructed).
+            // `name` misses are `null`, and a repo-store `ErrRepoSeeOther`
+            // selects the `Redirect` union member (`RepoLookup::Redirect`,
+            // M9.43b).
             "repositoryRedirect" => match repository_redirect_arg(arguments) {
                 RepositoryRedirectArg::Key(key) => match self.repository_redirects.get(&key) {
                     Some(RepoLookup::Found(data)) => Ok(Some(FieldValue::Object(Arc::new(
@@ -4381,6 +4427,9 @@ impl ObjectValue for QueryRoot {
                     Some(RepoLookup::Blocked { name, reason }) => Err(ExecError::new(format!(
                         "repository {name} has been blocked. reason: {reason}"
                     ))),
+                    Some(RepoLookup::Redirect { url }) => Ok(Some(FieldValue::Object(Arc::new(
+                        RedirectObject { url: url.clone() },
+                    )))),
                     Some(RepoLookup::Error(message)) => Err(ExecError::new(message.clone())),
                     // No prefetch was performed for this request.
                     None => Ok(None),
@@ -4402,6 +4451,9 @@ impl ObjectValue for QueryRoot {
                         Some(RepoLookup::NotFound) => Ok(Some(FieldValue::Null)),
                         Some(RepoLookup::Blocked { name, reason }) => Err(ExecError::new(format!(
                             "repository {name} has been blocked. reason: {reason}"
+                        ))),
+                        Some(RepoLookup::Redirect { url }) => Ok(Some(FieldValue::Object(
+                            Arc::new(RedirectObject { url: url.clone() }),
                         ))),
                         Some(RepoLookup::Error(message)) => Err(ExecError::new(message.clone())),
                         None => Ok(None),
@@ -4628,6 +4680,9 @@ impl ObjectValue for QueryRoot {
                                     "repository {name} has been blocked. reason: {reason}"
                                 )))
                             }
+                            Some(RepoLookup::Redirect { url }) => {
+                                return Err(RepoLookup::see_other_error(&url))
+                            }
                             Some(RepoLookup::Error(message)) => {
                                 return Err(ExecError::new(message.clone()))
                             }
@@ -4688,6 +4743,9 @@ impl ObjectValue for QueryRoot {
                             Some(RepoLookup::Blocked { name, reason }) => Err(ExecError::new(
                                 format!("repository {name} has been blocked. reason: {reason}"),
                             )),
+                            Some(RepoLookup::Redirect { url }) => {
+                                Err(RepoLookup::see_other_error(&url))
+                            }
                             Some(RepoLookup::Error(message)) => {
                                 Err(ExecError::new(message.clone()))
                             }
