@@ -186,6 +186,7 @@ impl RepoPagerRuntimeClients {
         crate::search_job::RepoPagerClients {
             pages: self.pages.as_ref(),
             zoekt: self.zoekt.as_ref(),
+            descriptions: None,
         }
     }
 }

@@ -705,6 +705,59 @@ impl PrivateRepoLister for PgPrivateRepoLister {
         run_to_completion(async move { list_minimal_repos(&pool, &options).await })
             .map_err(|error| JobError(error.to_string()))
     }
+
+    /// `db.Repos().Count` (`internal/database/repos.go:322-335`) for
+    /// `computeExcludedRepos`. Applies the same visibility/fork/archive and
+    /// pattern filters as [`list_minimal_repos`], but no limit/order.
+    fn count_repos(&self, options: &ReposListOptions) -> Result<i64, JobError> {
+        let pool = self.pool.clone();
+        let options = options.clone();
+        run_to_completion(async move { count_repos(&pool, &options).await })
+            .map_err(|error| JobError(error.to_string()))
+    }
+}
+
+async fn count_repos(pool: &PgPool, options: &ReposListOptions) -> Result<i64, sqlx::Error> {
+    let mut sql = String::from(
+        "SELECT count(*) FROM repo \
+         WHERE repo.deleted_at IS NULL AND repo.blocked IS NULL",
+    );
+    let mut arguments: Vec<String> = Vec::new();
+
+    if options.only_private {
+        sql.push_str(" AND repo.private");
+    }
+    if options.no_private {
+        sql.push_str(" AND NOT repo.private");
+    }
+    if options.no_forks {
+        sql.push_str(" AND NOT repo.fork");
+    }
+    if options.only_forks {
+        sql.push_str(" AND repo.fork");
+    }
+    if options.no_archived {
+        sql.push_str(" AND NOT repo.archived");
+    }
+    if options.only_archived {
+        sql.push_str(" AND repo.archived");
+    }
+    for pattern in &options.include_patterns {
+        arguments.push(pattern.clone());
+        sql.push_str(&format!(" AND repo.name ~* ${}", arguments.len()));
+    }
+    if !options.exclude_pattern.is_empty() {
+        arguments.push(options.exclude_pattern.clone());
+        sql.push_str(&format!(" AND lower(repo.name) !~* ${}", arguments.len()));
+    }
+    sql.push_str(" AND ");
+    sql.push_str(AUTHZ_CONDITION);
+
+    let mut query = sqlx::query_scalar::<_, i64>(&sql);
+    for argument in &arguments {
+        query = query.bind(argument);
+    }
+    query.fetch_one(pool).await
 }
 
 /// Unrestricted/restricted repo visibility for an anonymous actor

@@ -135,18 +135,34 @@ impl zoekt_search::Streamer for StreamerAdapter<'_> {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ReposListOptions {
     pub only_private: bool,
+    pub no_private: bool,
     pub limit: Option<i64>,
     pub only_forks: bool,
     pub no_forks: bool,
     pub only_archived: bool,
     pub no_archived: bool,
     pub exclude_pattern: String,
+    /// `IncludePatterns` (`database.ReposListOptions`). Used by
+    /// `computeExcludedRepos`, not by `privateReposForActor`.
+    pub include_patterns: Vec<String>,
+    /// `SearchContextID` resolved by `searchcontexts.ResolveSearchContextSpec`.
+    pub search_context_id: i64,
 }
 
-/// Read-only `db.Repos().ListMinimalRepos` semantics used by
-/// `privateReposForActor` (`internal/search/zoekt/indexed_search.go:697-724`).
+/// Read-only `db.Repos().ListMinimalRepos`/`Repos().Count` semantics used by
+/// `privateReposForActor` (`indexed_search.go:697-724`) and
+/// `computeExcludedRepos` (`repos.go:1004-1089`).
 pub trait PrivateRepoLister {
     fn list_minimal_repos(&self, options: &ReposListOptions) -> Result<Vec<MinimalRepo>, JobError>;
+
+    /// `db.Repos().Count`. The default keeps list-only fakes (`M9.8*` seams,
+    /// tests) working: `ComputeExcluded` then reports the explicit seam error
+    /// instead of fabricating a count.
+    fn count_repos(&self, _options: &ReposListOptions) -> Result<i64, JobError> {
+        Err(JobError(
+            "db.Repos().Count is not ported (M9.37a)".to_owned(),
+        ))
+    }
 }
 
 /// `repos.Resolver.Iterator` + `zoekt.Streamer.List` collaborators the
@@ -154,6 +170,10 @@ pub trait PrivateRepoLister {
 pub struct RepoPagerClients<'a> {
     pub pages: &'a dyn crate::search_jobutil_repos::RepoPageSource,
     pub zoekt: &'a dyn crate::search_jobutil_repos::ZoektRepoLister,
+    /// `db.Repos().GetRepoDescriptionsByIDs`; only read by the `RepoSearch`
+    /// tree node when `description:` patterns are present. `None` makes that
+    /// node report the explicit descriptions seam error.
+    pub descriptions: Option<&'a dyn crate::search_jobutil_repos::RepoDescriptionLister>,
 }
 
 impl std::fmt::Debug for RepoPagerClients<'_> {
@@ -468,6 +488,7 @@ fn private_repos_for_actor(
         only_archived: repo_opts.only_archived,
         no_archived: repo_opts.no_archived,
         exclude_pattern: sg_zoekt::languages::union_regexps(&repo_opts.minus_repo_filters),
+        ..ReposListOptions::default()
     };
     match clients.db.list_minimal_repos(&options) {
         Ok(repos) => repos.into_iter().map(|repo| (repo.id, repo.name)).collect(),
