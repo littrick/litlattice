@@ -52,6 +52,51 @@ pub enum GitHubAppRoute {
     Setup,
 }
 
+/// `createGitHubApp` (`githubapp/httpapi.go:495-543`): POST the conversion
+/// URL, require `201 Created`, then map the response to a `GitHubApp`.
+///
+/// This is the direct entry point used by the differential harness; the
+/// handler path calls it through [`GitHubAppServer::convert_manifest`].
+pub fn convert_github_app_manifest(
+    http: &dyn HttpDoer,
+    conversion_url: &str,
+    domain: &str,
+    kind: &str,
+    user_id: i32,
+) -> Result<NewGitHubApp, String> {
+    let (status, body) = http.post(conversion_url)?;
+    if status != 201 {
+        return Err(format!("expected 201 statusCode, got: {status}"));
+    }
+    let response: ManifestResponse =
+        serde_json::from_slice(&body).map_err(|error| error.to_string())?;
+    let html_url = parse_go_url(&response.html_url)?;
+    let parsed = url::Url::parse(&html_url).map_err(|error| error.to_string())?;
+    let scheme = parsed.scheme();
+    let host = parsed.host_str().unwrap_or("").to_owned();
+    // `url.URL.Host` includes the port (e.g. `ghe.example.com:8443`); keep it
+    // so `base_url`/`logo` match the baseline.
+    let authority = match parsed.port() {
+        Some(port) => format!("{host}:{port}"),
+        None => host,
+    };
+    Ok(NewGitHubApp {
+        app_id: response.id,
+        name: response.name,
+        slug: response.slug.clone(),
+        client_id: response.client_id,
+        client_secret: response.client_secret,
+        webhook_secret: response.webhook_secret,
+        private_key: response.pem,
+        base_url: format!("{scheme}://{authority}"),
+        app_url: html_url.clone(),
+        domain: domain.to_owned(),
+        kind: kind.to_owned(),
+        logo: format!("{scheme}://{authority}/identicons/app/app/{}", response.slug),
+        created_by_user_id: user_id,
+    })
+}
+
 /// `githubapp/httpapi.go:64-68` path table.
 pub fn route(path: &str) -> Option<GitHubAppRoute> {
     match path {
@@ -1207,31 +1252,7 @@ impl GitHubAppServer {
         kind: &str,
         user_id: i32,
     ) -> Result<NewGitHubApp, String> {
-        let (status, body) = self.http.post(conversion_url)?;
-        if status != 201 {
-            return Err(format!("expected 201 statusCode, got: {status}"));
-        }
-        let response: ManifestResponse =
-            serde_json::from_slice(&body).map_err(|error| error.to_string())?;
-        let html_url = parse_go_url(&response.html_url)?;
-        let parsed = url::Url::parse(&html_url).map_err(|error| error.to_string())?;
-        let scheme = parsed.scheme();
-        let host = parsed.host_str().unwrap_or("").to_owned();
-        Ok(NewGitHubApp {
-            app_id: response.id,
-            name: response.name,
-            slug: response.slug.clone(),
-            client_id: response.client_id,
-            client_secret: response.client_secret,
-            webhook_secret: response.webhook_secret,
-            private_key: response.pem,
-            base_url: format!("{scheme}://{host}"),
-            app_url: html_url.clone(),
-            domain: domain.to_owned(),
-            kind: kind.to_owned(),
-            logo: format!("{scheme}://{host}/identicons/app/app/{}", response.slug),
-            created_by_user_id: user_id,
-        })
+        convert_github_app_manifest(self.http.as_ref(), conversion_url, domain, kind, user_id)
     }
 
     // -- setupHandler -------------------------------------------------------

@@ -43,6 +43,7 @@ use url::Url;
 
 use crate::auth::{
     Authenticator as _, GitHubAppAuthenticator, InstallationAuthenticator, InstallationTokenCache,
+    OAuthBearerToken,
 };
 use crate::azuredevops::{self, AzureDevOpsAuth, BaseUrl};
 use crate::bitbucketcloud as bbc;
@@ -895,6 +896,27 @@ impl SourceAuth {
             }
         }
     }
+
+    /// The authenticator the GitHub client installs for this source auth
+    /// (`ghauth.FromConnection`): a PAT becomes `*auth.OAuthBearerToken`,
+    /// which sets `Authorization: Bearer <token>` (not the `token` prefix
+    /// used by some REST call sites); an installation token authenticator is
+    /// used as-is.
+    fn as_github_authenticator(&self) -> Option<Arc<dyn crate::auth::Authenticator>> {
+        match self {
+            SourceAuth::None => None,
+            SourceAuth::OAuthToken(token) | SourceAuth::BearerToken(token) => {
+                Some(Arc::new(OAuthBearerToken {
+                    token: token.clone(),
+                    ..OAuthBearerToken::default()
+                }))
+            }
+            SourceAuth::GitHubAppInstallation(auth) => {
+                Some(Arc::clone(auth) as Arc<dyn crate::auth::Authenticator>)
+            }
+            SourceAuth::GitLabPrivateToken(_) | SourceAuth::Basic { .. } => None,
+        }
+    }
 }
 
 async fn send(
@@ -1016,6 +1038,24 @@ impl GitHubSource {
     pub fn with_auto_delete_branch(mut self, enabled: bool) -> Self {
         self.auto_delete_branch = enabled;
         self
+    }
+
+    /// `sources.GitHubSource.ValidateAuthenticator`: `client.GetAuthenticatedUser`
+    /// over the GitHub GraphQL API (`POST {apiRoot}/graphql`, `Accept:
+    /// application/vnd.github.antiope-preview+json`, `Authorization: Bearer`).
+    /// Errors keep the baseline text (`request to <url> returned status ...`,
+    /// `error in GraphQL response: ...`).
+    pub async fn validate_authenticator(&self) -> Result<(), SourceError> {
+        let client = crate::github::V4Client::new(
+            self.api_url.clone(),
+            self.auth.as_github_authenticator(),
+            Arc::clone(&self.http),
+        );
+        client
+            .get_authenticated_user()
+            .await
+            .map(|_| ())
+            .map_err(|err| SourceError::other(err.to_string()))
     }
 
     async fn graphql(&self, query: &str, variables: Value) -> Result<Value, SourceError> {
