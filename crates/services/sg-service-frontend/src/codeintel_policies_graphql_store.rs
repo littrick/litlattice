@@ -59,6 +59,14 @@ impl PgCodeIntelPoliciesStore {
         self.repository_match_limit = limit;
         self
     }
+
+    /// `database.AuthzQueryConds` for the request actor (batches seam).
+    fn authz(&self, actor: Actor) -> Result<String, String> {
+        block_on(crate::batches_graphql_store::authz_conds_async(
+            &self.pool,
+            actor,
+        ))
+    }
 }
 
 impl CodeIntelPoliciesDatabase for PgCodeIntelPoliciesStore {
@@ -72,10 +80,13 @@ impl CodeIntelPoliciesDatabase for PgCodeIntelPoliciesStore {
     fn get_configuration_policy_by_id(
         &self,
         id: i32,
+        actor: Actor,
     ) -> Result<Option<ConfigurationPolicy>, String> {
+        let authz = self.authz(actor)?;
         block_on(codeintel_policies::get_configuration_policy_by_id(
             &self.pool,
             id,
+            &authz,
         ))
     }
 
@@ -122,12 +133,15 @@ impl CodeIntelPoliciesDatabase for PgCodeIntelPoliciesStore {
         patterns: &[String],
         limit: i64,
         offset: i64,
+        actor: Actor,
     ) -> Result<(Vec<i32>, i64), String> {
+        let authz = self.authz(actor)?;
         block_on(codeintel_policies::get_repo_ids_by_glob_patterns(
             &self.pool,
             patterns,
             limit,
             offset,
+            &authz,
         ))
     }
 

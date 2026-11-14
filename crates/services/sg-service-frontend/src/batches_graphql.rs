@@ -1521,6 +1521,29 @@ impl ChangesetObject {
         metadata_view(&self.row.external_service_type, &self.row.metadata)
     }
 
+    /// `changesetResolver.getBranchSpecDescription`
+    /// (`cmd/frontend/internal/batches/resolvers/changeset.go:309`) for
+    /// draft changesets: the current `changeset_specs` row, with the Go error
+    /// texts.
+    fn branch_spec_description(
+        &self,
+    ) -> Result<crate::batches_changeset_read::ChangesetSpecDiffRow, ExecError> {
+        if self.row.current_spec_id == 0 {
+            return Err(ExecError::new("Changeset has no ChangesetSpec"));
+        }
+        let spec = self
+            .db
+            .changeset_read()
+            .ok_or_else(|| ExecError::new("batch changes changeset read surface is not wired"))?
+            .changeset_spec_for_diff(self.row.current_spec_id)
+            .map_err(ExecError::new)?
+            .ok_or_else(|| ExecError::new("no results"))?;
+        if spec.spec_type == "existing" {
+            return Err(ExecError::new("ChangesetSpec imports a changeset"));
+        }
+        Ok(spec)
+    }
+
     fn next_sync_at(&self) -> Result<Option<OffsetDateTime>, ExecError> {
         if self.db.disable_auto_code_host_syncs() {
             return Ok(None);
@@ -1656,9 +1679,9 @@ impl ChangesetObject {
                 if self.row.published() {
                     return Ok(Some(json_str(self.metadata().title)));
                 }
-                // Draft changesets read the title from `changeset_specs`
-                // (`getBranchSpecDescription`), which is not ported.
-                Ok(Some(FieldValue::Null))
+                // Draft changesets read the title from the current
+                // `changeset_specs` row (`getBranchSpecDescription`).
+                Ok(Some(json_str(self.branch_spec_description()?.title)))
             }
             "body" => {
                 if self.row.is_importing() {
@@ -1667,7 +1690,7 @@ impl ChangesetObject {
                 if self.row.published() {
                     return Ok(Some(json_str(self.metadata().body)));
                 }
-                Ok(Some(FieldValue::Null))
+                Ok(Some(json_str(self.branch_spec_description()?.body)))
             }
             "author" => Ok(Some(self.author())),
             // Labels are computed from `changeset_events` in the baseline

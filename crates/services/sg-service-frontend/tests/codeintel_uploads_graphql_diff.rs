@@ -76,6 +76,11 @@ struct Case {
     include_deleted: Option<bool>,
     #[serde(default)]
     matches_only: Option<bool>,
+    /// M9.42b: per-case actor. Absent/empty = internal (baseline default).
+    #[serde(default)]
+    viewer: String,
+    #[serde(default)]
+    uid: i32,
 }
 
 fn case_kind(case: &Case) -> &str {
@@ -448,14 +453,19 @@ async fn codeintel_uploads_graphql_harness() {
     for case in &corpus.cases {
         let arguments = arguments_for(case);
         let kind = case_kind(case);
+        let actor = match case.viewer.as_str() {
+            "anonymous" => Actor::Anonymous,
+            "user" => Actor::User { uid: case.uid },
+            _ => Actor::Internal,
+        };
         let document = match kind {
-            "preciseIndexes" => match precise_indexes(&handle, &arguments, Actor::Internal) {
+            "preciseIndexes" => match precise_indexes(&handle, &arguments, actor) {
                 Ok(value) => render_field(value).unwrap_or_else(|error| {
                     panic!("render {}: {error}", case.name);
                 }),
                 Err(error) => error_document(&error),
             },
-            "indexerKeys" => match indexer_keys(&handle, &arguments, Actor::Internal) {
+            "indexerKeys" => match indexer_keys(&handle, &arguments, actor) {
                 Ok(value) => {
                     let mut map = Map::new();
                     map.insert(
@@ -471,7 +481,7 @@ async fn codeintel_uploads_graphql_harness() {
             "preciseIndexByID" => match precise_index_by_id(
                 &handle,
                 case.id.as_deref().unwrap_or_default(),
-                Actor::Internal,
+                actor,
             ) {
                 Ok(Some(value)) => {
                     let mut map = Map::new();
@@ -491,23 +501,23 @@ async fn codeintel_uploads_graphql_harness() {
                 Err(error) => error_document(&error),
             },
             "deletePreciseIndex" => {
-                let outcome = delete_precise_index(&handle, &arguments, Actor::Internal);
+                let outcome = delete_precise_index(&handle, &arguments, actor);
                 mutation_document(&pool, outcome.err()).await
             }
             "deletePreciseIndexes" => {
-                let outcome = delete_precise_indexes(&handle, &arguments, Actor::Internal);
+                let outcome = delete_precise_indexes(&handle, &arguments, actor);
                 mutation_document(&pool, outcome.err()).await
             }
             "reindexPreciseIndex" => {
-                let outcome = reindex_precise_index(&handle, &arguments, Actor::Internal);
+                let outcome = reindex_precise_index(&handle, &arguments, actor);
                 mutation_document(&pool, outcome.err()).await
             }
             "reindexPreciseIndexes" => {
-                let outcome = reindex_precise_indexes(&handle, &arguments, Actor::Internal);
+                let outcome = reindex_precise_indexes(&handle, &arguments, actor);
                 mutation_document(&pool, outcome.err()).await
             }
             "retentionPolicyOverview" => {
-                match precise_index_by_id(&handle, case.id.as_deref().unwrap_or_default(), Actor::Internal) {
+                match precise_index_by_id(&handle, case.id.as_deref().unwrap_or_default(), actor) {
                     Ok(Some(value)) => {
                         let mut map = Map::new();
                         map.insert(
@@ -539,7 +549,7 @@ async fn codeintel_uploads_graphql_harness() {
                     .as_deref()
                     .and_then(|value| value.parse::<i32>().ok())
                     .unwrap_or_default();
-                match repository_code_intel_summary(&handle, repository_id, Actor::Internal) {
+                match repository_code_intel_summary(&handle, repository_id, actor) {
                     Ok(value) => render_field(value).unwrap_or_else(|error| {
                         panic!("render {}: {error}", case.name);
                     }),
@@ -547,7 +557,7 @@ async fn codeintel_uploads_graphql_harness() {
                 }
             }
             "codeIntelSummary" => {
-                match code_intel_summary(&handle, &Arguments::default(), Actor::Internal) {
+                match code_intel_summary(&handle, &Arguments::default(), actor) {
                     Ok(value) => render_code_intel_summary(value, &arguments).unwrap_or_else(
                         |error| panic!("render {}: {error}", case.name),
                     ),

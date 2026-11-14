@@ -498,11 +498,12 @@ pub const ILLEGAL_CONFIGURATION_POLICY_DELETE: &str =
 pub async fn get_configuration_policy_by_id(
     pool: &PgPool,
     id: i32,
+    authz: &str,
 ) -> Result<Option<ConfigurationPolicy>, String> {
-    // `p.repository_id IS NULL OR (authz)`: the internal actor's authz
-    // predicate is `TRUE`, so the disjunction is always true.
+    // `p.repository_id IS NULL OR (authz)`: global policies are visible to
+    // everyone; repository-specific policies require repository access.
     let query = format!(
-        "{GET_CONFIGURATION_POLICIES_SELECT}WHERE p.id = $1 AND (p.repository_id IS NULL OR TRUE)"
+        "{GET_CONFIGURATION_POLICIES_SELECT}WHERE p.id = $1 AND (p.repository_id IS NULL OR ({authz}))"
     );
     let row = sqlx::query(&query)
         .bind(id)
@@ -618,14 +619,14 @@ pub async fn delete_configuration_policy_by_id(pool: &PgPool, id: i32) -> Result
     tx.commit().await.map_err(|err| err.to_string())
 }
 
-/// `Store.GetRepoIDsByGlobPatterns`: returns `(ids, totalCount)`.
-///
-/// The authz predicate is again the internal-actor `TRUE` form.
+/// `Store.GetRepoIDsByGlobPatterns`: returns `(ids, totalCount)`. The
+/// repository `authz` predicate is applied to both the count and the page.
 pub async fn get_repo_ids_by_glob_patterns(
     pool: &PgPool,
     patterns: &[String],
     limit: i64,
     offset: i64,
+    authz: &str,
 ) -> Result<(Vec<i32>, i64), String> {
     if patterns.is_empty() {
         return Ok((Vec::new(), 0));
@@ -635,7 +636,7 @@ pub async fn get_repo_ids_by_glob_patterns(
     let mut tx = pool.begin().await.map_err(|err| err.to_string())?;
 
     let count_query = format!(
-        "SELECT COUNT(*)\nFROM repo\nWHERE\n\t({condition}) AND\n\tdeleted_at IS NULL AND\n\tblocked IS NULL AND\n\t(TRUE)"
+        "SELECT COUNT(*)\nFROM repo\nWHERE\n\t({condition}) AND\n\tdeleted_at IS NULL AND\n\tblocked IS NULL AND\n\t({authz})"
     );
     let mut count = sqlx::query(&count_query);
     for bind in &binds {
@@ -648,7 +649,7 @@ pub async fn get_repo_ids_by_glob_patterns(
     let total_count: i64 = row.try_get(0).map_err(|err| err.to_string())?;
 
     let select_query = format!(
-        "SELECT id\nFROM repo\nWHERE\n\t({condition}) AND\n\tdeleted_at IS NULL AND\n\tblocked IS NULL AND\n\t(TRUE)\nORDER BY stars DESC NULLS LAST, id\nLIMIT {limit}\nOFFSET {offset}"
+        "SELECT id\nFROM repo\nWHERE\n\t({condition}) AND\n\tdeleted_at IS NULL AND\n\tblocked IS NULL AND\n\t({authz})\nORDER BY stars DESC NULLS LAST, id\nLIMIT {limit}\nOFFSET {offset}"
     );
     let mut select = sqlx::query(&select_query);
     for bind in &binds {

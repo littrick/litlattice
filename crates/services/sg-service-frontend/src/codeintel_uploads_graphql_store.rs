@@ -38,6 +38,7 @@ use crate::codeintel_uploads_graphql::{
     SetRerunAutoIndexJobsOptions, UploadRow,
 };
 use crate::git_graphql::GitObjectSource;
+use sg_graphql::exec::Actor;
 
 pub(crate) fn block_on<F: Future>(future: F) -> F::Output {
     match tokio::runtime::Handle::try_current() {
@@ -355,10 +356,24 @@ impl PgCodeIntelUploadsStore {
         self.auto_indexing_enabled = enabled;
         self
     }
+
+    /// `database.AuthzQueryConds` for the request actor, reusing the batches
+    /// repository-permission seam. The fragment references the `repo` table.
+    fn authz(&self, actor: Actor) -> Result<String, String> {
+        block_on(crate::batches_graphql_store::authz_conds_async(
+            &self.pool,
+            actor,
+        ))
+    }
 }
 
 impl CodeIntelUploadsDatabase for PgCodeIntelUploadsStore {
-    fn get_uploads(&self, opts: &GetUploadsOptions) -> Result<(Vec<UploadRow>, i64), String> {
+    fn get_uploads(
+        &self,
+        opts: &GetUploadsOptions,
+        actor: Actor,
+    ) -> Result<(Vec<UploadRow>, i64), String> {
+        let authz = self.authz(actor)?;
         let mut conditions: Vec<String> = Vec::new();
         let mut params: Vec<Param> = Vec::new();
         let mut ctes: Vec<String> = Vec::new();
@@ -423,6 +438,7 @@ impl CodeIntelUploadsDatabase for PgCodeIntelUploadsStore {
         conditions.push("NOT u.expired".to_owned());
         conditions.push("repo.deleted_at IS NULL".to_owned());
         conditions.push("repo.blocked IS NULL".to_owned());
+        conditions.push(authz);
         let where_clause = if conditions.is_empty() {
             "TRUE".to_owned()
         } else {
@@ -472,7 +488,9 @@ impl CodeIntelUploadsDatabase for PgCodeIntelUploadsStore {
     fn get_auto_index_jobs(
         &self,
         opts: &GetAutoIndexJobsOptions,
+        actor: Actor,
     ) -> Result<(Vec<AutoIndexJobRow>, i64), String> {
+        let authz = self.authz(actor)?;
         let mut conditions: Vec<String> = Vec::new();
         let mut params: Vec<Param> = Vec::new();
         if opts.repository_id != 0 {
@@ -505,6 +523,7 @@ impl CodeIntelUploadsDatabase for PgCodeIntelUploadsStore {
         if let Some(condition) = indexer_condition(&opts.indexer_names, &mut params) {
             conditions.push(condition);
         }
+        conditions.push(authz);
         let where_clause = if conditions.is_empty() {
             "TRUE".to_owned()
         } else {
@@ -541,14 +560,15 @@ impl CodeIntelUploadsDatabase for PgCodeIntelUploadsStore {
         })
     }
 
-    fn get_uploads_by_ids(&self, ids: &[i64]) -> Result<Vec<UploadRow>, String> {
+    fn get_uploads_by_ids(&self, ids: &[i64], actor: Actor) -> Result<Vec<UploadRow>, String> {
         if ids.is_empty() {
             return Ok(Vec::new());
         }
+        let authz = self.authz(actor)?;
         let placeholders: Vec<String> = (1..=ids.len()).map(|i| format!("${i}")).collect();
         let select = upload_select();
         let sql = format!(
-            "{select}\nWHERE repo.deleted_at IS NULL AND u.id IN ({})\nORDER BY u.id",
+            "{select}\nWHERE repo.deleted_at IS NULL AND u.id IN ({}) AND {authz}\nORDER BY u.id",
             placeholders.join(", ")
         );
         let rows = block_on(async {
@@ -565,14 +585,19 @@ impl CodeIntelUploadsDatabase for PgCodeIntelUploadsStore {
             .map_err(|error| error.to_string())
     }
 
-    fn get_auto_index_jobs_by_ids(&self, ids: &[i64]) -> Result<Vec<AutoIndexJobRow>, String> {
+    fn get_auto_index_jobs_by_ids(
+        &self,
+        ids: &[i64],
+        actor: Actor,
+    ) -> Result<Vec<AutoIndexJobRow>, String> {
         if ids.is_empty() {
             return Ok(Vec::new());
         }
+        let authz = self.authz(actor)?;
         let placeholders: Vec<String> = (1..=ids.len()).map(|i| format!("${i}")).collect();
         let select = index_select();
         let sql = format!(
-            "{select}\nWHERE repo.deleted_at IS NULL AND u.id IN ({})\nORDER BY u.id",
+            "{select}\nWHERE repo.deleted_at IS NULL AND u.id IN ({}) AND {authz}\nORDER BY u.id",
             placeholders.join(", ")
         );
         let rows = block_on(async {
@@ -589,10 +614,11 @@ impl CodeIntelUploadsDatabase for PgCodeIntelUploadsStore {
             .map_err(|error| error.to_string())
     }
 
-    fn get_upload_by_id(&self, id: i64) -> Result<Option<UploadRow>, String> {
+    fn get_upload_by_id(&self, id: i64, actor: Actor) -> Result<Option<UploadRow>, String> {
+        let authz = self.authz(actor)?;
         let select = upload_select();
         let sql = format!(
-            "{select}\nWHERE repo.deleted_at IS NULL AND u.state != 'deleted' AND u.id = $1"
+            "{select}\nWHERE repo.deleted_at IS NULL AND u.state != 'deleted' AND u.id = $1 AND {authz}"
         );
         let row = block_on(
             sqlx::query(&sql)
@@ -605,9 +631,14 @@ impl CodeIntelUploadsDatabase for PgCodeIntelUploadsStore {
             .map_err(|error| error.to_string())
     }
 
-    fn get_auto_index_job_by_id(&self, id: i64) -> Result<Option<AutoIndexJobRow>, String> {
+    fn get_auto_index_job_by_id(
+        &self,
+        id: i64,
+        actor: Actor,
+    ) -> Result<Option<AutoIndexJobRow>, String> {
+        let authz = self.authz(actor)?;
         let select = index_select();
-        let sql = format!("{select}\nWHERE repo.deleted_at IS NULL AND u.id = $1");
+        let sql = format!("{select}\nWHERE repo.deleted_at IS NULL AND u.id = $1 AND {authz}");
         let row = block_on(
             sqlx::query(&sql)
                 .bind(id)
@@ -703,10 +734,22 @@ impl CodeIntelUploadsDatabase for PgCodeIntelUploadsStore {
         .map_err(|error| error.to_string())
     }
 
-    fn get_indexer_names(&self, repository_id: i32) -> Result<Vec<String>, String> {
+    fn get_indexer_names(
+        &self,
+        repository_id: i32,
+        actor: Actor,
+    ) -> Result<Vec<String>, String> {
+        // `GetIndexers` only applies authz to the repository-scoped query; the
+        // global query does not reference `repo`.
+        let authz = if repository_id == 0 {
+            "TRUE".to_owned()
+        } else {
+            self.authz(actor)?
+        };
         block_on(sg_db::codeintel_uploads::get_indexer_names(
             &self.pool,
             repository_id,
+            &authz,
         ))
         .map_err(|error| error.to_string())
     }
@@ -1008,7 +1051,11 @@ impl CodeIntelUploadsDatabase for PgCodeIntelUploadsStore {
             .map_err(|error| error.to_string())
     }
 
-    fn recent_activity(&self, repository_id: i32) -> Result<RecentActivityRows, String> {
+    fn recent_activity(
+        &self,
+        repository_id: i32,
+        actor: Actor,
+    ) -> Result<RecentActivityRows, String> {
         let upload_groups = block_on(
             sg_db::codeintel_autoindexing_summary::recent_uploads_summary(
                 &self.pool,
@@ -1035,12 +1082,12 @@ impl CodeIntelUploadsDatabase for PgCodeIntelUploadsStore {
         let uploads = if upload_ids.is_empty() {
             Vec::new()
         } else {
-            self.get_uploads_by_ids(&upload_ids)?
+            self.get_uploads_by_ids(&upload_ids, actor)?
         };
         let indexes = if index_ids.is_empty() {
             Vec::new()
         } else {
-            self.get_auto_index_jobs_by_ids(&index_ids)?
+            self.get_auto_index_jobs_by_ids(&index_ids, actor)?
         };
         Ok(RecentActivityRows { uploads, indexes })
     }

@@ -100,12 +100,17 @@ pub struct ChangesetReadExtra {
     pub sync_state: ChangesetSyncState,
 }
 
-/// The `changeset_specs` columns `getBranchSpecDescription` needs.
+/// The `changeset_specs` columns `GetChangesetSpecByID` /
+/// `getBranchSpecDescription` need: the diff preview reads
+/// `type`/`base_rev`/`diff`, while draft `Changeset.title`/`body` read
+/// `title`/`body`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChangesetSpecDiffRow {
     pub spec_type: String,
     pub base_rev: String,
     pub diff: Vec<u8>,
+    pub title: String,
+    pub body: String,
 }
 
 /// `btypes.ChangesetsStats`.

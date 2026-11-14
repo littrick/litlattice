@@ -241,21 +241,35 @@ pub struct SetRerunAutoIndexJobsOptions {
 // ---------------------------------------------------------------------------
 
 pub trait CodeIntelUploadsDatabase: Send + Sync {
-    /// `store.GetUploads` (uploads half of `PreciseIndexes`).
-    fn get_uploads(&self, opts: &GetUploadsOptions) -> Result<(Vec<UploadRow>, i64), String>;
-    /// `store.GetAutoIndexJobs` (`WithoutUpload: true`).
+    /// `store.GetUploads` (uploads half of `PreciseIndexes`), with
+    /// `database.AuthzQueryConds` for the request actor.
+    fn get_uploads(
+        &self,
+        opts: &GetUploadsOptions,
+        actor: Actor,
+    ) -> Result<(Vec<UploadRow>, i64), String>;
+    /// `store.GetAutoIndexJobs` (`WithoutUpload: true`), with authz.
     fn get_auto_index_jobs(
         &self,
         opts: &GetAutoIndexJobsOptions,
+        actor: Actor,
     ) -> Result<(Vec<AutoIndexJobRow>, i64), String>;
-    /// `store.GetUploadsByIDs` (dataloader backfill).
-    fn get_uploads_by_ids(&self, ids: &[i64]) -> Result<Vec<UploadRow>, String>;
-    /// `store.GetAutoIndexJobsByIDs` (dataloader backfill).
-    fn get_auto_index_jobs_by_ids(&self, ids: &[i64]) -> Result<Vec<AutoIndexJobRow>, String>;
-    /// `store.GetUploadByID` (single-row `PreciseIndexByID`).
-    fn get_upload_by_id(&self, id: i64) -> Result<Option<UploadRow>, String>;
-    /// `store.GetAutoIndexJobByID` (single-row `PreciseIndexByID`).
-    fn get_auto_index_job_by_id(&self, id: i64) -> Result<Option<AutoIndexJobRow>, String>;
+    /// `store.GetUploadsByIDs` (dataloader backfill), with authz.
+    fn get_uploads_by_ids(&self, ids: &[i64], actor: Actor) -> Result<Vec<UploadRow>, String>;
+    /// `store.GetAutoIndexJobsByIDs` (dataloader backfill), with authz.
+    fn get_auto_index_jobs_by_ids(
+        &self,
+        ids: &[i64],
+        actor: Actor,
+    ) -> Result<Vec<AutoIndexJobRow>, String>;
+    /// `store.GetUploadByID` (single-row `PreciseIndexByID`), with authz.
+    fn get_upload_by_id(&self, id: i64, actor: Actor) -> Result<Option<UploadRow>, String>;
+    /// `store.GetAutoIndexJobByID` (single-row `PreciseIndexByID`), with authz.
+    fn get_auto_index_job_by_id(
+        &self,
+        id: i64,
+        actor: Actor,
+    ) -> Result<Option<AutoIndexJobRow>, String>;
     /// `store.DeleteUploadByID`.
     fn delete_upload_by_id(&self, id: i64) -> Result<(), String>;
     /// `store.DeleteAutoIndexJobByID`.
@@ -275,8 +289,10 @@ pub trait CodeIntelUploadsDatabase: Send + Sync {
         &self,
         opts: &SetRerunAutoIndexJobsOptions,
     ) -> Result<(), String>;
-    /// `store.GetIndexers` (`Query.indexerKeys`).
-    fn get_indexer_names(&self, repository_id: i32) -> Result<Vec<String>, String>;
+    /// `store.GetIndexers` (`Query.indexerKeys`); the repository-scoped query
+    /// applies `database.AuthzQueryConds`, the global one does not.
+    fn get_indexer_names(&self, repository_id: i32, actor: Actor)
+        -> Result<Vec<String>, String>;
     /// `store.GetAuditLogsForUpload` (`PreciseIndex.auditLogs`).
     fn get_audit_logs_for_upload(&self, upload_id: i32) -> Result<Vec<AuditLogRow>, String>;
     /// `store.NumRepositoriesWithCodeIntelligence` (`Query.codeIntelSummary`).
@@ -336,7 +352,11 @@ pub trait CodeIntelUploadsDatabase: Send + Sync {
     ) -> Result<Option<OffsetDateTime>, String>;
     /// `store.GetRecentUploadsSummary` + `GetRecentAutoIndexJobsSummary`
     /// (grouped, then flattened; the caller sorts by id).
-    fn recent_activity(&self, repository_id: i32) -> Result<RecentActivityRows, String>;
+    fn recent_activity(
+        &self,
+        repository_id: i32,
+        actor: Actor,
+    ) -> Result<RecentActivityRows, String>;
     /// `conf.CodeIntelAutoIndexingEnabled`.
     fn auto_indexing_enabled(&self) -> bool {
         false
@@ -593,7 +613,7 @@ pub struct PreciseIndexRecord {
 pub fn precise_indexes(
     db: &CodeIntelUploadsHandle,
     arguments: &Arguments,
-    _actor: Actor,
+    actor: Actor,
 ) -> Result<FieldValue, ExecError> {
     let page_size = arguments
         .i64("first")
@@ -687,7 +707,7 @@ pub fn precise_indexes(
                 allow_deleted_upload,
                 limit: page_size,
                 offset: upload_offset,
-            })
+            }, actor)
             .map_err(ExecError::new)?;
         uploads = rows;
         total_upload_count = total;
@@ -705,7 +725,7 @@ pub fn precise_indexes(
                 without_upload: true,
                 limit: page_size,
                 offset: index_offset,
-            })
+            }, actor)
             .map_err(ExecError::new)?;
         auto_index_jobs = rows;
         total_jobs_count = total;
@@ -777,7 +797,7 @@ pub fn precise_indexes(
     let index_by_id: HashMap<i64, AutoIndexJobRow> = if index_ids.is_empty() {
         HashMap::new()
     } else {
-        db.get_auto_index_jobs_by_ids(&index_ids)
+        db.get_auto_index_jobs_by_ids(&index_ids, actor)
             .map_err(ExecError::new)?
             .into_iter()
             .map(|job| (job.id, job))
@@ -786,7 +806,7 @@ pub fn precise_indexes(
     let upload_by_id: HashMap<i64, UploadRow> = if upload_ids.is_empty() {
         HashMap::new()
     } else {
-        db.get_uploads_by_ids(&upload_ids)
+        db.get_uploads_by_ids(&upload_ids, actor)
             .map_err(ExecError::new)?
             .into_iter()
             .map(|upload| (upload.id, upload))
@@ -837,13 +857,13 @@ pub fn precise_indexes(
 pub fn precise_index_by_id(
     db: &CodeIntelUploadsHandle,
     id: &str,
-    _actor: Actor,
+    actor: Actor,
 ) -> Result<Option<FieldValue>, ExecError> {
     let (upload_id, index_id) = decode_precise_index_id(id).map_err(ExecError::new)?;
 
     if let Some(upload_id) = upload_id {
         let Some(upload) = db
-            .get_upload_by_id(upload_id)
+            .get_upload_by_id(upload_id, actor)
             .map_err(ExecError::new)?
         else {
             return Ok(None);
@@ -851,7 +871,7 @@ pub fn precise_index_by_id(
         // `newPreciseIndexResolver`: load the upload's associated index.
         let index = match upload.associated_index_id {
             Some(index_id) => db
-                .get_auto_index_job_by_id(index_id)
+                .get_auto_index_job_by_id(index_id, actor)
                 .map_err(ExecError::new)?,
             None => None,
         };
@@ -873,14 +893,16 @@ pub fn precise_index_by_id(
         return Err(ExecError::new("invalid identifier"));
     };
     let Some(index) = db
-        .get_auto_index_job_by_id(index_id)
+        .get_auto_index_job_by_id(index_id, actor)
         .map_err(ExecError::new)?
     else {
         return Ok(None);
     };
     // `newPreciseIndexResolver`: load the index's associated upload.
     let upload = match index.associated_upload_id {
-        Some(upload_id) => db.get_upload_by_id(upload_id).map_err(ExecError::new)?,
+        Some(upload_id) => db
+            .get_upload_by_id(upload_id, actor)
+            .map_err(ExecError::new)?,
         None => None,
     };
     let audit_logs = match &upload {
@@ -904,14 +926,14 @@ pub fn precise_index_by_id(
 pub fn indexer_keys(
     db: &CodeIntelUploadsHandle,
     arguments: &Arguments,
-    _actor: Actor,
+    actor: Actor,
 ) -> Result<FieldValue, ExecError> {
     let repository_id = match arguments.string("repo") {
         Some(id) => unmarshal_relay_id(id).map_err(ExecError::new)?,
         None => 0,
     };
     let names = db
-        .get_indexer_names(repository_id)
+        .get_indexer_names(repository_id, actor)
         .map_err(ExecError::new)?;
     let mut keys: Vec<String> = names
         .into_iter()
@@ -951,8 +973,10 @@ pub fn repository_code_intel_summary(
     let last_index_scan = db
         .last_index_scan(repository_id)
         .map_err(ExecError::new)?;
-    let activity = db.recent_activity(repository_id).map_err(ExecError::new)?;
-    let nodes = repository_summary_nodes(db, activity)?;
+    let activity = db
+        .recent_activity(repository_id, actor)
+        .map_err(ExecError::new)?;
+    let nodes = repository_summary_nodes(db, activity, actor)?;
     Ok(FieldValue::Object(Arc::new(RepositorySummaryObject {
         nodes,
         last_upload_retention_scan,
@@ -968,6 +992,7 @@ pub fn repository_code_intel_summary(
 fn repository_summary_nodes(
     db: &CodeIntelUploadsHandle,
     activity: RecentActivityRows,
+    actor: Actor,
 ) -> Result<Vec<PreciseIndexObject>, ExecError> {
     let mut index_by_id: std::collections::HashMap<i64, AutoIndexJobRow> = activity
         .indexes
@@ -983,7 +1008,7 @@ fn repository_summary_nodes(
         .collect();
     if !missing_index_ids.is_empty() {
         for index in db
-            .get_auto_index_jobs_by_ids(&missing_index_ids)
+            .get_auto_index_jobs_by_ids(&missing_index_ids, actor)
             .map_err(ExecError::new)?
         {
             index_by_id.insert(index.id, index);
@@ -1004,7 +1029,7 @@ fn repository_summary_nodes(
         .collect();
     if !missing_upload_ids.is_empty() {
         for upload in db
-            .get_uploads_by_ids(&missing_upload_ids)
+            .get_uploads_by_ids(&missing_upload_ids, actor)
             .map_err(ExecError::new)?
         {
             upload_by_id.insert(upload.id, upload);
