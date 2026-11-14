@@ -1,26 +1,40 @@
 #![forbid(unsafe_code)]
 
-//! M9.33c: the inbound GitHub App installation webhook.
+//! M9.33c/M9.34c/M9.35c: the inbound webhook routes.
 //!
-//! Ports the `installation` path of the generic webhook route
-//! (`/.api/webhooks/{webhook_uuid}`):
+//! Ports the generic webhook route (`/.api/webhooks/{webhook_uuid}`):
 //!
 //! * `cmd/frontend/internal/webhooks/webhooks.go` — `handler`, `Dispatch`
-//!   (`defaultHandlers` registers `ping` and `installation` for `GITHUB`);
+//!   (`defaultHandlers` registers `ping`/`installation` for `GITHUB` and
+//!   `ping` for `BITBUCKETSERVER`; other kinds have no default handler);
 //! * `cmd/frontend/internal/webhooks/github_webhooks.go` — secret branch,
 //!   `github.ValidatePayload`, `github.ParseWebHook`;
 //! * `internal/github_apps/store` — `GetByAppID` and the
-//!   `github_app_installs` upsert (`Install`).
+//!   `github_app_installs` upsert (`Install`);
+//! * `gitlab_webhooks.go` / `bitbucketcloud_webhooks.go` /
+//!   `azuredevops_webhooks.go` (M9.35c) — token/signature checks, event
+//!   parsing and `Dispatch(<event kind>)`;
+//! * `internal/extsvc/{gitlab,bitbucketcloud,azuredevops}` event parsing.
 //!
 //! No new table, column or Redis key: the existing `webhooks`,
-//! `github_apps` and `github_app_installs` rows are reused, and the webhook
+//! `github_apps` and `github_app_installs` rows are reused. The webhook
 //! signature contract is the go-github v55 one (`X-Hub-Signature-256` then
-//! `X-Hub-Signature`, HMAC-SHA1/256/512 over the raw body).
+//! `X-Hub-Signature`, HMAC-SHA1/256/512 over the raw body); GitLab uses the
+//! shared `X-Gitlab-Token`, and Azure DevOps is unsigned.
 //!
-//! Errata (source wins): the baseline registers **only** `installation`. An
-//! `installation_repositories` event parses (it is a known go-github event)
-//! but dispatches to no handler, which is an HTTP 200 no-op; this module
-//! reproduces that.
+//! Errata (source wins):
+//!
+//! * The baseline registers **only** `installation` (GitHub). An
+//!   `installation_repositories` event parses but dispatches to no handler,
+//!   an HTTP 200 no-op; this module reproduces that.
+//! * `gitlab_webhooks.go` never reads `X-Gitlab-Event`: the event kind is the
+//!   payload's `object_kind`. GitLab's unknown object kind (and a
+//!   `merge_request` with an unknown/missing action) answers **204** with the
+//!   error text, not 200/400.
+//! * In production `internal/httpapi/webhookhandlers` registers batches/sync
+//!   handlers for these kinds; those handler side effects are outside this
+//!   slice, so a successfully parsed event is a no-op here, matching
+//!   `Dispatch` with no registered handler.
 
 use bytes::Bytes;
 use http::header::HeaderValue;
@@ -45,6 +59,18 @@ const X_GITHUB_EVENT: &str = "x-github-event";
 const KIND_GITHUB: &str = "GITHUB";
 /// `extsvc.KindBitbucketServer` (`VariantBitbucketServer.AsKind()`).
 const KIND_BITBUCKET_SERVER: &str = "BITBUCKETSERVER";
+/// `extsvc.KindGitLab`.
+const KIND_GITLAB: &str = "GITLAB";
+/// `extsvc.KindBitbucketCloud`.
+const KIND_BITBUCKET_CLOUD: &str = "BITBUCKETCLOUD";
+/// `extsvc.KindAzureDevOps`.
+const KIND_AZURE_DEVOPS: &str = "AZUREDEVOPS";
+
+/// `gitlab.TokenHeaderName`.
+const X_GITLAB_TOKEN: &str = "x-gitlab-token";
+/// `gitlab_webhooks.go` reads the event key from `bitbucketcloud`'s
+/// `X-Event-Key` header (never `X-Gitlab-Event`; see the module errata).
+const X_EVENT_KEY: &str = "x-event-key";
 
 /// `ghtypes.UserCredentialGitHubAppKind` / `SiteCredentialGitHubAppKind`.
 const KIND_USER_CREDENTIAL: &str = "USER_CREDENTIAL";
@@ -250,8 +276,10 @@ where
     match webhook.code_host_kind.as_str() {
         KIND_GITHUB => github_response(req, deps, secret).await,
         KIND_BITBUCKET_SERVER => bitbucket_server_response(req, secret).await,
-        // GITLAB / BITBUCKET_CLOUD / AZURE_DEVOPS have Go handlers but are out
-        // of this slice; unknown kinds hit the same default in the baseline.
+        KIND_GITLAB => gitlab_response(req, secret).await,
+        KIND_BITBUCKET_CLOUD => bitbucket_cloud_response(req, secret).await,
+        KIND_AZURE_DEVOPS => azure_devops_response(req).await,
+        // Remaining kinds hit the same default in the baseline.
         other => http_error(
             StatusCode::NOT_IMPLEMENTED,
             &format!(
@@ -363,6 +391,351 @@ fn parse_bitbucket_server_event(event_key: &str, body: &[u8]) -> Result<(), Stri
             go_quote(other)
         )),
     }
+}
+
+// ---------------------------------------------------------------------------
+// GitLab (`gitlab_webhooks.go` + `internal/extsvc/gitlab/webhooks`)
+// ---------------------------------------------------------------------------
+
+/// `handleGitLabWebHook` + `HandleGitLabWebhook`.
+///
+/// Errata (source wins): the Go handler never reads `X-Gitlab-Event`; the event
+/// kind is the payload's `object_kind`. The only header is the shared
+/// `X-Gitlab-Token`, compared with `subtle.ConstantTimeCompare`.
+async fn gitlab_response<B>(req: &mut Request<B>, secret: &str) -> Response<BoxBody>
+where
+    B: hyper::body::Body<Data = Bytes> + Unpin + Send,
+    B::Error: std::fmt::Display,
+{
+    let body = if secret.is_empty() {
+        match read_body(req).await {
+            Ok(body) => body,
+            Err(_error) => {
+                return http_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Error while reading request body.",
+                )
+            }
+        }
+    } else {
+        if !constant_time_eq(header(req, X_GITLAB_TOKEN).as_bytes(), secret.as_bytes()) {
+            return http_error(StatusCode::BAD_REQUEST, "Could not validate payload with secret.");
+        }
+        match read_body(req).await {
+            Ok(body) => body,
+            // Any `gitlabValidatePayload` error (including a read failure after
+            // the token check) is answered as a 400 by the caller.
+            Err(_error) => {
+                return http_error(StatusCode::BAD_REQUEST, "Could not validate payload with secret.")
+            }
+        }
+    };
+
+    handle_gitlab_event(&body)
+}
+
+/// `gitlab/webhooks.UnmarshalEvent` dispatch, including the downcast path.
+fn handle_gitlab_event(payload: &[u8]) -> Response<BoxBody> {
+    let object_kind = match gitlab_object_kind(payload) {
+        Ok(kind) => kind,
+        Err(error) => {
+            return http_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("determining object kind: {error}"),
+            )
+        }
+    };
+
+    match object_kind.as_str() {
+        "merge_request" => match gitlab_merge_request_action(payload) {
+            Ok(action) => match action.as_str() {
+                "approved" | "close" | "merge" | "reopen" | "unapproved" | "update" => {
+                    // `Dispatch` has no handler for these kinds -> no-op.
+                    empty_ok()
+                }
+                other => {
+                    // `downcast` wraps `ErrObjectKindUnknown`; the handler
+                    // answers 204 with the error text.
+                    no_content(format!(
+                        "unknown merge request event action: {other}: unknown object kind"
+                    ))
+                }
+            },
+            // `mergeRequestEvent` itself failed to unmarshal.
+            Err(error) => http_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("unmarshalling event kind from webhook payload: {error}"),
+            ),
+        },
+        // `PipelineEvent` / `PushEvent`: syntactically valid payloads unmarshal;
+        // typed field-level decode differences are documented in the overview.
+        "pipeline" | "push" => empty_ok(),
+        other => no_content(format!("kind: {other}: unknown object kind")),
+    }
+}
+
+/// The first `json.Unmarshal` into `struct{ ObjectKind string }`, with the
+/// `encoding/json` error text the Go handler would produce for the shapes the
+/// corpus covers.
+fn gitlab_object_kind(payload: &[u8]) -> Result<String, String> {
+    use serde_json::Value;
+
+    let value: Value = serde_json::from_slice(payload)
+        .map_err(|error| go_json_syntax_error(payload, &error))?;
+
+    match value {
+        // `json.Unmarshal(null, &struct)` succeeds and leaves the zero value.
+        Value::Null => Ok(String::new()),
+        Value::Object(map) => match map.get("object_kind") {
+            None | Some(Value::Null) => Ok(String::new()),
+            Some(Value::String(kind)) => Ok(kind.clone()),
+            Some(other) => Err(format!(
+                "json: cannot unmarshal {} into Go struct field .object_kind of type string",
+                go_json_value_kind(other)
+            )),
+        },
+        other => Err(format!(
+            "json: cannot unmarshal {} into Go value of type struct {{ ObjectKind string \"json:\\\"object_kind\\\"\" }}",
+            go_json_value_kind(&other)
+        )),
+    }
+}
+
+/// `mergeRequestEvent.downcast`: the `object_attributes.action` string.
+fn gitlab_merge_request_action(payload: &[u8]) -> Result<String, String> {
+    use serde_json::Value;
+
+    // Re-parsing cannot fail: `gitlab_object_kind` already accepted the payload.
+    let value: Value = serde_json::from_slice(payload).map_err(|error| error.to_string())?;
+    match value {
+        Value::Null => Ok(String::new()),
+        Value::Object(map) => match map.get("object_attributes") {
+            None | Some(Value::Null) => Ok(String::new()),
+            Some(Value::Object(attributes)) => match attributes.get("action") {
+                None | Some(Value::Null) => Ok(String::new()),
+                Some(Value::String(action)) => Ok(action.clone()),
+                Some(other) => Err(format!(
+                    "json: cannot unmarshal {} into Go struct field mergeRequestEventObjectAttributes.action of type string",
+                    go_json_value_kind(other)
+                )),
+            },
+            Some(other) => Err(format!(
+                "json: cannot unmarshal {} into Go struct field mergeRequestEvent.object_attributes of type webhooks.mergeRequestEventObjectAttributes",
+                go_json_value_kind(other)
+            )),
+        },
+        // Top-level non-objects were rejected by `gitlab_object_kind`.
+        _ => Ok(String::new()),
+    }
+}
+
+/// `encoding/json`'s value kind names used in unmarshal errors.
+fn go_json_value_kind(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "bool",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
+    }
+}
+
+/// Best-effort `encoding/json` syntax error text. Only the shapes the corpus
+/// exercises are reproduced exactly (empty/truncated input, trailing
+/// characters).
+fn go_json_syntax_error(payload: &[u8], error: &serde_json::Error) -> String {
+    if String::from_utf8_lossy(payload).trim().is_empty() || error.is_eof() {
+        return "unexpected end of JSON input".to_owned();
+    }
+    let message = error.to_string();
+    if message.contains("trailing characters") {
+        // serde's column is 1-based; Go reports the offending byte.
+        let index = error.column().saturating_sub(1);
+        if let Some(ch) = String::from_utf8_lossy(payload).chars().nth(index) {
+            return format!("invalid character {ch:?} after top-level value");
+        }
+    }
+    message
+}
+
+// ---------------------------------------------------------------------------
+// Bitbucket Cloud (`bitbucketcloud_webhooks.go`)
+// ---------------------------------------------------------------------------
+
+/// `HandleBitbucketCloudWebhook`: body, optional `X-Hub-Signature` (go-github
+/// HMAC), `X-Event-Key`, `bitbucketcloud.ParseWebhookEvent`, then `Dispatch`.
+async fn bitbucket_cloud_response<B>(req: &mut Request<B>, secret: &str) -> Response<BoxBody>
+where
+    B: hyper::body::Body<Data = Bytes> + Unpin + Send,
+    B::Error: std::fmt::Display,
+{
+    let body = match read_body(req).await {
+        Ok(body) => body,
+        Err(_error) => {
+            return http_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Error while reading request body.",
+            )
+        }
+    };
+
+    if !secret.is_empty() {
+        let signature = header(req, X_HUB_SIGNATURE);
+        if validate_github_signature(signature, &body, secret.as_bytes()).is_err() {
+            return http_error(StatusCode::BAD_REQUEST, "Could not validate payload with secret.");
+        }
+    }
+
+    let event_key = header(req, X_EVENT_KEY).to_owned();
+    match parse_bitbucket_cloud_event(&event_key, &body) {
+        Ok(()) => empty_ok(),
+        Err(BitbucketCloudParseError::UnknownKey) => http_error(
+            StatusCode::NOT_FOUND,
+            &format!("unknown webhook event key: {event_key}"),
+        ),
+        Err(BitbucketCloudParseError::Json(text)) => {
+            http_error(StatusCode::INTERNAL_SERVER_ERROR, &text)
+        }
+    }
+}
+
+enum BitbucketCloudParseError {
+    /// `UnknownWebhookEventKey`: the handler answers 404.
+    UnknownKey,
+    /// Any `json.Unmarshal` error into the typed event: 500 with the raw text.
+    Json(String),
+}
+
+/// `bitbucketcloud.ParseWebhookEvent`'s key switch.
+fn parse_bitbucket_cloud_event(
+    event_key: &str,
+    payload: &[u8],
+) -> Result<(), BitbucketCloudParseError> {
+    match event_key {
+        "pullrequest:approved"
+        | "pullrequest:changes_request_created"
+        | "pullrequest:changes_request_removed"
+        | "pullrequest:comment_created"
+        | "pullrequest:comment_deleted"
+        | "pullrequest:comment_updated"
+        | "pullrequest:fulfilled"
+        | "pullrequest:rejected"
+        | "pullrequest:unapproved"
+        | "pullrequest:updated"
+        | "repo:commit_status_created"
+        | "repo:commit_status_updated"
+        | "repo:push" => match serde_json::from_slice::<serde_json::Value>(payload) {
+            Ok(_) => Ok(()),
+            Err(error) => Err(BitbucketCloudParseError::Json(go_json_syntax_error(
+                payload, &error,
+            ))),
+        },
+        _ => Err(BitbucketCloudParseError::UnknownKey),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Azure DevOps (`azuredevops_webhooks.go`)
+// ---------------------------------------------------------------------------
+
+/// `HandleAzureDevOpsWebhook`: no secret/signature check, `BaseEvent` parse,
+/// `azuredevops.ParseWebhookEvent`, then `Dispatch(event.EventType)`.
+async fn azure_devops_response<B>(req: &mut Request<B>) -> Response<BoxBody>
+where
+    B: hyper::body::Body<Data = Bytes> + Unpin + Send,
+    B::Error: std::fmt::Display,
+{
+    let body = match read_body(req).await {
+        Ok(body) => body,
+        Err(_error) => {
+            return http_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Error while reading request body.",
+            )
+        }
+    };
+
+    // The Go handler discards the concrete unmarshal error and always answers
+    // with the same message.
+    let event_type = match azure_event_type(&body) {
+        Ok(event_type) => event_type,
+        Err(_error) => {
+            return http_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Error while reading request body.",
+            )
+        }
+    };
+
+    match event_type.as_str() {
+        "git.pullrequest.merged" | "git.pullrequest.updated" => {
+            match azure_typed_event(&event_type, &body) {
+                Ok(()) => empty_ok(),
+                Err(text) => http_error(StatusCode::INTERNAL_SERVER_ERROR, &text),
+            }
+        }
+        // `webhookNotFoundErr` implements `NotFound()`, so the handler answers
+        // 404 with the literal message.
+        _ => http_error(StatusCode::NOT_FOUND, "webhook not found"),
+    }
+}
+
+/// `json.Unmarshal(payload, &azuredevops.BaseEvent)`.
+fn azure_event_type(payload: &[u8]) -> Result<String, String> {
+    use serde_json::Value;
+
+    let value: Value = serde_json::from_slice(payload).map_err(|error| error.to_string())?;
+    match value {
+        Value::Null => Ok(String::new()),
+        Value::Object(map) => match map.get("eventType") {
+            None | Some(Value::Null) => Ok(String::new()),
+            Some(Value::String(event_type)) => Ok(event_type.clone()),
+            Some(_) => Err("eventType is not a string".to_owned()),
+        },
+        _ => Err("BaseEvent is not an object".to_owned()),
+    }
+}
+
+/// `azuredevops.ParseWebhookEvent`'s typed unmarshal. The simulated event
+/// subtype (`message.text`) does not affect the dispatch outcome: none of the
+/// derived types has a handler, so every successful parse is a 200 no-op.
+fn azure_typed_event(event_type: &str, payload: &[u8]) -> Result<(), String> {
+    use serde_json::Value;
+
+    let value: Value = serde_json::from_slice(payload).map_err(|error| error.to_string())?;
+    match value {
+        // `json.Unmarshal(null, &PullRequest*Event)` is a no-op.
+        Value::Null | Value::Object(_) => {
+            let _ = event_type;
+            Ok(())
+        }
+        other => Err(format!(
+            "json: cannot unmarshal {} into Go value of type azuredevops.PullRequestEvent",
+            go_json_value_kind(&other)
+        )),
+    }
+}
+
+/// `subtle.ConstantTimeCompare(a, b) == 1`.
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    let mut difference = 0u8;
+    for (a, b) in left.iter().zip(right.iter()) {
+        difference |= a ^ b;
+    }
+    difference == 0
+}
+
+/// A 204 response with a body (`w.WriteHeader(204)` + `fmt.Fprintf`). The
+/// recorder the oracle uses captures the body even for 204.
+fn no_content(body: String) -> Response<BoxBody> {
+    let mut response = Response::new(tonic::body::boxed(Full::new(Bytes::from(body))));
+    *response.status_mut() = StatusCode::NO_CONTENT;
+    *response.headers_mut() = plain_headers();
+    response
 }
 
 async fn read_body<B>(req: &mut Request<B>) -> Result<Vec<u8>, String>
