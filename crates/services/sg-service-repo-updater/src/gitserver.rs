@@ -490,6 +490,231 @@ impl sg_extsvc::gitolite::GitoliteRepoLister for GitserverSourcesClient {
     }
 }
 
+impl GitserverRepoClient {
+    /// `gitserver.Client.CreateCommitFromPatch`: send the metadata event, then
+    /// the patch as a client stream, and decode either the response or the
+    /// typed `CreateCommitFromPatchError` carried in `grpc-status-details-bin`.
+    pub async fn create_commit_from_patch_with_scope(
+        &self,
+        request: &sg_extsvc::batches_sources::CreateCommitFromPatchRequest,
+        scope: &str,
+    ) -> Result<
+        sg_extsvc::batches_sources::CreateCommitFromPatchResponse,
+        sg_extsvc::batches_sources::GitserverPushError,
+    > {
+        let started = std::time::Instant::now();
+        let result = self.create_commit_from_patch_inner(request).await;
+        self.metrics.observe_gitserver_client(
+            "CreateCommitFromPatch",
+            scope,
+            started.elapsed().as_secs_f64(),
+            result.is_err(),
+        );
+        result
+    }
+
+    async fn create_commit_from_patch_inner(
+        &self,
+        request: &sg_extsvc::batches_sources::CreateCommitFromPatchRequest,
+    ) -> Result<
+        sg_extsvc::batches_sources::CreateCommitFromPatchResponse,
+        sg_extsvc::batches_sources::GitserverPushError,
+    > {
+        use sg_extsvc::batches_sources::{
+            CreateCommitFromPatchResponse, GitserverPushError,
+        };
+
+        let Some(addr) = self.address_for(&request.repo) else {
+            return Err(GitserverPushError::Other(
+                "no gitserver endpoints configured".to_owned(),
+            ));
+        };
+        let mut client = self
+            .service_client(&addr)
+            .await
+            .map_err(|err| GitserverPushError::Other(err.to_string()))?;
+
+        let metadata = gpb::create_commit_from_patch_binary_request::Metadata {
+            repo: request.repo.clone(),
+            base_commit: request.base_commit.clone(),
+            target_ref: request.target_ref.clone(),
+            commit_info: Some(gpb::PatchCommitInfo {
+                messages: request.commit_info.messages.clone(),
+                author_name: request.commit_info.author_name.clone(),
+                author_email: request.commit_info.author_email.clone(),
+                committer_name: String::new(),
+                committer_email: String::new(),
+                date: parse_rfc3339_timestamp(&request.commit_info.date),
+            }),
+            push: request.push.as_ref().map(|push| gpb::PushConfig {
+                remote_url: push.remote_url.clone(),
+                private_key: push.private_key.clone(),
+                passphrase: push.passphrase.clone(),
+            }),
+            push_ref: None,
+            patch_filenames_no_prefix: request.patch_filenames_no_prefix,
+        };
+
+        let mut events = Vec::with_capacity(2);
+        events.push(gpb::CreateCommitFromPatchBinaryRequest {
+            payload: Some(
+                gpb::create_commit_from_patch_binary_request::Payload::Metadata(metadata),
+            ),
+        });
+        if !request.patch.is_empty() {
+            events.push(gpb::CreateCommitFromPatchBinaryRequest {
+                payload: Some(
+                    gpb::create_commit_from_patch_binary_request::Payload::Patch(
+                        gpb::create_commit_from_patch_binary_request::Patch {
+                            data: request.patch.clone(),
+                        },
+                    ),
+                ),
+            });
+        }
+
+        match client
+            .create_commit_from_patch_binary(tokio_stream::iter(events))
+            .await
+        {
+            Ok(response) => {
+                let response = response.into_inner();
+                Ok(CreateCommitFromPatchResponse {
+                    rev: response.rev,
+                    error: None,
+                    changelist_id: response.changelist_id,
+                })
+            }
+            Err(status) => Err(decode_create_commit_error(status)),
+        }
+    }
+}
+
+/// Decode `CreateCommitFromPatchError` from the `google.rpc.Status` payload
+/// (`internal/gitserver/errwrap.go`); fall back to the status text.
+fn decode_create_commit_error(
+    status: tonic::Status,
+) -> sg_extsvc::batches_sources::GitserverPushError {
+    use prost::Message as _;
+    use sg_extsvc::batches_sources::{CreateCommitFromPatchError, GitserverPushError};
+
+    #[derive(Clone, PartialEq, prost::Message)]
+    struct RpcStatus {
+        #[prost(int32, tag = "1")]
+        code: i32,
+        #[prost(string, tag = "2")]
+        message: String,
+        #[prost(message, repeated, tag = "3")]
+        details: Vec<prost_types::Any>,
+    }
+
+    if let Ok(rpc) = RpcStatus::decode(status.details()) {
+        for any in &rpc.details {
+            if any
+                .type_url
+                .ends_with("gitserver.v1.CreateCommitFromPatchError")
+            {
+                if let Ok(payload) =
+                    gpb::CreateCommitFromPatchError::decode(any.value.as_slice())
+                {
+                    return GitserverPushError::Patch(CreateCommitFromPatchError {
+                        repository_name: payload.repository_name,
+                        internal_error: payload.internal_error,
+                        command: payload.command,
+                        combined_output: payload.combined_output,
+                    });
+                }
+            }
+        }
+    }
+    GitserverPushError::Other(status_error_text(&status))
+}
+
+/// `timestamppb.New` for the ISO-8601 `time.Time` JSON form used by
+/// `PatchCommitInfo.Date`. Returns `None` for an empty/unparsable value, which
+/// the baseline represents as the zero timestamp.
+fn parse_rfc3339_timestamp(value: &str) -> Option<prost_types::Timestamp> {
+    if value.is_empty() {
+        return None;
+    }
+    let (date, rest) = value.split_once('T')?;
+    let mut date_parts = date.split('-');
+    let year: i64 = date_parts.next()?.parse().ok()?;
+    let month: i64 = date_parts.next()?.parse().ok()?;
+    let day: i64 = date_parts.next()?.parse().ok()?;
+    if date_parts.next().is_some() {
+        return None;
+    }
+
+    let (time_part, offset_seconds) = if let Some(stripped) = rest.strip_suffix('Z') {
+        (stripped, 0i64)
+    } else if let Some(index) = rest.find(|ch| ch == '+' || ch == '-') {
+        let (time_part, offset) = rest.split_at(index);
+        let sign = if offset.starts_with('-') { -1 } else { 1 };
+        let (hours, minutes) = offset.get(1..)?.split_once(':')?;
+        let hours: i64 = hours.parse().ok()?;
+        let minutes: i64 = minutes.parse().ok()?;
+        (time_part, sign * (hours * 3600 + minutes * 60))
+    } else {
+        (rest, 0)
+    };
+
+    let mut time_parts = time_part.split(':');
+    let hour: i64 = time_parts.next()?.parse().ok()?;
+    let minute: i64 = time_parts.next()?.parse().ok()?;
+    let seconds_part = time_parts.next()?;
+    let (seconds, fraction) = match seconds_part.split_once('.') {
+        Some((seconds, fraction)) => (seconds, fraction),
+        None => (seconds_part, ""),
+    };
+    let second: i64 = seconds.parse().ok()?;
+    let nanos: i32 = if fraction.is_empty() {
+        0
+    } else {
+        let mut digits = fraction.to_owned();
+        digits.truncate(9);
+        while digits.len() < 9 {
+            digits.push('0');
+        }
+        digits.parse().ok()?
+    };
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+
+    // Days from `1970-01-01` (Howard Hinnant's `days_from_civil`).
+    let adjusted_year = if month <= 2 { year - 1 } else { year };
+    let era = if adjusted_year >= 0 { adjusted_year } else { adjusted_year - 399 } / 400;
+    let year_of_era = adjusted_year - era * 400;
+    let month_prime = (month + 9) % 12;
+    let day_of_year = (153 * month_prime + 2) / 5 + day - 1;
+    let day_of_era =
+        year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    let days = era * 146_097 + day_of_era - 719_468;
+
+    let seconds_since_epoch =
+        days * 86_400 + hour * 3_600 + minute * 60 + second - offset_seconds;
+    Some(prost_types::Timestamp {
+        seconds: seconds_since_epoch,
+        nanos,
+    })
+}
+
+#[async_trait]
+impl sg_extsvc::batches_sources::GitserverCommitClient for GitserverSourcesClient {
+    async fn create_commit_from_patch(
+        &self,
+        request: sg_extsvc::batches_sources::CreateCommitFromPatchRequest,
+    ) -> Result<
+        sg_extsvc::batches_sources::CreateCommitFromPatchResponse,
+        sg_extsvc::batches_sources::GitserverPushError,
+    > {
+        self.inner
+            .create_commit_from_patch_with_scope(&request, "batches.sources")
+            .await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

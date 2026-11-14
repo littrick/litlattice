@@ -4333,3 +4333,260 @@ fn _auth_documentation(_auth: &GitLabAuth) {}
 fn _header_documentation(headers: &[(String, String)]) -> Option<&str> {
     header_get(headers, "Content-Type")
 }
+
+// ---------------------------------------------------------------------------
+// M9.34b: gitserver `CreateCommitFromPatch` and GitHub REST duplicate commit
+// (`internal/gitserver`, `sources/github.go:138-173`,
+// `reconciler/executor.go:616-648`)
+// ---------------------------------------------------------------------------
+
+/// `protocol.CreateCommitFromPatchError`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CreateCommitFromPatchError {
+    pub repository_name: String,
+    pub internal_error: String,
+    pub command: String,
+    pub combined_output: String,
+}
+
+impl CreateCommitFromPatchError {
+    /// `CreateCommitFromPatchError.Error()`: the baseline returns only the
+    /// internal error text.
+    pub fn message(&self) -> &str {
+        &self.internal_error
+    }
+
+    /// `executor.pushCommitError.Error()`'s display form. The baseline uses
+    /// `%q` for the repo name and `strings.TrimSpace` for the combined output.
+    pub fn push_commit_message(&self) -> String {
+        format!(
+            "creating commit from patch for repository {:?}: {}\n```\n$ {}\n{}\n```",
+            self.repository_name,
+            self.internal_error,
+            self.command,
+            self.combined_output.trim()
+        )
+    }
+}
+
+/// `protocol.CreateCommitFromPatchResponse`, reduced to the fields the
+/// reconciler reads (`Rev`; `Error`/`ChangelistId` are carried for fidelity).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CreateCommitFromPatchResponse {
+    pub rev: String,
+    pub error: Option<CreateCommitFromPatchError>,
+    pub changelist_id: String,
+}
+
+/// The two shapes of a failed `CreateCommitFromPatch`: the typed protocol
+/// error (surfaced through `errors.As` in `pushCommit`) or any other
+/// transport/RPC error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GitserverPushError {
+    Patch(CreateCommitFromPatchError),
+    Other(String),
+}
+
+/// The gitserver RPC seam. Production is a gRPC `GitserverServiceClient`
+/// (`crates/services/sg-service-repo-updater/src/gitserver.rs`); tests and the
+/// differential inject a fake.
+#[async_trait]
+pub trait GitserverCommitClient: Send + Sync {
+    /// `gitserver.Client.CreateCommitFromPatch`.
+    async fn create_commit_from_patch(
+        &self,
+        request: CreateCommitFromPatchRequest,
+    ) -> Result<CreateCommitFromPatchResponse, GitserverPushError>;
+}
+
+/// `executor.pushCommit`: call the RPC and map the two error shapes. A typed
+/// protocol error whose combined output contains `patch does not apply` is
+/// non-retryable (`errcode.MakeNonRetryable`); every other failure stays
+/// retryable.
+pub async fn push_commit(
+    client: &dyn GitserverCommitClient,
+    request: CreateCommitFromPatchRequest,
+) -> Result<CreateCommitFromPatchResponse, SourceError> {
+    client
+        .create_commit_from_patch(request)
+        .await
+        .map_err(push_commit_error)
+}
+
+/// `pushCommit`'s error mapping, split out for the differential harness.
+pub fn push_commit_error(error: GitserverPushError) -> SourceError {
+    match error {
+        GitserverPushError::Patch(error) => {
+            let message = error.push_commit_message();
+            if error.combined_output.contains("patch does not apply") {
+                SourceError::non_retryable(message)
+            } else {
+                SourceError::other(message)
+            }
+        }
+        GitserverPushError::Other(message) => SourceError::other(message),
+    }
+}
+
+/// Bridges a [`SourceAuth`] onto the [`crate::auth::Authenticator`] trait the
+/// GitHub REST client expects. The authenticator only needs to set the same
+/// headers [`SourceAuth::apply`] does.
+struct SourceAuthAuthenticator(SourceAuth);
+
+impl crate::auth::Authenticator for SourceAuthAuthenticator {
+    fn authenticate(
+        &self,
+        _method: &str,
+        _url: &str,
+        headers: &mut Vec<(String, String)>,
+    ) -> Result<(), String> {
+        self.0.apply(headers);
+        Ok(())
+    }
+
+    fn hash(&self) -> String {
+        format!("{:?}", self.0)
+    }
+}
+
+/// `GitHubSource.DuplicateCommit` (`sources/github.go:138`): re-create the
+/// pushed commit through the REST API so a GitHub App installation can sign
+/// it, then move the branch ref onto the signed commit.
+///
+/// Error prefixes are verbatim: `getting owner and repo name to duplicate
+/// commit`, `getting commit to duplicate`, `creating new commit`, `updating
+/// ref to point to new commit`.
+pub async fn duplicate_commit(
+    api_url: &Url,
+    auth: &SourceAuth,
+    http: Arc<dyn HttpDoer>,
+    request: &CreateCommitFromPatchRequest,
+    repo: &Repo,
+    rev: &str,
+) -> Result<github::RestCommit, SourceError> {
+    let message = request.commit_info.messages.join("\n");
+    let name_with_owner = repo
+        .metadata
+        .get("NameWithOwner")
+        .or_else(|| repo.metadata.get("name_with_owner"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let (owner, repo_name) = split_repository_name_with_owner(name_with_owner)
+        .map_err(|err| err.with_prefix("getting owner and repo name to duplicate commit"))?;
+
+    let authenticator: Arc<dyn crate::auth::Authenticator> =
+        Arc::new(SourceAuthAuthenticator(auth.clone()));
+    let client = github::V3Client::new(api_url.clone(), Some(authenticator), http);
+
+    // Get the original, unsigned commit.
+    let commit = client
+        .get_ref(&owner, &repo_name, rev)
+        .await
+        .map_err(|err| SourceError::other(err.to_string()).with_prefix("getting commit to duplicate"))?;
+
+    // Our new signed commit should have the same parents as the original.
+    let parents: Vec<String> = commit.parents.iter().map(|parent| parent.sha.clone()).collect();
+    // Create the new commit using the original tree SHA and parents; author
+    // and committer are omitted because the App installation is the author.
+    let new_commit = client
+        .create_commit(
+            &owner,
+            &repo_name,
+            &message,
+            &commit.commit.tree.sha,
+            &parents,
+            None,
+            None,
+        )
+        .await
+        .map_err(|err| SourceError::other(err.to_string()).with_prefix("creating new commit"))?;
+
+    // Update the branch ref to point to the new commit, orphaning the original.
+    client
+        .update_ref(&owner, &repo_name, rev, &new_commit.sha)
+        .await
+        .map_err(|err| {
+            SourceError::other(err.to_string()).with_prefix("updating ref to point to new commit")
+        })?;
+
+    Ok(new_commit)
+}
+
+// ---------------------------------------------------------------------------
+// M9.34b: user-credential-first / site-credential-fallback runtime selection
+// (`sources.withAuthenticatorForUser` / `withSiteAuthenticator`,
+// `sources.go:472-506`)
+// ---------------------------------------------------------------------------
+
+/// `database.UserCredentialScope` / `store.GetSiteCredentialOpts` lookup seam.
+///
+/// Production adapts the existing `user_credentials` (batches domain) and
+/// `batch_changes_site_credentials` stores; no new tables or keys. `Ok(None)`
+/// means "not found" (Go: `errcode.IsNotFound` / `store.ErrNoResults`); `Err`
+/// carries any other lookup failure.
+#[async_trait]
+pub trait BatchesCredentialStore: Send + Sync {
+    /// `loadUserCredential`: scope `(Domain: batches, UserID,
+    /// ExternalServiceType, ExternalServiceID)`.
+    async fn user_credential(
+        &self,
+        user_id: i32,
+        repo: &Repo,
+    ) -> Result<Option<SourceAuth>, String>;
+
+    /// `loadSiteCredential`: scope `(ExternalServiceType,
+    /// ExternalServiceID)`.
+    async fn site_credential(&self, repo: &Repo) -> Result<Option<SourceAuth>, String>;
+}
+
+/// `sources.withAuthenticatorForUser`: prefer the user credential, fall back
+/// to the site credential, and surface lookup errors with the baseline's
+/// prefixes.
+pub async fn with_authenticator_for_user(
+    store: &dyn BatchesCredentialStore,
+    user_id: i32,
+    repo: &Repo,
+) -> Result<SourceAuth, SourceError> {
+    match store.user_credential(user_id, repo).await {
+        Ok(Some(auth)) => Ok(auth),
+        Ok(None) => with_site_authenticator(store, repo).await,
+        Err(err) => Err(SourceError::other(err).with_prefix("loading user credential")),
+    }
+}
+
+/// `sources.withSiteAuthenticator`: use the site credential or fail with
+/// `ErrMissingCredentials`.
+pub async fn with_site_authenticator(
+    store: &dyn BatchesCredentialStore,
+    repo: &Repo,
+) -> Result<SourceAuth, SourceError> {
+    match store.site_credential(repo).await {
+        Ok(Some(auth)) => Ok(auth),
+        Ok(None) => Err(SourceError::other(MISSING_CREDENTIALS)),
+        Err(err) => Err(SourceError::other(err).with_prefix("loading site credential")),
+    }
+}
+
+/// The runtime push-credential selection: resolve the user-preferred/site
+/// credential `SourceAuth` and hand it to
+/// [`push_authenticator_for_source_auth`]. A credential kind without a push
+/// mapping is `ErrNoPushCredentials`.
+pub async fn push_authenticator_for_user(
+    store: &dyn BatchesCredentialStore,
+    user_id: i32,
+    repo: &Repo,
+) -> Result<PushAuthenticator, SourceError> {
+    let auth = with_authenticator_for_user(store, user_id, repo).await?;
+    push_authenticator_for_source_auth(&auth)
+        .ok_or_else(|| SourceError::non_retryable(NO_PUSH_CREDENTIALS))
+}
+
+/// Site-credential variant of [`push_authenticator_for_user`].
+pub async fn push_authenticator_for_site(
+    store: &dyn BatchesCredentialStore,
+    repo: &Repo,
+) -> Result<PushAuthenticator, SourceError> {
+    let auth = with_site_authenticator(store, repo).await?;
+    push_authenticator_for_source_auth(&auth)
+        .ok_or_else(|| SourceError::non_retryable(NO_PUSH_CREDENTIALS))
+}
