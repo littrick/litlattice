@@ -1362,17 +1362,12 @@ fn compute_excluded_repos(
         return Err(JobError("context canceled".to_owned()));
     }
 
-    // `ResolveSearchContextSpec`; the instance-level/global contexts carry ID
-    // 0, and only that case is modeled here.
-    let search_context_id = if opts.search_context_spec.is_empty()
-        || opts.search_context_spec == "global"
-    {
-        0
-    } else {
-        return Err(JobError(
-            "search context resolution is not ported (M9.37a)".to_owned(),
-        ));
-    };
+    // `ResolveSearchContextSpec` (`repos.go:1021-1024`). Resolution failures
+    // (including the unknown-context text) abort before any count query.
+    let search_context = clients
+        .db
+        .resolve_search_context(&opts.search_context_spec)?;
+    let search_context_id = search_context.id;
 
     let limit = if opts.limit != 0 {
         opts.limit

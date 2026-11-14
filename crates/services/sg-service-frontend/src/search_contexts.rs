@@ -424,6 +424,23 @@ pub trait SearchContextsDatabase {
     fn get_current_user(&self, uid: i32) -> Result<Option<User>, Error>;
 
     fn get_search_context(&self, opts: &GetSearchContextOptions) -> Result<SearchContext, Error>;
+
+    /// `SearchContexts().GetSearchContext(ctx, opts)` as used by
+    /// `ResolveSearchContextSpec`: the same lookup, but with the request
+    /// actor's permission predicate (`public`/owner/org-member/site-admin).
+    ///
+    /// The plain [`Self::get_search_context`] is the context-less
+    /// create/update validation lookup (internal bypass). Implementations
+    /// without permission-aware storage may keep this default; the production
+    /// store overrides it.
+    fn get_search_context_for_actor(
+        &self,
+        _ctx: &RequestContext,
+        opts: &GetSearchContextOptions,
+    ) -> Result<SearchContext, Error> {
+        self.get_search_context(opts)
+    }
+
     fn create_search_context_with_repository_revisions(
         &self,
         search_context: &SearchContext,
@@ -535,11 +552,14 @@ pub fn resolve_search_context_spec(
         }
 
         if has_search_context_name {
-            return db.get_search_context(&GetSearchContextOptions {
-                name: parsed.search_context_name,
-                namespace_user_id: namespace.user,
-                namespace_org_id: namespace.organization,
-            });
+            return db.get_search_context_for_actor(
+                ctx,
+                &GetSearchContextOptions {
+                    name: parsed.search_context_name,
+                    namespace_user_id: namespace.user,
+                    namespace_org_id: namespace.organization,
+                },
+            );
         }
 
         return Err(Error::other(format!(
@@ -549,11 +569,14 @@ pub fn resolve_search_context_spec(
     }
 
     // Check if instance-level context.
-    db.get_search_context(&GetSearchContextOptions {
-        name: parsed.search_context_name,
-        namespace_user_id: 0,
-        namespace_org_id: 0,
-    })
+    db.get_search_context_for_actor(
+        ctx,
+        &GetSearchContextOptions {
+            name: parsed.search_context_name,
+            namespace_user_id: 0,
+            namespace_org_id: 0,
+        },
+    )
 }
 
 // ---------------------------------------------------------------------------

@@ -27,6 +27,7 @@ use sg_zoekt::indexed_repo_revs::{IndexedRepoRevs, MinimalRepo};
 use sg_zoekt::query::{IndexedRequestType, Query};
 use sg_zoekt::types::{SearchOptions, SearchResult};
 
+use crate::search_contexts::{get_global_search_context, SearchContext};
 use crate::search_stream::progress::SearchEvent;
 use crate::search_stream::zoekt_search::{self, ZoektParameters};
 
@@ -161,6 +162,19 @@ pub trait PrivateRepoLister {
     fn count_repos(&self, _options: &ReposListOptions) -> Result<i64, JobError> {
         Err(JobError(
             "db.Repos().Count is not ported (M9.37a)".to_owned(),
+        ))
+    }
+
+    /// `searchcontexts.ResolveSearchContextSpec`. The default resolves only the
+    /// global/empty spec (which needs no database) and keeps the explicit seam
+    /// error for everything else; production and differential fakes override
+    /// it with a real `search_contexts` lookup.
+    fn resolve_search_context(&self, spec: &str) -> Result<SearchContext, JobError> {
+        if crate::search_contexts::is_global_search_context_spec(spec) {
+            return Ok(get_global_search_context());
+        }
+        Err(JobError(
+            "search context resolution is not ported (M9.37a)".to_owned(),
         ))
     }
 }
