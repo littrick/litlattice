@@ -38,6 +38,15 @@ struct RepoFilterSpec {
     repo: String,
 }
 
+/// `actor.FromContext(ctx)` for the case (M9.39b).
+#[derive(Debug, Deserialize, Default, Clone, Copy)]
+struct ActorSpec {
+    #[serde(default)]
+    uid: i32,
+    #[serde(default)]
+    internal: bool,
+}
+
 #[derive(Debug, Deserialize, Default, Clone)]
 struct RepoOptsSpec {
     #[serde(default)]
@@ -48,6 +57,9 @@ struct RepoOptsSpec {
     description_patterns: Vec<String>,
     #[serde(default)]
     search_context_spec: String,
+    /// Request actor for `ResolveSearchContextSpec` (M9.39b).
+    #[serde(default)]
+    actor: ActorSpec,
     #[serde(default)]
     visibility: String,
     #[serde(default)]
@@ -174,16 +186,18 @@ impl PrivateRepoLister for FakeDb {
         Ok(count)
     }
 
-    /// `searchcontexts.ResolveSearchContextSpec`. Global/empty needs no
-    /// database; other specs resolve against `SG_QTEST_DSN` exactly like the
-    /// Go oracle (`search_contexts`/`names`, anonymous actor).
+    /// `searchcontexts.ResolveSearchContextSpec(ctx, ...)`. Global/empty
+    /// needs no database; other specs resolve against `SG_QTEST_DSN` exactly
+    /// like the Go oracle (`search_contexts`/`names`), applying `ctx`'s actor
+    /// permission predicate.
     fn resolve_search_context(
         &self,
         spec: &str,
+        ctx: &sg_service_frontend::search_contexts::RequestContext,
     ) -> Result<sg_service_frontend::search_contexts::SearchContext, JobError> {
         use sg_service_frontend::search_contexts::{
             get_global_search_context, is_global_search_context_spec,
-            resolve_search_context_spec, RequestContext,
+            resolve_search_context_spec,
         };
         if is_global_search_context_spec(spec) {
             return Ok(get_global_search_context());
@@ -211,12 +225,8 @@ impl PrivateRepoLister for FakeDb {
             .map_err(|error| JobError(error.to_string()))?;
         let _guard = runtime.enter();
         let store = sg_service_frontend::search_contexts_store::PgSearchContextsStore::new(pool);
-        resolve_search_context_spec(
-            &store,
-            &RequestContext::default(),
-            spec,
-        )
-        .map_err(|error| JobError(error.to_string()))
+        resolve_search_context_spec(&store, ctx, spec)
+            .map_err(|error| JobError(error.to_string()))
     }
 }
 
@@ -337,6 +347,11 @@ fn repo_opts(spec: &RepoOptsSpec) -> TreeRepoOptions {
         minus_repo_filters: spec.minus_repo_filters.clone(),
         description_patterns: spec.description_patterns.clone(),
         search_context_spec: spec.search_context_spec.clone(),
+        request_context: sg_service_frontend::search_contexts::RequestContext {
+            actor_uid: spec.actor.uid,
+            internal: spec.actor.internal,
+            sourcegraph_dot_com_mode: false,
+        },
         visibility,
         limit: spec.limit,
         fork_set: spec.fork_set,
@@ -555,8 +570,9 @@ fn load_cases(path: &str) -> Vec<Case> {
 fn search_repo_jobs_diff() {
     if std::env::var("SG_M937A_DIFF").as_deref() != Ok("1")
         && std::env::var("SG_M938A_DIFF").as_deref() != Ok("1")
+        && std::env::var("SG_M939B_DIFF").as_deref() != Ok("1")
     {
-        eprintln!("SG_M937A_DIFF/SG_M938A_DIFF not set; skipping");
+        eprintln!("SG_M937A_DIFF/SG_M938A_DIFF/SG_M939B_DIFF not set; skipping");
         return;
     }
     let corpus_path = std::env::var("M937A_CORPUS").expect("M937A_CORPUS must be set");
@@ -567,6 +583,10 @@ fn search_repo_jobs_diff() {
     // oracle's concatenated output.
     if let Ok(context_corpus) = std::env::var("M938A_CORPUS") {
         cases.extend(load_cases(&context_corpus));
+    }
+    // M9.39b appends the actor corpus (same order as the Go oracle output).
+    if let Ok(actor_corpus) = std::env::var("M939B_CORPUS") {
+        cases.extend(load_cases(&actor_corpus));
     }
 
     let output: Vec<Value> = cases.iter().map(run_case).collect();

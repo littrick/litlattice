@@ -120,6 +120,9 @@ pub struct ResolveOptions {
     pub only_archived: bool,
     /// `ExperimentalFeatures.PerforceChangelistMapping == "enabled"`.
     pub perforce_changelist_mapping: bool,
+    /// `actor.FromContext(ctx)` + `dotcom.SourcegraphDotComMode()` used by
+    /// `ResolveSearchContextSpec`. The zero value is the anonymous actor.
+    pub request_context: RequestContext,
 }
 
 impl Default for ResolveOptions {
@@ -144,6 +147,7 @@ impl Default for ResolveOptions {
             no_archived: false,
             only_archived: false,
             perforce_changelist_mapping: false,
+            request_context: RequestContext::anonymous(),
         }
     }
 }
@@ -586,7 +590,7 @@ impl Resolver {
 
         let search_context = self
             .db
-            .resolve_search_context(&options.search_context_spec, &RequestContext::default())?;
+            .resolve_search_context(&options.search_context_spec, &options.request_context)?;
 
         let mut list_options = repo_list_options(options, &include_patterns, limit + 1);
         // A search context without a query replaces `context:` at parse time.
@@ -1366,6 +1370,7 @@ impl ResolveOptions {
             no_archived: options.no_archived,
             only_archived: options.only_archived,
             perforce_changelist_mapping: false,
+            request_context: options.request_context,
         }
     }
 }

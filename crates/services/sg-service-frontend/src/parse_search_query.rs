@@ -214,6 +214,7 @@ fn output_job_tree(
         // `outputJobTree` does not set `Inputs.OriginalQuery` or
         // `Inputs.ContextLines`, so they keep their zero values.
         original_query: String::new(),
+        request_context: crate::search_contexts::RequestContext::anonymous(),
         sub_repo_enabled: false,
         cody_context_hook: None,
         cody_context: None,

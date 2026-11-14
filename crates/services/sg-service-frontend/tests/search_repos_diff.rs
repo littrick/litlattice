@@ -296,6 +296,7 @@ fn resolve_options(options: &OptionsIn) -> ResolveOptions {
         no_archived: options.no_archived.unwrap_or(false),
         only_archived: options.only_archived.unwrap_or(false),
         perforce_changelist_mapping: options.perforce_changelist_mapping.unwrap_or(false),
+        request_context: RequestContext::anonymous(),
     }
 }
 

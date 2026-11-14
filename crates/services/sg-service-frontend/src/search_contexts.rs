@@ -318,6 +318,35 @@ pub struct RequestContext {
     pub sourcegraph_dot_com_mode: bool,
 }
 
+impl RequestContext {
+    /// `actor.FromContext(ctx)` for a request actor.
+    pub fn from_actor(
+        actor: &crate::actor_middleware::Actor,
+        sourcegraph_dot_com_mode: bool,
+    ) -> Self {
+        Self {
+            actor_uid: actor.uid,
+            internal: actor.internal,
+            sourcegraph_dot_com_mode,
+        }
+    }
+
+    /// The zero actor (anonymous, non-internal), matching the actor in
+    /// `context.Background()`.
+    pub fn anonymous() -> Self {
+        Self::default()
+    }
+
+    /// The actor fields `applySubRepoFiltering` reads from the context.
+    pub fn sub_repo_actor(&self) -> crate::search_jobutil_misc_jobs::Actor {
+        crate::search_jobutil_misc_jobs::Actor {
+            uid: self.actor_uid,
+            internal: self.internal,
+            mock_user: false,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Errors
 // ---------------------------------------------------------------------------

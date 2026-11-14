@@ -135,6 +135,7 @@ fn inputs(case: &Case) -> TreeInputs {
         sanitize_search_patterns: case.sanitize_patterns.clone(),
         on_sourcegraph_dot_com: case.on_sourcegraph_dot_com,
         original_query: case.original_query.clone(),
+        request_context: sg_service_frontend::search_contexts::RequestContext::anonymous(),
         sub_repo_enabled: false,
         cody_context_hook: None,
         cody_context: None,
