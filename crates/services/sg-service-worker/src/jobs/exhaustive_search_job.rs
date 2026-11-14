@@ -613,13 +613,23 @@ impl SearchJob {
 
     /// `newSearcherFactory` (`job.go:76-79`): the production adapter bundle
     /// over the M9.10a resolver and the exhaustive job tree.
-    fn production_searcher(pool: &PgPool, live_config: &LiveConfig) -> Arc<dyn NewSearcher> {
+    fn production_searcher(
+        pool: &PgPool,
+        live_config: &LiveConfig,
+        keyring: &sg_keyring::Keyring,
+    ) -> Arc<dyn NewSearcher> {
         let config = live_config.current();
-        let runtime = sg_service_frontend::search_runtime::assemble_exhaustive(
-            pool,
-            &config.service_connections,
-            &config.site,
-        );
+        // `client.New(logger, db, gitserver.NewClient(...))` closes over the
+        // worker `database.DB`, whose external-account reads decrypt with
+        // `keyring.Default().UserExternalAccountKey`. The Rust worker has no
+        // process-global default, so pass the ring key explicitly (M9.40d).
+        let runtime =
+            sg_service_frontend::search_runtime::assemble_exhaustive_with_encryption_key(
+                pool,
+                &config.service_connections,
+                &config.site,
+                keyring.user_external_account_key(),
+            );
         let clients = JobClients::new(
             Arc::new(
                 crate::jobs::exhaustive_search_searcher::FrontendRepoResolver::new(Arc::clone(
@@ -657,7 +667,9 @@ impl SearchJob {
             Arc::new(ObjectStorageMatchWriterFactory::new(uploads));
         let new_searcher = match &self.new_searcher_factory {
             Some(factory) => factory(),
-            None => Self::production_searcher(&deps.frontend, &deps.live_config),
+            None => {
+                Self::production_searcher(&deps.frontend, &deps.live_config, &deps.keyring)
+            }
         };
 
         Ok(assemble_search_job_routines(

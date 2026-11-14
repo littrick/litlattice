@@ -116,6 +116,11 @@ pub struct CommitRuntimeClientsOwned {
     /// Owned leaf collaborators; borrowed into
     /// [`crate::search_commit_job::CommitRuntimeClients::leaf`].
     pub leaf: Option<crate::search_leaf_jobs::LeafJobClients>,
+    /// Diagnostic: whether `keyring.Default().UserExternalAccountKey` was
+    /// injected into the owners seam (M9.40d). Execution reads the key through
+    /// [`crate::search_owners::PgOwnershipSource`]; this mirror lets the
+    /// worker-assembly differential observe the worker wiring without a DB.
+    pub user_external_account_key_present: bool,
 }
 
 impl CommitRuntimeClientsOwned {
@@ -134,8 +139,12 @@ impl CommitRuntimeClientsOwned {
 pub fn max_repos_from_site(site: &SiteConfiguration) -> Option<i64> {
     let raw = site.raw();
     // `If MaxRepos unset use deprecated value` (`limits.go:32-34`).
+    // `schema.SiteConfiguration.SearchLimits` is tagged `json:"search.limits"`
+    // (a dotted top-level key, like `encryption.keys`). M9.40d erratum: the
+    // port previously read the camelCase `searchLimits`, so the configured
+    // limit never took effect.
     let max_repos = raw
-        .get("searchLimits")
+        .get("search.limits")
         .and_then(|limits| limits.get("maxRepos"))
         .and_then(serde_json::Value::as_i64)
         .filter(|value| *value > 0)
@@ -251,6 +260,7 @@ fn assemble_commit_clients(
         Arc::new(GitserverContributorFetcher::new(Arc::new(
             GitClientContributorCountSource::new(Arc::clone(gitserver)),
         )));
+    let user_external_account_key_present = key.is_some();
     let ownership_source = Arc::new(
         PgOwnershipSource::new(
             pool.clone(),
@@ -271,6 +281,7 @@ fn assemble_commit_clients(
             content_searcher: None,
             ownership: Some(ownership),
         }),
+        user_external_account_key_present,
     })
 }
 
@@ -365,6 +376,19 @@ pub fn assemble_exhaustive(
     connections: &ServiceConnections,
     site: &SiteConfiguration,
 ) -> ExhaustiveRuntime {
+    assemble_exhaustive_with_encryption_key(pool, connections, site, None)
+}
+
+/// [`assemble_exhaustive`] with the worker keyring's
+/// `UserExternalAccountKey` (`keyring.Default().UserExternalAccountKey`), so
+/// the owners seam can decrypt `user_external_accounts.account_data`
+/// (M9.40d). `None` keeps the previous behavior.
+pub fn assemble_exhaustive_with_encryption_key(
+    pool: &PgPool,
+    connections: &ServiceConnections,
+    site: &SiteConfiguration,
+    user_external_account_key: Option<Arc<dyn Key>>,
+) -> ExhaustiveRuntime {
     let max_repos = max_repos_from_site(site);
     let db = Arc::new(PgPrivateRepoLister::new(pool.clone()));
     let gitserver = Arc::new(GitClient::new(connections.git_servers.clone()));
@@ -373,7 +397,11 @@ pub fn assemble_exhaustive(
     // See `assemble_inner`: the baseline always has searcher/symbols/commit
     // clients, so exhaustive search keeps the same shape.
     let searcher = Some(assemble_searcher_clients(connections, &gitserver));
-    let commit = Some(assemble_commit_clients(pool, &gitserver, None));
+    let commit = Some(assemble_commit_clients(
+        pool,
+        &gitserver,
+        user_external_account_key,
+    ));
 
     // Exhaustive queries never touch indexed zoekt (`index:no`); the
     // resolver's zoekt lister only backs `repohasfile` filters, which are not
@@ -686,11 +714,26 @@ pub fn assemble_commit_search(
     connections: &ServiceConnections,
     site: &SiteConfiguration,
 ) -> TreeRuntimeClients {
+    assemble_commit_search_with_encryption_key(pool, connections, site, None)
+}
+
+/// [`assemble_commit_search`] with the worker keyring's
+/// `UserExternalAccountKey`, mirroring the exhaustive variant (M9.40d).
+pub fn assemble_commit_search_with_encryption_key(
+    pool: &PgPool,
+    connections: &ServiceConnections,
+    site: &SiteConfiguration,
+    user_external_account_key: Option<Arc<dyn Key>>,
+) -> TreeRuntimeClients {
     let db = Arc::new(PgPrivateRepoLister::new(pool.clone()));
     let gitserver = Arc::new(GitClient::new(connections.git_servers.clone()));
     let gitserver_addrs = gitserver_addresses(connections, site);
     let searcher = assemble_searcher_clients(connections, &gitserver);
-    let commit = Some(assemble_commit_clients(pool, &gitserver, None));
+    let commit = Some(assemble_commit_clients(
+        pool,
+        &gitserver,
+        user_external_account_key,
+    ));
 
     // Code-monitor plans use `repoPagerJob{skipPartitioning:true}` and only
     // commit leaves, so the resolver's zoekt lister is never called; the
@@ -1171,7 +1214,7 @@ mod tests {
         );
         assert_eq!(
             max_repos_from_site(&site(serde_json::json!({
-                "searchLimits": {"maxRepos": 7},
+                "search.limits": {"maxRepos": 7},
                 "maxReposToSearch": 42
             }))),
             Some(7)
@@ -1179,7 +1222,7 @@ mod tests {
         // Non-positive values keep the default.
         assert_eq!(
             max_repos_from_site(&site(serde_json::json!({
-                "searchLimits": {"maxRepos": 0},
+                "search.limits": {"maxRepos": 0},
                 "maxReposToSearch": -1
             }))),
             None
