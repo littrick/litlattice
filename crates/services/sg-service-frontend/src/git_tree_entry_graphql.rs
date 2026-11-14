@@ -266,7 +266,16 @@ fn go_path_dir(path: &str) -> String {
 // ---------------------------------------------------------------------------
 
 /// Go `pageContent` (`git_tree_entry.go:169-215`), 1-indexed.
-fn page_content(content: &[u8], start_line: Option<i32>, end_line: Option<i32>) -> &[u8] {
+///
+/// Shared with the offline highlighter: `fileDiffHighlighter` slices the file
+/// content through `GitTreeEntryResolver.Content` *before* calling
+/// `highlight.CodeAsLines`, so the highlight range and the highlighted lines
+/// line up exactly (`repository_comparison.go:491-515`).
+pub(crate) fn page_content(
+    content: &[u8],
+    start_line: Option<i32>,
+    end_line: Option<i32>,
+) -> &[u8] {
     if start_line.is_none() && end_line.is_none() {
         return content;
     }

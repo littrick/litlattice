@@ -31,7 +31,9 @@ use sqlx::postgres::PgPoolOptions;
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
-use sg_git::{CommitDetails, CommitSignature, CommitsOptions, GitObject, RawDiffOptions};
+use sg_git::{
+    CommitDetails, CommitSignature, CommitsOptions, FileStat, GitObject, RawDiffOptions,
+};
 use sg_graphql::exec::{execute_with, Actor, ExecRequest};
 use sg_graphql::schema::{
     assemble, BATCHES_SCHEMA, GITHUB_APPS_SCHEMA, MAIN_SCHEMA, OUTBOUND_WEBHOOKS_SCHEMA,
@@ -45,7 +47,6 @@ use sg_service_frontend::graphql_resolvers::{
     FrontendRootResolver, OrgData, OrganizationLookup, RepoKey, RepoLookup, RepositoryData,
     UserData, UserKey, UserLookup, UserObject,
 };
-use sg_service_frontend::search_stream::convert::MinimalRepo;
 
 /// Same bytes as `m932dComparisonDiff` in the Go oracle.
 const COMPARISON_DIFF: &str = "diff --git README.md README.md
@@ -131,6 +132,25 @@ impl GitObjectSource for FakeGitObjects {
         path: &str,
     ) -> Result<Vec<u8>, GitSourceError> {
         Ok(file_content(path).to_owned().into_bytes())
+    }
+
+    /// M9.35d: `GitCommit.tree(path:)` stats the path; only `docs` exists (the
+    /// root shortcut never reaches the source). Mirrors the Go oracle's
+    /// `StatFunc`.
+    async fn stat(
+        &self,
+        _repo_id: i32,
+        _repo_name: &str,
+        _oid: &str,
+        path: &str,
+    ) -> Result<FileStat, GitSourceError> {
+        if path == "docs" {
+            Ok(FileStat::synthetic("docs", true))
+        } else {
+            Err(GitSourceError::not_exist(format!(
+                "ls-tree {path}: file does not exist"
+            )))
+        }
     }
 
     async fn get_commit(
