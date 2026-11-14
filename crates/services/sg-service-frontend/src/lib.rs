@@ -160,6 +160,7 @@ pub mod search_searcher_jobs;
 pub mod search_source;
 pub mod search_stream;
 pub mod service;
+pub mod sub_repo_perms_checker;
 pub mod security_event_logs;
 pub mod service_connections;
 pub mod session_auth;
