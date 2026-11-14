@@ -521,6 +521,9 @@ pub struct SchemaGraphqlDeps {
     /// Code Insights read-only surface (M9.29b); `None` reproduces an absent
     /// `InsightsResolver` (`insights.graphql` is not appended).
     insights: Option<crate::insights_graphql::InsightsHandle>,
+    /// `InsightsAggregationResolver` seam (M9.34a); `None` reproduces an
+    /// absent resolver (`insights_aggregations.graphql` is not appended).
+    insights_aggregations: Option<crate::insights_aggregations_graphql::AggregationsHandle>,
     /// `Repository.embeddingExists`'s database seam (M9.14c); `None` keeps the
     /// field unported.
     embeddings: Option<Arc<dyn crate::embeddings_graphql::RepositoryEmbeddingsStore>>,
@@ -613,6 +616,7 @@ impl SchemaGraphqlDeps {
             codeintel_policies: None,
             notebooks: None,
             insights: None,
+            insights_aggregations: None,
             embeddings: None,
             diagnostics: None,
             org_invitation_config: None,
@@ -692,6 +696,7 @@ impl SchemaGraphqlDeps {
             codeintel_policies: None,
             notebooks: None,
             insights: None,
+            insights_aggregations: None,
             embeddings: None,
             diagnostics: None,
             org_invitation_config: None,
@@ -1125,6 +1130,26 @@ impl SchemaGraphqlDeps {
         Ok(self)
     }
 
+    /// Enable the SearchQueryAggregate GraphQL surface (M9.34a): append
+    /// `insights_aggregations.graphql` (as `NewSchema` does for a non-nil
+    /// `InsightsAggregationResolver`) and hand the seam to the executor.
+    ///
+    /// The default [`sg_graphql::schema::assemble_oss`] schema never includes
+    /// this document, so OSS introspection stays unchanged.
+    pub fn with_insights_aggregations(
+        mut self,
+        seam: crate::insights_aggregations_graphql::AggregationsHandle,
+    ) -> Result<Self, sg_graphql::schema::SchemaError> {
+        if !self.schema.types.contains_key("SearchQueryAggregate") {
+            self.schema = Arc::new(sg_graphql::schema::assemble(&[
+                self.schema.schema_string.as_str(),
+                sg_graphql::schema::INSIGHTS_AGGREGATIONS_SCHEMA,
+            ])?);
+        }
+        self.insights_aggregations = Some(seam);
+        Ok(self)
+    }
+
     /// Enable the saved-searches GraphQL surface (M9.13a): append
     /// `saved_searches.graphql` and hand the database seam to the executor.
     pub fn with_saved_searches(
@@ -1431,6 +1456,7 @@ impl SchemaGraphqlDeps {
             codeintel_policies: None,
             notebooks: None,
             insights: None,
+            insights_aggregations: None,
             embeddings: None,
             diagnostics: None,
             org_invitation_config: None,
@@ -2640,6 +2666,7 @@ impl GraphqlDeps for SchemaGraphqlDeps {
             .with_codeintel_policies(self.codeintel_policies.clone())
             .with_notebooks(self.notebooks.clone())
             .with_insights(self.insights.clone())
+            .with_insights_aggregations(self.insights_aggregations.clone())
             .with_ranking_roots(ranking_roots)
             .with_search_roots(search_root)
             .with_git(git)

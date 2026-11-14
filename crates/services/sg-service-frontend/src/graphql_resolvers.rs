@@ -2682,6 +2682,7 @@ impl FrontendRootResolver {
                 codeintel_policies: None,
                 notebooks: None,
                 insights: None,
+                insights_aggregations: None,
                 batches: None,
                 github_apps: None,
                 teams: None,
@@ -2926,6 +2927,15 @@ impl FrontendRootResolver {
     ) -> Self {
         self.query.insights = insights.clone();
         self.mutation.insights = insights;
+        self
+    }
+
+    /// Attach the `SearchQueryAggregate` surface (M9.34a).
+    pub fn with_insights_aggregations(
+        mut self,
+        seam: Option<crate::insights_aggregations_graphql::AggregationsHandle>,
+    ) -> Self {
+        self.query.insights_aggregations = seam;
         self
     }
 
@@ -3278,6 +3288,10 @@ struct QueryRoot {
     /// Optional Code Insights read-only surface (M9.29b). `None` leaves
     /// `Query.insightViews` / `Query.insightsDashboards` unported.
     insights: Option<crate::insights_graphql::InsightsHandle>,
+    /// Optional `InsightsAggregationResolver` surface (M9.34a). `None` leaves
+    /// `Query.searchQueryAggregate` unported.
+    insights_aggregations:
+        Option<crate::insights_aggregations_graphql::AggregationsHandle>,
     /// Optional outbound webhook surface (M9.27b). `None` leaves
     /// `Query.outboundWebhooks` / `outboundWebhookEventTypes` and
     /// `node(OutboundWebhook)` unported.
@@ -5160,6 +5174,20 @@ impl ObjectValue for QueryRoot {
             _ if self.insights.is_some() && crate::insights_graphql::is_root_field(field) => {
                 crate::insights_graphql::root_field(
                     self.insights.as_ref().expect("checked insights"),
+                    field,
+                    arguments,
+                    actor,
+                )
+            }
+            // `InsightsAggregationResolver` root field
+            // (`Query.searchQueryAggregate`, M9.34a).
+            _ if self.insights_aggregations.is_some()
+                && crate::insights_aggregations_graphql::is_root_field(field) =>
+            {
+                crate::insights_aggregations_graphql::root_field(
+                    self.insights_aggregations
+                        .as_ref()
+                        .expect("checked insights aggregations"),
                     field,
                     arguments,
                     actor,

@@ -60,3 +60,11 @@ pub const NOTEBOOKS_SCHEMA: &str = include_str!("sdl/notebooks.graphql");
 /// Appended only when the insights resolver is explicitly enabled (M9.29b);
 /// `assemble_oss` never includes it.
 pub const INSIGHTS_SCHEMA: &str = include_str!("sdl/insights.graphql");
+
+/// `//go:embed insights_aggregations.graphql` —
+/// `OptionalResolver.InsightsAggregationResolver` SDL (M9.34a):
+/// `Query.searchQueryAggregate`, `SearchQueryAggregate`, the aggregation
+/// result union and its enums. `NewSchema` appends it only when the
+/// aggregation resolver is present, so `assemble_oss` never includes it.
+pub const INSIGHTS_AGGREGATIONS_SCHEMA: &str =
+    include_str!("sdl/insights_aggregations.graphql");
