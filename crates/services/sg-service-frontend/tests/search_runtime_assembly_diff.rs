@@ -1300,6 +1300,7 @@ fn run_case(case: &Case) -> Value {
             db: db.clone(),
             gitserver: gitserver.clone(),
             leaf: None,
+            user_external_account_key_present: false,
         })),
         repo_pager: None,
     };

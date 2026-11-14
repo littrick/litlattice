@@ -1110,6 +1110,21 @@ pub fn assemble_code_monitor_job(
     live_config: Arc<sg_config::LiveConfig>,
     worker_hostname: String,
 ) -> CodeMonitorJobRoutines {
+    assemble_code_monitor_job_with_keyring(pool, site, live_config, worker_hostname, None)
+}
+
+/// [`assemble_code_monitor_job`] with the worker keyring's
+/// `UserExternalAccountKey`. Go's `codemonitors.Search` builds
+/// `client.New(logger, db, gitserver.NewClient(...))` over the worker
+/// `database.DB`; the owners seam behind the commit job tree needs the same
+/// key to decrypt `user_external_accounts.account_data` (M9.40d).
+pub fn assemble_code_monitor_job_with_keyring(
+    pool: PgPool,
+    site: &SiteConfiguration,
+    live_config: Arc<sg_config::LiveConfig>,
+    worker_hostname: String,
+    user_external_account_key: Option<Arc<dyn sg_encryption::Key>>,
+) -> CodeMonitorJobRoutines {
     let concurrency = code_monitors_concurrency(site);
     let poll_interval = code_monitors_poll_interval(site);
     let external_url = external_url(site);
@@ -1132,11 +1147,13 @@ pub fn assemble_code_monitor_job(
     // 3. `newTriggerQueryRunner`.
     let trigger_store = Arc::new(TriggerJobStore::new(pool.clone()));
     let config = live_config.current();
-    let search_runtime = sg_service_frontend::search_runtime::assemble_commit_search(
-        &pool,
-        &config.service_connections,
-        site,
-    );
+    let search_runtime =
+        sg_service_frontend::search_runtime::assemble_commit_search_with_encryption_key(
+            &pool,
+            &config.service_connections,
+            site,
+            user_external_account_key,
+        );
     let searcher = Arc::new(FrontendTriggerSearcher::new(
         search_runtime,
         Arc::new(PgTriggerSearchStore::new(pool.clone())),
@@ -1259,11 +1276,12 @@ impl Job for CodeMonitorJob {
         }
 
         let site = deps.live_config.current().site.clone();
-        Ok(assemble_code_monitor_job(
+        Ok(assemble_code_monitor_job_with_keyring(
             deps.frontend.clone(),
             &site,
             Arc::clone(&deps.live_config),
             default_hostname(),
+            deps.keyring.user_external_account_key(),
         )
         .routines)
     }
