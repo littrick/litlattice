@@ -31,12 +31,16 @@ use regex::Regex;
 
 use sg_proto::gitserver as pb;
 use sg_search_query::basic::{plan_to_q, q_string, q_string_value, Basic, Plan};
-use sg_search_query::fields::{FIELD_FILE, FIELD_REPO, FIELD_SELECT};
+use sg_search_query::fields::{
+    FIELD_ARCHIVED, FIELD_CONTEXT, FIELD_FILE, FIELD_FORK, FIELD_REPO, FIELD_SELECT,
+};
 use sg_search_query::labels::Labels;
 use sg_search_query::node::{visit_field, visit_parameter, Node, Operator, OperatorKind, Pattern};
 use sg_search_query::parser::SearchType;
+use sg_search_query::pipeline::{init, run};
 use sg_search_query::predicate::parse_as_predicate;
-use sg_search_query::validate::YesNoOnly;
+use sg_search_query::validate::{parse_yes_no_only, YesNoOnly};
+use sg_search_query::{mapper, string_human};
 use sg_zoekt::global_query::{default_global_query_scope, GlobalZoektQuery};
 use sg_zoekt::indexed_repo_revs::{partition_repos, IndexedRepoRevs, RepositoryRevisions};
 use sg_zoekt::languages::lang_to_file_regexp;
@@ -418,6 +422,8 @@ enum NodeKind {
         /// `search.Inputs.SearchMode`; `Precise` for trees produced by
         /// `new_plan_job` (construction does not model the runtime mode).
         search_mode: SearchMode,
+        /// `dotcom.SourcegraphDotComMode()` (`alert/observer.go:95`).
+        on_sourcegraph_dot_com: bool,
     },
     /// `searcher.TextSearchJob` (`internal/search/searcher/search.go:33-55`).
     SearcherText {
@@ -1268,18 +1274,11 @@ fn set_tree_repos(node: &JobNode, resolved: &ResolvedRepos) -> JobNode {
     JobNode { kind, children }
 }
 
-/// `searchalert.Observer` subset reachable from the tree (`observer.go:28-45,
-/// 177-219`): context errors are ignored, errors that `errorToAlert` cannot
-/// convert are accumulated, `Done` adds the structural-search hint and drops
-/// residual errors once results were seen. DB/repo-resolution alert branches
-/// are not ported (no DB seam here).
-///
-/// Known gap (M9.38d real-index smoke): a repo filter that resolves to no
-/// repository yields `ErrNoResolvedRepos`. Go's `alert.Observer` turns it into
-/// the `No repositories found` alert (`observer.go:247`); this tree observer
-/// has no repo-resolution seam, so the stream currently surfaces
-/// `event: error` with `"no resolved repositories"` instead. The smoke script
-/// asserts both behaviors explicitly and will flag the fix.
+/// `searchalert.Observer` ported from `internal/search/alert/observer.go`
+/// (M9.39a): context errors are ignored, errors that `errorToAlert` cannot
+/// convert are accumulated, `ErrNoResolvedRepos` becomes the
+/// `No repositories found` alert (`observer.go:247`), and `Done` adds the
+/// structural-search hint and drops residual errors once results were seen.
 struct TreeAlertObserver {
     inputs: comb::AlertInputs,
     has_results: bool,
@@ -1307,6 +1306,252 @@ impl TreeAlertObserver {
             Some(existing) => comb::JobFailure::Multi(vec![existing, error]),
         });
     }
+
+    /// `Observer.update` (`observer.go:200-204`): replace only on a strictly
+    /// higher priority (ties keep the existing alert).
+    fn update(&mut self, alert: comb::Alert) {
+        if self
+            .alert
+            .as_ref()
+            .is_none_or(|current| alert.priority > current.priority)
+        {
+            self.alert = Some(alert);
+        }
+    }
+
+    /// `Observer.Error(ctx, err)` (`observer.go:177-197`). When `errorToAlert`
+    /// produces an alert, residual errors are dropped exactly like the
+    /// baseline's `alert, _ := o.errorToAlert(...)`.
+    fn observe(
+        &mut self,
+        ctx: &comb::RunContext,
+        clients: Option<&RuntimeClients<'_>>,
+        err: &comb::JobFailure,
+    ) {
+        // `isContextError`: a canceled/expired context wins over the error's
+        // identity; such errors are reported through progress stats instead.
+        if ctx.err().is_some() || err.is_canceled() || err.is_deadline_exceeded() {
+            return;
+        }
+        match self.error_to_alert(ctx, clients, err) {
+            Some(alert) => self.update(alert),
+            None => self.append_error(err.clone()),
+        }
+    }
+
+    /// `Observer.errorToAlert` (`observer.go:221-285`) / `multierrorToAlert`
+    /// (`observer.go:167-175`). Only the `ErrNoResolvedRepos` mapping is in
+    /// this slice's scope; every other error keeps bubbling up.
+    fn error_to_alert(
+        &self,
+        ctx: &comb::RunContext,
+        clients: Option<&RuntimeClients<'_>>,
+        err: &comb::JobFailure,
+    ) -> Option<comb::Alert> {
+        match err {
+            comb::JobFailure::Multi(errors) => {
+                let alerts: Vec<Option<comb::Alert>> = errors
+                    .iter()
+                    .map(|part| self.error_to_alert(ctx, clients, part))
+                    .collect();
+                comb::max_priority_alert(&alerts)
+            }
+            comb::JobFailure::Message(message)
+                if !self.has_results && message == crate::search_jobutil_repos::ERR_NO_RESOLVED_REPOS =>
+            {
+                Some(self.alert_for_no_resolved_repos(clients))
+            }
+            _ => None,
+        }
+    }
+
+    /// `Observer.alertForNoResolvedRepos` (`observer.go:65-162`), text
+    /// verbatim. `clients == None` models the parts that need no database
+    /// (the DB branches then fall through, like Go's `err != nil` guards).
+    fn alert_for_no_resolved_repos(
+        &self,
+        clients: Option<&RuntimeClients<'_>>,
+    ) -> comb::Alert {
+        let nodes = run(init(
+            self.inputs.query.clone(),
+            self.inputs.pattern_type,
+        ))
+        .unwrap_or_default();
+        let (repo_values, minus_repo_values) = query_include_exclude(&nodes, FIELD_REPO, true);
+        let repo_filters: Vec<ParsedRepoFilter> = repo_values
+            .iter()
+            .filter_map(|value| parse_repository_revisions(value).ok())
+            .collect();
+        let (context_values, _) = query_include_exclude(&nodes, FIELD_CONTEXT, false);
+        let fork = query_yes_no_only(&nodes, FIELD_FORK);
+        let archived = query_yes_no_only(&nodes, FIELD_ARCHIVED);
+
+        if context_values.len() == 1
+            && !crate::search_contexts::is_global_search_context_spec(&context_values[0])
+            && !repo_filters.is_empty()
+        {
+            let without_context_filter = {
+                let kept = mapper::map_field(&nodes, FIELD_CONTEXT, &mut |_, _, _| None);
+                string_human(&kept)
+            };
+            return comb::Alert {
+                prometheus_type: "no_resolved_repos__context_none_in_common".to_owned(),
+                title: format!(
+                    "No repositories found for your query within the context {}",
+                    context_values[0]
+                ),
+                proposed_queries: vec![comb::QueryDescription {
+                    description: "search in the global context".to_owned(),
+                    query: format!(
+                        "context:{} {}",
+                        crate::search_contexts::GLOBAL_SEARCH_CONTEXT_NAME,
+                        without_context_filter
+                    ),
+                    pattern_type: self.inputs.pattern_type,
+                    annotations: BTreeMap::new(),
+                }],
+                ..comb::Alert::default()
+            };
+        }
+
+        if !self.inputs.on_sourcegraph_dot_com {
+            if let Some(clients) = clients {
+                // `needsRepositoryConfiguration`: only branch when the count
+                // read succeeds (`err == nil`).
+                if let Ok(count) = clients.db.count_code_host_external_services() {
+                    if count == 0 {
+                        let description = if clients.db.current_user_is_site_admin() {
+                            "To start searching code, first go to site admin to configure repositories and code hosts."
+                        } else {
+                            "To start searching code, ask the site admin to configure and enable repositories."
+                        };
+                        return comb::Alert {
+                            title: "No repositories or code hosts configured".to_owned(),
+                            description: description.to_owned(),
+                            ..comb::Alert::default()
+                        };
+                    }
+                }
+            }
+        }
+
+        let (only_forks, no_forks, forks_not_set) = match fork {
+            Some(YesNoOnly::Only) => (true, false, false),
+            Some(YesNoOnly::No) => (false, true, false),
+            Some(YesNoOnly::Yes) => (false, false, false),
+            // Invalid cannot reach here (parsing/validation rejects it); Go
+            // panics in `yesNoOnlyValue`, we treat it as unset.
+            Some(YesNoOnly::Invalid) | None => (false, false, true),
+        };
+        let archived_not_set = archived.is_none();
+
+        let mut proposed_queries = Vec::new();
+        if forks_not_set {
+            let options = alert_repo_options(&repo_filters, &minus_repo_values);
+            if repos_exist(clients, &options) {
+                proposed_queries.push(comb::QueryDescription {
+                    description: "include forked repositories in your query.".to_owned(),
+                    query: format!("{} fork:yes", self.inputs.original_query),
+                    pattern_type: self.inputs.pattern_type,
+                    annotations: BTreeMap::new(),
+                });
+            }
+        }
+
+        if archived_not_set {
+            let mut options = alert_repo_options(&repo_filters, &minus_repo_values);
+            options.only_forks = only_forks;
+            options.no_forks = no_forks;
+            options.only_archived = true;
+            if repos_exist(clients, &options) {
+                proposed_queries.push(comb::QueryDescription {
+                    description: "include archived repositories in your query.".to_owned(),
+                    query: format!("{} archived:yes", self.inputs.original_query),
+                    pattern_type: self.inputs.pattern_type,
+                    annotations: BTreeMap::new(),
+                });
+            }
+        }
+
+        if !proposed_queries.is_empty() {
+            return comb::Alert {
+                prometheus_type: "no_resolved_repos__repos_exist_when_altered".to_owned(),
+                title: "No repositories found".to_owned(),
+                description:
+                    "Try altering the query or use a different `repo:<regexp>` filter to see results"
+                        .to_owned(),
+                proposed_queries,
+                ..comb::Alert::default()
+            };
+        }
+
+        comb::Alert {
+            prometheus_type: "no_resolved_repos__generic".to_owned(),
+            title: "No repositories found".to_owned(),
+            description: "Try using a different `repo:<regexp>` filter to see results".to_owned(),
+            ..comb::Alert::default()
+        }
+    }
+}
+
+/// `Q.StringValues` / `Q.Repositories` value partition. `skip_predicates`
+/// matches `Repositories` (`IsPredicate` values are not repo filters).
+fn query_include_exclude(
+    nodes: &[Node],
+    field: &str,
+    skip_predicates: bool,
+) -> (Vec<String>, Vec<String>) {
+    let mut include = Vec::new();
+    let mut exclude = Vec::new();
+    visit_field(nodes, field, &mut |value, negated, annotation| {
+        if skip_predicates && annotation.labels.is_set(Labels::IS_PREDICATE) {
+            return;
+        }
+        if negated {
+            exclude.push(value.to_owned());
+        } else {
+            include.push(value.to_owned());
+        }
+    });
+    (include, exclude)
+}
+
+/// `Q.Fork` / `Q.Archived` (`types.go:123-145`): the last value wins.
+fn query_yes_no_only(nodes: &[Node], field: &str) -> Option<YesNoOnly> {
+    let mut result = None;
+    visit_field(nodes, field, &mut |value, _, _| {
+        result = Some(parse_yes_no_only(value));
+    });
+    result
+}
+
+/// `search.RepoOptions` from the alert branch: filters only (no context).
+fn alert_repo_options(
+    repo_filters: &[ParsedRepoFilter],
+    minus_repo_filters: &[String],
+) -> crate::search_repos::ResolveOptions {
+    crate::search_repos::ResolveOptions {
+        repo_filters: repo_filters.to_vec(),
+        minus_repo_filters: minus_repo_filters.to_vec(),
+        ..crate::search_repos::ResolveOptions::default()
+    }
+}
+
+/// `Observer.reposExist` (`observer.go:51-63`): resolve and report whether any
+/// page carries a repo revision. Missing repo pager yields `false`, matching a
+/// failing iterator.
+fn repos_exist(
+    clients: Option<&RuntimeClients<'_>>,
+    options: &crate::search_repos::ResolveOptions,
+) -> bool {
+    let Some(pager) = clients.and_then(|clients| clients.repo_pager) else {
+        return false;
+    };
+    let resolved = pager.pages.resolve_pages(options);
+    resolved
+        .pages
+        .iter()
+        .any(|page| !page.repo_revs.is_empty())
 }
 
 impl comb::AlertObserver for TreeAlertObserver {
@@ -1315,16 +1560,16 @@ impl comb::AlertObserver for TreeAlertObserver {
     }
 
     fn observe_error(&mut self, ctx: &comb::RunContext, err: &comb::JobFailure) {
-        // `isContextError`: a canceled/expired context wins over the error's
-        // identity; such errors are reported through progress stats instead.
-        if ctx.err().is_some() || err.is_canceled() || err.is_deadline_exceeded() {
-            return;
-        }
-        for part in err.parts() {
-            if let comb::JobFailure::Message(message) = part {
-                self.append_error(comb::JobFailure::Message(message.clone()));
-            }
-        }
+        self.observe(ctx, None, err);
+    }
+
+    fn observe_error_with_clients(
+        &mut self,
+        ctx: &comb::RunContext,
+        clients: &RuntimeClients<'_>,
+        err: &comb::JobFailure,
+    ) {
+        self.observe(ctx, Some(clients), err);
     }
 
     fn done(&mut self) -> (Option<comb::Alert>, Option<comb::JobFailure>) {
@@ -1775,12 +2020,14 @@ impl JobNode {
                 original_query,
                 pattern_type,
                 search_mode,
+                on_sourcegraph_dot_com,
             } => {
                 let inputs = comb::AlertInputs {
                     query: query.clone(),
                     original_query: original_query.clone(),
                     pattern_type: alert_pattern_type(pattern_type),
                     search_mode: *search_mode,
+                    on_sourcegraph_dot_com: *on_sourcegraph_dot_com,
                     ..comb::AlertInputs::default()
                 };
                 let observer_inputs = inputs.clone();
@@ -2219,6 +2466,7 @@ impl JobNode {
                 original_query: inputs.original_query.clone(),
                 pattern_type: comb::pattern_type_str(inputs.pattern_type),
                 search_mode: inputs.search_mode,
+                on_sourcegraph_dot_com: inputs.on_sourcegraph_dot_com,
             },
             vec![child],
         )
@@ -2409,6 +2657,7 @@ fn new_alert_job(inputs: &TreeInputs, plan: &Plan, child: JobNode) -> JobNode {
             pattern_type: crate::search_jobutil_combinators::pattern_type_str(inputs.pattern_type),
             // `TreeInputs` does not model the runtime `search.SearchMode`.
             search_mode: SearchMode::Precise,
+            on_sourcegraph_dot_com: inputs.on_sourcegraph_dot_com,
         },
         vec![child],
     )

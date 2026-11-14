@@ -1025,6 +1025,20 @@ fn matches_limit(results: &mut Vec<Match>, mut limit: i64) -> i64 {
 pub trait AlertObserver {
     fn set_has_results(&mut self, has_results: bool);
     fn observe_error(&mut self, ctx: &RunContext, err: &JobFailure);
+
+    /// `Observer.Error(ctx, err)` with the runtime clients the DB-backed alert
+    /// branches read (`observer.go:177-197`). The default keeps observers that
+    /// model only the reachable-from-this-slice parts working; the tree
+    /// observer overrides it to port `ErrNoResolvedRepos`.
+    fn observe_error_with_clients(
+        &mut self,
+        ctx: &RunContext,
+        _clients: &RuntimeClients<'_>,
+        err: &JobFailure,
+    ) {
+        self.observe_error(ctx, err);
+    }
+
     fn done(&mut self) -> (Option<Alert>, Option<JobFailure>);
 }
 
@@ -1108,7 +1122,7 @@ impl CombinatorJob for AlertJob {
 
         observer.set_has_results(count > 0);
         if let Some(err) = &err {
-            observer.observe_error(ctx, err);
+            observer.observe_error_with_clients(ctx, clients, err);
         }
         let (observer_alert, done_err) = observer.done();
         err = done_err;
