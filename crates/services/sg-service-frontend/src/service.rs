@@ -1368,6 +1368,41 @@ impl Service for FrontendService {
                 Arc::clone(&keyring),
             ),
         ));
+        // M9.41c: production read-only Batch Changes and Code Intel GraphQL
+        // surfaces. `graphqlbackend.NewSchema` appends `batches.graphql` +
+        // `githubapps.graphql` for a non-nil `BatchChangesResolver`, and every
+        // vendored `codeintel*.graphql` document for a non-nil
+        // `CodeIntelResolver`; the builders below reproduce that SDL set. The
+        // stores read the same frontend tables as the Go baseline and the
+        // gitserver seam backs `projectRoot`/`tags`/retention matching.
+        let codeintel_git_source: Arc<dyn crate::git_graphql::GitObjectSource> =
+            crate::git_graphql::production_git_source(Arc::clone(wiring.live()));
+        let graphql_deps = graphql_deps
+            .with_batches(Arc::new(
+                crate::batches_graphql_store::PgBatchesGraphqlStore::new(session_pool.clone())
+                    .with_gitserver_changeset_diff_source(Arc::clone(&codeintel_git_source)),
+            ))
+            .and_then(|deps| {
+                deps.with_codeintel_uploads(Arc::new(
+                    crate::codeintel_uploads_graphql_store::PgCodeIntelUploadsStore::new(
+                        session_pool.clone(),
+                    )
+                    .with_git(Arc::clone(&codeintel_git_source)),
+                ))
+            })
+            .and_then(|deps| {
+                deps.with_codeintel_policies(Arc::new(
+                    crate::codeintel_policies_graphql_store::PgCodeIntelPoliciesStore::new(
+                        session_pool.clone(),
+                        Arc::clone(&codeintel_git_source),
+                    ),
+                ))
+            })
+            .map_err(|err| {
+                ServiceError::new(format!(
+                    "failed to register batch changes/code intel GraphQL surfaces: {err}"
+                ))
+            })?;
         let graphql_deps = graphql_deps
             .with_production_surfaces(
                 Some(search_contexts),
