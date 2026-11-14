@@ -108,6 +108,11 @@ pub enum AggregationNotAvailableReasonType {
     TimeoutExtensionAvailable,
     TimeoutNoExtensionAvailable,
     ErrorOccurred,
+    /// `OTHER_ERROR` is declared by `insights_aggregations.graphql` but never
+    /// produced by the baseline resolvers (`types` only defines the five above
+    /// and uses the out-of-enum `ERROR_OCCURRED`). Kept for completeness so a
+    /// future producer can serialize it.
+    OtherError,
 }
 
 impl AggregationNotAvailableReasonType {
@@ -118,6 +123,7 @@ impl AggregationNotAvailableReasonType {
             Self::TimeoutExtensionAvailable => "TIMEOUT_EXTENSION_AVAILABLE",
             Self::TimeoutNoExtensionAvailable => "TIMEOUT_NO_EXTENSION_AVAILABLE",
             Self::ErrorOccurred => "ERROR_OCCURRED",
+            Self::OtherError => "OTHER_ERROR",
         }
     }
 }
