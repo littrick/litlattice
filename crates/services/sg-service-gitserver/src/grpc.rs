@@ -1149,8 +1149,8 @@ impl gpb::gitserver_service_server::GitserverService for Grpc {
         let options = CommitLogOptions {
             ranges: request.ranges,
             all_refs: request.all_refs,
-            after_seconds: request.after.as_ref().map_or(0, |time| time.seconds),
-            before_seconds: request.before.as_ref().map_or(0, |time| time.seconds),
+            after_seconds: request.after.as_ref().map(|time| time.seconds),
+            before_seconds: request.before.as_ref().map(|time| time.seconds),
             max_commits: request.max_commits,
             skip: request.skip,
             follow_only_first_parent: request.follow_only_first_parent,
