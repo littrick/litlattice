@@ -1203,6 +1203,25 @@ impl Service for FrontendService {
                         Arc::clone(wiring.live()),
                     ),
                 ));
+        // M9.35a: `Query.searchQueryAggregate` executes through the same
+        // `SearchDeps` as `Query.search` and `/.api/search/stream`. The seam
+        // applies the per-match tabulator and the 2s/55s deadline; buffer and
+        // proactive limits fall back to the baseline defaults (500 / 50000).
+        let insights_aggregations: crate::insights_aggregations_graphql::AggregationsHandle =
+            Arc::new(
+                crate::insights_aggregations_graphql::ProductionAggregationSeam::new(Arc::new(
+                    crate::insights_aggregations::ProductionAggregationSearchSeam::from_search_deps(
+                        Arc::clone(&search_deps),
+                    ),
+                )),
+            );
+        let graphql_deps = graphql_deps
+            .with_insights_aggregations(insights_aggregations)
+            .map_err(|err| {
+                ServiceError::new(format!(
+                    "failed to register the insights aggregation GraphQL surface: {err}"
+                ))
+            })?;
         // M9.8jf/M9.8jj: `Query.slowRequests` reads the FIFO list whose
         // capacity is `observability.captureSlowGraphQLRequestsLimit`
         // (`conf.Get()` per request in the baseline; here from the current
