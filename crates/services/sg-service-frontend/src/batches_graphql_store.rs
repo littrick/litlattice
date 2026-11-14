@@ -232,6 +232,10 @@ pub struct PgBatchesGraphqlStore {
     /// M9.30c: `keyring.Default()` for the batch changes credential key. `None`
     /// keeps credentials in plaintext, like the Go baseline with a nil key.
     pub(crate) credential_keyring: Option<std::sync::Arc<sg_keyring::Keyring>>,
+    /// M9.37d: the `httpcli.Doer` the credential validation path uses to build
+    /// a `sources.GitHubSource` (`GitHubSource.ValidateAuthenticator`). When it
+    /// is not wired the seam keeps the historical success default.
+    pub(crate) credential_http_doer: Option<std::sync::Arc<dyn sg_extsvc::HttpDoer>>,
 }
 
 impl PgBatchesGraphqlStore {
@@ -242,12 +246,24 @@ impl PgBatchesGraphqlStore {
             batch_changes_restricted_to_admins: false,
             changeset_diff_source: None,
             credential_keyring: None,
+            credential_http_doer: None,
         }
     }
 
     /// Wire the keyring used by `keyring.Default().BatchChangesCredentialKey`.
     pub fn with_keyring(mut self, keyring: std::sync::Arc<sg_keyring::Keyring>) -> Self {
         self.credential_keyring = Some(keyring);
+        self
+    }
+
+    /// Wire the `httpcli.Doer` used by `service.ValidateAuthenticator` to reach
+    /// the code host. Production passes a `reqwest`-backed doer; the
+    /// differential harness injects a recording fake.
+    pub fn with_credential_http_doer(
+        mut self,
+        doer: std::sync::Arc<dyn sg_extsvc::HttpDoer>,
+    ) -> Self {
+        self.credential_http_doer = Some(doer);
         self
     }
 
