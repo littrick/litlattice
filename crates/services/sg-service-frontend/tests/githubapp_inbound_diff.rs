@@ -47,6 +47,14 @@ struct FixtureApp {
     kind: String,
     #[serde(rename = "baseURL")]
     base_url: String,
+    #[serde(rename = "creatorID", default)]
+    creator_id: i32,
+    #[serde(rename = "privateKey", default = "default_private_key")]
+    private_key: String,
+}
+
+fn default_private_key() -> String {
+    "pem".to_owned()
 }
 
 #[derive(Deserialize)]
@@ -77,6 +85,8 @@ struct Case {
     uuid: String,
     #[serde(default)]
     event: String,
+    #[serde(rename = "eventKey", default)]
+    event_key: String,
     #[serde(default)]
     body: String,
     #[serde(rename = "contentType", default)]
@@ -118,10 +128,43 @@ struct InstallRow {
 }
 
 #[derive(Serialize)]
+struct UserCredentialRow {
+    domain: String,
+    #[serde(rename = "userID")]
+    user_id: i32,
+    #[serde(rename = "externalServiceType")]
+    external_service_type: String,
+    #[serde(rename = "externalServiceID")]
+    external_service_id: String,
+    credential: String,
+    #[serde(rename = "encryptionKeyID")]
+    encryption_key_id: String,
+    #[serde(rename = "githubAppID")]
+    github_app_id: i32,
+}
+
+#[derive(Serialize)]
+struct SiteCredentialRow {
+    #[serde(rename = "externalServiceType")]
+    external_service_type: String,
+    #[serde(rename = "externalServiceID")]
+    external_service_id: String,
+    credential: String,
+    #[serde(rename = "encryptionKeyID")]
+    encryption_key_id: String,
+    #[serde(rename = "githubAppID")]
+    github_app_id: i32,
+}
+
+#[derive(Serialize)]
 struct InboundOutput {
     status: u16,
     body: String,
     installs: Vec<InstallRow>,
+    #[serde(rename = "userCredentials")]
+    user_credentials: Vec<UserCredentialRow>,
+    #[serde(rename = "siteCredentials")]
+    site_credentials: Vec<SiteCredentialRow>,
 }
 
 #[derive(Serialize)]
@@ -169,9 +212,11 @@ fn actor_identity(spec: &str) -> ActorIdentity {
 async fn seed_database(pool: &sqlx::PgPool, corpus: &Corpus) {
     for query in [
         "DELETE FROM github_app_installs",
+        "DELETE FROM user_credentials WHERE domain = 'batches'",
+        "DELETE FROM batch_changes_site_credentials",
         "DELETE FROM github_apps",
         "DELETE FROM webhooks",
-        "DELETE FROM users WHERE id IN (101, 102, 103)",
+        "DELETE FROM users WHERE id IN (101, 102, 103, 201, 202)",
     ] {
         sqlx::query(query).execute(pool).await.unwrap();
     }
@@ -180,16 +225,18 @@ async fn seed_database(pool: &sqlx::PgPool, corpus: &Corpus) {
             "INSERT INTO github_apps \
                  (id, app_id, name, slug, base_url, client_id, client_secret, private_key, \
                   encryption_key_id, logo, app_url, domain, kind, creator_id) \
-             VALUES ($1, $2, $3, $3, $4, 'cid', 'csec', 'pem', '', 'logo', $5, \
-                     $6, $7::github_app_kind, 0)",
+             VALUES ($1, $2, $3, $3, $4, 'cid', 'csec', $5, '', 'logo', $6, \
+                     $7, $8::github_app_kind, $9)",
         )
         .bind(app.id)
         .bind(app.app_id)
         .bind(&app.name)
         .bind(&app.base_url)
+        .bind(&app.private_key)
         .bind(format!("https://example.com/apps/{}", app.name))
         .bind(&app.domain)
         .bind(&app.kind)
+        .bind(app.creator_id)
         .execute(pool)
         .await
         .unwrap();
@@ -238,9 +285,11 @@ async fn seed_database(pool: &sqlx::PgPool, corpus: &Corpus) {
 async fn seed_site_database(pool: &sqlx::PgPool, corpus: &Corpus) {
     for query in [
         "DELETE FROM github_app_installs",
+        "DELETE FROM user_credentials WHERE domain = 'batches'",
+        "DELETE FROM batch_changes_site_credentials",
         "DELETE FROM github_apps",
         "DELETE FROM webhooks",
-        "DELETE FROM users WHERE id IN (101, 102, 103)",
+        "DELETE FROM users WHERE id IN (101, 102, 103, 201, 202)",
     ] {
         sqlx::query(query).execute(pool).await.unwrap();
     }
@@ -285,6 +334,50 @@ async fn snapshot_installs(pool: &sqlx::PgPool) -> Vec<InstallRow> {
             account_avatar_url: row.get("account_avatar_url"),
             account_url: row.get("account_url"),
             account_type: row.get("account_type"),
+        })
+        .collect()
+}
+
+async fn snapshot_user_credentials(pool: &sqlx::PgPool) -> Vec<UserCredentialRow> {
+    let rows = sqlx::query(
+        "SELECT domain, user_id, external_service_type, external_service_id, credential, \
+                encryption_key_id, COALESCE(github_app_id,0)::int4 AS github_app_id \
+         FROM user_credentials WHERE domain = 'batches' \
+         ORDER BY user_id, external_service_type, external_service_id",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap();
+    rows.iter()
+        .map(|row| UserCredentialRow {
+            domain: row.get("domain"),
+            user_id: row.get("user_id"),
+            external_service_type: row.get("external_service_type"),
+            external_service_id: row.get("external_service_id"),
+            credential: String::from_utf8_lossy(&row.get::<Vec<u8>, _>("credential")).into_owned(),
+            encryption_key_id: row.get("encryption_key_id"),
+            github_app_id: row.get("github_app_id"),
+        })
+        .collect()
+}
+
+async fn snapshot_site_credentials(pool: &sqlx::PgPool) -> Vec<SiteCredentialRow> {
+    let rows = sqlx::query(
+        "SELECT external_service_type, external_service_id, credential, encryption_key_id, \
+                COALESCE(github_app_id,0)::int4 AS github_app_id \
+         FROM batch_changes_site_credentials \
+         ORDER BY external_service_type, external_service_id",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap();
+    rows.iter()
+        .map(|row| SiteCredentialRow {
+            external_service_type: row.get("external_service_type"),
+            external_service_id: row.get("external_service_id"),
+            credential: String::from_utf8_lossy(&row.get::<Vec<u8>, _>("credential")).into_owned(),
+            encryption_key_id: row.get("encryption_key_id"),
+            github_app_id: row.get("github_app_id"),
         })
         .collect()
 }
@@ -403,6 +496,11 @@ async fn githubapp_inbound_diff() {
                         .headers_mut()
                         .insert("x-github-event", case.event.parse().unwrap());
                 }
+                if !case.event_key.is_empty() {
+                    request
+                        .headers_mut()
+                        .insert("x-event-key", case.event_key.parse().unwrap());
+                }
                 if let Some(signature) =
                     sign_inbound(&case.signature_mode, secret.as_bytes(), &body)
                 {
@@ -427,6 +525,8 @@ async fn githubapp_inbound_diff() {
                     status,
                     body: String::from_utf8_lossy(&body).into_owned(),
                     installs: snapshot_installs(&pool).await,
+                    user_credentials: snapshot_user_credentials(&pool).await,
+                    site_credentials: snapshot_site_credentials(&pool).await,
                 };
                 write_output(&out_dir, &case.name, &output);
                 println!("RUST {} status={status}", case.name);

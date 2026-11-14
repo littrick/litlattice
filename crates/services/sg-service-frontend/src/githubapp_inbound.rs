@@ -30,6 +30,8 @@ use serde::Deserialize;
 use sha2::Sha256;
 use tonic::body::BoxBody;
 
+use crate::batches_credentials::BatchesCredentialsDatabase;
+use crate::batches_graphql_store::PgBatchesGraphqlStore;
 use crate::external_api::{go_quote, validate_github_signature};
 
 /// The generic webhook mount (`webhooks.NewHandler`).
@@ -41,6 +43,12 @@ const X_GITHUB_EVENT: &str = "x-github-event";
 
 /// `extsvc.KindGitHub`.
 const KIND_GITHUB: &str = "GITHUB";
+/// `extsvc.KindBitbucketServer` (`VariantBitbucketServer.AsKind()`).
+const KIND_BITBUCKET_SERVER: &str = "BITBUCKETSERVER";
+
+/// `ghtypes.UserCredentialGitHubAppKind` / `SiteCredentialGitHubAppKind`.
+const KIND_USER_CREDENTIAL: &str = "USER_CREDENTIAL";
+const KIND_SITE_CREDENTIAL: &str = "SITE_CREDENTIAL";
 
 // ---------------------------------------------------------------------------
 // Seams
@@ -70,7 +78,14 @@ pub enum WebhookLookup {
 pub struct InboundApp {
     /// `github_apps.id` (the `github_app_installs.app_id` FK).
     pub id: i32,
+    /// The GitHub App ID (`github_apps.app_id`), used to build the
+    /// authenticator.
+    pub app_id: i32,
     pub kind: String,
+    /// `github_apps.base_url` (`app.BaseURL` for the credential URL).
+    pub base_url: String,
+    /// `github_apps.creator_id` (`app.CreatedByUserId`).
+    pub created_by_user_id: i32,
 }
 
 /// `ghtypes.GitHubAppInstallation` for `Install`.
@@ -97,6 +112,20 @@ pub trait InboundDeps: Send + Sync {
     ) -> Result<Option<InboundApp>, String>;
     /// `GitHubApps().Install` (the `(app_id, installation_id)` upsert).
     fn install(&self, install: &InboundInstall) -> Result<(), String>;
+    /// `service.CreateBatchChangesUserCredential` with the `GITHUB_APP`
+    /// strategy, wrapping failures with the Go message prefix.
+    fn create_user_credential(
+        &self,
+        app: &InboundApp,
+        external_service_url: &str,
+    ) -> Result<(), String>;
+    /// `service.CreateBatchChangesSiteCredential` with the `GITHUB_APP`
+    /// strategy, wrapping failures with the Go message prefix.
+    fn create_site_credential(
+        &self,
+        app: &InboundApp,
+        external_service_url: &str,
+    ) -> Result<(), String>;
 }
 
 // ---------------------------------------------------------------------------
@@ -217,18 +246,32 @@ where
         }
     };
 
-    if webhook.code_host_kind != KIND_GITHUB {
-        return http_error(
+    let secret = webhook.secret.as_deref().unwrap_or("");
+    match webhook.code_host_kind.as_str() {
+        KIND_GITHUB => github_response(req, deps, secret).await,
+        KIND_BITBUCKET_SERVER => bitbucket_server_response(req, secret).await,
+        // GITLAB / BITBUCKET_CLOUD / AZURE_DEVOPS have Go handlers but are out
+        // of this slice; unknown kinds hit the same default in the baseline.
+        other => http_error(
             StatusCode::NOT_IMPLEMENTED,
             &format!(
                 "webhooks not implemented for code host kind {}",
-                go_quote(&webhook.code_host_kind)
+                go_quote(other)
             ),
-        );
+        ),
     }
+}
 
-    // `handleGitHubWebHook`: an empty secret skips signature validation.
-    let secret = webhook.secret.as_deref().unwrap_or("");
+/// `handleGitHubWebHook` + `HandleWebhook`.
+async fn github_response<B>(
+    req: &mut Request<B>,
+    deps: &dyn InboundDeps,
+    secret: &str,
+) -> Response<BoxBody>
+where
+    B: hyper::body::Body<Data = Bytes> + Unpin + Send,
+    B::Error: std::fmt::Display,
+{
     let body = match read_body(req).await {
         Ok(body) => body,
         Err(_error) => {
@@ -257,6 +300,69 @@ where
     };
 
     handle_github_event(req, &payload, deps)
+}
+
+/// `handleBitbucketServerWebhook` + `HandleBitBucketServerWebhook`
+/// (`bitbucketserver_webhooks.go`).
+async fn bitbucket_server_response<B>(req: &mut Request<B>, secret: &str) -> Response<BoxBody>
+where
+    B: hyper::body::Body<Data = Bytes> + Unpin + Send,
+    B::Error: std::fmt::Display,
+{
+    let body = match read_body(req).await {
+        Ok(body) => body,
+        Err(_error) => {
+            return http_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Error while reading request body.",
+            )
+        }
+    };
+
+    let signature = header(req, X_HUB_SIGNATURE);
+    let event_key = header(req, "x-event-key");
+
+    // Bitbucket Server `diagnostics:ping` test events are unsigned even when
+    // a secret is configured.
+    if !(signature.is_empty() && event_key == "diagnostics:ping")
+        && !secret.is_empty()
+        && validate_github_signature(signature, &body, secret.as_bytes()).is_err()
+    {
+        return http_error(StatusCode::BAD_REQUEST, "Could not validate payload with secret.");
+    }
+
+    match parse_bitbucket_server_event(event_key, &body) {
+        Ok(()) => {
+            // `Dispatch`: only `ping` has a handler; `diagnostics:ping` and
+            // the parsable payload events are no-ops. Every successful
+            // dispatch answers 200 with an empty body.
+            empty_ok()
+        }
+        Err(error) => http_error(StatusCode::BAD_REQUEST, &format!("parsing webhook: {error}")),
+    }
+}
+
+/// `bitbucketserver.ParseWebhookEvent`.
+fn parse_bitbucket_server_event(event_key: &str, body: &[u8]) -> Result<(), String> {
+    match event_key {
+        // `PingEvent{}` ignores the payload entirely.
+        "ping" | "diagnostics:ping" => Ok(()),
+        "repo:refs_changed"
+        | "repo:build_status"
+        | "pr:activity:status"
+        | "pr:activity:event"
+        | "pr:activity:rescope"
+        | "pr:activity:merge"
+        | "pr:activity:comment"
+        | "pr:activity:reviewers"
+        | "pr:participant:status" => serde_json::from_slice::<serde_json::Value>(body)
+            .map(|_| ())
+            .map_err(|error| error.to_string()),
+        other => Err(format!(
+            "unknown webhook event type: {}",
+            go_quote(other)
+        )),
+    }
 }
 
 async fn read_body<B>(req: &mut Request<B>) -> Result<Vec<u8>, String>
@@ -377,16 +483,47 @@ fn handle_installation(event: InstallationEvent, deps: &dyn InboundDeps) -> Resu
         })?;
 
     let account = installation.account.unwrap_or_default();
+    let account_login = account.login.unwrap_or_default();
     deps.install(&InboundInstall {
         app_id: app.id,
         installation_id: installation.id.unwrap_or(0) as i32,
         url: html_url,
-        account_login: account.login.unwrap_or_default(),
+        account_login: account_login.clone(),
         account_avatar_url: account.avatar_url.unwrap_or_default(),
         account_url: account.html_url.unwrap_or_default(),
         account_type: account.account_type.unwrap_or_default(),
     })?;
+
+    // `handleInstallation`: after the install upsert, credential-kind apps
+    // create their batches credential (`handleCredentialCreation`).
+    if app.kind == KIND_USER_CREDENTIAL || app.kind == KIND_SITE_CREDENTIAL {
+        let external_service_url = external_service_url(&app.base_url)?;
+        if app.kind == KIND_USER_CREDENTIAL {
+            deps.create_user_credential(&app, &external_service_url)?;
+        } else {
+            deps.create_site_credential(&app, &external_service_url)?;
+        }
+    }
+
     Ok(())
+}
+
+/// `url.JoinPath(app.BaseURL, "/")`: always a trailing slash. The baseline
+/// wraps a failure with `Unexpected error while creating external service url
+/// for github app: <err>`.
+fn external_service_url(base_url: &str) -> Result<String, String> {
+    match url::Url::parse(base_url) {
+        Ok(mut parsed) => {
+            if !parsed.path().ends_with('/') {
+                let path = format!("{}/", parsed.path());
+                parsed.set_path(&path);
+            }
+            Ok(parsed.to_string())
+        }
+        Err(error) => Err(format!(
+            "Unexpected error while creating external service url for github app: {error}"
+        )),
+    }
 }
 
 /// `url.Parse(htmlURL)` + `fmt.Sprintf("%s://%s/", Scheme, Host)`.
@@ -461,6 +598,11 @@ pub fn sign(algorithm: &str, secret: &[u8], body: &[u8]) -> Option<String> {
             let mut key = secret.to_vec();
             key.extend_from_slice(b"-wrong");
             Some(format!("sha256={}", hmac_sha256_hex(&key, body)))
+        }
+        "wrong_sha1" => {
+            let mut key = secret.to_vec();
+            key.extend_from_slice(b"-wrong");
+            Some(format!("sha1={}", hmac_sha1_hex(&key, body)))
         }
         "malformed" => Some("sha256=zzzz".to_owned()),
         _ => None,
@@ -546,7 +688,8 @@ impl InboundDeps for PgInboundDeps {
         use sqlx::Row;
         let row = block_on(
             sqlx::query(
-                "SELECT id, kind::text AS kind FROM github_apps \
+                "SELECT id, app_id, kind::text AS kind, base_url, creator_id::int4 AS creator_id \
+                 FROM github_apps \
                  WHERE app_id = $1 AND trim(trailing '/' from base_url) = $2 \
                  LIMIT 1",
             )
@@ -557,7 +700,10 @@ impl InboundDeps for PgInboundDeps {
         .map_err(|error| error.to_string())?;
         Ok(row.map(|row| InboundApp {
             id: row.try_get("id").unwrap_or_default(),
+            app_id: row.try_get("app_id").unwrap_or_default(),
             kind: row.try_get("kind").unwrap_or_default(),
+            base_url: row.try_get("base_url").unwrap_or_default(),
+            created_by_user_id: row.try_get("creator_id").unwrap_or_default(),
         }))
     }
 
@@ -576,7 +722,79 @@ impl InboundDeps for PgInboundDeps {
             .map(|_| ())
             .map_err(|error| error.to_string())
     }
+
+    fn create_user_credential(
+        &self,
+        app: &InboundApp,
+        external_service_url: &str,
+    ) -> Result<(), String> {
+        let wrap = |error: String| {
+            format!("Unexpected error while creating user credential for github app: {error}")
+        };
+        // `store.New(db, ..., keyring.Default().BatchChangesCredentialKey)`.
+        let store = PgBatchesGraphqlStore::new(self.pool.clone()).with_keyring(self.keyring.clone());
+        let user_id = app.created_by_user_id;
+        if store
+            .get_user_credential_by_scope(user_id, GITHUB_APP_EXTERNAL_SERVICE_TYPE, external_service_url)
+            .map_err(wrap)?
+            .is_some()
+        {
+            return Err(wrap("a credential for this code host already exists".to_owned()));
+        }
+        // `MarshalAuthenticator(*ghauth.GitHubAppAuthenticator)`: the
+        // authenticator's fields are unexported, so `Auth` is `{}`.
+        let (credential, encryption_key_id) = store
+            .encrypt_credential(GITHUB_APP_AUTHENTICATOR_JSON)
+            .map_err(wrap)?;
+        store
+            .create_user_credential(
+                user_id,
+                GITHUB_APP_EXTERNAL_SERVICE_TYPE,
+                external_service_url,
+                &credential,
+                &encryption_key_id,
+                Some(i64::from(app.id)),
+            )
+            .map(|_| ())
+            .map_err(wrap)
+    }
+
+    fn create_site_credential(
+        &self,
+        app: &InboundApp,
+        external_service_url: &str,
+    ) -> Result<(), String> {
+        let wrap = |error: String| {
+            format!("Unexpected error while creating site credential for github app: {error}")
+        };
+        let store = PgBatchesGraphqlStore::new(self.pool.clone()).with_keyring(self.keyring.clone());
+        if store
+            .get_site_credential_by_scope(GITHUB_APP_EXTERNAL_SERVICE_TYPE, external_service_url)
+            .map_err(wrap)?
+            .is_some()
+        {
+            return Err(wrap("a credential for this code host already exists".to_owned()));
+        }
+        // `SiteCredential.SetAuthenticator` returns early for GitHub Apps, so
+        // the stored credential is empty and the key id is `''`.
+        store
+            .create_site_credential(
+                GITHUB_APP_EXTERNAL_SERVICE_TYPE,
+                external_service_url,
+                &[],
+                "",
+                Some(i64::from(app.id)),
+            )
+            .map(|_| ())
+            .map_err(wrap)
+    }
 }
+
+/// `extsvc.VariantGitHub.AsType()`.
+const GITHUB_APP_EXTERNAL_SERVICE_TYPE: &str = "github";
+
+/// `MarshalAuthenticator(*ghauth.GitHubAppAuthenticator)`.
+const GITHUB_APP_AUTHENTICATOR_JSON: &str = r#"{"Type":"GitHubApp","Auth":{}}"#;
 
 #[cfg(test)]
 mod tests {
