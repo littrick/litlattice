@@ -174,6 +174,11 @@ fn failure_for(
     description: &str,
 ) -> Option<JobFailure> {
     match kind {
+        "stale_permissions" => Some(JobFailure::StalePermissions),
+        // `*gitdomain.BadCommitError`: the alert only reads `Spec`.
+        "bad_commit" => Some(JobFailure::BadCommit {
+            spec: message.to_owned(),
+        }),
         "missing_revs" => Some(JobFailure::MissingRepoRevs(rev_specs_from(missing))),
         "over_repo_limit" => Some(JobFailure::OverRepoLimit {
             proposed_queries: query_descs(proposed_queries),
@@ -346,13 +351,8 @@ fn result_match() -> Match {
     })
 }
 
-#[test]
-fn search_alerts_diff() {
-    let Ok(corpus_path) = std::env::var("M940B_CORPUS") else {
-        return;
-    };
-    let out_path = std::env::var("M940B_OUT").expect("M940B_OUT is not set");
-    let raw = std::fs::read_to_string(&corpus_path).expect("read corpus");
+fn run_corpus(corpus_path: &str, out_path: &str) {
+    let raw = std::fs::read_to_string(corpus_path).expect("read corpus");
     let corpus: Corpus = serde_json::from_str(&raw).expect("parse corpus");
 
     let mut results = Vec::with_capacity(corpus.cases.len());
@@ -410,5 +410,26 @@ fn search_alerts_diff() {
     }
 
     let encoded = serde_json::to_string_pretty(&results).expect("encode output");
-    std::fs::write(&out_path, encoded).expect("write output");
+    std::fs::write(out_path, encoded).expect("write output");
+}
+
+#[test]
+fn search_alerts_diff() {
+    let Ok(corpus_path) = std::env::var("M940B_CORPUS") else {
+        return;
+    };
+    let out_path = std::env::var("M940B_OUT").expect("M940B_OUT is not set");
+    run_corpus(&corpus_path, &out_path);
+}
+
+/// M9.41d: the two remaining `errorToAlert` branches
+/// (`authz.ErrStalePermissions`, `*gitdomain.BadCommitError`) plus their
+/// `MultiError` priority interactions.
+#[test]
+fn search_alerts_m941d_diff() {
+    let Ok(corpus_path) = std::env::var("M941D_ALERT_CORPUS") else {
+        return;
+    };
+    let out_path = std::env::var("M941D_ALERT_OUT").expect("M941D_ALERT_OUT is not set");
+    run_corpus(&corpus_path, &out_path);
 }

@@ -363,6 +363,7 @@ fn result(case: &Case) -> Value {
         features: Features {
             content_based_lang_filters: case.features.content_based_lang_filters,
             debug: case.features.debug,
+            zoekt_search_options_override: String::new(),
         },
         context_lines: case.context_lines.unwrap_or(1),
         sub_repo_enabled: case.sub_repo_enabled,

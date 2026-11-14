@@ -728,6 +728,9 @@ fn frontend_exhaustive_inputs(
         features: sg_service_frontend::search_client::Features {
             content_based_lang_filters: inputs.features.content_based_lang_filters,
             debug: inputs.features.debug,
+            // `Features.ZoektSearchOptionsOverride` is only written by the
+            // authenticated HTTP handler; the worker never sets it.
+            zoekt_search_options_override: String::new(),
         },
         context_lines: inputs.context_lines,
         sub_repo_enabled: inputs.sub_repo_enabled,

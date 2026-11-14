@@ -278,9 +278,6 @@ impl SearchDeps for FakeSearchDeps {
         Vec::new()
     }
 
-    fn is_authenticated(&self) -> bool {
-        false
-    }
 }
 
 // ---------------------------------------------------------------------------

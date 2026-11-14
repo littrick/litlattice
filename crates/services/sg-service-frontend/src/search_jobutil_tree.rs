@@ -1362,8 +1362,9 @@ impl TreeAlertObserver {
     /// (only without results) and the structural memory alerts. Everything
     /// else keeps bubbling up.
     ///
-    /// `authz.ErrStalePermissions` and `*gitdomain.BadCommitError` are outside
-    /// this slice's scope and still bubble.
+    /// `authz.ErrStalePermissions` and `*gitdomain.BadCommitError` are
+    /// translated right after `Multi`, before the no-resolved-repos branch
+    /// (`observer.go:237-245`); everything else keeps bubbling.
     fn error_to_alert(
         &self,
         ctx: &comb::RunContext,
@@ -1378,6 +1379,15 @@ impl TreeAlertObserver {
                     .collect();
                 comb::max_priority_alert(&alerts)
             }
+            // `observer.go:237-241`: `errors.HasType[authz.ErrStalePermissions]`.
+            comb::JobFailure::StalePermissions => Some(comb::Alert {
+                prometheus_type: "no_resolved_repos__stale_permissions".to_owned(),
+                title: "Permissions syncing in progress".to_owned(),
+                description: "Permissions are being synced from your code host, please wait for a minute and try again.".to_owned(),
+                ..comb::Alert::default()
+            }),
+            // `observer.go:243-245`: `*gitdomain.BadCommitError`.
+            comb::JobFailure::BadCommit { spec } => Some(alert_for_invalid_revision(spec)),
             // `observer.go:251-259`: `*errOverRepoLimit`.
             comb::JobFailure::OverRepoLimit {
                 proposed_queries,
@@ -1620,6 +1630,19 @@ fn repos_exist(
 /// `searchalert.AlertForMissingRepoRevs` (`observer.go:330-370`), text
 /// verbatim: single repo / single rev, single repo / multiple revs, and the
 /// multi-repo list with a 10-entry sample. Callers force `priority = 6`.
+/// `search.AlertForInvalidRevision` (`internal/search/alert.go:167-175`).
+/// `strings.TrimSuffix(revision, "^0")` then the fixed description.
+fn alert_for_invalid_revision(revision: &str) -> comb::Alert {
+    let revision = revision.strip_suffix("^0").unwrap_or(revision);
+    comb::Alert {
+        title: "Invalid revision syntax".to_owned(),
+        description: format!(
+            "We don't know how to interpret the revision ({revision}) you specified. Learn more about the revision syntax in our documentation: https://sourcegraph.com/docs/code-search/queries#repository-revisions."
+        ),
+        ..comb::Alert::default()
+    }
+}
+
 fn alert_for_missing_repo_revs(
     missing_repo_revs: &[crate::search_repos::RepoRevSpecs],
 ) -> comb::Alert {
@@ -2924,7 +2947,7 @@ pub fn new_basic_job(inputs: &TreeInputs, basic: &Basic) -> Result<JobNode, JobE
         .unwrap_or_default();
     let builder = JobBuilder {
         result_types,
-        features: inputs.features,
+        features: inputs.features.clone(),
         pattern_type: inputs.pattern_type,
         file_match_limit,
         select: selector,

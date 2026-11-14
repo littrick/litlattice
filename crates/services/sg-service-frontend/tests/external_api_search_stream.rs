@@ -66,9 +66,6 @@ impl SearchDeps for FakeDeps {
             .collect()
     }
 
-    fn is_authenticated(&self) -> bool {
-        false
-    }
 }
 
 fn ts(seconds: i64) -> OffsetDateTime {

@@ -69,10 +69,15 @@ impl Protocol {
 }
 
 /// The subset of `search.Features` this slice models (`types.go:387-400`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+///
+/// `zoekt_search_options_override` mirrors `Features.ZoektSearchOptionsOverride`:
+/// `Plan` leaves it empty and the HTTP handler copies `?zoekt-search-opts=`
+/// only for authenticated requests (`cmd/frontend/internal/search/search.go:144`).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Features {
     pub content_based_lang_filters: bool,
     pub debug: bool,
+    pub zoekt_search_options_override: String,
 }
 
 /// `schema.Settings` fields read by `Plan`.
@@ -145,7 +150,11 @@ impl std::error::Error for PlanError {}
 // already captures `Send + Sync` state.
 pub type SettingsLoader = Box<dyn Fn() -> Result<Settings, String> + Send + Sync>;
 pub type FeatureFlagLoader = Box<dyn Fn() -> BTreeMap<String, bool> + Send + Sync>;
-pub type SearchContextResolver = Arc<dyn Fn(&str) -> Result<String, String> + Send + Sync>;
+/// `searchcontexts.ResolveSearchContextSpec(ctx, ...)` -> `sc.Query`. `ctx`
+/// carries the Plan-stage request actor (`actor.FromContext(ctx)`), which Go
+/// reads from `context.Context` when validating org-namespaced contexts.
+pub type SearchContextResolver =
+    Arc<dyn Fn(&str, &crate::search_contexts::RequestContext) -> Result<String, String> + Send + Sync>;
 pub type SanitizePatternsLoader = Box<dyn Fn() -> Vec<String> + Send + Sync>;
 
 /// `schema.SettingsExperimentalFeatures.SearchSanitization`
@@ -268,7 +277,9 @@ impl SearchClient {
         SearchClient { deps }
     }
 
-    /// `searchClient.Plan` (`client.go:83-161`).
+    /// `searchClient.Plan` (`client.go:83-161`) with no request actor (the Go
+    /// `context.Background()` equivalent). Callers with an actor use
+    /// [`SearchClient::plan_with_context`].
     pub fn plan(
         &self,
         version: &str,
@@ -278,19 +289,49 @@ impl SearchClient {
         protocol: Protocol,
         context_lines: Option<i32>,
     ) -> Result<Inputs, PlanError> {
+        self.plan_with_context(
+            version,
+            pattern_type,
+            search_query,
+            search_mode,
+            protocol,
+            context_lines,
+            &crate::search_contexts::RequestContext::anonymous(),
+        )
+    }
+
+    /// `searchClient.Plan` with the request actor (`actor.FromContext(ctx)`).
+    /// `sourcegraph_dot_com_mode` comes from
+    /// `searchClient.sourcegraphDotComMode` (`dotcom.SourcegraphDotComMode()`),
+    /// so the caller only supplies the actor fields.
+    pub fn plan_with_context(
+        &self,
+        version: &str,
+        pattern_type: Option<&str>,
+        search_query: &str,
+        search_mode: SearchMode,
+        protocol: Protocol,
+        context_lines: Option<i32>,
+        request_context: &crate::search_contexts::RequestContext,
+    ) -> Result<Inputs, PlanError> {
         let search_type = detect_search_type(version, pattern_type)?;
         let search_type = override_search_type(search_query, search_type);
 
         let settings = (self.deps.user_settings)().map_err(PlanError::UserSettings)?;
 
         // Beta: replace each `context:` term with the search context's query.
+        // `ResolveSearchContextSpec` reads the actor from `ctx`; the dotcom
+        // flag comes from the search client, not the caller.
         let search_contexts_query_enabled = settings
             .experimental_features
             .as_ref()
             .is_some_and(|features| get_bool_ptr(features.search_contexts_query, true));
         let resolver = self.deps.resolve_search_context.clone();
-        let substitute_contexts_step =
-            substitute_search_contexts(move |context: &str| resolver(context));
+        let mut request_context = *request_context;
+        request_context.sourcegraph_dot_com_mode = self.deps.on_sourcegraph_dot_com;
+        let substitute_contexts_step = substitute_search_contexts(move |context: &str| {
+            resolver(context, &request_context)
+        });
 
         let plan = pipeline(vec![
             init(search_query.to_owned(), search_type),
@@ -480,6 +521,7 @@ pub fn to_features(flags: Option<&BTreeMap<String, bool>>) -> Features {
     Features {
         content_based_lang_filters: get("search-content-based-lang-detection"),
         debug: get("search-debug"),
+        zoekt_search_options_override: String::new(),
     }
 }
 
@@ -496,7 +538,9 @@ mod tests {
         PlanDeps {
             user_settings: Box::new(|| Ok(Settings::default())),
             feature_flags: Box::new(BTreeMap::new),
-            resolve_search_context: Arc::new(|_: &str| Err("unexpected context lookup".to_owned())),
+            resolve_search_context: Arc::new(|_: &str, _: &crate::search_contexts::RequestContext| {
+                Err("unexpected context lookup".to_owned())
+            }),
             sanitize_search_patterns: Box::new(Vec::new),
             on_sourcegraph_dot_com: false,
         }
@@ -617,7 +661,10 @@ mod tests {
                 ..Settings::default()
             })
         });
-        deps.resolve_search_context = Arc::new(|context: &str| Ok(format!("repo:{context}")));
+        deps.resolve_search_context =
+            Arc::new(|context: &str, _: &crate::search_contexts::RequestContext| {
+                Ok(format!("repo:{context}"))
+            });
         let inputs = run_plan(deps, "V3", None, "context:foo a", None).unwrap();
         assert!(inputs
             .plan
@@ -628,7 +675,10 @@ mod tests {
 
         // ExperimentalFeatures nil -> substitution disabled.
         let mut deps = test_deps();
-        deps.resolve_search_context = Arc::new(|context: &str| Ok(format!("repo:{context}")));
+        deps.resolve_search_context =
+            Arc::new(|context: &str, _: &crate::search_contexts::RequestContext| {
+                Ok(format!("repo:{context}"))
+            });
         let inputs = run_plan(deps, "V3", None, "context:foo a", None).unwrap();
         assert!(inputs
             .plan
@@ -684,6 +734,7 @@ mod tests {
             Features {
                 content_based_lang_filters: false,
                 debug: true,
+                zoekt_search_options_override: String::new(),
             }
         );
     }

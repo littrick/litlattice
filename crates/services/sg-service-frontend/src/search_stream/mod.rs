@@ -339,6 +339,19 @@ pub trait SearchDeps: Send + Sync {
     /// `searchClient.Plan`.
     async fn plan(&self, args: &Args) -> Result<SearchInputs, PlanError>;
 
+    /// `searchClient.Plan(ctx, ...)` with the request actor
+    /// (`actor.FromContext(ctx)`), used by `ResolveSearchContextSpec` while
+    /// substituting `context:` filters. Defaults to [`SearchDeps::plan`]
+    /// (anonymous) so existing implementations are unchanged.
+    async fn plan_with_context(
+        &self,
+        args: &Args,
+        request_context: crate::search_contexts::RequestContext,
+    ) -> Result<SearchInputs, PlanError> {
+        let _ = request_context;
+        self.plan(args).await
+    }
+
     /// `searchClient.Execute` as an item stream. The stream ends when the
     /// baseline `Execute` would return.
     async fn execute(
@@ -369,9 +382,12 @@ pub trait SearchDeps: Send + Sync {
     async fn repo_names(&self, ids: &[i32]) -> Vec<(i32, String)>;
 
     /// `actor.FromContext(ctx).IsAuthenticated()`; gates the
-    /// `zoekt-search-opts` override. No actor middleware is ported, so the
-    /// production implementation reports `false`.
-    fn is_authenticated(&self) -> bool;
+    /// `zoekt-search-opts` override (`search.go:144`). The request actor is
+    /// passed explicitly because a trait object has no `context.Context`;
+    /// `None` (direct callers/tests) models the anonymous actor.
+    fn is_authenticated(&self, actor: Option<&crate::actor_middleware::Actor>) -> bool {
+        actor.is_some_and(crate::actor_middleware::Actor::is_authenticated)
+    }
 }
 
 /// Production deps: Postgres-backed metadata, the ported
@@ -388,11 +404,8 @@ pub struct BackendDeps {
 
 impl BackendDeps {
     pub fn new(pool: sqlx::PgPool) -> Self {
-        Self::with_deps(
-            pool,
-            default_plan_deps(),
-            Arc::new(TreeJobRunner::unconfigured()),
-        )
+        let plan_deps = plan_deps_with_search_contexts(pool.clone());
+        Self::with_deps(pool, plan_deps, Arc::new(TreeJobRunner::unconfigured()))
     }
 
     /// Test/differential seam: inject the `Plan` loaders and the runner.
@@ -407,11 +420,8 @@ impl BackendDeps {
     /// Production seam (M9.8im): inject the assembled search runtime while
     /// keeping the ported plan loaders.
     pub fn with_runtime(pool: sqlx::PgPool, runtime: TreeRuntimeClients) -> Self {
-        Self::with_deps(
-            pool,
-            default_plan_deps(),
-            Arc::new(TreeJobRunner::with_clients(runtime)),
-        )
+        let plan_deps = plan_deps_with_search_contexts(pool.clone());
+        Self::with_deps(pool, plan_deps, Arc::new(TreeJobRunner::with_clients(runtime)))
     }
 }
 
@@ -427,14 +437,37 @@ pub fn default_plan_deps() -> PlanDeps {
     PlanDeps {
         user_settings: Box::new(|| Ok(crate::search_client::Settings::default())),
         feature_flags: Box::new(BTreeMap::new),
-        resolve_search_context: Arc::new(|context: &str| {
-            Err(format!(
-                "search context resolution is not ported yet (context: {context})"
-            ))
-        }),
+        resolve_search_context: Arc::new(
+            |context: &str, _: &crate::search_contexts::RequestContext| {
+                Err(format!(
+                    "search context resolution is not ported yet (context: {context})"
+                ))
+            },
+        ),
         sanitize_search_patterns: Box::new(Vec::new),
         on_sourcegraph_dot_com: false,
     }
+}
+
+/// Production `Plan` loaders backed by the real search-contexts store.
+/// `ResolveSearchContextSpec` receives the Plan-stage `RequestContext`, so the
+/// dotcom org-membership check uses the request actor exactly like
+/// `client.go:106`.
+pub fn plan_deps_with_search_contexts(pool: sqlx::PgPool) -> PlanDeps {
+    let mut deps = default_plan_deps();
+    let store = Arc::new(crate::search_contexts_store::PgSearchContextsStore::new(pool));
+    deps.resolve_search_context = Arc::new(
+        move |context: &str, request_context: &crate::search_contexts::RequestContext| {
+            crate::search_contexts::resolve_search_context_spec(
+                store.as_ref(),
+                request_context,
+                context,
+            )
+            .map(|resolved| resolved.query)
+            .map_err(|error| error.to_string())
+        },
+    );
+    deps
 }
 
 /// `client.QueryError` / generic `Plan` errors, as the handler distinguishes
@@ -483,7 +516,7 @@ pub fn tree_inputs(inputs: &SearchInputs) -> TreeInputs {
         // `search.includeForks`/`includeArchived` are not modelled by
         // `search_client::Settings` yet.
         user_settings: jb::UserSettings::default(),
-        features: inputs.features,
+        features: inputs.features.clone(),
         context_lines: inputs.context_lines,
         sanitize_search_patterns: inputs.sanitize_search_patterns.clone(),
         on_sourcegraph_dot_com: inputs.on_sourcegraph_dot_com,
@@ -656,6 +689,18 @@ impl crate::codycontext::KeywordContextSearcher for SearchKeywordSearcher {
 #[async_trait]
 impl SearchDeps for BackendDeps {
     async fn plan(&self, args: &Args) -> Result<SearchInputs, PlanError> {
+        self.plan_with_context(
+            args,
+            crate::search_contexts::RequestContext::anonymous(),
+        )
+        .await
+    }
+
+    async fn plan_with_context(
+        &self,
+        args: &Args,
+        request_context: crate::search_contexts::RequestContext,
+    ) -> Result<SearchInputs, PlanError> {
         let pattern_type = if args.pattern_type.is_empty() {
             None
         } else {
@@ -669,13 +714,14 @@ impl SearchDeps for BackendDeps {
         };
         let inputs = self
             .client
-            .plan(
+            .plan_with_context(
                 &args.version,
                 pattern_type,
                 &args.query,
                 search_mode,
                 Protocol::Streaming,
                 args.context_lines,
+                &request_context,
             )
             .map_err(map_plan_error)?;
 
@@ -762,10 +808,6 @@ impl SearchDeps for BackendDeps {
             }
         }
     }
-
-    fn is_authenticated(&self) -> bool {
-        false
-    }
 }
 
 /// Search deps for entry points that do not have a database (tests of other
@@ -794,10 +836,6 @@ impl SearchDeps for UnavailableDeps {
 
     async fn repo_names(&self, _ids: &[i32]) -> Vec<(i32, String)> {
         Vec::new()
-    }
-
-    fn is_authenticated(&self) -> bool {
-        false
     }
 }
 
@@ -1175,7 +1213,14 @@ async fn serve_http<B>(
         }
     };
 
-    let inputs = match deps.plan(&args).await {
+    // `actor.FromContext(ctx)` at Plan time: `ResolveSearchContextSpec`
+    // validates org-namespaced contexts against this actor. The dotcom flag is
+    // filled by `SearchClient` from its `PlanDeps`.
+    let plan_request_context = match request_actor.as_ref() {
+        Some(actor) => crate::search_contexts::RequestContext::from_actor(actor, false),
+        None => crate::search_contexts::RequestContext::anonymous(),
+    };
+    let mut inputs = match deps.plan_with_context(&args, plan_request_context).await {
         Ok(inputs) => inputs,
         Err(PlanError::Query {
             message,
@@ -1192,6 +1237,13 @@ async fn serve_http<B>(
             return writer.out;
         }
     };
+
+    // `search.go:144`: the zoekt debug override is only honoured for an
+    // authenticated actor (`actor.FromContext(ctx).IsAuthenticated()`).
+    if deps.is_authenticated(request_actor.as_ref()) {
+        inputs.features.zoekt_search_options_override =
+            args.zoekt_search_options_override.clone();
+    }
 
     let display_filter = DisplayFilter::new(&args, inputs.max_results);
     let progress = ProgressAggregator::new(

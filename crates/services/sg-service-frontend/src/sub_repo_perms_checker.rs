@@ -479,6 +479,45 @@ pub fn configure_from_site(
     }
 }
 
+/// `conf.Watch` for `experimentalFeatures.subRepoPermissions.enabled`
+/// (`subrepoperms/sub_repo_perms.go:119-133`). Go re-reads the site config on
+/// every replacement and updates the checker's `enabled` flag in place; the
+/// Rust runtime is rebuilt (it has no separate cache to preserve), which is
+/// observationally identical to `authz.SubRepoEnabled(checker)` flipping.
+///
+/// The initial configuration is installed by [`configure_from_site`] before
+/// this task starts, so only later generation changes call it again.
+pub fn spawn_sub_repo_config_watch(
+    tasks: &mut tokio::task::JoinSet<()>,
+    live: Arc<sg_config::LiveConfig>,
+    getter: Arc<dyn SubRepoPermissionsGetter>,
+    shutdown: tokio_util::sync::CancellationToken,
+) {
+    let mut receiver = live.subscribe();
+    tasks.spawn(async move {
+        loop {
+            tokio::select! {
+                _ = shutdown.cancelled() => break,
+                changed = receiver.changed() => {
+                    if changed.is_err() {
+                        break;
+                    }
+                    let site = live.current().site.clone();
+                    let enabled = configure_from_site(
+                        &site,
+                        Some(Arc::clone(&getter)),
+                        Actor::default(),
+                    );
+                    tracing::info!(
+                        enabled = enabled,
+                        "reconfigured sub-repository permission checker from site config"
+                    );
+                }
+            }
+        }
+    });
+}
+
 /// Production `database.SubRepoPermsStore`-backed getter.
 ///
 /// Go's store is synchronous and reads `conf.Get()` on every query

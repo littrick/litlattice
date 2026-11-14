@@ -105,6 +105,21 @@ pub trait SearchExecutor: Send + Sync {
         mode: SearchStreamMode,
     ) -> Result<PlannedSearch, SearchExecutionError>;
 
+    /// `client.Plan(ctx, ...)` with the GraphQL request actor
+    /// (`actor.FromContext(ctx)`), threaded into
+    /// [`crate::search_stream::SearchDeps::plan_with_context`] so Plan-stage
+    /// search-context resolution sees the actor. Defaults to
+    /// [`SearchExecutor::plan`] (anonymous).
+    async fn plan_with_context(
+        &self,
+        args: &SearchArgs,
+        mode: SearchStreamMode,
+        request_context: crate::search_contexts::RequestContext,
+    ) -> Result<PlannedSearch, SearchExecutionError> {
+        let _ = request_context;
+        self.plan(args, mode).await
+    }
+
     /// `client.Execute`, materialized into an aggregating result.
     async fn execute(
         &self,
@@ -145,6 +160,20 @@ impl SearchExecutor for BackendSearchExecutor {
         args: &SearchArgs,
         mode: SearchStreamMode,
     ) -> Result<PlannedSearch, SearchExecutionError> {
+        self.plan_with_context(
+            args,
+            mode,
+            crate::search_contexts::RequestContext::anonymous(),
+        )
+        .await
+    }
+
+    async fn plan_with_context(
+        &self,
+        args: &SearchArgs,
+        mode: SearchStreamMode,
+        request_context: crate::search_contexts::RequestContext,
+    ) -> Result<PlannedSearch, SearchExecutionError> {
         let stream_args = Args {
             query: args.query.clone(),
             version: args.version.clone(),
@@ -159,7 +188,7 @@ impl SearchExecutor for BackendSearchExecutor {
         };
         let mut inputs = self
             .deps
-            .plan(&stream_args)
+            .plan_with_context(&stream_args, request_context)
             .await
             .map_err(|error| match error {
                 PlanError::Query {
@@ -248,7 +277,14 @@ pub async fn prefetch_search_roots(
         pattern_type: field.arguments.string("patternType").map(str::to_owned),
         query: field.arguments.string("query").unwrap_or("").to_owned(),
     };
-    Some(match executor.plan(&args, SearchStreamMode::Batch).await {
+    // `actor.FromContext(ctx)` at Plan time. The dotcom flag is filled by the
+    // search client from `dotcom.SourcegraphDotComMode()`; the execute phase
+    // rebuilds the context from `planned.inputs.on_sourcegraph_dot_com`.
+    let plan_context = crate::search_contexts::RequestContext::from_graphql_actor(actor, false);
+    Some(match executor
+        .plan_with_context(&args, SearchStreamMode::Batch, plan_context)
+        .await
+    {
         Ok(planned) => {
             // `actor.FromContext(ctx)` + `dotcom.SourcegraphDotComMode()`.
             let request_context = crate::search_contexts::RequestContext::from_graphql_actor(
