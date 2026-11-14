@@ -212,16 +212,21 @@ pub enum CommitLogOrder {
     TopoDate,
 }
 
+/// Unix seconds of Go's zero `time.Time` (0001-01-01T00:00:00Z). The Go client
+/// always sets `timestamppb.New(opt.After)`, so an unset filter arrives as this
+/// value rather than an absent timestamp.
+pub const GO_ZERO_TIME_SECONDS: i64 = -62_135_596_800;
+
 /// `git.CommitLogOpts` without the proto dependency.
 #[derive(Debug, Clone)]
 pub struct CommitLogOptions {
     pub ranges: Vec<Vec<u8>>,
     pub all_refs: bool,
-    /// The gRPC handler passes `GetAfter().AsTime()` even when the timestamp is
-    /// unset; a nil `Timestamppb` yields the Unix epoch (not Go's zero time), so
-    /// both filters are always emitted.
-    pub after_seconds: i64,
-    pub before_seconds: i64,
+    /// `nil` means the request carried no timestamp, while Go's zero `time.Time`
+    /// arrives as [`GO_ZERO_TIME_SECONDS`]; both are unset and emit no filter.
+    /// An explicit epoch (`0`) is a real filter, matching `!opt.After.IsZero()`.
+    pub after_seconds: Option<i64>,
+    pub before_seconds: Option<i64>,
     pub max_commits: u32,
     pub skip: u32,
     pub follow_only_first_parent: bool,
@@ -1322,9 +1327,14 @@ impl GitRepo {
             arg.push(OsStr::from_bytes(&options.author_query));
             args.push(arg);
         }
-        // See `CommitLogOptions`: unset timestamps arrive as the Unix epoch.
-        args.push(format!("--after={}", rfc3339_utc(options.after_seconds)).into());
-        args.push(format!("--before={}", rfc3339_utc(options.before_seconds)).into());
+        // `gitcli.commitlog.go:59-64`: only emit a filter when the timestamp is
+        // set and not Go's zero time.
+        if let Some(seconds) = options.after_seconds.filter(|s| *s != GO_ZERO_TIME_SECONDS) {
+            args.push(format!("--after={}", rfc3339_utc(seconds)).into());
+        }
+        if let Some(seconds) = options.before_seconds.filter(|s| *s != GO_ZERO_TIME_SECONDS) {
+            args.push(format!("--before={}", rfc3339_utc(seconds)).into());
+        }
         match options.order {
             CommitLogOrder::CommitDate => args.push("--date-order".into()),
             CommitLogOrder::TopoDate => args.push("--topo-order".into()),
@@ -3121,8 +3131,8 @@ mod tests {
         let options = |ranges: Vec<Vec<u8>>| CommitLogOptions {
             ranges,
             all_refs: false,
-            after_seconds: 0,
-            before_seconds: before,
+            after_seconds: None,
+            before_seconds: Some(before),
             max_commits: 0,
             skip: 0,
             follow_only_first_parent: false,

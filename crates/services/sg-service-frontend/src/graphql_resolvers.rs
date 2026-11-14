@@ -7152,6 +7152,34 @@ impl ObjectValue for RepositoryObject {
                     None => Ok(None),
                 }
             }
+            // `Repository.DefaultBranch` (`repository.go:425-440`):
+            // `gitserver.GetDefaultBranch(repo, false)`; an empty ref name is
+            // `null`. Returns a `GitRef` named with the full ref
+            // (`refs/heads/main`), like `NewGitRefResolver(repo, refName)`.
+            "defaultBranch" => {
+                let Some(git) = &self.git else {
+                    return Ok(None);
+                };
+                match git.default_branches.get(&self.data.id) {
+                    Some(crate::git_graphql::DefaultBranchLookup::Found(name)) => {
+                        Ok(Some(FieldValue::Object(Arc::new(
+                            crate::search_graphql::GitRefObject::new(
+                                self.minimal_repo(),
+                                name.clone(),
+                                Some(git.clone()),
+                            ),
+                        ))))
+                    }
+                    Some(crate::git_graphql::DefaultBranchLookup::NotFound) => {
+                        Ok(Some(FieldValue::Null))
+                    }
+                    Some(crate::git_graphql::DefaultBranchLookup::Error(message)) => {
+                        Err(ExecError::new(message.clone()))
+                    }
+                    // Not prefetched: behave like a transport-only resolver.
+                    None => Ok(None),
+                }
+            }
             // `Repository.GitRefs`/`Branches`/`Tags`
             // (`repository_git_refs.go:20-74`).
             "gitRefs" | "branches" | "tags" => {
