@@ -1414,6 +1414,78 @@ impl Service for FrontendService {
                     "failed to register batch changes/code intel GraphQL surfaces: {err}"
                 ))
             })?;
+        // M9.42a: production Notebooks / Code Insights / GitHub Apps / Code Intel
+        // autoindexing surfaces. `graphqlbackend.NewSchema` appends
+        // `notebooks.graphql`, `insights.graphql` and `githubapps.graphql` for a
+        // non-nil `NotebooksResolver` / `InsightsResolver` / `GitHubAppsResolver`,
+        // and the `codeintel*.graphql` document set for a non-nil
+        // `CodeIntelResolver` (the autoindexing document is already appended by
+        // `with_codeintel_uploads` above). The stores read the same frontend /
+        // code-insights tables as the Go baseline; no new tables, columns or
+        // Redis keys. `with_batches` already registered `githubapps.graphql`, so
+        // `with_github_apps` only attaches its handle.
+        //
+        // The insights store reads the `sourcegraph-codeinsights` database
+        // (`database.NewInsightsDB`); connect lazily so a frontend without that
+        // database still starts and only the queries surface the connection
+        // error.
+        let insights_dsn = crate::service_connections::service_connections()
+            .map(|connections| connections.code_insights_dsn)
+            .unwrap_or_default();
+        let insights_pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(5)
+            .connect_lazy(&insights_dsn)
+            .map_err(|err| {
+                ServiceError::new(format!("configuring the code insights database: {err}"))
+            })?;
+        let external_url = wiring
+            .live()
+            .current()
+            .site
+            .raw()
+            .get("externalURL")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        // `conf.CodeIntelAutoIndexingEnabled` is read per request in the
+        // baseline; the store keeps a snapshot from the same live site config.
+        let autoindexing_site = wiring.live().current().site.clone();
+        let graphql_deps = graphql_deps
+            .with_notebooks(Arc::new(
+                crate::notebooks_store::PgNotebooksStore::new(session_pool.clone()),
+            ))
+            .and_then(|deps| {
+                deps.with_insights(Arc::new(
+                    crate::insights_store::PgInsightsStore::new(insights_pool.clone())
+                        .with_frontend_pool(session_pool.clone()),
+                ))
+            })
+            .and_then(|deps| {
+                deps.with_github_apps(Arc::new(
+                    crate::github_apps_graphql_store::GitHubAppsPgDatabase::new(
+                        session_pool.clone(),
+                        Arc::clone(&keyring),
+                    )
+                    .with_external_url(external_url),
+                ))
+            })
+            .map_err(|err| {
+                ServiceError::new(format!(
+                    "failed to register notebooks/insights/github apps GraphQL surfaces: {err}"
+                ))
+            })?;
+        // The inference/enqueue half of the autoindexing service lives in
+        // `sg-service-worker` (which depends on this crate), so the production
+        // root cannot inject a jobs runtime; configuration/script reads and the
+        // schema surface work, while inference reports the explicit
+        // "not configured" error.
+        let graphql_deps = graphql_deps.with_codeintel_autoindexing(Arc::new(
+            crate::codeintel_autoindexing_graphql_store::PgCodeIntelAutoindexingStore::with_site_configuration(
+                session_pool.clone(),
+                autoindexing_site,
+                None,
+            ),
+        ));
         let graphql_deps = graphql_deps
             .with_production_surfaces(
                 Some(search_contexts),
