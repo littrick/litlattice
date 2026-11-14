@@ -3304,6 +3304,10 @@ impl JobBuilder {
             num_context_lines: self.num_context_lines,
             features: crate::search_stream::zoekt_search::Features {
                 debug: self.features.debug,
+                zoekt_search_options_override: self
+                    .features
+                    .zoekt_search_options_override
+                    .clone(),
             },
             pattern_type: self.pattern_type,
             ..ZoektParameters::default()

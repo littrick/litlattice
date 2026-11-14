@@ -52,10 +52,16 @@ impl SelectPath {
 }
 
 /// `search.Features` fields read by `ToSearchOptions`.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Features {
     /// `Features.Debug`: set `SearchOptions.DebugScore`.
     pub debug: bool,
+    /// `Features.ZoektSearchOptionsOverride`: JSON applied over the
+    /// constructed [`SearchOptions`] (see [`apply_search_options_override`]).
+    ///
+    /// The HTTP handler only copies `?zoekt-search-opts=` into this field for
+    /// authenticated requests (`cmd/frontend/internal/search/search.go:144`).
+    pub zoekt_search_options_override: String,
 }
 
 /// `search.ZoektParameters` (`internal/search/types.go:161-168`).
@@ -104,9 +110,23 @@ impl Default for ZoektParameters {
 impl ZoektParameters {
     /// `search.ZoektParameters.ToSearchOptions` (`internal/search/types.go:170-235`).
     ///
-    /// The `Features.ZoektSearchOptionsOverride` JSON override is not ported
-    /// (see the overview's errata).
+    /// The baseline builds the full options and then applies
+    /// `Features.ZoektSearchOptionsOverride` from a deferred closure, so the
+    /// override also applies to the `select:repo` early return and rolls back
+    /// entirely on a JSON/type error.
     pub fn to_search_options(&self) -> SearchOptions {
+        let mut options = self.base_search_options();
+        if !self.features.zoekt_search_options_override.is_empty() {
+            apply_search_options_override(
+                &mut options,
+                &self.features.zoekt_search_options_override,
+            );
+        }
+        options
+    }
+
+    /// The body of `ToSearchOptions`, before the override `defer`.
+    fn base_search_options(&self) -> SearchOptions {
         let use_bm25 =
             self.pattern_type == SearchType::CodyContext && self.typ == IndexedRequestType::Text;
 
@@ -169,6 +189,111 @@ impl ZoektParameters {
         options.document_ranks_weight = self.document_ranks_weight;
 
         options
+    }
+}
+
+/// `ToSearchOptions`' deferred `json.Unmarshal` override.
+///
+/// Go unmarshals into the already-built `*zoekt.SearchOptions`, so only keys
+/// present in the JSON change; unknown keys are ignored, `null` is a no-op,
+/// and **any** error (syntax, top-level non-object, type mismatch, integer
+/// overflow) restores the pre-override value wholesale. The candidate is kept
+/// separate so Rust reproduces that all-or-nothing rollback.
+fn apply_search_options_override(options: &mut SearchOptions, raw: &str) {
+    let Ok(serde_json::Value::Object(fields)) = serde_json::from_str::<serde_json::Value>(raw)
+    else {
+        // Mirrors `json.Unmarshal` erroring for malformed JSON or a non-object
+        // top level; `null`/unknown values below are no-ops.
+        return;
+    };
+
+    let mut candidate = options.clone();
+    for (key, value) in fields {
+        if !apply_search_option_field(&mut candidate, &key, &value) {
+            return;
+        }
+    }
+    *options = candidate;
+}
+
+/// Applies one `zoekt.SearchOptions` field. Returns `false` when Go's
+/// `encoding/json` would report a type error (which rolls back the override).
+///
+/// `Go` matches field names case-insensitively when there is no exact match;
+/// `SpanContext` is the only Go field this port does not model, and unknown
+/// keys are ignored.
+fn apply_search_option_field(
+    options: &mut SearchOptions,
+    key: &str,
+    value: &serde_json::Value,
+) -> bool {
+    // `null` has no effect on Go's non-pointer struct fields.
+    if value.is_null() {
+        return true;
+    }
+    match key.to_ascii_lowercase().as_str() {
+        "estimatedoccount" => set_bool(&mut options.estimate_doc_count, value),
+        "whole" => set_bool(&mut options.whole, value),
+        "shardmaxmatchcount" => set_i64(&mut options.shard_max_match_count, value),
+        "totalmaxmatchcount" => set_i64(&mut options.total_max_match_count, value),
+        "shardrepomaxmatchcount" => set_i64(&mut options.shard_repo_max_match_count, value),
+        "maxwalltime" => set_duration(&mut options.max_wall_time, value),
+        "flushwalltime" => set_duration(&mut options.flush_wall_time, value),
+        "maxdocdisplaycount" => set_i64(&mut options.max_doc_display_count, value),
+        "maxmatchdisplaycount" => set_i64(&mut options.max_match_display_count, value),
+        "numcontextlines" => set_i64(&mut options.num_context_lines, value),
+        "chunkmatches" => set_bool(&mut options.chunk_matches, value),
+        "usedocumentranks" => set_bool(&mut options.use_document_ranks, value),
+        "documentranksweight" => set_f64(&mut options.document_ranks_weight, value),
+        "usebm25scoring" => set_bool(&mut options.use_bm25_scoring, value),
+        "trace" => set_bool(&mut options.trace, value),
+        "debugscore" => set_bool(&mut options.debug_score, value),
+        _ => true,
+    }
+}
+
+fn set_bool(slot: &mut bool, value: &serde_json::Value) -> bool {
+    match value.as_bool() {
+        Some(value) => {
+            *slot = value;
+            true
+        }
+        None => false,
+    }
+}
+
+fn set_i64(slot: &mut i64, value: &serde_json::Value) -> bool {
+    match value.as_i64() {
+        Some(value) => {
+            *slot = value;
+            true
+        }
+        // A fractional or exponent number is not accepted for Go integer
+        // fields (`strconv.ParseInt` on the literal).
+        None => false,
+    }
+}
+
+/// `time.Duration` is `int64` nanoseconds on the wire. Rust's [`Duration`] is
+/// unsigned; a negative override value is not representable and is treated as
+/// a rollback (documented errata).
+fn set_duration(slot: &mut Duration, value: &serde_json::Value) -> bool {
+    match value.as_i64() {
+        Some(nanos) if nanos >= 0 => {
+            *slot = Duration::from_nanos(nanos as u64);
+            true
+        }
+        _ => false,
+    }
+}
+
+fn set_f64(slot: &mut f64, value: &serde_json::Value) -> bool {
+    match value.as_f64() {
+        Some(value) => {
+            *slot = value;
+            true
+        }
+        None => false,
     }
 }
 
@@ -665,6 +790,87 @@ mod tests {
         let repo_options = repo_params.to_search_options();
         assert_eq!(repo_options.shard_repo_max_match_count, 1);
         assert_eq!(repo_options.flush_wall_time, Duration::ZERO);
+    }
+
+    fn with_override(raw: &str) -> ZoektParameters {
+        ZoektParameters {
+            features: Features {
+                zoekt_search_options_override: raw.to_owned(),
+                ..Features::default()
+            },
+            ..ZoektParameters::default()
+        }
+    }
+
+    #[test]
+    fn to_search_options_applies_override_fields() {
+        let options = with_override(
+            r#"{"Trace":true,"DebugScore":true,"MaxWallTime":1500000000,
+                "FlushWallTime":250000000,"ShardMaxMatchCount":7,
+                "DocumentRanksWeight":0.25,"UseDocumentRanks":true}"#,
+        )
+        .to_search_options();
+        assert!(options.trace);
+        assert!(options.debug_score);
+        assert_eq!(options.max_wall_time, Duration::from_millis(1500));
+        assert_eq!(options.flush_wall_time, Duration::from_millis(250));
+        assert_eq!(options.shard_max_match_count, 7);
+        assert_eq!(options.document_ranks_weight, 0.25);
+        assert!(options.use_document_ranks);
+        // Untouched fields keep the constructed value.
+        assert_eq!(options.total_max_match_count, 100_000);
+    }
+
+    #[test]
+    fn to_search_options_override_matches_field_names_case_insensitively() {
+        let options = with_override(r#"{"debugscore":true,"CHUNKMATCHES":false}"#).to_search_options();
+        assert!(options.debug_score);
+        assert!(!options.chunk_matches);
+    }
+
+    #[test]
+    fn to_search_options_override_unknown_keys_and_null_are_no_ops() {
+        let options = with_override(r#"{"Bogus":1,"Trace":null}"#).to_search_options();
+        assert!(!options.trace);
+        assert_eq!(options.shard_max_match_count, 10_000);
+    }
+
+    #[test]
+    fn to_search_options_override_rolls_back_on_type_error() {
+        // `ShardMaxMatchCount` is valid but `Trace` is not: Go rolls back both.
+        let options = with_override(r#"{"ShardMaxMatchCount":7,"Trace":"yes"}"#)
+            .to_search_options();
+        assert_eq!(options.shard_max_match_count, 10_000);
+        assert!(!options.trace);
+    }
+
+    #[test]
+    fn to_search_options_override_rolls_back_on_bad_json() {
+        let options = with_override("{not json").to_search_options();
+        assert_eq!(options.shard_max_match_count, 10_000);
+        assert!(!options.trace);
+    }
+
+    #[test]
+    fn to_search_options_override_applies_after_select_repo_early_return() {
+        let params = ZoektParameters {
+            select: SelectPath(vec!["repo".to_owned()]),
+            features: Features {
+                zoekt_search_options_override: r#"{"ShardRepoMaxMatchCount":9,"DebugScore":true}"#
+                    .to_owned(),
+                ..Features::default()
+            },
+            ..ZoektParameters::default()
+        };
+        let options = params.to_search_options();
+        assert_eq!(options.shard_repo_max_match_count, 9);
+        assert!(options.debug_score);
+    }
+
+    #[test]
+    fn to_search_options_override_rejects_fractional_integers() {
+        let options = with_override(r#"{"ShardMaxMatchCount":1.5}"#).to_search_options();
+        assert_eq!(options.shard_max_match_count, 10_000);
     }
 
     #[derive(Debug, Clone)]

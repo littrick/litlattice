@@ -315,6 +315,7 @@ fn params(case: &Case) -> ZoektParameters {
         num_context_lines: case.num_context_lines,
         features: Features {
             debug: case.features_debug,
+            ..Features::default()
         },
         pattern_type: pattern_type(&case.pattern_type),
         trace: false,
