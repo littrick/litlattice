@@ -66,6 +66,10 @@ pub struct HighlightKey {
 pub struct HighlightedFile {
     pub lines: Vec<String>,
     pub aborted: bool,
+    /// M9.37c: the full HTML table (`HighlightedCode.HTML()`), needed by
+    /// `GitBlob.highlight`'s `html`/`lineRanges` fields. `None` when the
+    /// producing path only has per-line HTML.
+    pub html: Option<String>,
 }
 
 /// Comparison-specific prefetch state, attached to [`GitPrefetch`].
@@ -170,13 +174,25 @@ pub fn offline_highlight(request: &HighlightRequest) -> Result<HighlightedFile, 
         let line = if line.is_empty() { "\n" } else { line };
         lines.push(format!("<span>{}</span>", go_html_escape(line)));
     }
+    // `generatePlainTable`: `<table>` + one `<tr>` per line with the `<span>`
+    // directly under the code cell (no `<div>`).
+    let mut html = String::from("<table>");
+    for (row, line) in lines.iter().enumerate() {
+        html.push_str("<tr><td class=\"line\" data-line=\"");
+        html.push_str(&(row + 1).to_string());
+        html.push_str("\"></td><td class=\"code\">");
+        html.push_str(line);
+        html.push_str("</td></tr>");
+    }
+    html.push_str("</table>");
     Ok(HighlightedFile {
         lines,
         aborted: true,
+        html: Some(html),
     })
 }
 
-async fn compute_highlight(
+pub(crate) async fn compute_highlight(
     source: &dyn GitObjectSource,
     request: &HighlightRequest,
 ) -> Result<HighlightedFile, HighlightError> {
@@ -275,6 +291,7 @@ impl HighlightSource for CodeHighlighterSource {
         Ok(HighlightedFile {
             lines: split_highlighted_lines(&html).map_err(HighlightError::Message)?,
             aborted,
+            html: Some(html),
         })
     }
 }
@@ -300,6 +317,22 @@ pub(crate) fn split_highlighted_lines(html: &str) -> Result<Vec<String>, String>
         position = row_end + "</tr>".len();
     }
     Ok(lines)
+}
+
+/// `HighlightedCode.SplitHighlightedLines(true)`: one rendered `<tr>…</tr>`
+/// per table row (`SplitLineRanges` uses these).
+pub(crate) fn split_highlighted_rows(html: &str) -> Vec<String> {
+    let mut rows = Vec::new();
+    let mut position = 0;
+    while let Some(row_start) = find_from(html, "<tr", position) {
+        let Some(row_end) = find_from(html, "</tr>", row_start) else {
+            break;
+        };
+        let end = row_end + "</tr>".len();
+        rows.push(html[row_start..end].to_owned());
+        position = end;
+    }
+    rows
 }
 
 fn find_from(haystack: &str, needle: &str, from: usize) -> Option<usize> {

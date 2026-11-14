@@ -24,9 +24,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use sg_git::FileStat;
-use sg_graphql::exec::{Actor, Arguments, ExecError, FieldValue, ObjectValue, RootField};
+use sg_graphql::exec::{
+    Actor, Arguments, ExecError, FieldValue, InputValue, ObjectValue, RootField,
+};
 use sg_graphql::json::Json;
 
+use crate::git_comparison_graphql::{
+    compute_highlight, parse_highlight_args, split_highlighted_rows, HighlightArgsKey,
+    HighlightError, HighlightKey, HighlightRequest, HighlightedFile,
+};
 use crate::git_graphql::{
     ContentLookup, DirLookup, GitCommitResolverObject, GitObjectSource, GitPrefetch,
     TreeEntryLookup,
@@ -41,6 +47,30 @@ const DEFAULT_SYMBOL_LIMIT: i32 = 100;
 const SYMBOLS_SERVER_TIMEOUT: Duration = Duration::from_secs(5);
 /// `GetMatchAtLineCharacter`'s over-fetch (`symbol.go:129`).
 const SYMBOLS_MATCH_FIRST: i32 = 999_999;
+/// `git_tree_entry.go:271-274`: pagination is only supported for plaintext.
+const HIGHLIGHT_PAGINATION_ERROR: &str = "pagination is not supported with formats other than HTML_PLAINTEXT, don't set startLine or endLine with other formats";
+/// `syntaxHighlightFileBlocklist` (`git_tree_entry.go:264-269`).
+const SYNTAX_HIGHLIGHT_FILE_BLOCKLIST: [&str; 3] =
+    ["yarn.lock", "pnpm-lock.yaml", "package-lock.json"];
+
+/// `GitTreeEntryResolver.Highlight`'s pagination guard, evaluated on the raw
+/// (pre-blocklist) format exactly like the baseline.
+fn highlight_pagination_unsupported(args: &HighlightArgsKey) -> bool {
+    (args.start_line.is_some() || args.end_line.is_some()) && args.format != "HTML_PLAINTEXT"
+}
+
+/// Apply `syntaxHighlightFileBlocklist`: lock files are forced to plaintext
+/// instead of hitting the syntax highlighter.
+fn normalized_tree_highlight_args(path: &str, args: &HighlightArgsKey) -> HighlightArgsKey {
+    let mut out = args.clone();
+    if SYNTAX_HIGHLIGHT_FILE_BLOCKLIST
+        .iter()
+        .any(|suffix| path.ends_with(suffix))
+    {
+        out.format = "HTML_PLAINTEXT".to_owned();
+    }
+    out
+}
 
 // ---------------------------------------------------------------------------
 // Prefetch
@@ -116,7 +146,8 @@ pub async fn prefetch_commit_entries(
         if (selected(field, "content")
             || selected(field, "byteSize")
             || selected(field, "totalLines")
-            || selected(field, "binary"))
+            || selected(field, "binary")
+            || selected(field, "highlight"))
             && !prefetch.contents.contains_key(&key)
         {
             let lookup = match source.read_file(repo.id, &repo.name, oid, path).await {
@@ -124,6 +155,65 @@ pub async fn prefetch_commit_entries(
                 Err(error) => ContentLookup::Error(error.message),
             };
             prefetch.contents.insert(key.clone(), lookup);
+        }
+
+        // M9.37c: `GitBlob.highlight` / `GitTreeEntry.highlight`. Content was
+        // sliced by `Content(startLine,endLine)` *before* the highlighter sees
+        // it (`GitTreeEntryResolver.Highlight`, `git_tree_entry.go:270-300`).
+        if !stat.is_dir() {
+            if let Some(highlight_field) = selected_field(field, "highlight") {
+                let raw_args = parse_highlight_args(&highlight_field.arguments);
+                let (highlight_key, result) = if highlight_pagination_unsupported(&raw_args) {
+                    let args = raw_args.clone();
+                    (
+                        HighlightKey {
+                            repo_id: repo.id,
+                            oid: oid.to_owned(),
+                            path: path.to_owned(),
+                            args,
+                        },
+                        Err(HIGHLIGHT_PAGINATION_ERROR.to_owned()),
+                    )
+                } else {
+                    let args = normalized_tree_highlight_args(path, &raw_args);
+                    let highlight_key = HighlightKey {
+                        repo_id: repo.id,
+                        oid: oid.to_owned(),
+                        path: path.to_owned(),
+                        args: args.clone(),
+                    };
+                    let result = match prefetch.contents.get(&key) {
+                        Some(ContentLookup::Found(bytes)) => {
+                            let request = HighlightRequest {
+                                content: bytes.clone(),
+                                filepath: path.to_owned(),
+                                disable_timeout: args.disable_timeout,
+                                highlight_long_lines: args.highlight_long_lines,
+                                format: args.format.clone(),
+                                start_line: args.start_line,
+                                end_line: args.end_line,
+                                // `highlightContent` uses `highlight.Code`'s
+                                // default: drop one final newline.
+                                keep_final_newline: false,
+                            };
+                            match compute_highlight(source, &request).await {
+                                Ok(highlighted) => Ok(highlighted),
+                                Err(HighlightError::Binary) => {
+                                    Err("cannot render binary file".to_owned())
+                                }
+                                Err(HighlightError::Message(message)) => Err(message),
+                            }
+                        }
+                        Some(ContentLookup::Error(message)) => Err(message.clone()),
+                        None => Err("tree entry content is not prefetched".to_owned()),
+                    };
+                    (highlight_key, result)
+                };
+                prefetch
+                    .tree_highlights
+                    .entry(highlight_key)
+                    .or_insert(result);
+            }
         }
 
         if stat.is_dir() && selected(field, "isSingleChild") {
@@ -271,11 +361,7 @@ fn go_path_dir(path: &str) -> String {
 /// content through `GitTreeEntryResolver.Content` *before* calling
 /// `highlight.CodeAsLines`, so the highlight range and the highlighted lines
 /// line up exactly (`repository_comparison.go:491-515`).
-pub(crate) fn page_content(
-    content: &[u8],
-    start_line: Option<i32>,
-    end_line: Option<i32>,
-) -> &[u8] {
+pub fn page_content(content: &[u8], start_line: Option<i32>, end_line: Option<i32>) -> &[u8] {
     if start_line.is_none() && end_line.is_none() {
         return content;
     }
@@ -789,6 +875,36 @@ impl GitTreeEntryObject {
             None => FieldValue::Null,
         }))
     }
+
+    /// `GitTreeEntryResolver.Highlight` / `GitBlob.highlight`
+    /// (`git_tree_entry.go:270-300`). The highlighter is asynchronous, so the
+    /// actual `highlight.CodeAsLines` ran during prefetch; this only applies
+    /// the pagination guard and reads the result.
+    fn highlight_field(&self, arguments: &Arguments) -> Result<Option<FieldValue>, ExecError> {
+        let raw_args = parse_highlight_args(arguments);
+        if highlight_pagination_unsupported(&raw_args) {
+            return Err(ExecError::new(HIGHLIGHT_PAGINATION_ERROR));
+        }
+        let args = normalized_tree_highlight_args(self.path(), &raw_args);
+        let Some(git) = &self.git else {
+            return Err(ExecError::new(
+                "tree entry highlight requires the gitserver GitSource (not wired for this request)",
+            ));
+        };
+        let key = HighlightKey {
+            repo_id: self.repo.id,
+            oid: self.oid.clone(),
+            path: self.path().to_owned(),
+            args,
+        };
+        match git.tree_highlights.get(&key) {
+            Some(Ok(file)) => Ok(Some(FieldValue::Object(Arc::new(HighlightedFileObject {
+                file: file.clone(),
+            })))),
+            Some(Err(message)) => Err(ExecError::new(message.clone())),
+            None => Err(ExecError::new("tree entry highlight is not prefetched")),
+        }
+    }
 }
 
 impl ObjectValue for GitTreeEntryObject {
@@ -832,8 +948,94 @@ impl ObjectValue for GitTreeEntryObject {
             "byteSize" => self.byte_size_field(),
             "totalLines" => self.total_lines_field(),
             "binary" => self.binary_field(),
+            "highlight" => self.highlight_field(arguments),
             "symbols" => self.symbols_field(arguments),
             "symbol" => self.symbol_field(arguments),
+            _ => Ok(None),
+        }
+    }
+}
+
+/// `HighlightedFileResolver` (`cmd/frontend/graphqlbackend/highlight.go`).
+pub struct HighlightedFileObject {
+    pub file: HighlightedFile,
+}
+
+/// `lineRanges(ranges: [HighlightLineRange!]!)` argument extraction.
+fn parse_line_ranges(arguments: &Arguments) -> Vec<(i32, i32)> {
+    match arguments.get("ranges") {
+        Some(InputValue::List(items)) => items
+            .iter()
+            .filter_map(|item| match item {
+                InputValue::Object(map) => {
+                    let start = map
+                        .get("startLine")
+                        .and_then(InputValue::as_i64)
+                        .unwrap_or(0) as i32;
+                    let end = map.get("endLine").and_then(InputValue::as_i64).unwrap_or(0) as i32;
+                    Some((start, end))
+                }
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+impl HighlightedFileObject {
+    /// `highlight.SplitLineRanges`: clamp each range
+    /// (`start<0→0`, `end>lines→lines`, `start>end→(0,0)`, in that order)
+    /// then return the rendered `<tr>` rows.
+    fn line_ranges_field(&self, arguments: &Arguments) -> Result<Option<FieldValue>, ExecError> {
+        let ranges = parse_line_ranges(arguments);
+        let rows = split_highlighted_rows(self.file.html.as_deref().unwrap_or(""));
+        let mut line_ranges: Vec<FieldValue> = Vec::with_capacity(ranges.len());
+        for (start_line, end_line) in ranges {
+            let mut start = start_line.max(0);
+            let mut end = end_line;
+            if end > rows.len() as i32 {
+                end = rows.len() as i32;
+            }
+            if start > end {
+                start = 0;
+                end = 0;
+            }
+            let items = rows[start as usize..end as usize]
+                .iter()
+                .map(|row| FieldValue::Json(Json::Str(row.clone())))
+                .collect();
+            line_ranges.push(FieldValue::List {
+                items,
+                element_type: Some("String"),
+            });
+        }
+        Ok(Some(FieldValue::List {
+            items: line_ranges,
+            element_type: None,
+        }))
+    }
+}
+
+impl ObjectValue for HighlightedFileObject {
+    fn type_name(&self) -> &'static str {
+        "HighlightedFile"
+    }
+
+    fn field(
+        &self,
+        field: &str,
+        arguments: &Arguments,
+        _actor: Actor,
+    ) -> Result<Option<FieldValue>, ExecError> {
+        match field {
+            "html" => Ok(Some(FieldValue::Json(Json::Str(
+                self.file.html.clone().unwrap_or_default(),
+            )))),
+            "aborted" => Ok(Some(FieldValue::Json(Json::Bool(self.file.aborted)))),
+            // `response == nil` → "{}"; a nil `scip.Document` also fails
+            // `jsonpb.Marshal` and yields "{}". Rust has no SCIP documents.
+            "lsif" => Ok(Some(FieldValue::Json(Json::Str("{}".to_owned())))),
+            "lineRanges" => self.line_ranges_field(arguments),
             _ => Ok(None),
         }
     }
