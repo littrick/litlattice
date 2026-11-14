@@ -112,6 +112,9 @@ impl SearcherRuntimeClients {
 pub struct CommitRuntimeClientsOwned {
     pub db: Arc<dyn CommitUserDB + Send + Sync>,
     pub gitserver: Arc<dyn crate::search_commit_job::GitserverClient + Send + Sync>,
+    /// Owned leaf collaborators; borrowed into
+    /// [`crate::search_commit_job::CommitRuntimeClients::leaf`].
+    pub leaf: Option<crate::search_leaf_jobs::LeafJobClients>,
 }
 
 impl CommitRuntimeClientsOwned {
@@ -120,6 +123,7 @@ impl CommitRuntimeClientsOwned {
         crate::search_commit_job::CommitRuntimeClients {
             db: self.db.as_ref(),
             gitserver: self.gitserver.as_ref(),
+            leaf: self.leaf.as_ref(),
         }
     }
 }
@@ -212,6 +216,10 @@ fn assemble_commit_clients(pool: &PgPool, gitserver: &Arc<GitClient>) -> Arc<Com
         gitserver: Arc::new(GitCommitGitserver {
             client: Arc::clone(gitserver),
         }),
+        // Ownership/contributor leaf seams are not wired in the production
+        // assembly yet; the leaf jobs then follow the baseline's explicit
+        // error/alert paths instead of fabricating results.
+        leaf: None,
     })
 }
 

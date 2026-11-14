@@ -441,6 +441,16 @@ enum NodeKind {
     },
     Structural {
         pattern_info: jb::TextPatternInfo,
+        /// `SearcherArgs.UseFullDeadline`.
+        use_full_deadline: bool,
+        /// `SearchJob.UseIndex` (`f.Index()`).
+        use_index: YesNoOnly,
+        /// `BatchRetry = Protocol == Batch`.
+        batch_retry: bool,
+        /// `SearchJob.Unindexed`; filled by [`set_tree_repos`].
+        unindexed: Vec<RepositoryRevisions>,
+        /// `SearchJob.Indexed`; filled by [`set_tree_repos`].
+        indexed: Option<IndexedRepoRevs>,
     },
     ZoektRepoSubsetText {
         /// `Repos`; `None` models a nil pointer.
@@ -731,7 +741,7 @@ impl JobNode {
                 ("diff".to_owned(), diff.to_string()),
                 ("limit".to_owned(), limit.to_string()),
             ],
-            NodeKind::Structural { pattern_info } => {
+            NodeKind::Structural { pattern_info, .. } => {
                 let mut res = Vec::new();
                 push_scoped(
                     &mut res,
@@ -1139,6 +1149,20 @@ fn set_tree_repos(node: &JobNode, resolved: &ResolvedRepos) -> JobNode {
             num_context_lines: *num_context_lines,
             use_full_deadline: *use_full_deadline,
             repos: resolved.unindexed.clone(),
+        },
+        NodeKind::Structural {
+            pattern_info,
+            use_full_deadline,
+            use_index,
+            batch_retry,
+            ..
+        } => NodeKind::Structural {
+            pattern_info: pattern_info.clone(),
+            use_full_deadline: *use_full_deadline,
+            use_index: *use_index,
+            batch_retry: *batch_retry,
+            unindexed: resolved.unindexed.clone(),
+            indexed: resolved.indexed.clone(),
         },
         NodeKind::SearcherSymbol { request, limit, .. } => NodeKind::SearcherSymbol {
             request: request.clone(),
@@ -1881,15 +1905,54 @@ impl JobNode {
                 repo_opts: repo_opts.clone(),
                 repo_name_patterns: compile_regexps(repo_name_patterns)?,
             }),
-            NodeKind::Structural { .. }
-            | NodeKind::FileContains { .. }
-            | NodeKind::FileHasOwners { .. }
-            | NodeKind::FileHasContributors { .. }
-            | NodeKind::SelectOwners => {
-                return Err(JobError(format!(
-                    "{} execution is not ported (M9.8hw)",
-                    self.name_str()
-                )));
+            NodeKind::Structural {
+                pattern_info,
+                use_full_deadline,
+                batch_retry,
+                unindexed,
+                indexed,
+                ..
+            } => {
+                let job = crate::search_leaf_jobs::StructuralSearchJob {
+                    pattern_info: to_searcher_pattern_info(pattern_info),
+                    use_full_deadline: *use_full_deadline,
+                    batch_retry: *batch_retry,
+                    unindexed: to_leaf_repos(unindexed),
+                    indexed: indexed.clone(),
+                };
+                Box::new(TreeLeafJob {
+                    name: self.name_str(),
+                    job: Box::new(job),
+                    swallow_error_when_canceled: false,
+                })
+            }
+            NodeKind::FileContains {
+                original_patterns,
+                filter_patterns,
+            } => Box::new(crate::search_leaf_jobs::FileContainsLeafJob {
+                include_patterns: filter_patterns.clone(),
+                original_patterns: original_patterns.clone(),
+                searcher: None,
+                child: only_child(children),
+            }),
+            NodeKind::FileHasOwners { include, exclude } => {
+                Box::new(crate::search_leaf_jobs::FileHasOwnersLeafJob {
+                    include: include.clone(),
+                    exclude: exclude.clone(),
+                    child: only_child(children),
+                })
+            }
+            NodeKind::FileHasContributors { include, exclude } => {
+                Box::new(crate::search_leaf_jobs::FileHasContributorsLeafJob {
+                    include: include.clone(),
+                    exclude: exclude.clone(),
+                    child: only_child(children),
+                })
+            }
+            NodeKind::SelectOwners => {
+                Box::new(crate::search_leaf_jobs::SelectOwnersLeafJob {
+                    child: only_child(children),
+                })
             }
             // Handled by the early return above; kept for exhaustiveness.
             NodeKind::RepoPager { .. } => {
@@ -2666,6 +2729,21 @@ fn to_searcher_repos(
         .collect()
 }
 
+/// Convert the pager's zoekt `RepositoryRevisions` into the structural leaf's
+/// model (`search_leaf_jobs::RepositoryRevisions`).
+fn to_leaf_repos(repos: &[RepositoryRevisions]) -> Vec<crate::search_leaf_jobs::RepositoryRevisions> {
+    repos
+        .iter()
+        .map(|repo| crate::search_leaf_jobs::RepositoryRevisions {
+            repo: crate::search_stream::convert::MinimalRepo {
+                id: repo.repo.id as i32,
+                name: repo.repo.name.clone(),
+            },
+            revs: repo.revs.clone(),
+        })
+        .collect()
+}
+
 fn to_searcher_symbol_request(
     request: &jb::SymbolSearchRequest,
 ) -> crate::search_searcher_jobs::SymbolSearchRequest {
@@ -2869,7 +2947,19 @@ pub fn new_flat_job(inputs: &TreeInputs, basic: &Basic) -> Result<JobNode, JobEr
         let pattern_info =
             jb::to_text_pattern_info(basic, result_types, &inputs.features, default_limit)
                 .map_err(JobError)?;
-        let structural_job = JobNode::leaf(NodeKind::Structural { pattern_info });
+        // `useFullDeadline = f.GetTimeout() != nil || f.Count() != nil ||
+        // searchInputs.Protocol != search.Batch` (`job.go:366-367`).
+        let use_full_deadline = jb::parameters_timeout_nanos(&basic.parameters).is_some()
+            || jb::parameters_count(&basic.parameters).is_some()
+            || inputs.protocol != Protocol::Batch;
+        let structural_job = JobNode::leaf(NodeKind::Structural {
+            pattern_info,
+            use_full_deadline,
+            use_index: basic.parameters.index(),
+            batch_retry: inputs.protocol == Protocol::Batch,
+            unindexed: Vec::new(),
+            indexed: None,
+        });
         all_jobs.push(repo_pager(
             structural_job,
             repo_options.clone(),

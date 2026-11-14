@@ -1081,6 +1081,7 @@ fn run_commit(case: &Case) -> Value {
     let commit_clients = CommitRuntimeClients {
         db: &db,
         gitserver: &gitserver,
+        leaf: None,
     };
 
     let streamer = NoopStreamer;

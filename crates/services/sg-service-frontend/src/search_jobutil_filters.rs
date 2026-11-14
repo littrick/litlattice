@@ -276,7 +276,48 @@ fn compile_patterns(
 
 /// `filterEvent` (`filter_file_contains.go:104-124`): keep only file and
 /// commit matches, and route each through the matching filter.
-fn filter_event(
+pub(crate) fn filter_event(
+    event: SearchEvent,
+    include_matchers: &[Regex],
+    original_pattern_matchers: &[Regex],
+    include_patterns: &[String],
+    case_sensitive: bool,
+    searcher: Option<&dyn CommitContentSearcher>,
+) -> SearchEvent {
+    filter_event_inner(
+        event,
+        include_matchers,
+        original_pattern_matchers,
+        include_patterns,
+        case_sensitive,
+        searcher,
+    )
+}
+
+/// Job-tree entry point: the construction layer already stored the final
+/// (case-folded) regexp sources in `NodeKind::FileContains`, so recompile them
+/// verbatim and reuse [`filter_event`].
+pub(crate) fn filter_event_from_sources(
+    event: SearchEvent,
+    include_sources: &[String],
+    original_sources: &[String],
+    searcher: Option<&dyn CommitContentSearcher>,
+) -> Result<SearchEvent, ContainsPatternError> {
+    let include_matchers =
+        compile_patterns(include_sources, true, ContainsPatternStage::Include)?;
+    let original_pattern_matchers =
+        compile_patterns(original_sources, true, ContainsPatternStage::Original)?;
+    Ok(filter_event(
+        event,
+        &include_matchers,
+        &original_pattern_matchers,
+        include_sources,
+        false,
+        searcher,
+    ))
+}
+
+fn filter_event_inner(
     event: SearchEvent,
     include_matchers: &[Regex],
     original_pattern_matchers: &[Regex],
@@ -834,13 +875,16 @@ fn contributor_matches(contributors: &[ContributorCount], re: &Regex) -> bool {
         .any(|contributor| re.is_match(&contributor.name) || re.is_match(&contributor.email))
 }
 
-fn any_filter_matches(contributors: &[ContributorCount], filters: &[Regex]) -> bool {
+pub(crate) fn any_filter_matches(
+    contributors: &[ContributorCount],
+    filters: &[Regex],
+) -> bool {
     filters
         .iter()
         .any(|filter| contributor_matches(contributors, filter))
 }
 
-fn all_filters_match(contributors: &[ContributorCount], filters: &[Regex]) -> bool {
+pub(crate) fn all_filters_match(contributors: &[ContributorCount], filters: &[Regex]) -> bool {
     filters
         .iter()
         .all(|filter| contributor_matches(contributors, filter))

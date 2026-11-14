@@ -163,6 +163,10 @@ pub struct CommitUserEmail {
 pub struct CommitRuntimeClients<'a> {
     pub db: &'a dyn CommitUserDB,
     pub gitserver: &'a dyn GitserverClient,
+    /// Optional leaf-job collaborators (contributors / `file:contains`
+    /// diff searcher / ownership rules). `None` keeps the leaf jobs' explicit
+    /// Go-style error/alert paths.
+    pub leaf: Option<&'a crate::search_leaf_jobs::LeafJobClients>,
 }
 
 /// `commit.SearchJob` (`commit.go:27-37`).
