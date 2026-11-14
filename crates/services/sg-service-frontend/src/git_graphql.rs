@@ -713,6 +713,12 @@ pub struct GitPrefetch {
     /// `symbol.DefaultZoektSymbolsClient()` injection point. `GitTreeEntry` /
     /// `GitCommit` `symbols` call the (synchronous) gRPC client here.
     pub symbols: Option<Arc<dyn crate::search_searcher_client::SymbolsClient + Send + Sync>>,
+    /// M9.37c: `GitBlob.highlight` / `GitTreeEntry.highlight` results, keyed
+    /// like the comparison file-diff highlights.
+    pub tree_highlights: HashMap<
+        crate::git_comparison_graphql::HighlightKey,
+        Result<crate::git_comparison_graphql::HighlightedFile, String>,
+    >,
 }
 
 impl Clone for GitPrefetch {
@@ -733,6 +739,7 @@ impl Clone for GitPrefetch {
             default_branches: self.default_branches.clone(),
             contributors: self.contributors.clone(),
             symbols: self.symbols.clone(),
+            tree_highlights: self.tree_highlights.clone(),
         }
     }
 }
@@ -758,6 +765,7 @@ impl std::fmt::Debug for GitPrefetch {
                 "symbols",
                 &self.symbols.as_ref().map(|_| "<symbols client>"),
             )
+            .field("tree_highlights", &self.tree_highlights)
             .finish()
     }
 }
