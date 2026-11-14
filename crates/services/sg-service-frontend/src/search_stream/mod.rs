@@ -47,7 +47,7 @@ use tonic::body::BoxBody;
 
 use self::args::Args;
 use self::convert::{FromMatchOptions, Match, RepoMetadata};
-use self::events::{EventAlert, EventFilter, EventMatch};
+use self::events::{Annotation, EventAlert, EventFilter, EventMatch, QueryDescription};
 use self::filters::SearchFilters;
 use self::progress::{Progress, ProgressAggregator, SearchEvent};
 use crate::search_client::{
@@ -55,6 +55,7 @@ use crate::search_client::{
     SearchClient, SearchMode,
 };
 use crate::search_job::JobError;
+use crate::search_jobutil_combinators as comb;
 use crate::search_jobutil_job_builders as jb;
 use crate::search_jobutil_tree::{self, JobNode, TreeInputs};
 
@@ -292,17 +293,43 @@ impl JobRunner for TreeJobRunner {
         };
         let ctx = crate::search_job::JobContext { deadline: None };
         runtime.with_clients(|clients| {
-            match crate::search_job::SearchJob::run(job, &ctx, clients, sender) {
-                Ok(()) => JobRunOutput::default(),
-                Err(err) => JobRunOutput {
-                    alert: None,
-                    error: Some(ExecuteError {
-                        message: err.0,
-                        unsupported: false,
-                    }),
-                },
+            let (alert, failure) = job.run_with_alert(&ctx, clients, sender);
+            JobRunOutput {
+                alert: alert.map(event_alert_from_comb),
+                error: failure.map(|err| ExecuteError {
+                    message: err.to_string(),
+                    unsupported: false,
+                }),
             }
         })
+    }
+}
+
+/// `eventWriter.Alert` conversion of a baseline `search.Alert`.
+fn event_alert_from_comb(alert: comb::Alert) -> EventAlert {
+    EventAlert {
+        title: alert.title,
+        description: alert.description,
+        kind: alert.kind,
+        proposed_queries: if alert.proposed_queries.is_empty() {
+            None
+        } else {
+            Some(
+                alert
+                    .proposed_queries
+                    .into_iter()
+                    .map(|query| QueryDescription {
+                        description: query.description,
+                        query: query.query,
+                        annotations: query
+                            .annotations
+                            .into_iter()
+                            .map(|(name, value)| Annotation { name, value })
+                            .collect(),
+                    })
+                    .collect(),
+            )
+        },
     }
 }
 
