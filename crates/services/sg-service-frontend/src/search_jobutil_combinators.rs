@@ -343,6 +343,17 @@ pub enum JobFailure {
     DeadlineExceeded,
     /// `errors.MultiError`/`errors.Join`.
     Multi(Vec<JobFailure>),
+    /// `*searchrepos.MissingRepoRevsError` (`repos.go:1224`): carries the
+    /// missing repo/rev pairs so the alert can render the baseline
+    /// description.
+    MissingRepoRevs(Vec<crate::search_repos::RepoRevSpecs>),
+    /// `*searchalert.errOverRepoLimit` (`observer.go:319`). The baseline type
+    /// is unexported and had no producer at the pinned commit; the observer
+    /// mapping is still ported verbatim.
+    OverRepoLimit {
+        proposed_queries: Vec<QueryDescription>,
+        description: String,
+    },
 }
 
 impl JobFailure {
@@ -351,7 +362,10 @@ impl JobFailure {
         match self {
             JobFailure::Canceled => true,
             JobFailure::Multi(errors) => errors.iter().any(JobFailure::is_canceled),
-            JobFailure::Message(_) | JobFailure::DeadlineExceeded => false,
+            JobFailure::Message(_)
+            | JobFailure::DeadlineExceeded
+            | JobFailure::MissingRepoRevs(_)
+            | JobFailure::OverRepoLimit { .. } => false,
         }
     }
 
@@ -360,7 +374,10 @@ impl JobFailure {
         match self {
             JobFailure::DeadlineExceeded => true,
             JobFailure::Multi(errors) => errors.iter().any(JobFailure::is_deadline_exceeded),
-            JobFailure::Message(_) | JobFailure::Canceled => false,
+            JobFailure::Message(_)
+            | JobFailure::Canceled
+            | JobFailure::MissingRepoRevs(_)
+            | JobFailure::OverRepoLimit { .. } => false,
         }
     }
 
@@ -383,6 +400,9 @@ impl fmt::Display for JobFailure {
             JobFailure::Message(message) => f.write_str(message),
             JobFailure::Canceled => f.write_str("context canceled"),
             JobFailure::DeadlineExceeded => f.write_str("context deadline exceeded"),
+            // `MissingRepoRevsError.Error` / `errOverRepoLimit.Error`.
+            JobFailure::MissingRepoRevs(_) => f.write_str("missing repo revs"),
+            JobFailure::OverRepoLimit { .. } => f.write_str("Too many matching repositories"),
             JobFailure::Multi(errors) => {
                 let messages: Vec<String> = errors.iter().map(ToString::to_string).collect();
                 f.write_str(&messages.join("\n"))

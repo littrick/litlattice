@@ -1180,6 +1180,17 @@ impl comb::CombinatorJob for TreeRepoPagerJob {
         }
 
         match resolved_pages.error {
+            // `maybeMissingRepoRevsError` is the only producer of this text
+            // and Go carries the typed `*MissingRepoRevsError` through the
+            // iterator, so keep the rev details for the alert description.
+            Some(err)
+                if err.0 == crate::search_repos::ERR_MISSING_REPO_REVS =>
+            {
+                (
+                    max_alerter.alert(),
+                    Some(comb::JobFailure::MissingRepoRevs(resolved_pages.missing)),
+                )
+            }
             Some(err) => (max_alerter.alert(), Some(comb::JobFailure::Message(err.0))),
             None => (max_alerter.alert(), None),
         }
@@ -1340,8 +1351,14 @@ impl TreeAlertObserver {
     }
 
     /// `Observer.errorToAlert` (`observer.go:221-285`) / `multierrorToAlert`
-    /// (`observer.go:167-175`). Only the `ErrNoResolvedRepos` mapping is in
-    /// this slice's scope; every other error keeps bubbling up.
+    /// (`observer.go:167-175`). Branch order mirrors the baseline: `Multi`
+    /// first, then typed over-limit / missing-revs (checked before the
+    /// string-based structural-search branches), then `ErrNoResolvedRepos`
+    /// (only without results) and the structural memory alerts. Everything
+    /// else keeps bubbling up.
+    ///
+    /// `authz.ErrStalePermissions` and `*gitdomain.BadCommitError` are outside
+    /// this slice's scope and still bubble.
     fn error_to_alert(
         &self,
         ctx: &comb::RunContext,
@@ -1356,10 +1373,51 @@ impl TreeAlertObserver {
                     .collect();
                 comb::max_priority_alert(&alerts)
             }
+            // `observer.go:251-259`: `*errOverRepoLimit`.
+            comb::JobFailure::OverRepoLimit {
+                proposed_queries,
+                description,
+            } => Some(comb::Alert {
+                prometheus_type: "over_repo_limit".to_owned(),
+                title: "Too many matching repositories".to_owned(),
+                proposed_queries: proposed_queries.clone(),
+                description: description.clone(),
+                ..comb::Alert::default()
+            }),
+            // `observer.go:260-265`: `*MissingRepoRevsError`, priority 6.
+            comb::JobFailure::MissingRepoRevs(missing) => {
+                let mut alert = alert_for_missing_repo_revs(missing);
+                alert.priority = 6;
+                Some(alert)
+            }
             comb::JobFailure::Message(message)
                 if !self.has_results && message == crate::search_jobutil_repos::ERR_NO_RESOLVED_REPOS =>
             {
                 Some(self.alert_for_no_resolved_repos(clients))
+            }
+            // `observer.go:267-275`: comby OOM / abnormal worker exit.
+            comb::JobFailure::Message(message)
+                if message.contains("Worker_oomed")
+                    || message.contains("Worker_exited_abnormally") =>
+            {
+                Some(comb::Alert {
+                    prometheus_type: "structural_search_needs_more_memory".to_owned(),
+                    title: "Structural search needs more memory".to_owned(),
+                    description: "Running your structural search may require more memory. If you are running the query on many repositories, try reducing the number of repositories with the `repo:` filter.".to_owned(),
+                    priority: 5,
+                    ..comb::Alert::default()
+                })
+            }
+            // `observer.go:276-284`: searcher OOM.
+            comb::JobFailure::Message(message) if message.contains("Out of memory") => {
+                Some(comb::Alert {
+                    prometheus_type:
+                        "structural_search_needs_more_memory__give_searcher_more_memory".to_owned(),
+                    title: "Structural search needs more memory".to_owned(),
+                    description: r#"Running your structural search requires more memory. You could try reducing the number of repositories with the "repo:" filter. If you are an administrator, try double the memory allocated for the "searcher" service. If you're unsure, reach out to us at support@sourcegraph.com."#.to_owned(),
+                    priority: 4,
+                    ..comb::Alert::default()
+                })
             }
             _ => None,
         }
@@ -1552,6 +1610,52 @@ fn repos_exist(
         .pages
         .iter()
         .any(|page| !page.repo_revs.is_empty())
+}
+
+/// `searchalert.AlertForMissingRepoRevs` (`observer.go:330-370`), text
+/// verbatim: single repo / single rev, single repo / multiple revs, and the
+/// multi-repo list with a 10-entry sample. Callers force `priority = 6`.
+fn alert_for_missing_repo_revs(
+    missing_repo_revs: &[crate::search_repos::RepoRevSpecs],
+) -> comb::Alert {
+    let description = if missing_repo_revs.len() == 1 {
+        let revs = missing_repo_revs[0].rev_specs();
+        if revs.len() == 1 {
+            format!(
+                "The repository {} matched by your repo: filter could not be searched because it does not contain the revision {:?}.",
+                missing_repo_revs[0].repo.name, revs[0]
+            )
+        } else {
+            format!(
+                "The repository {} matched by your repo: filter could not be searched because it has multiple specified revisions: @{}.",
+                missing_repo_revs[0].repo.name,
+                revs.join(",")
+            )
+        }
+    } else {
+        let sample_size = missing_repo_revs.len().min(10);
+        let mut description = format!(
+            "{} repositories matched by your repo: filter could not be searched because the following revisions do not exist, or differ but were specified for the same repository:",
+            missing_repo_revs.len()
+        );
+        for repo_revs in &missing_repo_revs[..sample_size] {
+            description.push_str(&format!(
+                "\n* {}@{}",
+                repo_revs.repo.name,
+                repo_revs.rev_specs().join(",")
+            ));
+        }
+        if sample_size < missing_repo_revs.len() {
+            description.push_str("\n* ...");
+        }
+        description
+    };
+    comb::Alert {
+        prometheus_type: "missing_repo_revs".to_owned(),
+        title: "Some repositories could not be searched".to_owned(),
+        description,
+        ..comb::Alert::default()
+    }
 }
 
 impl comb::AlertObserver for TreeAlertObserver {
