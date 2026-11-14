@@ -697,10 +697,11 @@ fn scenario_handler_non_retryable() {
         error,
         own_repo_indexing::is_non_retryable(error)
     ));
+    let resolve_head = "cannot resolve HEAD: boom";
     print_line(format!(
-        "handler analytics err={} non-retryable={}",
-        esc(own_repo_indexing::ANALYTICS_NOT_PORTED),
-        own_repo_indexing::is_non_retryable(own_repo_indexing::ANALYTICS_NOT_PORTED)
+        "handler resolve-head err={} non-retryable={}",
+        esc(resolve_head),
+        own_repo_indexing::is_non_retryable(resolve_head)
     ));
 }
 

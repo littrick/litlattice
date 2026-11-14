@@ -31,10 +31,16 @@
 //! `ClearSignals`, then one `AddCommit` per non-merge commit with its changed
 //! files and `commit.Author` identity.
 //!
+//! `analytics` (`internal/own/background/analytics.go`) is ported in full:
+//! sub-repo-permissions skip, repo lookup, `HEAD` resolution (non-retryable
+//! on failure), a recursive `ReadDir` that counts every file, CODEOWNERS
+//! ownership (ingested `codeowners.contents`, else the baseline's git file
+//! locations with last-matching-rule semantics) and assigned owners/teams
+//! inherited down the tree, then the two idempotent root writes to
+//! `repo_paths.tree_files_count` and `ownership_path_stats`.
+//!
 //! ## Deferred (documented gaps, see docs §76)
 //!
-//! * `analytics` (`internal/own/background/analytics.go`): the handler returns
-//!   a non-retryable "not ported yet" failure so the record does not spin.
 //! * `recent-views` (`internal/own/background/recent_views.go`): its routine is
 //!   not registered. It needs `event_logs_scrape_state_own`, which has no Rust
 //!   store yet; the job type never appears in `QueuePerRepoIndexJobs`, so no
@@ -54,6 +60,10 @@
 //!   `sub-repo permissions check: <err>`; the baseline passes the raw store
 //!   error through `errcode.MakeNonRetryable`. The message is the only way the
 //!   generic worker learns "non-retryable", hence the prefix.
+//! * The analytics indexer parses ingested CODEOWNERS from the `codeowners.contents`
+//!   text instead of the `contents_proto` protobuf, and its part wildcards
+//!   support only `*`/`?` (no character classes). Git files and ordinary
+//!   patterns behave the same as `wildmatch-go`; see the M9.42d overview.
 //! * Not ported: RED metrics, the repo/commit counters, log lines and
 //!   tracing spans. The store's debug-info lookup for unknown heartbeat IDs
 //!   is also omitted (the framework already logs the unknown id).
@@ -61,6 +71,7 @@
 //!   handler pool; `NumHandlers` is read once when the routines are built, the
 //!   same moment the baseline calls `getConcurrencyConfig()`.
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -179,9 +190,18 @@ pub const DEFAULT_RATE_BURST_LIMIT: usize = 5;
 /// `DefaultMaxConcurrency`.
 pub const DEFAULT_MAX_CONCURRENCY: usize = 5;
 
-/// The failure returned for `analytics` while the indexer is not ported.
-pub const ANALYTICS_NOT_PORTED: &str =
-    "own analytics indexer is not ported yet: unsupported own index job type";
+/// `codeownersLocations` from `internal/own/service.go`, in priority order.
+pub const CODEOWNERS_LOCATIONS: &[&str] = &[
+    ".github/test.CODEOWNERS",
+    "CODEOWNERS",
+    ".github/CODEOWNERS",
+    ".gitlab/CODEOWNERS",
+    "docs/CODEOWNERS",
+];
+
+/// Prefix for a failed `ResolveRevision` (`cannot resolve HEAD`), which the
+/// baseline marks non-retryable via `errcode.MakeNonRetryable`.
+pub const CANNOT_RESOLVE_HEAD: &str = "cannot resolve HEAD";
 
 /// `own.IsEnabled`.
 pub fn own_enabled() -> bool {
@@ -958,17 +978,485 @@ pub async fn index_recent_contributors(
     Ok(())
 }
 
+/// One `ReadDir` entry. `name` is repository-relative for recursive reads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnalyticsDirEntry {
+    pub name: String,
+    pub is_dir: bool,
+}
+
+/// The gitserver operations the analytics indexer needs. Split from
+/// [`RecentContributionsProvider`] because analytics resolves a revision and
+/// reads a recursive tree plus optional text files.
+#[async_trait]
+pub trait AnalyticsProvider: Send + Sync {
+    async fn resolve_revision(&self, repo: &str, rev: &str) -> Result<String, String>;
+
+    async fn read_dir_recursive(
+        &self,
+        repo: &str,
+        commit: &str,
+    ) -> Result<Vec<AnalyticsDirEntry>, String>;
+
+    async fn read_file_optional(
+        &self,
+        repo: &str,
+        commit: &str,
+        path: &str,
+    ) -> Result<Option<String>, String>;
+}
+
+#[async_trait]
+impl AnalyticsProvider for GitserverClient {
+    async fn resolve_revision(&self, repo: &str, rev: &str) -> Result<String, String> {
+        // `ResolveRevisionOptions{EnsureRevision: false}`.
+        GitserverClient::resolve_revision(self, repo, rev, false)
+            .await
+            .map_err(|err| err.to_string())
+    }
+
+    async fn read_dir_recursive(
+        &self,
+        repo: &str,
+        commit: &str,
+    ) -> Result<Vec<AnalyticsDirEntry>, String> {
+        GitserverClient::read_dir_entries(self, repo, commit, "", true)
+            .await
+            .map_err(|err| err.to_string())
+            .map(|entries| {
+                entries
+                    .into_iter()
+                    .map(|entry| AnalyticsDirEntry {
+                        name: entry.name,
+                        is_dir: entry.is_dir,
+                    })
+                    .collect()
+            })
+    }
+
+    async fn read_file_optional(
+        &self,
+        repo: &str,
+        commit: &str,
+        path: &str,
+    ) -> Result<Option<String>, String> {
+        match GitserverClient::read_file_optional(self, repo, commit, path).await {
+            Ok(Some(contents)) => Ok(Some(String::from_utf8_lossy(&contents).into_owned())),
+            Ok(None) => Ok(None),
+            Err(err) => Err(err.to_string()),
+        }
+    }
+}
+
+/// One compiled CODEOWNERS rule (`internal/own/codeowners` +
+/// `internal/paths.Compile`). The owner identities are irrelevant to the
+/// analytics indexer: only "has at least one owner" matters.
+struct CodeownersRule {
+    parts: Vec<GlobPart>,
+    has_owners: bool,
+}
+
+enum GlobPart {
+    AnySubPath,
+    AnyMatch,
+    Exact(String),
+    Wild(String),
+}
+
+/// `paths.Compile`. `None` mirrors a compile error, which
+/// `CompiledRule.match` treats as a no-match for that rule.
+fn compile_glob(pattern: &str) -> Option<Vec<GlobPart>> {
+    let mut parts = Vec::new();
+    if !pattern.starts_with('/') {
+        // No leading `/` is equivalent to prefixing with `/**/`.
+        parts.push(GlobPart::AnySubPath);
+    }
+    for part in pattern.trim_matches('/').split('/') {
+        match part {
+            "" => return None, // two consecutive forward slashes
+            "**" => parts.push(GlobPart::AnySubPath),
+            "*" => parts.push(GlobPart::AnyMatch),
+            part if part.contains('*') => parts.push(GlobPart::Wild(part.to_owned())),
+            part => parts.push(GlobPart::Exact(part.to_owned())),
+        }
+    }
+    if pattern.ends_with('/') {
+        parts.push(GlobPart::AnySubPath);
+    }
+    if matches!(parts.last(), Some(GlobPart::AnySubPath)) {
+        // A trailing `/**` is necessarily `/**/*`: it must not match the
+        // directory itself.
+        parts.push(GlobPart::AnyMatch);
+    }
+    Some(parts)
+}
+
+fn part_matches(part: &GlobPart, text: &str) -> bool {
+    match part {
+        GlobPart::AnySubPath | GlobPart::AnyMatch => true,
+        GlobPart::Exact(exact) => exact == text,
+        GlobPart::Wild(pattern) => wildcard_match(pattern, text),
+    }
+}
+
+/// `wildmatch-go` for the `*`/`?` subset CODEOWNERS patterns use.
+fn wildcard_match(pattern: &str, text: &str) -> bool {
+    fn go(pattern: &[char], text: &[char]) -> bool {
+        let Some((&first, rest)) = pattern.split_first() else {
+            return text.is_empty();
+        };
+        match first {
+            '*' => go(rest, text) || (!text.is_empty() && go(pattern, &text[1..])),
+            '?' => !text.is_empty() && go(rest, &text[1..]),
+            _ => text.first() == Some(&first) && go(rest, &text[1..]),
+        }
+    }
+    let pattern: Vec<char> = pattern.chars().collect();
+    let text: Vec<char> = text.chars().collect();
+    go(&pattern, &text)
+}
+
+/// `paths.GlobPattern.Match`, including the `**` state machine.
+fn glob_matches(parts: &[GlobPart], file_path: &str) -> bool {
+    if parts.is_empty() || parts.len() >= 100 {
+        return false;
+    }
+    let mut path = file_path;
+    path = path.strip_prefix('/').unwrap_or(path);
+    path = path.strip_suffix('/').unwrap_or(path);
+
+    // State bit `i` means "the first `i` pattern parts matched the consumed
+    // path so far". Leading `**` also matches the empty prefix.
+    let mut initial: u128 = 1;
+    for (index, part) in parts.iter().enumerate() {
+        if !matches!(part, GlobPart::AnySubPath) {
+            break;
+        }
+        initial |= 1 << (index + 1);
+    }
+
+    let mut current = initial;
+    let mut next: u128 = 0;
+    let mut remaining = path;
+    loop {
+        let (part, has_next, rest) = next_part(remaining, '/');
+        remaining = rest;
+        for index in 0..parts.len() {
+            if (current >> index) & 1 == 0 {
+                continue;
+            }
+            let current_part = &parts[index];
+            if part_matches(current_part, part) {
+                next |= 1 << (index + 1);
+                if index + 1 < parts.len()
+                    && matches!(parts[index + 1], GlobPart::AnySubPath)
+                {
+                    next |= 1 << (index + 2);
+                }
+            } else {
+                next &= !(1 << (index + 1));
+                if index + 1 < parts.len()
+                    && matches!(parts[index + 1], GlobPart::AnySubPath)
+                {
+                    next &= !(1 << (index + 2));
+                }
+            }
+            // `**` may consume any number of parts, so keep the preceding bit.
+            if matches!(current_part, GlobPart::AnySubPath) {
+                next |= 1 << index;
+            }
+        }
+        if current == 0 {
+            return false;
+        }
+        current = next;
+        if !has_next {
+            break;
+        }
+        next = 0;
+    }
+    (current >> parts.len()) & 1 == 1
+}
+
+fn next_part(s: &str, separator: char) -> (&str, bool, &str) {
+    match s.find(separator) {
+        Some(index) => (
+            &s[..index],
+            true,
+            &s[index + separator.len_utf8()..],
+        ),
+        None => (s, false, s),
+    }
+}
+
+/// `lineWithoutComments`.
+fn line_without_comments(line: &str) -> &str {
+    let mut escaped = false;
+    for (index, character) in line.char_indices() {
+        if character == '#' && !escaped {
+            return &line[..index];
+        }
+        if character == '\\' && !escaped {
+            escaped = true;
+            continue;
+        }
+        escaped = false;
+    }
+    line
+}
+
+/// `matchSection`: `[name]`, `^[name]` or `[name][2]`.
+fn is_section(line: &str) -> bool {
+    let mut rest = line.trim();
+    if let Some(stripped) = rest.strip_prefix('^') {
+        rest = stripped.trim_start();
+    }
+    let Some(after_open) = rest.strip_prefix('[') else {
+        return false;
+    };
+    let Some(close) = after_open.find(']') else {
+        return false;
+    };
+    if close == 0 {
+        return false; // `[^\]]+` requires a name
+    }
+    let tail = after_open[close + 1..].trim();
+    if tail.is_empty() {
+        return true;
+    }
+    let Some(inner) = tail.strip_prefix('[').and_then(|t| t.strip_suffix(']')) else {
+        return false;
+    };
+    !inner.is_empty() && inner.chars().all(|character| character.is_ascii_digit())
+}
+
+/// `matchRule`: pattern (with `\ ` escapes) followed by whitespace-separated
+/// owners. Returns the unescaped pattern and owner tokens.
+fn parse_rule(line: &str) -> Option<(String, Vec<&str>)> {
+    let bytes = line.as_bytes();
+    let mut start = 0;
+    while start < bytes.len() && (bytes[start] as char).is_ascii_whitespace() {
+        start += 1;
+    }
+    if start == bytes.len() {
+        return None;
+    }
+    let mut end = start;
+    while end < bytes.len() {
+        let character = bytes[end] as char;
+        if character == '\\' && end + 1 < bytes.len() {
+            end += 2;
+            continue;
+        }
+        if character.is_ascii_whitespace() {
+            break;
+        }
+        end += 1;
+    }
+    let raw_pattern = &line[start..end];
+    let owners: Vec<&str> = line[end..].split_whitespace().collect();
+    let mut pattern = String::with_capacity(raw_pattern.len());
+    let mut escaped = false;
+    for character in raw_pattern.chars() {
+        if character == '\\' && !escaped {
+            escaped = true;
+            continue;
+        }
+        pattern.push(character);
+        escaped = false;
+    }
+    Some((pattern, owners))
+}
+
+/// `codeowners.Parse`: ordered rules; invalid globs are kept as no-match
+/// rules, matching the lazy-compile behavior in `CompiledRule.match`.
+fn parse_codeowners(contents: &str) -> Vec<CodeownersRule> {
+    let mut rules = Vec::new();
+    for line in contents.lines() {
+        let line = line_without_comments(line);
+        if line.trim().is_empty() || is_section(line) {
+            continue;
+        }
+        let Some((pattern, owners)) = parse_rule(line) else {
+            continue;
+        };
+        let Some(parts) = compile_glob(&pattern) else {
+            continue;
+        };
+        rules.push(CodeownersRule {
+            parts,
+            has_owners: !owners.is_empty(),
+        });
+    }
+    rules
+}
+
+/// `Ruleset.Match`: the last matching rule wins; no match has no owners.
+fn ruleset_owns(rules: &[CodeownersRule], path: &str) -> bool {
+    if path.is_empty() {
+        return false;
+    }
+    let mut absolute = String::with_capacity(path.len() + 1);
+    absolute.push('/');
+    absolute.push_str(path);
+    for rule in rules.iter().rev() {
+        if glob_matches(&rule.parts, &absolute) {
+            return rule.has_owners;
+        }
+    }
+    false
+}
+
+/// `analyticsIndexer.codeowners`: ingested `codeowners.contents` first, then
+/// the baseline's git locations. Any error makes the whole ruleset absent
+/// (`noOwners`), exactly like the Go helper's `if ruleset == nil || err != nil`.
+async fn load_codeowners(
+    pool: &PgPool,
+    git: &dyn AnalyticsProvider,
+    repo: &str,
+    repo_id: i32,
+    commit: &str,
+) -> Vec<CodeownersRule> {
+    match sg_db::ownership_stats::ingested_codeowners(pool, repo_id).await {
+        Ok(Some(contents)) => return parse_codeowners(&contents),
+        Ok(None) => {}
+        // A store error makes `RulesetForRepo` fail, which the Go helper
+        // collapses to `noOwners` without falling back to git files.
+        Err(_) => return Vec::new(),
+    }
+    for path in CODEOWNERS_LOCATIONS {
+        match git.read_file_optional(repo, commit, path).await {
+            Ok(Some(contents)) => return parse_codeowners(&contents),
+            Ok(None) => continue,
+            Err(_) => return Vec::new(),
+        }
+    }
+    Vec::new()
+}
+
+/// The union of assigned owner and team paths (`.Match` only tests presence).
+async fn load_assigned_paths(pool: &PgPool, repo_id: i32) -> HashMap<String, ()> {
+    let owners = sg_db::ownership_stats::assigned_owner_paths(pool, repo_id).await;
+    let teams = sg_db::ownership_stats::assigned_team_paths(pool, repo_id).await;
+    match (owners, teams) {
+        (Ok(owners), Ok(teams)) => {
+            let mut paths: HashMap<String, ()> = owners.into_iter().map(|path| (path, ())).collect();
+            for path in teams {
+                paths.insert(path, ());
+            }
+            paths
+        }
+        // `analyticsIndexer.assignedOwners` returns `noOwners` on either error.
+        _ => HashMap::new(),
+    }
+}
+
+/// `analyticsIndexer.indexRepo`.
+pub async fn index_analytics(
+    pool: &PgPool,
+    git: &dyn AnalyticsProvider,
+    repo_id: i32,
+    sub_repo_permissions_enabled: bool,
+) -> Result<(), String> {
+    // 🚨 SECURITY: the background indexer uses the internal actor, so it sees
+    // every repository and file. Only sub-repo-permission repos are skipped.
+    if sub_repo_permissions_enabled {
+        let sub_repo = sg_db::sub_repo_perms::repo_id_supported(pool, repo_id)
+            .await
+            .map_err(|err| wrap_error("sub-repo permissions check", &err.to_string()))?;
+        if sub_repo {
+            return Ok(());
+        }
+    }
+
+    let repo = match sg_db::repos::RepoStore::new(pool.clone())
+        .get_by_id(repo_id)
+        .await
+        .map_err(|err| wrap_error("repoStore.Get", &err.to_string()))?
+    {
+        Some(repo) => repo,
+        None => return Err(format!("repoStore.Get: repo not found: id={repo_id}")),
+    };
+    if let Some(blocked) = &repo.blocked {
+        let reason = blocked
+            .get("reason")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        return Err(format!(
+            "repoStore.Get: repository {} has been blocked. reason: {reason}",
+            repo.name
+        ));
+    }
+
+    let commit = git
+        .resolve_revision(&repo.name, "HEAD")
+        .await
+        .map_err(|err| wrap_error(CANNOT_RESOLVE_HEAD, &err))?;
+
+    let entries = git
+        .read_dir_recursive(&repo.name, &commit)
+        .await
+        .map_err(|err| wrap_error("ls-tree", &err))?;
+
+    let rules = load_codeowners(pool, git, &repo.name, repo_id, &commit).await;
+    let assigned = load_assigned_paths(pool, repo_id).await;
+
+    let mut total_count: i32 = 0;
+    let mut counts = sg_db::ownership_stats::PathAggregateCounts::default();
+    for entry in entries {
+        if entry.is_dir {
+            continue;
+        }
+        total_count += 1;
+        let codeowned = ruleset_owns(&rules, &entry.name);
+        let assigned_owned = sg_db::ownership_stats::assigned_match(&assigned, &entry.name);
+        if codeowned {
+            counts.codeowned_file_count += 1;
+        }
+        if assigned_owned {
+            counts.assigned_ownership_file_count += 1;
+        }
+        if codeowned || assigned_owned {
+            counts.total_owned_file_count += 1;
+        }
+    }
+
+    let timestamp = OffsetDateTime::now_utc();
+    let rows = sg_db::repo_paths::update_file_counts(
+        pool,
+        repo_id,
+        "",
+        total_count,
+        timestamp,
+    )
+    .await
+    .map_err(|err| wrap_error("UpdateFileCounts", &err))?;
+    if rows == 0 {
+        return Err("expected total file count updates".to_owned());
+    }
+
+    let rows =
+        sg_db::ownership_stats::update_aggregate_counts(pool, repo_id, "", counts, timestamp)
+            .await
+            .map_err(|err| wrap_error("UpdateAggregateCounts", &err))?;
+    if rows == 0 {
+        return Err("expected CODEOWNERS-owned file count update".to_owned());
+    }
+    Ok(())
+}
+
 /// `workerutil.NonRetryableError` classification for the generic worker.
 pub fn is_non_retryable(failure_message: &str) -> bool {
     failure_message == "unsupported own index job type"
-        || failure_message == ANALYTICS_NOT_PORTED
         || failure_message.starts_with("sub-repo permissions check: ")
+        || failure_message.starts_with(CANNOT_RESOLVE_HEAD)
 }
 
 /// `handler.Handle`.
 pub struct OwnBackgroundHandler {
     pool: PgPool,
     git: Arc<dyn RecentContributionsProvider>,
+    analytics_git: Arc<dyn AnalyticsProvider>,
     live_config: Arc<LiveConfig>,
     limiter: Arc<OwnRateLimiter>,
 }
@@ -977,12 +1465,14 @@ impl OwnBackgroundHandler {
     pub fn new(
         pool: PgPool,
         git: Arc<dyn RecentContributionsProvider>,
+        analytics_git: Arc<dyn AnalyticsProvider>,
         live_config: Arc<LiveConfig>,
         limiter: Arc<OwnRateLimiter>,
     ) -> Self {
         Self {
             pool,
             git,
+            analytics_git,
             live_config,
             limiter,
         }
@@ -1010,7 +1500,15 @@ impl DbWorkerHandler<OwnBackgroundStore> for OwnBackgroundHandler {
                 )
                 .await
             }
-            SIGNAL_ANALYTICS => Err(ANALYTICS_NOT_PORTED.to_owned()),
+            SIGNAL_ANALYTICS => {
+                index_analytics(
+                    &self.pool,
+                    self.analytics_git.as_ref(),
+                    record.repo_id,
+                    sub_repo_permissions_enabled(&self.live_config.current().site),
+                )
+                .await
+            }
             _ => Err("unsupported own index job type".to_owned()),
         }
     }
@@ -1049,6 +1547,8 @@ impl Job for OwnRepoIndexingQueue {
         let git = Arc::new(GitserverClient::new(
             unified.service_connections.git_servers.clone(),
         ));
+        let recent_git: Arc<dyn RecentContributionsProvider> = git.clone();
+        let analytics_git: Arc<dyn AnalyticsProvider> = git;
         let store = Arc::new(OwnBackgroundStore::new(deps.frontend.clone()));
         let limiter = Arc::new(OwnRateLimiter::new(rate_limit_config(&unified.site)));
 
@@ -1056,7 +1556,8 @@ impl Job for OwnRepoIndexingQueue {
             Arc::clone(&store),
             Arc::new(OwnBackgroundHandler::new(
                 deps.frontend.clone(),
-                git,
+                recent_git,
+                analytics_git,
                 deps.live_config.clone(),
                 limiter,
             )),
@@ -1184,10 +1685,45 @@ mod tests {
     #[test]
     fn non_retryable_classification() {
         assert!(is_non_retryable("unsupported own index job type"));
-        assert!(is_non_retryable(ANALYTICS_NOT_PORTED));
+        assert!(is_non_retryable("cannot resolve HEAD: revision not found"));
         assert!(is_non_retryable("sub-repo permissions check: boom"));
         assert!(!is_non_retryable("repoStore.Get: repo not found: id=1"));
         assert!(!is_non_retryable("Commits: boom"));
+    }
+
+    fn owns(pattern: &str, path: &str) -> bool {
+        let rules = parse_codeowners(&format!("{pattern} @owner\n"));
+        ruleset_owns(&rules, path)
+    }
+
+    #[test]
+    fn codeowners_globs_match_the_baseline() {
+        assert!(owns("*", "a.go"));
+        assert!(owns("*.go", "a.go"));
+        assert!(!owns("*.go", "README.md"));
+        assert!(owns("/src/", "src/b.go"));
+        assert!(!owns("/src/", "a.go"));
+        assert!(owns("src/**", "src/deep/c.go"));
+        assert!(!owns("src/**", "src"));
+        assert!(owns("src/*.go", "src/b.go"));
+        assert!(!owns("src/*.go", "src/deep/c.go"));
+    }
+
+    #[test]
+    fn codeowners_last_rule_wins_and_comments_are_ignored() {
+        let rules = parse_codeowners("*.go @a\n/src/b.go\n");
+        assert!(ruleset_owns(&rules, "a.go"));
+        assert!(!ruleset_owns(&rules, "src/b.go"));
+
+        let rules = parse_codeowners(
+            "# comment\n[documentation]\ndocs/ @docs\nsrc/*.go @gophers # tail\n",
+        );
+        assert!(ruleset_owns(&rules, "docs/guide.md"));
+        assert!(ruleset_owns(&rules, "src/b.go"));
+        assert!(!ruleset_owns(&rules, "src/deep/c.go"));
+        assert!(is_section("[documentation]"));
+        assert!(is_section("^[Documentation][2]"));
+        assert!(!is_section("[not closed"));
     }
 
     #[test]
