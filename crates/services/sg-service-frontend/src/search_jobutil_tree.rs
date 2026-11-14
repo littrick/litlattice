@@ -45,7 +45,9 @@ use sg_zoekt::query::{self as zoekt_query, IndexedRequestType};
 use crate::codycontext::{self, CodyContextJobParts, CodyContextOptions, CodyFileMatcher};
 use crate::search_client::{Features, Protocol, SearchMode};
 use crate::search_commit_job::CodeMonitorHookHandle;
-use crate::search_contexts::{parse_repository_revisions, ParsedRepoFilter, RepoVisibility};
+use crate::search_contexts::{
+    parse_repository_revisions, ParsedRepoFilter, RepoVisibility, RequestContext,
+};
 use crate::search_job::{
     GlobalTextSearchJob, JobContext, JobError, RepoSubsetTextSearchJob, RuntimeClients, SearchJob,
     SymbolSearchJob, Verbosity,
@@ -80,6 +82,9 @@ pub struct TreeInputs {
     pub on_sourcegraph_dot_com: bool,
     /// `Inputs.Query` rendered by `AlertJob` attributes.
     pub original_query: String,
+    /// `actor.FromContext(ctx)`: carried into `search.RepoOptions` for
+    /// `ResolveSearchContextSpec` and into `subRepoPermsFilterJob`.
+    pub request_context: RequestContext,
     /// `authz.SubRepoEnabled(authz.DefaultSubRepoPermsChecker)`.
     pub sub_repo_enabled: bool,
     /// `codycontext.NewSearchJob`; `None` means "not ported".
@@ -132,6 +137,8 @@ pub struct TreeRepoOptions {
     pub archived_set: bool,
     pub no_archived: bool,
     pub only_archived: bool,
+    /// `actor.FromContext(ctx)` for `ResolveSearchContextSpec`.
+    pub request_context: RequestContext,
 }
 
 impl Default for TreeRepoOptions {
@@ -160,6 +167,7 @@ impl Default for TreeRepoOptions {
             archived_set: false,
             no_archived: false,
             only_archived: false,
+            request_context: RequestContext::anonymous(),
         }
     }
 }
@@ -189,6 +197,7 @@ impl TreeRepoOptions {
             archived_set: options.archived_set,
             no_archived: options.no_archived,
             only_archived: options.only_archived,
+            request_context: RequestContext::anonymous(),
         }
     }
 
@@ -505,7 +514,11 @@ enum NodeKind {
     Sanitize {
         patterns: Vec<String>,
     },
-    SubRepoPerms,
+    /// `jobutil.subRepoPermsFilterJob`; carries the request actor the
+    /// baseline reads from `actor.FromContext(ctx)`.
+    SubRepoPerms {
+        actor: crate::search_jobutil_misc_jobs::Actor,
+    },
     /// `codycontext.searchJob` (`codycontext/job.go:234-265`). The baseline's
     /// `Children()` is nil, so the three sub-jobs are stored out-of-line.
     CodyContext {
@@ -683,7 +696,7 @@ impl JobNode {
             NodeKind::Select { .. } => "SelectJob",
             NodeKind::SelectOwners => "SelectOwnersSearchJob",
             NodeKind::Sanitize { .. } => "SanitizeJob",
-            NodeKind::SubRepoPerms => "SubRepoPermsFilterJob",
+            NodeKind::SubRepoPerms { .. } => "SubRepoPermsFilterJob",
             NodeKind::CodyContext { .. } => "CodyContextSearchJob",
             NodeKind::RepoPager { .. } => "RepoPagerJob",
             NodeKind::ReposPartial => "PartialReposJob",
@@ -702,7 +715,7 @@ impl JobNode {
             | NodeKind::Log
             | NodeKind::SelectOwners
             | NodeKind::Sanitize { .. }
-            | NodeKind::SubRepoPerms
+            | NodeKind::SubRepoPerms { .. }
             | NodeKind::ReposPartial
             | NodeKind::StaticEvents { .. } => Vec::new(),
             NodeKind::Sequential { ensure_unique } => {
@@ -1434,7 +1447,7 @@ fn compute_excluded_repos(
     // (including the unknown-context text) abort before any count query.
     let search_context = clients
         .db
-        .resolve_search_context(&opts.search_context_spec)?;
+        .resolve_search_context(&opts.search_context_spec, &opts.request_context)?;
     let search_context_id = search_context.id;
 
     let limit = if opts.limit != 0 {
@@ -1957,16 +1970,24 @@ impl JobNode {
             // `authz.DefaultSubRepoPermsChecker` defaults to the noop checker:
             // no runtime means the baseline does not even wrap the child
             // (`job.go:229`). When configured and enabled, filter file/commit
-            // results the way `subRepoPermsFilterJob` does.
-            NodeKind::SubRepoPerms => {
+            // results the way `subRepoPermsFilterJob` does. The checker stays
+            // the process-wide one; the actor is the request's
+            // (`actor.FromContext(ctx)`).
+            NodeKind::SubRepoPerms { actor } => {
                 match crate::sub_repo_perms_checker::sub_repo_runtime() {
                     Some(runtime)
                         if crate::search_jobutil_misc_jobs::SubRepoPermissionChecker::enabled(
                             runtime.checker.as_ref(),
                         ) =>
                     {
+                        let request_runtime =
+                            std::sync::Arc::new(crate::sub_repo_perms_checker::SubRepoPermsRuntime {
+                                checker: std::sync::Arc::clone(&runtime.checker),
+                                actor: *actor,
+                                modified_files: runtime.modified_files.clone(),
+                            });
                         Box::new(SubRepoPermsFilterCombinator {
-                            runtime,
+                            runtime: request_runtime,
                             child: only_child(children),
                         })
                     }
@@ -2084,9 +2105,20 @@ impl JobNode {
         JobNode::new(NodeKind::Sanitize { patterns }, vec![child])
     }
 
-    /// `jobutil.subRepoPermsFilterJob`.
+    /// `jobutil.subRepoPermsFilterJob` for the anonymous actor.
     pub fn sub_repo_perms(child: JobNode) -> JobNode {
-        JobNode::new(NodeKind::SubRepoPerms, vec![child])
+        Self::sub_repo_perms_for_actor(
+            child,
+            crate::search_jobutil_misc_jobs::Actor::default(),
+        )
+    }
+
+    /// `jobutil.subRepoPermsFilterJob` with the request actor.
+    pub fn sub_repo_perms_for_actor(
+        child: JobNode,
+        actor: crate::search_jobutil_misc_jobs::Actor,
+    ) -> JobNode {
+        JobNode::new(NodeKind::SubRepoPerms { actor }, vec![child])
     }
 
     /// `jobutil.reposPartialJob`, runnable without an enclosing pager.
@@ -2519,7 +2551,10 @@ pub fn new_basic_job(inputs: &TreeInputs, basic: &Basic) -> Result<JobNode, JobE
             on_sourcegraph_dot_com: inputs.on_sourcegraph_dot_com,
         },
     );
-    let repo_options = TreeRepoOptions::from_job_builders(&job_repo_options);
+    let mut repo_options = TreeRepoOptions::from_job_builders(&job_repo_options);
+    // `actor.FromContext(ctx)` travels with the repo options into
+    // `doQueryDB`/`computeExcludedRepos` (`ResolveSearchContextSpec`).
+    repo_options.request_context = inputs.request_context;
     let contains_ref_globs = contains_ref_globs(&b);
 
     // `filter.SelectPathFromString(b.FindValue(query.FieldSelect))`.
@@ -2658,7 +2693,10 @@ pub fn new_basic_job(inputs: &TreeInputs, basic: &Basic) -> Result<JobNode, JobE
     }
 
     if inputs.sub_repo_enabled {
-        basic_job = JobNode::new(NodeKind::SubRepoPerms, vec![basic_job]);
+        basic_job = JobNode::sub_repo_perms_for_actor(
+            basic_job,
+            inputs.request_context.sub_repo_actor(),
+        );
     }
 
     let select_value = q_string_value(&b.to_parse_tree(), FIELD_SELECT);
@@ -3003,6 +3041,7 @@ pub fn new_flat_job(inputs: &TreeInputs, basic: &Basic) -> Result<JobNode, JobEr
         },
     );
     let mut repo_options = TreeRepoOptions::from_job_builders(&job_repo_options);
+    repo_options.request_context = inputs.request_context;
     let contains_ref_globs = contains_ref_globs(basic);
 
     let mut all_jobs = Vec::new();

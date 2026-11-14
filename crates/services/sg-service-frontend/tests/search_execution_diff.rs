@@ -205,6 +205,7 @@ fn inputs(case: &Case) -> TreeInputs {
         sanitize_search_patterns: Vec::new(),
         on_sourcegraph_dot_com: false,
         original_query: case.original_query.clone(),
+        request_context: sg_service_frontend::search_contexts::RequestContext::anonymous(),
         sub_repo_enabled: false,
         cody_context_hook: None,
         cody_context: None,

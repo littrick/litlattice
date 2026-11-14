@@ -165,11 +165,16 @@ pub trait PrivateRepoLister {
         ))
     }
 
-    /// `searchcontexts.ResolveSearchContextSpec`. The default resolves only the
-    /// global/empty spec (which needs no database) and keeps the explicit seam
-    /// error for everything else; production and differential fakes override
-    /// it with a real `search_contexts` lookup.
-    fn resolve_search_context(&self, spec: &str) -> Result<SearchContext, JobError> {
+    /// `searchcontexts.ResolveSearchContextSpec(ctx, ...)`. The default
+    /// resolves only the global/empty spec (which needs no database) and
+    /// keeps the explicit seam error for everything else; production and
+    /// differential fakes override it with a real `search_contexts` lookup.
+    /// `ctx` carries the request actor's permission predicate.
+    fn resolve_search_context(
+        &self,
+        spec: &str,
+        _ctx: &crate::search_contexts::RequestContext,
+    ) -> Result<SearchContext, JobError> {
         if crate::search_contexts::is_global_search_context_spec(spec) {
             return Ok(get_global_search_context());
         }

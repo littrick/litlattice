@@ -724,20 +724,17 @@ impl PrivateRepoLister for PgPrivateRepoLister {
             .map_err(|error| JobError(error.to_string()))
     }
 
-    /// `searchcontexts.ResolveSearchContextSpec` for `computeExcludedRepos`.
-    /// Uses the shared Postgres store and the anonymous actor, matching the
-    /// `context.Background()` oracle.
+    /// `searchcontexts.ResolveSearchContextSpec(ctx, ...)` for
+    /// `computeExcludedRepos`: the request actor's permission predicate is
+    /// applied by the shared Postgres store.
     fn resolve_search_context(
         &self,
         spec: &str,
+        ctx: &crate::search_contexts::RequestContext,
     ) -> Result<crate::search_contexts::SearchContext, JobError> {
         let store = PgSearchContextsStore::new(self.pool.clone());
-        crate::search_contexts::resolve_search_context_spec(
-            &store,
-            &crate::search_contexts::RequestContext::default(),
-            spec,
-        )
-        .map_err(|error| JobError(error.to_string()))
+        crate::search_contexts::resolve_search_context_spec(&store, ctx, spec)
+            .map_err(|error| JobError(error.to_string()))
     }
 }
 

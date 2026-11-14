@@ -447,8 +447,21 @@ pub fn tree_inputs(inputs: &SearchInputs) -> TreeInputs {
         sanitize_search_patterns: inputs.sanitize_search_patterns.clone(),
         on_sourcegraph_dot_com: inputs.on_sourcegraph_dot_com,
         original_query: inputs.original_query.clone(),
-        // `authz.SubRepoEnabled` is not ported.
-        sub_repo_enabled: false,
+        // No actor is threaded into `SearchInputs` yet (actor middleware is
+        // not wired into the search executor); the anonymous actor keeps the
+        // pre-M9.39b behavior. Callers that have an actor use
+        // [`tree_inputs_with_context`].
+        request_context: crate::search_contexts::RequestContext::anonymous(),
+        // `authz.SubRepoEnabled(authz.DefaultSubRepoPermsChecker)`: the global
+        // checker decides whether the filter job is wrapped at all; the
+        // request actor is applied inside it.
+        sub_repo_enabled: crate::sub_repo_perms_checker::sub_repo_runtime()
+            .map(|runtime| {
+                crate::search_jobutil_misc_jobs::SubRepoPermissionChecker::enabled(
+                    runtime.checker.as_ref(),
+                )
+            })
+            .unwrap_or(false),
         // `codycontext.NewSearchJob` is ported; the hook stays `None` so the
         // tree builder calls it directly.
         cody_context_hook: None,
@@ -456,6 +469,18 @@ pub fn tree_inputs(inputs: &SearchInputs) -> TreeInputs {
         // mutation (the codycontext client is not ported yet).
         cody_context: inputs.cody_context.clone(),
     }
+}
+
+/// [`tree_inputs`] with an explicit request actor (`actor.FromContext(ctx)`).
+/// Once the search executor carries the request actor, this replaces the
+/// anonymous default above.
+pub fn tree_inputs_with_context(
+    inputs: &SearchInputs,
+    request_context: crate::search_contexts::RequestContext,
+) -> TreeInputs {
+    let mut tree = tree_inputs(inputs);
+    tree.request_context = request_context;
+    tree
 }
 
 /// Map a successful `search_client::SearchClient::plan` to the handler's
