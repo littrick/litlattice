@@ -1004,6 +1004,37 @@ impl Service for FrontendService {
         // endpoints or an invalid endpoint list keeps the pre-existing
         // `TreeJobRunner::unconfigured()` behavior byte-for-byte.
         let search_site = wiring.live().current().site.clone();
+        // M9.40a: `authz.DefaultSubRepoPermsChecker =
+        // subrepoperms.NewSubRepoPermsClient(db.SubRepoPerms())`
+        // (`cmd/frontend/internal/authz/init.go:46`). The checker is gated by
+        // `experimentalFeatures.subRepoPermissions.enabled`; the getter reads
+        // `authz.enforceForSiteAdmins` per query. Request actors are applied by
+        // the job tree (`inputs.request_context.sub_repo_actor()`), so the
+        // installed runtime keeps the anonymous actor.
+        let sub_repo_pool = search_pool.clone();
+        let sub_repo_enforce_live = std::sync::Arc::clone(wiring.live());
+        let sub_repo_getter: std::sync::Arc<
+            dyn crate::sub_repo_perms_checker::SubRepoPermissionsGetter,
+        > = std::sync::Arc::new(
+            crate::sub_repo_perms_checker::PgSubRepoPermissionsGetter::new(
+                sub_repo_pool,
+                move || {
+                    sub_repo_enforce_live
+                        .current()
+                        .site
+                        .authz_enforce_for_site_admins()
+                },
+            ),
+        );
+        let sub_repo_enabled = crate::sub_repo_perms_checker::configure_from_site(
+            &search_site,
+            Some(sub_repo_getter),
+            crate::search_jobutil_misc_jobs::Actor::default(),
+        );
+        tracing::info!(
+            enabled = sub_repo_enabled,
+            "configured sub-repository permission checker"
+        );
         let search_deps: Arc<dyn crate::search_stream::SearchDeps> =
             match crate::service_connections::service_connections() {
                 Ok(connections) => {

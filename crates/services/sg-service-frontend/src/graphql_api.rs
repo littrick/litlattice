@@ -1661,7 +1661,14 @@ impl GraphqlDeps for SchemaGraphqlDeps {
         // injected seam before the synchronous executor replays the snapshot.
         let search_root = match &self.search_executor {
             Some(executor) => {
-                crate::search_graphql::prefetch_search_roots(executor.as_ref(), &fields).await
+                // `schemaResolver.Search(ctx, ...)`: the resolver's request
+                // actor (`actor.FromContext(ctx)`) is authoritative.
+                crate::search_graphql::prefetch_search_roots(
+                    executor.as_ref(),
+                    &fields,
+                    request.actor,
+                )
+                .await
             }
             None => None,
         };

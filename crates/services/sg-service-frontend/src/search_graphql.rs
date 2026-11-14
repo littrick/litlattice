@@ -111,6 +111,20 @@ pub trait SearchExecutor: Send + Sync {
         planned: &PlannedSearch,
         mode: SearchStreamMode,
     ) -> Result<SearchExecution, SearchExecutionError>;
+
+    /// `client.Execute` with the GraphQL request actor
+    /// (`actor.FromContext(ctx)`), threaded into the job tree through
+    /// [`crate::search_stream::SearchDeps::execute_with_context`]. Defaults to
+    /// [`SearchExecutor::execute`] (anonymous) for existing executors.
+    async fn execute_with_context(
+        &self,
+        planned: &PlannedSearch,
+        mode: SearchStreamMode,
+        request_context: crate::search_contexts::RequestContext,
+    ) -> Result<SearchExecution, SearchExecutionError> {
+        let _ = request_context;
+        self.execute(planned, mode).await
+    }
 }
 
 /// Production executor: reuses the ported `search_stream` deps.
@@ -172,10 +186,27 @@ impl SearchExecutor for BackendSearchExecutor {
     async fn execute(
         &self,
         planned: &PlannedSearch,
+        mode: SearchStreamMode,
+    ) -> Result<SearchExecution, SearchExecutionError> {
+        self.execute_with_context(
+            planned,
+            mode,
+            crate::search_contexts::RequestContext::anonymous(),
+        )
+        .await
+    }
+
+    async fn execute_with_context(
+        &self,
+        planned: &PlannedSearch,
         _mode: SearchStreamMode,
+        request_context: crate::search_contexts::RequestContext,
     ) -> Result<SearchExecution, SearchExecutionError> {
         let start = Instant::now();
-        let mut stream = self.deps.execute(&planned.inputs, &planned.query).await;
+        let mut stream = self
+            .deps
+            .execute_with_context(&planned.inputs, &planned.query, request_context)
+            .await;
         let mut execution = SearchExecution::default();
         while let Some(item) = stream.next().await {
             match item {
@@ -209,6 +240,7 @@ impl SearchExecutor for BackendSearchExecutor {
 pub async fn prefetch_search_roots(
     executor: &dyn SearchExecutor,
     fields: &[RootField],
+    actor: Actor,
 ) -> Option<SearchRoot> {
     let field = fields.iter().find(|field| field.name == "search")?;
     let args = SearchArgs {
@@ -217,10 +249,20 @@ pub async fn prefetch_search_roots(
         query: field.arguments.string("query").unwrap_or("").to_owned(),
     };
     Some(match executor.plan(&args, SearchStreamMode::Batch).await {
-        Ok(planned) => match executor.execute(&planned, SearchStreamMode::Batch).await {
-            Ok(execution) => SearchRoot::Completed(execution),
-            Err(error) => SearchRoot::Error(execution_error_message(error)),
-        },
+        Ok(planned) => {
+            // `actor.FromContext(ctx)` + `dotcom.SourcegraphDotComMode()`.
+            let request_context = crate::search_contexts::RequestContext::from_graphql_actor(
+                actor,
+                planned.inputs.on_sourcegraph_dot_com,
+            );
+            match executor
+                .execute_with_context(&planned, SearchStreamMode::Batch, request_context)
+                .await
+            {
+                Ok(execution) => SearchRoot::Completed(execution),
+                Err(error) => SearchRoot::Error(execution_error_message(error)),
+            }
+        }
         Err(SearchExecutionError::Query {
             message,
             expected_operand,

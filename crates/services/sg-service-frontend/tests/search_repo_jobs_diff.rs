@@ -60,6 +60,10 @@ struct RepoOptsSpec {
     /// Request actor for `ResolveSearchContextSpec` (M9.39b).
     #[serde(default)]
     actor: ActorSpec,
+    /// `dotcom.SourcegraphDotComMode()` when the actor came from a GraphQL
+    /// request (M9.40a).
+    #[serde(default)]
+    dotcom: bool,
     #[serde(default)]
     visibility: String,
     #[serde(default)]
@@ -350,7 +354,7 @@ fn repo_opts(spec: &RepoOptsSpec) -> TreeRepoOptions {
         request_context: sg_service_frontend::search_contexts::RequestContext {
             actor_uid: spec.actor.uid,
             internal: spec.actor.internal,
-            sourcegraph_dot_com_mode: false,
+            sourcegraph_dot_com_mode: spec.dotcom,
         },
         visibility,
         limit: spec.limit,
@@ -571,8 +575,9 @@ fn search_repo_jobs_diff() {
     if std::env::var("SG_M937A_DIFF").as_deref() != Ok("1")
         && std::env::var("SG_M938A_DIFF").as_deref() != Ok("1")
         && std::env::var("SG_M939B_DIFF").as_deref() != Ok("1")
+        && std::env::var("SG_M940A_DIFF").as_deref() != Ok("1")
     {
-        eprintln!("SG_M937A_DIFF/SG_M938A_DIFF/SG_M939B_DIFF not set; skipping");
+        eprintln!("SG_M937A_DIFF/SG_M938A_DIFF/SG_M939B_DIFF/SG_M940A_DIFF not set; skipping");
         return;
     }
     let corpus_path = std::env::var("M937A_CORPUS").expect("M937A_CORPUS must be set");
@@ -587,6 +592,11 @@ fn search_repo_jobs_diff() {
     // M9.39b appends the actor corpus (same order as the Go oracle output).
     if let Ok(actor_corpus) = std::env::var("M939B_CORPUS") {
         cases.extend(load_cases(&actor_corpus));
+    }
+    // M9.40a appends the GraphQL-layer actor corpus (actor + dotcom mode);
+    // same order as the Go oracle output.
+    if let Ok(graphql_actor_corpus) = std::env::var("M940A_CORPUS") {
+        cases.extend(load_cases(&graphql_actor_corpus));
     }
 
     let output: Vec<Value> = cases.iter().map(run_case).collect();
