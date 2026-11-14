@@ -574,6 +574,8 @@ impl ChangesetSource for FakeSource {
         Ok(sg_service_worker::jobs::batches_reconciler::PushResult {
             changelist_id: Some("cl-1".to_owned()),
             rev: Some("rev".to_owned()),
+            request: None,
+            remote_repo: None,
         })
     }
 }
