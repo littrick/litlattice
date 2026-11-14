@@ -402,6 +402,8 @@ fn run_filter(case: &Case) -> Value {
         "contains" => Box::new(FileContainsLeafJob {
             include_patterns: case.include.clone(),
             original_patterns: case.original.clone(),
+            raw_include_patterns: case.include.clone(),
+            case_sensitive: true,
             searcher: None,
             child: Box::new(child),
         }),

@@ -300,8 +300,14 @@ fn merge_events(events: Vec<SearchEvent>) -> SearchEvent {
 
 /// `fileContainsFilterJob` over a combinator child.
 pub struct FileContainsLeafJob {
+    /// Case-folded compiled sources (`NodeKind::FileContains.filter_patterns`).
     pub include_patterns: Vec<String>,
+    /// Case-folded compiled sources (`NodeKind::FileContains.original_patterns`).
     pub original_patterns: Vec<String>,
+    /// Raw `file:contains.content()` patterns, passed verbatim to the searcher.
+    pub raw_include_patterns: Vec<String>,
+    /// Original case sensitivity (`search.TextPatternInfo.IsCaseSensitive`).
+    pub case_sensitive: bool,
     pub searcher: Option<Box<dyn CommitContentSearcher>>,
     pub child: Box<dyn comb::CombinatorJob>,
 }
@@ -317,13 +323,22 @@ impl comb::CombinatorJob for FileContainsLeafJob {
         let Self {
             include_patterns,
             original_patterns,
+            raw_include_patterns,
+            case_sensitive,
             searcher,
             child,
         } = self;
         let runtime_searcher = leaf_clients(clients).and_then(LeafJobClients::content_searcher);
         let searcher = searcher.as_deref().or(runtime_searcher);
         let mut filtered = |event: SearchEvent| {
-            match filter_event_from_sources(event, include_patterns, original_patterns, searcher) {
+            match filter_event_from_sources(
+                event,
+                include_patterns,
+                original_patterns,
+                raw_include_patterns,
+                *case_sensitive,
+                searcher,
+            ) {
                 Ok(event) => stream(event),
                 Err(error) => {
                     // Construction compiled the same sources successfully, so
@@ -352,12 +367,16 @@ fn filter_event_from_sources(
     event: SearchEvent,
     include_patterns: &[String],
     original_patterns: &[String],
+    raw_include_patterns: &[String],
+    case_sensitive: bool,
     searcher: Option<&dyn CommitContentSearcher>,
 ) -> Result<SearchEvent, ContainsPatternError> {
     search_jobutil_filters::filter_event_from_sources(
         event,
         include_patterns,
         original_patterns,
+        raw_include_patterns,
+        case_sensitive,
         searcher,
     )
 }
