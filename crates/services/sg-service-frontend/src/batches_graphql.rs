@@ -2002,6 +2002,9 @@ fn batch_changes(
     actor: Actor,
     scope: BatchChangeScope,
 ) -> Result<FieldValue, ExecError> {
+    // `enterprise.BatchChangesEnabledForUser` (resolver.go:169): enabled plus
+    // `batchChanges.restrictToAdmins` for non-site-admins.
+    crate::batches_changeset_read::require_batch_changes_enabled(db, actor)?;
     let filter = parse_batch_change_filter(db.as_ref(), arguments, actor, scope)?;
     Ok(FieldValue::Object(Arc::new(
         BatchChangeConnectionObject::new(db.clone(), filter, actor),
@@ -2013,10 +2016,8 @@ fn batch_change(
     arguments: &Arguments,
     actor: Actor,
 ) -> Result<FieldValue, ExecError> {
-    let _ = actor;
-    if !db.batch_changes_enabled() {
-        return Err(ExecError::new(BATCH_CHANGES_DISABLED));
-    }
+    // `enterprise.BatchChangesEnabledForUser` (resolver.go:194).
+    crate::batches_changeset_read::require_batch_changes_enabled(db, actor)?;
     let Some(namespace) = arguments.string("namespace") else {
         return Err(ExecError::new("invalid ID \"\" for namespace"));
     };
@@ -2105,11 +2106,10 @@ pub fn repository_batch_changes(
 fn node_batch_change(
     db: &BatchesHandle,
     id: &str,
-    _actor: Actor,
+    actor: Actor,
 ) -> Result<Option<FieldValue>, ExecError> {
-    if !db.batch_changes_enabled() {
-        return Err(ExecError::new(BATCH_CHANGES_DISABLED));
-    }
+    // `Resolver.batchChangeByID` (resolver.go:169) uses the user-level check.
+    crate::batches_changeset_read::require_batch_changes_enabled(db, actor)?;
     let id = unmarshal_relay_int(id).map_err(ExecError::new)?;
     if id == 0 {
         return Err(ExecError::new("invalid node id"));
@@ -2132,9 +2132,8 @@ fn node_changeset(
     id: &str,
     actor: Actor,
 ) -> Result<Option<FieldValue>, ExecError> {
-    if !db.batch_changes_enabled() {
-        return Err(ExecError::new(BATCH_CHANGES_DISABLED));
-    }
+    // `Resolver.changesetByID` (resolver.go:137) uses the user-level check.
+    crate::batches_changeset_read::require_batch_changes_enabled(db, actor)?;
     let id = unmarshal_relay_int(id).map_err(ExecError::new)?;
     if id == 0 {
         return Err(ExecError::new("invalid node id"));

@@ -1391,7 +1391,18 @@ impl Service for FrontendService {
         let graphql_deps = graphql_deps
             .with_batches(Arc::new(
                 crate::batches_graphql_store::PgBatchesGraphqlStore::new(session_pool.clone())
-                    .with_gitserver_changeset_diff_source(Arc::clone(&codeintel_git_source)),
+                    .with_gitserver_changeset_diff_source(Arc::clone(&codeintel_git_source))
+                    // M9.43d: `conf.BatchChangesEnabled()` /
+                    // `conf.BatchChangesRestrictedToAdmins()` read the live site
+                    // configuration (`batchChanges.enabled` /
+                    // `batchChanges.restrictToAdmins`); Batch Changes is always
+                    // disabled on dotcom.
+                    .with_live_batch_changes_configuration(
+                        Arc::clone(wiring.live()),
+                        crate::service_connections::sourcegraph_dotcom_mode(&|key: &str| {
+                            std::env::var(key).ok()
+                        }),
+                    ),
             ))
             .and_then(|deps| {
                 deps.with_codeintel_uploads(Arc::new(
