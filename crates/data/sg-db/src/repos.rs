@@ -848,7 +848,7 @@ pub async fn list_minimal_repos(
         repos.push(RepoListItem {
             id: row.try_get("id")?,
             name: row.try_get("name")?,
-            stars: row.try_get("stars")?,
+            stars: i64::from(row.try_get::<i32, _>("stars")?),
             external_id: row.try_get("external_id")?,
             external_service_type: row.try_get("external_service_type")?,
             external_service_id: row.try_get("external_service_id")?,
@@ -888,7 +888,7 @@ ORDER BY repo.id
             Ok(RepoListItem {
                 id: row.try_get("id")?,
                 name: row.try_get("name")?,
-                stars: row.try_get("stars")?,
+                stars: i64::from(row.try_get::<i32, _>("stars")?),
                 external_id: row.try_get("external_id")?,
                 external_service_type: row.try_get("external_service_type")?,
                 external_service_id: row.try_get("external_service_id")?,
