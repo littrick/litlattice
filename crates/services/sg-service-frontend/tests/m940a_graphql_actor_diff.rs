@@ -84,9 +84,6 @@ impl SearchDeps for RecordingDeps {
         Vec::new()
     }
 
-    fn is_authenticated(&self) -> bool {
-        false
-    }
 }
 
 fn search_root_field() -> RootField {

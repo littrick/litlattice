@@ -159,7 +159,7 @@ fn build_plan_deps(case: &CorpusCase) -> PlanDeps {
     let feature_flags: FeatureFlagLoader = Box::new(move || flags.clone());
 
     let contexts = case.contexts.clone();
-    let resolve_search_context: SearchContextResolver = Arc::new(move |spec: &str| {
+    let resolve_search_context: SearchContextResolver = Arc::new(move |spec: &str, _: &sg_service_frontend::search_contexts::RequestContext| {
         if spec.is_empty() || spec == "global" {
             return Ok(String::new());
         }
@@ -527,9 +527,6 @@ impl SearchDeps for FramingDeps {
             .collect()
     }
 
-    fn is_authenticated(&self) -> bool {
-        false
-    }
 }
 
 fn header_field(headers: &http::HeaderMap, name: &str) -> String {

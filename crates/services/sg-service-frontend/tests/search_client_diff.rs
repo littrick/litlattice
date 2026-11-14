@@ -142,7 +142,7 @@ fn run_case(case: &CorpusCase) -> Value {
     let feature_flags: FeatureFlagLoader = Box::new(move || flags.clone());
 
     let contexts = case.contexts.clone();
-    let resolve_search_context: SearchContextResolver = Arc::new(move |spec: &str| {
+    let resolve_search_context: SearchContextResolver = Arc::new(move |spec: &str, _: &sg_service_frontend::search_contexts::RequestContext| {
         // `ResolveSearchContextSpec` special-cases the global context (and the
         // empty spec) before touching the database.
         if spec.is_empty() || spec == "global" {

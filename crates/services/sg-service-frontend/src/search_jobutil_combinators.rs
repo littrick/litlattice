@@ -343,6 +343,11 @@ pub enum JobFailure {
     DeadlineExceeded,
     /// `errors.MultiError`/`errors.Join`.
     Multi(Vec<JobFailure>),
+    /// `authz.ErrStalePermissions` (`internal/authz/perms.go:58`).
+    StalePermissions,
+    /// `*gitdomain.BadCommitError` (`internal/gitserver/gitdomain/errors.go:34`);
+    /// the alert only reads `Spec`, so the port carries just that.
+    BadCommit { spec: String },
     /// `*searchrepos.MissingRepoRevsError` (`repos.go:1224`): carries the
     /// missing repo/rev pairs so the alert can render the baseline
     /// description.
@@ -364,6 +369,8 @@ impl JobFailure {
             JobFailure::Multi(errors) => errors.iter().any(JobFailure::is_canceled),
             JobFailure::Message(_)
             | JobFailure::DeadlineExceeded
+            | JobFailure::StalePermissions
+            | JobFailure::BadCommit { .. }
             | JobFailure::MissingRepoRevs(_)
             | JobFailure::OverRepoLimit { .. } => false,
         }
@@ -376,6 +383,8 @@ impl JobFailure {
             JobFailure::Multi(errors) => errors.iter().any(JobFailure::is_deadline_exceeded),
             JobFailure::Message(_)
             | JobFailure::Canceled
+            | JobFailure::StalePermissions
+            | JobFailure::BadCommit { .. }
             | JobFailure::MissingRepoRevs(_)
             | JobFailure::OverRepoLimit { .. } => false,
         }
@@ -400,6 +409,15 @@ impl fmt::Display for JobFailure {
             JobFailure::Message(message) => f.write_str(message),
             JobFailure::Canceled => f.write_str("context canceled"),
             JobFailure::DeadlineExceeded => f.write_str("context deadline exceeded"),
+            // `authz.ErrStalePermissions.Error`.
+            JobFailure::StalePermissions => {
+                f.write_str("permissions are stale and being updated")
+            }
+            // `gitdomain.BadCommitError.Error` (repo/commit are not carried;
+            // the alert only reads `Spec`).
+            JobFailure::BadCommit { spec } => {
+                write!(f, "ResolveRevision: got bad commit at revision {spec:?}")
+            }
             // `MissingRepoRevsError.Error` / `errOverRepoLimit.Error`.
             JobFailure::MissingRepoRevs(_) => f.write_str("missing repo revs"),
             JobFailure::OverRepoLimit { .. } => f.write_str("Too many matching repositories"),

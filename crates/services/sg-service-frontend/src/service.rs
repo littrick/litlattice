@@ -1028,12 +1028,23 @@ impl Service for FrontendService {
         );
         let sub_repo_enabled = crate::sub_repo_perms_checker::configure_from_site(
             &search_site,
-            Some(sub_repo_getter),
+            Some(std::sync::Arc::clone(&sub_repo_getter)),
             crate::search_jobutil_misc_jobs::Actor::default(),
         );
         tracing::info!(
             enabled = sub_repo_enabled,
             "configured sub-repository permission checker"
+        );
+        // M9.41d: `conf.Watch` in `NewSubRepoPermsClient`
+        // (`subrepoperms/sub_repo_perms.go:119`). Re-read
+        // `experimentalFeatures.subRepoPermissions` whenever the live site
+        // config changes; the runtime is rebuilt only on an actual generation
+        // change.
+        crate::sub_repo_perms_checker::spawn_sub_repo_config_watch(
+            &mut background,
+            std::sync::Arc::clone(wiring.live()),
+            sub_repo_getter,
+            ctx.shutdown.clone(),
         );
         let search_deps: Arc<dyn crate::search_stream::SearchDeps> =
             match crate::service_connections::service_connections() {
