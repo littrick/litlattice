@@ -972,6 +972,33 @@ impl Service for FrontendService {
         // GraphQL stores read the same primary pool.
         let search_contexts_pool = search_pool.clone();
         let ranking_pool = search_pool.clone();
+        // `serve_cmd.go:143`: `keyring.Init` builds the encryption keys from
+        // the site configuration and fails startup when one cannot be
+        // constructed. The `conf.Watch` equivalent below rebuilds the ring in
+        // place; a rebuild failure terminates the process like the baseline's
+        // `panic`.
+        //
+        // M9.39c: initialized before the search runtime because the owners
+        // production seam decrypts `user_external_accounts.account_data`
+        // with `UserExternalAccountKey`.
+        let keyring = sg_keyring::init(&wiring.live().current().site)
+            .await
+            .map_err(|err| {
+                ServiceError::with_source("initializing keyring", std::io::Error::other(err))
+            })?;
+        {
+            let built_generation = wiring.live().generation();
+            let keyring = Arc::clone(&keyring);
+            let live = Arc::clone(wiring.live());
+            let shutdown = ctx.shutdown.clone();
+            background.spawn(async move {
+                if let Err(err) = sg_keyring::watch(keyring, live, built_generation, shutdown).await
+                {
+                    tracing::error!(error = %err, "creating encryption keyring");
+                    std::process::exit(2);
+                }
+            });
+        }
         // M9.8im: assemble the search runtime from the same static endpoints
         // `serve_cmd` uses (the live service connections). Missing zoekt
         // endpoints or an invalid endpoint list keeps the pre-existing
@@ -980,8 +1007,12 @@ impl Service for FrontendService {
         let search_deps: Arc<dyn crate::search_stream::SearchDeps> =
             match crate::service_connections::service_connections() {
                 Ok(connections) => {
-                    match crate::search_runtime::assemble(&search_pool, &connections, &search_site)
-                    {
+                    match crate::search_runtime::assemble_with_encryption_key(
+                        &search_pool,
+                        &connections,
+                        &search_site,
+                        keyring.user_external_account_key(),
+                    ) {
                         Ok(runtime) => Arc::new(crate::search_stream::BackendDeps::with_runtime(
                             search_pool,
                             runtime,
@@ -1003,29 +1034,6 @@ impl Service for FrontendService {
                     Arc::new(crate::search_stream::BackendDeps::new(search_pool))
                 }
             };
-        // `serve_cmd.go:143`: `keyring.Init` builds the encryption keys from
-        // the site configuration and fails startup when one cannot be
-        // constructed. The `conf.Watch` equivalent below rebuilds the ring in
-        // place; a rebuild failure terminates the process like the baseline's
-        // `panic`.
-        let keyring = sg_keyring::init(&wiring.live().current().site)
-            .await
-            .map_err(|err| {
-                ServiceError::with_source("initializing keyring", std::io::Error::other(err))
-            })?;
-        {
-            let built_generation = wiring.live().generation();
-            let keyring = Arc::clone(&keyring);
-            let live = Arc::clone(wiring.live());
-            let shutdown = ctx.shutdown.clone();
-            background.spawn(async move {
-                if let Err(err) = sg_keyring::watch(keyring, live, built_generation, shutdown).await
-                {
-                    tracing::error!(error = %err, "creating encryption keyring");
-                    std::process::exit(2);
-                }
-            });
-        }
         // `serve_cmd.go:153`: `overrideExtSvcConfig` runs after the keyring is
         // initialized so it can decrypt existing configs and encrypt new ones.
         // It fails startup when the file cannot be applied; the watcher below

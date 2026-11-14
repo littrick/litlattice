@@ -20,19 +20,25 @@
 //! `code_monitors_graphql_store`.
 //!
 //! [`GitserverContributorFetcher`] is the production `file:has.contributor()`
-//! seam. The Rust gitserver client does not expose `ContributorCount` yet, so
-//! the adapter takes the transport as [`ContributorCountSource`].
+//! seam. M9.39c adds the real `sg_git::GitserverClient::contributor_count`
+//! transport (`GitClientContributorCountSource`, and the `LiveConfig`-bound
+//! `production_contributor_fetcher`) plus the external-account handle
+//! augmentation of `Bag` resolution (`fetchCodeHostHandles`/`linkBack`).
 //!
-//! See `docs/overviews/m9_38b_owners_parser_overview.md`.
+//! See `docs/overviews/m9_38b_owners_parser_overview.md` and
+//! `docs/overviews/m9_39c_contributor_grpc_overview.md`.
 
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::sync::{Arc, Mutex, OnceLock};
 
+use async_trait::async_trait;
 use regex::Regex;
 use sqlx::{PgPool, Row};
 
-use crate::git_graphql::GitObjectSource;
+use sg_encryption::Key;
+
+use crate::git_graphql::{GitObjectSource, GitSourceError};
 use crate::search_job::JobError;
 use crate::search_jobutil_filters::{
     ContributorCount, ContributorFetcher, ContributorOptions,
@@ -776,16 +782,64 @@ pub const CODEOWNERS_LOCATIONS: [&str; 5] = [
     "docs/CODEOWNERS",
 ];
 
+/// `fetchCodeHostHandles`'s per-provider `PublicAccountData.Login`
+/// (`internal/own/ownref.go:429`).
+///
+/// The stored `account_data` JSON is decoded with the provider structs from
+/// `sg-extsvc`; malformed data returns `None` because the baseline's
+/// `GetPublicExternalAccountData` error is skipped (`continue`). GitHub only
+/// exposes `login` in the baseline snapshot (see the overview's erratum), and
+/// an empty login is not a handle.
+pub fn external_account_login(service_type: &str, account_data: &str) -> Option<String> {
+    let login = match service_type {
+        "github" => {
+            serde_json::from_str::<sg_extsvc::github::User>(account_data)
+                .ok()?
+                .login
+        }
+        "gitlab" => {
+            serde_json::from_str::<sg_extsvc::gitlab::AuthUser>(account_data)
+                .ok()?
+                .username
+        }
+        "bitbucketcloud" => {
+            serde_json::from_str::<sg_extsvc::bitbucketcloud::Account>(account_data)
+                .ok()?
+                .username
+        }
+        "azuredevops" => serde_json::from_str::<sg_extsvc::azuredevops::Profile>(account_data)
+            .ok()?
+            .email_address
+            .to_lowercase(),
+        _ => return None,
+    };
+    (!login.is_empty()).then_some(login)
+}
+
 /// Production ownership source over gitserver + Postgres (existing tables
 /// only).
 pub struct PgOwnershipSource {
     pool: PgPool,
     objects: Arc<dyn GitObjectSource>,
+    /// `user_external_accounts.account_data` decryption key
+    /// (`keyring.Default().UserExternalAccountKey`). `None` leaves encrypted
+    /// account data unreadable; plaintext/unmigrated rows still resolve.
+    key: Option<Arc<dyn Key>>,
 }
 
 impl PgOwnershipSource {
     pub fn new(pool: PgPool, objects: Arc<dyn GitObjectSource>) -> Self {
-        Self { pool, objects }
+        Self {
+            pool,
+            objects,
+            key: None,
+        }
+    }
+
+    /// [`Self::new`] plus the keyring key for `user_external_accounts`.
+    pub fn with_encryption_key(mut self, key: Option<Arc<dyn Key>>) -> Self {
+        self.key = key;
+        self
     }
 
     fn read_codeowners_file(
@@ -799,6 +853,48 @@ impl PgOwnershipSource {
             Ok(bytes) => Ok(Some(String::from_utf8_lossy(&bytes).into_owned())),
             Err(err) if err.not_exist => Ok(None),
             Err(err) => Err(JobError(err.message)),
+        }
+    }
+
+    /// `userReferencesBatch.augment`'s `batchFetchCodeHostHandles` +
+    /// `linkBack` (`internal/own/ownref.go:378,419,473`): add every code-host
+    /// login linked to the user so the same user resolves through any of its
+    /// external handles. Per-account decode/decrypt failures are skipped, as
+    /// `fetchCodeHostHandles` does.
+    fn augment_external_handles(&self, user_id: i32, refs: &mut Vec<OwnershipRef>) {
+        let accounts = block_on(sg_db::user_external_accounts::list(
+            &self.pool,
+            &sg_db::user_external_accounts::ExternalAccountsListOptions {
+                user_id: Some(user_id),
+                ..Default::default()
+            },
+        ))
+        .unwrap_or_default();
+        for account in accounts {
+            let Some(cipher) = account.account_data.as_deref() else {
+                continue;
+            };
+            // `extsvc.NewEncryptedData`: empty cipher with empty key id is nil.
+            if cipher.is_empty() && account.encryption_key_id.is_empty() {
+                continue;
+            }
+            let Ok(plaintext) = block_on(sg_encryption::maybe_decrypt(
+                self.key.as_deref(),
+                cipher,
+                &account.encryption_key_id,
+            )) else {
+                continue;
+            };
+            let Some(handle) =
+                external_account_login(&account.service_type, &plaintext)
+            else {
+                continue;
+            };
+            refs.push(OwnershipRef {
+                user_id: Some(user_id),
+                handle,
+                ..OwnershipRef::default()
+            });
         }
     }
 }
@@ -940,6 +1036,9 @@ impl OwnershipSource for PgOwnershipSource {
                     });
                 }
             }
+            // `batchFetchCodeHostHandles`: GitHub/GitLab/Bitbucket/Azure
+            // logins linked to this user.
+            self.augment_external_handles(user.id, &mut refs);
         } else if !is_mail_address(text) {
             let handle = text.trim_start_matches('@');
             if let Ok(team) = block_on(sg_db::teams::get_team_by_name(&self.pool, handle)) {
@@ -991,6 +1090,182 @@ impl ContributorFetcher for GitserverContributorFetcher {
         options: &ContributorOptions,
     ) -> Result<Vec<ContributorCount>, JobError> {
         self.source.contributor_count(repo_name, options)
+    }
+}
+
+fn go_contributor_options(options: &ContributorOptions) -> sg_git::ContributorOptions {
+    sg_git::ContributorOptions {
+        range: options.range.clone(),
+        // `filter_file_contributor.go:137` leaves `After` at the zero
+        // `time.Time`; the client turns `None` into that timestamp.
+        after: None,
+        path: options.path.clone(),
+    }
+}
+
+fn contributor_counts(
+    counts: Vec<sg_git::ContributorCount>,
+) -> Vec<ContributorCount> {
+    counts
+        .into_iter()
+        .map(|count| ContributorCount {
+            name: count.name,
+            email: count.email,
+            count: count.count,
+        })
+        .collect()
+}
+
+/// Synchronous [`ContributorCountSource`] over a shared
+/// [`sg_git::GitserverClient`]. The search job tree is synchronous while the
+/// gRPC call is async, so the bridge uses the same blocking helper as the
+/// ownership DB reads. Errors keep the gitserver status text (no fabrication).
+pub struct GitClientContributorCountSource {
+    client: Arc<sg_git::GitserverClient>,
+}
+
+impl GitClientContributorCountSource {
+    pub fn new(client: Arc<sg_git::GitserverClient>) -> Self {
+        Self { client }
+    }
+}
+
+impl ContributorCountSource for GitClientContributorCountSource {
+    fn contributor_count(
+        &self,
+        repo_name: &str,
+        options: &ContributorOptions,
+    ) -> Result<Vec<ContributorCount>, JobError> {
+        let options = go_contributor_options(options);
+        block_on(self.client.contributor_count(repo_name, &options))
+            .map(contributor_counts)
+            .map_err(|error| JobError(error.to_string()))
+    }
+}
+
+/// Production [`ContributorCountSource`] bound to the live site
+/// configuration (`conf.Get()`), like
+/// [`crate::git_graphql::production_git_source`]: shard addresses and pins
+/// are re-read on every call, and the `sg-git` clients are cached by address
+/// list.
+pub struct LiveConfigContributorCountSource {
+    live: Arc<sg_config::LiveConfig>,
+    clients: Mutex<HashMap<Vec<String>, Arc<sg_git::GitserverClient>>>,
+}
+
+impl LiveConfigContributorCountSource {
+    pub fn new(live: Arc<sg_config::LiveConfig>) -> Self {
+        Self {
+            live,
+            clients: Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+impl ContributorCountSource for LiveConfigContributorCountSource {
+    fn contributor_count(
+        &self,
+        repo_name: &str,
+        options: &ContributorOptions,
+    ) -> Result<Vec<ContributorCount>, JobError> {
+        let unified = self.live.current();
+        let addresses = sg_git::addresses::GitserverAddresses::from_unified(&unified);
+        let addr = addresses
+            .addr_for_repo(repo_name)
+            .ok_or_else(|| JobError("no gitserver address configured".to_owned()))?
+            .to_owned();
+        let client = {
+            let mut clients = self.clients.lock().expect("contributor client cache");
+            match clients.get(&addresses.addresses) {
+                Some(client) => Arc::clone(client),
+                None => {
+                    let client = Arc::new(sg_git::GitserverClient::new(
+                        addresses.addresses.clone(),
+                    ));
+                    clients.insert(addresses.addresses.clone(), Arc::clone(&client));
+                    client
+                }
+            }
+        };
+        let options = go_contributor_options(options);
+        block_on(client.contributor_count_at(&addr, repo_name, &options))
+            .map(contributor_counts)
+            .map_err(|error| JobError(error.to_string()))
+    }
+}
+
+/// The production `file:has.contributor()` fetcher backed by the live
+/// configuration.
+pub fn production_contributor_fetcher(
+    live: Arc<sg_config::LiveConfig>,
+) -> Arc<GitserverContributorFetcher> {
+    Arc::new(GitserverContributorFetcher::new(Arc::new(
+        LiveConfigContributorCountSource::new(live),
+    )))
+}
+
+/// [`GitObjectSource`] over a shared [`sg_git::GitserverClient`], used by the
+/// production ownership source when only the process-wide client is available
+/// (the baseline `own.NewService(gitserver, db)` takes the same client).
+pub struct GitClientObjectSource {
+    client: Arc<sg_git::GitserverClient>,
+}
+
+impl GitClientObjectSource {
+    pub fn new(client: Arc<sg_git::GitserverClient>) -> Self {
+        Self { client }
+    }
+}
+
+#[async_trait]
+impl GitObjectSource for GitClientObjectSource {
+    async fn resolve_revision(
+        &self,
+        _repo_id: i32,
+        repo_name: &str,
+        rev: &str,
+    ) -> Result<String, GitSourceError> {
+        self.client
+            .resolve_revision(repo_name, rev, true)
+            .await
+            .map_err(GitSourceError::from)
+    }
+
+    async fn get_commit(
+        &self,
+        _repo_id: i32,
+        repo_name: &str,
+        oid: &str,
+    ) -> Result<sg_git::CommitDetails, GitSourceError> {
+        self.client
+            .get_commit_details(repo_name, oid)
+            .await
+            .map_err(GitSourceError::from)
+    }
+
+    async fn get_object(
+        &self,
+        _repo_id: i32,
+        repo_name: &str,
+        revspec: &str,
+    ) -> Result<sg_git::GitObject, GitSourceError> {
+        self.client
+            .get_object(repo_name, revspec)
+            .await
+            .map_err(GitSourceError::from)
+    }
+
+    async fn read_file(
+        &self,
+        _repo_id: i32,
+        repo_name: &str,
+        oid: &str,
+        path: &str,
+    ) -> Result<Vec<u8>, GitSourceError> {
+        self.client
+            .read_file(repo_name, oid, path)
+            .await
+            .map_err(GitSourceError::from)
     }
 }
 

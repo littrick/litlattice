@@ -331,6 +331,65 @@ pub struct CommitsOptions {
     pub follow_path_renames: bool,
 }
 
+/// `gitserver.ContributorOptions` (`internal/gitserver/commands.go:171`).
+///
+/// Go models `After` as `time.Time` and always sets
+/// `timestamppb.New(opt.After)`. The zero `time.Time` is
+/// `0001-01-01T00:00:00Z`, i.e. Unix seconds
+/// [`GO_ZERO_TIME_UNIX_SECONDS`], **not** the Unix epoch. `None` reproduces
+/// that zero value so the wire request matches the baseline.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ContributorOptions {
+    pub range: String,
+    /// Unix seconds; `None` means Go's zero `time.Time`.
+    pub after: Option<i64>,
+    pub path: String,
+}
+
+/// `time.Time{}.Unix()`: `0001-01-01T00:00:00Z`.
+pub const GO_ZERO_TIME_UNIX_SECONDS: i64 = -62_135_596_800;
+
+/// `gitdomain.ContributorCount` (`internal/gitserver/gitdomain/common.go:373`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ContributorCount {
+    pub name: String,
+    pub email: String,
+    pub count: i32,
+}
+
+/// `ContributorOptions.ToProto` as `clientImplementor.ContributorCount` builds
+/// it (`internal/gitserver/commands.go:204`). Exposed for differential
+/// testing.
+pub fn contributor_counts_request(
+    repo: &str,
+    options: &ContributorOptions,
+) -> pb::ContributorCountsRequest {
+    pb::ContributorCountsRequest {
+        repo_name: repo.to_owned(),
+        range: options.range.as_bytes().to_vec(),
+        after: Some(prost_types::Timestamp {
+            seconds: options.after.unwrap_or(GO_ZERO_TIME_UNIX_SECONDS),
+            nanos: 0,
+        }),
+        path: options.path.as_bytes().to_vec(),
+    }
+}
+
+/// `gitdomain.ContributorCountFromProto` over the raw signature bytes:
+/// `string(p.GetAuthor().GetName())` / `.GetEmail()` with Go's UTF-8
+/// replacement. Exposed for differential testing.
+pub fn contributor_count_from_proto_parts(
+    name: &[u8],
+    email: &[u8],
+    count: i32,
+) -> ContributorCount {
+    ContributorCount {
+        name: String::from_utf8_lossy(name).into_owned(),
+        email: String::from_utf8_lossy(email).into_owned(),
+        count,
+    }
+}
+
 /// `gitserver.DiffOptions.RangeType`: `".."` (`ONLY_IN_HEAD`) or `"..."`
 /// (`INTERSECTION`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -982,6 +1041,50 @@ impl GitserverClient {
             .map_err(|status| translate_status(status, &context))?
             .into_inner();
         Ok(git_object_from_proto(response.object.unwrap_or_default()))
+    }
+
+    /// `gitserver.Client.ContributorCount` (`internal/gitserver/commands.go:187`).
+    ///
+    /// The request always carries `After` (Go calls `timestamppb.New` on the
+    /// zero `time.Time`), so `None` is sent as
+    /// [`GO_ZERO_TIME_UNIX_SECONDS`] rather than omitting the field. The
+    /// response maps `count` and the optional author name/email exactly like
+    /// `gitdomain.ContributorCountFromProto`.
+    pub async fn contributor_count(
+        &self,
+        repo: &str,
+        options: &ContributorOptions,
+    ) -> Result<Vec<ContributorCount>, Error> {
+        let addr = self
+            .addr_for(repo)
+            .ok_or_else(|| Error::Message("no gitserver address configured".to_owned()))?
+            .to_owned();
+        self.contributor_count_at(&addr, repo, options).await
+    }
+
+    /// `ContributorCount` against an explicitly resolved shard (site-config
+    /// pins).
+    pub async fn contributor_count_at(
+        &self,
+        addr: &str,
+        repo: &str,
+        options: &ContributorOptions,
+    ) -> Result<Vec<ContributorCount>, Error> {
+        let mut client = self.client(addr).await?;
+        let context = format!("contributor count {repo}");
+        let response = client
+            .contributor_counts(contributor_counts_request(repo, options))
+            .await
+            .map_err(|status| translate_status(status, &context))?
+            .into_inner();
+        Ok(response
+            .counts
+            .into_iter()
+            .map(|count| {
+                let author = count.author.unwrap_or_default();
+                contributor_count_from_proto_parts(&author.name, &author.email, count.count)
+            })
+            .collect())
     }
 
     /// `gitserver.Client.Commits` (`CommitsOptions.ToProto` + a `CommitLog`

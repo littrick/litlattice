@@ -36,6 +36,7 @@ use tokio_stream::StreamExt;
 
 use sg_config::{ServiceConnections, SiteConfiguration};
 use sg_db::repos as db_repos;
+use sg_encryption::Key;
 use sg_git::GitserverClient as GitClient;
 use sg_proto::gitserver as pb;
 use sg_zoekt::indexed_repo_revs::MinimalRepo;
@@ -158,7 +159,26 @@ pub fn assemble(
     connections: &ServiceConnections,
     site: &SiteConfiguration,
 ) -> Result<TreeRuntimeClients, RuntimeConfigError> {
-    assemble_inner(pool, connections, site, None)
+    assemble_inner(pool, connections, site, None, None)
+}
+
+/// [`assemble`] with the frontend keyring's
+/// `UserExternalAccountKey`, so the owners production seam can decrypt
+/// `user_external_accounts.account_data` (`keyring.Default()` in the
+/// baseline).
+pub fn assemble_with_encryption_key(
+    pool: &PgPool,
+    connections: &ServiceConnections,
+    site: &SiteConfiguration,
+    user_external_account_key: Option<Arc<dyn Key>>,
+) -> Result<TreeRuntimeClients, RuntimeConfigError> {
+    assemble_inner(
+        pool,
+        connections,
+        site,
+        None,
+        user_external_account_key,
+    )
 }
 
 /// [`assemble`] plus an optional test override for the `RepoPagerJob`
@@ -171,7 +191,7 @@ pub fn assemble_with_repo_pager(
     site: &SiteConfiguration,
     repo_pager: Option<Arc<RepoPagerRuntimeClients>>,
 ) -> Result<TreeRuntimeClients, RuntimeConfigError> {
-    assemble_inner(pool, connections, site, repo_pager)
+    assemble_inner(pool, connections, site, repo_pager, None)
 }
 
 /// Build `job.RuntimeClients.Searcher`: `searcher.SearcherURLs()` and
@@ -210,16 +230,47 @@ fn assemble_searcher_clients(
 /// Build `job.RuntimeClients.Commit`: the baseline always wires `db.Users` /
 /// `db.UserEmails` + `gitserver.DefaultClient`; a missing git server list
 /// surfaces as an RPC error rather than a not-ported leaf.
-fn assemble_commit_clients(pool: &PgPool, gitserver: &Arc<GitClient>) -> Arc<CommitRuntimeClientsOwned> {
+///
+/// M9.39c also wires the leaf collaborators the baseline installs on the same
+/// client: `file:has.contributor()` (`gitserver.Client.ContributorCount`) and
+/// `own.Search` (`own.NewService(gitserver, db)`). `key` decrypts
+/// `user_external_accounts.account_data` for the owners bag augmentation.
+fn assemble_commit_clients(
+    pool: &PgPool,
+    gitserver: &Arc<GitClient>,
+    key: Option<Arc<dyn Key>>,
+) -> Arc<CommitRuntimeClientsOwned> {
+    use crate::search_jobutil_filters::ContributorFetcher;
+    use crate::search_leaf_jobs::OwnershipFetcher;
+    use crate::search_owners::{
+        GitClientContributorCountSource, GitClientObjectSource, GitserverContributorFetcher,
+        PgOwnershipSource, RulesCacheOwnershipFetcher,
+    };
+
+    let contributors: Arc<dyn ContributorFetcher + Send + Sync> =
+        Arc::new(GitserverContributorFetcher::new(Arc::new(
+            GitClientContributorCountSource::new(Arc::clone(gitserver)),
+        )));
+    let ownership_source = Arc::new(
+        PgOwnershipSource::new(
+            pool.clone(),
+            Arc::new(GitClientObjectSource::new(Arc::clone(gitserver))),
+        )
+        .with_encryption_key(key),
+    );
+    let ownership: Arc<dyn OwnershipFetcher + Send + Sync> =
+        Arc::new(RulesCacheOwnershipFetcher::new(ownership_source));
+
     Arc::new(CommitRuntimeClientsOwned {
         db: Arc::new(PgCommitUserDB::new(pool.clone())),
         gitserver: Arc::new(GitCommitGitserver {
             client: Arc::clone(gitserver),
         }),
-        // Ownership/contributor leaf seams are not wired in the production
-        // assembly yet; the leaf jobs then follow the baseline's explicit
-        // error/alert paths instead of fabricating results.
-        leaf: None,
+        leaf: Some(crate::search_leaf_jobs::LeafJobClients {
+            contributors: Some(contributors),
+            content_searcher: None,
+            ownership: Some(ownership),
+        }),
     })
 }
 
@@ -228,6 +279,7 @@ fn assemble_inner(
     connections: &ServiceConnections,
     site: &SiteConfiguration,
     explicit_repo_pager: Option<Arc<RepoPagerRuntimeClients>>,
+    user_external_account_key: Option<Arc<dyn Key>>,
 ) -> Result<TreeRuntimeClients, RuntimeConfigError> {
     let max_repos = max_repos_from_site(site);
     let zoekt = Arc::new(
@@ -241,7 +293,11 @@ fn assemble_inner(
     let gitserver = Arc::new(GitClient::new(connections.git_servers.clone()));
     let gitserver_addrs = gitserver_addresses(connections, site);
     let searcher = Some(assemble_searcher_clients(connections, &gitserver));
-    let commit = Some(assemble_commit_clients(pool, &gitserver));
+    let commit = Some(assemble_commit_clients(
+        pool,
+        &gitserver,
+        user_external_account_key,
+    ));
 
     // `repos.Resolver` (M9.10a). The production resolver shares the zoekt
     // streamer, gitserver client and (when configured) searcher client with
@@ -317,7 +373,7 @@ pub fn assemble_exhaustive(
     // See `assemble_inner`: the baseline always has searcher/symbols/commit
     // clients, so exhaustive search keeps the same shape.
     let searcher = Some(assemble_searcher_clients(connections, &gitserver));
-    let commit = Some(assemble_commit_clients(pool, &gitserver));
+    let commit = Some(assemble_commit_clients(pool, &gitserver, None));
 
     // Exhaustive queries never touch indexed zoekt (`index:no`); the
     // resolver's zoekt lister only backs `repohasfile` filters, which are not
@@ -634,7 +690,7 @@ pub fn assemble_commit_search(
     let gitserver = Arc::new(GitClient::new(connections.git_servers.clone()));
     let gitserver_addrs = gitserver_addresses(connections, site);
     let searcher = assemble_searcher_clients(connections, &gitserver);
-    let commit = Some(assemble_commit_clients(pool, &gitserver));
+    let commit = Some(assemble_commit_clients(pool, &gitserver, None));
 
     // Code-monitor plans use `repoPagerJob{skipPartitioning:true}` and only
     // commit leaves, so the resolver's zoekt lister is never called; the
