@@ -492,7 +492,9 @@ enum NodeKind {
         select: Vec<String>,
     },
     SelectOwners,
-    Sanitize,
+    Sanitize {
+        patterns: Vec<String>,
+    },
     SubRepoPerms,
     /// `codycontext.searchJob` (`codycontext/job.go:234-265`). The baseline's
     /// `Children()` is nil, so the three sub-jobs are stored out-of-line.
@@ -670,7 +672,7 @@ impl JobNode {
             NodeKind::FileHasContributors { .. } => "FileHasContributorsFilterJob",
             NodeKind::Select { .. } => "SelectJob",
             NodeKind::SelectOwners => "SelectOwnersSearchJob",
-            NodeKind::Sanitize => "SanitizeJob",
+            NodeKind::Sanitize { .. } => "SanitizeJob",
             NodeKind::SubRepoPerms => "SubRepoPermsFilterJob",
             NodeKind::CodyContext { .. } => "CodyContextSearchJob",
             NodeKind::RepoPager { .. } => "RepoPagerJob",
@@ -689,7 +691,7 @@ impl JobNode {
             | NodeKind::Parallel
             | NodeKind::Log
             | NodeKind::SelectOwners
-            | NodeKind::Sanitize
+            | NodeKind::Sanitize { .. }
             | NodeKind::SubRepoPerms
             | NodeKind::ReposPartial
             | NodeKind::StaticEvents { .. } => Vec::new(),
@@ -1288,6 +1290,340 @@ impl comb::CombinatorJob for CommitLeafJob {
     }
 }
 
+/// `searchrepos.ComputeExcludedJob` (`internal/search/repos/excluded_job.go`):
+/// count archived/forks excluded by the repo options and emit one stats event.
+struct ComputeExcludedJob {
+    repo_opts: TreeRepoOptions,
+}
+
+impl comb::CombinatorJob for ComputeExcludedJob {
+    fn run(
+        &mut self,
+        ctx: &comb::RunContext,
+        clients: &RuntimeClients<'_>,
+        stream: comb::Sender<'_>,
+    ) -> (Option<comb::Alert>, Option<comb::JobFailure>) {
+        match compute_excluded_repos(ctx, clients, &self.repo_opts) {
+            Ok((forks, archived)) => {
+                stream(SearchEvent {
+                    results: Vec::new(),
+                    stats: Stats {
+                        excluded_forks: forks,
+                        excluded_archived: archived,
+                        ..Stats::default()
+                    },
+                });
+                (None, None)
+            }
+            Err(err) => (None, Some(comb::JobFailure::Message(err.0))),
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        "ReposComputeExcludedJob"
+    }
+}
+
+/// `computeExcludedRepos` (`repos.go:1004-1089`).
+///
+/// The fork/archived probes are only run when the corresponding
+/// `fork:`/`archived:` source was absent and the repo filter is not exactly
+/// one anchored literal. Both counts feed one `Stats` event.
+fn compute_excluded_repos(
+    ctx: &comb::RunContext,
+    clients: &RuntimeClients<'_>,
+    opts: &TreeRepoOptions,
+) -> Result<(i64, i64), JobError> {
+    if ctx.is_canceled() {
+        return Err(JobError("context canceled".to_owned()));
+    }
+
+    // `ResolveSearchContextSpec`; the instance-level/global contexts carry ID
+    // 0, and only that case is modeled here.
+    let search_context_id = if opts.search_context_spec.is_empty()
+        || opts.search_context_spec == "global"
+    {
+        0
+    } else {
+        return Err(JobError(
+            "search context resolution is not ported (M9.37a)".to_owned(),
+        ));
+    };
+
+    let limit = if opts.limit != 0 {
+        opts.limit
+    } else {
+        clients.max_repos.unwrap_or(i64::from(i32::MAX >> 1))
+    };
+
+    let include_patterns: Vec<String> = opts
+        .repo_filters
+        .iter()
+        .map(|filter| optimize_repo_pattern_with_heuristics(&filter.repo))
+        .collect();
+
+    let options = crate::search_job::ReposListOptions {
+        include_patterns,
+        exclude_pattern: sg_zoekt::languages::union_regexps(&opts.minus_repo_filters),
+        // List N+1 repos so the caller can see omitted repos.
+        limit: Some(limit.saturating_add(1)),
+        no_forks: opts.no_forks,
+        only_forks: opts.only_forks,
+        no_archived: opts.no_archived,
+        only_archived: opts.only_archived,
+        only_private: opts.visibility == RepoVisibility::Private,
+        no_private: opts.visibility == RepoVisibility::Public,
+        search_context_id,
+        ..crate::search_job::ReposListOptions::default()
+    };
+
+    let exactly_one = exactly_one_repo(&opts.repo_filters);
+
+    let mut forks = 0;
+    if !opts.fork_set && !exactly_one {
+        let mut select_forks = options.clone();
+        select_forks.only_forks = true;
+        select_forks.no_forks = false;
+        forks = clients.db.count_repos(&select_forks)?;
+    }
+
+    let mut archived = 0;
+    if !opts.archived_set && !exactly_one {
+        let mut select_archived = options.clone();
+        select_archived.only_archived = true;
+        select_archived.no_archived = false;
+        archived = clients.db.count_repos(&select_archived)?;
+    }
+
+    Ok((forks, archived))
+}
+
+/// `optimizeRepoPatternWithHeuristics` (`repos.go:1198-1209`). The
+/// Sourcegraph.com `^` prefix is not modeled (the port runs with dotcom mode
+/// off, matching the differential environment).
+fn optimize_repo_pattern_with_heuristics(pattern: &str) -> String {
+    pattern.replace("github.com", r"github\.com")
+}
+
+/// `ExactlyOneRepo` (`repos.go:1094-1109`): one repo filter anchored by `^`
+/// and `$` whose body parses to a single literal (`regexpsyntax.OpLiteral`).
+fn exactly_one_repo(filters: &[ParsedRepoFilter]) -> bool {
+    let [filter] = filters else {
+        return false;
+    };
+    let repo = &filter.repo;
+    if repo.len() < 2 || !repo.starts_with('^') || !repo.ends_with('$') {
+        return false;
+    }
+    regexp_body_is_literal(&repo[1..repo.len() - 1])
+}
+
+/// Conservative `OpLiteral` check: every metacharacter makes the pattern
+/// non-literal; a backslash escapes the following character (which is then
+/// literal).
+fn regexp_body_is_literal(body: &str) -> bool {
+    let mut chars = body.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => {
+                if chars.next().is_none() {
+                    return false;
+                }
+            }
+            '.' | '+' | '*' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | '^' | '$' => {
+                return false
+            }
+            _ => {}
+        }
+    }
+    true
+}
+
+/// `sanitizeJob` (`jobutil/sanitize_job.go`): drop match ranges/commits whose
+/// matched text matches any sanitize pattern.
+struct SanitizeCombinatorJob {
+    patterns: Vec<Regex>,
+    child: Box<dyn comb::CombinatorJob>,
+}
+
+impl comb::CombinatorJob for SanitizeCombinatorJob {
+    fn run(
+        &mut self,
+        ctx: &comb::RunContext,
+        clients: &RuntimeClients<'_>,
+        stream: comb::Sender<'_>,
+    ) -> (Option<comb::Alert>, Option<comb::JobFailure>) {
+        let patterns = &self.patterns;
+        let mut filtered = |event: SearchEvent| {
+            stream(sanitize_event(event, patterns));
+        };
+        self.child.run(ctx, clients, &mut filtered)
+    }
+
+    fn name(&self) -> &'static str {
+        "SanitizeJob"
+    }
+}
+
+/// `sanitizeJob.sanitizeEvent`.
+fn sanitize_event(mut event: SearchEvent, patterns: &[Regex]) -> SearchEvent {
+    let mut sanitized = Vec::with_capacity(event.results.len());
+    for result in std::mem::take(&mut event.results) {
+        match result {
+            Match::File(file_match) => {
+                if let Some(file_match) = sanitize_file_match(file_match, patterns) {
+                    sanitized.push(Match::File(file_match));
+                }
+            }
+            Match::Commit(commit_match) => {
+                if sanitize_commit_match(&commit_match, patterns) {
+                    sanitized.push(Match::Commit(commit_match));
+                }
+            }
+            Match::Repo(repo_match) => sanitized.push(Match::Repo(repo_match)),
+            // The baseline's `default` arm drops unknown result kinds; owner
+            // matches are not produced at this stage.
+            Match::Owner(_) => {}
+        }
+    }
+    event.results = sanitized;
+    event
+}
+
+fn matches_any_sanitize_pattern(value: &str, patterns: &[Regex]) -> bool {
+    patterns.iter().any(|pattern| pattern.is_match(value))
+}
+
+fn sanitize_file_match(
+    mut file_match: crate::search_stream::convert::FileMatch,
+    patterns: &[Regex],
+) -> Option<crate::search_stream::convert::FileMatch> {
+    if !file_match.symbols.is_empty() {
+        return Some(file_match);
+    }
+
+    let mut sanitized_chunks = Vec::with_capacity(file_match.chunk_matches.len());
+    for chunk in std::mem::take(&mut file_match.chunk_matches) {
+        let mut sanitized_ranges = Vec::with_capacity(chunk.ranges.len());
+        for (index, range) in chunk.ranges.iter().enumerate() {
+            let start = (range.start.offset - chunk.content_start.offset).max(0) as usize;
+            let end = (range.end.offset - chunk.content_start.offset).max(0) as usize;
+            let matched = chunk.content.get(start..end).unwrap_or("");
+            if matches_any_sanitize_pattern(matched, patterns) {
+                continue;
+            }
+            sanitized_ranges.push(chunk.ranges[index]);
+        }
+        if sanitized_ranges.is_empty() {
+            continue;
+        }
+        sanitized_chunks.push(crate::search_stream::convert::ChunkMatch {
+            content: chunk.content,
+            content_start: chunk.content_start,
+            ranges: sanitized_ranges,
+        });
+    }
+
+    if sanitized_chunks.is_empty() {
+        return None;
+    }
+    file_match.chunk_matches = sanitized_chunks;
+    Some(file_match)
+}
+
+fn sanitize_commit_match(
+    commit_match: &crate::search_stream::convert::CommitMatch,
+    patterns: &[Regex],
+) -> bool {
+    match &commit_match.diff_preview {
+        Some(diff_preview) => !matches_any_sanitize_pattern(&diff_preview.content, patterns),
+        None => true,
+    }
+}
+
+/// `RepoSearchJob` (`jobutil/repos.go:21-165`) execution over the injected
+/// page source. The description store is only consulted for `description:`
+/// patterns (and only when a page is non-empty by construction).
+struct RepoSearchLeafJob {
+    repo_opts: TreeRepoOptions,
+    repo_name_patterns: Vec<Regex>,
+}
+
+impl comb::CombinatorJob for RepoSearchLeafJob {
+    fn run(
+        &mut self,
+        _ctx: &comb::RunContext,
+        clients: &RuntimeClients<'_>,
+        stream: comb::Sender<'_>,
+    ) -> (Option<comb::Alert>, Option<comb::JobFailure>) {
+        let Some(repo_pager) = clients.repo_pager else {
+            return (
+                None,
+                Some(comb::JobFailure::Message(
+                    "RepoSearchJob execution is not ported (M9.37a)".to_owned(),
+                )),
+            );
+        };
+
+        let description_patterns: Vec<Regex> = self
+            .repo_opts
+            .description_patterns
+            .iter()
+            .filter_map(|pattern| Regex::new(&format!("(?is){pattern}")).ok())
+            .collect();
+
+        let resolved = repo_pager
+            .pages
+            .resolve_pages(&crate::search_repos::ResolveOptions::from_tree(
+                &self.repo_opts,
+            ));
+        for page in &resolved.pages {
+            page.maybe_send_stats(stream);
+
+            let description_matches = if description_patterns.is_empty() {
+                BTreeMap::new()
+            } else {
+                let Some(descriptions) = repo_pager.descriptions else {
+                    return (
+                        None,
+                        Some(comb::JobFailure::Message(
+                            "RepoSearchJob descriptions are not ported (M9.37a)".to_owned(),
+                        )),
+                    );
+                };
+                let ids: Vec<u32> = page.repo_revs.iter().map(|repo| repo.repo.id).collect();
+                match descriptions.get_repo_descriptions_by_ids(&ids) {
+                    Ok(repo_descriptions) => crate::search_jobutil_repos::description_match_ranges(
+                        &repo_descriptions,
+                        &description_patterns,
+                    ),
+                    Err(err) => return (None, Some(comb::JobFailure::Message(err.0))),
+                }
+            };
+
+            stream(SearchEvent {
+                results: crate::search_jobutil_repos::repo_revs_to_repo_matches(
+                    &page.repo_revs,
+                    &self.repo_name_patterns,
+                    &description_matches,
+                ),
+                stats: Stats::default(),
+            });
+        }
+
+        match resolved.error {
+            // Do not error with no results for repo search.
+            Some(err) if err.0 == crate::search_jobutil_repos::ERR_NO_RESOLVED_REPOS => (None, None),
+            Some(err) => (None, Some(comb::JobFailure::Message(err.0))),
+            None => (None, None),
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        "RepoSearchJob"
+    }
+}
+
 impl JobNode {
     /// Converts this tree into the executable combinator representation.
     fn to_combinator(&self) -> Result<Box<dyn comb::CombinatorJob>, JobError> {
@@ -1522,16 +1858,34 @@ impl JobNode {
                     swallow_error_when_canceled: true,
                 })
             }
+            NodeKind::ComputeExcluded { repo_opts } => {
+                Box::new(ComputeExcludedJob {
+                    repo_opts: repo_opts.clone(),
+                })
+            }
+            NodeKind::Sanitize { patterns } => Box::new(SanitizeCombinatorJob {
+                patterns: compile_regexps(patterns)?,
+                child: only_child(children),
+            }),
+            // Sub-repo permissions default to disabled (`authz.DefaultSubRepoPermsChecker`
+            // is nil), in which case the baseline passes results through. The
+            // checker itself is not modeled in this port.
+            NodeKind::SubRepoPerms => only_child(children),
+            // `reposPartialJob` is resolved by the enclosing pager; when run
+            // directly it just runs its child.
+            NodeKind::ReposPartial => only_child(children),
+            NodeKind::RepoSearch {
+                repo_opts,
+                repo_name_patterns,
+            } => Box::new(RepoSearchLeafJob {
+                repo_opts: repo_opts.clone(),
+                repo_name_patterns: compile_regexps(repo_name_patterns)?,
+            }),
             NodeKind::Structural { .. }
-            | NodeKind::ComputeExcluded { .. }
             | NodeKind::FileContains { .. }
             | NodeKind::FileHasOwners { .. }
             | NodeKind::FileHasContributors { .. }
-            | NodeKind::SelectOwners
-            | NodeKind::Sanitize
-            | NodeKind::SubRepoPerms
-            | NodeKind::ReposPartial
-            | NodeKind::RepoSearch { .. } => {
+            | NodeKind::SelectOwners => {
                 return Err(JobError(format!(
                     "{} execution is not ported (M9.8hw)",
                     self.name_str()
@@ -1577,6 +1931,51 @@ impl JobNode {
 
     pub fn or(children: Vec<JobNode>) -> JobNode {
         new_or_job(children)
+    }
+
+    /// `searchrepos.ComputeExcludedJob`.
+    pub fn compute_excluded(repo_opts: TreeRepoOptions) -> JobNode {
+        JobNode::leaf(NodeKind::ComputeExcluded { repo_opts })
+    }
+
+    /// `jobutil.sanitizeJob`.
+    pub fn sanitize(patterns: Vec<String>, child: JobNode) -> JobNode {
+        JobNode::new(NodeKind::Sanitize { patterns }, vec![child])
+    }
+
+    /// `jobutil.subRepoPermsFilterJob`.
+    pub fn sub_repo_perms(child: JobNode) -> JobNode {
+        JobNode::new(NodeKind::SubRepoPerms, vec![child])
+    }
+
+    /// `jobutil.reposPartialJob`, runnable without an enclosing pager.
+    pub fn repos_partial(child: JobNode) -> JobNode {
+        JobNode::new(NodeKind::ReposPartial, vec![child])
+    }
+
+    /// `jobutil.RepoSearchJob`.
+    pub fn repo_search(repo_opts: TreeRepoOptions, repo_name_patterns: Vec<String>) -> JobNode {
+        JobNode::leaf(NodeKind::RepoSearch {
+            repo_opts,
+            repo_name_patterns,
+        })
+    }
+
+    /// `searchrepos.repoPagerJob` over the tree's partial child.
+    pub fn repo_pager(
+        repo_opts: TreeRepoOptions,
+        contains_ref_globs: bool,
+        skip_partitioning: bool,
+        inner: JobNode,
+    ) -> JobNode {
+        JobNode::new(
+            NodeKind::RepoPager {
+                repo_opts,
+                contains_ref_globs,
+                skip_partitioning,
+            },
+            vec![JobNode::new(NodeKind::ReposPartial, vec![inner])],
+        )
     }
 
     pub fn zoekt_repo_subset_text(
@@ -2137,7 +2536,12 @@ pub fn new_basic_job(inputs: &TreeInputs, basic: &Basic) -> Result<JobNode, JobE
     }
 
     if !inputs.sanitize_search_patterns.is_empty() {
-        basic_job = JobNode::new(NodeKind::Sanitize, vec![basic_job]);
+        basic_job = JobNode::new(
+            NodeKind::Sanitize {
+                patterns: inputs.sanitize_search_patterns.clone(),
+            },
+            vec![basic_job],
+        );
     }
 
     let max_results = jb::parameters_max_results(&b.parameters, default_limit);
@@ -3489,6 +3893,7 @@ mod pager_tests {
         let pager = RepoPagerClients {
             pages,
             zoekt: lister,
+            descriptions: None,
         };
         let db = NoDb;
         let streamer = NoStreamer;
