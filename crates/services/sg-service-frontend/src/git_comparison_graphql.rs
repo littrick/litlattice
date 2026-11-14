@@ -580,7 +580,34 @@ fn highlighted_side(
     match git.comparison.highlights.get(&key) {
         Some(Ok(highlighted)) => Ok(highlighted.clone()),
         Some(Err(message)) => Err(message.clone()),
-        None => Err("highlight is not prefetched".to_owned()),
+        // M9.34d: `Changeset.diff` is resolved from the synchronous GraphQL
+        // field hook (`batches_changeset_read.rs`), which has no selection set
+        // to drive `prefetch_file_diff_extras`. Both of its paths still
+        // prefetch the `oldFile`/`newFile` content (`ensure_content`), so
+        // replay `highlight.CodeAsLines` from that content with the same
+        // offline highlighter. This mirrors `prefetch_side_highlight` (no new
+        // highlighter is introduced).
+        None => match content_bytes(git, repo_id, oid, path) {
+            Err(message) => Err(message),
+            Ok(content) => {
+                let request = HighlightRequest {
+                    content,
+                    filepath: path.to_owned(),
+                    disable_timeout: args.disable_timeout,
+                    highlight_long_lines: args.highlight_long_lines,
+                    format: args.format.clone(),
+                    start_line: args.start_line,
+                    end_line: args.end_line,
+                    // `fileDiffHighlighter` keeps the final newline.
+                    keep_final_newline: true,
+                };
+                match offline_highlight(&request) {
+                    Ok(highlighted) => Ok(highlighted),
+                    Err(HighlightError::Binary) => Ok(HighlightedFile::default()),
+                    Err(HighlightError::Message(message)) => Err(message),
+                }
+            }
+        },
     }
 }
 

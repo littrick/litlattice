@@ -608,7 +608,7 @@ pub(crate) async fn compute_comparison_commits(
     data: &ComparisonData,
     first: Option<i32>,
     path: &str,
-    node_selections: &[RootField],
+    connection_selections: &[RootField],
     depth: usize,
 ) -> Result<Vec<CommitDetails>, String> {
     let range = format!("{}..{}", data.base_revspec, data.head_revspec);
@@ -638,6 +638,13 @@ pub(crate) async fn compute_comparison_commits(
         .commit_log(repo.id, &repo.name, &options)
         .await
         .map_err(|error| error.message)?;
+    // M9.34d: `GitCommitConnection.nodes` carries the per-commit selection set.
+    // Callers pass the `commits` field's selections (which include `nodes`);
+    // unwrap it before replaying `GitCommit.tree`/`diff` prefetch, exactly like
+    // `prefetch_ancestors` does (`git_commit_extra.rs`).
+    let node_selections = selected(connection_selections, "nodes")
+        .map(|nodes| nodes.selections.as_slice())
+        .unwrap_or(&[]);
     for commit in &commits {
         prefetch.commits.insert(
             (repo.id, commit.oid.clone()),
