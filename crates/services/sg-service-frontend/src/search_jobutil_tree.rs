@@ -956,6 +956,67 @@ fn only_child(mut children: Vec<Box<dyn comb::CombinatorJob>>) -> Box<dyn comb::
     }
 }
 
+/// `jobutil.subRepoPermsFilterJob` as a combinator: filters each streamed
+/// event's results through the configured sub-repository checker, appending
+/// errors exactly like the Go job (`errors.Append` + the generic
+/// `subRepoFilterFunc` error from `applySubRepoFiltering`).
+struct SubRepoPermsFilterCombinator {
+    runtime: std::sync::Arc<crate::sub_repo_perms_checker::SubRepoPermsRuntime>,
+    child: Box<dyn comb::CombinatorJob>,
+}
+
+impl comb::CombinatorJob for SubRepoPermsFilterCombinator {
+    fn run(
+        &mut self,
+        ctx: &comb::RunContext,
+        clients: &RuntimeClients<'_>,
+        stream: comb::Sender<'_>,
+    ) -> (Option<comb::Alert>, Option<comb::JobFailure>) {
+        let Self { runtime, child } = self;
+        let mut errs: Vec<String> = Vec::new();
+        let (alert, failure) = {
+            let mut filtered = |event: SearchEvent| {
+                let mut event = event;
+                let results = std::mem::take(&mut event.results);
+                let (results, err) = crate::search_jobutil_misc_jobs::apply_sub_repo_filtering(
+                    runtime.checker.as_ref(),
+                    &runtime.actor,
+                    &runtime.modified_files,
+                    &mut crate::search_jobutil_misc_jobs::NoopPermsLog,
+                    results,
+                );
+                event.results = results;
+                if let Some(err) = err {
+                    errs.push(err.to_string());
+                }
+                stream(event);
+            };
+            child.run(ctx, clients, &mut filtered)
+        };
+        if let Some(failure) = &failure {
+            errs.push(failure.to_string());
+        }
+        if errs.is_empty() {
+            (alert, failure)
+        } else {
+            (
+                alert,
+                Some(comb::JobFailure::Message(
+                    crate::search_jobutil_misc_jobs::format_multi_error(&errs),
+                )),
+            )
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        "SubRepoPermsFilterJob"
+    }
+
+    fn children(&self) -> Vec<&dyn comb::CombinatorJob> {
+        vec![self.child.as_ref()]
+    }
+}
+
 fn indexed_request_type_str(typ: IndexedRequestType) -> &'static str {
     match typ {
         IndexedRequestType::Text => "text",
@@ -1891,10 +1952,25 @@ impl JobNode {
                 patterns: compile_regexps(patterns)?,
                 child: only_child(children),
             }),
-            // Sub-repo permissions default to disabled (`authz.DefaultSubRepoPermsChecker`
-            // is nil), in which case the baseline passes results through. The
-            // checker itself is not modeled in this port.
-            NodeKind::SubRepoPerms => only_child(children),
+            // `authz.DefaultSubRepoPermsChecker` defaults to the noop checker:
+            // no runtime means the baseline does not even wrap the child
+            // (`job.go:229`). When configured and enabled, filter file/commit
+            // results the way `subRepoPermsFilterJob` does.
+            NodeKind::SubRepoPerms => {
+                match crate::sub_repo_perms_checker::sub_repo_runtime() {
+                    Some(runtime)
+                        if crate::search_jobutil_misc_jobs::SubRepoPermissionChecker::enabled(
+                            runtime.checker.as_ref(),
+                        ) =>
+                    {
+                        Box::new(SubRepoPermsFilterCombinator {
+                            runtime,
+                            child: only_child(children),
+                        })
+                    }
+                    _ => only_child(children),
+                }
+            }
             // `reposPartialJob` is resolved by the enclosing pager; when run
             // directly it just runs its child.
             NodeKind::ReposPartial => only_child(children),

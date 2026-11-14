@@ -456,10 +456,17 @@ pub fn apply_sub_repo_filtering(
                 }
             }
             Match::Commit(cm) => {
-                let paths = modified_files
-                    .get(&(cm.repo.id, cm.commit.id.clone()))
-                    .cloned()
-                    .unwrap_or_default();
+                // `result.CommitMatch.ModifiedFiles` is now modelled on the
+                // match itself; the injected map remains as a fallback for
+                // callers that predate that field.
+                let paths = if cm.modified_files.is_empty() {
+                    modified_files
+                        .get(&(cm.repo.id, cm.commit.id.clone()))
+                        .cloned()
+                        .unwrap_or_default()
+                } else {
+                    cm.modified_files.clone()
+                };
                 match can_read_any_path(checker, actor, &cm.repo.name, &paths) {
                     Err(err) => errs.push(err.message),
                     Ok(true) => {
