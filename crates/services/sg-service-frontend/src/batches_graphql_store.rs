@@ -219,12 +219,19 @@ impl Binds {
 
 pub struct PgBatchesGraphqlStore {
     pub(crate) pool: PgPool,
-    /// `conf.BatchChangesEnabled`. Only the differential harness disables it
-    /// to exercise `ErrBatchChangesDisabled`; production keeps the default.
-    batch_changes_enabled: bool,
-    /// `conf.BatchChangesRestrictToAdmins`. Test seam only; production keeps
-    /// the default (`false`).
-    batch_changes_restricted_to_admins: bool,
+    /// `conf.BatchChangesEnabled` override. The differential harness sets it
+    /// to exercise `ErrBatchChangesDisabled`; production leaves it `None` and
+    /// reads the live site configuration instead.
+    batch_changes_enabled: Option<bool>,
+    /// `conf.BatchChangesRestrictToAdmins` override. Same precedence rules as
+    /// `batch_changes_enabled`.
+    batch_changes_restricted_to_admins: Option<bool>,
+    /// `conf.Get()` (`batchChanges.enabled` / `batchChanges.restrictToAdmins`).
+    /// `None` keeps the historical `true`/`false` defaults, as in tests.
+    batch_changes_live_config: Option<std::sync::Arc<sg_config::LiveConfig>>,
+    /// `dotcom.SourcegraphDotComMode()`; Batch Changes is always disabled on
+    /// dotcom (`conf.BatchChangesEnabled`, `internal/conf/computed.go`).
+    dotcom_mode: bool,
     /// M9.26c gitserver seam for `Changeset.diff`; `None` until a gitserver
     /// client is wired into the store.
     pub(crate) changeset_diff_source:
@@ -242,8 +249,10 @@ impl PgBatchesGraphqlStore {
     pub fn new(pool: PgPool) -> Self {
         Self {
             pool,
-            batch_changes_enabled: true,
-            batch_changes_restricted_to_admins: false,
+            batch_changes_enabled: None,
+            batch_changes_restricted_to_admins: None,
+            batch_changes_live_config: None,
+            dotcom_mode: false,
             changeset_diff_source: None,
             credential_keyring: None,
             credential_http_doer: None,
@@ -291,13 +300,27 @@ impl PgBatchesGraphqlStore {
 
     /// Test seam for the `batchChanges.enabled: false` site configuration.
     pub fn with_batch_changes_enabled(mut self, enabled: bool) -> Self {
-        self.batch_changes_enabled = enabled;
+        self.batch_changes_enabled = Some(enabled);
         self
     }
 
     /// Test seam for `batchChanges.restrictToAdmins: true`.
     pub fn with_batch_changes_restricted_to_admins(mut self, restricted: bool) -> Self {
-        self.batch_changes_restricted_to_admins = restricted;
+        self.batch_changes_restricted_to_admins = Some(restricted);
+        self
+    }
+
+    /// Production wiring: read `batchChanges.enabled` /
+    /// `batchChanges.restrictToAdmins` from the live site configuration
+    /// (`conf.Get()`) on every call, mirroring `internal/conf/computed.go`.
+    /// Explicit test seams still take precedence.
+    pub fn with_live_batch_changes_configuration(
+        mut self,
+        live: std::sync::Arc<sg_config::LiveConfig>,
+        dotcom_mode: bool,
+    ) -> Self {
+        self.batch_changes_live_config = Some(live);
+        self.dotcom_mode = dotcom_mode;
         self
     }
 
@@ -2157,17 +2180,80 @@ fn batch_change_joins(filter: &BatchChangeFilter) -> String {
     joins
 }
 
+/// `conf.BatchChangesEnabled()`: Batch Changes is always disabled on dotcom;
+/// otherwise `batchChanges.enabled`, defaulting to `true` when absent/null.
+pub(crate) fn batch_changes_enabled_from_site(
+    site: &sg_config::SiteConfiguration,
+    dotcom_mode: bool,
+) -> bool {
+    if dotcom_mode {
+        return false;
+    }
+    site.raw()
+        .get("batchChanges.enabled")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(true)
+}
+
+/// `conf.BatchChangesRestrictedToAdmins()`: `batchChanges.restrictToAdmins`,
+/// defaulting to `false` when absent/null.
+pub(crate) fn batch_changes_restricted_to_admins_from_site(
+    site: &sg_config::SiteConfiguration,
+) -> bool {
+    site.raw()
+        .get("batchChanges.restrictToAdmins")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+}
+
+/// Resolve `BatchChangesEnabled` with the store getter's precedence: explicit
+/// test seam, then live site configuration, then the Go default (`true`).
+pub(crate) fn resolve_batch_changes_enabled(
+    enabled_override: Option<bool>,
+    live: Option<&sg_config::LiveConfig>,
+    dotcom_mode: bool,
+) -> bool {
+    if let Some(enabled) = enabled_override {
+        return enabled;
+    }
+    match live {
+        Some(live) => batch_changes_enabled_from_site(&live.current().site, dotcom_mode),
+        None => true,
+    }
+}
+
+/// Resolve `BatchChangesRestrictToAdmins` with the store getter's precedence.
+pub(crate) fn resolve_batch_changes_restricted_to_admins(
+    restricted_override: Option<bool>,
+    live: Option<&sg_config::LiveConfig>,
+) -> bool {
+    if let Some(restricted) = restricted_override {
+        return restricted;
+    }
+    match live {
+        Some(live) => batch_changes_restricted_to_admins_from_site(&live.current().site),
+        None => false,
+    }
+}
+
 impl BatchesGraphqlDatabase for PgBatchesGraphqlStore {
     fn now(&self) -> OffsetDateTime {
         OffsetDateTime::now_utc()
     }
 
     fn batch_changes_enabled(&self) -> bool {
-        self.batch_changes_enabled
+        resolve_batch_changes_enabled(
+            self.batch_changes_enabled,
+            self.batch_changes_live_config.as_deref(),
+            self.dotcom_mode,
+        )
     }
 
     fn batch_changes_restricted_to_admins(&self) -> bool {
-        self.batch_changes_restricted_to_admins
+        resolve_batch_changes_restricted_to_admins(
+            self.batch_changes_restricted_to_admins,
+            self.batch_changes_live_config.as_deref(),
+        )
     }
 
     fn specs_database(&self) -> Option<&dyn crate::batches_specs_graphql::BatchesSpecsDatabase> {
@@ -2700,4 +2786,72 @@ fn text_search_clause(term: &TextSearchTerm, binds: &mut Binds) -> String {
         "(COALESCE(changesets.external_title, changeset_specs.title) {operator} {first} \
          {boolean} repo.name::text {operator} {second})"
     )
+}
+
+#[cfg(test)]
+mod batch_changes_config_tests {
+    use super::*;
+
+    fn site(raw: &str) -> sg_config::SiteConfiguration {
+        sg_config::SiteConfiguration::parse(raw).expect("site config")
+    }
+
+    fn live(raw: &str) -> sg_config::LiveConfig {
+        sg_config::LiveConfig::new(sg_config::Unified {
+            site: site(raw),
+            ..Default::default()
+        })
+    }
+
+    fn enabled(raw: &str, dotcom: bool) -> bool {
+        let live = live(raw);
+        resolve_batch_changes_enabled(None, Some(&live), dotcom)
+    }
+
+    fn restricted(raw: &str) -> bool {
+        let live = live(raw);
+        resolve_batch_changes_restricted_to_admins(None, Some(&live))
+    }
+
+    #[test]
+    fn defaults_match_go() {
+        assert!(enabled("{}", false));
+        assert!(!restricted("{}"));
+    }
+
+    #[test]
+    fn null_keeps_defaults() {
+        let raw = r#"{"batchChanges.enabled":null,"batchChanges.restrictToAdmins":null}"#;
+        assert!(enabled(raw, false));
+        assert!(!restricted(raw));
+    }
+
+    #[test]
+    fn reads_non_default_site_configuration() {
+        let raw = r#"{"batchChanges.enabled":false,"batchChanges.restrictToAdmins":true}"#;
+        assert!(!enabled(raw, false));
+        assert!(restricted(raw));
+    }
+
+    #[test]
+    fn dotcom_disables_batch_changes() {
+        assert!(!enabled(r#"{"batchChanges.enabled":true}"#, true));
+    }
+
+    #[test]
+    fn explicit_test_seam_wins() {
+        let live = live(r#"{"batchChanges.enabled":true,"batchChanges.restrictToAdmins":false}"#);
+        assert!(!resolve_batch_changes_enabled(
+            Some(false),
+            Some(&live),
+            false
+        ));
+        assert!(resolve_batch_changes_restricted_to_admins(
+            Some(true),
+            Some(&live)
+        ));
+        // No live config keeps the historical defaults.
+        assert!(resolve_batch_changes_enabled(None, None, false));
+        assert!(!resolve_batch_changes_restricted_to_admins(None, None));
+    }
 }

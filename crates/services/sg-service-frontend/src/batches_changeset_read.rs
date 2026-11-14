@@ -723,8 +723,12 @@ fn state_changeset(row: &ChangesetRow) -> Result<Changeset, String> {
     })
 }
 
-/// `enterprise.BatchChangesEnabledForUser`.
-fn require_batch_changes_enabled(db: &BatchesHandle, actor: Actor) -> Result<(), ExecError> {
+/// `enterprise.BatchChangesEnabledForUser`: site-level enabled check followed
+/// by the `batchChanges.restrictToAdmins` / `users.site_admin` check.
+pub(crate) fn require_batch_changes_enabled(
+    db: &BatchesHandle,
+    actor: Actor,
+) -> Result<(), ExecError> {
     if !db.batch_changes_enabled() {
         return Err(ExecError::new(BATCH_CHANGES_DISABLED));
     }
