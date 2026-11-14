@@ -274,6 +274,7 @@ impl RepoPageSource for FakePages {
             } else {
                 self.error()
             },
+            missing: Vec::new(),
         }
     }
 }

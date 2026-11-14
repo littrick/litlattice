@@ -179,6 +179,10 @@ impl RepoPage {
 pub struct ResolvedPages {
     pub pages: Vec<RepoPage>,
     pub error: Option<JobError>,
+    /// `ResolveOutcome.missing`: revs the resolver could not find. Carried so
+    /// the alert observer can render `MissingRepoRevsError`'s description
+    /// (the baseline keeps this typed through the iterator).
+    pub missing: Vec<crate::search_repos::RepoRevSpecs>,
 }
 
 /// `repos.Resolver.Iterator` reduced to its observable behavior: a sequence
@@ -199,6 +203,7 @@ pub trait RepoPageSource {
         ResolvedPages {
             pages: self.pages(),
             error: self.error(),
+            missing: Vec::new(),
         }
     }
 }

@@ -1343,6 +1343,7 @@ impl crate::search_jobutil_repos::RepoPageSource for ResolverRepoPageSource {
                 })
                 .collect(),
             error: outcome.error,
+            missing: outcome.missing,
         }
     }
 }
