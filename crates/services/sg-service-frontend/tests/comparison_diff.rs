@@ -92,6 +92,14 @@ type GitCommitConnection {
 type GitCommit {
   oid: GitObjectID!
   message: String!
+  tree(path: String!): GitTree
+  diff(base: String): RepositoryComparison!
+}
+
+type GitTree {
+  path: String!
+  name: String!
+  isDirectory: Boolean!
 }
 
 type PageInfo {
@@ -357,6 +365,24 @@ impl GitObjectSource for FakeGit {
             .get(&k)
             .map(|text| text.clone().into_bytes())
             .ok_or_else(|| GitSourceError::new(format!("file not found: {k}")))
+    }
+
+    /// M9.34d: `GitCommit.tree(path)` stats the path; only `docs` exists in
+    /// the corpus (the root shortcut never reaches the source).
+    async fn stat(
+        &self,
+        _repo_id: i32,
+        _repo_name: &str,
+        _oid: &str,
+        path: &str,
+    ) -> Result<sg_git::FileStat, GitSourceError> {
+        if path == "docs" {
+            Ok(sg_git::FileStat::synthetic("docs", true))
+        } else {
+            Err(GitSourceError::not_exist(format!(
+                "ls-tree {path}: file does not exist"
+            )))
+        }
     }
 
     fn commit_extra(&self) -> Option<&dyn GitCommitExtraSource> {
