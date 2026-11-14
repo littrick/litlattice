@@ -17,19 +17,26 @@
 //!
 //! Gated by `SG_M934A_AGG_DIFF=1`.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use serde::Deserialize;
 use serde_json::{json, Value};
+use time::OffsetDateTime;
 
 use sg_graphql::exec::{execute_with, Actor, ExecRequest};
 use sg_service_frontend::graphql_resolvers::FrontendRootResolver;
 use sg_service_frontend::insights_aggregations::{
-    AggregationGroup, AggregationNotAvailableReasonType, AggregationResult, AggregationResults,
-    ModeAvailability, SearchAggregationMode, SearchAggregationsInput,
+    AggregationCountFunc, AggregationGroup, AggregationNotAvailableReasonType, AggregationResult,
+    AggregationResults, ModeAvailability, SearchAggregationMode, SearchAggregationsInput,
 };
+use sg_service_frontend::search_stream::convert::{
+    ChunkMatch, CommitMatch, FileMatch, FileRef, GitCommit, Match, MatchedString, MinimalRepo,
+    RepoMatch, RepoMetadata, Signature, Symbol, SymbolMatch,
+};
+use sg_service_frontend::search_stream::events::{Location, Range};
 use sg_service_frontend::insights_aggregations_graphql::{
     AggregationGraphqlSeam, AggregationsHandle,
 };
@@ -271,6 +278,236 @@ fn search_query_aggregate_diff() {
         fs::write(
             out_dir.join(format!("{}.json", case.name)),
             serde_json::to_string_pretty(&document).unwrap(),
+        )
+        .unwrap();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// M9.35a: per-match tabulator differential
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct TabCorpus {
+    cases: Vec<TabCase>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TabCase {
+    name: String,
+    mode: String,
+    query: String,
+    #[serde(rename = "patternType")]
+    pattern_type: String,
+    matches: Vec<TabMatch>,
+    #[serde(default, rename = "repoMetadata")]
+    repo_metadata: Option<BTreeMap<String, Option<String>>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TabMatch {
+    kind: String,
+    #[serde(default)]
+    repo: String,
+    #[serde(default, rename = "repoId")]
+    repo_id: i32,
+    #[serde(default)]
+    path: String,
+    #[serde(default)]
+    chunks: Vec<TabChunk>,
+    #[serde(default)]
+    symbols: Vec<String>,
+    #[serde(default)]
+    author: String,
+    #[serde(default, rename = "commitMessage")]
+    commit_message: String,
+    #[serde(default, rename = "diffPreview")]
+    diff_preview: bool,
+    #[serde(default, rename = "messageRanges")]
+    message_ranges: usize,
+}
+
+#[derive(Debug, Deserialize)]
+struct TabChunk {
+    content: String,
+    ranges: Vec<[i64; 2]>,
+}
+
+fn tab_repo(name: &str, id: i32) -> MinimalRepo {
+    MinimalRepo {
+        id,
+        name: name.to_owned(),
+    }
+}
+
+fn tab_file_ref(case: &TabMatch) -> FileRef {
+    FileRef {
+        repo: tab_repo(&case.repo, case.repo_id),
+        commit_id: String::new(),
+        path: case.path.clone(),
+        input_rev: None,
+        precise_language: String::new(),
+    }
+}
+
+fn tab_match(case: &TabMatch) -> Match {
+    match case.kind.as_str() {
+        "file" => {
+            let file = tab_file_ref(case);
+            let chunk_matches = case
+                .chunks
+                .iter()
+                .map(|chunk| ChunkMatch {
+                    content: chunk.content.clone(),
+                    content_start: Location {
+                        offset: 0,
+                        line: 1,
+                        column: 0,
+                    },
+                    ranges: chunk
+                        .ranges
+                        .iter()
+                        .map(|range| Range {
+                            start: Location {
+                                offset: range[0],
+                                line: 1,
+                                column: range[0],
+                            },
+                            end: Location {
+                                offset: range[1],
+                                line: 1,
+                                column: range[1],
+                            },
+                        })
+                        .collect(),
+                })
+                .collect();
+            let symbols = case
+                .symbols
+                .iter()
+                .map(|name| SymbolMatch {
+                    symbol: Symbol {
+                        name: name.clone(),
+                        path: String::new(),
+                        line: 0,
+                        character: 0,
+                        kind: String::new(),
+                        language: String::new(),
+                        parent: String::new(),
+                        parent_kind: String::new(),
+                    },
+                    file: file.clone(),
+                })
+                .collect();
+            Match::File(FileMatch {
+                file,
+                chunk_matches,
+                symbols,
+                path_matches: Vec::new(),
+                limit_hit: false,
+                debug: None,
+            })
+        }
+        "repo" => Match::Repo(RepoMatch {
+            name: case.repo.clone(),
+            id: case.repo_id,
+            rev: String::new(),
+            description_matches: Vec::new(),
+            repo_name_matches: Vec::new(),
+        }),
+        "commit" => {
+            let signature = Signature {
+                name: case.author.clone(),
+                email: String::new(),
+                date: OffsetDateTime::UNIX_EPOCH,
+            };
+            let matched_ranges: Vec<Range> = (0..case.message_ranges)
+                .map(|index| Range {
+                    start: Location {
+                        offset: index as i64,
+                        line: 1,
+                        column: 0,
+                    },
+                    end: Location {
+                        offset: index as i64 + 1,
+                        line: 1,
+                        column: 1,
+                    },
+                })
+                .collect();
+            let preview = MatchedString {
+                content: case.commit_message.clone(),
+                matched_ranges,
+            };
+            Match::Commit(CommitMatch {
+                commit: GitCommit {
+                    id: String::new(),
+                    message: case.commit_message.clone(),
+                    author: signature.clone(),
+                    committer: signature,
+                    parents: Vec::new(),
+                },
+                repo: tab_repo(&case.repo, case.repo_id),
+                message_preview: if case.diff_preview {
+                    None
+                } else {
+                    Some(preview.clone())
+                },
+                diff_preview: if case.diff_preview { Some(preview) } else { None },
+                refs: Vec::new(),
+                source_refs: Vec::new(),
+                diff: Vec::new(),
+                modified_files: Vec::new(),
+            })
+        }
+        other => panic!("unknown tab match kind {other:?}"),
+    }
+}
+
+#[test]
+fn search_query_aggregate_tabulation_diff() {
+    if std::env::var("SG_M935A_AGG_DIFF").ok().as_deref() != Some("1") {
+        return;
+    }
+    let corpus_path = std::env::var("M935A_CORPUS").expect("M935A_CORPUS");
+    let out_dir = PathBuf::from(std::env::var("M935A_OUT").expect("M935A_OUT"));
+    fs::create_dir_all(&out_dir).unwrap();
+
+    let corpus: TabCorpus =
+        serde_json::from_str(&fs::read_to_string(&corpus_path).unwrap()).unwrap();
+    for case in &corpus.cases {
+        let mode = SearchAggregationMode::from_raw(&case.mode)
+            .unwrap_or_else(|| panic!("unknown mode {:?}", case.mode));
+        let count_func =
+            AggregationCountFunc::for_mode(&case.query, &case.pattern_type, mode)
+                .unwrap_or_else(|err| panic!("{}: {err}", case.name));
+        let repo = case.repo_metadata.as_ref().map(|pairs| RepoMetadata {
+            id: 0,
+            name: String::new(),
+            description: String::new(),
+            fork: false,
+            archived: false,
+            private: false,
+            stars: 0,
+            last_fetched: None,
+            key_value_pairs: Some(pairs.clone()),
+            topics: None,
+        });
+
+        let mut counts: BTreeMap<String, i32> = BTreeMap::new();
+        for fixture in &case.matches {
+            let match_ = tab_match(fixture);
+            for (group, count) in count_func.count(&match_, repo.as_ref()) {
+                *counts.entry(group).or_insert(0) += count;
+            }
+        }
+        let matches: Vec<Value> = counts
+            .into_iter()
+            .map(|(group, count)| json!({"group": group, "count": count}))
+            .collect();
+        fs::write(
+            out_dir.join(format!("{}.json", case.name)),
+            serde_json::to_string_pretty(&json!({"matches": matches})).unwrap(),
         )
         .unwrap();
     }

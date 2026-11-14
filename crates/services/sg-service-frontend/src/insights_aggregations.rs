@@ -12,16 +12,25 @@
 //!
 //! See `dev/rs/docs/overviews/m9_33a_insights_preview_production_overview.md`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::future::Future;
+use std::sync::Arc;
+use std::time::Duration;
 
 use sg_insights_query::{
     add_author_filter, add_file_filter, add_repo_filter, add_repo_metadata_filter,
     aggregation_query, detect_search_type, is_single_repo_query, new_pattern_replacer,
     parameters_from_query_plan, parse_query, set_case_sensitivity, MULTIPLE_PATTERN_ERR,
-    UNSUPPORTED_PATTERN_TYPE_ERR,
+    NO_REPO_METADATA_TEXT, UNSUPPORTED_PATTERN_TYPE_ERR,
 };
 use sg_search_query::fields::{FIELD_SELECT, FIELD_TYPE};
+use sg_search_query::node::Node;
 use sg_search_query::SearchType;
+
+use crate::search_stream::args::Args;
+use crate::search_stream::convert::{ChunkMatch, Match, RepoMetadata};
+use crate::search_stream::progress::SearchEvent;
+use crate::search_stream::{ExecuteItem, SearchDeps};
 
 // ---------------------------------------------------------------------------
 // Constants (`aggregates_resolvers.go:27-49`)
@@ -180,6 +189,19 @@ pub trait AggregationSearchSeam: Send + Sync + std::fmt::Debug {
         mode: SearchAggregationMode,
     ) -> AggregationSearchOutcome;
 
+    /// `search` with the resolver's `context.WithTimeout` deadline and the
+    /// GraphQL `patternType` (the baseline passes it to `SearchClient.Plan`).
+    /// Fake seams only implement [`search`]; the default ignores both.
+    fn search_with_timeout(
+        &self,
+        modified_query: &str,
+        mode: SearchAggregationMode,
+        _pattern_type: &str,
+        _time_limit_seconds: i32,
+    ) -> AggregationSearchOutcome {
+        self.search(modified_query, mode)
+    }
+
     /// `conf.Get().InsightsAggregationsBufferSize`.
     fn buffer_size(&self) -> i32;
 
@@ -188,6 +210,431 @@ pub trait AggregationSearchSeam: Send + Sync + std::fmt::Debug {
 
     /// `getExtendedTimeout`: user setting or the 55s default.
     fn extended_timeout_seconds(&self) -> i32;
+}
+
+// ---------------------------------------------------------------------------
+// Per-match tabulator (`internal/insights/aggregation/aggregation.go:40-168`)
+// ---------------------------------------------------------------------------
+
+/// `getCasedPattern`: the regexp the capture-group counter applies, with a
+/// `(?i:...)` wrapper when the query is case-insensitive.
+pub fn get_cased_pattern(query: &str) -> Result<String, String> {
+    let plan = parse_query(query, "regexp")?;
+    if plan.len() != 1 {
+        return Err("Pipeline generated plan with multiple steps.".to_owned());
+    }
+    let basic = &plan[0];
+    let pattern = match &basic.pattern {
+        Some(Node::Pattern(pattern)) => pattern.value.clone(),
+        _ => return Err("compute endpoint expects nonempty pattern".to_owned()),
+    };
+    if basic.is_case_sensitive() {
+        Ok(pattern)
+    } else {
+        Ok(format!("(?i:{pattern})"))
+    }
+}
+
+/// `AggregationCountFunc`: one match's `(group, count)` contributions.
+#[derive(Debug, Clone)]
+pub enum AggregationCountFunc {
+    Repo,
+    Path,
+    Author,
+    RepoMetadata,
+    CaptureGroup { regex: regex::Regex },
+}
+
+impl AggregationCountFunc {
+    /// `GetCountFuncForMode`.
+    pub fn for_mode(
+        query: &str,
+        pattern_type: &str,
+        mode: SearchAggregationMode,
+    ) -> Result<Self, String> {
+        let _ = pattern_type;
+        Ok(match mode {
+            SearchAggregationMode::Repo => Self::Repo,
+            SearchAggregationMode::Path => Self::Path,
+            SearchAggregationMode::Author => Self::Author,
+            SearchAggregationMode::RepoMetadata => Self::RepoMetadata,
+            SearchAggregationMode::CaptureGroup => {
+                let pattern = get_cased_pattern(query)?;
+                let regex = regex::Regex::new(&pattern)
+                    .map_err(|err| format!("Could not compile regexp: {err}"))?;
+                Self::CaptureGroup { regex }
+            }
+        })
+    }
+
+    /// `AggregationCountFunc(match, repo)`.
+    pub fn count(&self, match_: &Match, repo: Option<&RepoMetadata>) -> Vec<(String, i32)> {
+        let repo_name = match_.repo_name();
+        let result_count = match_.result_count() as i32;
+        match self {
+            Self::Repo => {
+                if repo_name.name.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![(repo_name.name, result_count)]
+                }
+            }
+            Self::Path => match match_ {
+                Match::File(file) if !file.file.path.is_empty() => {
+                    vec![(file.file.path.clone(), result_count)]
+                }
+                _ => Vec::new(),
+            },
+            Self::Author => match match_ {
+                Match::Commit(commit) if !commit.commit.author.name.is_empty() => {
+                    vec![(commit.commit.author.name.clone(), result_count)]
+                }
+                _ => Vec::new(),
+            },
+            Self::CaptureGroup { regex } => {
+                let mut groups: BTreeMap<String, i32> = BTreeMap::new();
+                for content in match_content(match_) {
+                    for captures in regex.captures_iter(&content) {
+                        let Some(group) = captures.get(1) else {
+                            continue;
+                        };
+                        let mut value = group.as_str().to_owned();
+                        // `key.Group[:100]` (byte slice in the baseline).
+                        if value.len() > 100 {
+                            value =
+                                String::from_utf8_lossy(&value.as_bytes()[..100]).into_owned();
+                        }
+                        *groups.entry(value).or_insert(0) += 1;
+                    }
+                }
+                groups.into_iter().collect()
+            }
+            Self::RepoMetadata => {
+                let mut metadata: BTreeMap<String, Option<String>> = BTreeMap::new();
+                metadata.insert(NO_REPO_METADATA_TEXT.to_owned(), None);
+                if let Some(repo) = repo {
+                    if let Some(pairs) = &repo.key_value_pairs {
+                        metadata = pairs.clone();
+                    }
+                }
+                metadata
+                    .into_iter()
+                    .map(|(key, value)| {
+                        let group = match value {
+                            Some(value) if !value.is_empty() => format!("{key}:{value}"),
+                            _ => key,
+                        };
+                        (group, result_count)
+                    })
+                    .collect()
+            }
+        }
+    }
+}
+
+/// `matchContent`.
+fn match_content(match_: &Match) -> Vec<String> {
+    match match_ {
+        Match::File(file) => {
+            if !file.chunk_matches.is_empty() {
+                let mut content = Vec::new();
+                for chunk in &file.chunk_matches {
+                    for range in &chunk.ranges {
+                        content.push(chunk_content(chunk, range));
+                    }
+                }
+                content
+            } else if !file.symbols.is_empty() {
+                Vec::new()
+            } else {
+                vec![file.file.path.clone()]
+            }
+        }
+        Match::Repo(repo) => vec![repo.name.clone()],
+        Match::Commit(commit) => {
+            if commit.diff_preview.is_some() {
+                Vec::new()
+            } else {
+                vec![commit.commit.message.clone()]
+            }
+        }
+        Match::Owner(_) => Vec::new(),
+    }
+}
+
+/// `chunkContent` (byte offsets relative to `ContentStart`).
+fn chunk_content(chunk: &ChunkMatch, range: &crate::search_stream::events::Range) -> String {
+    let start = range.start.offset - chunk.content_start.offset;
+    let end = range.end.offset - chunk.content_start.offset;
+    if start < 0 || end < start || end as usize > chunk.content.len() {
+        return String::new();
+    }
+    chunk
+        .content
+        .get(start as usize..end as usize)
+        .unwrap_or_default()
+        .to_owned()
+}
+
+/// `searchAggregationResults.Send`: one event's per-group counts. The caller
+/// merges them across events and feeds [`LimitedAggregator`].
+pub fn tabulate_event(
+    event: &SearchEvent,
+    count_func: &AggregationCountFunc,
+    repos: &HashMap<i32, RepoMetadata>,
+) -> Vec<(String, i32)> {
+    let mut combined: BTreeMap<String, i32> = BTreeMap::new();
+    for match_ in &event.results {
+        let repo = repos.get(&match_.repo_name().id);
+        for (group, count) in count_func.count(match_, repo) {
+            *combined.entry(group).or_insert(0) += count;
+        }
+    }
+    combined.into_iter().collect()
+}
+
+fn plan_error_message(error: crate::search_stream::PlanError) -> String {
+    match error {
+        crate::search_stream::PlanError::Query { message, .. }
+        | crate::search_stream::PlanError::Other(message) => message,
+    }
+}
+
+/// One production aggregation search through [`SearchDeps`]: `Plan` with the
+/// baseline's `V3`/`Precise`/`Streaming` settings, execute the stream, and
+/// tabulate every match. Mirrors `insightsSearchClient.Search` followed by
+/// `searchAggregationResults.Send`, including the repo metadata lookup.
+pub async fn run_aggregation_search(
+    deps: &dyn SearchDeps,
+    modified_query: &str,
+    pattern_type: &str,
+    mode: SearchAggregationMode,
+    time_limit_seconds: i32,
+) -> AggregationSearchOutcome {
+    let args = Args {
+        query: modified_query.to_owned(),
+        version: "V3".to_owned(),
+        pattern_type: pattern_type.to_owned(),
+        display: -1,
+        max_line_len: -1,
+        // `streaming.Search` requests chunk matches (`cm=t`).
+        enable_chunk_matches: true,
+        // `search.Precise`.
+        search_mode: 0,
+        context_lines: None,
+        zoekt_search_options_override: String::new(),
+    };
+    let inputs = match deps.plan(&args).await {
+        Ok(inputs) => inputs,
+        Err(error) => {
+            return AggregationSearchOutcome {
+                error: Some(plan_error_message(error)),
+                ..AggregationSearchOutcome::default()
+            }
+        }
+    };
+    let count_func = match AggregationCountFunc::for_mode(modified_query, pattern_type, mode) {
+        Ok(count_func) => count_func,
+        Err(error) => {
+            return AggregationSearchOutcome {
+                error: Some(error),
+                ..AggregationSearchOutcome::default()
+            }
+        }
+    };
+
+    let search = async {
+        let mut stream = deps.execute(&inputs, modified_query).await;
+        let mut outcome = AggregationSearchOutcome::default();
+        let mut combined: BTreeMap<String, i32> = BTreeMap::new();
+        while let Some(item) = tokio_stream::StreamExt::next(&mut stream).await {
+            match item {
+                ExecuteItem::Event(event) => {
+                    outcome.result_count += event
+                        .results
+                        .iter()
+                        .map(|match_| match_.result_count() as i32)
+                        .sum::<i32>();
+                    let repos = if mode == SearchAggregationMode::RepoMetadata {
+                        let ids: Vec<i32> = event
+                            .results
+                            .iter()
+                            .map(|match_| match_.repo_name().id)
+                            .collect::<BTreeSet<_>>()
+                            .into_iter()
+                            .collect();
+                        match deps.repo_metadata(&ids).await {
+                            Ok(repos) => repos,
+                            Err(error) => {
+                                outcome.error = Some(error);
+                                break;
+                            }
+                        }
+                    } else {
+                        HashMap::new()
+                    };
+                    for (group, count) in tabulate_event(&event, &count_func, &repos) {
+                        *combined.entry(group).or_insert(0) += count;
+                    }
+                }
+                ExecuteItem::Alert(_) => {}
+                ExecuteItem::Error { message, .. } => {
+                    outcome.error = Some(message);
+                    break;
+                }
+            }
+        }
+        outcome.matches = combined
+            .into_iter()
+            .map(|(group, count)| AggregationMatchResult { group, count })
+            .collect();
+        outcome
+    };
+
+    match tokio::time::timeout(
+        Duration::from_secs(u64::try_from(time_limit_seconds.max(1)).unwrap_or(1)),
+        search,
+    )
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(_) => AggregationSearchOutcome {
+            timed_out: true,
+            ..AggregationSearchOutcome::default()
+        },
+    }
+}
+
+/// `block_in_place` + the ambient handle, like the other GraphQL stores; the
+/// fallback runtime keeps unit tests without a runtime working.
+fn block_on<F: Future>(future: F) -> F::Output {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => tokio::task::block_in_place(|| handle.block_on(future)),
+        Err(_) => tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build current-thread runtime")
+            .block_on(future),
+    }
+}
+
+type AggregationSearchFn =
+    dyn Fn(&str, SearchAggregationMode, &str, i32) -> AggregationSearchOutcome + Send + Sync;
+
+/// Production [`AggregationSearchSeam`] assembled by the frontend search
+/// combination root from the shared [`SearchDeps`].
+pub struct ProductionAggregationSearchSeam {
+    search: Option<Arc<AggregationSearchFn>>,
+    buffer_size: i32,
+    proactive_result_limit: i64,
+    extended_timeout_seconds: i32,
+}
+
+impl std::fmt::Debug for ProductionAggregationSearchSeam {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProductionAggregationSearchSeam")
+            .field("search", &self.search.is_some())
+            .field("buffer_size", &self.buffer_size)
+            .field("proactive_result_limit", &self.proactive_result_limit)
+            .finish()
+    }
+}
+
+impl ProductionAggregationSearchSeam {
+    /// Unconnected seam: `search_aggregations` returns the baseline's
+    /// `search execution is not connected` error.
+    pub fn new() -> Self {
+        Self {
+            search: None,
+            buffer_size: 0,
+            proactive_result_limit: 0,
+            extended_timeout_seconds: EXTENDED_SEARCH_TIME_LIMIT_SECONDS_DEFAULT,
+        }
+    }
+
+    /// Wire the shared `SearchDeps` behind `/.api/search/stream`.
+    pub fn from_search_deps(deps: Arc<dyn SearchDeps>) -> Self {
+        let search = move |query: &str,
+                           mode: SearchAggregationMode,
+                           pattern_type: &str,
+                           time_limit_seconds: i32| {
+            block_on(run_aggregation_search(
+                deps.as_ref(),
+                query,
+                pattern_type,
+                mode,
+                time_limit_seconds,
+            ))
+        };
+        Self {
+            search: Some(Arc::new(search)),
+            ..Self::new()
+        }
+    }
+
+    pub fn with_buffer_size(mut self, buffer_size: i32) -> Self {
+        self.buffer_size = buffer_size;
+        self
+    }
+
+    pub fn with_proactive_result_limit(mut self, limit: i64) -> Self {
+        self.proactive_result_limit = limit;
+        self
+    }
+
+    pub fn with_extended_timeout_seconds(mut self, seconds: i32) -> Self {
+        self.extended_timeout_seconds = seconds;
+        self
+    }
+}
+
+impl Default for ProductionAggregationSearchSeam {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl AggregationSearchSeam for ProductionAggregationSearchSeam {
+    fn search(
+        &self,
+        modified_query: &str,
+        mode: SearchAggregationMode,
+    ) -> AggregationSearchOutcome {
+        self.search_with_timeout(
+            modified_query,
+            mode,
+            "",
+            DEFAULT_SEARCH_TIME_LIMIT_SECONDS,
+        )
+    }
+
+    fn search_with_timeout(
+        &self,
+        modified_query: &str,
+        mode: SearchAggregationMode,
+        pattern_type: &str,
+        time_limit_seconds: i32,
+    ) -> AggregationSearchOutcome {
+        match &self.search {
+            Some(search) => search(modified_query, mode, pattern_type, time_limit_seconds),
+            None => AggregationSearchOutcome {
+                error: Some(crate::insights_aggregations_graphql::NOT_CONNECTED.to_owned()),
+                ..AggregationSearchOutcome::default()
+            },
+        }
+    }
+
+    fn buffer_size(&self) -> i32 {
+        self.buffer_size
+    }
+
+    fn proactive_result_limit(&self) -> i64 {
+        self.proactive_result_limit
+    }
+
+    fn extended_timeout_seconds(&self) -> i32 {
+        self.extended_timeout_seconds
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -811,7 +1258,12 @@ pub fn search_aggregations(
     };
     let mut aggregator = LimitedAggregator::new(buffer_size);
 
-    let outcome = seam.search(&modified_query, mode);
+    let outcome = seam.search_with_timeout(
+        &modified_query,
+        mode,
+        &input.pattern_type,
+        search_time_limit,
+    );
     if outcome.timed_out {
         let reason_type = if input.extended_timeout {
             AggregationNotAvailableReasonType::TimeoutNoExtensionAvailable
