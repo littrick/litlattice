@@ -138,8 +138,18 @@ fn go_html_escape(text: &str) -> String {
 /// `generatePlainTable` followed by `SplitHighlightedLines(false)`, which keeps
 /// one `<span>TEXT</span>` per line. `HTML_PLAINTEXT` is the only format that
 /// does not call the syntect service; it always reports `aborted=true`.
+///
+/// M9.35d: `start_line`/`end_line` are applied with `GitTreeEntry.Content`'s
+/// `pageContent` *before* highlighting, matching `fileDiffHighlighter`
+/// (`repository_comparison.go:491-515`). The binary check also runs on the
+/// sliced bytes, exactly like `highlight.Code` receiving the paged content.
 pub fn offline_highlight(request: &HighlightRequest) -> Result<HighlightedFile, HighlightError> {
-    if is_binary(&request.content) {
+    let content = crate::git_tree_entry_graphql::page_content(
+        &request.content,
+        request.start_line,
+        request.end_line,
+    );
+    if is_binary(content) {
         return Err(HighlightError::Binary);
     }
     if request.format != "HTML_PLAINTEXT" {
@@ -148,7 +158,7 @@ pub fn offline_highlight(request: &HighlightRequest) -> Result<HighlightedFile, 
             request.format
         )));
     }
-    let mut code = String::from_utf8_lossy(&request.content).into_owned();
+    let mut code = String::from_utf8_lossy(content).into_owned();
     if !request.keep_final_newline {
         if let Some(stripped) = code.strip_suffix('\n') {
             code = stripped.to_owned();
@@ -1186,6 +1196,29 @@ mod tests {
             offline_highlight(&request("a\n", "HTML_HIGHLIGHT")),
             Err(HighlightError::Message(_))
         ));
+    }
+
+    #[test]
+    fn plaintext_applies_start_end_lines_before_highlighting() {
+        // M9.35d: `fileDiffHighlighter` slices the file content through
+        // `GitTreeEntry.Content` before `highlight.CodeAsLines`.
+        let mut req = request("line one\nold line\nline three\ncontext\n", "HTML_PLAINTEXT");
+        req.start_line = Some(2);
+        req.end_line = Some(2);
+        let highlighted = offline_highlight(&req).unwrap();
+        assert!(highlighted.aborted);
+        assert_eq!(
+            highlighted.lines,
+            vec!["<span>old line</span>".to_owned(), "<span>\n</span>".to_owned()]
+        );
+    }
+
+    #[test]
+    fn plaintext_out_of_range_slices_empty_content() {
+        let mut req = request("a\nb\n", "HTML_PLAINTEXT");
+        req.start_line = Some(9);
+        let highlighted = offline_highlight(&req).unwrap();
+        assert_eq!(highlighted.lines, vec!["<span>\n</span>".to_owned()]);
     }
 
     #[test]

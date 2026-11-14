@@ -219,6 +219,30 @@ pub trait ObjectValue: Send + Sync {
         arguments: &Arguments,
         actor: Actor,
     ) -> Result<Option<FieldValue>, ExecError>;
+
+    /// Whether [`Self::field_with_selections`] wants the flattened
+    /// sub-selection set for `field`. Defaults to `false`, so the executor does
+    /// not flatten selections for resolvers that only read their arguments.
+    ///
+    /// This is the synchronous counterpart of the async prefetch walk
+    /// ([`root_fields`]): a resolver reached from a synchronous field hook can
+    /// still perform a selection-set-aware prefetch while it resolves.
+    fn needs_selections(&self, _field: &str) -> bool {
+        false
+    }
+
+    /// Resolve `field`, passing the flattened sub-selections of an
+    /// object-returning field (empty unless [`Self::needs_selections`] opted
+    /// in). The default ignores them and delegates to [`Self::field`].
+    fn field_with_selections(
+        &self,
+        field: &str,
+        arguments: &Arguments,
+        _selections: &[RootField],
+        actor: Actor,
+    ) -> Result<Option<FieldValue>, ExecError> {
+        self.field(field, arguments, actor)
+    }
 }
 
 /// Root objects for an operation kind (`Query`, `Mutation`, ...). Returning
@@ -1337,7 +1361,62 @@ fn execute_object<'s, 'q>(
             .map(|spec| spec.field_type.ends_with('!'))
             .unwrap_or(false);
 
-        let resolved = resolve_field(schema, &parent, parent_type, field, variables, root, actor);
+        // Resolvers that opt in (`needs_selections`) get the flattened
+        // sub-selection set while they resolve, so a synchronous field hook can
+        // do the same selection-set-aware prefetch as the async walk.
+        let needs_selections = match &parent {
+            Parent::Business(object) => object.needs_selections(&field.name),
+            Parent::Intro(_) => false,
+        };
+        let child_selections = if needs_selections {
+            match named_field_type(schema, parent_type, &field.name)
+                .filter(|child_type| is_composite_type(schema, child_type))
+            {
+                Some(child_type) => {
+                    let mut child_selections = selected_fields(
+                        schema,
+                        &child_type,
+                        &field.selection_set.items,
+                        fragments,
+                        variables,
+                    );
+                    // Interface/union-typed fields keep their inline fragments
+                    // under `type_conditions`; merge those flattened fields so
+                    // an opt-in resolver sees the selections of every possible
+                    // runtime type (e.g. `Changeset.diff`'s
+                    // `... on RepositoryComparison { commits { ... } }`). The
+                    // resolver only prefetches what it can observe.
+                    if matches!(
+                        schema.types.get(&child_type).map(|def| def.kind),
+                        Some(TypeKind::Interface | TypeKind::Union)
+                    ) {
+                        for (_, nested) in type_condition_fields(
+                            schema,
+                            &child_type,
+                            &field.selection_set.items,
+                            fragments,
+                            variables,
+                        ) {
+                            child_selections.extend(nested);
+                        }
+                    }
+                    child_selections
+                }
+                None => Vec::new(),
+            }
+        } else {
+            Vec::new()
+        };
+        let resolved = resolve_field(
+            schema,
+            &parent,
+            parent_type,
+            field,
+            variables,
+            root,
+            actor,
+            &child_selections,
+        );
         // Only a value that *is* null (`nil` in the baseline) triggers
         // `got nil for non-null`; nulls propagated from a field error or a
         // failed non-null child are silent (`exec.go:78-100,243-262`).
@@ -1458,6 +1537,7 @@ fn execute_resolved<'s, 'q>(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn resolve_field<'s>(
     schema: &'s Schema,
     parent: &Parent<'s>,
@@ -1466,11 +1546,12 @@ fn resolve_field<'s>(
     variables: &BTreeMap<String, RtValue>,
     root: Option<&dyn ObjectValue>,
     actor: Actor,
+    selections: &[RootField],
 ) -> Result<Resolved<'s>, ExecError> {
     match parent {
         Parent::Business(object) => {
             let arguments = collect_arguments(schema, parent_type, field, variables);
-            match object.field(&field.name, &arguments, actor)? {
+            match object.field_with_selections(&field.name, &arguments, selections, actor)? {
                 Some(value) => Ok(resolved_from_field_value(value)),
                 None => Err(no_ported_resolver(&field.name, parent_type)),
             }

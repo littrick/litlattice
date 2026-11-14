@@ -37,7 +37,9 @@ use sg_extsvc::batches_state::{
     ChangesetReviewState, ChangesetSyncState,
 };
 use sg_extsvc::batches_state_load::{parse_changeset_metadata, parse_event_metadata};
-use sg_graphql::exec::{Actor, Arguments, ExecError, FieldValue, InputValue, ObjectValue};
+use sg_graphql::exec::{
+    Actor, Arguments, ExecError, FieldValue, InputValue, ObjectValue, RootField,
+};
 use sg_graphql::json::Json;
 use sg_git::{DiffRangeType, RawDiffOptions};
 use sg_service_gitserver::diff::{parse_multi_file_diff, FileDiff};
@@ -51,9 +53,10 @@ use crate::batches_graphql::{
     BATCH_CHANGES_DISABLED, DEFAULT_FIRST,
 };
 use crate::git_commit_extra::{
-    ComparisonData, FileDiffConnectionObject, RepositoryComparisonObject,
+    compute_comparison_commits, ComparisonData, FileDiffConnectionObject,
+    RepositoryComparisonObject,
 };
-use crate::git_comparison_graphql::NewFileSource;
+use crate::git_comparison_graphql::{prefetch_file_diff_extras, NewFileSource};
 use crate::git_graphql::{GitObjectSource, GitPrefetch};
 use crate::graphql_resolvers::{
     datetime_rfc3339, PageInfoObject, RepositoryData, RepositoryObject,
@@ -1007,6 +1010,19 @@ fn repository_data(repo: &MinimalRepo) -> RepositoryData {
 }
 
 fn changeset_diff_field(object: &ChangesetObject) -> Result<Option<FieldValue>, ExecError> {
+    changeset_diff_field_with_selections(object, &[])
+}
+
+/// M9.35d: `Changeset.diff` reached through the executor's
+/// [`ObjectValue::field_with_selections`] hook. The `diff` selection set lets
+/// the returned `RepositoryComparison` prefetch `commits { nodes { tree diff } }`
+/// and the hunk `highlight` results synchronously, exactly like the async
+/// prefetch walk does for `Repository.comparison`
+/// (`git_comparison_graphql::prefetch_repository_comparison`).
+pub(crate) fn changeset_diff_field_with_selections(
+    object: &ChangesetObject,
+    selections: &[RootField],
+) -> Result<Option<FieldValue>, ExecError> {
     if object.row.is_importing() {
         return Ok(Some(FieldValue::Null));
     }
@@ -1063,9 +1079,13 @@ fn changeset_diff_field(object: &ChangesetObject) -> Result<Option<FieldValue>, 
     let Some(source) = read_db.changeset_diff_source() else {
         return Ok(Some(FieldValue::Null));
     };
-    let comparison = source
+    let mut comparison = source
         .comparison_with_git(&minimal_repo(repo), &base, &head)
         .map_err(ExecError::new)?;
+    if !selections.is_empty() {
+        prefetch_changeset_comparison(&mut comparison, &minimal_repo(repo), selections)
+            .map_err(ExecError::new)?;
+    }
     Ok(Some(FieldValue::Object(Arc::new(
         RepositoryComparisonObject {
             repo: minimal_repo(repo),
@@ -1074,6 +1094,73 @@ fn changeset_diff_field(object: &ChangesetObject) -> Result<Option<FieldValue>, 
             commits_source: comparison.source,
         },
     ))))
+}
+
+/// Selection-set-aware prefetch for the comparison returned by
+/// `Changeset.diff`. Mirrors `prefetch_repository_comparison`: only the
+/// selected `fileDiffs`/`commits` subtrees are computed, and the per-commit
+/// `tree`/`diff` fields are replayed from the prefetched gitserver data.
+fn prefetch_changeset_comparison(
+    comparison: &mut ChangesetComparison,
+    repo: &MinimalRepo,
+    selections: &[RootField],
+) -> Result<(), String> {
+    let (Some(source), Some(git)) = (comparison.source.clone(), comparison.git.clone()) else {
+        return Ok(());
+    };
+    let mut prefetch = (*git).clone();
+
+    if let Some(file_diffs_field) = selections.iter().find(|field| field.name == "fileDiffs") {
+        if let Some(Ok(files)) = &comparison.data.file_diffs {
+            let files = files.clone();
+            crate::batches_graphql_store::block_on(prefetch_file_diff_extras(
+                source.as_ref(),
+                &mut prefetch,
+                repo,
+                &comparison.data,
+                &files,
+                &file_diffs_field.selections,
+            ));
+        }
+    }
+
+    if let Some(commits_field) = selections.iter().find(|field| field.name == "commits") {
+        let first = commits_field
+            .arguments
+            .i64("first")
+            .map(|value| value as i32);
+        let path = commits_field
+            .arguments
+            .string("path")
+            .unwrap_or_default()
+            .to_owned();
+        let data = &comparison.data;
+        let result = crate::batches_graphql_store::block_on(async {
+            let Some(extra) = source.commit_extra() else {
+                return None;
+            };
+            Some(
+                compute_comparison_commits(
+                    extra,
+                    source.as_ref(),
+                    &mut prefetch,
+                    repo,
+                    data,
+                    first,
+                    &path,
+                    &commits_field.selections,
+                    0,
+                )
+                .await,
+            )
+        });
+        if let Some(result) = result {
+            comparison.data.commits = Some(result);
+        }
+    }
+
+    comparison.git = Some(Arc::new(prefetch));
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

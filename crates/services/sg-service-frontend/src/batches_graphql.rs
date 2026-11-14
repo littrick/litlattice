@@ -33,7 +33,9 @@ use std::sync::{Arc, OnceLock};
 
 use base64::Engine as _;
 use serde_json::Value as JsonValue;
-use sg_graphql::exec::{Actor, Arguments, ExecError, FieldValue, InputValue, ObjectValue};
+use sg_graphql::exec::{
+    Actor, Arguments, ExecError, FieldValue, InputValue, ObjectValue, RootField,
+};
 use sg_graphql::json::Json;
 use time::{Duration, OffsetDateTime};
 
@@ -1595,6 +1597,27 @@ impl ObjectValue for ChangesetObject {
             ))),
             _ => self.external_field(field, arguments, actor),
         }
+    }
+
+    /// M9.35d: `Changeset.diff`'s comparison prefetch is driven by its
+    /// selection set (`commits { nodes { tree diff } }`, hunk `highlight`).
+    fn needs_selections(&self, field: &str) -> bool {
+        field == "diff" && self.repo.is_some()
+    }
+
+    fn field_with_selections(
+        &self,
+        field: &str,
+        arguments: &Arguments,
+        selections: &[RootField],
+        actor: Actor,
+    ) -> Result<Option<FieldValue>, ExecError> {
+        if field == "diff" && self.repo.is_some() {
+            return crate::batches_changeset_read::changeset_diff_field_with_selections(
+                self, selections,
+            );
+        }
+        self.field(field, arguments, actor)
     }
 }
 
