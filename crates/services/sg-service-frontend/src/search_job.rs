@@ -165,6 +165,25 @@ pub trait PrivateRepoLister {
         ))
     }
 
+    /// `db.ExternalServices().Count(kinds=CodeHost kinds)`
+    /// (`searchalert.needsRepositoryConfiguration`,
+    /// `internal/search/alert/observer.go:302-317`). The default keeps
+    /// list-only fakes working: `alert_for_no_resolved_repos` then skips the
+    /// "no repositories or code hosts configured" branch, exactly like Go
+    /// does when the count read returns an error.
+    fn count_code_host_external_services(&self) -> Result<i64, JobError> {
+        Err(JobError(
+            "db.ExternalServices().Count is not ported (M9.39a)".to_owned(),
+        ))
+    }
+
+    /// `auth.CheckCurrentUserIsSiteAdmin(ctx, db) == nil`
+    /// (`internal/search/alert/observer.go:94`). `RuntimeClients` carries no
+    /// actor, so the default models the anonymous actor (`false`).
+    fn current_user_is_site_admin(&self) -> bool {
+        false
+    }
+
     /// `searchcontexts.ResolveSearchContextSpec`. The default resolves only the
     /// global/empty spec (which needs no database) and keeps the explicit seam
     /// error for everything else; production and differential fakes override

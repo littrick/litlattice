@@ -739,6 +739,52 @@ impl PrivateRepoLister for PgPrivateRepoLister {
         )
         .map_err(|error| JobError(error.to_string()))
     }
+
+    /// `needsRepositoryConfiguration`
+    /// (`internal/search/alert/observer.go:302-317`): the number of external
+    /// services whose kind is a code host
+    /// (`database.ExternalServiceKinds`, `external_services.go:205-224`).
+    fn count_code_host_external_services(&self) -> Result<i64, JobError> {
+        let pool = self.pool.clone();
+        run_to_completion(async move { count_code_host_external_services(&pool).await })
+            .map_err(|error| JobError(error.to_string()))
+    }
+}
+
+/// `extsvc.Kind*` strings with `CodeHost: true`
+/// (`internal/database/external_services.go:205-224`).
+const CODE_HOST_EXTERNAL_SERVICE_KINDS: &[&str] = &[
+    "AWSCODECOMMIT",
+    "AZUREDEVOPS",
+    "BITBUCKETCLOUD",
+    "BITBUCKETSERVER",
+    "GERRIT",
+    "GITHUB",
+    "GITLAB",
+    "GITOLITE",
+    "GOPACKAGES",
+    "JVMPACKAGES",
+    "NPMPACKAGES",
+    "OTHER",
+    "PAGURE",
+    "PERFORCE",
+    "PHABRICATOR",
+    "PYTHONPACKAGES",
+    "RUSTPACKAGES",
+    "RUBYPACKAGES",
+];
+
+async fn count_code_host_external_services(pool: &PgPool) -> Result<i64, sqlx::Error> {
+    let kinds: Vec<String> = CODE_HOST_EXTERNAL_SERVICE_KINDS
+        .iter()
+        .map(|kind| (*kind).to_owned())
+        .collect();
+    sqlx::query_scalar::<_, i64>(
+        "SELECT count(*) FROM external_services WHERE deleted_at IS NULL AND kind = ANY($1)",
+    )
+    .bind(&kinds)
+    .fetch_one(pool)
+    .await
 }
 
 async fn count_repos(pool: &PgPool, options: &ReposListOptions) -> Result<i64, sqlx::Error> {
