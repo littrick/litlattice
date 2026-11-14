@@ -1199,6 +1199,13 @@ fn set_tree_repos(node: &JobNode, resolved: &ResolvedRepos) -> JobNode {
 /// convert are accumulated, `Done` adds the structural-search hint and drops
 /// residual errors once results were seen. DB/repo-resolution alert branches
 /// are not ported (no DB seam here).
+///
+/// Known gap (M9.38d real-index smoke): a repo filter that resolves to no
+/// repository yields `ErrNoResolvedRepos`. Go's `alert.Observer` turns it into
+/// the `No repositories found` alert (`observer.go:247`); this tree observer
+/// has no repo-resolution seam, so the stream currently surfaces
+/// `event: error` with `"no resolved repositories"` instead. The smoke script
+/// asserts both behaviors explicitly and will flag the fix.
 struct TreeAlertObserver {
     inputs: comb::AlertInputs,
     has_results: bool,
