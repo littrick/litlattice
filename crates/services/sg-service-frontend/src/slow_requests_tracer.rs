@@ -789,6 +789,9 @@ async fn resolve_repository(
         Ok(RepoLookup::Blocked { name, reason }) => Some(Err(format!(
             "repository {name} has been blocked. reason: {reason}"
         ))),
+        Ok(RepoLookup::Redirect { url }) => Some(Err(format!(
+            "repo not found at this location, but might exist at {url}"
+        ))),
         Ok(RepoLookup::Error(error)) => Some(Err(error)),
         Err(error) => Some(Err(error)),
     }

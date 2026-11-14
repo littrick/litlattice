@@ -197,6 +197,29 @@ pub trait GitObjectSource: Send + Sync {
         ))
     }
 
+    /// `gitserver.Client.ReadDir` (M9.43b): rich entries for
+    /// `GitTree.entries`/`files`/`directories`.
+    ///
+    /// The default maps the name-only [`Self::read_dir`] to non-directory
+    /// synthetic stats, which keeps older fakes compiling; production and the
+    /// differential harness override it to preserve the directory flag.
+    async fn read_dir_stats(
+        &self,
+        repo_id: i32,
+        repo_name: &str,
+        oid: &str,
+        path: &str,
+        recursive: bool,
+    ) -> Result<Vec<sg_git::FileStat>, GitSourceError> {
+        let names = self
+            .read_dir(repo_id, repo_name, oid, path, recursive)
+            .await?;
+        Ok(names
+            .into_iter()
+            .map(|name| sg_git::FileStat::synthetic(&name, false))
+            .collect())
+    }
+
     /// `gitserver.Client.NewFileReader` (M9.8iy): the full file content.
     async fn read_file(
         &self,
@@ -507,6 +530,28 @@ impl GitObjectSource for GitserverGitObjects {
         Ok(entries.into_iter().map(|entry| entry.name).collect())
     }
 
+    /// M9.43b: `GitTree.entries`/`files`/`directories`. gitserver already
+    /// returns full paths and the directory bit, which is all the list
+    /// resolvers read.
+    async fn read_dir_stats(
+        &self,
+        _repo_id: i32,
+        repo_name: &str,
+        oid: &str,
+        path: &str,
+        recursive: bool,
+    ) -> Result<Vec<sg_git::FileStat>, GitSourceError> {
+        let (client, addr) = self.client_for(repo_name).await?;
+        let entries = client
+            .read_dir_entries_at(&addr, repo_name, oid, path, recursive)
+            .await
+            .map_err(GitSourceError::from)?;
+        Ok(entries
+            .into_iter()
+            .map(|entry| sg_git::FileStat::synthetic(&entry.name, entry.is_dir))
+            .collect())
+    }
+
     async fn read_file(
         &self,
         _repo_id: i32,
@@ -678,6 +723,15 @@ pub enum DirLookup {
     Error(String),
 }
 
+/// Rich `ReadDir` outcome for `GitTree.entries`/`files`/`directories`
+/// (M9.43b). `Found(vec![])` is the baseline's swallowed
+/// `file does not exist` empty-tree case.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DirEntriesLookup {
+    Found(Vec<sg_git::FileStat>),
+    Error(String),
+}
+
 /// All gitserver data prefetched for one GraphQL request.
 ///
 /// Keys are `(repo id, revspec/oid)`; the repository name travels with the
@@ -695,6 +749,9 @@ pub struct GitPrefetch {
     pub tree_entries: HashMap<(i32, String, String), TreeEntryLookup>,
     pub contents: HashMap<(i32, String, String), ContentLookup>,
     pub dirs: HashMap<(i32, String, String), DirLookup>,
+    /// M9.43b: `GitTree.entries`/`files`/`directories` listings, keyed by
+    /// `(repo id, oid, path, recursive)`.
+    pub dir_entries: HashMap<(i32, String, String, bool), DirEntriesLookup>,
     /// Submodule clone URLs seen while prefetching tree entries (the
     /// `path.Join(repoName, submoduleURL)` form, M9.8iy).
     pub submodule_urls: Vec<String>,
@@ -732,6 +789,7 @@ impl Clone for GitPrefetch {
             tree_entries: self.tree_entries.clone(),
             contents: self.contents.clone(),
             dirs: self.dirs.clone(),
+            dir_entries: self.dir_entries.clone(),
             submodule_urls: self.submodule_urls.clone(),
             submodule_repo_names: self.submodule_repo_names.clone(),
             blame: self.blame.clone(),
@@ -755,6 +813,7 @@ impl std::fmt::Debug for GitPrefetch {
             .field("tree_entries", &self.tree_entries)
             .field("contents", &self.contents)
             .field("dirs", &self.dirs)
+            .field("dir_entries", &self.dir_entries)
             .field("submodule_urls", &self.submodule_urls)
             .field("submodule_repo_names", &self.submodule_repo_names)
             .field("blame", &self.blame)
@@ -790,6 +849,19 @@ impl GitPrefetch {
     /// The prefetched directory listing for `(oid, path)`.
     pub fn dir(&self, repo_id: i32, oid: &str, path: &str) -> Option<&DirLookup> {
         self.dirs.get(&(repo_id, oid.to_owned(), path.to_owned()))
+    }
+
+    /// The prefetched rich directory listing for
+    /// `(oid, path, recursive)` (`GitTree.entries`/`files`/`directories`).
+    pub fn dir_entries(
+        &self,
+        repo_id: i32,
+        oid: &str,
+        path: &str,
+        recursive: bool,
+    ) -> Option<&DirEntriesLookup> {
+        self.dir_entries
+            .get(&(repo_id, oid.to_owned(), path.to_owned(), recursive))
     }
 
     /// `cloneURLToRepoName` result for a submodule URL (`None` when the lookup
