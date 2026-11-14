@@ -187,6 +187,159 @@ async fn compute_highlight(
 }
 
 // ---------------------------------------------------------------------------
+// Production highlighter adapter (M9.36d)
+// ---------------------------------------------------------------------------
+
+/// The production [`HighlightSource`]: `highlight.CodeAsLines` backed by the
+/// M9.23c syntect `CodeHighlighter` (`highlight.Code`). `fileDiffHighlighter`
+/// and `GitBlob.highlight` both go through `CodeAsLines`, so this adapter is
+/// their shared implementation.
+///
+/// Order matches the baseline: `Content(startLine,endLine)` is applied first
+/// ([`crate::git_tree_entry_graphql::page_content`]), then the sliced bytes are
+/// highlighted. Binary detection therefore runs on the sliced content, exactly
+/// like `fileDiffHighlighter` calling `highlight.Code` with the paged bytes.
+pub struct CodeHighlighterSource {
+    highlighter: Arc<dyn crate::graphql_inventory_c::CodeHighlighter>,
+}
+
+impl CodeHighlighterSource {
+    pub fn new(highlighter: Arc<dyn crate::graphql_inventory_c::CodeHighlighter>) -> Self {
+        Self { highlighter }
+    }
+
+    /// Production assembly: `SRC_SYNTECT_SERVER` (the same client the
+    /// `highlightCode` resolver uses).
+    pub fn production() -> Self {
+        Self::new(Arc::new(
+            crate::markdown_graphql::SyntectCodeHighlighter::from_env(),
+        ))
+    }
+}
+
+#[async_trait]
+impl HighlightSource for CodeHighlighterSource {
+    async fn highlight(
+        &self,
+        request: &HighlightRequest,
+    ) -> Result<HighlightedFile, HighlightError> {
+        let content = crate::git_tree_entry_graphql::page_content(
+            &request.content,
+            request.start_line,
+            request.end_line,
+        );
+        if is_binary(content) {
+            return Err(HighlightError::Binary);
+        }
+
+        // `HTML_PLAINTEXT` never reaches syntect in Go (`unhighlightedCode`).
+        if request.format == "HTML_PLAINTEXT" {
+            return offline_highlight(request);
+        }
+        if request.format != "HTML_HIGHLIGHT" {
+            return Err(HighlightError::Message(format!(
+                "syntax highlighting for format {} is not available",
+                request.format
+            )));
+        }
+
+        let code = String::from_utf8_lossy(content).into_owned();
+        let normalized = crate::markdown_graphql::normalize_filepath(&request.filepath);
+        if crate::markdown_graphql::detect_language(&normalized, &code).is_empty() {
+            // Unknown language: the syntect server renders a plain-text table.
+            // Reproduce that offline (`HTML_PLAINTEXT`) instead of sending an
+            // empty `filetype`.
+            let mut plain = request.clone();
+            plain.format = "HTML_PLAINTEXT".to_owned();
+            return offline_highlight(&plain);
+        }
+
+        // `SyntectCodeHighlighter` (like `highlight.Code`) strips one final
+        // newline unless told otherwise; re-add one so `KeepFinalNewline`
+        // sends the exact bytes to the server.
+        let input = if request.keep_final_newline {
+            format!("{code}\n")
+        } else {
+            code
+        };
+        let (html, aborted) = self
+            .highlighter
+            .highlight_with_options(
+                &input,
+                &request.filepath,
+                request.disable_timeout,
+                request.highlight_long_lines,
+            )
+            .await
+            .map_err(HighlightError::Message)?;
+        Ok(HighlightedFile {
+            lines: split_highlighted_lines(&html).map_err(HighlightError::Message)?,
+            aborted,
+        })
+    }
+}
+
+/// `HighlightedCode.SplitHighlightedLines(false)`: one entry per table row,
+/// the rendered first child of the row's code cell (`tr > td.code > div`).
+///
+/// The ported stand-ins emit canonical HTML (Go `html.Render` round-trips to
+/// itself), so extracting the raw `<div>…</div>` / `<span>…</span>` substring
+/// matches the baseline's parse-and-render output.
+pub(crate) fn split_highlighted_lines(html: &str) -> Result<Vec<String>, String> {
+    let mut lines = Vec::new();
+    let mut position = 0;
+    while let Some(row_start) = find_from(html, "<tr", position) {
+        let Some(row_end) = find_from(html, "</tr>", row_start) else {
+            break;
+        };
+        let row = &html[row_start..row_end];
+        let td_start = rfind_td(row).ok_or("expected <td> in highlighted table row")?;
+        let cell_start = find_from(row, ">", td_start).ok_or("unterminated <td>")? + 1;
+        let cell_end = find_from(row, "</td>", cell_start).ok_or("unterminated <td>")?;
+        lines.push(first_child(&row[cell_start..cell_end])?);
+        position = row_end + "</tr>".len();
+    }
+    Ok(lines)
+}
+
+fn find_from(haystack: &str, needle: &str, from: usize) -> Option<usize> {
+    haystack.get(from..)?.find(needle).map(|offset| from + offset)
+}
+
+fn rfind_td(row: &str) -> Option<usize> {
+    let mut found = None;
+    let mut position = 0;
+    while let Some(start) = find_from(row, "<td", position) {
+        found = Some(start);
+        position = start + 3;
+    }
+    found
+}
+
+/// The first child node of a code cell, re-serialized as the baseline's
+/// `html.Render` would (canonical input is preserved verbatim).
+fn first_child(inner: &str) -> Result<String, String> {
+    let inner = inner.trim_start();
+    if inner.is_empty() {
+        return Ok(String::new());
+    }
+    if !inner.starts_with('<') {
+        let end = inner.find('<').unwrap_or(inner.len());
+        return Ok(inner[..end].to_string());
+    }
+    let name_end = inner[1..]
+        .find(|ch: char| ch.is_whitespace() || ch == '>' || ch == '/')
+        .map(|offset| offset + 1)
+        .ok_or("unterminated element")?;
+    let name = &inner[1..name_end];
+    let open_end = find_from(inner, ">", name_end).ok_or("unterminated element")?;
+    let close = format!("</{name}>");
+    let close_at =
+        find_from(inner, &close, open_end).ok_or_else(|| format!("missing {close}"))?;
+    Ok(inner[..close_at + close.len()].to_string())
+}
+
+// ---------------------------------------------------------------------------
 // Selection helpers
 // ---------------------------------------------------------------------------
 

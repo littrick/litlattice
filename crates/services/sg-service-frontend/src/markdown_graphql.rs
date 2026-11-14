@@ -1663,6 +1663,21 @@ impl crate::graphql_inventory_c::CodeHighlighter for SyntectCodeHighlighter {
         filepath: &str,
         disable_timeout: bool,
     ) -> Result<String, String> {
+        self.highlight_with_options(code, filepath, disable_timeout, false)
+            .await
+            .map(|(html, _aborted)| html)
+    }
+
+    /// M9.36d: full `highlight.Code`, including the `highlightLongLines`
+    /// `line_length_limit` choice and the aborted (plain-table fallback) flag
+    /// that `CodeAsLines` propagates to `FileDiffHunk.highlight`.
+    async fn highlight_with_options(
+        &self,
+        code: &str,
+        filepath: &str,
+        disable_timeout: bool,
+        highlight_long_lines: bool,
+    ) -> Result<(String, bool), String> {
         // `highlight.Code`: normalize filepath, detect language, drop one final
         // newline, then request syntect-server.
         let filepath = normalize_filepath(filepath);
@@ -1672,7 +1687,7 @@ impl crate::graphql_inventory_c::CodeHighlighter for SyntectCodeHighlighter {
             code = stripped.to_string();
         }
 
-        let body = build_highlight_request(&filepath, &language, &code);
+        let body = build_highlight_request(&filepath, &language, &code, highlight_long_lines);
         let mut request = self
             .client
             .post(format!("{}/", self.base_url))
@@ -1688,24 +1703,24 @@ impl crate::graphql_inventory_c::CodeHighlighter for SyntectCodeHighlighter {
         } else {
             match tokio::time::timeout(Duration::from_secs(3), send).await {
                 Ok(response) => response,
-                Err(_) => return Ok(generate_plain_table(&code)),
+                Err(_) => return Ok((generate_plain_table(&code), true)),
             }
         };
 
         let response = match response {
             Ok(response) => response,
-            Err(_) => return Ok(generate_plain_table(&code)),
+            Err(_) => return Ok((generate_plain_table(&code), true)),
         };
         if response.status() == reqwest::StatusCode::BAD_REQUEST {
-            return Ok(generate_plain_table(&code));
+            return Ok((generate_plain_table(&code), true));
         }
         let bytes = match response.bytes().await {
             Ok(bytes) => bytes,
-            Err(_) => return Ok(generate_plain_table(&code)),
+            Err(_) => return Ok((generate_plain_table(&code), true)),
         };
         let decoded: serde_json::Value = match serde_json::from_slice(&bytes) {
             Ok(decoded) => decoded,
-            Err(_) => return Ok(generate_plain_table(&code)),
+            Err(_) => return Ok((generate_plain_table(&code), true)),
         };
         let error = decoded
             .get("error")
@@ -1713,25 +1728,28 @@ impl crate::graphql_inventory_c::CodeHighlighter for SyntectCodeHighlighter {
             .unwrap_or("");
         if !error.is_empty() {
             // `highlight.Code` surfaces all server-side highlighting errors as
-            // a plain-text table (`err == nil`).
-            return Ok(generate_plain_table(&code));
+            // a plain-text table (`err == nil`, `aborted=true`).
+            return Ok((generate_plain_table(&code), true));
         }
         let scip = decoded
             .get("scip")
             .and_then(|value| value.as_str())
             .unwrap_or("");
         if !scip.is_empty() {
-            return Ok(scip.to_string());
+            return Ok((scip.to_string(), false));
         }
-        Ok(decoded
-            .get("data")
-            .and_then(|value| value.as_str())
-            .unwrap_or("")
-            .to_string())
+        Ok((
+            decoded
+                .get("data")
+                .and_then(|value| value.as_str())
+                .unwrap_or("")
+                .to_string(),
+            false,
+        ))
     }
 }
 
-fn normalize_filepath(filepath: &str) -> String {
+pub(crate) fn normalize_filepath(filepath: &str) -> String {
     match filepath.rfind('.') {
         Some(pos) => format!(
             "{}.{}",
@@ -1743,7 +1761,7 @@ fn normalize_filepath(filepath: &str) -> String {
 }
 
 /// `DetectSyntaxHighlightingLanguage` + enry's extension strategy.
-fn detect_language(filepath: &str, content: &str) -> String {
+pub(crate) fn detect_language(filepath: &str, content: &str) -> String {
     let extension = filepath.rsplit('.').next().unwrap_or("");
     // `baseHighlightConfig.Extensions` overrides enry.
     let base = match extension {
@@ -1815,15 +1833,24 @@ fn go_json_string(input: &str) -> String {
     out
 }
 
-fn build_highlight_request(filepath: &str, language: &str, code: &str) -> String {
+fn build_highlight_request(
+    filepath: &str,
+    language: &str,
+    code: &str,
+    highlight_long_lines: bool,
+) -> String {
     let mut body = String::from("{\"filepath\":");
     body.push_str(&go_json_string(filepath));
     body.push_str(",\"filetype\":");
     body.push_str(&go_json_string(language));
     body.push_str(",\"code\":");
     body.push_str(&go_json_string(code));
-    body.push_str(",\"line_length_limit\":");
-    body.push_str(&LINE_LENGTH_LIMIT.to_string());
+    // Go `Query.LineLengthLimit` has `omitempty`: 0 (highlightLongLines) is
+    // omitted, otherwise 2000.
+    if !highlight_long_lines {
+        body.push_str(",\"line_length_limit\":");
+        body.push_str(&LINE_LENGTH_LIMIT.to_string());
+    }
     body.push_str(",\"engine\":\"syntect\"}");
     body
 }

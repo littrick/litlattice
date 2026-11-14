@@ -379,6 +379,8 @@ pub struct BlameKey {
 pub struct GitserverGitObjects {
     live: Arc<sg_config::LiveConfig>,
     clients: tokio::sync::Mutex<HashMap<Vec<String>, Arc<sg_git::GitserverClient>>>,
+    /// M9.36d: production syntax highlighting (`highlight.CodeAsLines`).
+    highlighter: crate::git_comparison_graphql::CodeHighlighterSource,
 }
 
 impl GitserverGitObjects {
@@ -386,6 +388,7 @@ impl GitserverGitObjects {
         Self {
             live,
             clients: tokio::sync::Mutex::new(HashMap::new()),
+            highlighter: crate::git_comparison_graphql::CodeHighlighterSource::production(),
         }
     }
 
@@ -466,6 +469,12 @@ impl GitObjectSource for GitserverGitObjects {
 
     fn commit_extra(&self) -> Option<&dyn crate::git_commit_extra::GitCommitExtraSource> {
         Some(self)
+    }
+
+    /// M9.36d: wire the existing M9.23c `CodeHighlighter` into the production
+    /// `GitObjectSource` so `FileDiffHunk.highlight` returns real markup.
+    fn highlighter(&self) -> Option<&dyn crate::git_comparison_graphql::HighlightSource> {
+        Some(&self.highlighter)
     }
 
     async fn stat(

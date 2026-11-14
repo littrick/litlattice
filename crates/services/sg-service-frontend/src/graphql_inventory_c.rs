@@ -138,6 +138,21 @@ pub trait CodeHighlighter: Send + Sync {
         filepath: &str,
         disable_timeout: bool,
     ) -> Result<String, String>;
+
+    /// M9.36d: the full `highlight.Code` contract used by `CodeAsLines`:
+    /// `highlightLongLines` selects `line_length_limit=2000` (omitted when
+    /// true) and the boolean reports whether highlighting was aborted into a
+    /// plain-text table (timeout/server error). The default keeps existing
+    /// implementations working by never aborting.
+    async fn highlight_with_options(
+        &self,
+        code: &str,
+        filepath: &str,
+        disable_timeout: bool,
+        _highlight_long_lines: bool,
+    ) -> Result<(String, bool), String> {
+        Ok((self.highlight(code, filepath, disable_timeout).await?, false))
+    }
 }
 
 /// `backend.ExternalServicesService.ListNamespaces` / `DiscoverRepos`
