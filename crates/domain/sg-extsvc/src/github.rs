@@ -229,6 +229,125 @@ pub struct RestPublicRepository {
     pub fork: bool,
 }
 
+/// `github.restCommitTree` (REST commit tree object).
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+pub struct RestCommitTree {
+    #[serde(default)]
+    pub url: String,
+    #[serde(default)]
+    pub sha: String,
+}
+
+/// `github.restCommitParent`.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+pub struct RestCommitParent {
+    #[serde(default)]
+    pub url: String,
+    #[serde(default)]
+    pub sha: String,
+}
+
+/// `github.restAuthorCommiter`.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+pub struct RestAuthorCommitter {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub email: String,
+    #[serde(default)]
+    pub date: String,
+}
+
+/// `github.Verification` (REST commit verification object).
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+pub struct Verification {
+    #[serde(default)]
+    pub verified: bool,
+    #[serde(default)]
+    pub reason: String,
+    #[serde(default)]
+    pub signature: String,
+    #[serde(default)]
+    pub payload: String,
+}
+
+/// The nested `commit` object of [`RestCommitRef`].
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+pub struct RestCommitRefCommit {
+    #[serde(default)]
+    pub url: String,
+    #[serde(default)]
+    pub author: Option<RestAuthorCommitter>,
+    #[serde(default)]
+    pub committer: Option<RestAuthorCommitter>,
+    #[serde(default)]
+    pub message: String,
+    #[serde(default)]
+    pub tree: RestCommitTree,
+}
+
+/// `github.restCommitRef` — from `GET repos/{owner}/{repo}/commits/{ref}`.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+pub struct RestCommitRef {
+    #[serde(default)]
+    pub url: String,
+    #[serde(default)]
+    pub sha: String,
+    #[serde(default)]
+    pub node_id: String,
+    #[serde(default)]
+    pub commit: RestCommitRefCommit,
+    #[serde(default)]
+    pub parents: Vec<RestCommitParent>,
+}
+
+/// `github.RestCommit` — from `POST repos/{owner}/{repo}/git/commits`.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+pub struct RestCommit {
+    #[serde(default)]
+    pub url: String,
+    #[serde(default)]
+    pub sha: String,
+    #[serde(default)]
+    pub node_id: String,
+    #[serde(default)]
+    pub author: Option<RestAuthorCommitter>,
+    #[serde(default)]
+    pub committer: Option<RestAuthorCommitter>,
+    #[serde(default)]
+    pub message: String,
+    #[serde(default)]
+    pub tree: RestCommitTree,
+    #[serde(default)]
+    pub parents: Vec<RestCommitParent>,
+    #[serde(default)]
+    pub verification: Verification,
+}
+
+/// `github.restUpdatedRef.object`.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+pub struct RestUpdatedRefObject {
+    #[serde(rename = "type", default)]
+    pub type_: String,
+    #[serde(default)]
+    pub sha: String,
+    #[serde(default)]
+    pub url: String,
+}
+
+/// `github.restUpdatedRef` — from `PATCH repos/{owner}/{repo}/git/{ref}`.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+pub struct RestUpdatedRef {
+    #[serde(default)]
+    pub r#ref: String,
+    #[serde(default)]
+    pub node_id: String,
+    #[serde(default)]
+    pub url: String,
+    #[serde(default)]
+    pub object: RestUpdatedRefObject,
+}
+
 /// `github.convertRestRepoPermissions`.
 fn convert_rest_repo_permissions(permissions: &RestRepositoryPermissions) -> String {
     if permissions.admin {
@@ -936,6 +1055,122 @@ impl V3Client {
             has_next_page: page * 100 < response.total_count,
         })
     }
+
+    /// `V3Client.patch`: the `PATCH` verb, used by `UpdateRef`.
+    async fn patch(
+        &self,
+        request_uri: &str,
+        payload: &Value,
+    ) -> Result<(ResponseState, Vec<u8>), GithubError> {
+        let body = serde_json::to_vec(payload)
+            .map_err(|err| GithubError::Json(format!("marshalling payload: {err}")))?;
+        self.request("PATCH", request_uri, body).await
+    }
+
+    /// `V3Client.GetRef`: `GET repos/{owner}/{repo}/commits/{ref}`.
+    pub async fn get_ref(
+        &self,
+        owner: &str,
+        repo: &str,
+        reference: &str,
+    ) -> Result<RestCommitRef, GithubError> {
+        let (_, commit) = self
+            .get_json::<RestCommitRef>(&format!("repos/{owner}/{repo}/commits/{reference}"))
+            .await?;
+        Ok(commit.unwrap_or_default())
+    }
+
+    /// `V3Client.CreateCommit`: `POST repos/{owner}/{repo}/git/commits`.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_commit(
+        &self,
+        owner: &str,
+        repo: &str,
+        message: &str,
+        tree: &str,
+        parents: &[String],
+        author: Option<&RestAuthorCommitter>,
+        committer: Option<&RestAuthorCommitter>,
+    ) -> Result<RestCommit, GithubError> {
+        // `encoding/json` with `omitempty` drops nil author/committer.
+        let mut payload = serde_json::Map::new();
+        payload.insert("message".into(), json!(message));
+        payload.insert("tree".into(), json!(tree));
+        payload.insert("parents".into(), json!(parents));
+        if let Some(author) = author {
+            payload.insert(
+                "author".into(),
+                json!({"name": author.name, "email": author.email, "date": author.date}),
+            );
+        }
+        if let Some(committer) = committer {
+            payload.insert(
+                "committer".into(),
+                json!({"name": committer.name, "email": committer.email, "date": committer.date}),
+            );
+        }
+        let (_, commit) = self
+            .post_json::<RestCommit>(
+                &format!("repos/{owner}/{repo}/git/commits"),
+                &Value::Object(payload),
+            )
+            .await?;
+        Ok(commit.unwrap_or_default())
+    }
+
+    /// `V3Client.UpdateRef`: `PATCH repos/{owner}/{repo}/git/{ref}` with
+    /// `{sha, force: true}`.
+    pub async fn update_ref(
+        &self,
+        owner: &str,
+        repo: &str,
+        reference: &str,
+        commit: &str,
+    ) -> Result<RestUpdatedRef, GithubError> {
+        let payload = json!({"sha": commit, "force": true});
+        let (_, updated) = self
+            .patch_json::<RestUpdatedRef>(
+                &format!("repos/{owner}/{repo}/git/{reference}"),
+                &payload,
+            )
+            .await?;
+        Ok(updated.unwrap_or_default())
+    }
+
+    async fn post_json<T: serde::de::DeserializeOwned>(
+        &self,
+        request_uri: &str,
+        payload: &Value,
+    ) -> Result<(ResponseState, Option<T>), GithubError> {
+        let (state, body) = self.post(request_uri, payload).await?;
+        decode_json::<T>(state, body)
+    }
+
+    async fn patch_json<T: serde::de::DeserializeOwned>(
+        &self,
+        request_uri: &str,
+        payload: &Value,
+    ) -> Result<(ResponseState, Option<T>), GithubError> {
+        let (state, body) = self.patch(request_uri, payload).await?;
+        decode_json::<T>(state, body)
+    }
+}
+
+/// `decode_json` mirrors `get_json`'s empty-body handling for the REST write
+/// endpoints.
+fn decode_json<T: serde::de::DeserializeOwned>(
+    state: ResponseState,
+    body: Vec<u8>,
+) -> Result<(ResponseState, Option<T>), GithubError> {
+    if state.status == 204 || state.status == 304 {
+        return Ok((state, None));
+    }
+    if body.is_empty() {
+        return Err(GithubError::Json("EOF".to_owned()));
+    }
+    let value = serde_json::from_slice(&body)
+        .map_err(|err| GithubError::Json(format!("json: {err}")))?;
+    Ok((state, Some(value)))
 }
 
 /// `github.User`.
