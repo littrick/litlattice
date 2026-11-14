@@ -33,6 +33,7 @@ use sg_zoekt::indexed_repo_revs::IndexedRepoRevs;
 
 use crate::search_job::{JobContext, JobError, RuntimeClients, SearchJob, Verbosity};
 use crate::search_jobutil_combinators as comb;
+use crate::search_owners;
 use crate::search_jobutil_filters::{
     self, CommitContentSearcher, ContributorFetcher, ContributorOptions, ContainsPatternError,
 };
@@ -50,16 +51,30 @@ const SEARCHER_NOT_PORTED: &str = "searcher backend is not ported yet";
 pub struct OwnershipRef {
     pub handle: String,
     pub email: String,
+    /// Set for assigned owners (`own.Reference.UserID`).
+    pub user_id: Option<i32>,
+    /// Set for assigned teams (`own.Reference.TeamID`).
+    pub team_id: Option<i32>,
+    /// `own.RepoContext.CodeHostKind` for `ResolutionGuess` (github teams).
+    pub code_host_kind: Option<String>,
+    pub repo_name: Option<String>,
 }
 
 /// `own.Search` rules lookup: owner references matching `path` at `commit`.
 pub trait OwnershipFetcher {
     fn owners(
         &self,
-        repo: &str,
+        repo_id: i32,
+        repo_name: &str,
         commit: &str,
         path: &str,
     ) -> Result<Vec<OwnershipRef>, JobError>;
+
+    /// `own.ByTextReference(...).Resolve`: references that resolve to the same
+    /// user/team as `text`. Errors are swallowed by the baseline.
+    fn resolve_text(&self, _text: &str) -> Vec<OwnershipRef> {
+        Vec::new()
+    }
 }
 
 /// Optional leaf collaborators injected through
@@ -498,11 +513,23 @@ fn max_alert(current: Option<comb::Alert>, candidate: Option<comb::Alert>) -> Op
     }
 }
 
+/// `own.ByTextReference(ctx, db, text)` plus DB resolution: the text key plus
+/// every reference the resolved user/team is known by (`bag.linkBack`).
+fn build_bag(ownership: Option<&dyn OwnershipFetcher>, term: &str) -> search_owners::Bag {
+    let mut bag = search_owners::Bag::by_text_reference(term);
+    if let Some(fetcher) = ownership {
+        for reference in fetcher.resolve_text(term) {
+            bag.add_reference(&reference);
+        }
+    }
+    bag
+}
+
 /// `ownersFilters` (`filter_job.go:154-172`).
-fn owners_filters(
+pub fn ownership_terms_match(
     owners: &[OwnershipRef],
     search_terms: &[String],
-    all_bags: &[Vec<String>],
+    all_bags: &[search_owners::Bag],
     exclude: bool,
 ) -> bool {
     // Empty search terms means "any owner matches".
@@ -510,37 +537,12 @@ fn owners_filters(
         return !owners.is_empty() == !exclude;
     }
     for bag in all_bags {
-        if is_within(owners, bag) == exclude {
+        let within = owners.iter().any(|owner| bag.contains(owner));
+        if within == exclude {
             return false;
         }
     }
     true
-}
-
-/// `own.bag.Contains` for one `ByTextReference` term.
-fn is_within(owners: &[OwnershipRef], bag: &[String]) -> bool {
-    owners.iter().any(|owner| {
-        bag.iter().any(|term| {
-            if let Some(handle) = term.strip_prefix('@') {
-                owner.handle.trim_start_matches('@') == handle
-            } else if term.contains('@') {
-                owner.email == *term
-            } else {
-                owner.handle.trim_start_matches('@') == term
-            }
-        })
-    })
-}
-
-/// `own.ByTextReference` reduced to the reference keys it registers.
-fn bag_for_term(term: &str) -> Vec<String> {
-    // `mail.ParseAddress` succeeding means an email key; otherwise the handle
-    // key is stored with its leading `@` stripped.
-    if term.contains('@') && !term.trim_start_matches('@').starts_with('@') {
-        vec![term.to_owned()]
-    } else {
-        vec![term.trim_start_matches('@').to_owned()]
-    }
 }
 
 /// `fileHasOwnersJob` (`filter_job.go:17-80`).
@@ -563,8 +565,10 @@ impl comb::CombinatorJob for FileHasOwnersLeafJob {
             child,
         } = self;
         let ownership = leaf_clients(clients).and_then(LeafJobClients::ownership_fetcher);
-        let include_bags: Vec<Vec<String>> = include.iter().map(|t| bag_for_term(t)).collect();
-        let exclude_bags: Vec<Vec<String>> = exclude.iter().map(|t| bag_for_term(t)).collect();
+        let include_bags: Vec<search_owners::Bag> =
+            include.iter().map(|term| build_bag(ownership, term)).collect();
+        let exclude_bags: Vec<search_owners::Bag> =
+            exclude.iter().map(|term| build_bag(ownership, term)).collect();
         let mut had_error = false;
 
         let (mut alert, failure) = {
@@ -603,9 +607,9 @@ impl comb::CombinatorJob for FileHasOwnersLeafJob {
 
 fn apply_ownership_filtering(
     ownership: Option<&dyn OwnershipFetcher>,
-    include_bags: &[Vec<String>],
+    include_bags: &[search_owners::Bag],
     include_terms: &[String],
-    exclude_bags: &[Vec<String>],
+    exclude_bags: &[search_owners::Bag],
     exclude_terms: &[String],
     matches: Vec<Match>,
 ) -> (Vec<Match>, bool) {
@@ -637,7 +641,7 @@ fn apply_ownership_filtering(
         };
         let mut file_owner_sets = Vec::with_capacity(paths.len());
         for path in &paths {
-            match ownership.owners(&repo.name, &commit, path) {
+            match ownership.owners(repo.id, &repo.name, &commit, path) {
                 Ok(owners) => file_owner_sets.push(owners),
                 Err(_) => {
                     had_error = true;
@@ -649,11 +653,11 @@ fn apply_ownership_filtering(
         let mut file_matches_include_terms = false;
         for owners in &file_owner_sets {
             if !include_terms.is_empty()
-                && owners_filters(owners, include_terms, include_bags, false)
+                && ownership_terms_match(owners, include_terms, include_bags, false)
             {
                 file_matches_include_terms = true;
             }
-            if !exclude_terms.is_empty() && !owners_filters(owners, exclude_terms, exclude_bags, true)
+            if !exclude_terms.is_empty() && !ownership_terms_match(owners, exclude_terms, exclude_bags, true)
             {
                 continue 'matches;
             }
@@ -665,6 +669,35 @@ fn apply_ownership_filtering(
     }
 
     (filtered, had_error)
+}
+
+/// `own.Reference.ResolutionGuess` (`ownref.go:46`). Assigned owners
+/// (`user_id`/`team_id`) are already resolved by the production fetcher; the
+/// explicit `team_id` branch keeps those resolved teams intact.
+pub fn resolution_guess(reference: &OwnershipRef) -> Option<ResolvedOwner> {
+    if reference.handle.is_empty() && reference.email.is_empty() {
+        return None;
+    }
+    let is_github_team = reference
+        .code_host_kind
+        .as_deref()
+        .is_some_and(|kind| kind.eq_ignore_ascii_case("github"))
+        && reference.handle.contains('/');
+    if reference.team_id.is_some() || is_github_team {
+        let name = reference.handle.clone();
+        Some(ResolvedOwner::Team {
+            handle: reference.handle.clone(),
+            email: reference.email.clone(),
+            name: name.clone(),
+            display_name: name,
+        })
+    } else {
+        Some(ResolvedOwner::Person {
+            handle: reference.handle.clone(),
+            email: reference.email.clone(),
+            user: None,
+        })
+    }
 }
 
 /// `selectOwnersJob` (`select_job.go:17-95`).
@@ -682,7 +715,7 @@ impl comb::CombinatorJob for SelectOwnersLeafJob {
         let ownership = leaf_clients(clients).and_then(LeafJobClients::ownership_fetcher);
         let mut had_error = false;
         let mut has_result_with_no_owners = false;
-        let mut seen: HashSet<(i32, String, String, String)> = HashSet::new();
+        let mut seen: HashSet<(String, String, String, String, String)> = HashSet::new();
 
         let (mut alert, failure) = {
             let mut filtered = |event: SearchEvent| {
@@ -697,6 +730,7 @@ impl comb::CombinatorJob for SelectOwnersLeafJob {
                         continue;
                     };
                     let refs = match ownership.owners(
+                        fm.file.repo.id,
                         &fm.file.repo.name,
                         &fm.file.commit_id,
                         &fm.file.path,
@@ -712,21 +746,29 @@ impl comb::CombinatorJob for SelectOwnersLeafJob {
                         continue;
                     }
                     for reference in refs {
-                        if reference.handle.is_empty() && reference.email.is_empty() {
+                        // `Reference.ResolutionGuess` returns nil when there is
+                        // no handle or email to guess from; the baseline raises
+                        // `ownership-search-error` and skips the reference.
+                        let Some(owner) = resolution_guess(&reference) else {
                             had_error = true;
                             continue;
-                        }
-                        // `Reference.ResolutionGuess` for an unresolved owner.
-                        let owner = ResolvedOwner::Person {
-                            handle: reference.handle.clone(),
-                            email: reference.email.clone(),
-                            user: None,
                         };
+                        let (owner_type, owner_identifier) = match &owner {
+                            ResolvedOwner::Person { handle, email, .. } => {
+                                ("person", format!("Person:{handle}{email}"))
+                            }
+                            ResolvedOwner::Team { handle, .. } => {
+                                ("team", format!("Team:{handle}"))
+                            }
+                        };
+                        // `OwnerMatch.Key`: repo name, commit, input rev and
+                        // `Type()+Identifier()`.
                         let key = (
-                            fm.file.repo.id,
+                            owner_type.to_owned(),
+                            owner_identifier,
+                            fm.file.repo.name.clone(),
                             fm.file.commit_id.clone(),
-                            reference.handle.clone(),
-                            reference.email.clone(),
+                            fm.file.input_rev.clone().unwrap_or_default(),
                         );
                         if seen.insert(key) {
                             owners.push(Match::Owner(OwnerMatch {
