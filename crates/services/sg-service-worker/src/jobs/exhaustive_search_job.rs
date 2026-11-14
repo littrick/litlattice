@@ -752,6 +752,50 @@ mod tests {
         );
     }
 
+    /// M9.40c: the worker's exhaustive-search runtime and the code-monitor
+    /// commit-search runtime must both carry the `file:contains.content()`
+    /// diff searcher (`LeafJobClients.content_searcher`), otherwise commit/diff
+    /// results are silently dropped by the filter (`searcher?`).
+    #[tokio::test]
+    async fn production_runtimes_wire_content_searcher() {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://unused@localhost/unused")
+            .expect("lazy pool");
+        let live = LiveConfig::new(sg_config::Unified::default());
+        let config = live.current();
+
+        let exhaustive = sg_service_frontend::search_runtime::assemble_exhaustive(
+            &pool,
+            &config.service_connections,
+            &config.site,
+        );
+        let leaf = exhaustive
+            .clients
+            .commit
+            .as_ref()
+            .and_then(|commit| commit.leaf.as_ref())
+            .expect("exhaustive commit clients");
+        assert!(
+            leaf.content_searcher.is_some(),
+            "exhaustive search must wire file:contains.content()'s searcher"
+        );
+
+        let commit_search = sg_service_frontend::search_runtime::assemble_commit_search(
+            &pool,
+            &config.service_connections,
+            &config.site,
+        );
+        let leaf = commit_search
+            .commit
+            .as_ref()
+            .and_then(|commit| commit.leaf.as_ref())
+            .expect("commit-search clients");
+        assert!(
+            leaf.content_searcher.is_some(),
+            "commit search must wire file:contains.content()'s searcher"
+        );
+    }
+
     #[test]
     fn appends_errors_like_multi_error() {
         assert_eq!(append_errors(None, None), None);

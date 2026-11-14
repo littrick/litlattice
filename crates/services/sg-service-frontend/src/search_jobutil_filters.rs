@@ -297,10 +297,17 @@ pub(crate) fn filter_event(
 /// Job-tree entry point: the construction layer already stored the final
 /// (case-folded) regexp sources in `NodeKind::FileContains`, so recompile them
 /// verbatim and reuse [`filter_event`].
+///
+/// The diff searcher still needs the *raw* `file:contains.content()` patterns
+/// and the original case-sensitivity flag: Go passes those verbatim to
+/// `searcher.Search` (`filter_file_contains.go:187-192`) because the searcher
+/// mishandles `(?i:)` case-insensitive regexps (`filter_file_contains.go:74-79`).
 pub(crate) fn filter_event_from_sources(
     event: SearchEvent,
     include_sources: &[String],
     original_sources: &[String],
+    raw_include_patterns: &[String],
+    case_sensitive: bool,
     searcher: Option<&dyn CommitContentSearcher>,
 ) -> Result<SearchEvent, ContainsPatternError> {
     let include_matchers =
@@ -311,8 +318,8 @@ pub(crate) fn filter_event_from_sources(
         event,
         &include_matchers,
         &original_pattern_matchers,
-        include_sources,
-        false,
+        raw_include_patterns,
+        case_sensitive,
         searcher,
     ))
 }

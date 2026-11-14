@@ -30,6 +30,7 @@
 //! See `docs/overviews/m9_8im_search_runtime_assembly_overview.md`.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use sqlx::PgPool;
 use tokio_stream::StreamExt;
@@ -53,9 +54,9 @@ use crate::search_repos::{
     ResolverSearcher, ResolverZoektLister,
 };
 use crate::search_searcher_client::{
-    default_searcher_client, grpc_client_from_endpoints, run_to_completion, SearcherClient,
-    SearcherClients, SearcherError, SearcherGitserver, SearcherLimiter, SymbolsClient,
-    SymbolsParameters, SymbolsResponse, NOT_PORTED_MESSAGE,
+    default_searcher_client, grpc_client_from_endpoints, protocol, run_to_completion,
+    SearcherClient, SearcherClients, SearcherError, SearcherGitserver, SearcherLimiter,
+    SymbolsClient, SymbolsParameters, SymbolsResponse, NOT_PORTED_MESSAGE,
 };
 use crate::search_stream::{RepoPagerRuntimeClients, TreeRuntimeClients};
 use crate::symbols_client::GrpcSymbolsClient;
@@ -231,14 +232,66 @@ fn assemble_searcher_clients(
 /// `db.UserEmails` + `gitserver.DefaultClient`; a missing git server list
 /// surfaces as an RPC error rather than a not-ported leaf.
 ///
+/// `searcher.Search` used by `file:contains.content()`'s diff filter
+/// (`filter_file_contains.go:163-221`). The baseline runs one unindexed search
+/// per include pattern at the commit of each streamed diff match; the request
+/// construction mirrors that call exactly.
+struct SearcherContentSearcher {
+    client: Arc<dyn SearcherClient + Send + Sync>,
+}
+
+impl crate::search_jobutil_filters::CommitContentSearcher for SearcherContentSearcher {
+    fn search_include(
+        &self,
+        request: &crate::search_jobutil_filters::IncludeSearchRequest,
+    ) -> Result<Vec<String>, JobError> {
+        let protocol_request = protocol::Request {
+            repo: request.repo_name.clone(),
+            repo_id: request.repo_id as u32,
+            commit: request.commit_id.clone(),
+            branch: String::new(),
+            pattern_info: protocol::PatternInfo {
+                query: Some(protocol::QueryNode::Pattern(protocol::PatternNode {
+                    value: request.pattern.clone(),
+                    is_negated: false,
+                    is_regexp: true,
+                    boost: false,
+                })),
+                is_case_sensitive: request.is_case_sensitive,
+                include_paths: vec![request.include_paths.clone()],
+                limit: request.file_match_limit as i32,
+                pattern_matches_content: true,
+                ..Default::default()
+            },
+            fetch_timeout: Duration::from_secs(3600),
+            indexed: false,
+            num_context_lines: 0,
+        };
+        let mut paths = Vec::new();
+        self.client
+            .search(&protocol_request, &mut |file_match| {
+                paths.push(file_match.path.clone())
+            })
+            .map_err(|error| JobError(error.to_string()))?;
+        Ok(paths)
+    }
+}
+
 /// M9.39c also wires the leaf collaborators the baseline installs on the same
 /// client: `file:has.contributor()` (`gitserver.Client.ContributorCount`) and
 /// `own.Search` (`own.NewService(gitserver, db)`). `key` decrypts
 /// `user_external_accounts.account_data` for the owners bag augmentation.
+///
+/// M9.40c wires `file:contains.content()`'s diff filter: the baseline calls
+/// `searcher.Search` with `clients.SearcherURLs` / `SearcherGRPCConnectionCache`
+/// (`filter_file_contains.go:163`). The searcher client is shared with the
+/// rest of the tree; pass it in so `LeafJobClients.content_searcher` is never
+/// silently `None` in a production runtime.
 fn assemble_commit_clients(
     pool: &PgPool,
     gitserver: &Arc<GitClient>,
     key: Option<Arc<dyn Key>>,
+    content_searcher: Option<Arc<dyn SearcherClient + Send + Sync>>,
 ) -> Arc<CommitRuntimeClientsOwned> {
     use crate::search_jobutil_filters::ContributorFetcher;
     use crate::search_leaf_jobs::OwnershipFetcher;
@@ -268,7 +321,10 @@ fn assemble_commit_clients(
         }),
         leaf: Some(crate::search_leaf_jobs::LeafJobClients {
             contributors: Some(contributors),
-            content_searcher: None,
+            content_searcher: content_searcher.map(|client| {
+                Arc::new(SearcherContentSearcher { client })
+                    as Arc<dyn crate::search_jobutil_filters::CommitContentSearcher + Send + Sync>
+            }),
             ownership: Some(ownership),
         }),
     })
@@ -297,6 +353,9 @@ fn assemble_inner(
         pool,
         &gitserver,
         user_external_account_key,
+        searcher
+            .as_ref()
+            .map(|searcher| Arc::clone(&searcher.client)),
     ));
 
     // `repos.Resolver` (M9.10a). The production resolver shares the zoekt
@@ -373,7 +432,14 @@ pub fn assemble_exhaustive(
     // See `assemble_inner`: the baseline always has searcher/symbols/commit
     // clients, so exhaustive search keeps the same shape.
     let searcher = Some(assemble_searcher_clients(connections, &gitserver));
-    let commit = Some(assemble_commit_clients(pool, &gitserver, None));
+    let commit = Some(assemble_commit_clients(
+        pool,
+        &gitserver,
+        None,
+        searcher
+            .as_ref()
+            .map(|searcher| Arc::clone(&searcher.client)),
+    ));
 
     // Exhaustive queries never touch indexed zoekt (`index:no`); the
     // resolver's zoekt lister only backs `repohasfile` filters, which are not
@@ -690,7 +756,12 @@ pub fn assemble_commit_search(
     let gitserver = Arc::new(GitClient::new(connections.git_servers.clone()));
     let gitserver_addrs = gitserver_addresses(connections, site);
     let searcher = assemble_searcher_clients(connections, &gitserver);
-    let commit = Some(assemble_commit_clients(pool, &gitserver, None));
+    let commit = Some(assemble_commit_clients(
+        pool,
+        &gitserver,
+        None,
+        Some(Arc::clone(&searcher.client)),
+    ));
 
     // Code-monitor plans use `repoPagerJob{skipPartitioning:true}` and only
     // commit leaves, so the resolver's zoekt lister is never called; the

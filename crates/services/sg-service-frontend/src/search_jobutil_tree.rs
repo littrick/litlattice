@@ -504,6 +504,10 @@ enum NodeKind {
     FileContains {
         original_patterns: Vec<String>,
         filter_patterns: Vec<String>,
+        /// Raw `file:contains.content()` patterns for the diff searcher.
+        raw_filter_patterns: Vec<String>,
+        /// `search.TextPatternInfo.IsCaseSensitive` for the diff searcher.
+        case_sensitive: bool,
     },
     FileHasOwners {
         include: Vec<String>,
@@ -807,6 +811,7 @@ impl JobNode {
             NodeKind::FileContains {
                 original_patterns,
                 filter_patterns,
+                ..
             } => vec![
                 (
                     "originalPatterns".to_owned(),
@@ -2275,9 +2280,13 @@ impl JobNode {
             NodeKind::FileContains {
                 original_patterns,
                 filter_patterns,
+                raw_filter_patterns,
+                case_sensitive,
             } => Box::new(crate::search_leaf_jobs::FileContainsLeafJob {
                 include_patterns: filter_patterns.clone(),
                 original_patterns: original_patterns.clone(),
+                raw_include_patterns: raw_filter_patterns.clone(),
+                case_sensitive: *case_sensitive,
                 searcher: None,
                 child: only_child(children),
             }),
@@ -3530,6 +3539,8 @@ fn new_file_contains_filter(
         NodeKind::FileContains {
             original_patterns: original_matchers,
             filter_patterns: include_matchers,
+            raw_filter_patterns: include_patterns,
+            case_sensitive,
         },
         vec![child],
     ))
