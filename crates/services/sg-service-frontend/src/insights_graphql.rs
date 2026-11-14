@@ -54,7 +54,9 @@ pub const DASHBOARD_KIND: &str = "dashboard";
 pub struct InsightViewFilters {
     pub include_repo_regex: Option<String>,
     pub exclude_repo_regex: Option<String>,
-    /// `None` reproduces a SQL `NULL` array (Go nil slice → JSON null).
+    /// `None` reproduces a SQL `NULL` array. Go scans it into a nil slice and
+    /// the GraphQL resolver returns a non-nil pointer to it, which renders as
+    /// `[]`; the output mapping below treats `None` the same way.
     pub search_contexts: Option<Vec<String>>,
 }
 
@@ -1680,16 +1682,20 @@ impl ObjectValue for InsightViewFiltersObject {
                 Some(value) => FieldValue::Json(Json::Str(value.clone())),
                 None => FieldValue::Null,
             })),
-            "searchContexts" => Ok(Some(match &self.filters.search_contexts {
-                Some(contexts) => FieldValue::List {
+            // `insightViewFiltersResolver.SearchContexts` returns a non-nil
+            // `*[]string` pointing at the store's slice, so Go renders a SQL
+            // `NULL` array as `[]`, never `null`. Mirror that here instead of
+            // leaking the `None`.
+            "searchContexts" => {
+                let contexts = self.filters.search_contexts.as_deref().unwrap_or(&[]);
+                Ok(Some(FieldValue::List {
                     element_type: Some("String"),
                     items: contexts
                         .iter()
                         .map(|context| FieldValue::Json(Json::Str(context.clone())))
                         .collect(),
-                },
-                None => FieldValue::Null,
-            })),
+                }))
+            }
             _ => Ok(None),
         }
     }
