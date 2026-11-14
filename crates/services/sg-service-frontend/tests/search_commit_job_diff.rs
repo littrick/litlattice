@@ -597,6 +597,7 @@ fn run(case: &Case) -> Value {
     let clients = CommitRuntimeClients {
         db: &db,
         gitserver: &gitserver,
+        leaf: None,
     };
 
     let mut job = SearchJob {

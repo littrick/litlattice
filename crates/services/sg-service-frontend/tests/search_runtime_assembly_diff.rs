@@ -1299,6 +1299,7 @@ fn run_case(case: &Case) -> Value {
         commit: Some(Arc::new(CommitRuntimeClientsOwned {
             db: db.clone(),
             gitserver: gitserver.clone(),
+            leaf: None,
         })),
         repo_pager: None,
     };

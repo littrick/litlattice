@@ -595,6 +595,7 @@ fn runtime(case: &Case, gitserver: Arc<FakeGitserver>) -> TreeRuntimeClients {
         commit: Some(Arc::new(CommitRuntimeClientsOwned {
             db: Arc::new(FakeUserDB),
             gitserver,
+            leaf: None,
         })),
         repo_pager: Some(Arc::new(RepoPagerRuntimeClients::new(
             Arc::new(FakePages {
