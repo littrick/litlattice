@@ -44,6 +44,7 @@ pub mod ownership_stats;
 pub mod permission_sync_jobs;
 pub mod perms_store;
 pub mod recent_contribution_signals;
+pub mod recent_view_signals;
 pub mod repo_embeddings;
 pub mod repo_paths;
 pub mod repo_statistics;

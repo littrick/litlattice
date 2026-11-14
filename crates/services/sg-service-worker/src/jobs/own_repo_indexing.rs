@@ -17,7 +17,9 @@
 //! 4. one scheduler routine per [`queue_per_repo_index_jobs`] entry
 //!    (`recent-contributors` every 5m, `analytics` every 24h), each named
 //!    after the job type, with the feature-flag wrapper (`loadConfig`, skip
-//!    when disabled) and the baseline's `ownIndexRepoQuery`.
+//!    when disabled) and the baseline's `ownIndexRepoQuery`;
+//! 5. the standalone `recent-views` routine (every 5m) for
+//!    `internal/own/background/recent_views.go`.
 //!
 //! The handler runs before each record is dispatched through an in-process
 //! token bucket built from `own.background.repoIndexRateLimit` /
@@ -41,10 +43,13 @@
 //!
 //! ## Deferred (documented gaps, see docs §76)
 //!
-//! * `recent-views` (`internal/own/background/recent_views.go`): its routine is
-//!   not registered. It needs `event_logs_scrape_state_own`, which has no Rust
-//!   store yet; the job type never appears in `QueuePerRepoIndexJobs`, so no
-//!   queue records are created for it either.
+//! * `recent-views` (`internal/own/background/recent_views.go`) is ported:
+//!   the bookmark in `event_logs_scrape_state_own`, the `ViewBlob` event
+//!   scan (limit 5000, ascending once bookmarked), sub-repo filtering,
+//!   `BuildAggregateFromEvents` (excluded repo patterns, ancestor counts,
+//!   additive `own_aggregate_recent_view` upserts) and the bookmark advance.
+//!   The routine is registered separately from `QueuePerRepoIndexJobs`, just
+//!   like the baseline.
 //!
 //! ## Errata
 //!
@@ -67,11 +72,21 @@
 //! * Not ported: RED metrics, the repo/commit counters, log lines and
 //!   tracing spans. The store's debug-info lookup for unknown heartbeat IDs
 //!   is also omitted (the framework already logs the unknown id).
+//! * `recent_views.go` advances the bookmark with
+//!   `events[numberOfEvents-1].ID`, indexing the *unfiltered* event list with
+//!   the filtered count. The Rust port keeps that bug verbatim: when events
+//!   are dropped (malformed JSON, sub-repo repo), the bookmark can lag and
+//!   the next run re-counts the tail.
+//! * `encoding/json` matches field names case-insensitively and accepts a
+//!   JSON `null` as zero values; [`parse_repo_path_and_name`] does both.
+//! * `Repos().GetByName` returns a blocked repo together with its
+//!   `BlockedRepoError`; `BuildAggregateFromEvents` treats that as a fatal
+//!   (non-NotFound) error, and so does the Rust port.
 //! * The Rust worker does not watch the site configuration to resize the
 //!   handler pool; `NumHandlers` is read once when the routines are built, the
 //!   same moment the baseline calls `getConcurrencyConfig()`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -102,6 +117,12 @@ pub const SIGNAL_RECENT_CONTRIBUTORS: &str = "recent-contributors";
 
 /// `types.Analytics`.
 pub const SIGNAL_ANALYTICS: &str = "analytics";
+
+/// `types.SignalRecentViews`.
+pub const SIGNAL_RECENT_VIEWS: &str = "recent-views";
+
+/// `recent.RefreshInterval` in `GetOwnIndexSchedulerRoutines`.
+pub const RECENT_VIEWS_REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
 /// `tableName`.
 pub const TABLE_NAME: &str = "own_background_jobs";
@@ -229,7 +250,7 @@ pub struct IndexJobType {
     pub refresh_interval: Duration,
 }
 
-/// `QueuePerRepoIndexJobs` (minus `recent-views`, which has no routine yet).
+/// `QueuePerRepoIndexJobs[0]` (`recent-views` is not queued per repository).
 pub const RECENT_CONTRIBUTORS_JOB: IndexJobType = IndexJobType {
     name: SIGNAL_RECENT_CONTRIBUTORS,
     index_interval: Duration::from_secs(24 * 60 * 60),
@@ -787,6 +808,292 @@ pub fn sub_repo_permissions_enabled(site: &SiteConfiguration) -> bool {
         .and_then(|value| value.get("enabled"))
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false)
+}
+
+/// `authz.SubRepoPermissionChecker` subset used by the recent-views filter:
+/// [`enabled`](SubRepoEnabledChecker::enabled) is `checker.Enabled()`, and
+/// [`enabled_for_repo`](SubRepoEnabledChecker::enabled_for_repo) is
+/// `EnabledForRepo` (the caller still gates on `enabled()` like
+/// `authz.SubRepoEnabledForRepo`).
+#[async_trait]
+pub trait SubRepoEnabledChecker: Send + Sync {
+    fn enabled(&self) -> bool;
+    async fn enabled_for_repo(&self, repo: &str) -> Result<bool, String>;
+}
+
+/// Production checker: `srp.NewSubRepoPermsClient(db.SubRepoPerms())` — the
+/// site feature flag plus `SubRepoPermsStore.RepoSupported` (a private
+/// Perforce repository).
+pub struct DefaultSubRepoChecker {
+    pool: PgPool,
+    site_enabled: bool,
+}
+
+impl DefaultSubRepoChecker {
+    pub fn new(pool: PgPool, site_enabled: bool) -> Self {
+        Self {
+            pool,
+            site_enabled,
+        }
+    }
+}
+
+#[async_trait]
+impl SubRepoEnabledChecker for DefaultSubRepoChecker {
+    fn enabled(&self) -> bool {
+        self.site_enabled
+    }
+
+    async fn enabled_for_repo(&self, repo: &str) -> Result<bool, String> {
+        if !self.site_enabled {
+            return Ok(false);
+        }
+        sg_db::sub_repo_perms::repo_supported(&self.pool, repo)
+            .await
+            .map_err(|err| err.to_string())
+    }
+}
+
+/// Go `json.Unmarshal(event.PublicArgument, &viewBlob)` / `&repoPathAndName`.
+///
+/// Mirrors `encoding/json` into a two-string struct: a JSON `null`, `{}` or a
+/// missing field leaves the zero value (no error), while a wrong field type or
+/// a non-object top-level value is an error. Keys are matched
+/// case-insensitively like `encoding/json`.
+pub fn parse_repo_path_and_name(raw: &str) -> Option<(String, String)> {
+    let value: serde_json::Value = serde_json::from_str(raw).ok()?;
+    let serde_json::Value::Object(map) = value else {
+        // `null` decodes into the struct as zero values; anything else is an
+        // "cannot unmarshal ... into Go value of type" error.
+        return match value {
+            serde_json::Value::Null => Some((String::new(), String::new())),
+            _ => None,
+        };
+    };
+    let field = |key: &str| -> Option<String> {
+        let mut value = String::new();
+        for (candidate, raw) in &map {
+            if candidate.eq_ignore_ascii_case(key) {
+                match raw {
+                    serde_json::Value::Null => value = String::new(),
+                    serde_json::Value::String(s) => value = s.clone(),
+                    _ => return None,
+                }
+            }
+        }
+        Some(value)
+    };
+    Some((field("repoName")?, field("filePath")?))
+}
+
+/// `recentViewsIndexer.handle(ctx, authz.DefaultSubRepoPermsChecker)`.
+pub async fn index_recent_views(
+    pool: &PgPool,
+    checker: &dyn SubRepoEnabledChecker,
+) -> Result<(), String> {
+    let bookmark = sg_db::recent_view_signals::get_bookmark(pool, SIGNAL_RECENT_VIEWS)
+        .await
+        .map_err(|err| format!("getting latest processed event ID: {err}"))?;
+    let events = sg_db::recent_view_signals::list_view_blob_events(pool, bookmark, 5000)
+        .await
+        .map_err(|err| format!("getting event logs: {err}"))?;
+
+    let mut filtered: Vec<sg_db::recent_view_signals::ViewBlobEvent> = Vec::new();
+    let mut sub_repo_cache: HashMap<String, bool> = HashMap::new();
+    for event in &events {
+        let Some((repo_name, _file_path)) = parse_repo_path_and_name(&event.public_argument)
+        else {
+            continue;
+        };
+        if let Some(is_sub_repo) = sub_repo_cache.get(&repo_name) {
+            if !is_sub_repo {
+                filtered.push(event.clone());
+            }
+            continue;
+        }
+        // `authz.SubRepoEnabledForRepo`: a disabled checker short-circuits to
+        // false; only then is `EnabledForRepo` consulted.
+        if !checker.enabled() {
+            filtered.push(event.clone());
+            sub_repo_cache.insert(repo_name, false);
+            continue;
+        }
+        match checker.enabled_for_repo(&repo_name).await {
+            // `r.logger.Debug(...)`: the event is neither kept nor cached.
+            Err(_) => {}
+            Ok(true) => {
+                sub_repo_cache.insert(repo_name, true);
+            }
+            Ok(false) => {
+                filtered.push(event.clone());
+                sub_repo_cache.insert(repo_name, false);
+            }
+        }
+    }
+
+    let number_of_events = filtered.len();
+    if number_of_events == 0 {
+        return Ok(());
+    }
+    build_aggregate_from_events(pool, &filtered)
+        .await
+        .map_err(|err| format!("building aggregates from events: {err}"))?;
+    // Baseline bug kept verbatim: the index is into `events` (unfiltered),
+    // not `filtered`.
+    let new_bookmark = events[number_of_events - 1].id as i32;
+    sg_db::recent_view_signals::update_bookmark(pool, new_bookmark, SIGNAL_RECENT_VIEWS).await
+}
+
+struct RepoMetadata {
+    repo_id: i32,
+    path_to_id: HashMap<String, i32>,
+}
+
+/// `recentViewSignalStore.BuildAggregateFromEvents`.
+async fn build_aggregate_from_events(
+    pool: &PgPool,
+    events: &[sg_db::recent_view_signals::ViewBlobEvent],
+) -> Result<(), String> {
+    // `OwnSignalConfigurations().LoadConfigurations({Name: "recent-views"})`
+    // then `regexifyPatterns` (`%` -> `.*`, unanchored `MatchString`).
+    let raw_patterns = sg_db::recent_view_signals::load_excluded_patterns(pool)
+        .await
+        .map_err(|err| format!("error during fetching own signals configuration: {err}"))?;
+    let mut excludes: Vec<regex::Regex> = Vec::with_capacity(raw_patterns.len());
+    for pattern in raw_patterns {
+        let regex = regex::Regex::new(&pattern.replace('%', ".*"))
+            .map_err(|err| format!("error during fetching own signals configuration: {err}"))?;
+        excludes.push(regex);
+    }
+
+    let mut repo_meta: HashMap<String, RepoMetadata> = HashMap::new();
+    let mut user_to_count_by_path: HashMap<u32, HashMap<(String, String), i32>> = HashMap::new();
+    let mut not_found_repos: HashSet<String> = HashSet::new();
+
+    for event in events {
+        let Some((repo_name, file_path)) = parse_repo_path_and_name(&event.public_argument)
+        else {
+            continue;
+        };
+        if excludes.iter().any(|regex| regex.is_match(&repo_name)) {
+            continue;
+        }
+        let user_id = event.user_id as u32;
+        *user_to_count_by_path
+            .entry(user_id)
+            .or_default()
+            .entry((repo_name.clone(), file_path.clone()))
+            .or_insert(0) += 1;
+
+        if !repo_meta.contains_key(&repo_name) {
+            if not_found_repos.contains(&repo_name) {
+                continue;
+            }
+            let repo = sg_db::repos::RepoStore::new(pool.clone())
+                .get_by_name(&repo_name)
+                .await
+                .map_err(|err| format!("error during fetching the repository: {err}"))?;
+            let Some(repo) = repo else {
+                not_found_repos.insert(repo_name);
+                continue;
+            };
+            if let Some(blocked) = &repo.blocked {
+                // `GetByName` returns `repo, repo.IsBlocked()`.
+                let reason = blocked
+                    .get("reason")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default();
+                return Err(format!(
+                    "error during fetching the repository: repository {} has been blocked. reason: {reason}",
+                    repo.name
+                ));
+            }
+            let mut path_to_id = HashMap::new();
+            path_to_id.insert(file_path.clone(), 0);
+            repo_meta.insert(
+                repo_name.clone(),
+                RepoMetadata {
+                    repo_id: repo.id,
+                    path_to_id,
+                },
+            );
+        }
+        repo_meta
+            .get_mut(&repo_name)
+            .expect("repo metadata inserted above")
+            .path_to_id
+            .insert(file_path, 0);
+    }
+
+    // `ensureRepoPaths` per repo; `paths` and the returned IDs are parallel.
+    for meta in repo_meta.values_mut() {
+        let paths: Vec<String> = meta.path_to_id.keys().cloned().collect();
+        let ids = sg_db::repo_paths::ensure_repo_paths(pool, &paths, meta.repo_id)
+            .await
+            .map_err(|err| format!("cannot insert repo paths: {err}"))?;
+        for (path, id) in paths.into_iter().zip(ids) {
+            meta.path_to_id.insert(path, id);
+        }
+    }
+
+    let mut users: Vec<(u32, HashMap<(String, String), i32>)> =
+        user_to_count_by_path.into_iter().collect();
+    users.sort_by_key(|(user_id, _)| *user_id);
+    for (user_id, path_and_count) in users {
+        let mut repo_path_id_to_count: std::collections::BTreeMap<i32, i32> =
+            std::collections::BTreeMap::new();
+        for ((repo_name, file_path), count) in path_and_count {
+            match repo_meta
+                .get(&repo_name)
+                .and_then(|meta| meta.path_to_id.get(&file_path))
+            {
+                Some(path_id) => {
+                    repo_path_id_to_count.insert(*path_id, count);
+                }
+                None if not_found_repos.contains(&repo_name) => {}
+                None => {
+                    return Err(format!(
+                        "cannot find id of path {file_path:?} of repo {repo_name:?}: this is a bug"
+                    ))
+                }
+            }
+        }
+        sg_db::recent_view_signals::insert_paths(pool, user_id as i32, &repo_path_id_to_count)
+            .await?;
+    }
+    Ok(())
+}
+
+/// `newRecentViewsIndexer(db, logger)` wrapped by `featureFlagWrapper`.
+pub struct RecentViewsHandler {
+    pool: PgPool,
+    live_config: Arc<LiveConfig>,
+}
+
+impl RecentViewsHandler {
+    pub fn new(pool: PgPool, live_config: Arc<LiveConfig>) -> Self {
+        Self { pool, live_config }
+    }
+}
+
+#[async_trait]
+impl Handler for RecentViewsHandler {
+    async fn handle(&self, _ctx: CancellationToken) -> Result<(), HandlerError> {
+        // `featureFlagWrapper.Handle`: `loadConfig`, skip when disabled.
+        let config = load_config(&self.pool, SIGNAL_RECENT_VIEWS)
+            .await
+            .map_err(|err| HandlerError::new(wrap_error("loadConfig", &err)))?;
+        if !config.enabled {
+            return Ok(());
+        }
+        let checker = DefaultSubRepoChecker::new(
+            self.pool.clone(),
+            sub_repo_permissions_enabled(&self.live_config.current().site),
+        );
+        index_recent_views(&self.pool, &checker)
+            .await
+            .map_err(HandlerError::new)
+    }
 }
 
 /// `ownRepoIndexSchedulerJob.Handle`.
@@ -1601,6 +1908,17 @@ impl Job for OwnRepoIndexingQueue {
             routines.push(scheduler.into());
         }
 
+        // `recent-views` is not queued per repo; it has its own periodic
+        // routine appended after the per-repo schedulers.
+        let recent_views = PeriodicRoutine::new(Arc::new(RecentViewsHandler::new(
+            deps.frontend.clone(),
+            deps.live_config.clone(),
+        )))
+        .with_name(SIGNAL_RECENT_VIEWS)
+        .with_description("")
+        .with_interval(RECENT_VIEWS_REFRESH_INTERVAL);
+        routines.push(recent_views.into());
+
         Ok(routines)
     }
 }
@@ -1772,6 +2090,7 @@ mod tests {
                 "own-background-jobs-janitor",
                 "recent-contributors",
                 "analytics",
+                "recent-views",
             ]
         );
         assert_eq!(
@@ -1782,5 +2101,7 @@ mod tests {
         assert_eq!(routines[3].description(), "");
         assert_eq!(routines[3].interval(), Duration::from_secs(5 * 60));
         assert_eq!(routines[4].interval(), Duration::from_secs(24 * 60 * 60));
+        assert_eq!(routines[5].description(), "");
+        assert_eq!(routines[5].interval(), RECENT_VIEWS_REFRESH_INTERVAL);
     }
 }
