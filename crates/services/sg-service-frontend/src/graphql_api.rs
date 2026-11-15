@@ -4587,6 +4587,25 @@ mod tests {
         fn decrypt_url(&self, _raw: &[u8], _encryption_key_id: &str) -> Result<String, String> {
             Err("unexpected Decrypt".to_owned())
         }
+
+        fn counts_for_outbound_webhook(&self, _id: i64) -> Result<(i64, i64), String> {
+            Err("unexpected CountsForOutboundWebhook".to_owned())
+        }
+
+        fn list_logs(
+            &self,
+            _opts: &crate::outbound_webhooks_graphql::LogListOpts,
+        ) -> Result<Vec<crate::outbound_webhooks_graphql::OutboundWebhookLogData>, String> {
+            Err("unexpected ListForOutboundWebhook".to_owned())
+        }
+
+        fn get_job(
+            &self,
+            _id: i64,
+        ) -> Result<Option<crate::outbound_webhooks_graphql::OutboundWebhookJobData>, String>
+        {
+            Err("unexpected GetByID".to_owned())
+        }
     }
 
     #[tokio::test]

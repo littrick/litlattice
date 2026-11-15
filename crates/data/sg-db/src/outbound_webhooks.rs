@@ -390,3 +390,150 @@ pub async fn delete(pool: &PgPool, id: i64) -> Result<(), String> {
         .map_err(|err| err.to_string())?;
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Outbound webhook logs and jobs (`internal/database/outbound_webhook_logs.go`,
+// `outbound_webhook_jobs.go`)
+// ---------------------------------------------------------------------------
+
+/// `types.OutboundWebhookLog` with the encrypted columns kept raw; decryption
+/// is the caller's job (`EncryptableWebhookLogMessage`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutboundWebhookLog {
+    pub id: i64,
+    pub job_id: i64,
+    pub outbound_webhook_id: i64,
+    pub sent_at: OffsetDateTime,
+    pub status_code: i32,
+    /// Empty when the column is NULL (`dbutil.NullString` scan).
+    pub encryption_key_id: String,
+    pub request: Vec<u8>,
+    pub response: Vec<u8>,
+    pub error: Vec<u8>,
+}
+
+/// `database.OutboundWebhookLogListOpts`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OutboundWebhookLogListOpts {
+    pub limit: i64,
+    pub offset: i64,
+    pub only_errors: bool,
+    pub outbound_webhook_id: i64,
+}
+
+/// `types.OutboundWebhookJob` (only the fields the GraphQL resolver exposes).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutboundWebhookJob {
+    pub id: i64,
+    pub event_type: String,
+    pub scope: Option<String>,
+    /// Empty when the column is NULL (`dbutil.NullString` scan).
+    pub encryption_key_id: String,
+    pub payload: Vec<u8>,
+}
+
+const OUTBOUND_WEBHOOK_LOG_COLUMNS: &str = "id, job_id, outbound_webhook_id, \
+     sent_at, status_code, encryption_key_id, request, response, error";
+
+fn scan_log(row: &PgRow) -> Result<OutboundWebhookLog, String> {
+    Ok(OutboundWebhookLog {
+        id: row.try_get("id").map_err(|err| err.to_string())?,
+        job_id: row.try_get("job_id").map_err(|err| err.to_string())?,
+        outbound_webhook_id: row
+            .try_get("outbound_webhook_id")
+            .map_err(|err| err.to_string())?,
+        sent_at: row
+            .try_get("sent_at")
+            .map_err(|err| err.to_string())?,
+        status_code: row
+            .try_get("status_code")
+            .map_err(|err| err.to_string())?,
+        encryption_key_id: row
+            .try_get::<Option<String>, _>("encryption_key_id")
+            .map_err(|err| err.to_string())?
+            .unwrap_or_default(),
+        request: row.try_get("request").map_err(|err| err.to_string())?,
+        response: row.try_get("response").map_err(|err| err.to_string())?,
+        error: row.try_get("error").map_err(|err| err.to_string())?,
+    })
+}
+
+/// `OutboundWebhookLogStore.ListForOutboundWebhook`: newest `id` first,
+/// `limit`/`offset` from `LimitOffset.SQL()`, and the baseline `where()`
+/// predicate (`status_code NOT BETWEEN 100 AND 399` when `OnlyErrors`).
+pub async fn list_logs(
+    pool: &PgPool,
+    opts: &OutboundWebhookLogListOpts,
+) -> Result<Vec<OutboundWebhookLog>, String> {
+    let mut where_sql = "outbound_webhook_id = $1".to_owned();
+    if opts.only_errors {
+        where_sql.push_str(" AND status_code NOT BETWEEN 100 AND 399");
+    }
+    let sql = format!(
+        "SELECT {OUTBOUND_WEBHOOK_LOG_COLUMNS} FROM outbound_webhook_logs \
+         WHERE {where_sql} ORDER BY id DESC LIMIT {} OFFSET {}",
+        opts.limit, opts.offset
+    );
+    let rows = sqlx::query(&sql)
+        .bind(opts.outbound_webhook_id)
+        .fetch_all(pool)
+        .await
+        .map_err(|err| err.to_string())?;
+    rows.iter().map(scan_log).collect()
+}
+
+/// `OutboundWebhookLogStore.CountsForOutboundWebhook`: `(total, errored)`.
+pub async fn counts_for_outbound_webhook(
+    pool: &PgPool,
+    outbound_webhook_id: i64,
+) -> Result<(i64, i64), String> {
+    let row = sqlx::query(
+        "SELECT \
+            COUNT(*) AS total, \
+            COUNT(*) FILTER (WHERE status_code NOT BETWEEN 100 AND 399) AS errored \
+         FROM outbound_webhook_logs WHERE outbound_webhook_id = $1",
+    )
+    .bind(outbound_webhook_id)
+    .fetch_one(pool)
+    .await
+    .map_err(|err| err.to_string())?;
+    Ok((
+        row.try_get("total").map_err(|err| err.to_string())?,
+        row.try_get("errored").map_err(|err| err.to_string())?,
+    ))
+}
+
+/// `OutboundWebhookJobStore.GetByID`: `None` is
+/// `OutboundWebhookJobNotFoundErr`.
+pub async fn get_job(
+    pool: &PgPool,
+    id: i64,
+) -> Result<Option<OutboundWebhookJob>, String> {
+    let row = sqlx::query(
+        "SELECT id, event_type, scope, encryption_key_id, payload \
+         FROM outbound_webhook_jobs WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|err| err.to_string())?;
+    row.map(|row| {
+        Ok(OutboundWebhookJob {
+            id: row.try_get("id").map_err(|err| err.to_string())?,
+            event_type: row
+                .try_get("event_type")
+                .map_err(|err| err.to_string())?,
+            scope: row
+                .try_get::<Option<String>, _>("scope")
+                .map_err(|err| err.to_string())?,
+            encryption_key_id: row
+                .try_get::<Option<String>, _>("encryption_key_id")
+                .map_err(|err| err.to_string())?
+                .unwrap_or_default(),
+            payload: row
+                .try_get("payload")
+                .map_err(|err| err.to_string())?,
+        })
+    })
+    .transpose()
+}

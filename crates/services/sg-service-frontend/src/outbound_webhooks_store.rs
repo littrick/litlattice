@@ -19,7 +19,8 @@ use sg_graphql::exec::Actor;
 use sqlx::PgPool;
 
 use crate::outbound_webhooks_graphql::{
-    FilterEventType, OutboundWebhooksGraphqlDatabase, ScopedEventTypeData, WebhookData,
+    FilterEventType, LogListOpts, OutboundWebhookJobData, OutboundWebhookLogData,
+    OutboundWebhooksGraphqlDatabase, ScopedEventTypeData, WebhookData,
 };
 
 fn block_on<F: Future>(future: F) -> F::Output {
@@ -79,6 +80,29 @@ impl OutboundWebhooksPgDatabase {
                 scope: event_type.scope.clone(),
             })
             .collect()
+    }
+
+    fn map_log(row: sg_db::outbound_webhooks::OutboundWebhookLog) -> OutboundWebhookLogData {
+        OutboundWebhookLogData {
+            id: row.id,
+            job_id: row.job_id,
+            sent_at: row.sent_at,
+            status_code: row.status_code,
+            encryption_key_id: row.encryption_key_id,
+            request: row.request,
+            response: row.response,
+            error: row.error,
+        }
+    }
+
+    fn map_job(row: sg_db::outbound_webhooks::OutboundWebhookJob) -> OutboundWebhookJobData {
+        OutboundWebhookJobData {
+            id: row.id,
+            event_type: row.event_type,
+            scope: row.scope,
+            encryption_key_id: row.encryption_key_id,
+            payload: row.payload,
+        }
     }
 }
 
@@ -193,5 +217,31 @@ impl OutboundWebhooksGraphqlDatabase for OutboundWebhooksPgDatabase {
             encryption_key_id,
         ))
         .map_err(|err| err.to_string())
+    }
+
+    fn counts_for_outbound_webhook(&self, id: i64) -> Result<(i64, i64), String> {
+        block_on(sg_db::outbound_webhooks::counts_for_outbound_webhook(
+            &self.pool,
+            id,
+        ))
+    }
+
+    fn list_logs(
+        &self,
+        opts: &LogListOpts,
+    ) -> Result<Vec<OutboundWebhookLogData>, String> {
+        let opts = sg_db::outbound_webhooks::OutboundWebhookLogListOpts {
+            limit: opts.limit,
+            offset: opts.offset,
+            only_errors: opts.only_errors,
+            outbound_webhook_id: opts.outbound_webhook_id,
+        };
+        let rows = block_on(sg_db::outbound_webhooks::list_logs(&self.pool, &opts))?;
+        Ok(rows.into_iter().map(Self::map_log).collect())
+    }
+
+    fn get_job(&self, id: i64) -> Result<Option<OutboundWebhookJobData>, String> {
+        let row = block_on(sg_db::outbound_webhooks::get_job(&self.pool, id))?;
+        Ok(row.map(Self::map_job))
     }
 }

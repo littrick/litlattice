@@ -9,12 +9,15 @@
 //! `OUTBOUND_WEBHOOKS_SCHEMA` + `VIEWER_SCHEMA`, as `assemble_oss()` does) and
 //! resolves through the production `FrontendRootResolver`.
 //!
+//! M9.46a extends the same corpus with `OutboundWebhook.stats` /
+//! `.logs` cases (existing `outbound_webhook_logs` table).
+//!
 //! Env:
 //!
-//! * `SG_M927B_OUTBOUND_WEBHOOKS_DIFF=1`
+//! * `SG_M946A_OUTBOUND_WEBHOOK_LOGS_DIFF=1`
 //! * `SG_QTEST_DSN` — scratch database
-//! * `M927B_CORPUS` — corpus JSON path
-//! * `M927B_OUT` — output directory (one `<name>.json` per case)
+//! * `M946A_CORPUS` — corpus JSON path
+//! * `M946A_OUT` — output directory (one `<name>.json` per case)
 
 #![allow(clippy::unwrap_used)]
 
@@ -69,11 +72,11 @@ fn normalized(response: &sg_graphql::exec::ExecResponse) -> String {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn outbound_webhooks_graphql_harness() {
-    if std::env::var("SG_M927B_OUTBOUND_WEBHOOKS_DIFF").as_deref() != Ok("1") {
+    if std::env::var("SG_M946A_OUTBOUND_WEBHOOK_LOGS_DIFF").as_deref() != Ok("1") {
         return;
     }
-    let corpus_path = std::env::var("M927B_CORPUS").expect("M927B_CORPUS");
-    let out = std::env::var("M927B_OUT").expect("M927B_OUT");
+    let corpus_path = std::env::var("M946A_CORPUS").expect("M946A_CORPUS");
+    let out = std::env::var("M946A_OUT").expect("M946A_OUT");
     let dsn = std::env::var("SG_QTEST_DSN").expect("SG_QTEST_DSN");
     std::fs::create_dir_all(&out).expect("out dir");
     let corpus: Corpus = serde_json::from_slice(&std::fs::read(&corpus_path).expect("corpus"))
