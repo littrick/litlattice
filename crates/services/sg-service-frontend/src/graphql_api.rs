@@ -547,6 +547,10 @@ pub struct SchemaGraphqlDeps {
     /// list). `None` reproduces the pre-wiring frontend (no entries).
     outbound_request_log:
         Option<Arc<dyn crate::outbound_requests_graphql::OutboundRequestLogSource>>,
+    /// M9.48a `AuthzResolver` seam: `authz.graphql` + the permissions-sync
+    /// jobs/info/stats and authz mutations. `None` reproduces an absent
+    /// optional resolver (the document is not appended).
+    authz: Option<crate::authz_graphql::AuthzHandle>,
 }
 
 /// Seams for the external-account GraphQL surface (M9.8ka): the
@@ -623,6 +627,7 @@ impl SchemaGraphqlDeps {
             inventory_c: None,
             inventory_d: None,
             outbound_request_log: None,
+            authz: None,
         }
     }
 
@@ -703,6 +708,7 @@ impl SchemaGraphqlDeps {
             inventory_c: Some(crate::graphql_inventory_c::InventoryCDeps::default()),
             inventory_d: Some(crate::graphql_inventory_d::InventoryDDeps::default()),
             outbound_request_log: None,
+            authz: None,
         }
     }
 
@@ -1224,6 +1230,26 @@ impl SchemaGraphqlDeps {
         self
     }
 
+    /// Enable the authz permissions GraphQL surface (M9.48a): append
+    /// `authz.graphql` (as `NewSchema` does for a non-nil `AuthzResolver`) and
+    /// hand the database seam to the executor.
+    ///
+    /// The default [`sg_graphql::schema::assemble_oss`] schema never includes
+    /// this document, so OSS introspection stays unchanged.
+    pub fn with_authz(
+        mut self,
+        db: crate::authz_graphql::AuthzHandle,
+    ) -> Result<Self, sg_graphql::schema::SchemaError> {
+        if !self.schema.types.contains_key("PermissionsSyncJob") {
+            self.schema = Arc::new(sg_graphql::schema::assemble(&[
+                self.schema.schema_string.as_str(),
+                sg_graphql::schema::AUTHZ_SCHEMA,
+            ])?);
+        }
+        self.authz = Some(db);
+        Ok(self)
+    }
+
     /// Attach the `Repository.embeddingExists` database seam (M9.14c).
     pub fn with_embeddings(
         mut self,
@@ -1463,6 +1489,7 @@ impl SchemaGraphqlDeps {
             inventory_c: None,
             inventory_d: None,
             outbound_request_log: None,
+            authz: None,
         }
     }
 }
@@ -2670,6 +2697,7 @@ impl GraphqlDeps for SchemaGraphqlDeps {
             .with_batches(self.batches.clone())
             .with_github_apps(self.github_apps.clone())
             .with_outbound_webhooks(self.outbound_webhooks.clone())
+            .with_authz(self.authz.clone(), site_admin)
             .with_code_monitors(self.code_monitors.clone())
             .with_codeintel_uploads(self.codeintel_uploads.clone())
             .with_codeintel_autoindexing(self.codeintel_autoindexing.clone())

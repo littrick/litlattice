@@ -61,6 +61,12 @@ pub const NOTEBOOKS_SCHEMA: &str = include_str!("sdl/notebooks.graphql");
 /// `assemble_oss` never includes it.
 pub const INSIGHTS_SCHEMA: &str = include_str!("sdl/insights.graphql");
 
+/// `//go:embed authz.graphql` — `OptionalResolver.AuthzResolver` SDL
+/// (M9.48a): permissions-sync jobs, Bitbucket project jobs,
+/// `PermissionsInfo`, syncing statistics and code-host state. Appended only
+/// when the authz resolver is enabled, so `assemble_oss` never includes it.
+pub const AUTHZ_SCHEMA: &str = include_str!("sdl/authz.graphql");
+
 /// `//go:embed insights_aggregations.graphql` —
 /// `OptionalResolver.InsightsAggregationResolver` SDL (M9.34a):
 /// `Query.searchQueryAggregate`, `SearchQueryAggregate`, the aggregation

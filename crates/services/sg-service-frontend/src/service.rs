@@ -1265,7 +1265,22 @@ impl Service for FrontendService {
                     crate::outbound_requests_graphql::RedisOutboundRequestLogStore::from_env(
                         Arc::clone(wiring.live()),
                     ),
-                ));
+                ))
+                // M9.48a: the authz permissions surface reuses
+                // `permission_sync_jobs`, `user_repo_permissions`,
+                // `repo_permissions`, `user_pending_permissions` and the
+                // Bitbucket project job table (no schema change).
+                .with_authz(crate::authz_graphql::AuthzHandle::new(Arc::new(
+                    crate::authz_graphql_store::PgAuthzStore::new(
+                        session_pool.clone(),
+                        Arc::clone(wiring.live()),
+                    ),
+                )))
+                .map_err(|err| {
+                    ServiceError::new(format!(
+                        "failed to register the authz GraphQL surface: {err}"
+                    ))
+                })?;
         // M9.35a: `Query.searchQueryAggregate` executes through the same
         // `SearchDeps` as `Query.search` and `/.api/search/stream`. The seam
         // applies the per-match tabulator and the 2s/55s deadline; buffer and

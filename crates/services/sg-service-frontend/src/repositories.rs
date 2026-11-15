@@ -594,6 +594,8 @@ pub struct RepositoriesConnectionObject {
     /// The request's embeddings snapshot (M9.14c), replayed by each node's
     /// `embeddingExists`. `None` keeps the field unported.
     embeddings: Option<Arc<crate::embeddings_graphql::EmbeddingsPrefetch>>,
+    /// The authz surface (M9.48a), replayed by each node.
+    authz: Option<crate::authz_graphql::AuthzHandle>,
 }
 
 impl RepositoriesConnectionObject {
@@ -601,6 +603,7 @@ impl RepositoriesConnectionObject {
         Self {
             data,
             embeddings: None,
+            authz: None,
         }
     }
 
@@ -610,6 +613,15 @@ impl RepositoriesConnectionObject {
         embeddings: Option<Arc<crate::embeddings_graphql::EmbeddingsPrefetch>>,
     ) -> Self {
         self.embeddings = embeddings;
+        self
+    }
+
+    /// Attach the authz surface (M9.48a).
+    pub fn with_authz(
+        mut self,
+        authz: Option<crate::authz_graphql::AuthzHandle>,
+    ) -> Self {
+        self.authz = authz;
         self
     }
 }
@@ -636,7 +648,8 @@ impl ObjectValue for RepositoriesConnectionObject {
                         .map(|data| {
                             FieldValue::Object(Arc::new(
                                 RepositoryObject::from_data(data)
-                                    .with_embeddings(self.embeddings.clone()),
+                                    .with_embeddings(self.embeddings.clone())
+                                    .with_authz(self.authz.clone()),
                             ))
                         })
                         .collect(),
