@@ -1192,7 +1192,7 @@ impl Service for FrontendService {
                     Arc::clone(wiring.live()),
                 )
                 .with_clone_urls(clone_url_resolver)
-                .with_log_events(log_events_store, Arc::clone(wiring.live()))
+                .with_log_events(log_events_store.clone(), Arc::clone(wiring.live()))
                 .with_site_configuration(Arc::clone(wiring.store()), Arc::clone(wiring.server()))
                 // M9.8jg: `Site.authProviders` reads the live `auth.providers`
                 // configuration snapshot on every request.
@@ -1484,7 +1484,15 @@ impl Service for FrontendService {
             .and_then(|deps| {
                 deps.with_insights(Arc::new(
                     crate::insights_store::PgInsightsStore::new(insights_pool.clone())
-                        .with_frontend_pool(session_pool.clone()),
+                        .with_frontend_pool(session_pool.clone())
+                        // M9.47c: `licensing.Check(FeatureCodeInsights)` from
+                        // the live site config `licenseKey` + the Redis
+                        // validity flag (the same check the worker's
+                        // `insights.license_check` routine runs).
+                        .with_live_license(
+                            Arc::clone(wiring.live()),
+                            log_events_store.clone(),
+                        ),
                 ))
             })
             .and_then(|deps| {

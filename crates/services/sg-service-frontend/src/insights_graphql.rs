@@ -2487,10 +2487,12 @@ pub struct InsightSeriesQueryStatusData {
 /// resolver transaction boundaries documented in
 /// `dev/rs/docs/overviews/m9_30b_insights_view_mutations_overview.md`.
 pub trait InsightsWriteDatabase: Send + Sync {
-    /// `licensing.Check(FeatureCodeInsights) == nil` (`false` reproduces
-    /// Limited Access Mode).
+    /// `licensing.Check(FeatureCodeInsights) == nil` (`false` is Limited
+    /// Access Mode). The default is `false` because an instance without a
+    /// configured license key runs the free plan, which does not include Code
+    /// Insights; implementations wire their real license seam (M9.47c).
     fn code_insights_licensed(&self) -> bool {
-        true
+        false
     }
 
     /// `auth.CheckUserIsSiteAdmin`; `Err` carries the verbatim message.

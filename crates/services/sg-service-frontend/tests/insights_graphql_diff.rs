@@ -85,6 +85,15 @@ struct Case {
     op: String,
     #[serde(default)]
     args: ArgumentsFixture,
+    /// M9.47c: `licensing.Check(FeatureCodeInsights)` for the case (the Go
+    /// oracle mocks the same way). Read-only fields do not consult it, but the
+    /// store now always goes through the real seam.
+    #[serde(default = "default_licensed")]
+    licensed: bool,
+}
+
+fn default_licensed() -> bool {
+    true
 }
 
 fn view_arguments(fixture: &ArgumentsFixture) -> Arguments {
@@ -371,9 +380,14 @@ async fn insights_graphql_harness() {
         .connect(&dsn)
         .await
         .expect("connect");
-    let handle: InsightsHandle = Arc::new(PgInsightsStore::new(pool));
+    let base_pool = pool.clone();
 
     for case in &corpus.cases {
+        let handle: InsightsHandle = Arc::new(
+            PgInsightsStore::new(base_pool.clone()).with_license_provider(Arc::new(
+                sg_service_frontend::insights_store::FixedCodeInsightsLicense(case.licensed),
+            )),
+        );
         let actor = Actor::Internal;
         let result: Result<Value, String> = (|| {
             match case.op.as_str() {
