@@ -48,9 +48,10 @@ pub mod sdl;
 /// `saved_searches.graphql`, the order `NewSchema` appends them in).
 pub use sdl::{
     BATCHES_SCHEMA, CODEINTEL_AUTOINDEXING_SCHEMA, CODEINTEL_POLICIES_SCHEMA,
+    BATCHES_SCHEMA, CODEINTEL_AUTOINDEXING_SCHEMA, CODEINTEL_POLICIES_SCHEMA,
     CODE_MONITORS_SCHEMA, CODY_CONTEXT_SCHEMA, EMBEDDINGS_SCHEMA, GITHUB_APPS_SCHEMA,
     INSIGHTS_AGGREGATIONS_SCHEMA, INSIGHTS_SCHEMA, MAIN_SCHEMA, NOTEBOOKS_SCHEMA,
-    OUTBOUND_WEBHOOKS_SCHEMA, SAVED_SEARCHES_SCHEMA, VIEWER_SCHEMA,
+    OUTBOUND_WEBHOOKS_SCHEMA, OWN_SCHEMA, SAVED_SEARCHES_SCHEMA, VIEWER_SCHEMA,
 };
 
 /// Built-in scalars provided by the GraphQL runtime (graph-gophers preloads
@@ -1035,6 +1036,42 @@ mod tests {
         assert!(query_fields.contains(&"outboundWebhooks"));
         // From viewer.graphql.
         assert!(query_fields.contains(&"viewer"));
+    }
+
+    /// M9.48c: the opt-in own document assembles on top of the OSS schema and
+    /// declares `GitBlob implements Ownable` (the SDL-coverage DIFF). The
+    /// default `assemble_oss` schema must not contain either.
+    #[test]
+    fn own_schema_assembles_and_gitblob_implements_ownable() {
+        let oss = assemble_oss().expect("OSS schema must assemble");
+        assert!(!oss.types.contains_key("Ownable"));
+        assert!(!oss.types["GitBlob"]
+            .fields
+            .iter()
+            .any(|field| field.name == "ownership"));
+
+        let schema = assemble(&[
+            MAIN_SCHEMA,
+            OUTBOUND_WEBHOOKS_SCHEMA,
+            VIEWER_SCHEMA,
+            OWN_SCHEMA,
+        ])
+        .expect("own schema must assemble");
+        assert_eq!(schema.types["Ownable"].kind, TypeKind::Interface);
+        assert!(schema
+            .possible_types("Ownable")
+            .iter()
+            .any(|def| def.name == "GitBlob"));
+        assert!(schema.types["GitBlob"]
+            .fields
+            .iter()
+            .any(|field| field.name == "ownership"));
+        for root in ["codeownersIngestedFiles", "ownSignalConfigurations", "instanceOwnershipStats"] {
+            assert!(schema.types["Query"]
+                .fields
+                .iter()
+                .any(|field| field.name == root));
+        }
     }
 
     #[test]

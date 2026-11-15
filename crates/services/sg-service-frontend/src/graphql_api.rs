@@ -485,6 +485,9 @@ pub struct SchemaGraphqlDeps {
     /// `SavedSearchesResolver`'s database seam (M9.13a); `None` reproduces an
     /// absent optional resolver (SDL not appended, root fields/types absent).
     saved_searches: Option<crate::saved_searches_graphql::SavedSearchesHandle>,
+    /// `OwnResolver`'s database seam (M9.48c); `None` reproduces an absent
+    /// optional resolver (`own.graphql` not appended).
+    own: Option<crate::own_graphql::OwnHandle>,
     /// `BatchChangesResolver`'s database seam (M9.24c); `None` reproduces an
     /// absent optional resolver (SDL not appended, root fields/types absent).
     batches: Option<crate::batches_graphql::BatchesHandle>,
@@ -609,6 +612,7 @@ impl SchemaGraphqlDeps {
             executor_secrets: None,
             rbac: None,
             saved_searches: None,
+            own: None,
             batches: None,
             github_apps: None,
             github_apps_schema: false,
@@ -690,6 +694,7 @@ impl SchemaGraphqlDeps {
             executor_secrets: None,
             rbac: None,
             saved_searches: None,
+            own: None,
             batches: None,
             github_apps: None,
             github_apps_schema: false,
@@ -1169,6 +1174,26 @@ impl SchemaGraphqlDeps {
         Ok(self)
     }
 
+    /// Enable the own ownership GraphQL surface (M9.48c): append the vendored
+    /// `own.graphql` document (as `NewSchema` does for a non-nil
+    /// `OwnResolver`) and hand the database/gitserver seam to the executor.
+    ///
+    /// The default [`sg_graphql::schema::assemble_oss`] schema never includes
+    /// this document, so OSS introspection stays unchanged.
+    pub fn with_own(
+        mut self,
+        db: crate::own_graphql::OwnHandle,
+    ) -> Result<Self, sg_graphql::schema::SchemaError> {
+        if !self.schema.types.contains_key("Ownable") {
+            self.schema = Arc::new(sg_graphql::schema::assemble(&[
+                self.schema.schema_string.as_str(),
+                sg_graphql::schema::OWN_SCHEMA,
+            ])?);
+        }
+        self.own = Some(db);
+        Ok(self)
+    }
+
     /// Enable the Batch Changes GraphQL read surface (M9.24c): append
     /// `batches.graphql` (as `NewSchema` does for a non-nil
     /// `BatchChangesResolver`) and hand the database seam to the executor.
@@ -1478,6 +1503,7 @@ impl SchemaGraphqlDeps {
             executor_secrets: None,
             rbac: None,
             saved_searches: None,
+            own: None,
             batches: None,
             github_apps: None,
             github_apps_schema: false,
@@ -1911,6 +1937,9 @@ impl GraphqlDeps for SchemaGraphqlDeps {
                 .await;
                 // M9.46b: `conf.ExternalURL()` for `rawZipArchiveURL`.
                 prefetch.external_url = external_url.clone();
+                // M9.48c: `GitBlob`/`GitTree`/`GitCommit.ownership` replay
+                // from the own seam.
+                prefetch.own = self.own.clone();
                 Some(Arc::new(prefetch))
             }
             None => None,
@@ -2717,6 +2746,7 @@ impl GraphqlDeps for SchemaGraphqlDeps {
             .with_executor_secret_roots(executor_secret_roots)
             .with_search_contexts(self.search_contexts.clone())
             .with_saved_searches(self.saved_searches.clone())
+            .with_own(self.own.clone())
             .with_batches(self.batches.clone())
             .with_github_apps(self.github_apps.clone())
             .with_outbound_webhooks(self.outbound_webhooks.clone())

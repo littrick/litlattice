@@ -83,3 +83,11 @@ pub const CODY_CONTEXT_SCHEMA: &str = include_str!("sdl/cody_context.graphql");
 /// Appended only when the embeddings resolver is present; `assemble_oss` never
 /// includes it.
 pub const EMBEDDINGS_SCHEMA: &str = include_str!("sdl/embeddings.graphql");
+
+/// `//go:embed own.graphql` — `OptionalResolver.OwnResolver` SDL (M9.48c):
+/// the `Ownable` interface, `GitBlob`/`GitTree`/`GitCommit.ownership`,
+/// `OwnershipStats`/`OwnershipConnection`/`Owner`/`OwnershipReasonType`,
+/// CODEOWNERS ingestion types and the `Query`/`Mutation` roots. `NewSchema`
+/// appends it only when the own resolver is present, so `assemble_oss` never
+/// includes it.
+pub const OWN_SCHEMA: &str = include_str!("sdl/own.graphql");
