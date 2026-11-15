@@ -248,7 +248,9 @@ async fn load_message(
     decode_message(&plaintext)
 }
 
-fn decode_message(plaintext: &str) -> Result<WebhookLogMessageData, String> {
+/// Decode the `WebhookLogMessage` JSON shared by `webhook_logs` and
+/// `outbound_webhook_logs` (`types.WebhookLogMessage`).
+pub(crate) fn decode_message(plaintext: &str) -> Result<WebhookLogMessageData, String> {
     let raw: RawWebhookLogMessage =
         serde_json::from_str(plaintext).map_err(|error| error.to_string())?;
     let mut headers: Vec<(String, Vec<String>)> = raw
@@ -850,6 +852,13 @@ pub struct WebhookLogMessageObject {
     message: WebhookLogMessageData,
 }
 
+impl WebhookLogMessageObject {
+    /// Reuse the `WebhookLogResponse` object for outbound webhook logs.
+    pub fn from_message(message: WebhookLogMessageData) -> Self {
+        Self { message }
+    }
+}
+
 impl ObjectValue for WebhookLogMessageObject {
     fn type_name(&self) -> &'static str {
         "WebhookLogResponse"
@@ -872,6 +881,13 @@ impl ObjectValue for WebhookLogMessageObject {
 /// `webhookLogRequestResolver` (`webhook_logs.go:289-307`).
 pub struct WebhookLogRequestObject {
     message: WebhookLogMessageData,
+}
+
+impl WebhookLogRequestObject {
+    /// Reuse the `WebhookLogRequest` object for outbound webhook logs.
+    pub fn from_message(message: WebhookLogMessageData) -> Self {
+        Self { message }
+    }
 }
 
 impl ObjectValue for WebhookLogRequestObject {

@@ -33,8 +33,10 @@
 //! The database is injected through [`OutboundWebhooksGraphqlDatabase`], a
 //! synchronous seam in the same style as the GitHub Apps resolver; the
 //! production adapter ([`crate::outbound_webhooks_store`]) bridges to sqlx.
-//! `stats`/`logs` are not part of this slice and stay unported. No table,
-//! column or Redis key is added.
+//! M9.46a adds `OutboundWebhook.stats` and `OutboundWebhook.logs` (with the
+//! `OutboundWebhookLog` / `OutboundWebhookJob` nodes), reading the existing
+//! `outbound_webhook_logs` / `outbound_webhook_jobs` tables. No table, column
+//! or Redis key is added.
 
 use std::net::{IpAddr, ToSocketAddrs};
 use std::sync::Arc;
@@ -42,11 +44,19 @@ use std::sync::Arc;
 use base64::Engine as _;
 use sg_graphql::exec::{Actor, Arguments, ExecError, FieldValue, InputValue, ObjectValue};
 use sg_graphql::json::Json;
+use time::OffsetDateTime;
 
-use crate::graphql_resolvers::PageInfoObject;
+use crate::graphql_resolvers::{datetime_rfc3339, PageInfoObject};
+use crate::webhook_logs::{decode_message, WebhookLogMessageObject, WebhookLogRequestObject};
 
 /// `outboundWebhookIDKind` (`outbound_webhooks.go:22`).
 pub const OUTBOUND_WEBHOOK_KIND: &str = "OutboundWebhook";
+/// `outboundWebhookLogIDKind` (`outbound_webhook_logs.go:16`).
+pub const OUTBOUND_WEBHOOK_LOG_KIND: &str = "OutboundWebhookLog";
+/// `outboundWebhookJobIDKind` (`outbound_webhook_logs.go:15`).
+pub const OUTBOUND_WEBHOOK_JOB_KIND: &str = "OutboundWebhookJob";
+/// `types.OutboundWebhookLogUnsentStatusCode`.
+pub const OUTBOUND_WEBHOOK_LOG_UNSENT_STATUS_CODE: i32 = 0;
 
 /// `auth.ErrNotAuthenticated`.
 const NOT_AUTHENTICATED: &str = "not authenticated";
@@ -134,6 +144,29 @@ pub trait OutboundWebhooksGraphqlDatabase: Send + Sync {
 
     /// `(*encryption.Encryptable).Decrypt` for `url` (`MaybeDecrypt`).
     fn decrypt_url(&self, raw: &[u8], encryption_key_id: &str) -> Result<String, String>;
+
+    /// `OutboundWebhookLogStore.CountsForOutboundWebhook`: `(total, errored)`.
+    fn counts_for_outbound_webhook(&self, id: i64) -> Result<(i64, i64), String>;
+
+    /// `OutboundWebhookLogStore.ListForOutboundWebhook` (`limit` includes the
+    /// `+1` probe).
+    fn list_logs(&self, opts: &LogListOpts) -> Result<Vec<OutboundWebhookLogData>, String>;
+
+    /// `OutboundWebhookJobStore.GetByID`: `None` is
+    /// `OutboundWebhookJobNotFoundErr`.
+    fn get_job(&self, id: i64) -> Result<Option<OutboundWebhookJobData>, String>;
+
+    /// `(*encryption.Encryptable).Decrypt` for any encrypted `bytea` column on
+    /// this surface (log request/response/error, job payload). They all use
+    /// `keyring.Default().OutboundWebhookKey`, so this defaults to
+    /// [`Self::decrypt_url`].
+    fn decrypt_outbound_value(
+        &self,
+        raw: &[u8],
+        encryption_key_id: &str,
+    ) -> Result<String, String> {
+        self.decrypt_url(raw, encryption_key_id)
+    }
 }
 
 /// `database.OutboundWebhookCountOpts`.
@@ -148,6 +181,38 @@ pub struct ListOpts {
     pub count: CountOpts,
     pub limit: i64,
     pub offset: i64,
+}
+
+/// `types.OutboundWebhookLog` with raw encrypted columns.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutboundWebhookLogData {
+    pub id: i64,
+    pub job_id: i64,
+    pub sent_at: OffsetDateTime,
+    pub status_code: i32,
+    pub encryption_key_id: String,
+    pub request: Vec<u8>,
+    pub response: Vec<u8>,
+    pub error: Vec<u8>,
+}
+
+/// `types.OutboundWebhookJob` projected to the GraphQL fields.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutboundWebhookJobData {
+    pub id: i64,
+    pub event_type: String,
+    pub scope: Option<String>,
+    pub encryption_key_id: String,
+    pub payload: Vec<u8>,
+}
+
+/// `database.OutboundWebhookLogListOpts`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LogListOpts {
+    pub limit: i64,
+    pub offset: i64,
+    pub only_errors: bool,
+    pub outbound_webhook_id: i64,
 }
 
 pub type OutboundWebhooksHandle = Arc<dyn OutboundWebhooksGraphqlDatabase + Send + Sync>;
@@ -197,6 +262,16 @@ pub fn require_current_user_is_site_admin(
 /// `relay.MarshalID(outboundWebhookIDKind, id)`.
 pub fn marshal_outbound_webhook_id(id: i64) -> String {
     base64::engine::general_purpose::URL_SAFE.encode(format!("{OUTBOUND_WEBHOOK_KIND}:{id}"))
+}
+
+/// `marshalOutboundWebhookLogID` (`outbound_webhook_logs.go:252`).
+pub fn marshal_outbound_webhook_log_id(id: i64) -> String {
+    base64::engine::general_purpose::URL_SAFE.encode(format!("{OUTBOUND_WEBHOOK_LOG_KIND}:{id}"))
+}
+
+/// `marshalOutboundWebhookJobID` (`outbound_webhook_logs.go:248`).
+pub fn marshal_outbound_webhook_job_id(id: i64) -> String {
+    base64::engine::general_purpose::URL_SAFE.encode(format!("{OUTBOUND_WEBHOOK_JOB_KIND}:{id}"))
 }
 
 /// `unmarshalOutboundWebhookID` (`outbound_webhooks.go:232-239`): kind
@@ -647,6 +722,55 @@ impl OutboundWebhookObject {
                 .ok_or_else(|| not_found(self.id)),
         }
     }
+
+    /// `outboundWebhookResolver.Logs` + the connection resolver
+    /// (`outbound_webhooks.go:374-402`, `outbound_webhook_logs.go:81-130`).
+    fn logs_field(&self, arguments: &Arguments) -> Result<FieldValue, ExecError> {
+        let first = arguments.i64("first").unwrap_or(50);
+        let mut offset = 0i64;
+        if let Some(after) = arguments.string("after") {
+            offset = after.parse::<i64>().map_err(|_| {
+                ExecError::new(format!("cannot parse offset {}", go_quote(after)))
+            })?;
+        }
+        let only_errors = arguments.bool("onlyErrors").unwrap_or(false);
+
+        // `newOutboundWebhookLogConnectionResolver` keeps the caller's limit
+        // and bumps it only for the nodes probe.
+        let listed = self
+            .db
+            .list_logs(&LogListOpts {
+                limit: first + 1,
+                offset,
+                only_errors,
+                outbound_webhook_id: self.id,
+            })
+            .map_err(ExecError::new)?;
+
+        let (total, errored) = self
+            .db
+            .counts_for_outbound_webhook(self.id)
+            .map_err(ExecError::new)?;
+        let total_count = if only_errors { errored } else { total };
+
+        let has_next_page = listed.len() as i64 > first;
+        let nodes = if has_next_page {
+            listed[..first.max(0) as usize].to_vec()
+        } else {
+            listed
+        };
+        let end_cursor = has_next_page.then(|| (first + offset).to_string());
+
+        Ok(FieldValue::Object(Arc::new(
+            OutboundWebhookLogConnectionObject {
+                nodes,
+                total_count,
+                has_next_page,
+                end_cursor,
+                db: self.db.clone(),
+            },
+        )))
+    }
 }
 
 impl ObjectValue for OutboundWebhookObject {
@@ -657,7 +781,7 @@ impl ObjectValue for OutboundWebhookObject {
     fn field(
         &self,
         field: &str,
-        _arguments: &Arguments,
+        arguments: &Arguments,
         _actor: Actor,
     ) -> Result<Option<FieldValue>, ExecError> {
         match field {
@@ -690,8 +814,18 @@ impl ObjectValue for OutboundWebhookObject {
                     element_type: None,
                 }))
             }
-            // Not part of this slice (see the module docs).
-            "stats" | "logs" => Ok(None),
+            // `func (r *outboundWebhookResolver) Stats()`.
+            "stats" => {
+                let (total, errored) = self
+                    .db
+                    .counts_for_outbound_webhook(self.id)
+                    .map_err(ExecError::new)?;
+                Ok(Some(FieldValue::Object(Arc::new(
+                    OutboundWebhookLogStatsObject { total, errored },
+                ))))
+            }
+            // `func (r *outboundWebhookResolver) Logs()`.
+            "logs" => Ok(Some(self.logs_field(arguments)?)),
             _ => Ok(None),
         }
     }
@@ -745,6 +879,213 @@ impl ObjectValue for OutboundWebhookScopedEventTypeObject {
                 Some(scope) => FieldValue::Json(Json::Str(scope.clone())),
                 None => FieldValue::Null,
             })),
+            _ => Ok(None),
+        }
+    }
+}
+
+/// `outboundWebhookLogStatsResolver` (`outbound_webhook_logs.go:55-66`).
+pub struct OutboundWebhookLogStatsObject {
+    total: i64,
+    errored: i64,
+}
+
+impl ObjectValue for OutboundWebhookLogStatsObject {
+    fn type_name(&self) -> &'static str {
+        "OutboundWebhookLogStats"
+    }
+
+    fn field(
+        &self,
+        field: &str,
+        _arguments: &Arguments,
+        _actor: Actor,
+    ) -> Result<Option<FieldValue>, ExecError> {
+        match field {
+            "total" => Ok(Some(FieldValue::Json(Json::Int(self.total)))),
+            "errored" => Ok(Some(FieldValue::Json(Json::Int(self.errored)))),
+            _ => Ok(None),
+        }
+    }
+}
+
+/// `outboundWebhookLogConnectionResolver` (`outbound_webhook_logs.go:68-130`).
+pub struct OutboundWebhookLogConnectionObject {
+    nodes: Vec<OutboundWebhookLogData>,
+    total_count: i64,
+    has_next_page: bool,
+    end_cursor: Option<String>,
+    db: OutboundWebhooksHandle,
+}
+
+impl ObjectValue for OutboundWebhookLogConnectionObject {
+    fn type_name(&self) -> &'static str {
+        "OutboundWebhookLogConnection"
+    }
+
+    fn field(
+        &self,
+        field: &str,
+        _arguments: &Arguments,
+        _actor: Actor,
+    ) -> Result<Option<FieldValue>, ExecError> {
+        match field {
+            "nodes" => Ok(Some(FieldValue::List {
+                items: self
+                    .nodes
+                    .iter()
+                    .map(|log| {
+                        FieldValue::Object(Arc::new(OutboundWebhookLogObject {
+                            log: log.clone(),
+                            db: self.db.clone(),
+                        }))
+                    })
+                    .collect(),
+                element_type: Some("OutboundWebhookLog"),
+            })),
+            "totalCount" => Ok(Some(FieldValue::Json(Json::Int(self.total_count)))),
+            "pageInfo" => Ok(Some(FieldValue::Object(Arc::new(PageInfoObject::new(
+                self.has_next_page,
+                self.end_cursor.clone(),
+            ))))),
+            _ => Ok(None),
+        }
+    }
+}
+
+/// `outboundWebhookLogResolver` (`outbound_webhook_logs.go:132-193`).
+pub struct OutboundWebhookLogObject {
+    log: OutboundWebhookLogData,
+    db: OutboundWebhooksHandle,
+}
+
+impl OutboundWebhookLogObject {
+    fn decrypt_message(
+        &self,
+        raw: &[u8],
+    ) -> Result<crate::webhook_logs::WebhookLogMessageData, String> {
+        let plaintext = self
+            .db
+            .decrypt_outbound_value(raw, &self.log.encryption_key_id)?;
+        decode_message(&plaintext)
+    }
+}
+
+impl ObjectValue for OutboundWebhookLogObject {
+    fn type_name(&self) -> &'static str {
+        "OutboundWebhookLog"
+    }
+
+    fn field(
+        &self,
+        field: &str,
+        _arguments: &Arguments,
+        _actor: Actor,
+    ) -> Result<Option<FieldValue>, ExecError> {
+        match field {
+            "id" => Ok(Some(FieldValue::Json(Json::Str(
+                marshal_outbound_webhook_log_id(self.log.id),
+            )))),
+            // `newOutboundWebhookJobResolver` is lazy: `job { id }` succeeds
+            // even when the row is missing.
+            "job" => Ok(Some(FieldValue::Object(Arc::new(
+                OutboundWebhookJobObject {
+                    id: self.log.job_id,
+                    db: self.db.clone(),
+                },
+            )))),
+            "sentAt" => Ok(Some(FieldValue::Json(Json::Str(datetime_rfc3339(
+                self.log.sent_at,
+            ))))),
+            "statusCode" => Ok(Some(FieldValue::Json(Json::Int(i64::from(
+                self.log.status_code,
+            ))))),
+            "request" => {
+                let message = self.decrypt_message(&self.log.request).map_err(ExecError::new)?;
+                Ok(Some(FieldValue::Object(Arc::new(
+                    WebhookLogRequestObject::from_message(message),
+                ))))
+            }
+            "response" => {
+                if self.log.status_code == OUTBOUND_WEBHOOK_LOG_UNSENT_STATUS_CODE {
+                    return Ok(Some(FieldValue::Null));
+                }
+                let message =
+                    self.decrypt_message(&self.log.response).map_err(ExecError::new)?;
+                Ok(Some(FieldValue::Object(Arc::new(
+                    WebhookLogMessageObject::from_message(message),
+                ))))
+            }
+            "error" => {
+                if self.log.status_code != OUTBOUND_WEBHOOK_LOG_UNSENT_STATUS_CODE {
+                    return Ok(Some(FieldValue::Null));
+                }
+                let message = self
+                    .db
+                    .decrypt_outbound_value(&self.log.error, &self.log.encryption_key_id)
+                    .map_err(ExecError::new)?;
+                Ok(Some(FieldValue::Json(Json::Str(message))))
+            }
+            _ => Ok(None),
+        }
+    }
+}
+
+/// `outboundWebhookJobResolver` (`outbound_webhook_logs.go:195-243`).
+pub struct OutboundWebhookJobObject {
+    id: i64,
+    db: OutboundWebhooksHandle,
+}
+
+impl OutboundWebhookJobObject {
+    /// `OutboundWebhookJobStore.GetByID`; missing rows surface
+    /// `OutboundWebhookJobNotFoundErr`.
+    fn load(&self) -> Result<OutboundWebhookJobData, String> {
+        self.db.get_job(self.id)?.ok_or_else(|| {
+            format!("outbound webhook job with id {} not found", self.id)
+        })
+    }
+}
+
+impl ObjectValue for OutboundWebhookJobObject {
+    fn type_name(&self) -> &'static str {
+        "OutboundWebhookJob"
+    }
+
+    fn field(
+        &self,
+        field: &str,
+        _arguments: &Arguments,
+        _actor: Actor,
+    ) -> Result<Option<FieldValue>, ExecError> {
+        match field {
+            // `func (r *outboundWebhookJobResolver) ID()` does not touch the
+            // database. Baseline bug: `newOutboundWebhookJobResolver` never
+            // copies its `id` argument into the resolver struct
+            // (`outbound_webhook_logs.go:203-211`), so `ID()` always marshals
+            // zero even though `job()` loads the real row. Reproduced verbatim.
+            "id" => Ok(Some(FieldValue::Json(Json::Str(
+                marshal_outbound_webhook_job_id(0),
+            )))),
+            "eventType" => {
+                let job = self.load().map_err(ExecError::new)?;
+                Ok(Some(FieldValue::Json(Json::Str(job.event_type))))
+            }
+            "scope" => {
+                let job = self.load().map_err(ExecError::new)?;
+                Ok(Some(match job.scope {
+                    Some(scope) => FieldValue::Json(Json::Str(scope)),
+                    None => FieldValue::Null,
+                }))
+            }
+            "payload" => {
+                let job = self.load().map_err(ExecError::new)?;
+                let payload = self
+                    .db
+                    .decrypt_outbound_value(&job.payload, &job.encryption_key_id)
+                    .map_err(ExecError::new)?;
+                Ok(Some(FieldValue::Json(Json::Str(payload))))
+            }
             _ => Ok(None),
         }
     }
