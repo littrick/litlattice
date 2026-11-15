@@ -776,6 +776,10 @@ pub struct GitPrefetch {
         crate::git_comparison_graphql::HighlightKey,
         Result<crate::git_comparison_graphql::HighlightedFile, String>,
     >,
+    /// M9.46b: `conf.ExternalURL()`-equivalent used by
+    /// `GitTreeEntry.rawZipArchiveURL`. Empty means "no live site config";
+    /// the resolver then falls back to Go's cached `http://example.com`.
+    pub external_url: String,
 }
 
 impl Clone for GitPrefetch {
@@ -798,6 +802,7 @@ impl Clone for GitPrefetch {
             contributors: self.contributors.clone(),
             symbols: self.symbols.clone(),
             tree_highlights: self.tree_highlights.clone(),
+            external_url: self.external_url.clone(),
         }
     }
 }
@@ -825,6 +830,7 @@ impl std::fmt::Debug for GitPrefetch {
                 &self.symbols.as_ref().map(|_| "<symbols client>"),
             )
             .field("tree_highlights", &self.tree_highlights)
+            .field("external_url", &self.external_url)
             .finish()
     }
 }
