@@ -156,14 +156,20 @@ fn signal_group(pid: u32, signal: &str) {
 
 struct Supervisor {
     died_action: DiedAction,
+    /// The final environment after `SetDefaultEnv` was applied. The baseline
+    /// mutates the process environment, so every child inherits these
+    /// defaults; the Rust port keeps them in an [`EnvMap`](crate::env::EnvMap)
+    /// and must export them explicitly.
+    env: Vec<(String, String)>,
     tasks: JoinSet<String>,
     pids: Vec<(String, u32)>,
 }
 
 impl Supervisor {
-    fn new(died_action: DiedAction) -> Self {
+    fn new(died_action: DiedAction, env: Vec<(String, String)>) -> Self {
         Self {
             died_action,
+            env,
             tasks: JoinSet::new(),
             pids: Vec::new(),
         }
@@ -174,6 +180,7 @@ impl Supervisor {
         for entry in entries {
             let mut command = tokio::process::Command::new("/bin/sh");
             command.arg("-c").arg(entry.shell_command());
+            command.envs(self.env.iter().map(|(key, value)| (key, value)));
             #[cfg(unix)]
             {
                 command.process_group(0);
@@ -312,8 +319,13 @@ pub async fn run_staged<M: crate::migrator::Migrator>(
     schemas: Option<&[String]>,
     migrator: &mut M,
     died_action: DiedAction,
+    env: &crate::env::EnvMap,
 ) -> i32 {
-    let mut supervisor = Supervisor::new(died_action);
+    let env: Vec<(String, String)> = env
+        .iter()
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    let mut supervisor = Supervisor::new(died_action, env.clone());
     if !postgres.is_empty() {
         println!("Starting postgres processes");
     }
@@ -322,7 +334,7 @@ pub async fn run_staged<M: crate::migrator::Migrator>(
     if let Some(schemas) = schemas {
         println!("Starting migrator");
         for schema in schemas {
-            if let Err(error) = migrator.up(schema) {
+            if let Err(error) = migrator.up(schema, &env) {
                 eprintln!("failed to run migrator for {schema}: {error}");
                 supervisor.shutdown().await;
                 return 1;

@@ -383,13 +383,32 @@ fn sha256_hex(bytes: &[u8]) -> String {
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-fn write_config_file(config_dir: &Path, relative: &str, contents: &str) -> Result<(), String> {
+/// `os.WriteFile` with an explicit mode. Creation applies `mode`; an existing
+/// file keeps its permissions, matching the baseline.
+fn write_with_mode(path: &Path, contents: &[u8], mode: u32) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(mode)
+        .open(path)?;
+    file.write_all(contents)
+}
+
+fn write_config_file(
+    config_dir: &Path,
+    relative: &str,
+    contents: &str,
+    mode: u32,
+) -> Result<(), String> {
     let path = config_dir.join(relative);
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .map_err(|error| format!("failed to create {}: {error}", parent.display()))?;
     }
-    fs::write(&path, contents)
+    write_with_mode(&path, contents.as_bytes(), mode)
         .map_err(|error| format!("failed to write {}: {error}", path.display()))
 }
 
@@ -398,7 +417,7 @@ fn write_nginx(env: &mut EnvMap, config_dir: &Path, files: &mut Vec<ConfigFile>)
     let relative = "nginx.conf";
     let path = config_dir.join(relative);
     if !path.exists() {
-        fs::write(&path, NGINX_CONF).map_err(|error| {
+        write_with_mode(&path, NGINX_CONF.as_bytes(), 0o600).map_err(|error| {
             format!(
                 "failed to generate nginx configuration to {}: {error}",
                 config_dir.display()
@@ -413,7 +432,8 @@ fn write_nginx(env: &mut EnvMap, config_dir: &Path, files: &mut Vec<ConfigFile>)
         )
     })?;
     for (name, contents) in NGINX_DIR {
-        fs::write(nginx_dir.join(name), contents).map_err(|error| {
+        // `nginxWriteFiles` writes these with `os.WriteFile(..., 0600)`.
+        write_with_mode(&nginx_dir.join(name), contents.as_bytes(), 0o600).map_err(|error| {
             format!(
                 "failed to generate nginx configuration to {}: {error}",
                 config_dir.display()
@@ -673,7 +693,8 @@ fn maybe_redis(
     fs::create_dir_all(&data_dir)
         .map_err(|error| format!("failed to create {}: {error}", data_dir.display()))?;
     let relative = format!("{}.conf", spec.name);
-    write_config_file(&paths.config_dir, &relative, &rendered)?;
+    // `tryCreateRedisConf` writes with `os.WriteFile(..., 0644)`.
+    write_config_file(&paths.config_dir, &relative, &rendered, 0o644)?;
     files.push(ConfigFile {
         path: relative.clone(),
         sha256: sha256_hex(rendered.as_bytes()),
@@ -967,6 +988,7 @@ fn run_postgres_reindex(env: &EnvMap) -> Option<i32> {
     let pgdata = Path::new(&env.value("DATA_DIR")).join("postgresql");
     let status = std::process::Command::new("/bin/bash")
         .arg("/reindex.sh")
+        .envs(env.iter().map(|(key, value)| (key, value)))
         .env("REINDEX_COMPLETED_FILE", marker)
         .env("PGDATA", pgdata)
         .env("PGHOST", "")
@@ -1033,6 +1055,7 @@ pub async fn run_from_env() -> i32 {
         stages.run_migrations.then_some(stages.schemas.as_slice()),
         &mut migrator,
         plan.proc_died_action,
+        &env,
     )
     .await
 }
