@@ -1,0 +1,477 @@
+//! M9.44a differential of the heavy fields on `GitTree.entries` nodes
+//! (`content`/`byteSize`/`totalLines`/`binary`/`highlight`) against
+//! graph-gophers.
+//!
+//! Both sides drive the same corpus through their real resolver stacks with a
+//! fake gitserver (`gitserver.NewMockClient` / [`GitObjectSource`]), writing
+//! one JSON document per case.
+//!
+//! Env:
+//!
+//! * `SG_M944A_DIFF=1`
+//! * `M944A_CORPUS` — path to `m944a_git_tree_heavy_corpus.json`
+//! * `M944A_OUT` — output directory (one `<name>.json` per case)
+
+#![allow(clippy::unwrap_used)]
+
+use std::collections::HashMap;
+use std::path::Path;
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use base64::Engine as _;
+use serde::Deserialize;
+use serde_json::Map;
+
+use sg_git::{CommitDetails, CommitSignature, FileStat, GitObject, Submodule};
+use sg_graphql::exec::{execute_with, root_fields, Actor, ExecRequest};
+use sg_graphql::schema::assemble_sdl;
+
+use sg_service_frontend::git_graphql::{prefetch_git_with, GitObjectSource, GitSourceError};
+use sg_service_frontend::graphql_resolvers::{
+    FrontendRootResolver, NodeRoots, RepoKey, RepoLookup, RepositoryData,
+};
+
+const SDL: &str = "
+schema { query: Query }
+
+scalar GitObjectID
+
+type Query {
+  repository(name: String, cloneURL: String, uri: String): Repository
+}
+
+type Repository {
+  id: ID!
+  name: String!
+  uri: String!
+  url: String!
+  commit(rev: String!, inputRevspec: String): GitCommit
+}
+
+type GitCommit {
+  oid: GitObjectID!
+  abbreviatedOID: String!
+  url: String!
+  canonicalURL: String!
+  tree(path: String = \"\"): GitTree
+}
+
+interface TreeEntry {
+  path: String!
+  name: String!
+  isDirectory: Boolean!
+  url: String!
+}
+
+type GitTree implements TreeEntry {
+  path: String!
+  name: String!
+  isDirectory: Boolean!
+  isRoot: Boolean!
+  url: String!
+  entries(first: Int, recursive: Boolean = false, ancestors: Boolean = false): [TreeEntry!]!
+  files(first: Int, recursive: Boolean = false): [File!]!
+  directories(first: Int, recursive: Boolean = false): [GitTree!]!
+}
+
+type File {
+  path: String!
+  name: String!
+  isDirectory: Boolean!
+  url: String!
+  content(startLine: Int, endLine: Int): String!
+  byteSize: Int!
+  totalLines: Int!
+  binary: Boolean!
+  highlight(
+    disableTimeout: Boolean = false
+    highlightLongLines: Boolean = false
+    format: String = \"HTML_HIGHLIGHTING\"
+    startLine: Int
+    endLine: Int
+  ): HighlightedFile!
+}
+
+type GitBlob implements TreeEntry {
+  path: String!
+  name: String!
+  isDirectory: Boolean!
+  url: String!
+  content(startLine: Int, endLine: Int): String!
+  byteSize: Int!
+  totalLines: Int!
+  binary: Boolean!
+  highlight(
+    disableTimeout: Boolean = false
+    highlightLongLines: Boolean = false
+    format: String = \"HTML_HIGHLIGHTING\"
+    startLine: Int
+    endLine: Int
+  ): HighlightedFile!
+}
+
+type HighlightedFile {
+  html: String!
+  aborted: Boolean!
+}
+";
+
+#[derive(Clone, Deserialize)]
+struct RepoFixture {
+    id: i32,
+    name: String,
+    uri: String,
+    #[serde(default)]
+    description: String,
+    #[serde(default)]
+    fork: bool,
+    #[serde(default)]
+    archived: bool,
+    #[serde(default)]
+    private: bool,
+    #[serde(default)]
+    stars: i32,
+}
+
+#[derive(Clone, Deserialize)]
+struct SignatureFixture {
+    name: String,
+    email: String,
+    date: i64,
+}
+
+#[derive(Clone, Deserialize)]
+struct CommitFixture {
+    oid: String,
+    #[serde(default)]
+    parents: Vec<String>,
+    author: SignatureFixture,
+    committer: Option<SignatureFixture>,
+    message: String,
+}
+
+#[derive(Clone, Deserialize)]
+struct SubmoduleFixture {
+    url: String,
+    path: String,
+    commit_sha: String,
+}
+
+#[derive(Clone, Deserialize)]
+struct EntryFixture {
+    name: String,
+    mode: u32,
+    submodule: Option<SubmoduleFixture>,
+}
+
+#[derive(Clone, Deserialize)]
+struct DirErrorFixture {
+    message: String,
+    #[serde(default)]
+    not_exist: bool,
+}
+
+#[derive(Clone, Deserialize)]
+struct ContentFixture {
+    text: Option<String>,
+    base64: Option<String>,
+}
+
+impl ContentFixture {
+    fn bytes(&self) -> Vec<u8> {
+        if let Some(encoded) = &self.base64 {
+            return base64::engine::general_purpose::STANDARD
+                .decode(encoded)
+                .expect("base64");
+        }
+        self.text.clone().unwrap_or_default().into_bytes()
+    }
+}
+
+#[derive(Deserialize)]
+struct Case {
+    name: String,
+    query: String,
+}
+
+#[derive(Deserialize)]
+struct Corpus {
+    repos: Vec<RepoFixture>,
+    #[serde(default)]
+    revisions: HashMap<String, String>,
+    #[serde(default)]
+    revision_errors: HashMap<String, String>,
+    #[serde(default)]
+    commits: HashMap<String, CommitFixture>,
+    #[serde(default)]
+    commit_errors: HashMap<String, String>,
+    #[serde(default)]
+    entries: HashMap<String, EntryFixture>,
+    #[serde(default)]
+    entry_errors: HashMap<String, String>,
+    #[serde(default)]
+    dir_entries: HashMap<String, Vec<EntryFixture>>,
+    #[serde(default)]
+    dir_entry_errors: HashMap<String, DirErrorFixture>,
+    #[serde(default)]
+    contents: HashMap<String, ContentFixture>,
+    #[serde(default)]
+    content_errors: HashMap<String, String>,
+    cases: Vec<Case>,
+}
+
+fn repo_data(fixture: &RepoFixture) -> RepositoryData {
+    RepositoryData {
+        id: fixture.id,
+        name: fixture.name.clone(),
+        uri: fixture.uri.clone(),
+        description: fixture.description.clone(),
+        fork: fixture.fork,
+        archived: fixture.archived,
+        private: fixture.private,
+        stars: fixture.stars,
+        external_id: String::new(),
+        external_service_type: String::new(),
+        external_service_id: String::new(),
+    }
+}
+
+fn signature(fixture: &SignatureFixture) -> CommitSignature {
+    CommitSignature {
+        name: fixture.name.clone(),
+        email: fixture.email.clone(),
+        date: Some(prost_types::Timestamp {
+            seconds: fixture.date,
+            nanos: 0,
+        }),
+    }
+}
+
+fn key(repo: &str, spec: &str) -> String {
+    format!("{repo}|{spec}")
+}
+
+fn entry_key(repo: &str, oid: &str, path: &str) -> String {
+    format!("{repo}|{oid}|{path}")
+}
+
+fn entry_stat(fixture: &EntryFixture) -> FileStat {
+    FileStat {
+        name: fixture.name.clone(),
+        size: 0,
+        mode: fixture.mode,
+        blob_oid: String::new(),
+        submodule: fixture.submodule.as_ref().map(|submodule| Submodule {
+            url: submodule.url.clone(),
+            path: submodule.path.clone(),
+            commit_sha: submodule.commit_sha.clone(),
+        }),
+    }
+}
+
+struct FakeGit {
+    revisions: HashMap<String, String>,
+    revision_errors: HashMap<String, String>,
+    commits: HashMap<String, CommitFixture>,
+    commit_errors: HashMap<String, String>,
+    entries: HashMap<String, EntryFixture>,
+    entry_errors: HashMap<String, String>,
+    dir_entries: HashMap<String, Vec<EntryFixture>>,
+    dir_entry_errors: HashMap<String, DirErrorFixture>,
+    contents: HashMap<String, ContentFixture>,
+    content_errors: HashMap<String, String>,
+}
+
+#[async_trait]
+impl GitObjectSource for FakeGit {
+    async fn resolve_revision(
+        &self,
+        _repo_id: i32,
+        repo_name: &str,
+        rev: &str,
+    ) -> Result<String, GitSourceError> {
+        let k = key(repo_name, rev);
+        if let Some(message) = self.revision_errors.get(&k) {
+            return Err(GitSourceError::new(message.clone()));
+        }
+        if let Some(oid) = self.revisions.get(&k) {
+            return Ok(oid.clone());
+        }
+        Err(GitSourceError::revision_not_found(format!(
+            "revision not found: {repo_name}@{rev}"
+        )))
+    }
+
+    async fn get_commit(
+        &self,
+        _repo_id: i32,
+        repo_name: &str,
+        oid: &str,
+    ) -> Result<CommitDetails, GitSourceError> {
+        let k = key(repo_name, oid);
+        if let Some(message) = self.commit_errors.get(&k) {
+            return Err(GitSourceError::new(message.clone()));
+        }
+        if let Some(fixture) = self.commits.get(&k) {
+            return Ok(CommitDetails {
+                oid: fixture.oid.clone(),
+                parents: fixture.parents.clone(),
+                author: signature(&fixture.author),
+                committer: fixture.committer.as_ref().map(signature),
+                message: fixture.message.clone(),
+            });
+        }
+        Err(GitSourceError::revision_not_found(format!(
+            "revision not found: {repo_name}@{oid}"
+        )))
+    }
+
+    async fn get_object(
+        &self,
+        _repo_id: i32,
+        repo_name: &str,
+        revspec: &str,
+    ) -> Result<GitObject, GitSourceError> {
+        Err(GitSourceError::revision_not_found(format!(
+            "revision not found: {repo_name}@{revspec}"
+        )))
+    }
+
+    async fn stat(
+        &self,
+        _repo_id: i32,
+        repo_name: &str,
+        oid: &str,
+        path: &str,
+    ) -> Result<FileStat, GitSourceError> {
+        let k = entry_key(repo_name, oid, path);
+        if let Some(message) = self.entry_errors.get(&k) {
+            return Err(GitSourceError::new(message.clone()));
+        }
+        if let Some(fixture) = self.entries.get(&k) {
+            return Ok(entry_stat(fixture));
+        }
+        Err(GitSourceError::not_exist(format!(
+            "ls-tree: {repo_name}@{oid}:{path}: file does not exist"
+        )))
+    }
+
+    async fn read_dir_stats(
+        &self,
+        _repo_id: i32,
+        repo_name: &str,
+        oid: &str,
+        path: &str,
+        recursive: bool,
+    ) -> Result<Vec<FileStat>, GitSourceError> {
+        let k = format!("{repo_name}|{oid}|{path}|{recursive}");
+        if let Some(fixture) = self.dir_entry_errors.get(&k) {
+            return if fixture.not_exist {
+                Err(GitSourceError::not_exist(fixture.message.clone()))
+            } else {
+                Err(GitSourceError::new(fixture.message.clone()))
+            };
+        }
+        Ok(self
+            .dir_entries
+            .get(&k)
+            .map(|entries| entries.iter().map(entry_stat).collect())
+            .unwrap_or_default())
+    }
+
+    async fn read_file(
+        &self,
+        _repo_id: i32,
+        repo_name: &str,
+        oid: &str,
+        path: &str,
+    ) -> Result<Vec<u8>, GitSourceError> {
+        let k = entry_key(repo_name, oid, path);
+        if let Some(message) = self.content_errors.get(&k) {
+            return Err(GitSourceError::new(message.clone()));
+        }
+        if let Some(fixture) = self.contents.get(&k) {
+            return Ok(fixture.bytes());
+        }
+        Err(GitSourceError::not_exist(format!(
+            "open: {repo_name}@{oid}:{path}: file does not exist"
+        )))
+    }
+}
+
+#[tokio::test]
+async fn git_tree_heavy_fields_harness() {
+    if std::env::var("SG_M944A_DIFF").as_deref() != Ok("1") {
+        return;
+    }
+    let corpus_path = std::env::var("M944A_CORPUS").expect("M944A_CORPUS");
+    let out = std::env::var("M944A_OUT").expect("M944A_OUT");
+    std::fs::create_dir_all(&out).expect("out dir");
+    let corpus: Corpus =
+        serde_json::from_slice(&std::fs::read(&corpus_path).expect("corpus")).expect("corpus json");
+    let schema = assemble_sdl(SDL).expect("schema");
+
+    let fake = FakeGit {
+        revisions: corpus.revisions.clone(),
+        revision_errors: corpus.revision_errors.clone(),
+        commits: corpus.commits.clone(),
+        commit_errors: corpus.commit_errors.clone(),
+        entries: corpus.entries.clone(),
+        entry_errors: corpus.entry_errors.clone(),
+        dir_entries: corpus.dir_entries.clone(),
+        dir_entry_errors: corpus.dir_entry_errors.clone(),
+        contents: corpus.contents.clone(),
+        content_errors: corpus.content_errors.clone(),
+    };
+
+    let mut repositories: HashMap<RepoKey, RepoLookup> = HashMap::new();
+    let mut nodes = NodeRoots::default();
+    for fixture in &corpus.repos {
+        let data = repo_data(fixture);
+        repositories.insert(
+            RepoKey::Name(fixture.name.clone()),
+            RepoLookup::Found(data.clone()),
+        );
+        nodes
+            .repositories
+            .insert(fixture.id, RepoLookup::Found(data));
+    }
+
+    for case in &corpus.cases {
+        let variables = Map::new();
+        let request = ExecRequest {
+            query: &case.query,
+            operation_name: "",
+            variables: &variables,
+            actor: Actor::Anonymous,
+        };
+        let fields = root_fields(&schema, &request);
+        let git = prefetch_git_with(
+            &fake,
+            &repositories,
+            &HashMap::new(),
+            &nodes,
+            None,
+            &fields,
+            None,
+            None,
+        )
+        .await;
+        let roots = FrontendRootResolver::with_prefetched_organizations(
+            None,
+            repositories.clone(),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            false,
+        )
+        .with_nodes(nodes.clone())
+        .with_git(Some(Arc::new(git)));
+        let response = execute_with(&schema, request, Some(&roots));
+        let body = response.to_json();
+        std::fs::write(Path::new(&out).join(format!("{}.json", case.name)), &body).expect("write");
+        println!("RUST {} len={}", case.name, body.len());
+    }
+}

@@ -14,13 +14,18 @@
 //! itself synchronous (it drives the gRPC call with `run_to_completion`).
 //!
 //! `GitTree.entries`/`files`/`directories` are ported (M9.43b): their
-//! `ReadDir` results are prefetched in [`prefetch_commit_entries`].
+//! `ReadDir` results are prefetched in [`prefetch_commit_entries`]. M9.44a
+//! additionally walks the selection set of the returned nodes and prefetches
+//! their content-backed heavy fields (`content`/`byteSize`/`totalLines`/
+//! `binary`/`highlight`; `prefetch_listed_entry_fields`).
 //!
-//! Out of scope: `history`/`languages`/`ownership`/`blame`/`highlight`/
-//! `richHTML`/`rawZipArchiveURL` and the
+//! Out of scope: `history`/`languages`/`ownership`/`blame`/`richHTML`/
+//! `rawZipArchiveURL` and the
 //! zoekt symbol index branch (`search.ListAllIndexed`, not ported — the
 //! baseline falls back to the symbols service when it returns nothing).
-//! `Location.resource` (`CodeIntelGitBlob`) is ported as a thin wrapper over
+//! `symbols` is synchronous at execution time via `prefetch.symbols`, so it
+//! needs no node-level prefetch. `Location.resource`
+//! (`CodeIntelGitBlob`) is ported as a thin wrapper over
 //! the same entry resolver; it is only fully resolved for prefetched entries.
 
 use std::sync::Arc;
@@ -38,7 +43,7 @@ use crate::git_comparison_graphql::{
 };
 use crate::git_graphql::{
     ContentLookup, DirEntriesLookup, DirLookup, GitCommitResolverObject, GitObjectSource,
-    GitPrefetch, TreeEntryLookup,
+    GitPrefetch, TreeEntryLookup, MAX_COMMIT_DEPTH,
 };
 use crate::graphql_resolvers::{CloneUrlResolver, PageInfoObject, RepositoryObject};
 use crate::search_searcher_client::{SymbolsParameters, SymbolsResponse};
@@ -55,6 +60,11 @@ const HIGHLIGHT_PAGINATION_ERROR: &str = "pagination is not supported with forma
 /// `syntaxHighlightFileBlocklist` (`git_tree_entry.go:264-269`).
 const SYNTAX_HIGHLIGHT_FILE_BLOCKLIST: [&str; 3] =
     ["yarn.lock", "pnpm-lock.yaml", "package-lock.json"];
+
+/// `GitTreeEntryResolver` fields that need the blob's full content.
+/// (`highlight` reads it through `Content` first, `git_tree_entry.go:277`.)
+const CONTENT_BACKED_FIELDS: [&str; 5] =
+    ["content", "byteSize", "totalLines", "binary", "highlight"];
 
 /// `GitTreeEntryResolver.Highlight`'s pagination guard, evaluated on the raw
 /// (pre-blocklist) format exactly like the baseline.
@@ -269,6 +279,33 @@ pub async fn prefetch_commit_entries(
                         }
                     }
                 }
+
+                // M9.44a: heavy fields selected on the *entries* nodes
+                // (`content`/`highlight`/...). The listing is already
+                // prefetched above, so the exact returned set (filter, sort,
+                // `first`, `recursive`, `ancestors`) can be reproduced here
+                // and each node's content/highlight prefetched. Without this
+                // an entry's `content`/`highlight` would reach execution with
+                // no prefetched data.
+                let kind = match selection.name.as_str() {
+                    "files" => EntryKind::Files,
+                    "directories" => EntryKind::Directories,
+                    _ => EntryKind::All,
+                };
+                let ancestors = kind == EntryKind::All
+                    && selection.arguments.bool("ancestors").unwrap_or(false);
+                let first = selection
+                    .arguments
+                    .i64("first")
+                    .map(|value| value as i32);
+                if let Ok(listed) = resolve_listing(
+                    prefetch, repo.id, oid, path, recursive, ancestors, first, kind,
+                ) {
+                    Box::pin(prefetch_listed_entry_fields(
+                        source, prefetch, repo, oid, &listed, selection, depth + 1,
+                    ))
+                    .await;
+                }
             }
         }
 
@@ -303,6 +340,140 @@ pub async fn prefetch_commit_entries(
             let url = submodule_clone_url(&repo.name, &submodule.url);
             if !prefetch.submodule_urls.contains(&url) {
                 prefetch.submodule_urls.push(url);
+            }
+        }
+    }
+}
+
+/// Prefetch the content-backed heavy fields selected on the nodes returned by
+/// one `entries`/`files`/`directories` listing (M9.44a).
+///
+/// `entries` is the exact node set [`resolve_listing`] would return, so the
+/// prefetch honors the listing's filter (`files`/`directories`), sort order,
+/// `first` cap, `recursive` de-nesting and `ancestors` chain. Directories with
+/// their own nested listing selection are descended recursively.
+#[allow(clippy::too_many_arguments)]
+async fn prefetch_listed_entry_fields(
+    source: &dyn GitObjectSource,
+    prefetch: &mut GitPrefetch,
+    repo: &MinimalRepo,
+    oid: &str,
+    entries: &[FileStat],
+    selection: &RootField,
+    depth: usize,
+) {
+    if depth > MAX_COMMIT_DEPTH {
+        return;
+    }
+    // Selections of the element node, including inline fragments (`TreeEntry`
+    // is an interface; `files` elements are the concrete `File` type).
+    let fields = flattened_selections(selection);
+    let wants_content = fields
+        .iter()
+        .any(|field| CONTENT_BACKED_FIELDS.contains(&field.name.as_str()));
+    let highlight_fields: Vec<&RootField> = fields
+        .iter()
+        .copied()
+        .filter(|field| field.name == "highlight")
+        .collect();
+    let listing_fields: Vec<&RootField> = fields
+        .iter()
+        .copied()
+        .filter(|field| matches!(field.name.as_str(), "entries" | "files" | "directories"))
+        .collect();
+
+    for stat in entries {
+        // `stat.name` is the full path relative to the repo root.
+        let path = stat.name.as_str();
+        if !stat.is_dir() {
+            let key = (repo.id, oid.to_owned(), path.to_owned());
+            if wants_content && !prefetch.contents.contains_key(&key) {
+                let lookup = match source.read_file(repo.id, &repo.name, oid, path).await {
+                    Ok(bytes) => ContentLookup::Found(bytes),
+                    Err(error) => ContentLookup::Error(error.message),
+                };
+                prefetch.contents.insert(key.clone(), lookup);
+            }
+            for highlight_field in &highlight_fields {
+                let raw_args = parse_highlight_args(&highlight_field.arguments);
+                let (highlight_key, result) = if highlight_pagination_unsupported(&raw_args) {
+                    (
+                        HighlightKey {
+                            repo_id: repo.id,
+                            oid: oid.to_owned(),
+                            path: path.to_owned(),
+                            args: raw_args.clone(),
+                        },
+                        Err(HIGHLIGHT_PAGINATION_ERROR.to_owned()),
+                    )
+                } else {
+                    let args = normalized_tree_highlight_args(path, &raw_args);
+                    let highlight_key = HighlightKey {
+                        repo_id: repo.id,
+                        oid: oid.to_owned(),
+                        path: path.to_owned(),
+                        args: args.clone(),
+                    };
+                    let result = match prefetch.contents.get(&key) {
+                        Some(ContentLookup::Found(bytes)) => {
+                            let request = HighlightRequest {
+                                content: bytes.clone(),
+                                filepath: path.to_owned(),
+                                disable_timeout: args.disable_timeout,
+                                highlight_long_lines: args.highlight_long_lines,
+                                format: args.format.clone(),
+                                start_line: args.start_line,
+                                end_line: args.end_line,
+                                keep_final_newline: false,
+                            };
+                            match compute_highlight(source, &request).await {
+                                Ok(highlighted) => Ok(highlighted),
+                                Err(HighlightError::Binary) => {
+                                    Err("cannot render binary file".to_owned())
+                                }
+                                Err(HighlightError::Message(message)) => Err(message),
+                            }
+                        }
+                        Some(ContentLookup::Error(message)) => Err(message.clone()),
+                        None => Err("tree entry content is not prefetched".to_owned()),
+                    };
+                    (highlight_key, result)
+                };
+                prefetch
+                    .tree_highlights
+                    .entry(highlight_key)
+                    .or_insert(result);
+            }
+        } else {
+            for listing in &listing_fields {
+                let recursive = listing.arguments.bool("recursive").unwrap_or(false);
+                prefetch_dir_entries(source, prefetch, repo, oid, path, recursive).await;
+                let kind = match listing.name.as_str() {
+                    "files" => EntryKind::Files,
+                    "directories" => EntryKind::Directories,
+                    _ => EntryKind::All,
+                };
+                let ancestors =
+                    kind == EntryKind::All && listing.arguments.bool("ancestors").unwrap_or(false);
+                if ancestors && !is_root_path(path) {
+                    let mut parent = path.to_owned();
+                    loop {
+                        parent = go_path_dir(&parent);
+                        prefetch_dir_entries(source, prefetch, repo, oid, &parent, false).await;
+                        if is_root_path(&parent) {
+                            break;
+                        }
+                    }
+                }
+                let first = listing.arguments.i64("first").map(|value| value as i32);
+                if let Ok(nested) = resolve_listing(
+                    prefetch, repo.id, oid, path, recursive, ancestors, first, kind,
+                ) {
+                    Box::pin(prefetch_listed_entry_fields(
+                        source, prefetch, repo, oid, &nested, listing, depth + 1,
+                    ))
+                    .await;
+                }
             }
         }
     }
@@ -748,6 +919,77 @@ enum EntryKind {
     Directories,
 }
 
+/// `GitTreeEntryResolver.entries`' node set (`git_tree.go:43-128`).
+///
+/// Shared by execution ([`GitTreeEntryObject::entries_resolve`]) and prefetch
+/// ([`prefetch_listed_entry_fields`]) so the heavy-field prefetch sees exactly
+/// the nodes the resolver returns. Errors are the resolver-visible message:
+/// a missing `ReadDir` prefetch, an errored listing, or the gitserver error.
+fn resolve_listing(
+    git: &GitPrefetch,
+    repo_id: i32,
+    oid: &str,
+    path: &str,
+    recursive: bool,
+    ancestors: bool,
+    first: Option<i32>,
+    kind: EntryKind,
+) -> Result<Vec<FileStat>, String> {
+    let mut entries = match git.dir_entries(repo_id, oid, path, recursive) {
+        Some(DirEntriesLookup::Found(entries)) => entries.clone(),
+        Some(DirEntriesLookup::Error(message)) => return Err(message.clone()),
+        None => return Err("tree entries are not prefetched".to_owned()),
+    };
+
+    // `recursive: true` returns the parent trees too (`ls-tree -r -t`); drop
+    // one entry per level of nesting below the root.
+    if recursive && !is_root_path(path) {
+        let depth = path.trim_matches('/').split('/').count();
+        if depth >= entries.len() {
+            entries.clear();
+        } else {
+            entries.drain(..depth);
+        }
+    }
+
+    entries.sort_by(|left, right| match (left.is_dir(), right.is_dir()) {
+        (true, false) => std::cmp::Ordering::Less,
+        (false, true) => std::cmp::Ordering::Greater,
+        _ => left.name.cmp(&right.name),
+    });
+
+    let max_resolvers = match first {
+        Some(first) => (entries.len() as i32).min(first).max(0) as usize,
+        None => entries.len(),
+    };
+    let mut resolvers: Vec<FileStat> = Vec::with_capacity(max_resolvers);
+    for entry in entries {
+        if resolvers.len() >= max_resolvers {
+            break;
+        }
+        let keep = match kind {
+            EntryKind::All => true,
+            EntryKind::Files => !entry.is_dir(),
+            EntryKind::Directories => entry.is_dir(),
+        };
+        if keep {
+            resolvers.push(entry);
+        }
+    }
+
+    if ancestors && !is_root_path(path) {
+        let parent_path = go_path_dir(path.trim_matches('/'));
+        // The baseline recurses with `{Ancestors: true}` only: no `first`,
+        // no `recursive`, no filter.
+        let mut ancestors_entries =
+            resolve_listing(git, repo_id, oid, &parent_path, false, true, None, EntryKind::All)?;
+        ancestors_entries.extend(resolvers);
+        return Ok(ancestors_entries);
+    }
+
+    Ok(resolvers)
+}
+
 /// `GitTreeEntryResolver` (`git_tree_entry.go:42-53`).
 #[derive(Clone)]
 pub struct GitTreeEntryObject {
@@ -919,75 +1161,27 @@ impl GitTreeEntryObject {
                 "tree entries require the gitserver GitSource (not wired for this request)",
             ));
         };
-        let mut entries =
-            match git.dir_entries(self.repo.id, &self.oid, self.path(), recursive) {
-                Some(DirEntriesLookup::Found(entries)) => entries.clone(),
-                Some(DirEntriesLookup::Error(message)) => {
-                    return Err(ExecError::new(message.clone()))
-                }
-                None => return Err(ExecError::new("tree entries are not prefetched")),
-            };
-
-        // `recursive: true` returns the parent trees too (`ls-tree -r -t`);
-        // drop one entry per level of nesting below the root.
-        if recursive && !self.is_root() {
-            let depth = self.path().trim_matches('/').split('/').count();
-            if depth >= entries.len() {
-                entries.clear();
-            } else {
-                entries.drain(..depth);
-            }
-        }
-
-        entries.sort_by(|left, right| match (left.is_dir(), right.is_dir()) {
-            (true, false) => std::cmp::Ordering::Less,
-            (false, true) => std::cmp::Ordering::Greater,
-            _ => left.name.cmp(&right.name),
-        });
-
-        let max_resolvers = match first {
-            Some(first) => (entries.len() as i32).min(first).max(0) as usize,
-            None => entries.len(),
-        };
-        let mut resolvers = Vec::with_capacity(max_resolvers);
-        for entry in entries {
-            if resolvers.len() >= max_resolvers {
-                break;
-            }
-            let keep = match kind {
-                EntryKind::All => true,
-                EntryKind::Files => !entry.is_dir(),
-                EntryKind::Directories => entry.is_dir(),
-            };
-            if keep {
-                resolvers.push(GitTreeEntryObject {
-                    repo: self.repo.clone(),
-                    oid: self.oid.clone(),
-                    input_rev: self.input_rev.clone(),
-                    stat: entry,
-                    git: self.git.clone(),
-                });
-            }
-        }
-
-        if ancestors && !self.is_root() {
-            let parent_path = go_path_dir(self.path().trim_matches('/'));
-            let parent = GitTreeEntryObject {
+        let entries = resolve_listing(
+            git,
+            self.repo.id,
+            &self.oid,
+            self.path(),
+            recursive,
+            ancestors,
+            first,
+            kind,
+        )
+        .map_err(ExecError::new)?;
+        Ok(entries
+            .into_iter()
+            .map(|entry| GitTreeEntryObject {
                 repo: self.repo.clone(),
                 oid: self.oid.clone(),
                 input_rev: self.input_rev.clone(),
-                stat: sg_git::FileStat::synthetic(&parent_path, true),
+                stat: entry,
                 git: self.git.clone(),
-            };
-            // The baseline recurses with `{Ancestors: true}` only: no `first`,
-            // no `recursive`, no filter.
-            let mut ancestors_entries =
-                parent.entries_resolve(false, true, None, EntryKind::All)?;
-            ancestors_entries.extend(resolvers);
-            return Ok(ancestors_entries);
-        }
-
-        Ok(resolvers)
+            })
+            .collect())
     }
 
     fn is_single_child_field(&self) -> Result<Option<FieldValue>, ExecError> {
