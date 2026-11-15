@@ -76,6 +76,7 @@ pub mod github_apps_graphql;
 pub mod githubapp_http_api;
 pub mod githubapp_inbound;
 pub mod webhook_authz_handlers;
+pub mod permissions_webhook;
 pub mod github_apps_graphql_store;
 pub mod gitlab_oauth;
 pub mod diagnostics_adapters;

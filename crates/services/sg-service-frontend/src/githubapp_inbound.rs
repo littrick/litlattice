@@ -47,6 +47,7 @@ use tonic::body::BoxBody;
 use crate::batches_credentials::BatchesCredentialsDatabase;
 use crate::batches_graphql_store::PgBatchesGraphqlStore;
 use crate::external_api::{go_quote, validate_github_signature};
+use crate::permissions_webhook::{self, PermissionsWebhookDeps, PgPermissionsWebhookDeps};
 use crate::webhook_authz_handlers::{dispatch_github, parse_event, AuthzDeps, PgAuthzDeps};
 
 /// The generic webhook mount (`webhooks.NewHandler`).
@@ -156,6 +157,11 @@ pub trait InboundDeps: Send + Sync {
     /// The M9.44b authz side-effect seams (`webhookhandlers.Init` handlers).
     /// `None` leaves the authz events as dispatch no-ops.
     fn authz_deps(&self) -> Option<&dyn AuthzDeps> {
+        None
+    }
+    /// The M9.45b `PermissionsGitHubWebhook` seams. `None` leaves its events
+    /// as no-ops.
+    fn permissions_webhook_deps(&self) -> Option<&dyn PermissionsWebhookDeps> {
         None
     }
 }
@@ -280,7 +286,7 @@ where
 
     let secret = webhook.secret.as_deref().unwrap_or("");
     match webhook.code_host_kind.as_str() {
-        KIND_GITHUB => github_response(req, deps, secret).await,
+        KIND_GITHUB => github_response(req, deps, secret, &webhook.code_host_urn).await,
         KIND_BITBUCKET_SERVER => bitbucket_server_response(req, secret).await,
         KIND_GITLAB => gitlab_response(req, secret).await,
         KIND_BITBUCKET_CLOUD => bitbucket_cloud_response(req, secret).await,
@@ -301,6 +307,7 @@ async fn github_response<B>(
     req: &mut Request<B>,
     deps: &dyn InboundDeps,
     secret: &str,
+    code_host_urn: &str,
 ) -> Response<BoxBody>
 where
     B: hyper::body::Body<Data = Bytes> + Unpin + Send,
@@ -333,7 +340,7 @@ where
         }
     };
 
-    handle_github_event(req, &payload, deps)
+    handle_github_event(req, &payload, deps, code_host_urn)
 }
 
 /// `handleBitbucketServerWebhook` + `HandleBitBucketServerWebhook`
@@ -804,6 +811,7 @@ fn handle_github_event<B>(
     req: &Request<B>,
     payload: &[u8],
     deps: &dyn InboundDeps,
+    code_host_urn: &str,
 ) -> Response<BoxBody> {
     let event = header(req, X_GITHUB_EVENT);
     match event {
@@ -832,28 +840,54 @@ fn handle_github_event<B>(
         // M9.44b: `webhookhandlers.Init` registration. `organization` parses
         // but has no handler; the others land under bogus code-host keys (see
         // `webhook_authz_handlers` errata), so `dispatch_github` is a no-op.
-        authz_event @ ("public" | "repository" | "member" | "team_add" | "organization"
-        | "membership") => {
-            let parsed = match parse_event(authz_event, payload) {
+        // `public` is only owned by the old handler.
+        "public" => {
+            let parsed = match parse_event("public", payload) {
                 Ok(parsed) => parsed,
                 Err(error) => {
                     return http_error(StatusCode::BAD_REQUEST, &error.message());
                 }
             };
-            let Some(authz) = deps.authz_deps() else {
-                return empty_ok();
-            };
-            match dispatch_github(authz_event, &parsed, authz) {
-                Ok(()) => empty_ok(),
-                Err(error) => {
+            if let Some(authz) = deps.authz_deps() {
+                if let Err(error) = dispatch_github("public", &parsed, authz) {
                     let status = if error.is_not_found() {
                         StatusCode::NOT_FOUND
                     } else {
                         StatusCode::INTERNAL_SERVER_ERROR
                     };
-                    http_error(status, error.message())
+                    return http_error(status, error.message());
                 }
             }
+            empty_ok()
+        }
+        // M9.45b: events registered by `PermissionsGitHubWebhook`. The old
+        // handlers for these (except `team`) are inert, so only the newer
+        // handler has side effects. Errors are swallowed by the handler, so
+        // the response is 200 after a successful parse.
+        authz_event @ ("repository" | "member" | "team_add" | "organization"
+        | "membership" | "team") => {
+            if authz_event != "team" {
+                // Preserve the old handler's parse-error surface first.
+                let parsed = match parse_event(authz_event, payload) {
+                    Ok(parsed) => parsed,
+                    Err(error) => {
+                        return http_error(StatusCode::BAD_REQUEST, &error.message());
+                    }
+                };
+                if let Some(authz) = deps.authz_deps() {
+                    let _ = dispatch_github(authz_event, &parsed, authz);
+                }
+            }
+            let parsed = match permissions_webhook::parse_event(authz_event, payload) {
+                Ok(parsed) => parsed,
+                Err(error) => {
+                    return http_error(StatusCode::BAD_REQUEST, &error.message());
+                }
+            };
+            if let Some(perms) = deps.permissions_webhook_deps() {
+                let _ = permissions_webhook::handle_event(&parsed, code_host_urn, perms);
+            }
+            empty_ok()
         }
         other => http_error(
             StatusCode::BAD_REQUEST,
@@ -1023,15 +1057,18 @@ pub struct PgInboundDeps {
     pool: sqlx::PgPool,
     keyring: std::sync::Arc<sg_keyring::Keyring>,
     authz: PgAuthzDeps,
+    perms_webhook: PgPermissionsWebhookDeps,
 }
 
 impl PgInboundDeps {
     pub fn new(pool: sqlx::PgPool, keyring: std::sync::Arc<sg_keyring::Keyring>) -> Self {
         let authz = PgAuthzDeps::new(pool.clone());
+        let perms_webhook = PgPermissionsWebhookDeps::new(pool.clone());
         Self {
             pool,
             keyring,
             authz,
+            perms_webhook,
         }
     }
 }
@@ -1050,6 +1087,10 @@ fn block_on<F: std::future::Future>(future: F) -> F::Output {
 impl InboundDeps for PgInboundDeps {
     fn authz_deps(&self) -> Option<&dyn AuthzDeps> {
         Some(&self.authz)
+    }
+
+    fn permissions_webhook_deps(&self) -> Option<&dyn PermissionsWebhookDeps> {
+        Some(&self.perms_webhook)
     }
 
     fn lookup_webhook(&self, uuid: &str) -> WebhookLookup {
