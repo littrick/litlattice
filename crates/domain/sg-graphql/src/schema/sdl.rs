@@ -49,6 +49,13 @@ pub const CODEINTEL_AUTOINDEXING_SCHEMA: &str =
 /// registered together, exactly like `NewSchema`'s `ReadDir` batch.
 pub const CODEINTEL_POLICIES_SCHEMA: &str = include_str!("sdl/codeintel.policies.graphql");
 
+/// `//go:embed codeintel*.graphql` — the code-navigation document (M9.48b):
+/// `GitBlob.lsif`, `GitBlobLSIFData`, `GitTreeLSIFData`, `CodeGraphData`,
+/// `Query.usagesForSymbol`, diagnostics and the input types. `assemble_oss`
+/// never includes it; production appends it through
+/// `with_codeintel_codenav` only when that surface is enabled.
+pub const CODEINTEL_CODENAV_SCHEMA: &str = include_str!("sdl/codeintel.codenav.graphql");
+
 /// `//go:embed notebooks.graphql` — `OptionalResolver.NotebooksResolver` SDL
 /// (M9.29a): `Query.notebooks`, the `Notebook`/`NotebookBlock` types and the
 /// notebook mutations. `NewSchema` appends it only when the notebooks

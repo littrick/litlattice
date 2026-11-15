@@ -4400,6 +4400,7 @@ dependencies = [
  "sg-proto",
  "sg-rcache",
  "sg-redis",
+ "sg-scip",
  "sg-search-query",
  "sg-service-gitserver",
  "sg-service-searcher",

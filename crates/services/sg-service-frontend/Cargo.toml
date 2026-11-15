@@ -28,6 +28,7 @@ sg-metrics = { path = "../../base/sg-metrics" }
 sg-proto = { path = "../../net/sg-proto" }
 sg-rcache = { path = "../../data/sg-rcache" }
 sg-redis = { path = "../../data/sg-redis" }
+sg-scip = { path = "../../domain/sg-scip" }
 sg-search-query = { path = "../../domain/sg-search-query" }
 sg-session = { path = "../../domain/sg-session" }
 sg-service-searcher = { path = "../sg-service-searcher" }

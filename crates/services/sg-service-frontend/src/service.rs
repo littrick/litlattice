@@ -1509,8 +1509,22 @@ impl Service for FrontendService {
         // `CodeIntelResolver`; the builders below reproduce that SDL set. The
         // stores read the same frontend tables as the Go baseline and the
         // gitserver seam backs `projectRoot`/`tags`/retention matching.
-        let codeintel_git_source: Arc<dyn crate::git_graphql::GitObjectSource> =
+        let codeintel_git_objects =
             crate::git_graphql::production_git_source(Arc::clone(wiring.live()));
+        let codeintel_git_source: Arc<dyn crate::git_graphql::GitObjectSource> =
+            codeintel_git_objects.clone();
+        // M9.48b: the codenav store needs gitserver `Diff` for cross-commit
+        // range translations; the same concrete object also implements
+        // `GitCommitExtraSource`.
+        let codeintel_git_extra: Arc<dyn crate::git_commit_extra::GitCommitExtraSource> =
+            codeintel_git_objects;
+        let codeintel_uploads_handle: crate::codeintel_uploads_graphql::CodeIntelUploadsHandle =
+            Arc::new(
+                crate::codeintel_uploads_graphql_store::PgCodeIntelUploadsStore::new(
+                    session_pool.clone(),
+                )
+                .with_git(Arc::clone(&codeintel_git_source)),
+            );
         let graphql_deps = graphql_deps
             .with_batches(Arc::new(
                 crate::batches_graphql_store::PgBatchesGraphqlStore::new(session_pool.clone())
@@ -1528,12 +1542,7 @@ impl Service for FrontendService {
                     ),
             ))
             .and_then(|deps| {
-                deps.with_codeintel_uploads(Arc::new(
-                    crate::codeintel_uploads_graphql_store::PgCodeIntelUploadsStore::new(
-                        session_pool.clone(),
-                    )
-                    .with_git(Arc::clone(&codeintel_git_source)),
-                ))
+                deps.with_codeintel_uploads(Arc::clone(&codeintel_uploads_handle))
             })
             .and_then(|deps| {
                 deps.with_codeintel_policies(Arc::new(
@@ -1541,6 +1550,18 @@ impl Service for FrontendService {
                         session_pool.clone(),
                         Arc::clone(&codeintel_git_source),
                     ),
+                ))
+            })
+            .and_then(|deps| {
+                // M9.48b: the code-navigation document plus its read-only
+                // SCIP/lsif seam.
+                deps.with_codeintel_codenav(Arc::new(
+                    crate::codeintel_codenav_store::PgCodeIntelCodenavStore::new(
+                        session_pool.clone(),
+                    )
+                    .with_git(Arc::clone(&codeintel_git_source))
+                    .with_diff_source(Arc::clone(&codeintel_git_extra))
+                    .with_uploads(Arc::clone(&codeintel_uploads_handle)),
                 ))
             })
             .map_err(|err| {

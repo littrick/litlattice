@@ -784,6 +784,10 @@ pub struct GitPrefetch {
     /// `GitTree.ownership`/`ownershipStats` and `GitCommit.ownership`.
     /// `None` leaves those fields unported.
     pub own: Option<crate::own_graphql::OwnHandle>,
+    /// M9.48b: the Code Intel code-navigation seam behind
+    /// `GitBlob.lsif`/`GitTree.lsif`/`GitBlob.codeGraphData`. `None` keeps the
+    /// optional surface unassembled.
+    pub codenav: Option<crate::codeintel_codenav_graphql::CodeIntelCodenavHandle>,
 }
 
 impl Clone for GitPrefetch {
@@ -808,6 +812,7 @@ impl Clone for GitPrefetch {
             tree_highlights: self.tree_highlights.clone(),
             external_url: self.external_url.clone(),
             own: self.own.clone(),
+            codenav: self.codenav.clone(),
         }
     }
 }
@@ -837,6 +842,7 @@ impl std::fmt::Debug for GitPrefetch {
             .field("tree_highlights", &self.tree_highlights)
             .field("external_url", &self.external_url)
             .field("own", &self.own.as_ref().map(|_| "<own handle>"))
+            .field("codenav", &self.codenav.as_ref().map(|_| "<codenav>"))
             .finish()
     }
 }
