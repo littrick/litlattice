@@ -933,15 +933,15 @@ fn go_path_ext(path: &str) -> String {
 /// `richHTML` (`file.go:34-43`).
 ///
 /// Markdown families render through the byte-compatible goldmark port
-/// ([`crate::markdown_graphql::render_markdown`]). `.ipynb` needs Go's
-/// `nb`/goldmark-jupyter/synth stack, which is not ported (M9.46b errata);
-/// everything else is the empty string.
+/// ([`crate::markdown_graphql::render_markdown`]); `.ipynb` uses the
+/// nb/goldmark-jupyter/synth-compatible port in [`crate::ipynb_render`].
+/// Everything else is the empty string.
 fn rich_html(content: &str, ext: &str) -> Result<String, String> {
     match ext.to_ascii_lowercase().as_str() {
         ".md" | ".mdown" | ".markdown" | ".markdn" => {
             crate::markdown_graphql::render_markdown(content)
         }
-        ".ipynb" => Err("ipynb rendering is not ported".to_owned()),
+        ".ipynb" => crate::ipynb_render::render(content),
         _ => Ok(String::new()),
     }
 }

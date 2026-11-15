@@ -11,11 +11,10 @@
 //! Deliberate approximation: `enry.GetLanguagesByContent` is ported for a
 //! curated subset of extensions (`.h`, `.html`, `.inc`, `.m`, `.php`, `.pl`,
 //! `.pm`, `.pro`, `.r`; M9.46b), using the generated rules' regexes verbatim in
-//! RE2-compatible form. `GetLanguagesByClassifier` (a trained Naive Bayes
-//! model) is not ported and contributes no candidates. Ambiguous extensions
-//! whose heuristic chain still has multiple candidates (or whose content hits
-//! an unported rule) return that candidate list instead. Modeline, shebang,
-//! filename and extension decisions are exact.
+//! RE2-compatible form. M9.47b ports `GetLanguagesByClassifier` — the trained
+//! Naive Bayes model plus the Linguist tokenizer — in
+//! [`crate::enry_classifier`], so ambiguous candidates are ranked like the
+//! baseline. Modeline, shebang, filename and extension decisions are exact.
 
 use crate::enry_data::{
     LANGUAGES_BY_EXTENSION, LANGUAGES_BY_FILENAME, LANGUAGES_BY_INTERPRETER, LANGUAGE_BY_ALIAS,
@@ -235,7 +234,14 @@ pub fn get_languages(path: &str, content: Option<&[u8]>) -> Vec<String> {
         1 => return candidates,
         _ => languages = candidates,
     }
-    // `GetLanguagesByClassifier`: not ported (trained Naive Bayes model).
+    // `GetLanguagesByClassifier` (go-enry `classifier.go`): rank the surviving
+    // candidates by the trained Naive Bayes model.
+    let candidates = crate::enry_classifier::classify(content, &languages);
+    match candidates.len() {
+        0 => {}
+        1 => return candidates,
+        _ => languages = candidates,
+    }
     languages
 }
 
