@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use sg_service_frontend::cody_context_graphql::{
-    chunk_end_line, count_lines, identity_rank, process_url_context, send_intent_request,
+    count_lines, identity_rank, process_url_context, send_intent_request,
     IntentBackendConfig, IntentHttpResponse, IntentHttpTransport, CHUNK_SIZE_RUNES,
 };
 
