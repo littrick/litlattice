@@ -178,6 +178,11 @@ impl Arguments {
         self.0.get(name)
     }
 
+    /// Iterate the resolved arguments in name order (used by prefetch keys).
+    pub fn iter(&self) -> impl Iterator<Item = (&String, &InputValue)> {
+        self.0.iter()
+    }
+
     pub fn string(&self, name: &str) -> Option<&str> {
         self.get(name).and_then(InputValue::as_str)
     }

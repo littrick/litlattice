@@ -980,7 +980,7 @@ fn default_settings_data() -> SettingsData {
 
 /// Data for nested resolver fields that need their own async lookups,
 /// prefetched once per request and shared by every object through an `Arc`.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct NestedPrefetch {
     pub user_organizations: HashMap<i32, UserOrganizationsLookup>,
     /// Keyed by organization id + argument set.
@@ -1058,6 +1058,10 @@ pub struct NestedPrefetch {
     /// `Repository.embeddingExists` lookups (M9.14c). `None` keeps the field
     /// unported when no embeddings seam was injected.
     pub repo_embeddings: Option<Arc<crate::embeddings_graphql::EmbeddingsPrefetch>>,
+    /// M9.48d cody context roots (see
+    /// [`crate::cody_context_graphql::prefetch_cody_context`]). `None` keeps
+    /// the cody root fields unported when no seam was injected.
+    pub cody_context: Option<Arc<crate::cody_context_graphql::CodyContextPrefetch>>,
     /// `Query.statusMessages` / `repositoryStats` / `backgroundJobs` /
     /// `gitservers` snapshots (M9.14c). `None` keeps all four unported when no
     /// diagnostics seam was injected.
@@ -3452,6 +3456,17 @@ impl ObjectValue for MutationRoot {
         arguments: &Arguments,
         actor: Actor,
     ) -> Result<Option<FieldValue>, ExecError> {
+        // M9.48d embeddings scheduling/cancellation mutations.
+        if let Some(graphql) = self
+            .business_c_nested
+            .repo_embeddings
+            .as_ref()
+            .and_then(|prefetch| prefetch.graphql.as_ref())
+        {
+            if crate::embeddings_graphql_surface::is_mutation_field(field) {
+                return crate::embeddings_graphql_surface::mutation_field(graphql, field);
+            }
+        }
         // M9.26a Batch Changes spec mutations (`createBatchSpec`,
         // `createChangesetSpec`, `createChangesetSpecs`).
         if let Some(batches) = &self.batches {
@@ -5251,6 +5266,35 @@ impl ObjectValue for QueryRoot {
                     actor,
                 )
             }
+            // M9.48d embeddings roots (`Query.embeddingsSearch` /
+            // `embeddingsMultiSearch` / `isContextRequiredForChatQuery` /
+            // `repoEmbeddingJobs`).
+            _ if self
+                .nested
+                .repo_embeddings
+                .as_ref()
+                .and_then(|prefetch| prefetch.graphql.as_ref())
+                .is_some()
+                && crate::embeddings_graphql_surface::is_query_root_field(field) =>
+            {
+                let graphql = self
+                    .nested
+                    .repo_embeddings
+                    .as_ref()
+                    .and_then(|prefetch| prefetch.graphql.as_ref())
+                    .expect("checked embeddings surface");
+                crate::embeddings_graphql_surface::query_root_field(graphql, field, arguments)
+            }
+            // M9.48d cody context roots.
+            _ if self.nested.cody_context.is_some()
+                && crate::cody_context_graphql::is_root_field(field) =>
+            {
+                crate::cody_context_graphql::root_field(
+                    self.nested.cody_context.as_ref().expect("checked cody context"),
+                    field,
+                    arguments,
+                )
+            }
             // `CodeMonitorsResolver` root fields (`Query.monitors`, M9.13a).
             _ if self.code_monitors.is_some()
                 && crate::code_monitors_graphql::is_root_field(field) =>
@@ -5284,7 +5328,7 @@ pub(crate) const MUST_BE_SITE_ADMIN_OR_SAME_USER: &str =
 
 /// `UserResolver` (`cmd/frontend/graphqlbackend/user.go:122-168`), limited to
 /// the fields backed by the user row and viewer authorization.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct UserObject {
     data: UserData,
     /// The viewer's `users.site_admin` (`false` for anonymous actors and for
@@ -6309,7 +6353,7 @@ const MUST_BE_SITE_ADMIN: &str = "must be site admin";
 
 /// `OrgResolver` (`cmd/frontend/graphqlbackend/org.go:65`), limited to the
 /// fields backed by the `orgs` row and viewer authorization.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct OrgObject {
     data: OrgData,
     /// The viewer's `users.site_admin`; member `User` objects built by
@@ -6589,7 +6633,7 @@ impl ObjectValue for OrgMembersConnectionObject {
 /// `organizationMembershipConnectionResolver` (`org_members.go:33-45`). The
 /// SDL exposes only `nodes`/`totalCount`; the baseline's
 /// `PageInfo() = HasNextPage(false)` is unreachable.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct OrganizationMembershipConnectionObject {
     memberships: Vec<MembershipData>,
     viewer_site_admin: bool,
@@ -6645,7 +6689,7 @@ impl ObjectValue for OrganizationMembershipConnectionObject {
 }
 
 /// `organizationMembershipResolver` (`org_members.go:47-61`).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct OrganizationMembershipObject {
     membership: MembershipData,
     viewer_site_admin: bool,
@@ -6776,7 +6820,7 @@ fn optional_cursor(cursor: &Option<String>) -> FieldValue {
 /// `orgConnectionStaticResolver` (`orgs.go:71-82`): `nodes` and `totalCount`
 /// from an already-fetched slice. The SDL `OrgConnection` type exposes no
 /// `pageInfo` field, so the baseline's `HasNextPage(false)` is not reachable.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct OrgConnectionStaticObject {
     nodes: Vec<OrgData>,
     viewer_site_admin: bool,
@@ -7084,6 +7128,22 @@ impl ObjectValue for RepositoryObject {
                 .map(Some),
                 None => Ok(None),
             },
+            // `RepositoryResolver.EmbeddingJobs` (`repository.go:124-131`) →
+            // `EnterpriseResolvers.embeddingsResolver.RepoEmbeddingJobs`
+            // (M9.48d): the connection is prefetched per repo id + arguments.
+            "embeddingJobs" => {
+                let Some(embeddings) = &self.embeddings else {
+                    return Ok(None);
+                };
+                let Some(graphql) = &embeddings.graphql else {
+                    return Ok(None);
+                };
+                crate::embeddings_graphql_surface::repository_embedding_jobs(
+                    graphql,
+                    self.data.id,
+                    arguments,
+                )
+            }
             // `RepositoryResolver.EmbeddingExists` (`repository.go:116-122`):
             // the gate and the per-repo lookup are prefetched (M9.14c).
             "embeddingExists" => {

@@ -46,6 +46,30 @@ fn search_contexts_enabled() -> bool {
     }
 }
 
+/// The configuration-level half of `cody.IsCodyEnabled`
+/// (`conf.CodyEnabled()`): the per-actor authentication and verified-email
+/// checks run in the prefetcher, and the license/RBAC/feature-flag branches
+/// stay explicit seams.
+fn cody_config_disabled_reason(live: &sg_config::LiveConfig) -> Option<String> {
+    let current = live.current();
+    let site = current.site.raw();
+    let enabled = site
+        .get("cody")
+        .and_then(|cody| cody.get("enabled"))
+        .and_then(serde_json::Value::as_bool)
+        .or_else(|| {
+            site.get("completions")
+                .and_then(|completions| completions.get("enabled"))
+                .and_then(serde_json::Value::as_bool)
+        })
+        .unwrap_or(false);
+    if enabled {
+        None
+    } else {
+        Some("cody is disabled".to_owned())
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Startup sequence (`cmd/frontend/internal/cli/serve_cmd.go:74-131`).
 //
@@ -1240,13 +1264,6 @@ impl Service for FrontendService {
                 .with_rbac_store(Arc::new(crate::rbac_graphql::PgRbacStore::new(
                     session_pool.clone(),
                 )))
-                // M9.14c: `Repository.embeddingExists` reads
-                // `repo_embedding_jobs.state = 'completed'` (no schema change).
-                .with_embeddings(Arc::new(
-                    crate::embeddings_graphql::PgRepositoryEmbeddingsStore::new(
-                        session_pool.clone(),
-                    ),
-                ))
                 // M9.15b: production adapters behind the M9.14c diagnostic
                 // seams. Background jobs read the existing
                 // `background-job-logger` Redis keys (read-only), gitserver
@@ -1266,6 +1283,96 @@ impl Service for FrontendService {
                         Arc::clone(wiring.live()),
                     ),
                 ));
+        // M9.48d: embeddings GraphQL surface. The jobs/stats/cancel paths read
+        // the existing `repo_embedding_jobs` / `repo_embedding_job_stats`
+        // tables (no schema change); the external embeddings service, gitserver
+        // file reader and scheduler stay explicit seams (`None` → the Go error
+        // texts, never fabricated results).
+        let force_allow_embeddings = std::env::var("SRC_INTERNAL_EMBEDDINGS_ALLOWED")
+            .map(|value| {
+                matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "1" | "t" | "true"
+                )
+            })
+            .unwrap_or(false);
+        let embeddings_enabled = crate::embeddings_graphql::embeddings_enabled(
+            wiring.live().current().site.raw(),
+            force_allow_embeddings,
+        );
+        let repo_lookup: Arc<dyn crate::graphql_resolvers::RepositoryLookup> =
+            Arc::new(crate::repository_store::PgRepositoryStore::new(
+                session_pool.clone(),
+            ));
+        let embeddings_deps = crate::embeddings_graphql_surface::EmbeddingsDeps {
+            enabled: embeddings_enabled,
+            repository: Arc::new(
+                crate::embeddings_graphql::PgRepositoryEmbeddingsStore::new(
+                    session_pool.clone(),
+                ),
+            ),
+            jobs: Arc::new(
+                crate::embeddings_graphql_surface::PgEmbeddingsJobsStore::new(
+                    session_pool.clone(),
+                ),
+            ),
+            repos: Some(Arc::new(
+                crate::embeddings_graphql_surface::RepositoryLookupAdapter {
+                    store: Arc::clone(&repo_lookup),
+                },
+            )),
+            search: None,
+            files: None,
+            scheduler: None,
+            // `cody.IsCodyEnabled`'s unauthenticated check runs per request in
+            // the prefetcher; the config-level reason is injected here.
+            cody_gate: crate::embeddings_graphql_surface::CodyGate {
+                cody_disabled_reason: cody_config_disabled_reason(wiring.live()),
+                // Per-user verified-email lookup is not wired at this layer
+                // (SEAM_GAP); the gate is still enforced when injected.
+                verified_email_error: None,
+            },
+        };
+        let graphql_deps = graphql_deps
+            .with_embeddings(embeddings_deps)
+            .map_err(|err| {
+                ServiceError::new(format!(
+                    "failed to register the embeddings GraphQL surface: {err}"
+                ))
+            })?;
+        // M9.48d: cody context surface. The retrieval client/chunk source/
+        // intent backends/URL fetcher are explicit runtime seams; the SDL and
+        // the pure resolver logic (identity rerank, gates, error texts) are
+        // mounted so unconnected deployments fail like the baseline instead of
+        // returning fabricated context.
+        let dotcom = crate::service_connections::sourcegraph_dotcom_mode(&|key: &str| {
+            std::env::var(key).ok()
+        });
+        let cody_context_deps = crate::cody_context_graphql::CodyContextDeps {
+            dotcom,
+            gate: crate::embeddings_graphql_surface::CodyGate {
+                cody_disabled_reason: cody_config_disabled_reason(wiring.live()),
+                verified_email_error: None,
+            },
+            context: None,
+            repos: Some(Arc::new(
+                crate::embeddings_graphql_surface::RepositoryLookupAdapter {
+                    store: repo_lookup,
+                },
+            )),
+            chunks: None,
+            intent: None,
+            intent_http: None,
+            reranker: crate::cody_context_graphql::CodyReranker::Identity,
+            url_fetcher: None,
+        };
+        let graphql_deps = graphql_deps
+            .with_cody_context(cody_context_deps)
+            .map_err(|err| {
+                ServiceError::new(format!(
+                    "failed to register the cody context GraphQL surface: {err}"
+                ))
+            })?;
         // M9.35a: `Query.searchQueryAggregate` executes through the same
         // `SearchDeps` as `Query.search` and `/.api/search/stream`. The seam
         // applies the per-match tabulator and the 2s/55s deadline; buffer and
