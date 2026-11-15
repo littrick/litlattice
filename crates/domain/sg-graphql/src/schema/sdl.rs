@@ -68,3 +68,11 @@ pub const INSIGHTS_SCHEMA: &str = include_str!("sdl/insights.graphql");
 /// aggregation resolver is present, so `assemble_oss` never includes it.
 pub const INSIGHTS_AGGREGATIONS_SCHEMA: &str =
     include_str!("sdl/insights_aggregations.graphql");
+
+/// `//go:embed own.graphql` — `OptionalResolver.OwnResolver` SDL (M9.48c):
+/// the `Ownable` interface, `GitBlob`/`GitTree`/`GitCommit.ownership`,
+/// `OwnershipStats`/`OwnershipConnection`/`Owner`/`OwnershipReasonType`,
+/// CODEOWNERS ingestion types and the `Query`/`Mutation` roots. `NewSchema`
+/// appends it only when the own resolver is present, so `assemble_oss` never
+/// includes it.
+pub const OWN_SCHEMA: &str = include_str!("sdl/own.graphql");

@@ -124,6 +124,8 @@ pub mod outbound_webhooks_graphql;
 pub mod outbound_webhooks_store;
 pub mod out_of_band_migrations_graphql;
 pub mod outbound_requests_graphql;
+pub mod own_graphql;
+pub mod own_store;
 pub mod package_repo_filters;
 pub mod parse_search_query;
 pub mod phabricator_graphql;

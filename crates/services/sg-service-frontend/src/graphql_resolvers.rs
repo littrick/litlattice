@@ -2690,6 +2690,7 @@ impl FrontendRootResolver {
                 executor_secret_roots:
                     crate::executor_secrets_graphql::ExecutorSecretRoots::default(),
                 saved_searches: None,
+                own: None,
                 code_monitors: None,
                 codeintel_uploads: None,
                 codeintel_autoindexing: None,
@@ -2813,6 +2814,15 @@ impl FrontendRootResolver {
         let nested = Arc::make_mut(&mut self.query.nested);
         nested.saved_searches =
             saved_searches.map(crate::saved_searches_graphql::SavedSearchesHandleWrapper);
+        self
+    }
+
+    /// Attach the optional own ownership surface (M9.48c): the root fields,
+    /// `CodeownersIngestedFile` node, `Repository.ingestedCodeowners` and the
+    /// `GitBlob`/`GitTree`/`GitCommit.ownership` fields.
+    pub fn with_own(mut self, own: Option<crate::own_graphql::OwnHandle>) -> Self {
+        self.query.own = own.clone();
+        self.mutation.own = own;
         self
     }
 
@@ -3272,6 +3282,9 @@ struct QueryRoot {
     /// Optional saved-searches database (M9.13a). `None` means the SDL was not
     /// appended and the root field is absent.
     saved_searches: Option<crate::saved_searches_graphql::SavedSearchesHandle>,
+    /// Optional own ownership surface (M9.48c). `None` means the SDL was not
+    /// appended and the own root fields are absent.
+    own: Option<crate::own_graphql::OwnHandle>,
     /// Optional Batch Changes database (M9.24c). `None` means the SDL was not
     /// appended and the root fields are absent.
     batches: Option<crate::batches_graphql::BatchesHandle>,
@@ -3344,6 +3357,8 @@ pub struct MutationRoot {
     executor_secret_nested: Arc<NestedPrefetch>,
     /// Optional saved-searches database (M9.13a).
     saved_searches: Option<crate::saved_searches_graphql::SavedSearchesHandle>,
+    /// Optional own ownership write surface (M9.48c).
+    own: Option<crate::own_graphql::OwnHandle>,
     /// Optional code-monitor resolver (M9.13a).
     code_monitors: Option<Arc<crate::code_monitors_graphql::CodeMonitorsResolver>>,
     /// Optional Batch Changes write surface (M9.25b).
@@ -3452,6 +3467,13 @@ impl ObjectValue for MutationRoot {
         arguments: &Arguments,
         actor: Actor,
     ) -> Result<Option<FieldValue>, ExecError> {
+        // M9.48c own ownership mutations (CODEOWNERS ingestion, signal
+        // configuration updates and assigned owner/team writes).
+        if let Some(own) = &self.own {
+            if crate::own_graphql::is_mutation_field(field) {
+                return crate::own_graphql::mutation_field(own, field, arguments, actor);
+            }
+        }
         // M9.26a Batch Changes spec mutations (`createBatchSpec`,
         // `createChangesetSpec`, `createChangesetSpecs`).
         if let Some(batches) = &self.batches {
@@ -4804,6 +4826,16 @@ impl ObjectValue for QueryRoot {
                             self.nested.clone(),
                         )
                     }
+                    // `NodeResolvers()["CodeownersIngestedFile"]` (M9.48c).
+                    _ if self.own.is_some()
+                        && crate::own_graphql::is_node_kind(kind.as_str()) =>
+                    {
+                        crate::own_graphql::node_field(
+                            self.own.as_ref().expect("checked own"),
+                            id,
+                            actor,
+                        )
+                    }
                     // `NodeResolvers()["SavedSearch"]` (M9.13a): registered
                     // only when the optional resolver is present.
                     "SavedSearch" if self.saved_searches.is_some() => {
@@ -5109,6 +5141,16 @@ impl ObjectValue for QueryRoot {
                 arguments,
                 actor,
             ),
+            // `OwnResolver` root fields (M9.48c): only present when the
+            // optional resolver was registered.
+            _ if self.own.is_some() && crate::own_graphql::is_root_field(field) => {
+                crate::own_graphql::root_field(
+                    self.own.as_ref().expect("checked own"),
+                    field,
+                    arguments,
+                    actor,
+                )
+            }
             // `SavedSearchesResolver` root fields (M9.13a): only present when
             // the optional resolver was registered.
             _ if self.saved_searches.is_some()
@@ -7041,6 +7083,14 @@ impl ObjectValue for RepositoryObject {
         actor: Actor,
     ) -> Result<Option<FieldValue>, ExecError> {
         match field {
+            // `Repository.ingestedCodeowners` (M9.48c): `RepoIngestedCodeowners`
+            // is open to anyone; NotFound → null.
+            "ingestedCodeowners" => {
+                let Some(own) = self.git.as_ref().and_then(|git| git.own.as_ref()) else {
+                    return Ok(None);
+                };
+                crate::own_graphql::repository_ingested_codeowners(own, &self.data, actor)
+            }
             // `Repository.indexConfiguration` (M9.28b).
             "indexConfiguration" => match &self.autoindexing {
                 Some(db) => crate::codeintel_autoindexing_graphql::repository_field(

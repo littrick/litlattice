@@ -780,6 +780,10 @@ pub struct GitPrefetch {
     /// `GitTreeEntry.rawZipArchiveURL`. Empty means "no live site config";
     /// the resolver then falls back to Go's cached `http://example.com`.
     pub external_url: String,
+    /// M9.48c: optional own GraphQL surface backing `GitBlob.ownership`,
+    /// `GitTree.ownership`/`ownershipStats` and `GitCommit.ownership`.
+    /// `None` leaves those fields unported.
+    pub own: Option<crate::own_graphql::OwnHandle>,
 }
 
 impl Clone for GitPrefetch {
@@ -803,6 +807,7 @@ impl Clone for GitPrefetch {
             symbols: self.symbols.clone(),
             tree_highlights: self.tree_highlights.clone(),
             external_url: self.external_url.clone(),
+            own: self.own.clone(),
         }
     }
 }
@@ -831,6 +836,7 @@ impl std::fmt::Debug for GitPrefetch {
             )
             .field("tree_highlights", &self.tree_highlights)
             .field("external_url", &self.external_url)
+            .field("own", &self.own.as_ref().map(|_| "<own handle>"))
             .finish()
     }
 }
@@ -1952,7 +1958,7 @@ impl ObjectValue for GitCommitResolverObject {
         &self,
         field: &str,
         arguments: &Arguments,
-        _actor: Actor,
+        actor: Actor,
     ) -> Result<Option<FieldValue>, ExecError> {
         match field {
             "id" => Ok(Some(FieldValue::Json(Json::Str(git_commit_relay_id(
@@ -2032,6 +2038,19 @@ impl ObjectValue for GitCommitResolverObject {
             }
             // `GitCommitResolver.Symbols` (`symbols.go:59-76`).
             "symbols" => crate::git_tree_entry_graphql::commit_symbols_field(self, arguments),
+            // M9.48c: `GitCommit.ownership` (Go `git_commit.go:471-473`).
+            "ownership" => {
+                let Some(own) = self.git.as_ref().and_then(|git| git.own.as_ref()) else {
+                    return Ok(None);
+                };
+                crate::own_graphql::git_commit_ownership(
+                    own,
+                    &self.repo,
+                    &self.oid,
+                    arguments,
+                    actor,
+                )
+            }
             _ => crate::git_commit_extra::commit_extra_field(self, field, arguments),
         }
     }

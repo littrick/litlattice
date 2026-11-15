@@ -1441,6 +1441,24 @@ impl Service for FrontendService {
                     "failed to register batch changes/code intel GraphQL surfaces: {err}"
                 ))
             })?;
+        // M9.48c: production Own ownership GraphQL surface. `NewSchema` appends
+        // `own.graphql` for a non-nil `OwnResolver`; the store reads the
+        // existing `codeowners`/`assigned_*`/`own_*`/`ownership_path_stats`
+        // tables and the gitserver seam backs the CODEOWNERS file lookup. No
+        // new tables, columns or Redis keys.
+        let graphql_deps = graphql_deps
+            .with_own(Arc::new(crate::own_store::PgOwnGraphqlStore::new(
+                session_pool.clone(),
+                Arc::clone(&codeintel_git_source),
+                crate::service_connections::sourcegraph_dotcom_mode(&|key: &str| {
+                    std::env::var(key).ok()
+                }),
+            )))
+            .map_err(|err| {
+                ServiceError::new(format!(
+                    "failed to register own ownership GraphQL surface: {err}"
+                ))
+            })?;
         // M9.42a: production Notebooks / Code Insights / GitHub Apps / Code Intel
         // autoindexing surfaces. `graphqlbackend.NewSchema` appends
         // `notebooks.graphql`, `insights.graphql` and `githubapps.graphql` for a

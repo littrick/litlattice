@@ -1825,7 +1825,7 @@ impl ObjectValue for GitTreeEntryObject {
         &self,
         field: &str,
         arguments: &Arguments,
-        _actor: Actor,
+        actor: Actor,
     ) -> Result<Option<FieldValue>, ExecError> {
         match field {
             "path" => Ok(Some(FieldValue::Json(Json::Str(self.path().to_owned())))),
@@ -1868,6 +1868,43 @@ impl ObjectValue for GitTreeEntryObject {
             "history" => self.history_field(arguments),
             "symbols" => self.symbols_field(arguments),
             "symbol" => self.symbol_field(arguments),
+            // M9.48c: `GitBlob.ownership` / `GitTree.ownership` /
+            // `GitTree.ownershipStats` (Go `git_tree_entry.go` forwards to the
+            // enterprise own resolver). Without the own handle the fields stay
+            // unported.
+            "ownership" => {
+                let Some(own) = self.git.as_ref().and_then(|git| git.own.as_ref()) else {
+                    return Ok(None);
+                };
+                if self.stat.is_dir() {
+                    crate::own_graphql::git_tree_ownership(
+                        own,
+                        &self.repo,
+                        &self.oid,
+                        self.path(),
+                        arguments,
+                        actor,
+                    )
+                } else {
+                    crate::own_graphql::git_blob_ownership(
+                        own,
+                        &self.repo,
+                        &self.oid,
+                        self.path(),
+                        arguments,
+                        actor,
+                    )
+                }
+            }
+            "ownershipStats" => {
+                if !self.stat.is_dir() {
+                    return Ok(None);
+                }
+                let Some(own) = self.git.as_ref().and_then(|git| git.own.as_ref()) else {
+                    return Ok(None);
+                };
+                crate::own_graphql::git_tree_ownership_stats(own, &self.repo, self.path())
+            }
             _ => Ok(None),
         }
     }
