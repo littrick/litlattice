@@ -183,18 +183,45 @@ impl CodeMonitorSnapshot for EmptySnapshot {
     }
 }
 
-/// Production has no search-planner wiring in this slice; `Snapshot` runs in
-/// the worker (M9.9f). Creating/updating a monitor therefore reports an
+/// Production `codemonitors.Snapshot` (`internal/codemonitors/search.go:77`):
+/// plans the monitor query, resolves the current revisions per repo, and
+/// returns the `map[api.RepoID][]string` written to `cm_last_searched`.
+///
+/// The search runtime is the same [`TreeRuntimeClients`] bundle the frontend
+/// search stream uses; `None` means the service connections were unavailable
+/// at assembly time, so snapshotting (and therefore create/update) reports an
 /// explicit error instead of silently skipping the snapshot.
-pub struct UnavailableSnapshot;
+pub struct ProductionSnapshot {
+    pub runtime: Option<crate::search_stream::TreeRuntimeClients>,
+}
 
-impl CodeMonitorSnapshot for UnavailableSnapshot {
+impl ProductionSnapshot {
+    pub fn new(runtime: crate::search_stream::TreeRuntimeClients) -> Self {
+        Self {
+            runtime: Some(runtime),
+        }
+    }
+
+    /// Unavailable variant used when endpoint configuration could not be
+    /// assembled.
+    pub fn unavailable() -> Self {
+        Self { runtime: None }
+    }
+}
+
+impl CodeMonitorSnapshot for ProductionSnapshot {
     fn snapshot(
         &self,
-        _query: &str,
-        _request_context: crate::search_contexts::RequestContext,
+        query: &str,
+        request_context: crate::search_contexts::RequestContext,
     ) -> Result<BTreeMap<i32, Vec<String>>, String> {
-        Err("code monitor snapshots are not available in this build".to_owned())
+        let Some(runtime) = self.runtime.as_ref() else {
+            return Err("code monitor snapshots are not available in this build".to_owned());
+        };
+        // `codemonitors.Snapshot` runs outside a transaction; the Rust adapter
+        // is per-statement, so `in_transaction` is always false here.
+        crate::codemonitors_search::snapshot(runtime, query, false, request_context)
+            .map_err(|error| error.0)
     }
 }
 
@@ -1960,20 +1987,12 @@ impl CodeMonitorsResolver {
         };
         let namespace = unmarshal_namespace_to_ids(&string_input(update, "namespace"))
             .map_err(ExecError::new)?;
-        let row = self
-            .db
-            .update_monitor(
-                monitor_id,
-                &string_input(update, "description"),
-                bool_input(update, "enabled"),
-                namespace.user,
-                namespace.org,
-                actor.uid().unwrap_or(0),
-                now,
-            )
-            .map_err(ExecError::new)?
-            .ok_or_else(|| ExecError::new(sql_no_rows()))?;
 
+        // The baseline runs the snapshot inside the update transaction but
+        // takes it against `rawDB`; an error rolls the transaction back. The
+        // Rust adapter is per-statement (M9.13a deferral), so validate and
+        // resolve the snapshot before any write to keep the same observable
+        // error semantics: a failed snapshot leaves `cm_*` untouched.
         let trigger_id = unmarshal_spec_i64(
             trigger_input
                 .get("id")
@@ -1991,19 +2010,35 @@ impl CodeMonitorsResolver {
             .get_query_trigger_for_monitor(monitor_id)
             .map_err(ExecError::new)?
             .ok_or_else(|| ExecError::new(sql_no_rows()))?;
-        if current.query_string != new_query {
-            let resolved = self
-                .snapshot
+        let resolved = if current.query_string != new_query {
+            self.snapshot
                 .snapshot(
                     &new_query,
                     crate::search_contexts::RequestContext::from_graphql_actor(actor, false),
                 )
+                .map_err(ExecError::new)?
+        } else {
+            BTreeMap::new()
+        };
+
+        let row = self
+            .db
+            .update_monitor(
+                monitor_id,
+                &string_input(update, "description"),
+                bool_input(update, "enabled"),
+                namespace.user,
+                namespace.org,
+                actor.uid().unwrap_or(0),
+                now,
+            )
+            .map_err(ExecError::new)?
+            .ok_or_else(|| ExecError::new(sql_no_rows()))?;
+
+        for (repo_id, commit_ids) in resolved {
+            self.db
+                .upsert_last_searched(monitor_id, repo_id, &commit_ids)
                 .map_err(ExecError::new)?;
-            for (repo_id, commit_ids) in resolved {
-                self.db
-                    .upsert_last_searched(monitor_id, repo_id, &commit_ids)
-                    .map_err(ExecError::new)?;
-            }
         }
         self.db
             .update_query_trigger(

@@ -1046,36 +1046,49 @@ impl Service for FrontendService {
             sub_repo_getter,
             ctx.shutdown.clone(),
         );
-        let search_deps: Arc<dyn crate::search_stream::SearchDeps> =
-            match crate::service_connections::service_connections() {
-                Ok(connections) => {
-                    match crate::search_runtime::assemble_with_encryption_key(
-                        &search_pool,
-                        &connections,
-                        &search_site,
-                        keyring.user_external_account_key(),
-                    ) {
-                        Ok(runtime) => Arc::new(crate::search_stream::BackendDeps::with_runtime(
-                            search_pool,
-                            runtime,
+        // The same runtime bundle drives both the search stream and the
+        // code-monitor `Snapshot` (`codemonitors.Snapshot`, M9.45d).
+        let (search_deps, snapshot_runtime): (
+            Arc<dyn crate::search_stream::SearchDeps>,
+            Option<crate::search_stream::TreeRuntimeClients>,
+        ) = match crate::service_connections::service_connections() {
+            Ok(connections) => {
+                match crate::search_runtime::assemble_with_encryption_key(
+                    &search_pool,
+                    &connections,
+                    &search_site,
+                    keyring.user_external_account_key(),
+                ) {
+                    Ok(runtime) => (
+                        Arc::new(crate::search_stream::BackendDeps::with_runtime(
+                            search_pool.clone(),
+                            runtime.clone(),
                         )),
-                        Err(error) => {
-                            tracing::warn!(
-                                error = %error,
-                                "search runtime is not configured; search execution is not ported"
-                            );
-                            Arc::new(crate::search_stream::BackendDeps::new(search_pool))
-                        }
+                        Some(runtime),
+                    ),
+                    Err(error) => {
+                        tracing::warn!(
+                            error = %error,
+                            "search runtime is not configured; search execution is not ported"
+                        );
+                        (
+                            Arc::new(crate::search_stream::BackendDeps::new(search_pool.clone())),
+                            None,
+                        )
                     }
                 }
-                Err(error) => {
-                    tracing::warn!(
-                        error = %error,
-                        "service connections unavailable; search execution is not ported"
-                    );
-                    Arc::new(crate::search_stream::BackendDeps::new(search_pool))
-                }
-            };
+            }
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "service connections unavailable; search execution is not ported"
+                );
+                (
+                    Arc::new(crate::search_stream::BackendDeps::new(search_pool.clone())),
+                    None,
+                )
+            }
+        };
         // `serve_cmd.go:153`: `overrideExtSvcConfig` runs after the keyring is
         // initialized so it can decrypt existing configs and encrypt new ones.
         // It fails startup when the file cannot be applied; the watcher below
@@ -1354,7 +1367,10 @@ impl Service for FrontendService {
             Arc::new(crate::code_monitors_graphql_store::PgCodeMonitorsGraphqlStore::new(
                 session_pool.clone(),
             )),
-            Arc::new(crate::code_monitors_graphql::UnavailableSnapshot),
+            Arc::new(match snapshot_runtime {
+                Some(runtime) => crate::code_monitors_graphql::ProductionSnapshot::new(runtime),
+                None => crate::code_monitors_graphql::ProductionSnapshot::unavailable(),
+            }),
             Arc::new(crate::code_monitors_graphql::UnavailableTestSender),
             code_monitors_enabled,
             crate::service_connections::sourcegraph_dotcom_mode(&|key: &str| {
