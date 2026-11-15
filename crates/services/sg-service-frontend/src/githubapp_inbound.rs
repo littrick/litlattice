@@ -47,6 +47,7 @@ use tonic::body::BoxBody;
 use crate::batches_credentials::BatchesCredentialsDatabase;
 use crate::batches_graphql_store::PgBatchesGraphqlStore;
 use crate::external_api::{go_quote, validate_github_signature};
+use crate::webhook_authz_handlers::{dispatch_github, parse_event, AuthzDeps, PgAuthzDeps};
 
 /// The generic webhook mount (`webhooks.NewHandler`).
 pub const WEBHOOKS_PREFIX: &str = "/.api/webhooks/";
@@ -152,6 +153,11 @@ pub trait InboundDeps: Send + Sync {
         app: &InboundApp,
         external_service_url: &str,
     ) -> Result<(), String>;
+    /// The M9.44b authz side-effect seams (`webhookhandlers.Init` handlers).
+    /// `None` leaves the authz events as dispatch no-ops.
+    fn authz_deps(&self) -> Option<&dyn AuthzDeps> {
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -823,6 +829,32 @@ fn handle_github_event<B>(
             }
             empty_ok()
         }
+        // M9.44b: `webhookhandlers.Init` registration. `organization` parses
+        // but has no handler; the others land under bogus code-host keys (see
+        // `webhook_authz_handlers` errata), so `dispatch_github` is a no-op.
+        authz_event @ ("public" | "repository" | "member" | "team_add" | "organization"
+        | "membership") => {
+            let parsed = match parse_event(authz_event, payload) {
+                Ok(parsed) => parsed,
+                Err(error) => {
+                    return http_error(StatusCode::BAD_REQUEST, &error.message());
+                }
+            };
+            let Some(authz) = deps.authz_deps() else {
+                return empty_ok();
+            };
+            match dispatch_github(authz_event, &parsed, authz) {
+                Ok(()) => empty_ok(),
+                Err(error) => {
+                    let status = if error.is_not_found() {
+                        StatusCode::NOT_FOUND
+                    } else {
+                        StatusCode::INTERNAL_SERVER_ERROR
+                    };
+                    http_error(status, error.message())
+                }
+            }
+        }
         other => http_error(
             StatusCode::BAD_REQUEST,
             &format!("unknown X-Github-Event in message: {other}"),
@@ -990,11 +1022,17 @@ pub fn sign(algorithm: &str, secret: &[u8], body: &[u8]) -> Option<String> {
 pub struct PgInboundDeps {
     pool: sqlx::PgPool,
     keyring: std::sync::Arc<sg_keyring::Keyring>,
+    authz: PgAuthzDeps,
 }
 
 impl PgInboundDeps {
     pub fn new(pool: sqlx::PgPool, keyring: std::sync::Arc<sg_keyring::Keyring>) -> Self {
-        Self { pool, keyring }
+        let authz = PgAuthzDeps::new(pool.clone());
+        Self {
+            pool,
+            keyring,
+            authz,
+        }
     }
 }
 
@@ -1010,6 +1048,10 @@ fn block_on<F: std::future::Future>(future: F) -> F::Output {
 }
 
 impl InboundDeps for PgInboundDeps {
+    fn authz_deps(&self) -> Option<&dyn AuthzDeps> {
+        Some(&self.authz)
+    }
+
     fn lookup_webhook(&self, uuid: &str) -> WebhookLookup {
         use sqlx::Row;
         let row = match block_on(
