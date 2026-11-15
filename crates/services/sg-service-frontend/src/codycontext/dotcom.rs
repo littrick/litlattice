@@ -273,6 +273,11 @@ pub struct KeywordPlanRequest {
     pub search_mode: SearchMode,
     pub protocol: Protocol,
     pub context_lines: Option<i32>,
+    /// `actor.FromContext(ctx)`: the request actor controls settings,
+    /// search-context resolution and sub-repo filtering. Anonymous requests
+    /// keep [`crate::search_contexts::RequestContext::anonymous`] and never
+    /// inherit another user's context.
+    pub request_context: crate::search_contexts::RequestContext,
 }
 
 /// The subset of `searchClient.Execute` the client consumes: only
@@ -292,7 +297,11 @@ pub struct KeywordSearchOutcome {
 #[async_trait]
 pub trait KeywordContextSearcher: Send + Sync {
     async fn plan(&self, request: &KeywordPlanRequest) -> Result<SearchInputs, String>;
-    async fn execute(&self, inputs: &SearchInputs) -> Result<KeywordSearchOutcome, String>;
+    async fn execute(
+        &self,
+        inputs: &SearchInputs,
+        request_context: crate::search_contexts::RequestContext,
+    ) -> Result<KeywordSearchOutcome, String>;
 }
 
 /// The ported `CodyContextClient`.
@@ -443,6 +452,7 @@ impl CodyContextClient {
         &self,
         args: &GetContextArgs,
         matcher: &CodyFileMatcher,
+        request_context: crate::search_contexts::RequestContext,
     ) -> Result<Vec<ContextList>, String> {
         if args.repos.is_empty() {
             // The search query `repo:^$` returns all repos, not zero repos.
@@ -459,6 +469,7 @@ impl CodyContextClient {
                 search_mode: SearchMode::Precise,
                 protocol: Protocol::Streaming,
                 context_lines: Some(0),
+                request_context,
             };
             let mut plan = self.keyword.plan(&request).await?;
             add_limits_and_filter(
@@ -467,7 +478,7 @@ impl CodyContextClient {
                 args.text_results_count,
                 matcher,
             );
-            let outcome = self.keyword.execute(&plan).await?;
+            let outcome = self.keyword.execute(&plan, request_context).await?;
             if let Some((title, description)) = &outcome.alert {
                 tracing::warn!(
                     %title,
@@ -491,6 +502,7 @@ impl CodyContextClient {
     pub async fn get_cody_context(
         &self,
         args: &GetContextArgs,
+        request_context: crate::search_contexts::RequestContext,
     ) -> Result<GetCodyContextResult, String> {
         if let Some(reason) = &self.cody_disabled_reason {
             return Err(format!("cody is not enabled: {reason}"));
@@ -541,7 +553,7 @@ impl CodyContextClient {
         // (`conc/pool.WithErrors`).
         let (embeddings_result, keyword_result) = tokio::join!(
             self.get_embeddings_context(&embeddings_args, &context_filter),
-            self.get_keyword_context(&keyword_args, &context_filter),
+            self.get_keyword_context(&keyword_args, &context_filter, request_context),
         );
         match (embeddings_result, keyword_result) {
             (Ok(embeddings), Ok(keyword)) => Ok(merge_context_lists(embeddings, keyword)),

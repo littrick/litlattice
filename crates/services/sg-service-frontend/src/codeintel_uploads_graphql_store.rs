@@ -754,10 +754,42 @@ impl CodeIntelUploadsDatabase for PgCodeIntelUploadsStore {
         .map_err(|error| error.to_string())
     }
 
-    fn get_audit_logs_for_upload(&self, upload_id: i32) -> Result<Vec<AuditLogRow>, String> {
+    fn check_site_admin(&self, actor: Actor) -> Result<(), String> {
+        // `auth.CheckCurrentUserIsSiteAdmin`: internal bypass, anonymous or a
+        // deleted/unknown user is `not authenticated`, a known non-admin is
+        // `must be site admin`.
+        if actor.is_internal() {
+            return Ok(());
+        }
+        let Some(uid) = actor.uid() else {
+            return Err(crate::admin_store::NOT_AUTHENTICATED.to_owned());
+        };
+        let row = block_on(
+            sqlx::query("SELECT site_admin FROM users WHERE id = $1 AND deleted_at IS NULL")
+                .bind(uid)
+                .fetch_optional(&self.pool),
+        )
+        .map_err(|error| error.to_string())?;
+        let Some(row) = row else {
+            return Err(crate::admin_store::NOT_AUTHENTICATED.to_owned());
+        };
+        if row.try_get::<bool, _>("site_admin").unwrap_or(false) {
+            Ok(())
+        } else {
+            Err(crate::admin_store::MUST_BE_SITE_ADMIN.to_owned())
+        }
+    }
+
+    fn get_audit_logs_for_upload(
+        &self,
+        upload_id: i32,
+        actor: Actor,
+    ) -> Result<Vec<AuditLogRow>, String> {
+        let authz = self.authz(actor)?;
         block_on(sg_db::codeintel_uploads::get_audit_logs_for_upload(
             &self.pool,
             upload_id,
+            &authz,
         ))
         .map(|rows| {
             rows.into_iter()

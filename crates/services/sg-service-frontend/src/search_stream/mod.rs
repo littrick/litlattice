@@ -649,13 +649,14 @@ impl crate::codycontext::KeywordContextSearcher for SearchKeywordSearcher {
     ) -> Result<SearchInputs, String> {
         let inputs = self
             .client
-            .plan(
+            .plan_with_context(
                 &request.version,
                 request.pattern_type.as_deref(),
                 &request.query,
                 request.search_mode,
                 request.protocol,
                 request.context_lines,
+                &request.request_context,
             )
             .map_err(|error| error.to_string())?;
         Ok(inputs_from_plan(inputs))
@@ -664,9 +665,10 @@ impl crate::codycontext::KeywordContextSearcher for SearchKeywordSearcher {
     async fn execute(
         &self,
         inputs: &SearchInputs,
+        request_context: crate::search_contexts::RequestContext,
     ) -> Result<crate::codycontext::KeywordSearchOutcome, String> {
-        let outcome =
-            run_inputs(self.runner.as_ref(), inputs).map_err(|JobError(message)| message)?;
+        let outcome = run_inputs_with_context(self.runner.as_ref(), inputs, request_context)
+            .map_err(|JobError(message)| message)?;
         if let Some(error) = outcome.error {
             return Err(error.message);
         }

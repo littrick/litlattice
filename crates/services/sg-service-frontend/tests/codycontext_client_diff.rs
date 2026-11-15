@@ -379,7 +379,11 @@ impl KeywordContextSearcher for FakeKeywordSearcher {
         Ok(sentinel_inputs())
     }
 
-    async fn execute(&self, inputs: &SearchInputs) -> Result<KeywordSearchOutcome, String> {
+    async fn execute(
+        &self,
+        inputs: &SearchInputs,
+        _request_context: sg_service_frontend::search_contexts::RequestContext,
+    ) -> Result<KeywordSearchOutcome, String> {
         let options = inputs.cody_context.as_ref();
         self.executions.lock().expect("lock").push(ExecutionRecord {
             code_count: options.map(|options| options.code_count).unwrap_or(0),
@@ -529,7 +533,13 @@ async fn run_keyword(case: &Case) -> Value {
         code_results_count: case.code_count,
         text_results_count: case.text_count,
     };
-    let result = context_client.get_keyword_context(&args, &matcher).await;
+    let result = context_client
+        .get_keyword_context(
+            &args,
+            &matcher,
+            sg_service_frontend::search_contexts::RequestContext::anonymous(),
+        )
+        .await;
     let (lists, error) = match &result {
         Ok(lists) => (chunks_json(lists), Value::Null),
         Err(error) => (Value::Array(Vec::new()), Value::String(error.clone())),
@@ -647,7 +657,12 @@ async fn run_full(case: &Case) -> Value {
         code_results_count: case.code_count,
         text_results_count: case.text_count,
     };
-    let result = context_client.get_cody_context(&args).await;
+    let result = context_client
+        .get_cody_context(
+            &args,
+            sg_service_frontend::search_contexts::RequestContext::anonymous(),
+        )
+        .await;
     let (lists, error) = match &result {
         Ok(result) => (chunks_json(&result.context_lists), Value::Null),
         Err(error) => (Value::Array(Vec::new()), Value::String(error.clone())),

@@ -1904,15 +1904,21 @@ SELECT \
     u.reason, u.operation::text AS operation \
 FROM lsif_uploads_audit_logs u \
 JOIN repo ON repo.id = u.repository_id \
-WHERE u.upload_id = $1 \
-ORDER BY u.sequence";
+WHERE u.upload_id = $1";
 
 /// `store.GetAuditLogsForUpload` (`store/uploads.go:624`).
+///
+/// The baseline appends `database.AuthzQueryConds(ctx, db)`, so the audit
+/// trail is only visible for uploads whose repository the request actor may
+/// see. `authz_conds` is that predicate (`TRUE` for the internal actor and
+/// site admins, exactly like Go).
 pub async fn get_audit_logs_for_upload(
     pool: &PgPool,
     upload_id: i32,
+    authz_conds: &str,
 ) -> Result<Vec<UploadAuditLogRow>, sqlx::Error> {
-    let rows = sqlx::query(GET_AUDIT_LOGS_FOR_UPLOAD_QUERY)
+    let query = format!("{GET_AUDIT_LOGS_FOR_UPLOAD_QUERY} AND {authz_conds} ORDER BY u.sequence");
+    let rows = sqlx::query(&query)
     .bind(upload_id)
     .fetch_all(pool)
     .await?;

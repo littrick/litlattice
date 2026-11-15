@@ -441,11 +441,14 @@ pub async fn get_query_trigger_for_job(
 #[derive(Debug, Clone, PartialEq)]
 pub struct Monitor {
     pub id: i64,
+    /// `cm_monitors.namespace_user_id`: user-owned monitors run searches as
+    /// their owner (`actor.FromUser(m.UserID)` in the worker).
+    pub namespace_user_id: Option<i32>,
 }
 
-/// `monitorByIDFmtStr` narrowed to the id.
+/// `monitorByIDFmtStr` narrowed to the id and owner namespace.
 pub const GET_MONITOR_SQL: &str =
-    "SELECT cm_monitors.id FROM cm_monitors WHERE cm_monitors.id = $1";
+    "SELECT cm_monitors.id, cm_monitors.namespace_user_id FROM cm_monitors WHERE cm_monitors.id = $1";
 
 /// `codeMonitorStore.GetMonitor`.
 pub async fn get_monitor(pool: &PgPool, monitor_id: i64) -> Result<Monitor, sqlx::Error> {
@@ -455,6 +458,7 @@ pub async fn get_monitor(pool: &PgPool, monitor_id: i64) -> Result<Monitor, sqlx
         .await?;
     Ok(Monitor {
         id: row.try_get("id")?,
+        namespace_user_id: row.try_get("namespace_user_id")?,
     })
 }
 

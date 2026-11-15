@@ -132,15 +132,29 @@ pub async fn load_excluded_patterns(pool: &PgPool) -> Result<Vec<String>, String
     Ok(patterns.unwrap_or_default())
 }
 
-/// `recentViewSignalStore.insertPaths`: find the parent chain for every leaf,
-/// augment each ancestor with the leaf's count, then issue one 5000-row batch
-/// per chunk of an additive `ON CONFLICT ... DO UPDATE` insert.
+/// `recentViewSignalStore.InsertPaths`: the production hard limit is 5000
+/// entries per bulk insert.
 pub async fn insert_paths(
     pool: &PgPool,
     user_id: i32,
     repo_path_id_to_count: &BTreeMap<i32, i32>,
 ) -> Result<(), String> {
-    let batch_size = repo_path_id_to_count.len().min(5000);
+    insert_paths_with_batch_size(pool, user_id, repo_path_id_to_count, 5000).await
+}
+
+/// `recentViewSignalStore.insertPaths`: find the parent chain for every leaf,
+/// augment each ancestor with the leaf's count, then issue one
+/// `max_batch_size`-row batch per chunk of an additive
+/// `ON CONFLICT ... DO UPDATE` insert. `max_batch_size` is the baseline's
+/// unexported parameter, exposed so the differential harness can force
+/// multiple batches without seeding 5001 paths.
+pub async fn insert_paths_with_batch_size(
+    pool: &PgPool,
+    user_id: i32,
+    repo_path_id_to_count: &BTreeMap<i32, i32>,
+    max_batch_size: usize,
+) -> Result<(), String> {
+    let batch_size = repo_path_id_to_count.len().min(max_batch_size);
     if batch_size == 0 {
         return Ok(());
     }

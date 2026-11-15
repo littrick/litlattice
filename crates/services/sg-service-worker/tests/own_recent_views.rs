@@ -379,4 +379,39 @@ async fn own_recent_views_harness() {
     seed_bookmark(&pool, 0).await;
     seed_event(&pool, "ViewBlob", 1, "null").await;
     print_state(&pool, "null-json", &invoke(&pool, &disabled).await).await;
+
+    // 19. More than 5000 distinct paths: the aggregate builder feeds
+    //     `insert_paths` 5000 leaves (plus their ancestors), so the
+    //     5000-row bulk-insert limit splits the augmented rows into two
+    //     batches. Print a compact summary instead of 5002 rows.
+    reset(&pool).await;
+    seed_base(&pool, &[]).await;
+    seed_bookmark(&pool, 0).await;
+    sqlx::query(
+        "INSERT INTO event_logs \
+             (name, url, user_id, anonymous_user_id, source, argument, version, \
+              timestamp, public_argument) \
+         SELECT 'ViewBlob', 'http://example.com', 1, '', 'test', '{}'::jsonb, 'v1', now(), \
+             jsonb_build_object('repoName', $1::text, 'filePath', 'src/file' || g || '.go') \
+         FROM generate_series(1, 5000) AS g",
+    )
+    .bind(REPO_A_NAME)
+    .execute(&pool)
+    .await
+    .expect("seed 5000 view events");
+    let error = invoke(&pool, &disabled).await;
+    let error_str = if error.is_err() { "error" } else { "none" };
+    let row = sqlx::query(
+        "SELECT count(*), COALESCE(sum(views_count), 0), COALESCE(max(views_count), 0) \
+         FROM own_aggregate_recent_view",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("query over-batch aggregates");
+    let rows: i64 = row.try_get(0).expect("count");
+    let total: i64 = row.try_get(1).expect("sum");
+    let max: i32 = row.try_get(2).expect("max");
+    print_line(format!(
+        "case=over-batch rows={rows} total={total} max={max} err={error_str}"
+    ));
 }
