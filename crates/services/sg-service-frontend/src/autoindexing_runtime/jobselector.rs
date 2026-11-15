@@ -482,7 +482,9 @@ pub fn new_auto_index_job(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::jobs::autoindex_config::{AutoIndexJobSpec, DockerStep as ConfigDockerStep};
+    use crate::autoindexing_runtime::autoindex_config::{
+        AutoIndexJobSpec, DockerStep as ConfigDockerStep,
+    };
 
     fn spec() -> AutoIndexJobSpec {
         AutoIndexJobSpec {

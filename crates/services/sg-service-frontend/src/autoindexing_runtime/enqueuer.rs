@@ -48,7 +48,7 @@ use sg_db::codeintel_autoindexing_enqueuer::{
 use sg_db::repos::{Repo, RepoStore};
 use sqlx::PgPool;
 
-use super::codeintel_autoindexing_jobselector::{JobSelector, JobSelectorSettings};
+use super::jobselector::{JobSelector, JobSelectorSettings};
 
 /// `dependencies.MinimialVersionedPackageRepo`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -149,8 +149,8 @@ impl IndexEnqueuer {
         pool: PgPool,
         revision_resolver: Arc<dyn RevisionResolver>,
         package_inference: Arc<dyn PackageRepoInference>,
-        inference_svc: Arc<dyn super::codeintel_autoindexing_jobselector::InferenceService>,
-        yaml_reader: Arc<dyn super::codeintel_autoindexing_jobselector::SourcegraphYamlReader>,
+        inference_svc: Arc<dyn super::jobselector::InferenceService>,
+        yaml_reader: Arc<dyn super::jobselector::SourcegraphYamlReader>,
         env: &mut EnvReader,
     ) -> Result<Self, String> {
         let settings = JobSelectorSettings::from_env(env)?;
@@ -318,7 +318,7 @@ impl IndexEnqueuer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::jobs::codeintel_autoindexing_jobselector::DEFAULT_MAXIMUM_INDEX_JOBS;
+    use crate::autoindexing_runtime::jobselector::DEFAULT_MAXIMUM_INDEX_JOBS;
 
     struct NoInference;
 
@@ -347,13 +347,13 @@ mod tests {
     struct UnusedInference;
 
     #[async_trait]
-    impl super::super::codeintel_autoindexing_jobselector::InferenceService for UnusedInference {
+    impl super::super::jobselector::InferenceService for UnusedInference {
         async fn infer_index_jobs(
             &self,
             _repo: &str,
             _commit: &str,
             _override_script: &str,
-        ) -> Result<super::super::codeintel_autoindexing_jobselector::InferenceResult, String>
+        ) -> Result<super::super::jobselector::InferenceResult, String>
         {
             panic!("inference must not be called");
         }
@@ -362,12 +362,12 @@ mod tests {
     struct UnusedYaml;
 
     #[async_trait]
-    impl super::super::codeintel_autoindexing_jobselector::SourcegraphYamlReader for UnusedYaml {
+    impl super::super::jobselector::SourcegraphYamlReader for UnusedYaml {
         async fn read(
             &self,
             _repo: &str,
             _commit: &str,
-        ) -> Result<String, super::super::codeintel_autoindexing_jobselector::FileReadError>
+        ) -> Result<String, super::super::jobselector::FileReadError>
         {
             panic!("yaml reader must not be called");
         }

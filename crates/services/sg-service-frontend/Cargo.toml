@@ -56,6 +56,9 @@ ring = "0.17"
 rsa = "0.9"
 serde = { workspace = true }
 serde_json = { workspace = true }
+# M9.44c: the autoindexing inference service moved here from the worker crate;
+# it reads gitserver archive tars (`tar::Archive`).
+tar = "0.4"
 sha1 = { version = "0.10", features = ["oid"] }
 sha2 = { workspace = true, features = ["oid"] }
 sqlx = { workspace = true }

@@ -32,8 +32,8 @@ use sg_luasandbox::util::{
     map_slice_or_singleton, new_type_error, set_lua_function, set_string, Decoder,
 };
 
-use crate::jobs::autoindex_config::{AutoIndexJobSpec, DockerStep};
-use crate::jobs::codeintel_autoindexing_path_patterns::PathPattern;
+use crate::autoindexing_runtime::autoindex_config::{AutoIndexJobSpec, DockerStep};
+use crate::autoindexing_runtime::path_patterns::PathPattern;
 
 // ---------------------------------------------------------------------------
 // Userdata identity

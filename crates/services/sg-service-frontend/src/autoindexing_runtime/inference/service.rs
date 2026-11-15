@@ -33,9 +33,9 @@ use super::luatypes::{
     flatten_recognizer_patterns, index_job_from_table, linearize_generator,
     named_recognizers_from_user_data_map, Recognizer,
 };
-use crate::jobs::autoindex_config::AutoIndexJobSpec;
-use crate::jobs::codeintel_autoindexing_jobselector::InferenceResult;
-use crate::jobs::codeintel_autoindexing_path_patterns::{
+use crate::autoindexing_runtime::autoindex_config::AutoIndexJobSpec;
+use crate::autoindexing_runtime::jobselector::InferenceResult;
+use crate::autoindexing_runtime::path_patterns::{
     compile_patterns, filter_paths, filter_paths_by_patterns, PathPattern,
 };
 

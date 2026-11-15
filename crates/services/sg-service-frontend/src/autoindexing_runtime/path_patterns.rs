@@ -21,7 +21,7 @@
 //! patterns are constructed with [`PathPattern::new`],
 //! [`PathPattern::combined`] and [`PathPattern::exclude`].
 
-use crate::paths::{compile, GlobPattern};
+use crate::autoindexing_runtime::paths::{compile, GlobPattern};
 
 /// `luatypes.GlobAndPathspecPattern`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

@@ -1485,16 +1485,40 @@ impl Service for FrontendService {
                     "failed to register notebooks/insights/github apps GraphQL surfaces: {err}"
                 ))
             })?;
-        // The inference/enqueue half of the autoindexing service lives in
-        // `sg-service-worker` (which depends on this crate), so the production
-        // root cannot inject a jobs runtime; configuration/script reads and the
-        // schema surface work, while inference reports the explicit
-        // "not configured" error.
+        // M9.44c: inject the production inference/enqueue runtime. The chain
+        // now lives in this crate (`autoindexing_runtime`), so the frontend
+        // process can construct it directly from the same gitserver endpoints,
+        // live site configuration and frontend pool used by the rest of the
+        // production assembly. `inferAutoIndexJobsForRepo` /
+        // `queueAutoIndexJobsForRepo` therefore execute the real Lua inference
+        // and write the existing `lsif_indexes` table instead of reporting
+        // "runtime is not configured".
+        let autoindexing_connections = crate::service_connections::service_connections();
+        let autoindexing_git_addresses = autoindexing_connections
+            .as_ref()
+            .map(|connections| connections.git_servers.clone())
+            .unwrap_or_default();
+        let autoindexing_jobs: Option<
+            Arc<dyn crate::codeintel_autoindexing_graphql::CodeIntelAutoindexingJobsRuntime>,
+        > = match crate::autoindexing_runtime::ProductionAutoindexingJobsRuntime::from_site_configuration(
+            session_pool.clone(),
+            Arc::new(sg_git::GitserverClient::new(autoindexing_git_addresses)),
+            &autoindexing_site,
+        ) {
+            Ok(runtime) => Some(Arc::new(runtime)),
+            Err(err) => {
+                // `env.MustGetInt` panics in the baseline; here the configuration
+                // error is logged and the mutations keep reporting the explicit
+                // "runtime is not configured" error instead of faking jobs.
+                tracing::warn!(error = %err, "autoindexing jobs runtime unavailable");
+                None
+            }
+        };
         let graphql_deps = graphql_deps.with_codeintel_autoindexing(Arc::new(
             crate::codeintel_autoindexing_graphql_store::PgCodeIntelAutoindexingStore::with_site_configuration(
                 session_pool.clone(),
                 autoindexing_site,
-                None,
+                autoindexing_jobs,
             ),
         ));
         let graphql_deps = graphql_deps

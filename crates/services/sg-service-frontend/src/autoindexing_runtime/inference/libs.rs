@@ -23,7 +23,7 @@ use sg_luasandbox::mlua::{AnyUserData, Error, Lua, Table, Value};
 use sg_luasandbox::util::{assert_lua_string, map_slice};
 
 use super::luatypes::{path_patterns_from_user_data, recognizer_from_table, Recognizer};
-use crate::jobs::codeintel_autoindexing_path_patterns::PathPattern;
+use crate::autoindexing_runtime::path_patterns::PathPattern;
 
 /// `defaultIndexers`.
 const DEFAULT_INDEXERS: &[(&str, &str)] = &[
