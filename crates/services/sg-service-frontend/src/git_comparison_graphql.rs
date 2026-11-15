@@ -16,7 +16,7 @@
 //! repository-level comparison, file content/highlight prefetch and the preview
 //! (patch-based) comparison.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -61,6 +61,30 @@ pub struct HighlightKey {
     pub args: HighlightArgsKey,
 }
 
+/// Portable subset of `scip.Occurrence` (`sourcegraph/scip`'s
+/// `bindings/go/scip/scip.pb.go`). Only the fields the highlighter consumes
+/// are modeled. `syntax_kind` holds the numeric `scip.SyntaxKind` enum value.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LsifOccurrence {
+    /// Half-open `[startLine, startChar, endLine, endChar]` or
+    /// `[startLine, startChar, endChar]`.
+    pub range: Vec<i32>,
+    pub symbol: Option<String>,
+    pub symbol_roles: i32,
+    pub override_documentation: Vec<String>,
+    pub syntax_kind: i32,
+}
+
+/// Portable subset of `scip.Document`. `internal/highlight` consumes only
+/// `Occurrences` for HTML/line-range rendering; `Language`/`RelativePath` are
+/// carried for `HighlightedFile.lsif` (protobuf JSON) fidelity.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LsifDocument {
+    pub language: Option<String>,
+    pub relative_path: Option<String>,
+    pub occurrences: Vec<LsifOccurrence>,
+}
+
 /// `highlight.CodeAsLines`' result: the per-line HTML and the aborted flag.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct HighlightedFile {
@@ -70,6 +94,15 @@ pub struct HighlightedFile {
     /// `GitBlob.highlight`'s `html`/`lineRanges` fields. `None` when the
     /// producing path only has per-line HTML.
     pub html: Option<String>,
+    /// M9.47d: `HighlightedCode.code`, the source text with at most one final
+    /// newline trimmed. Required to render a SCIP document (`DocumentToHTML` /
+    /// `LinesForRanges`) when `lsif` is present.
+    pub code: Option<String>,
+    /// M9.47d: `HighlightedCode.document`, the `scip.Document` produced by a
+    /// tree-sitter/`JSON_SCIP` request. `None` for every syntect/HTML/plain
+    /// response, which is exactly when Go's `HighlightedFileResolver.LineRanges`
+    /// takes the HTML branch and `lsif` marshals to `"{}"`.
+    pub lsif: Option<LsifDocument>,
 }
 
 /// Comparison-specific prefetch state, attached to [`GitPrefetch`].
@@ -189,6 +222,8 @@ pub fn offline_highlight(request: &HighlightRequest) -> Result<HighlightedFile, 
         lines,
         aborted: true,
         html: Some(html),
+        code: Some(code),
+        lsif: None,
     })
 }
 
@@ -276,7 +311,7 @@ impl HighlightSource for CodeHighlighterSource {
         let input = if request.keep_final_newline {
             format!("{code}\n")
         } else {
-            code
+            code.clone()
         };
         let (html, aborted) = self
             .highlighter
@@ -292,6 +327,8 @@ impl HighlightSource for CodeHighlighterSource {
             lines: split_highlighted_lines(&html).map_err(HighlightError::Message)?,
             aborted,
             html: Some(html),
+            code: Some(code),
+            lsif: None,
         })
     }
 }
@@ -370,6 +407,443 @@ fn first_child(inner: &str) -> Result<String, String> {
     let close_at =
         find_from(inner, &close, open_end).ok_or_else(|| format!("missing {close}"))?;
     Ok(inner[..close_at + close.len()].to_string())
+}
+
+// ---------------------------------------------------------------------------
+// SCIP document consumption (M9.47d)
+// ---------------------------------------------------------------------------
+//
+// Portable port of `cmd/frontend/internal/highlight/html.go`'s
+// `DocumentToHTML`, `DocumentToSplitHTML`'s row builder and
+// `HighlightedCode.LinesForRanges` (`highlight.go:202`). The producer
+// (tree-sitter queries in syntect_server) is not portable; a SCIP document is
+// injected through `HighlightSource` (tests / a future transport).
+
+/// `scip.SyntaxKind_name` (`bindings/go/scip/scip.pb.go:367-407`). Returns
+/// `None` for `UnspecifiedSyntaxKind` (no class) and `Some("")` for unknown
+/// enum values, matching Go's map lookup in `appendTextToNode`.
+fn syntax_kind_class(kind: i32) -> Option<&'static str> {
+    if kind == 0 {
+        return None;
+    }
+    Some(match kind {
+        1 => "Comment",
+        2 => "PunctuationDelimiter",
+        3 => "PunctuationBracket",
+        4 => "Keyword",
+        5 => "IdentifierOperator",
+        6 => "Identifier",
+        7 => "IdentifierBuiltin",
+        8 => "IdentifierNull",
+        9 => "IdentifierConstant",
+        10 => "IdentifierMutableGlobal",
+        11 => "IdentifierParameter",
+        12 => "IdentifierLocal",
+        13 => "IdentifierShadowed",
+        14 => "IdentifierNamespace",
+        15 => "IdentifierFunction",
+        16 => "IdentifierFunctionDefinition",
+        17 => "IdentifierMacro",
+        18 => "IdentifierMacroDefinition",
+        19 => "IdentifierType",
+        20 => "IdentifierBuiltinType",
+        21 => "IdentifierAttribute",
+        22 => "RegexEscape",
+        23 => "RegexRepeated",
+        24 => "RegexWildcard",
+        25 => "RegexDelimiter",
+        26 => "RegexJoin",
+        27 => "StringLiteral",
+        28 => "StringLiteralEscape",
+        29 => "StringLiteralSpecial",
+        30 => "StringLiteralKey",
+        31 => "CharacterLiteral",
+        32 => "NumericLiteral",
+        33 => "BooleanLiteral",
+        34 => "Tag",
+        35 => "TagAttribute",
+        36 => "TagDelimiter",
+        _ => "",
+    })
+}
+
+/// `normalizeSCIPRange` (`html.go:320`): a three-element range is single-line.
+fn normalize_scip_range(range: &[i32]) -> (i32, i32, i32, i32) {
+    match range.len() {
+        3 => (range[0], range[1], range[0], range[2]),
+        n if n >= 4 => (range[0], range[1], range[2], range[3]),
+        _ => (0, 0, 0, 0),
+    }
+}
+
+/// `safeSlice` (`html.go:83`): rune-indexed, truncating at the line end.
+fn safe_slice(text: &[char], start: i32, finish: i32) -> String {
+    if start > finish {
+        return String::new();
+    }
+    let start = start.max(0) as usize;
+    let finish = finish.max(0) as usize;
+    if start > text.len() {
+        return String::new();
+    }
+    if finish > text.len() {
+        return text[start..].iter().collect();
+    }
+    text[start..finish].iter().collect()
+}
+
+/// `htmlManager` (`html.go:112`). Rows are accumulated as
+/// `(line number, [(syntax kind, text)])`; rendering is deferred so a row can
+/// be added mid-occurrence exactly like `newHtmlRow`/`addText`.
+struct ScipHtmlManager<'a> {
+    lines: Vec<Vec<char>>,
+    occurrences: &'a [LsifOccurrence],
+    row: i32,
+    occ_idx: usize,
+    valid_lines: Option<HashSet<i32>>,
+    rows: Vec<(i32, Vec<(i32, String)>)>,
+}
+
+impl<'a> ScipHtmlManager<'a> {
+    fn new(
+        code: &str,
+        document: &'a LsifDocument,
+        valid_lines: Option<HashSet<i32>>,
+    ) -> Self {
+        let lines = code
+            .split('\n')
+            .map(|line| {
+                let line = line.strip_suffix('\r').unwrap_or(line);
+                // Important for e.g. selecting whitespace in the produced table.
+                let line = if line.is_empty() { "\n" } else { line };
+                line.chars().collect()
+            })
+            .collect();
+        Self {
+            lines,
+            occurrences: &document.occurrences,
+            row: 0,
+            occ_idx: 0,
+            valid_lines,
+            rows: Vec::new(),
+        }
+    }
+
+    fn process(&mut self) {
+        let row_count = self.lines.len() as i32;
+        while self.row < row_count {
+            self.process_row();
+            self.next_row();
+        }
+    }
+
+    fn valid_row(&self, row: i32) -> bool {
+        self.valid_lines
+            .as_ref()
+            .map_or(true, |valid| valid.contains(&row))
+    }
+
+    fn next_row(&mut self) {
+        self.row += 1;
+    }
+
+    fn current_line(&self) -> Vec<char> {
+        self.lines
+            .get(self.row as usize)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    fn add_row(&mut self, row: i32) {
+        self.rows.push((row, Vec::new()));
+    }
+
+    fn add_text(&mut self, kind: i32, text: String) {
+        if text.is_empty() {
+            return;
+        }
+        if let Some(last) = self.rows.last_mut() {
+            last.1.push((kind, text));
+        }
+    }
+
+    fn process_row(&mut self) {
+        let row = self.row;
+        if !self.valid_row(row) {
+            return;
+        }
+        self.add_row(row);
+
+        let mut line_character: i32 = 0;
+        while self.occ_idx < self.occurrences.len()
+            && self.occurrences[self.occ_idx]
+                .range
+                .first()
+                .copied()
+                .unwrap_or(i32::MAX)
+                < row + 1
+        {
+            let occ = self.occurrences[self.occ_idx].clone();
+            self.occ_idx += 1;
+            line_character = self.process_one_occ(&occ, line_character);
+        }
+
+        let line = self.current_line();
+        let len = line.len() as i32;
+        if line_character != len {
+            self.add_text(0, safe_slice(&line, line_character, len));
+        }
+    }
+
+    fn process_one_occ(&mut self, occ: &LsifOccurrence, line_character: i32) -> i32 {
+        let (start_row, start_character, end_row, end_character) =
+            normalize_scip_range(&occ.range);
+
+        // Skip occurrences that end before the current row.
+        if end_row < self.row {
+            return 0;
+        }
+
+        if start_row == self.row && line_character != start_character {
+            let current_line = self.current_line();
+            self.add_text(
+                0,
+                safe_slice(&current_line, line_character, start_character),
+            );
+        }
+
+        if start_row == end_row {
+            self.process_single_line_occ(occ, start_row, start_character, end_character);
+        } else {
+            self.process_multi_line_occ(occ, start_row, start_character, end_row, end_character);
+        }
+
+        end_character
+    }
+
+    fn process_single_line_occ(
+        &mut self,
+        occ: &LsifOccurrence,
+        start_row: i32,
+        start_character: i32,
+        end_character: i32,
+    ) {
+        if start_row != self.row {
+            return;
+        }
+        let line = self.lines[start_row as usize].clone();
+        self.add_text(
+            occ.syntax_kind,
+            safe_slice(&line, start_character, end_character),
+        );
+    }
+
+    fn process_multi_line_occ(
+        &mut self,
+        occ: &LsifOccurrence,
+        start_row: i32,
+        start_character: i32,
+        end_row: i32,
+        end_character: i32,
+    ) {
+        let max_row = self.lines.len() as i32;
+
+        if self.row == start_row {
+            let line = self.current_line();
+            let len = line.len() as i32;
+            self.add_text(occ.syntax_kind, safe_slice(&line, start_character, len));
+            self.next_row();
+            self.add_row(self.row);
+        }
+
+        while self.row < end_row && self.row < max_row {
+            let line = self.current_line();
+            let text: String = line.iter().collect();
+            self.add_text(occ.syntax_kind, text);
+            self.next_row();
+            if self.row >= max_row {
+                break;
+            }
+            self.add_row(self.row);
+        }
+
+        if self.row == end_row && self.row < max_row {
+            let line = self.current_line();
+            self.add_text(occ.syntax_kind, safe_slice(&line, 0, end_character));
+        }
+    }
+}
+
+/// Render one `<tr>` the way Go's `html.Render(newHtmlRow(...))` does.
+fn render_scip_row(row: i32, segments: &[(i32, String)]) -> String {
+    let mut out = String::from("<tr>");
+    out.push_str("<td class=\"line\" data-line=\"");
+    out.push_str(&(row + 1).to_string());
+    out.push_str("\"></td><td class=\"code\">");
+    for (kind, text) in segments {
+        match syntax_kind_class(*kind) {
+            Some(name) => {
+                out.push_str("<span class=\"hl-typed-");
+                out.push_str(name);
+                out.push_str("\">");
+            }
+            None => out.push_str("<span>"),
+        }
+        out.push_str(&go_html_escape(text));
+        out.push_str("</span>");
+    }
+    out.push_str("</td></tr>");
+    out
+}
+
+/// `highlight.DocumentToHTML` (`html.go:54`): the full table, line numbers on.
+pub fn document_to_html(code: &str, document: &LsifDocument) -> String {
+    let mut manager = ScipHtmlManager::new(code, document, None);
+    manager.process();
+    let mut out = String::from("<table>");
+    for (row, segments) in &manager.rows {
+        out.push_str(&render_scip_row(*row, segments));
+    }
+    out.push_str("</table>");
+    out
+}
+
+/// `HighlightedCode.LinesForRanges` (`highlight.go:202`): render only the
+/// requested rows, then slice each range (clamp order matches Go).
+pub fn lines_for_ranges(
+    code: &str,
+    document: &LsifDocument,
+    ranges: &[(i32, i32)],
+) -> Result<Vec<Vec<String>>, String> {
+    let max_lines = code.split('\n').count() as i32;
+
+    let mut valid_lines = HashSet::new();
+    for &(start_line, end_line) in ranges {
+        let (start, end) = clamp_range(start_line, end_line, max_lines);
+        for row in start..end {
+            valid_lines.insert(row);
+        }
+    }
+
+    let mut manager = ScipHtmlManager::new(code, document, Some(valid_lines));
+    manager.process();
+    let string_rows: HashMap<i32, String> = manager
+        .rows
+        .iter()
+        .map(|(row, segments)| (*row, render_scip_row(*row, segments)))
+        .collect();
+
+    let mut line_ranges = Vec::with_capacity(ranges.len());
+    for &(start_line, end_line) in ranges {
+        let (start, end) = clamp_range(start_line, end_line, max_lines);
+        let mut current = Vec::new();
+        for row in start..end {
+            match string_rows.get(&row) {
+                Some(text) => current.push(text.clone()),
+                None => return Err("Missing row for some reason".to_owned()),
+            }
+        }
+        line_ranges.push(current);
+    }
+    Ok(line_ranges)
+}
+
+/// Go `LinesForRanges`/`SplitLineRanges` clamp order:
+/// `start<0→0`, `start>end→(0,0)`, `end>max→max`.
+fn clamp_range(start_line: i32, end_line: i32, max_lines: i32) -> (i32, i32) {
+    let mut start = start_line;
+    let mut end = end_line;
+    if start < 0 {
+        start = 0;
+    }
+    if start > end {
+        start = 0;
+        end = 0;
+    }
+    if end > max_lines {
+        end = max_lines;
+    }
+    (start, end)
+}
+
+/// Minimal JSON string quoting matching gogo `jsonpb` (no HTML escaping).
+fn jsonpb_string(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 2);
+    out.push('"');
+    for ch in text.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{08}' => out.push_str("\\b"),
+            '\u{0c}' => out.push_str("\\f"),
+            c if (c as u32) < 0x20 => {
+                out.push_str(&format!("\\u{:04x}", c as u32));
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+fn lsif_occurrence_json(occurrence: &LsifOccurrence) -> String {
+    // Field order mirrors gogo `jsonpb`'s struct-field traversal so the
+    // serialized string is byte-identical to Go (the resolver returns it as a
+    // string). `EmitDefaults:false` omits zero/empty values.
+    let mut parts: Vec<String> = Vec::new();
+    if !occurrence.range.is_empty() {
+        let range: Vec<String> = occurrence.range.iter().map(i32::to_string).collect();
+        parts.push(format!("\"range\":[{}]", range.join(",")));
+    }
+    if let Some(symbol) = &occurrence.symbol {
+        if !symbol.is_empty() {
+            parts.push(format!("\"symbol\":{}", jsonpb_string(symbol)));
+        }
+    }
+    if occurrence.symbol_roles != 0 {
+        parts.push(format!("\"symbolRoles\":{}", occurrence.symbol_roles));
+    }
+    if !occurrence.override_documentation.is_empty() {
+        let docs: Vec<String> = occurrence
+            .override_documentation
+            .iter()
+            .map(|doc| jsonpb_string(doc))
+            .collect();
+        parts.push(format!("\"overrideDocumentation\":[{}]", docs.join(",")));
+    }
+    if occurrence.syntax_kind != 0 {
+        parts.push(format!("\"syntaxKind\":{}", occurrence.syntax_kind));
+    }
+    format!("{{{}}}", parts.join(","))
+}
+
+/// `HighlightedFileResolver.LSIF` (`graphqlbackend/highlight.go:58`):
+/// `jsonpb{EnumsAsInts:true,EmitDefaults:false}`. An empty/nil document
+/// marshals to `"{}"`.
+pub fn lsif_document_json(document: &LsifDocument) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(language) = &document.language {
+        if !language.is_empty() {
+            parts.push(format!("\"language\":{}", jsonpb_string(language)));
+        }
+    }
+    if let Some(path) = &document.relative_path {
+        if !path.is_empty() {
+            parts.push(format!("\"relativePath\":{}", jsonpb_string(path)));
+        }
+    }
+    if !document.occurrences.is_empty() {
+        let occurrences: Vec<String> = document
+            .occurrences
+            .iter()
+            .map(lsif_occurrence_json)
+            .collect();
+        parts.push(format!("\"occurrences\":[{}]", occurrences.join(",")));
+    }
+    format!("{{{}}}", parts.join(","))
 }
 
 // ---------------------------------------------------------------------------
