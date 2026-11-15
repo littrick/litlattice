@@ -1095,6 +1095,9 @@ pub struct NestedPrefetch {
         (i32, crate::webhook_logs::WebhookLogsArgs),
         crate::webhook_logs::WebhookLogsConnectionLookup,
     >,
+    /// Authz permissions surface (M9.48a); attached to every `User` object
+    /// built with this nested snapshot so `User.permissionsInfo` resolves.
+    pub authz: Option<crate::authz_graphql::AuthzHandle>,
 }
 
 /// The database seam for `User.organizations` (`db.Orgs().GetByUserID` plus
@@ -2707,6 +2710,7 @@ impl FrontendRootResolver {
                 github_apps: None,
                 teams: None,
                 outbound_webhooks: None,
+                authz: None,
             },
             mutation: MutationRoot {
                 inventory: Arc::new(InventoryRoots::default()),
@@ -2862,6 +2866,19 @@ impl FrontendRootResolver {
     ) -> Self {
         self.query.outbound_webhooks = outbound_webhooks.clone();
         self.mutation.outbound_webhooks = outbound_webhooks;
+        self
+    }
+
+    /// Attach the authz permissions surface (M9.48a).
+    pub fn with_authz(
+        mut self,
+        authz: Option<crate::authz_graphql::AuthzHandle>,
+        viewer_site_admin: bool,
+    ) -> Self {
+        self.query.authz = authz.clone();
+        self.mutation.authz = authz.clone();
+        self.mutation.authz_viewer_site_admin = viewer_site_admin;
+        Arc::make_mut(&mut self.query.nested).authz = authz;
         self
     }
 
@@ -3341,6 +3358,8 @@ struct QueryRoot {
     /// `Query.outboundWebhooks` / `outboundWebhookEventTypes` and
     /// `node(OutboundWebhook)` unported.
     outbound_webhooks: Option<crate::outbound_webhooks_graphql::OutboundWebhooksHandle>,
+    /// M9.48a authz surface (`Query.permissionsSyncJobs` etc.).
+    authz: Option<crate::authz_graphql::AuthzHandle>,
 }
 
 /// `Mutation` root: `settingsMutation`/log events/temporary settings/feature
@@ -3405,6 +3424,10 @@ pub struct MutationRoot {
     notebooks: Option<crate::notebooks_graphql::NotebooksHandle>,
     /// Optional Code Insights dashboard and view/series mutations (M9.30a/b).
     insights: Option<crate::insights_graphql::InsightsHandle>,
+    /// Optional authz mutations (M9.48a).
+    authz: Option<crate::authz_graphql::AuthzHandle>,
+    /// The viewer's `users.site_admin` for the authz mutation gates.
+    authz_viewer_site_admin: bool,
 }
 
 impl MutationRoot {
@@ -3501,6 +3524,19 @@ impl ObjectValue for MutationRoot {
         if let Some(own) = &self.own {
             if crate::own_graphql::is_mutation_field(field) {
                 return crate::own_graphql::mutation_field(own, field, arguments, actor);
+            }
+        }
+        // M9.48a authz mutations (`setRepositoryPermissions*`,
+        // `schedule*PermissionsSync`, `cancelPermissionsSyncJob`).
+        if let Some(authz) = self.authz.as_ref() {
+            if crate::authz_graphql::is_mutation_field(field) {
+                return crate::authz_graphql::mutation_field(
+                    authz,
+                    field,
+                    arguments,
+                    actor,
+                    self.authz_viewer_site_admin,
+                );
             }
         }
         // M9.26a Batch Changes spec mutations (`createBatchSpec`,
@@ -3879,7 +3915,9 @@ impl QueryRoot {
                             .with_inventory_d(Some(self.inventory.graphql_d.clone()))
                             .with_autoindexing(self.codeintel_autoindexing.clone())
                             .with_codeintel_policies(self.codeintel_policies.clone())
-                            .with_codeintel_uploads(self.codeintel_uploads.clone()),
+                            .with_codeintel_uploads(self.codeintel_uploads.clone())
+                            .with_authz(self.authz.clone())
+                            .with_viewer_site_admin(self.viewer_site_admin),
                     )))),
                     Some(RepoLookup::NotFound) => Ok(Some(FieldValue::Null)),
                     Some(RepoLookup::Blocked { name, reason }) => Err(ExecError::new(format!(
@@ -4406,7 +4444,9 @@ impl ObjectValue for QueryRoot {
                             .with_embeddings(self.nested.repo_embeddings.clone())
                             .with_inventory_d(Some(self.inventory.graphql_d.clone()))
                             .with_codeintel_policies(self.codeintel_policies.clone())
-                            .with_codeintel_uploads(self.codeintel_uploads.clone());
+                            .with_codeintel_uploads(self.codeintel_uploads.clone())
+                            .with_authz(self.authz.clone())
+                            .with_viewer_site_admin(self.viewer_site_admin);
                         // `Repository.batchChanges` (M9.24c): the batch-changes
                         // resolver is attached to the object, like the
                         // `User`/`Org` root fields which get it through
@@ -4437,7 +4477,9 @@ impl ObjectValue for QueryRoot {
                                 .with_embeddings(self.nested.repo_embeddings.clone())
                                 .with_inventory_d(Some(self.inventory.graphql_d.clone()))
                                 .with_codeintel_policies(self.codeintel_policies.clone())
-                            .with_codeintel_uploads(self.codeintel_uploads.clone());
+                            .with_codeintel_uploads(self.codeintel_uploads.clone())
+                                .with_authz(self.authz.clone())
+                                .with_viewer_site_admin(self.viewer_site_admin);
                             if let Some(batches) = self.batches.clone() {
                                 object = object.with_batches(batches);
                             }
@@ -4472,7 +4514,9 @@ impl ObjectValue for QueryRoot {
                             .with_inventory_d(Some(self.inventory.graphql_d.clone()))
                             .with_autoindexing(self.codeintel_autoindexing.clone())
                             .with_codeintel_policies(self.codeintel_policies.clone())
-                            .with_codeintel_uploads(self.codeintel_uploads.clone()),
+                            .with_codeintel_uploads(self.codeintel_uploads.clone())
+                            .with_authz(self.authz.clone())
+                            .with_viewer_site_admin(self.viewer_site_admin),
                     )))),
                     Some(RepoLookup::NotFound) => Ok(Some(FieldValue::Null)),
                     Some(RepoLookup::Blocked { name, reason }) => Err(ExecError::new(format!(
@@ -4497,7 +4541,9 @@ impl ObjectValue for QueryRoot {
                                 .with_inventory_d(Some(self.inventory.graphql_d.clone()))
                             .with_autoindexing(self.codeintel_autoindexing.clone())
                                 .with_codeintel_policies(self.codeintel_policies.clone())
-                            .with_codeintel_uploads(self.codeintel_uploads.clone()),
+                            .with_codeintel_uploads(self.codeintel_uploads.clone())
+                                .with_authz(self.authz.clone())
+                                .with_viewer_site_admin(self.viewer_site_admin),
                         )))),
                         Some(RepoLookup::NotFound) => Ok(Some(FieldValue::Null)),
                         Some(RepoLookup::Blocked { name, reason }) => Err(ExecError::new(format!(
@@ -4525,7 +4571,8 @@ impl ObjectValue for QueryRoot {
                             crate::repositories::RepositoriesConnectionObject::from_data(
                                 data.clone(),
                             )
-                            .with_embeddings(self.nested.repo_embeddings.clone()),
+                            .with_embeddings(self.nested.repo_embeddings.clone())
+                            .with_authz(self.authz.clone()),
                         ))))
                     }
                     Some(crate::repositories::RepositoriesConnectionLookup::Error(message)) => {
@@ -5269,6 +5316,19 @@ impl ObjectValue for QueryRoot {
                     actor,
                 )
             }
+            // Authz root fields (`Query.permissionsSyncJobs` /
+            // `permissionsSyncingStats` / `bitbucketProjectPermissionJobs` /
+            // `usersWithPendingPermissions` / `authorizedUserRepositories`,
+            // M9.48a).
+            _ if self.authz.is_some() && crate::authz_graphql::is_root_field(field) => {
+                crate::authz_graphql::root_field(
+                    self.authz.as_ref().expect("checked authz"),
+                    field,
+                    arguments,
+                    actor,
+                    self.viewer_site_admin,
+                )
+            }
             // Outbound webhook root fields (`Query.outboundWebhooks` /
             // `Query.outboundWebhookEventTypes`, M9.27b).
             _ if self.outbound_webhooks.is_some()
@@ -5407,6 +5467,8 @@ pub struct UserObject {
     /// `User.teams` handle (M9.27a). Also available through
     /// `nested.teams` for objects built by the request prefetch.
     teams: Option<crate::teams_graphql::TeamsHandleWrapper>,
+    /// `User.permissionsInfo` (M9.48a); `None` leaves the field unported.
+    authz: Option<crate::authz_graphql::AuthzHandle>,
 }
 
 impl UserObject {
@@ -5416,6 +5478,7 @@ impl UserObject {
             viewer_site_admin: false,
             nested: Arc::new(NestedPrefetch::default()),
             teams: None,
+            authz: None,
         }
     }
 
@@ -5425,7 +5488,17 @@ impl UserObject {
             viewer_site_admin,
             nested: Arc::new(NestedPrefetch::default()),
             teams: None,
+            authz: None,
         }
+    }
+
+    /// Attach the authz surface (M9.48a).
+    pub fn with_authz(
+        mut self,
+        authz: Option<crate::authz_graphql::AuthzHandle>,
+    ) -> Self {
+        self.authz = authz;
+        self
     }
 
     /// Attach the Teams handle so `User.teams` resolves (M9.27a).
@@ -5474,6 +5547,17 @@ impl ObjectValue for UserObject {
         arguments: &Arguments,
         actor: Actor,
     ) -> Result<Option<FieldValue>, ExecError> {
+        if let Some(authz) = self.authz.as_ref().or(self.nested.authz.as_ref()) {
+            if crate::authz_graphql::is_user_field(field) {
+                return crate::authz_graphql::user_field(
+                    authz,
+                    self.data.id,
+                    field,
+                    actor,
+                    self.viewer_site_admin,
+                );
+            }
+        }
         match field {
             "id" => Ok(Some(FieldValue::Json(Json::Str(Self::relay_id(
                 self.data.id,
@@ -7048,6 +7132,12 @@ pub struct RepositoryObject {
     /// The uploads surface (M9.30d); `None` leaves
     /// `Repository.codeIntelSummary` unported.
     codeintel_uploads: Option<crate::codeintel_uploads_graphql::CodeIntelUploadsHandle>,
+    /// The authz surface (M9.48a); `None` leaves `Repository.authorizedUsers`
+    /// and `Repository.permissionsInfo` unported.
+    authz: Option<crate::authz_graphql::AuthzHandle>,
+    /// The viewer's `users.site_admin`, needed by the authz gates reached
+    /// through `Repository` (the root resolver knows it per request).
+    viewer_site_admin: bool,
 }
 
 impl RepositoryObject {
@@ -7061,7 +7151,24 @@ impl RepositoryObject {
             autoindexing: None,
             codeintel_policies: None,
             codeintel_uploads: None,
+            authz: None,
+            viewer_site_admin: false,
         }
+    }
+
+    /// Attach the authz surface (M9.48a).
+    pub fn with_authz(
+        mut self,
+        authz: Option<crate::authz_graphql::AuthzHandle>,
+    ) -> Self {
+        self.authz = authz;
+        self
+    }
+
+    /// Attach the viewer's site-admin flag for the authz gates.
+    pub fn with_viewer_site_admin(mut self, viewer_site_admin: bool) -> Self {
+        self.viewer_site_admin = viewer_site_admin;
+        self
     }
 
     /// Attach the uploads surface (M9.30d).
@@ -7151,6 +7258,18 @@ impl ObjectValue for RepositoryObject {
         arguments: &Arguments,
         actor: Actor,
     ) -> Result<Option<FieldValue>, ExecError> {
+        if let Some(authz) = self.authz.as_ref() {
+            if crate::authz_graphql::is_repository_field(field) {
+                return crate::authz_graphql::repository_field(
+                    authz,
+                    self.data.id,
+                    field,
+                    arguments,
+                    actor,
+                    self.viewer_site_admin,
+                );
+            }
+        }
         match field {
             // `Repository.ingestedCodeowners` (M9.48c): `RepoIngestedCodeowners`
             // is open to anyone; NotFound → null.

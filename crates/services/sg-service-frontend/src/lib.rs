@@ -116,6 +116,8 @@ pub mod middleware;
 pub mod mux;
 pub mod oauth_login;
 pub mod oauth_routes;
+pub mod authz_graphql;
+pub mod authz_graphql_store;
 pub mod oauth_wiring;
 pub mod oidc_login;
 pub mod oidc_middleware;

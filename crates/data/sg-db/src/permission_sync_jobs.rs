@@ -691,6 +691,540 @@ fn scan_job(row: sqlx::postgres::PgRow) -> Result<PermissionSyncJob, sqlx::Error
     })
 }
 
+// ---------------------------------------------------------------------------
+// Read side used by the authz GraphQL surface (M9.48a)
+// ---------------------------------------------------------------------------
+
+/// One `permission_sync_jobs` row with every column the authz GraphQL
+/// `PermissionsSyncJob` type exposes. `place_in_queue` is `Some` only when
+/// `with_place_in_queue` was requested (`ROW_NUMBER()` over queued rows).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PermissionSyncJobListRow {
+    pub id: i32,
+    pub state: String,
+    pub failure_message: Option<String>,
+    pub reason: String,
+    pub cancellation_reason: Option<String>,
+    pub triggered_by_user_id: Option<i32>,
+    pub queued_at: Option<OffsetDateTime>,
+    pub started_at: Option<OffsetDateTime>,
+    pub finished_at: Option<OffsetDateTime>,
+    pub process_after: Option<OffsetDateTime>,
+    pub num_resets: i32,
+    pub num_failures: i32,
+    pub last_heartbeat_at: Option<OffsetDateTime>,
+    pub worker_hostname: String,
+    pub cancel: bool,
+    pub repository_id: Option<i32>,
+    pub user_id: Option<i32>,
+    pub priority: i32,
+    pub no_perms: bool,
+    pub invalidate_caches: bool,
+    pub permissions_added: i32,
+    pub permissions_removed: i32,
+    pub permissions_found: i32,
+    pub code_host_states: Vec<serde_json::Value>,
+    pub is_partial_success: bool,
+    pub place_in_queue: Option<i32>,
+}
+
+/// `database.ListPermissionSyncJobOpts` narrowed to the fields the GraphQL
+/// resolvers set, plus the pagination arguments (`database.PaginationArgs`).
+#[derive(Debug, Clone, Default)]
+pub struct PermissionSyncJobListOpts {
+    pub id: i32,
+    pub user_id: i32,
+    pub repo_id: i32,
+    pub reason: String,
+    pub reason_group: String,
+    pub state: String,
+    pub null_process_after: bool,
+    pub not_null_process_after: bool,
+    pub not_canceled: bool,
+    pub partial_success: bool,
+    pub with_place_in_queue: bool,
+    pub search_type: Option<String>,
+    pub query: String,
+    /// `database.PaginationArgs.First` (+1 probe), applied with `ORDER BY id ASC`.
+    pub first: Option<i64>,
+    /// `database.PaginationArgs.Last` (+1 probe), applied with `ORDER BY id DESC`.
+    pub last: Option<i64>,
+    /// Cursor values (job IDs).
+    pub after: Option<i32>,
+    pub before: Option<i32>,
+}
+
+/// `ReasonGroupToReasons` (`internal/database/permission_sync_jobs.go:77-119`).
+fn reason_group_reasons(group: &str) -> Option<&'static [&'static str]> {
+    match group {
+        "MANUAL" => Some(&["REASON_MANUAL_REPO_SYNC", "REASON_MANUAL_USER_SYNC"]),
+        "WEBHOOK" => Some(&[
+            "REASON_GITHUB_USER_EVENT",
+            "REASON_GITHUB_USER_ADDED_EVENT",
+            "REASON_GITHUB_USER_REMOVED_EVENT",
+            "REASON_GITHUB_USER_MEMBERSHIP_ADDED_EVENT",
+            "REASON_GITHUB_USER_MEMBERSHIP_REMOVED_EVENT",
+            "REASON_GITHUB_TEAM_ADDED_TO_REPO_EVENT",
+            "REASON_GITHUB_TEAM_REMOVED_FROM_REPO_EVENT",
+            "REASON_GITHUB_ORG_MEMBER_ADDED_EVENT",
+            "REASON_GITHUB_ORG_MEMBER_REMOVED_EVENT",
+            "REASON_GITHUB_REPO_EVENT",
+            "REASON_GITHUB_REPO_MADE_PRIVATE_EVENT",
+        ]),
+        "SCHEDULE" => Some(&[
+            "REASON_USER_OUTDATED_PERMS",
+            "REASON_USER_NO_PERMS",
+            "REASON_REPO_OUTDATED_PERMS",
+            "REASON_REPO_NO_PERMS",
+            "REASON_REPO_UPDATED_FROM_CODE_HOST",
+        ]),
+        "SOURCEGRAPH" => Some(&[
+            "REASON_USER_EMAIL_REMOVED",
+            "REASON_USER_EMAIL_VERIFIED",
+            "REASON_USER_ADDED",
+            "REASON_USER_ADDED_TO_ORG",
+            "REASON_USER_REMOVED_FROM_ORG",
+            "REASON_USER_ACCEPTED_ORG_INVITE",
+            "REASON_EXTERNAL_ACCOUNT_ADDED",
+            "REASON_EXTERNAL_ACCOUNT_DELETED",
+        ]),
+        // `UNKNOWN` has no reasons; the baseline adds no condition.
+        _ => None,
+    }
+}
+
+#[derive(Debug, Clone)]
+enum JobParam {
+    Int(i32),
+    Text(String),
+    Bool(bool),
+}
+
+struct JobQuery {
+    sql: String,
+    params: Vec<JobParam>,
+}
+
+impl JobQuery {
+    fn new(base: &str) -> Self {
+        Self {
+            sql: base.to_owned(),
+            params: Vec::new(),
+        }
+    }
+
+    fn push(&mut self, param: JobParam) -> String {
+        self.params.push(param);
+        format!("${}", self.params.len())
+    }
+
+    fn push_int(&mut self, value: i32) -> String {
+        self.push(JobParam::Int(value))
+    }
+
+    fn push_text(&mut self, value: impl Into<String>) -> String {
+        self.push(JobParam::Text(value.into()))
+    }
+
+    fn bind<'q>(
+        &self,
+        mut query: sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments>,
+    ) -> sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments> {
+        for param in &self.params {
+            query = match param {
+                JobParam::Int(value) => query.bind(*value),
+                JobParam::Text(value) => query.bind(value.clone()),
+                JobParam::Bool(value) => query.bind(*value),
+            };
+        }
+        query
+    }
+}
+
+/// Conditions shared by `List` and `Count` (`opts.sqlConds()`). Returns
+/// whether a top-level `WHERE` was emitted.
+fn job_conditions(query: &mut JobQuery, opts: &PermissionSyncJobListOpts) -> bool {
+    let mut conditions = Vec::new();
+    if opts.id != 0 {
+        conditions.push(format!("permission_sync_jobs.id = {}", query.push_int(opts.id)));
+    }
+    if opts.user_id != 0 {
+        conditions.push(format!("user_id = {}", query.push_int(opts.user_id)));
+    }
+    if opts.repo_id != 0 {
+        conditions.push(format!("repository_id = {}", query.push_int(opts.repo_id)));
+    }
+    if !opts.reason_group.is_empty() && opts.reason.is_empty() {
+        if let Some(reasons) = reason_group_reasons(&opts.reason_group) {
+            let placeholders: Vec<String> = reasons
+                .iter()
+                .map(|reason| query.push_text(*reason))
+                .collect();
+            conditions.push(format!("reason IN ({})", placeholders.join(", ")));
+        }
+    }
+    if !opts.reason.is_empty() {
+        conditions.push(format!("reason = {}", query.push_text(opts.reason.clone())));
+    }
+    if opts.partial_success {
+        conditions.push("is_partial_success = TRUE".to_owned());
+        conditions.push("state = lower('completed')".to_owned());
+    } else if !opts.state.is_empty() {
+        conditions.push(format!("state = lower({})", query.push_text(opts.state.clone())));
+        conditions.push("is_partial_success = FALSE".to_owned());
+    }
+    if opts.null_process_after {
+        conditions.push("process_after IS NULL".to_owned());
+    }
+    if opts.not_null_process_after {
+        conditions.push("process_after IS NOT NULL".to_owned());
+    }
+    if opts.not_canceled {
+        conditions.push("cancel = false".to_owned());
+    }
+    match opts.search_type.as_deref() {
+        Some("REPOSITORY") => {
+            conditions.push("permission_sync_jobs.repository_id IS NOT NULL".to_owned());
+            if !opts.query.is_empty() {
+                let pattern = format!("%{}%", opts.query);
+                conditions.push(format!("repo.name ILIKE {}", query.push_text(pattern)));
+            }
+        }
+        Some("USER") => {
+            conditions.push("permission_sync_jobs.user_id IS NOT NULL".to_owned());
+            if !opts.query.is_empty() {
+                let pattern = format!("%{}%", opts.query);
+                let first = query.push_text(pattern.clone());
+                let second = query.push_text(pattern);
+                conditions.push(format!(
+                    "(users.username ILIKE {first} OR users.display_name ILIKE {second})"
+                ));
+            }
+        }
+        _ => {}
+    }
+    if !conditions.is_empty() {
+        query.sql.push_str(" WHERE ");
+        query.sql.push_str(&conditions.join(" AND "));
+        true
+    } else {
+        false
+    }
+}
+
+fn job_search_join(opts: &PermissionSyncJobListOpts) -> String {
+    if opts.query.is_empty() {
+        return String::new();
+    }
+    match opts.search_type.as_deref() {
+        Some("REPOSITORY") => " JOIN repo ON permission_sync_jobs.repository_id = repo.id".to_owned(),
+        Some("USER") => " JOIN users ON permission_sync_jobs.user_id = users.id".to_owned(),
+        _ => String::new(),
+    }
+}
+
+const JOB_COLUMNS: &str = "permission_sync_jobs.id, permission_sync_jobs.state, \
+    permission_sync_jobs.reason, permission_sync_jobs.cancellation_reason, \
+    permission_sync_jobs.triggered_by_user_id, permission_sync_jobs.failure_message, \
+    permission_sync_jobs.queued_at, permission_sync_jobs.started_at, \
+    permission_sync_jobs.finished_at, permission_sync_jobs.process_after, \
+    permission_sync_jobs.num_resets, permission_sync_jobs.num_failures, \
+    permission_sync_jobs.last_heartbeat_at, permission_sync_jobs.worker_hostname, \
+    permission_sync_jobs.cancel, permission_sync_jobs.repository_id, \
+    permission_sync_jobs.user_id, permission_sync_jobs.priority, \
+    permission_sync_jobs.no_perms, permission_sync_jobs.invalidate_caches, \
+    permission_sync_jobs.permissions_added, permission_sync_jobs.permissions_removed, \
+    permission_sync_jobs.permissions_found, permission_sync_jobs.code_host_states, \
+    permission_sync_jobs.is_partial_success";
+
+fn scan_list_row(row: &sqlx::postgres::PgRow) -> Result<PermissionSyncJobListRow, sqlx::Error> {
+    let code_host_states: Option<Vec<serde_json::Value>> = row.try_get("code_host_states")?;
+    // `ROW_NUMBER()` is `int8`; Go scans it into `*int32`.
+    let place_in_queue: Option<i32> = match row.try_get::<Option<i64>, _>("queue_rank") {
+        Ok(value) => value.map(|value| value as i32),
+        Err(_) => None,
+    };
+    Ok(PermissionSyncJobListRow {
+        id: row.try_get("id")?,
+        state: row.try_get("state")?,
+        failure_message: row.try_get("failure_message")?,
+        reason: row.try_get("reason")?,
+        cancellation_reason: row.try_get("cancellation_reason")?,
+        triggered_by_user_id: row.try_get("triggered_by_user_id")?,
+        queued_at: row.try_get("queued_at")?,
+        started_at: row.try_get("started_at")?,
+        finished_at: row.try_get("finished_at")?,
+        process_after: row.try_get("process_after")?,
+        num_resets: row.try_get("num_resets")?,
+        num_failures: row.try_get("num_failures")?,
+        last_heartbeat_at: row.try_get("last_heartbeat_at")?,
+        worker_hostname: row.try_get("worker_hostname")?,
+        cancel: row.try_get("cancel")?,
+        repository_id: row.try_get("repository_id")?,
+        user_id: row.try_get("user_id")?,
+        priority: row.try_get("priority")?,
+        no_perms: row.try_get("no_perms")?,
+        invalidate_caches: row.try_get("invalidate_caches")?,
+        permissions_added: row.try_get("permissions_added")?,
+        permissions_removed: row.try_get("permissions_removed")?,
+        permissions_found: row.try_get("permissions_found")?,
+        code_host_states: code_host_states.unwrap_or_default(),
+        is_partial_success: row.try_get::<Option<bool>, _>("is_partial_success")?.unwrap_or(false),
+        place_in_queue,
+    })
+}
+
+/// `List` with the authz resolver's `PaginationArgs` semantics. The query is
+/// always ordered by `permission_sync_jobs.id` (the caller's only order key).
+pub async fn list_permission_sync_jobs(
+    pool: &PgPool,
+    opts: &PermissionSyncJobListOpts,
+) -> Result<Vec<PermissionSyncJobListRow>, sqlx::Error> {
+    let mut query = JobQuery::new(&format!(
+        "SELECT {JOB_COLUMNS}{} FROM permission_sync_jobs",
+        if opts.with_place_in_queue {
+            ", queue_ranks.rank AS queue_rank"
+        } else {
+            ""
+        }
+    ));
+    query.sql.push_str(&job_search_join(opts));
+    if opts.with_place_in_queue {
+        query.sql.push_str(
+            " LEFT JOIN (SELECT id, ROW_NUMBER() OVER (ORDER BY permission_sync_jobs.priority DESC, \
+             permission_sync_jobs.process_after ASC NULLS FIRST, permission_sync_jobs.id ASC) AS rank \
+             FROM permission_sync_jobs WHERE state = 'queued') AS queue_ranks \
+             ON queue_ranks.id = permission_sync_jobs.id",
+        );
+    }
+    let mut has_where = job_conditions(&mut query, opts);
+
+    // `database.PaginationArgs.SQL()` where clause. The jobs connection keeps
+    // the default `ConnectionResolverOptions.Ascending == false`, so `first`
+    // pages descend and `last` pages ascend.
+    let ascending = opts.last.is_some();
+    let mut pagination_conditions = Vec::new();
+    if let Some(after) = opts.after {
+        let op = if ascending { ">" } else { "<" };
+        pagination_conditions.push(format!(
+            "(permission_sync_jobs.id) {op} ({})",
+            query.push_int(after)
+        ));
+    }
+    if let Some(before) = opts.before {
+        let op = if ascending { "<" } else { ">" };
+        pagination_conditions.push(format!(
+            "(permission_sync_jobs.id) {op} ({})",
+            query.push_int(before)
+        ));
+    }
+    if !pagination_conditions.is_empty() {
+        if has_where {
+            query.sql.push_str(" AND ");
+        } else {
+            query.sql.push_str(" WHERE ");
+            has_where = true;
+        }
+        query.sql.push_str(&pagination_conditions.join(" AND "));
+    }
+    // `AppendOrderToQuery` + `AppendLimitToQuery`.
+    let direction = if ascending { "ASC" } else { "DESC" };
+    query
+        .sql
+        .push_str(&format!(" ORDER BY permission_sync_jobs.id {direction}"));
+    if let Some(limit) = opts.first.or(opts.last) {
+        query.sql.push_str(&format!(" LIMIT {limit}"));
+    }
+
+    let rows = query
+        .bind(sqlx::query(&query.sql))
+        .fetch_all(pool)
+        .await?;
+    rows.iter().map(scan_list_row).collect()
+}
+
+/// `Count` with the same conditions (no pagination).
+pub async fn count_permission_sync_jobs(
+    pool: &PgPool,
+    opts: &PermissionSyncJobListOpts,
+) -> Result<i64, sqlx::Error> {
+    let mut query = JobQuery::new(&format!(
+        "SELECT COUNT(*) FROM permission_sync_jobs{}",
+        job_search_join(opts)
+    ));
+    let _ = job_conditions(&mut query, opts);
+    query.bind(sqlx::query(&query.sql)).fetch_one(pool).await.map(|row| {
+        use sqlx::Row as _;
+        row.get::<i64, _>(0)
+    })
+}
+
+const COUNT_USERS_WITH_FAILING: &str = r#"
+WITH latest_user_sync_jobs AS (
+  SELECT DISTINCT ON (user_id) user_id, id, state
+  FROM permission_sync_jobs
+  WHERE user_id IS NOT NULL AND state IN ('completed', 'failed')
+  ORDER BY user_id, finished_at DESC
+)
+SELECT COUNT(*)
+FROM latest_user_sync_jobs
+JOIN users ON users.id = latest_user_sync_jobs.user_id
+WHERE latest_user_sync_jobs.state = 'failed' AND users.deleted_at IS NULL
+"#;
+
+/// `CountUsersWithFailingSyncJob`.
+pub async fn count_users_with_failing_sync_job(pool: &PgPool) -> Result<i64, sqlx::Error> {
+    sqlx::query_scalar(COUNT_USERS_WITH_FAILING).fetch_one(pool).await
+}
+
+const COUNT_REPOS_WITH_FAILING: &str = r#"
+WITH latest_repo_sync_jobs AS (
+  SELECT DISTINCT ON (repository_id) repository_id, id, state
+  FROM permission_sync_jobs
+  WHERE repository_id IS NOT NULL AND state IN ('completed', 'failed')
+  ORDER BY repository_id, finished_at DESC
+)
+SELECT COUNT(*)
+FROM latest_repo_sync_jobs
+JOIN repo ON repo.id = latest_repo_sync_jobs.repository_id
+WHERE latest_repo_sync_jobs.state = 'failed' AND repo.deleted_at IS NULL
+"#;
+
+/// `CountReposWithFailingSyncJob`.
+pub async fn count_repos_with_failing_sync_job(pool: &PgPool) -> Result<i64, sqlx::Error> {
+    sqlx::query_scalar(COUNT_REPOS_WITH_FAILING).fetch_one(pool).await
+}
+
+/// `CancelQueuedJob`: `true` when exactly one queued row was canceled; `false`
+/// reproduces the baseline's `notFoundError` when no row matched.
+pub async fn cancel_queued_job(
+    pool: &PgPool,
+    id: i32,
+    reason: &str,
+    now: OffsetDateTime,
+) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query(CANCEL_QUEUED_JOB)
+        .bind(id)
+        .bind(now)
+        .bind(reason)
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected() == 1)
+}
+
+/// `database.PermissionSyncJobOpts`, restricted to the fields the authz
+/// mutations pass to `Create{User,Repo}SyncJob`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CreatePermissionSyncJobOpts {
+    pub reason: String,
+    pub priority: i32,
+    pub invalidate_caches: bool,
+    pub triggered_by_user_id: i32,
+    pub process_after: Option<OffsetDateTime>,
+}
+
+const CREATE_USER_SYNC_JOB_WITH_OPTS: &str = r#"
+INSERT INTO permission_sync_jobs (
+	reason, triggered_by_user_id, process_after, repository_id, user_id, priority, invalidate_caches, no_perms
+) VALUES ($1, $2, $3, NULL, $4, $5, $6, FALSE)
+ON CONFLICT DO NOTHING
+RETURNING id
+"#;
+
+const CREATE_REPO_SYNC_JOB_WITH_OPTS: &str = r#"
+INSERT INTO permission_sync_jobs (
+	reason, triggered_by_user_id, process_after, repository_id, user_id, priority, invalidate_caches, no_perms
+) VALUES ($1, $2, $3, $4, NULL, $5, $6, FALSE)
+ON CONFLICT DO NOTHING
+RETURNING id
+"#;
+
+async fn create_with_opts(
+    pool: &PgPool,
+    target_id: i32,
+    user: bool,
+    opts: &CreatePermissionSyncJobOpts,
+    now: OffsetDateTime,
+) -> Result<(), sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    // `createSyncJob`: a postponed job skips the duplicate check.
+    if opts.process_after.is_none() {
+        let duplicates_query = if user {
+            QUEUED_DUPLICATES_FOR_USER
+        } else {
+            QUEUED_DUPLICATES_FOR_REPO
+        };
+        if let Some(row) = sqlx::query(duplicates_query)
+            .bind(target_id)
+            .fetch_optional(&mut *tx)
+            .await?
+        {
+            let existing_priority: i32 = sqlx::Row::try_get(&row, "priority")?;
+            if existing_priority >= opts.priority {
+                tx.commit().await?;
+                return Ok(());
+            }
+            let existing_id: i32 = sqlx::Row::try_get(&row, "id")?;
+            sqlx::query(CANCEL_QUEUED_JOB)
+                .bind(existing_id)
+                .bind(now)
+                .bind(CANCELLATION_REASON_HIGHER_PRIORITY)
+                .execute(&mut *tx)
+                .await?;
+        }
+    }
+    let triggered_by = if opts.triggered_by_user_id == 0 {
+        None
+    } else {
+        Some(opts.triggered_by_user_id)
+    };
+    let insert = if user {
+        CREATE_USER_SYNC_JOB_WITH_OPTS
+    } else {
+        CREATE_REPO_SYNC_JOB_WITH_OPTS
+    };
+    let mut query = sqlx::query(insert)
+        .bind(&opts.reason)
+        .bind(triggered_by)
+        .bind(opts.process_after);
+    if user {
+        query = query.bind(target_id);
+    } else {
+        query = query.bind(target_id);
+    }
+    let query = if user {
+        query.bind(opts.priority).bind(opts.invalidate_caches)
+    } else {
+        query.bind(opts.priority).bind(opts.invalidate_caches)
+    };
+    let inserted = query.fetch_optional(&mut *tx).await?;
+    if inserted.is_none() {
+        tx.rollback().await?;
+        return Err(sqlx::Error::RowNotFound);
+    }
+    tx.commit().await
+}
+
+/// `CreateUserSyncJob` with the full `PermissionSyncJobOpts` (M9.48a).
+pub async fn create_user_sync_job_with_opts(
+    pool: &PgPool,
+    user_id: i32,
+    opts: &CreatePermissionSyncJobOpts,
+    now: OffsetDateTime,
+) -> Result<(), sqlx::Error> {
+    create_with_opts(pool, user_id, true, opts, now).await
+}
+
+/// `CreateRepoSyncJob` with the full `PermissionSyncJobOpts` (M9.48a).
+pub async fn create_repo_sync_job_with_opts(
+    pool: &PgPool,
+    repo_id: i32,
+    opts: &CreatePermissionSyncJobOpts,
+    now: OffsetDateTime,
+) -> Result<(), sqlx::Error> {
+    create_with_opts(pool, repo_id, false, opts, now).await
+}
+
 fn scan_reset_rows(
     now: OffsetDateTime,
     rows: &[sqlx::postgres::PgRow],
