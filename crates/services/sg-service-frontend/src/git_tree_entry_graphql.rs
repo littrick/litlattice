@@ -67,8 +67,14 @@ const SYNTAX_HIGHLIGHT_FILE_BLOCKLIST: [&str; 3] =
 
 /// `GitTreeEntryResolver` fields that need the blob's full content.
 /// (`highlight` reads it through `Content` first, `git_tree_entry.go:277`.)
-const CONTENT_BACKED_FIELDS: [&str; 5] =
-    ["content", "byteSize", "totalLines", "binary", "highlight"];
+const CONTENT_BACKED_FIELDS: [&str; 6] = [
+    "content",
+    "byteSize",
+    "totalLines",
+    "binary",
+    "highlight",
+    "richHTML",
+];
 
 /// `GitTreeEntryResolver.Highlight`'s pagination guard, evaluated on the raw
 /// (pre-blocklist) format exactly like the baseline.
@@ -484,7 +490,8 @@ pub async fn prefetch_commit_entries(
             || selected(field, "totalLines")
             || selected(field, "binary")
             || selected(field, "languages")
-            || selected(field, "highlight"))
+            || selected(field, "highlight")
+            || selected(field, "richHTML"))
             && !prefetch.contents.contains_key(&key)
         {
             let lookup = match source.read_file(repo.id, &repo.name, oid, path).await {
@@ -911,6 +918,31 @@ fn go_path_dir(path: &str) -> String {
         Some(0) => "/".to_owned(),
         Some(index) => go_path_clean(&path[..index]),
         None => ".".to_owned(),
+    }
+}
+
+/// Go `path.Ext("/a/b.md")` = `".md"`; empty when the base name has no dot.
+fn go_path_ext(path: &str) -> String {
+    let base = go_path_base(path);
+    match base.rfind('.') {
+        Some(index) => base[index..].to_owned(),
+        None => String::new(),
+    }
+}
+
+/// `richHTML` (`file.go:34-43`).
+///
+/// Markdown families render through the byte-compatible goldmark port
+/// ([`crate::markdown_graphql::render_markdown`]). `.ipynb` needs Go's
+/// `nb`/goldmark-jupyter/synth stack, which is not ported (M9.46b errata);
+/// everything else is the empty string.
+fn rich_html(content: &str, ext: &str) -> Result<String, String> {
+    match ext.to_ascii_lowercase().as_str() {
+        ".md" | ".mdown" | ".markdown" | ".markdn" => {
+            crate::markdown_graphql::render_markdown(content)
+        }
+        ".ipynb" => Err("ipynb rendering is not ported".to_owned()),
+        _ => Ok(String::new()),
     }
 }
 
@@ -1487,6 +1519,90 @@ impl GitTreeEntryObject {
         }))
     }
 
+    /// `GitTreeEntryResolver.RichHTML` (`git_tree_entry.go:239-247`,
+    /// `file.go:34-43`): page `Content` first, then render by extension.
+    fn rich_html_field(&self, arguments: &Arguments) -> Result<Option<FieldValue>, ExecError> {
+        let start_line = arguments.i64("startLine").map(|line| line as i32);
+        let end_line = arguments.i64("endLine").map(|line| line as i32);
+        let bytes = self.content_bytes()?;
+        let page = page_content(bytes, start_line, end_line);
+        let html = rich_html(
+            &String::from_utf8_lossy(page),
+            &go_path_ext(self.path()),
+        )
+        .map_err(ExecError::new)?;
+        Ok(Some(FieldValue::Json(Json::Str(html))))
+    }
+
+    /// `GitTreeEntryResolver.RawZipArchiveURL` (`git_tree_entry.go:419-425`):
+    /// `conf.ExternalURLParsed().ResolveReference(Repository.URL() + "-/raw/" +
+    /// Path())` with `format=zip`. The reference path is absolute, so the
+    /// external URL's own path is discarded by `ResolveReference` (matching Go).
+    fn raw_zip_archive_url(&self) -> String {
+        let repo_url = format!("/{}", self.repo.name);
+        let joined = go_path_join(&[&repo_url, "-/raw/", self.path()]);
+        let external = self
+            .git
+            .as_ref()
+            .map(|git| git.external_url.as_str())
+            .unwrap_or("");
+        // `conf.ExternalURLParsed`'s cached default when site config is unset.
+        let base = if external.is_empty() {
+            "http://example.com"
+        } else {
+            external
+        };
+        let mut url = url::Url::parse(base)
+            .or_else(|_| url::Url::parse("http://example.com"))
+            .expect("static default URL parses");
+        url.set_path(&joined);
+        url.set_query(Some("format=zip"));
+        url.to_string()
+    }
+
+    /// `GitTreeEntryResolver.Blame` (`git_blob.go:18-56`), reachable from
+    /// `GitTree.entries` nodes as well as `GitBlob` (M9.46b).
+    fn blame_field(&self, arguments: &Arguments) -> Result<Option<FieldValue>, ExecError> {
+        let start_line = arguments.i64("startLine").map(|line| line as i32);
+        let end_line = arguments.i64("endLine").map(|line| line as i32);
+        if start_line.is_some() != end_line.is_some() {
+            return Err(ExecError::new(
+                "both startLine and endLine must be specified or neither",
+            ));
+        }
+        let ignore_whitespace = arguments.bool("ignoreWhitespace").unwrap_or(false);
+        let Some(git) = &self.git else {
+            return Err(ExecError::new(
+                "blame requires the gitserver GitSource (not wired for this request)",
+            ));
+        };
+        let key = BlameKey {
+            repo_id: self.repo.id,
+            oid: self.oid.clone(),
+            path: self.path().to_owned(),
+            start_line,
+            end_line,
+            ignore_whitespace,
+        };
+        match git.blame(&key) {
+            Some(BlameLookup::Found(hunks)) => Ok(Some(FieldValue::List {
+                items: hunks
+                    .iter()
+                    .map(|hunk| {
+                        FieldValue::Object(Arc::new(crate::graphql_inventory_d::HunkObject {
+                            repo: self.repo.clone(),
+                            git: self.git.clone(),
+                            hunk: hunk.clone(),
+                        }))
+                    })
+                    .collect(),
+                element_type: Some("Hunk"),
+            })),
+            Some(BlameLookup::Error(message)) => Err(ExecError::new(message.clone())),
+            None => Err(ExecError::new("blame is not prefetched")),
+        }
+    }
+
     /// `GitTreeEntryResolver.History` (`git_tree_history.go:9-26`).
     fn history_field(&self, arguments: &Arguments) -> Result<Option<FieldValue>, ExecError> {
         let Some(git) = &self.git else {
@@ -1741,6 +1857,13 @@ impl ObjectValue for GitTreeEntryObject {
             "binary" => self.binary_field(),
             "highlight" => self.highlight_field(arguments),
             "languages" => self.languages_field(),
+            "richHTML" => self.rich_html_field(arguments),
+            "rawZipArchiveURL" => Ok(Some(FieldValue::Json(Json::Str(
+                self.raw_zip_archive_url(),
+            )))),
+            // M9.46b: `GitBlob.blame` is reachable on `GitTree.entries` nodes
+            // too (Go dispatches the same `GitTreeEntryResolver.Blame`).
+            "blame" => self.blame_field(arguments),
             "history" => self.history_field(arguments),
             "symbols" => self.symbols_field(arguments),
             "symbol" => self.symbol_field(arguments),

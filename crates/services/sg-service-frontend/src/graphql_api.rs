@@ -1862,8 +1862,8 @@ impl GraphqlDeps for SchemaGraphqlDeps {
         // synchronous resolvers. `repositories`/`repository_redirects`/`nodes`/
         // `search_root` are still owned here (they move into the roots below).
         let git = match &self.git_objects {
-            Some(source) => Some(Arc::new(
-                crate::git_graphql::prefetch_git_with(
+            Some(source) => {
+                let mut prefetch = crate::git_graphql::prefetch_git_with(
                     source.as_ref(),
                     &repositories,
                     &repository_redirects,
@@ -1875,8 +1875,11 @@ impl GraphqlDeps for SchemaGraphqlDeps {
                         deps.resolver.as_ref() as &dyn crate::graphql_resolvers::CloneUrlResolver
                     }),
                 )
-                .await,
-            )),
+                .await;
+                // M9.46b: `conf.ExternalURL()` for `rawZipArchiveURL`.
+                prefetch.external_url = external_url.clone();
+                Some(Arc::new(prefetch))
+            }
             None => None,
         };
         // `Query.namespace`/`Query.namespaceByName` share the user/org store

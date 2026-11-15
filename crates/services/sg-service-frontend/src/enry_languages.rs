@@ -8,11 +8,14 @@
 //! are exact. The repo-specific override maps below are copied verbatim from
 //! `lib/codeintel/languages/extensions.go`.
 //!
-//! Deliberate approximation: `enry.GetLanguagesByContent` (rule/regex
-//! heuristics) and `GetLanguagesByClassifier` (a trained model) are not
-//! ported and contribute no candidates. Only ambiguous extensions whose answer
-//! depends on file content can therefore differ; the extension-level candidate
-//! list is returned instead. Modeline and shebang are ported faithfully.
+//! Deliberate approximation: `enry.GetLanguagesByContent` is ported for a
+//! curated subset of extensions (`.h`, `.html`, `.inc`, `.m`, `.php`, `.pl`,
+//! `.pm`, `.pro`, `.r`; M9.46b), using the generated rules' regexes verbatim in
+//! RE2-compatible form. `GetLanguagesByClassifier` (a trained Naive Bayes
+//! model) is not ported and contributes no candidates. Ambiguous extensions
+//! whose heuristic chain still has multiple candidates (or whose content hits
+//! an unported rule) return that candidate list instead. Modeline, shebang,
+//! filename and extension decisions are exact.
 
 use crate::enry_data::{
     LANGUAGES_BY_EXTENSION, LANGUAGES_BY_FILENAME, LANGUAGES_BY_INTERPRETER, LANGUAGE_BY_ALIAS,
@@ -208,7 +211,8 @@ pub fn get_languages(path: &str, content: Option<&[u8]>) -> Vec<String> {
         };
     }
 
-    // modeline, then shebang; content heuristics and classifier are no-ops.
+    // modeline -> shebang -> content heuristics (`GetLanguagesByClassifier`
+    // remains a no-op, see the module docs).
     if let Some(candidates) = modeline(content) {
         match candidates.len() {
             0 => {}
@@ -222,8 +226,212 @@ pub fn get_languages(path: &str, content: Option<&[u8]>) -> Vec<String> {
         1 => return candidates,
         _ => languages = candidates,
     }
-    // `GetLanguagesByContent` and `GetLanguagesByClassifier`: not ported.
+    // `enry.GetLanguagesByContent` (`common.go:470-483`): the content
+    // heuristic ignores the candidate set and returns the first matching
+    // rule's languages (`data.Heuristics.Match`).
+    let candidates = content_heuristics(path, content);
+    match candidates.len() {
+        0 => {}
+        1 => return candidates,
+        _ => languages = candidates,
+    }
+    // `GetLanguagesByClassifier`: not ported (trained Naive Bayes model).
     languages
+}
+
+/// Go `filepath.Ext`, lower-cased (`GetLanguagesByContent`).
+fn go_filepath_ext(path: &str) -> String {
+    let base = filepath_base(path);
+    let ext = match base.rfind('.') {
+        Some(index) => &base[index..],
+        None => "",
+    };
+    ext.to_lowercase()
+}
+
+/// The first matching `data.ContentHeuristics[ext]` rule's languages
+/// (`go-enry data/heuristics.go:13-28`).
+///
+/// This is a curated, verbatim-rule subset of the generated table; a missing
+/// extension or an unimplemented later rule falls through (no content
+/// decision), like a missing heuristic entry.
+fn content_heuristics(path: &str, content: &[u8]) -> Vec<String> {
+    let ext = go_filepath_ext(path);
+    let rules = content_heuristic_regexes();
+    let matched: Option<&[&str]> = match ext.as_str() {
+        ".h" => {
+            if rules.objc.is_match(content) {
+                Some(&["Objective-C"])
+            } else if rules.h_cpp.is_match(content) {
+                Some(&["C++"])
+            } else {
+                Some(&["C"])
+            }
+        }
+        ".html" => {
+            if rules.ecmarkup.is_match(content) {
+                Some(&["Ecmarkup"])
+            } else {
+                Some(&["HTML"])
+            }
+        }
+        ".inc" => {
+            // `".inc"`'s first implemented rule (PHP); the 68K/SourcePawn/
+            // NASL/POV/Pascal/BitBake rules are not ported (errata).
+            if rules.inc_php.is_match(content) {
+                Some(&["PHP"])
+            } else {
+                None
+            }
+        }
+        ".m" => {
+            if rules.objc.is_match(content) {
+                Some(&["Objective-C"])
+            } else if rules.m_mercury.is_match(content) {
+                Some(&["Mercury"])
+            } else if rules.m_muf.is_match(content) {
+                Some(&["MUF"])
+            } else if rules.m_m.is_match(content) {
+                Some(&["M"])
+            } else if rules.m_matlab.is_match(content) {
+                Some(&["MATLAB"])
+            } else {
+                None
+            }
+        }
+        ".php" => {
+            if rules.php_hack.is_match(content) {
+                Some(&["Hack"])
+            } else if rules.php_php.is_match(content) {
+                Some(&["PHP"])
+            } else {
+                None
+            }
+        }
+        ".pl" | ".pm" => {
+            if rules.pl_prolog.is_match(content) {
+                Some(&["Prolog"])
+            } else if !rules.pl_use_v6.is_match(content)
+                && rules.pl_perl.is_match(content)
+            {
+                Some(&["Perl"])
+            } else if rules.pl_raku.is_match(content) {
+                Some(&["Raku"])
+            } else if ext == ".pm" && rules.pm_xpm.is_match(content) {
+                Some(&["X PixMap"])
+            } else {
+                None
+            }
+        }
+        ".pro" => {
+            if rules.pro_proguard.is_match(content) {
+                Some(&["Proguard"])
+            } else if rules.pro_prolog.is_match(content) {
+                Some(&["Prolog"])
+            } else if rules.pro_ini.is_match(content) {
+                Some(&["INI"])
+            } else if rules.pro_headers.is_match(content)
+                && rules.pro_sources.is_match(content)
+            {
+                Some(&["QMake"])
+            } else {
+                None
+            }
+        }
+        ".r" => {
+            if rules.r_rebol.is_match(content) {
+                Some(&["Rebol"])
+            } else if rules.r_r.is_match(content) {
+                Some(&["R"])
+            } else {
+                None
+            }
+        }
+        _ => None,
+    };
+    matched
+        .map(|aliases| {
+            aliases
+                .iter()
+                .map(|alias| {
+                    language_by_alias(alias).unwrap_or_else(|| (*alias).to_owned())
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Compiled regexes for [`content_heuristics`] (`MustCompileMultiline` = RE2
+/// with `(?m)`; ASCII classes substitute Go's ASCII `\w`/`\W`).
+struct ContentHeuristicRegexes {
+    objc: regex::bytes::Regex,
+    h_cpp: regex::bytes::Regex,
+    ecmarkup: regex::bytes::Regex,
+    inc_php: regex::bytes::Regex,
+    m_mercury: regex::bytes::Regex,
+    m_muf: regex::bytes::Regex,
+    m_m: regex::bytes::Regex,
+    m_matlab: regex::bytes::Regex,
+    php_hack: regex::bytes::Regex,
+    php_php: regex::bytes::Regex,
+    pl_prolog: regex::bytes::Regex,
+    pl_use_v6: regex::bytes::Regex,
+    pl_perl: regex::bytes::Regex,
+    pl_raku: regex::bytes::Regex,
+    pm_xpm: regex::bytes::Regex,
+    pro_proguard: regex::bytes::Regex,
+    pro_prolog: regex::bytes::Regex,
+    pro_ini: regex::bytes::Regex,
+    pro_headers: regex::bytes::Regex,
+    pro_sources: regex::bytes::Regex,
+    r_rebol: regex::bytes::Regex,
+    r_r: regex::bytes::Regex,
+}
+
+fn content_heuristic_regexes() -> &'static ContentHeuristicRegexes {
+    static REGEXES: std::sync::OnceLock<ContentHeuristicRegexes> = std::sync::OnceLock::new();
+    REGEXES.get_or_init(|| ContentHeuristicRegexes {
+        objc: regex::bytes::Regex::new(
+            r#"(?m)^\s*(@(interface|class|protocol|property|end|synchronised|selector|implementation)\b|#import\s+.+\.h[">])"#,
+        )
+        .expect("objc"),
+        h_cpp: regex::bytes::Regex::new(
+            r#"(?m)^\s*#\s*include <(cstdint|string|vector|map|list|array|bitset|queue|stack|forward_list|unordered_map|unordered_set|(i|o|io)stream)>|^\s*template\s*<|^[ \t]*(try|constexpr)|^[ \t]*catch\s*\(|^[ \t]*(class|(using[ \t]+)?namespace)\s+[A-Za-z0-9_]+|^[ \t]*(private|public|protected):$|__has_cpp_attribute|__cplusplus >|std::[A-Za-z0-9_]+"#,
+        )
+        .expect("h cpp"),
+        ecmarkup: regex::bytes::Regex::new(
+            r#"(?m)<emu-(?:alg|annex|biblio|clause|eqn|example|figure|gann|gmod|gprose|grammar|intro|not-ref|note|nt|prodref|production|rhs|table|t|xref)(?:$|\s|>)"#,
+        )
+        .expect("ecmarkup"),
+        inc_php: regex::bytes::Regex::new(r"(?m)^<\?(?:php)?").expect("inc php"),
+        m_mercury: regex::bytes::Regex::new(r"(?m):- module").expect("mercury"),
+        m_muf: regex::bytes::Regex::new(r"(?m)^: ").expect("muf"),
+        m_m: regex::bytes::Regex::new(r"(?m)^\s*;").expect("m"),
+        m_matlab: regex::bytes::Regex::new(r"(?m)^\s*%").expect("matlab"),
+        php_hack: regex::bytes::Regex::new(r"(?m)<\?hh").expect("php hack"),
+        php_php: regex::bytes::Regex::new(r"(?m)<\?[^h]").expect("php"),
+        pl_prolog: regex::bytes::Regex::new(r"(?m)^[^#]*:-").expect("pl prolog"),
+        pl_use_v6: regex::bytes::Regex::new(r"(?m)^\s*use\s+v6\b").expect("use v6"),
+        pl_perl: regex::bytes::Regex::new(
+            r#"(?m)\buse\s+(?:strict\b|v?5\b)|^\s*use\s+(?:constant|overload)\b|^\s*(?:\*|(?:our\s*)?@)EXPORT\s*=|^\s*package\s+[A-Za-z_][A-Za-z0-9_]*(?:::[A-Za-z0-9_]+)*\s*(?:[;{]|\sv?\d)|[\s$][A-Za-z_][A-Za-z0-9_]*(?:::[A-Za-z0-9_]+)*->[a-zA-Z_\[({]"#,
+        )
+        .expect("perl"),
+        pl_raku: regex::bytes::Regex::new(
+            r"(?m)^\s*(?:use\s+v6\b|\bmodule\b|\b(?:my\s+)?class\b)",
+        )
+        .expect("raku"),
+        pm_xpm: regex::bytes::Regex::new(r"(?m)^\s*\/\* XPM \*\/").expect("xpm"),
+        pro_proguard: regex::bytes::Regex::new(
+            r"(?m)^-(include\b.*\.pro$|keep\b|keepclassmembers\b|keepattributes\b)",
+        )
+        .expect("proguard"),
+        pro_prolog: regex::bytes::Regex::new(r"(?m)^[^\[#]+:-").expect("pro prolog"),
+        pro_ini: regex::bytes::Regex::new(r"(?m)last_client=").expect("ini"),
+        pro_headers: regex::bytes::Regex::new(r"(?m)HEADERS").expect("headers"),
+        pro_sources: regex::bytes::Regex::new(r"(?m)SOURCES").expect("sources"),
+        r_rebol: regex::bytes::Regex::new(r"(?im:\bRebol\b)").expect("rebol"),
+        r_r: regex::bytes::Regex::new(r"(?m)<-|^\s*#").expect("r"),
+    })
 }
 
 fn normalize_alias(alias: &str) -> String {
