@@ -163,14 +163,22 @@ pub struct ActionJobFilter {
 
 /// The snapshot seam (`codemonitors.Snapshot`).
 pub trait CodeMonitorSnapshot: Send + Sync {
-    fn snapshot(&self, query: &str) -> Result<BTreeMap<i32, Vec<String>>, String>;
+    fn snapshot(
+        &self,
+        query: &str,
+        request_context: crate::search_contexts::RequestContext,
+    ) -> Result<BTreeMap<i32, Vec<String>>, String>;
 }
 
 /// An empty snapshot, used by unit/differential harnesses.
 pub struct EmptySnapshot;
 
 impl CodeMonitorSnapshot for EmptySnapshot {
-    fn snapshot(&self, _query: &str) -> Result<BTreeMap<i32, Vec<String>>, String> {
+    fn snapshot(
+        &self,
+        _query: &str,
+        _request_context: crate::search_contexts::RequestContext,
+    ) -> Result<BTreeMap<i32, Vec<String>>, String> {
         Ok(BTreeMap::new())
     }
 }
@@ -181,7 +189,11 @@ impl CodeMonitorSnapshot for EmptySnapshot {
 pub struct UnavailableSnapshot;
 
 impl CodeMonitorSnapshot for UnavailableSnapshot {
-    fn snapshot(&self, _query: &str) -> Result<BTreeMap<i32, Vec<String>>, String> {
+    fn snapshot(
+        &self,
+        _query: &str,
+        _request_context: crate::search_contexts::RequestContext,
+    ) -> Result<BTreeMap<i32, Vec<String>>, String> {
         Err("code monitor snapshots are not available in this build".to_owned())
     }
 }
@@ -1982,7 +1994,10 @@ impl CodeMonitorsResolver {
         if current.query_string != new_query {
             let resolved = self
                 .snapshot
-                .snapshot(&new_query)
+                .snapshot(
+                    &new_query,
+                    crate::search_contexts::RequestContext::from_graphql_actor(actor, false),
+                )
                 .map_err(ExecError::new)?;
             for (repo_id, commit_ids) in resolved {
                 self.db
@@ -2186,7 +2201,14 @@ pub fn create_code_monitor(
     let namespace = unmarshal_namespace_to_ids(&namespace_id).map_err(ExecError::new)?;
     let trigger_input = input_object(arguments, "trigger")?;
     let query = string_input(trigger_input, "query");
-    let resolved = resolver.snapshot.snapshot(&query).map_err(ExecError::new)?;
+    // `codemonitors.Snapshot(ctx, ...)` runs with the request actor.
+    let resolved = resolver
+        .snapshot
+        .snapshot(
+            &query,
+            crate::search_contexts::RequestContext::from_graphql_actor(actor, false),
+        )
+        .map_err(ExecError::new)?;
     let now = resolver.now();
     let monitor = resolver
         .db

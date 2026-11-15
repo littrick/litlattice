@@ -1013,7 +1013,11 @@ impl CodeMonitorsGraphqlDatabase for InMemoryCodeMonitors {
 struct EmptySnapshot;
 
 impl CodeMonitorSnapshot for EmptySnapshot {
-    fn snapshot(&self, _query: &str) -> Result<BTreeMap<i32, Vec<String>>, String> {
+    fn snapshot(
+        &self,
+        _query: &str,
+        _request_context: sg_service_frontend::search_contexts::RequestContext,
+    ) -> Result<BTreeMap<i32, Vec<String>>, String> {
         Ok(BTreeMap::new())
     }
 }

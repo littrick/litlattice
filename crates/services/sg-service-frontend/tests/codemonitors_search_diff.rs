@@ -649,6 +649,7 @@ fn run_search(case: &Case) -> serde_json::Value {
         &case.query,
         case.monitor_id,
         case.trigger_id,
+        sg_service_frontend::search_contexts::RequestContext::anonymous(),
     ) {
         Ok(matches) => (None, None, commit_matches_json(&matches)),
         Err(failure) => (
@@ -764,7 +765,12 @@ fn run_hook(case: &Case) -> serde_json::Value {
 fn run_snapshot(case: &Case) -> serde_json::Value {
     let gitserver = Arc::new(FakeGitserver::new(case));
     let runtime = runtime(case, gitserver.clone());
-    let (error, snapshot) = match snapshot(&runtime, &case.query, case.in_transaction) {
+    let (error, snapshot) = match snapshot(
+        &runtime,
+        &case.query,
+        case.in_transaction,
+        sg_service_frontend::search_contexts::RequestContext::anonymous(),
+    ) {
         Ok(resolved) => (
             None,
             resolved

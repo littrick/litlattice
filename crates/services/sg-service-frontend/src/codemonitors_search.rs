@@ -38,7 +38,9 @@ use crate::search_jobutil_combinators::JobFailure;
 use crate::search_jobutil_tree::{new_plan_job, JobNode};
 use crate::search_searcher_client::SearcherErrorKind;
 use crate::search_stream::convert::{CommitMatch, Match};
-use crate::search_stream::{default_plan_deps, inputs_from_plan, tree_inputs, TreeRuntimeClients};
+use crate::search_stream::{
+    default_plan_deps, inputs_from_plan, tree_inputs_with_context, TreeRuntimeClients,
+};
 
 /// `codemonitors.ErrInvalidMonitorQuery` (`search.go:148`).
 pub const ERR_INVALID_MONITOR_QUERY: &str =
@@ -109,21 +111,31 @@ pub trait TriggerSearchStore: Send + Sync {
 }
 
 /// Plan + build the job tree, the shared prefix of `Search` and `Snapshot`.
-fn plan_tree(query: &str) -> Result<JobNode, JobError> {
+///
+/// `request_context` is `actor.FromContext(ctx)` (`search.go:29`, `:86`): the
+/// worker passes the monitor owner's user actor, the GraphQL `Snapshot` caller
+/// passes the request actor, and both fall back to anonymous — never to an
+/// internal actor that would leak repository visibility or search contexts.
+fn plan_tree(
+    query: &str,
+    request_context: crate::search_contexts::RequestContext,
+) -> Result<JobNode, JobError> {
     let client = SearchClient::new(default_plan_deps());
     let planned = client
-        .plan(
+        .plan_with_context(
             "V3",
             None,
             query,
             SearchMode::Precise,
             Protocol::Streaming,
             Some(0),
+            &request_context,
         )
         .map_err(|error| JobError(error.to_string()))?;
     let inputs = inputs_from_plan(planned);
-    let tree_inputs = tree_inputs(&inputs);
+    let tree_inputs = tree_inputs_with_context(&inputs, request_context);
     new_plan_job(&tree_inputs, &inputs.plan)
+
 }
 
 fn code_monitor_hook(
@@ -159,8 +171,10 @@ pub fn search(
     query: &str,
     monitor_id: i64,
     trigger_id: i32,
+    request_context: crate::search_contexts::RequestContext,
 ) -> Result<Vec<CommitMatch>, TriggerSearchFailure> {
-    let tree = plan_tree(query).map_err(|error| TriggerSearchFailure::non_retryable(error.0))?;
+    let tree =
+        plan_tree(query, request_context).map_err(|error| TriggerSearchFailure::non_retryable(error.0))?;
 
     let hook = CodeMonitorHookHandle::new(code_monitor_hook(store, monitor_id, trigger_id));
     let mut tree = add_code_monitor_hook(&tree, hook)
@@ -204,6 +218,7 @@ pub fn snapshot(
     runtime: &TreeRuntimeClients,
     query: &str,
     in_transaction: bool,
+    request_context: crate::search_contexts::RequestContext,
 ) -> Result<BTreeMap<i32, Vec<String>>, JobError> {
     if in_transaction {
         return Err(JobError(
@@ -211,7 +226,7 @@ pub fn snapshot(
         ));
     }
 
-    let tree = plan_tree(query)?;
+    let tree = plan_tree(query, request_context)?;
     let resolved = Arc::new(Mutex::new(BTreeMap::<i32, Vec<String>>::new()));
 
     let hook = {

@@ -483,6 +483,7 @@ pub trait TriggerSearcher: Send + Sync + 'static {
         query: &str,
         monitor_id: i64,
         trigger_job_id: i32,
+        request_context: sg_service_frontend::search_contexts::RequestContext,
     ) -> Result<TriggerSearchOutcome, TriggerSearchError>;
 }
 
@@ -497,6 +498,7 @@ impl TriggerSearcher for NotPortedTriggerSearcher {
         _query: &str,
         _monitor_id: i64,
         _trigger_job_id: i32,
+        _request_context: sg_service_frontend::search_contexts::RequestContext,
     ) -> Result<TriggerSearchOutcome, TriggerSearchError> {
         Err("codemonitors.Search is not ported to the Rust worker (M9.8ip)".to_owned().into())
     }
@@ -522,6 +524,7 @@ impl TriggerSearcher for FrontendTriggerSearcher {
         query: &str,
         monitor_id: i64,
         trigger_job_id: i32,
+        request_context: sg_service_frontend::search_contexts::RequestContext,
     ) -> Result<TriggerSearchOutcome, TriggerSearchError> {
         let results: Vec<SearchCommitMatch> = codemonitors_search::search(
             &self.runtime,
@@ -529,6 +532,7 @@ impl TriggerSearcher for FrontendTriggerSearcher {
             query,
             monitor_id,
             trigger_job_id,
+            request_context,
         )?;
         let first_committer_date = results
             .first()
@@ -752,8 +756,22 @@ pub async fn run_query_trigger_classified(
         .await
         .map_err(TriggerRunError::from)?;
 
+    // SECURITY: run as the monitor owner (`actor.WithActor(ctx,
+    // actor.FromUser(m.UserID))` in `background/workers.go`). Org-owned
+    // monitors have no user owner and keep the anonymous actor rather than
+    // inheriting an internal one (no repository/search-context leak).
+    let request_context = sg_service_frontend::search_contexts::RequestContext {
+        actor_uid: monitor.namespace_user_id.unwrap_or(0),
+        internal: false,
+        sourcegraph_dot_com_mode: false,
+    };
     let searched = searcher
-        .search(&query_trigger.query_string, monitor.id, trigger_job_id)
+        .search(
+            &query_trigger.query_string,
+            monitor.id,
+            trigger_job_id,
+            request_context,
+        )
         .await;
 
     let new_latest_result = latest_result_time(
@@ -1426,7 +1444,10 @@ mod tests {
 
         async fn get_monitor(&self, _monitor_id: i64) -> Result<Monitor, String> {
             self.calls.lock().unwrap().push("get_monitor".to_owned());
-            Ok(Monitor { id: 42 })
+            Ok(Monitor {
+                id: 42,
+                namespace_user_id: Some(1),
+            })
         }
 
         async fn set_query_trigger_next_run(
@@ -1478,6 +1499,7 @@ mod tests {
             _query: &str,
             _monitor_id: i64,
             _trigger_job_id: i32,
+            _request_context: sg_service_frontend::search_contexts::RequestContext,
         ) -> Result<TriggerSearchOutcome, TriggerSearchError> {
             self.outcome.clone()
         }

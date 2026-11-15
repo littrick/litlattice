@@ -293,8 +293,15 @@ pub trait CodeIntelUploadsDatabase: Send + Sync {
     /// applies `database.AuthzQueryConds`, the global one does not.
     fn get_indexer_names(&self, repository_id: i32, actor: Actor)
         -> Result<Vec<String>, String>;
-    /// `store.GetAuditLogsForUpload` (`PreciseIndex.auditLogs`).
-    fn get_audit_logs_for_upload(&self, upload_id: i32) -> Result<Vec<AuditLogRow>, String>;
+    /// `store.GetAuditLogsForUpload` (`PreciseIndex.auditLogs`); the store
+    /// applies `database.AuthzQueryConds` for the request actor.
+    fn get_audit_logs_for_upload(
+        &self,
+        upload_id: i32,
+        actor: Actor,
+    ) -> Result<Vec<AuditLogRow>, String>;
+    /// `auth.CheckCurrentUserIsSiteAdmin` against the `users` table.
+    fn check_site_admin(&self, actor: Actor) -> Result<(), String>;
     /// `store.NumRepositoriesWithCodeIntelligence` (`Query.codeIntelSummary`).
     fn num_repositories_with_code_intelligence(&self) -> Result<i64, String>;
     /// `store.RepositoryIDsWithErrors` (`Query.codeIntelSummary`).
@@ -833,7 +840,7 @@ pub fn precise_indexes(
         // there is no upload, otherwise the upload's audit trail.
         if let Some(upload) = &pair.upload {
             pair.audit_logs = Some(
-                db.get_audit_logs_for_upload(upload.id as i32)
+                db.get_audit_logs_for_upload(upload.id as i32, actor)
                     .map_err(ExecError::new)?,
             );
         }
@@ -876,7 +883,7 @@ pub fn precise_index_by_id(
             None => None,
         };
         let audit_logs = Some(
-            db.get_audit_logs_for_upload(upload.id as i32)
+            db.get_audit_logs_for_upload(upload.id as i32, actor)
                 .map_err(ExecError::new)?,
         );
         return Ok(Some(FieldValue::Object(Arc::new(PreciseIndexObject {
@@ -907,7 +914,7 @@ pub fn precise_index_by_id(
     };
     let audit_logs = match &upload {
         Some(upload) => Some(
-            db.get_audit_logs_for_upload(upload.id as i32)
+            db.get_audit_logs_for_upload(upload.id as i32, actor)
                 .map_err(ExecError::new)?,
         ),
         None => None,
@@ -966,7 +973,7 @@ pub fn repository_code_intel_summary(
     repository_id: i32,
     actor: Actor,
 ) -> Result<FieldValue, ExecError> {
-    check_site_admin(actor)?;
+    db.check_site_admin(actor).map_err(ExecError::new)?;
     let last_upload_retention_scan = db
         .last_upload_retention_scan(repository_id)
         .map_err(ExecError::new)?;
@@ -1044,7 +1051,7 @@ fn repository_summary_nodes(
             .associated_index_id
             .and_then(|id| index_by_id.get(&id).cloned());
         let audit_logs = Some(
-            db.get_audit_logs_for_upload(upload.id as i32)
+            db.get_audit_logs_for_upload(upload.id as i32, actor)
                 .map_err(ExecError::new)?,
         );
         nodes.push(PreciseIndexObject {
@@ -1067,7 +1074,7 @@ fn repository_summary_nodes(
             .and_then(|id| upload_by_id.get(&id).cloned());
         let audit_logs = match &upload {
             Some(upload) => Some(
-                db.get_audit_logs_for_upload(upload.id as i32)
+                db.get_audit_logs_for_upload(upload.id as i32, actor)
                     .map_err(ExecError::new)?,
             ),
             None => None,
@@ -1083,10 +1090,6 @@ fn repository_summary_nodes(
     }
     nodes.sort_by(|a, b| a.id().cmp(&b.id()));
     Ok(nodes)
-}
-
-fn check_site_admin(actor: Actor) -> Result<(), ExecError> {
-    crate::admin_store::check_current_user_is_site_admin(actor, false).map_err(ExecError::new)
 }
 
 fn states_argument(arguments: &Arguments) -> Vec<String> {
@@ -1128,7 +1131,7 @@ pub fn delete_precise_index(
     arguments: &Arguments,
     actor: Actor,
 ) -> Result<FieldValue, ExecError> {
-    check_site_admin(actor)?;
+    db.check_site_admin(actor).map_err(ExecError::new)?;
     let id = required_id(arguments)?;
     let (upload_id, index_id) = decode_precise_index_id(&id).map_err(ExecError::new)?;
     if let Some(upload_id) = upload_id {
@@ -1146,7 +1149,7 @@ pub fn delete_precise_indexes(
     arguments: &Arguments,
     actor: Actor,
 ) -> Result<FieldValue, ExecError> {
-    check_site_admin(actor)?;
+    db.check_site_admin(actor).map_err(ExecError::new)?;
     let (upload_states, index_states) =
         bifurcate_states(&states_argument(arguments)).map_err(ExecError::new)?;
     let skip_uploads = upload_states.is_empty() && !index_states.is_empty();
@@ -1189,7 +1192,7 @@ pub fn reindex_precise_index(
     arguments: &Arguments,
     actor: Actor,
 ) -> Result<FieldValue, ExecError> {
-    check_site_admin(actor)?;
+    db.check_site_admin(actor).map_err(ExecError::new)?;
     let id = required_id(arguments)?;
     let (upload_id, index_id) = decode_precise_index_id(&id).map_err(ExecError::new)?;
     if let Some(upload_id) = upload_id {
@@ -1207,7 +1210,7 @@ pub fn reindex_precise_indexes(
     arguments: &Arguments,
     actor: Actor,
 ) -> Result<FieldValue, ExecError> {
-    check_site_admin(actor)?;
+    db.check_site_admin(actor).map_err(ExecError::new)?;
     let (upload_states, index_states) =
         bifurcate_states(&states_argument(arguments)).map_err(ExecError::new)?;
     let skip_uploads = upload_states.is_empty() && !index_states.is_empty();
