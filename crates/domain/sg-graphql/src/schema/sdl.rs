@@ -68,3 +68,18 @@ pub const INSIGHTS_SCHEMA: &str = include_str!("sdl/insights.graphql");
 /// aggregation resolver is present, so `assemble_oss` never includes it.
 pub const INSIGHTS_AGGREGATIONS_SCHEMA: &str =
     include_str!("sdl/insights_aggregations.graphql");
+
+/// `//go:embed cody_context.graphql` — `OptionalResolver.CodyContextResolver`
+/// SDL (M9.48d): `Query.getCodyContext*`/`chatIntent`/`rankContext`/
+/// `recordContext`/`chatContext`/`urlMentionContext`, the `CodyContextResult`
+/// union and its result objects. `NewSchema` appends it only when the context
+/// resolver is present, so `assemble_oss` never includes it.
+pub const CODY_CONTEXT_SCHEMA: &str = include_str!("sdl/cody_context.graphql");
+
+/// `//go:embed embeddings.graphql` — `OptionalResolver.EmbeddingsResolver` SDL
+/// (M9.48d): `Query.embeddingsSearch`/`embeddingsMultiSearch`/
+/// `isContextRequiredForChatQuery`/`repoEmbeddingJobs`, the scheduling
+/// mutations, `Repository.embeddingJobs` and the `RepoEmbeddingJob` types.
+/// Appended only when the embeddings resolver is present; `assemble_oss` never
+/// includes it.
+pub const EMBEDDINGS_SCHEMA: &str = include_str!("sdl/embeddings.graphql");

@@ -524,9 +524,12 @@ pub struct SchemaGraphqlDeps {
     /// `InsightsAggregationResolver` seam (M9.34a); `None` reproduces an
     /// absent resolver (`insights_aggregations.graphql` is not appended).
     insights_aggregations: Option<crate::insights_aggregations_graphql::AggregationsHandle>,
-    /// `Repository.embeddingExists`'s database seam (M9.14c); `None` keeps the
-    /// field unported.
-    embeddings: Option<Arc<dyn crate::embeddings_graphql::RepositoryEmbeddingsStore>>,
+    /// The embeddings GraphQL surface (M9.48d), which includes the M9.14c
+    /// `Repository.embeddingExists` seam. `None` keeps the SDL unregistered.
+    embeddings: Option<Arc<crate::embeddings_graphql_surface::EmbeddingsDeps>>,
+    /// The Cody context GraphQL surface (M9.48d). `None` keeps the SDL
+    /// unregistered.
+    cody_context: Option<Arc<crate::cody_context_graphql::CodyContextDeps>>,
     /// Read-only diagnostic `Query` fields (M9.14c); `None` keeps all four
     /// unported.
     diagnostics: Option<crate::diagnostics_graphql::DiagnosticsDeps>,
@@ -618,6 +621,7 @@ impl SchemaGraphqlDeps {
             insights: None,
             insights_aggregations: None,
             embeddings: None,
+            cody_context: None,
             diagnostics: None,
             org_invitation_config: None,
             inventory_c: None,
@@ -698,6 +702,7 @@ impl SchemaGraphqlDeps {
             insights: None,
             insights_aggregations: None,
             embeddings: None,
+            cody_context: None,
             diagnostics: None,
             org_invitation_config: None,
             inventory_c: Some(crate::graphql_inventory_c::InventoryCDeps::default()),
@@ -1224,13 +1229,40 @@ impl SchemaGraphqlDeps {
         self
     }
 
-    /// Attach the `Repository.embeddingExists` database seam (M9.14c).
+    /// Attach the embeddings GraphQL surface (M9.48d), including the M9.14c
+    /// `Repository.embeddingExists` seam. Appends `embeddings.graphql` (as
+    /// `NewSchema` does for a non-nil `EmbeddingsResolver`); the default
+    /// [`sg_graphql::schema::assemble_oss`] schema never includes it.
     pub fn with_embeddings(
         mut self,
-        store: Arc<dyn crate::embeddings_graphql::RepositoryEmbeddingsStore>,
-    ) -> Self {
-        self.embeddings = Some(store);
-        self
+        deps: crate::embeddings_graphql_surface::EmbeddingsDeps,
+    ) -> Result<Self, sg_graphql::schema::SchemaError> {
+        if !self.schema.types.contains_key("RepoEmbeddingJob") {
+            self.schema = Arc::new(sg_graphql::schema::assemble(&[
+                self.schema.schema_string.as_str(),
+                sg_graphql::schema::EMBEDDINGS_SCHEMA,
+            ])?);
+        }
+        self.embeddings = Some(Arc::new(deps));
+        Ok(self)
+    }
+
+    /// Attach the Cody context GraphQL surface (M9.48d): appends
+    /// `cody_context.graphql` (as `NewSchema` does for a non-nil
+    /// `CodyContextResolver`). The default
+    /// [`sg_graphql::schema::assemble_oss`] schema never includes it.
+    pub fn with_cody_context(
+        mut self,
+        deps: crate::cody_context_graphql::CodyContextDeps,
+    ) -> Result<Self, sg_graphql::schema::SchemaError> {
+        if !self.schema.types.contains_key("ChatIntentResponse") {
+            self.schema = Arc::new(sg_graphql::schema::assemble(&[
+                self.schema.schema_string.as_str(),
+                sg_graphql::schema::CODY_CONTEXT_SCHEMA,
+            ])?);
+        }
+        self.cody_context = Some(Arc::new(deps));
+        Ok(self)
     }
 
     /// Attach the read-only diagnostic `Site` seams (M9.14c).
@@ -1458,6 +1490,7 @@ impl SchemaGraphqlDeps {
             insights: None,
             insights_aggregations: None,
             embeddings: None,
+            cody_context: None,
             diagnostics: None,
             org_invitation_config: None,
             inventory_c: None,
@@ -2422,7 +2455,7 @@ impl GraphqlDeps for SchemaGraphqlDeps {
         // once. `None` keeps the field unported.
         let embeddings_prefetch = match &self.embeddings {
             None => None,
-            Some(store) => {
+            Some(deps) => {
                 let force_allow = std::env::var("SRC_INTERNAL_EMBEDDINGS_ALLOWED")
                     .map(|value| {
                         matches!(
@@ -2461,15 +2494,31 @@ impl GraphqlDeps for SchemaGraphqlDeps {
                     }
                 }
                 Some(Arc::new(
-                    crate::embeddings_graphql::prefetch_embeddings(
-                        store.as_ref(),
+                    crate::embeddings_graphql_surface::prefetch_embeddings_graphql(
+                        deps,
+                        enabled,
                         &fields,
                         repo_ids,
-                        enabled,
+                        request.actor,
+                        site_admin,
+                        is_mutation,
                     )
                     .await,
                 ))
             }
+        };
+        // M9.48d: the Cody context roots run their DB/HTTP/gitserver work
+        // before execution; an unconnected backend yields an explicit error.
+        let cody_prefetch = match &self.cody_context {
+            None => None,
+            Some(deps) => Some(Arc::new(
+                crate::cody_context_graphql::prefetch_cody_context(
+                    deps,
+                    &fields,
+                    request.actor,
+                )
+                .await,
+            )),
         };
         // `Query.statusMessages` / `repositoryStats` / `backgroundJobs` /
         // `gitservers` (M9.14c): site-admin gated; `None` keeps them unported.
@@ -2639,6 +2688,7 @@ impl GraphqlDeps for SchemaGraphqlDeps {
         });
         Arc::make_mut(&mut nested).auth_providers = auth_providers_root.clone();
         Arc::make_mut(&mut nested).repo_embeddings = embeddings_prefetch;
+        Arc::make_mut(&mut nested).cody_context = cody_prefetch;
         Arc::make_mut(&mut nested).diagnostics = diagnostics_prefetch;
         let executor_secret_nested = Arc::clone(&nested);
         let mut roots =

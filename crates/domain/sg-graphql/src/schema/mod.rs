@@ -48,8 +48,8 @@ pub mod sdl;
 /// `saved_searches.graphql`, the order `NewSchema` appends them in).
 pub use sdl::{
     BATCHES_SCHEMA, CODEINTEL_AUTOINDEXING_SCHEMA, CODEINTEL_POLICIES_SCHEMA,
-    CODE_MONITORS_SCHEMA, GITHUB_APPS_SCHEMA, INSIGHTS_AGGREGATIONS_SCHEMA,
-    INSIGHTS_SCHEMA, MAIN_SCHEMA, NOTEBOOKS_SCHEMA,
+    CODE_MONITORS_SCHEMA, CODY_CONTEXT_SCHEMA, EMBEDDINGS_SCHEMA, GITHUB_APPS_SCHEMA,
+    INSIGHTS_AGGREGATIONS_SCHEMA, INSIGHTS_SCHEMA, MAIN_SCHEMA, NOTEBOOKS_SCHEMA,
     OUTBOUND_WEBHOOKS_SCHEMA, SAVED_SEARCHES_SCHEMA, VIEWER_SCHEMA,
 };
 
@@ -1253,6 +1253,68 @@ mod tests {
         ))
         .unwrap_err();
         assert!(err.message().contains("not found"), "{err}");
+    }
+
+    #[test]
+    fn cody_context_and_embeddings_documents_assemble_opt_in() {
+        // `assemble_oss()` (the default introspection surface) must not grow.
+        let oss = assemble_oss().expect("oss schema");
+        assert!(!oss.types.contains_key("ChatIntentResponse"));
+        assert!(!oss.types.contains_key("RepoEmbeddingJob"));
+
+        // `NewSchema` append order: embeddings.graphql then cody_context.graphql.
+        let full = assemble(&[
+            MAIN_SCHEMA,
+            OUTBOUND_WEBHOOKS_SCHEMA,
+            VIEWER_SCHEMA,
+            EMBEDDINGS_SCHEMA,
+            CODY_CONTEXT_SCHEMA,
+        ])
+        .expect("opt-in schema");
+        for ty in [
+            "EmbeddingsSearchResult",
+            "EmbeddingsSearchResults",
+            "RepoEmbeddingJob",
+            "RepoEmbeddingJobsConnection",
+            "RepoEmbeddingsStats",
+            "ChatIntentResponse",
+            "ChatContextResult",
+            "CodyContextAlternativesResult",
+            "CodyContextList",
+            "FileChunkContext",
+            "RankingResponse",
+            "RankedItem",
+            "RetrieverContextItem",
+            "URLMentionContextResult",
+            "InputContextItem",
+            "RankOptions",
+        ] {
+            assert!(full.types.contains_key(ty), "missing {ty}");
+        }
+        let query = &full.types["Query"];
+        for field in [
+            "embeddingsSearch",
+            "embeddingsMultiSearch",
+            "isContextRequiredForChatQuery",
+            "repoEmbeddingJobs",
+            "getCodyContext",
+            "getCodyContextAlternatives",
+            "chatIntent",
+            "rankContext",
+            "recordContext",
+            "chatContext",
+            "urlMentionContext",
+        ] {
+            assert!(
+                query.fields.iter().any(|def| def.name == field),
+                "missing Query.{field}"
+            );
+        }
+        let repository = &full.types["Repository"];
+        assert!(repository
+            .fields
+            .iter()
+            .any(|def| def.name == "embeddingJobs"));
     }
 
     #[test]

@@ -22,6 +22,7 @@
 //! [`EmbeddingsPrefetch`].
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use sg_graphql::exec::RootField;
@@ -74,6 +75,10 @@ impl RepositoryEmbeddingsStore for PgRepositoryEmbeddingsStore {
 pub struct EmbeddingsPrefetch {
     pub enabled: bool,
     pub exists: HashMap<i32, Result<bool, String>>,
+    /// M9.48d surface prefetch (searches, jobs, mutations, cody gate result).
+    /// `None` when the embeddings GraphQL surface was not requested/injected.
+    pub graphql:
+        Option<Arc<crate::embeddings_graphql_surface::EmbeddingsGraphqlPrefetch>>,
 }
 
 /// Resolve every `embeddingExists` that could be reached by this request.
@@ -91,6 +96,7 @@ pub async fn prefetch_embeddings(
     let mut prefetch = EmbeddingsPrefetch {
         enabled,
         exists: HashMap::new(),
+        graphql: None,
     };
     if !field_selected(fields, "embeddingExists") {
         return prefetch;
@@ -123,6 +129,38 @@ pub fn field_selected(fields: &[RootField], name: &str) -> bool {
         }
     }
     false
+}
+
+/// `embeddings.IsContextRequiredForChatQuery` (`internal/embeddings/
+/// context_detection.go`): trim, lowercase and test every no-context regexp.
+pub fn is_context_required_for_chat_query(query: &str) -> bool {
+    static NO_CONTEXT: std::sync::OnceLock<Vec<regex::Regex>> = std::sync::OnceLock::new();
+    let regexps = NO_CONTEXT.get_or_init(|| {
+        [
+            // Erratum: the baseline lowercases the query but the regexp keeps
+            // a capital `Cody`, so "hello Cody" never matches.
+            r"^(hello|hey|hi|what['’]s up|how's it going)( Cody)?[!\.\?]?$",
+            r"(previous|above)\s+(message|code|text)",
+            r"(translate|convert|change|for|make|refactor|rewrite|ignore|describe|explain|fix|try|show)\s+(that|this|above|previous|it|again)",
+            r"i don['’]t understand",
+            r"what you just said",
+            r"(explain|describe).*in more detail",
+            r"(this|that).*?\s+(is|seems|looks)\s+(wrong|incorrect|bad|good)",
+            r"(this|that).*?\s+(does not|doesn't work)",
+            r"(is not|isn['’]t) (correct|right)",
+            r"i don['’]t think that['’]s (correct|right)",
+            r"(does not|doesn['’]t) (look|seem) (correct|right)",
+            r"are you (sure|certain)",
+            r"you're (incorrect|not right|wrong)",
+            r"^(yes|no|correct|wrong|nope|yep|now|cool)(\s|.|,|!)",
+            r"```",
+        ]
+        .into_iter()
+        .map(|pattern| regex::Regex::new(pattern).expect("no-context regexp"))
+        .collect()
+    });
+    let query = query.trim().to_lowercase();
+    !regexps.iter().any(|regexp| regexp.is_match(&query))
 }
 
 /// `conf.EmbeddingsEnabled()` = `GetEmbeddingsConfig(siteConfig) != nil`.
