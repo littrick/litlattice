@@ -2692,6 +2692,7 @@ impl FrontendRootResolver {
                 saved_searches: None,
                 code_monitors: None,
                 codeintel_uploads: None,
+                codeintel_codenav: None,
                 codeintel_autoindexing: None,
                 codeintel_policies: None,
                 notebooks: None,
@@ -2898,6 +2899,15 @@ impl FrontendRootResolver {
     ) -> Self {
         self.query.codeintel_uploads = codeintel_uploads.clone();
         self.mutation.codeintel_uploads = codeintel_uploads;
+        self
+    }
+
+    /// Attach the optional Code Intel code-navigation seam (M9.48b).
+    pub fn with_codeintel_codenav(
+        mut self,
+        codeintel_codenav: Option<crate::codeintel_codenav_graphql::CodeIntelCodenavHandle>,
+    ) -> Self {
+        self.query.codeintel_codenav = codeintel_codenav;
         self
     }
 
@@ -3289,6 +3299,10 @@ struct QueryRoot {
     /// `codeintel.autoindexing.graphql` was not appended and
     /// `Query.preciseIndexes` is absent.
     codeintel_uploads: Option<crate::codeintel_uploads_graphql::CodeIntelUploadsHandle>,
+    /// Optional Code Intel code-navigation seam (M9.48b). `None` means
+    /// `codeintel.codenav.graphql` was not appended and
+    /// `Query.usagesForSymbol` is absent.
+    codeintel_codenav: Option<crate::codeintel_codenav_graphql::CodeIntelCodenavHandle>,
     /// Optional code-intel autoindexing database (M9.28b). `None` keeps the
     /// autoindexing root fields and `Repository.indexConfiguration` unported.
     codeintel_autoindexing:
@@ -5157,6 +5171,17 @@ impl ObjectValue for QueryRoot {
                     arguments,
                     actor,
                 )
+            }
+            // Code Intel code-navigation root field (`Query.usagesForSymbol`,
+            // M9.48b).
+            _ if self.codeintel_codenav.is_some() && field == "usagesForSymbol" => {
+                let db = self
+                    .codeintel_codenav
+                    .as_ref()
+                    .expect("checked codeintel codenav");
+                db.usages_for_symbol(arguments, actor)
+                    .map(Some)
+                    .map_err(ExecError::new)
             }
             // `UploadsServiceResolver` root field (`Query.preciseIndexes`,
             // M9.27d).

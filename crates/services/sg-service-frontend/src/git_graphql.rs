@@ -780,6 +780,10 @@ pub struct GitPrefetch {
     /// `GitTreeEntry.rawZipArchiveURL`. Empty means "no live site config";
     /// the resolver then falls back to Go's cached `http://example.com`.
     pub external_url: String,
+    /// M9.48b: the Code Intel code-navigation seam behind
+    /// `GitBlob.lsif`/`GitTree.lsif`/`GitBlob.codeGraphData`. `None` keeps the
+    /// optional surface unassembled.
+    pub codenav: Option<crate::codeintel_codenav_graphql::CodeIntelCodenavHandle>,
 }
 
 impl Clone for GitPrefetch {
@@ -803,6 +807,7 @@ impl Clone for GitPrefetch {
             symbols: self.symbols.clone(),
             tree_highlights: self.tree_highlights.clone(),
             external_url: self.external_url.clone(),
+            codenav: self.codenav.clone(),
         }
     }
 }
@@ -831,6 +836,7 @@ impl std::fmt::Debug for GitPrefetch {
             )
             .field("tree_highlights", &self.tree_highlights)
             .field("external_url", &self.external_url)
+            .field("codenav", &self.codenav.as_ref().map(|_| "<codenav>"))
             .finish()
     }
 }

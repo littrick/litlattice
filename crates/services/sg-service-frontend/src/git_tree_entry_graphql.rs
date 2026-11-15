@@ -1163,7 +1163,7 @@ fn position_url_fragment(position: Position, force_include_character: bool) -> S
 }
 
 /// `rangeResolver.urlFragment` (`location.go:83-89`).
-fn range_url_fragment(range: SymbolRange) -> String {
+pub(crate) fn range_url_fragment(range: SymbolRange) -> String {
     if range.start == range.end {
         return position_url_fragment(range.start, false);
     }
@@ -1868,6 +1868,38 @@ impl ObjectValue for GitTreeEntryObject {
             "history" => self.history_field(arguments),
             "symbols" => self.symbols_field(arguments),
             "symbol" => self.symbol_field(arguments),
+            // M9.48b: `TreeEntry.lsif` / `GitBlob.lsif` / `GitTree.lsif`
+            // (`git_tree_entry.go:477-495`). The resolver kind follows the
+            // entry kind: a directory resolves `GitTreeLSIFData`, a file
+            // `GitBlobLSIFData`.
+            "lsif" => {
+                let codenav = self.git.as_ref().and_then(|git| git.codenav.as_ref());
+                crate::codeintel_codenav_graphql::lsif_field(
+                    codenav,
+                    self.repo.clone(),
+                    &self.oid,
+                    self.path(),
+                    self.stat.is_dir(),
+                    arguments,
+                )
+            }
+            // M9.48b: `GitBlob.codeGraphData` (`git_tree_entry.go:497-508`).
+            "codeGraphData" => {
+                let codenav = self.git.as_ref().and_then(|git| git.codenav.as_ref());
+                crate::codeintel_codenav_graphql::code_graph_data_field(
+                    codenav,
+                    self.repo.clone(),
+                    &self.oid,
+                    self.path(),
+                    arguments,
+                )
+            }
+            // `GitBlob.localCodeIntel` / `GitBlob.symbolInfo` need the symbols
+            // gRPC `LocalCodeIntel`/`SymbolInfo` methods, which the Rust
+            // client does not expose (SERVICE_GAP, see the overview).
+            "localCodeIntel" | "symbolInfo" => {
+                Ok(Some(crate::codeintel_codenav_graphql::symbol_info_gap()))
+            }
             _ => Ok(None),
         }
     }
@@ -2300,6 +2332,7 @@ impl ObjectValue for SymbolObject {
 }
 
 /// `locationResolver` (`location.go:18-60`).
+#[derive(Clone)]
 pub struct LocationObject {
     pub resource: GitTreeEntryObject,
     pub range: SymbolRange,

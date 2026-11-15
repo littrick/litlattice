@@ -515,6 +515,9 @@ pub struct SchemaGraphqlDeps {
     /// `CodeIntelPoliciesResolver`'s database seam (M9.28c); `None`
     /// reproduces an absent resolver.
     codeintel_policies: Option<crate::codeintel_policies_graphql::CodeIntelPoliciesHandle>,
+    /// Code Intel code-navigation seam (M9.48b); `None` reproduces an absent
+    /// `CodeIntelResolver` codenav document.
+    codeintel_codenav: Option<crate::codeintel_codenav_graphql::CodeIntelCodenavHandle>,
     /// `NotebooksResolver`'s database seam (M9.29a); `None` reproduces an
     /// absent optional resolver (`notebooks.graphql` not appended).
     notebooks: Option<crate::notebooks_graphql::NotebooksHandle>,
@@ -614,6 +617,7 @@ impl SchemaGraphqlDeps {
             codeintel_uploads: None,
             codeintel_autoindexing: None,
             codeintel_policies: None,
+            codeintel_codenav: None,
             notebooks: None,
             insights: None,
             insights_aggregations: None,
@@ -694,6 +698,7 @@ impl SchemaGraphqlDeps {
             codeintel_uploads: None,
             codeintel_autoindexing: None,
             codeintel_policies: None,
+            codeintel_codenav: None,
             notebooks: None,
             insights: None,
             insights_aggregations: None,
@@ -1090,6 +1095,43 @@ impl SchemaGraphqlDeps {
         Ok(self)
     }
 
+    /// Enable the Code Intel code-navigation GraphQL surface (M9.48b): append
+    /// `codeintel.codenav.graphql` (the baseline appends every
+    /// `codeintel*.graphql` document for a non-nil `CodeIntelResolver`) and
+    /// hand the database seam to the executor.
+    ///
+    /// The codenav document references `PreciseIndex`, so the auto-indexing
+    /// document is appended first when it is not already present (production
+    /// calls this after [`Self::with_codeintel_uploads`]). The default
+    /// [`sg_graphql::schema::assemble_oss`] schema never includes either
+    /// document, so OSS introspection stays unchanged.
+    pub fn with_codeintel_codenav(
+        mut self,
+        db: crate::codeintel_codenav_graphql::CodeIntelCodenavHandle,
+    ) -> Result<Self, sg_graphql::schema::SchemaError> {
+        let mut append_autoindexing = false;
+        let mut append_codenav = false;
+        if !self.schema.types.contains_key("PreciseIndex") {
+            append_autoindexing = true;
+            append_codenav = true;
+        }
+        if !self.schema.types.contains_key("GitBlobLSIFData") {
+            append_codenav = true;
+        }
+        if append_autoindexing || append_codenav {
+            let mut documents = vec![self.schema.schema_string.as_str()];
+            if append_autoindexing {
+                documents.push(sg_graphql::schema::CODEINTEL_AUTOINDEXING_SCHEMA);
+            }
+            if append_codenav {
+                documents.push(sg_graphql::schema::CODEINTEL_CODENAV_SCHEMA);
+            }
+            self.schema = Arc::new(sg_graphql::schema::assemble(&documents)?);
+        }
+        self.codeintel_codenav = Some(db);
+        Ok(self)
+    }
+
     /// Enable the Notebooks GraphQL surface (M9.29a): append
     /// `notebooks.graphql` (as `NewSchema` does for a non-nil
     /// `NotebooksResolver`) and hand the database seam to the executor.
@@ -1454,6 +1496,7 @@ impl SchemaGraphqlDeps {
             codeintel_uploads: None,
             codeintel_autoindexing: None,
             codeintel_policies: None,
+            codeintel_codenav: None,
             notebooks: None,
             insights: None,
             insights_aggregations: None,
@@ -1878,6 +1921,9 @@ impl GraphqlDeps for SchemaGraphqlDeps {
                 .await;
                 // M9.46b: `conf.ExternalURL()` for `rawZipArchiveURL`.
                 prefetch.external_url = external_url.clone();
+                // M9.48b: `GitBlob.lsif`/`codeGraphData` read through the
+                // optional code-navigation seam.
+                prefetch.codenav = self.codeintel_codenav.clone();
                 Some(Arc::new(prefetch))
             }
             None => None,
@@ -2674,6 +2720,7 @@ impl GraphqlDeps for SchemaGraphqlDeps {
             .with_codeintel_uploads(self.codeintel_uploads.clone())
             .with_codeintel_autoindexing(self.codeintel_autoindexing.clone())
             .with_codeintel_policies(self.codeintel_policies.clone())
+            .with_codeintel_codenav(self.codeintel_codenav.clone())
             .with_notebooks(self.notebooks.clone())
             .with_insights(self.insights.clone())
             .with_insights_aggregations(self.insights_aggregations.clone())
