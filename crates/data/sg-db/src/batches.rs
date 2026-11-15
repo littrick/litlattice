@@ -1240,6 +1240,30 @@ WHERE id = $1
     Ok(())
 }
 
+/// `Store.UpdateChangesetCommitVerification` (`changesets.go:1088-1116`): the
+/// baseline writes only `updated_at` and `commit_verification` in one
+/// statement. `jsonbColumn(nil)` is `{}`, so callers pass `{}` for an
+/// unverified commit rather than SQL `NULL`.
+pub async fn update_reconciler_changeset_commit_verification(
+    conn: &mut sqlx::PgConnection,
+    id: i64,
+    verification: &serde_json::Value,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"
+UPDATE changesets
+SET updated_at = clock_timestamp(),
+    commit_verification = $2::jsonb
+WHERE id = $1
+"#,
+    )
+    .bind(id)
+    .bind(verification)
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
+}
+
 /// `BatchChange.URL(ctx, namespaceName)` (the `[link](url)` markdown wrapper is
 /// applied by the executor). Errors mirror `loadBatchChange`/`GetByID`/`URL`.
 pub async fn batch_change_link(

@@ -643,7 +643,10 @@ pub struct InstallationAccessToken {
 /// `POST /app/installations/{id}/access_tokens` endpoint.
 pub struct InstallationAuthenticator {
     installation_id: i32,
-    token: InstallationAccessToken,
+    /// `InstallationAuthenticator.installationAccessToken`, behind a mutex so
+    /// the push path (`GitserverPushConfig`) can refresh it through a shared
+    /// `Arc` (`Refresh` takes `&mut self` in the baseline).
+    token: std::sync::Mutex<InstallationAccessToken>,
     base_url: url::Url,
     app: Arc<GitHubAppAuthenticator>,
     cache: Option<Arc<dyn InstallationTokenCache>>,
@@ -674,7 +677,7 @@ impl InstallationAuthenticator {
     ) -> Self {
         Self {
             installation_id,
-            token: InstallationAccessToken::default(),
+            token: std::sync::Mutex::new(InstallationAccessToken::default()),
             base_url,
             app,
             cache,
@@ -715,12 +718,24 @@ impl InstallationAuthenticator {
         })
     }
 
+    /// The currently-held token (`GetToken`).
+    fn current_token(&self) -> InstallationAccessToken {
+        self.token
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .clone()
+    }
+
+    fn store_token(&self, token: InstallationAccessToken) {
+        *self.token.lock().unwrap_or_else(|err| err.into_inner()) = token;
+    }
+
     fn store_in_cache(&self) {
         let Some(cache) = self.cache.as_ref() else {
             return;
         };
-        let expires_at = self
-            .token
+        let token = self.current_token();
+        let expires_at = token
             .expires_at
             .map(|value| {
                 value
@@ -729,7 +744,7 @@ impl InstallationAuthenticator {
             })
             .unwrap_or_default();
         let value = serde_json::json!({
-            "token": self.token.token,
+            "token": token.token,
             "expires_at": expires_at,
         });
         if let Ok(bytes) = serde_json::to_vec(&value) {
@@ -741,10 +756,14 @@ impl InstallationAuthenticator {
     /// a refresh; a zero expiry never does; otherwise refresh within five
     /// minutes of expiry.
     pub fn needs_refresh_at(&self, now: time::OffsetDateTime) -> bool {
-        if self.token.token.is_empty() {
+        Self::token_needs_refresh_at(&self.current_token(), now)
+    }
+
+    fn token_needs_refresh_at(token: &InstallationAccessToken, now: time::OffsetDateTime) -> bool {
+        if token.token.is_empty() {
             return true;
         }
-        match self.token.expires_at {
+        match token.expires_at {
             None => false,
             Some(expires_at) => expires_at - now < time::Duration::minutes(5),
         }
@@ -759,17 +778,36 @@ impl InstallationAuthenticator {
     /// is adopted before contacting GitHub; only a token that still needs a
     /// refresh triggers the HTTP call.
     pub async fn refresh(&mut self) -> Result<(), String> {
+        self.refresh_token().await
+    }
+
+    /// `sources.GitserverPushConfig`'s `InstallationAuthenticator` branch:
+    /// refresh on demand and return the token the push URL must use.
+    ///
+    /// Unlike [`Self::refresh`], this takes `&self` so a shared
+    /// `SourceAuth::GitHubAppInstallation` can refresh without exclusive
+    /// access. The baseline serialises refreshes with the authenticator's
+    /// mutex; here concurrent callers may both refresh, which is benign (the
+    /// newest token wins and the cache is updated).
+    pub async fn refresh_if_needed(&self) -> Result<InstallationAccessToken, String> {
+        if !self.needs_refresh() {
+            return Ok(self.get_token());
+        }
+        self.refresh_token().await?;
+        Ok(self.get_token())
+    }
+
+    async fn refresh_token(&self) -> Result<(), String> {
         let now = (self.now)();
         if let Some(cached) = self.get_from_cache() {
-            if cached.token != self.token.token {
-                let previous = self.token.clone();
-                self.token = cached;
-                if !self.needs_refresh_at(now) {
+            let current = self.current_token();
+            if cached.token != current.token {
+                if !Self::token_needs_refresh_at(&cached, now) {
+                    self.store_token(cached);
                     return Ok(());
                 }
-                // The cached token is stale; restore so we can report the
-                // fresh response, matching the baseline's flow.
-                self.token = previous;
+                // The cached token is stale; keep the current one so we can
+                // report the fresh response, matching the baseline's flow.
             }
         }
 
@@ -816,7 +854,7 @@ impl InstallationAuthenticator {
             .and_then(|value| {
                 time::OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339).ok()
             });
-        self.token = InstallationAccessToken { token, expires_at };
+        self.store_token(InstallationAccessToken { token, expires_at });
         self.store_in_cache();
         Ok(())
     }
@@ -824,12 +862,12 @@ impl InstallationAuthenticator {
     /// `InstallationAuthenticator.SetURLUser`.
     pub fn set_url_user(&self, url: &mut url::Url) {
         let _ = url.set_username("x-access-token");
-        let _ = url.set_password(Some(&self.token.token));
+        let _ = url.set_password(Some(&self.current_token().token));
     }
 
     /// `InstallationAuthenticator.GetToken`.
     pub fn get_token(&self) -> InstallationAccessToken {
-        self.token.clone()
+        self.current_token()
     }
 
     /// `InstallationAuthenticator.InstallationID`.
@@ -845,7 +883,7 @@ impl InstallationAuthenticator {
 
     /// Test hook: set the cached token directly.
     pub fn set_token(&mut self, token: InstallationAccessToken) {
-        self.token = token;
+        self.store_token(token);
     }
 }
 
@@ -859,7 +897,7 @@ impl Authenticator for InstallationAuthenticator {
         set_header(
             headers,
             "Authorization",
-            &format!("Bearer {}", self.token.token),
+            &format!("Bearer {}", self.current_token().token),
         );
         Ok(())
     }

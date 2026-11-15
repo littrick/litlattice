@@ -912,10 +912,17 @@ pub trait ChangesetSource: Send + Sync {
 }
 
 /// `github.RestCommit`'s verification projection written back to the changeset.
+///
+/// `internal/extsvc/github.Verification` (not the v55 `SignatureVerification`
+/// pointer form): every field is always present and defaults to the zero
+/// value, matching `jsonbColumn(commit.Verification)`.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct CommitVerification {
     pub sha: String,
     pub verified: bool,
+    pub reason: String,
+    pub signature: String,
+    pub payload: String,
 }
 
 /// `sources.Sourcer`.
@@ -1486,7 +1493,11 @@ impl ChangesetSource for ExtsvcReconcilerSource {
             Some(remote_repo) => remote_repo,
             None => self.factory.repo_metadata.repo(&self.factory.kind, remote).await?,
         };
-        let authenticator = extsvc::push_authenticator_for_source_auth(&self.factory.auth);
+        // `GitserverPushConfig`: installation tokens refresh before the URL
+        // is built (`NeedsRefresh` → `Refresh` → `GetToken`).
+        let authenticator = extsvc::push_authenticator_for_source_auth_refreshed(&self.factory.auth)
+            .await
+            .map_err(map_source_error)?;
         let push_conf = extsvc::gitserver_push_config(&remote_repo, authenticator.as_ref())
             .map_err(map_source_error)?;
         let target_repo = self
@@ -1539,6 +1550,9 @@ impl ChangesetSource for ExtsvcReconcilerSource {
         Ok(CommitVerification {
             sha: commit.sha,
             verified: commit.verification.verified,
+            reason: commit.verification.reason,
+            signature: commit.verification.signature,
+            payload: commit.verification.payload,
         })
     }
 }
@@ -2120,6 +2134,15 @@ pub trait ReconcilerStore: Send {
     /// metadata (seam, overview §4).
     async fn upsert_changeset_events(&mut self, changeset: &Changeset) -> Result<(), String>;
     async fn update_changeset(&mut self, changeset: &Changeset) -> Result<(), String>;
+    /// `Store.UpdateChangesetCommitVerification`: a single update of
+    /// `changesets.commit_verification` (and `updated_at`) inside the open
+    /// transaction. `verification` is `None` for an unverified commit, which
+    /// the baseline stores as `{}` (`jsonbColumn(nil)`), never SQL `NULL`.
+    async fn update_changeset_commit_verification(
+        &mut self,
+        changeset_id: i64,
+        verification: Option<&CommitVerification>,
+    ) -> Result<(), String>;
     /// `state.SetDerivedState` (`executor.go:148`), run after the plan and
     /// the row update. The handler row carried by
     /// [`ChangesetWorkerStore`] has no code-host metadata or events, so the
@@ -2578,18 +2601,31 @@ impl<'a> Executor<'a> {
                 {
                     Ok(Some(signing)) => match signing.duplicate_commit(&remote, &resp).await {
                         Ok(verification) => {
-                            if !verification.verified && reject_unverified {
-                                // `errors.New` (retryable), wrapped by the caller.
-                                return (
-                                    after_done,
-                                    Err(ReconcilerError::retryable(format!(
-                                        "running after commit routine: {REJECT_UNSIGNED_COMMIT}"
-                                    ))),
-                                );
+                            if verification.verified {
+                                // `UpdateChangesetCommitVerification`: the
+                                // verification object (not the SHA) is written
+                                // to `changesets.commit_verification`.
+                                if let Err(err) = self
+                                    .store
+                                    .update_changeset_commit_verification(
+                                        self.ch.id,
+                                        Some(&verification),
+                                    )
+                                    .await
+                                {
+                                    return (
+                                        after_done,
+                                        Err(ReconcilerError::retryable(format!(
+                                            "running after commit routine: failed to update changeset with commit verification: {err}"
+                                        ))),
+                                    );
+                                }
+                            } else if reject_unverified {
+                                // Baseline quirk: `errors.Wrap(err, ...)` with
+                                // a nil `err` returns nil, so the unverified
+                                // rejection is a no-op and the commit is
+                                // accepted. Kept verbatim (erratum §2).
                             }
-                            // `newCommit.Verification.Verified` →
-                            // `UpdateChangesetCommitVerification` needs the
-                            // store transaction; see overview gap.
                         }
                         Err(err) => {
                             return (
@@ -3448,6 +3484,31 @@ impl ReconcilerStore for PgReconcilerStore {
         db::update_reconciler_changeset(&mut self.conn, &update)
             .await
             .map_err(|err| err.to_string())
+    }
+
+    async fn update_changeset_commit_verification(
+        &mut self,
+        changeset_id: i64,
+        verification: Option<&CommitVerification>,
+    ) -> Result<(), String> {
+        // `jsonbColumn(commit.Verification)`; `nil` becomes `{}` rather than
+        // SQL NULL (`UpdateChangesetCommitVerification`, changesets.go).
+        let value = match verification {
+            Some(verification) => serde_json::json!({
+                "verified": verification.verified,
+                "reason": verification.reason,
+                "signature": verification.signature,
+                "payload": verification.payload,
+            }),
+            None => serde_json::json!({}),
+        };
+        db::update_reconciler_changeset_commit_verification(
+            &mut self.conn,
+            changeset_id,
+            &value,
+        )
+        .await
+        .map_err(|err| err.to_string())
     }
 
     async fn set_derived_state(&mut self, changeset_id: i64) -> Result<(), String> {

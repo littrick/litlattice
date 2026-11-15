@@ -4326,9 +4326,9 @@ pub async fn resolve_commit_signing_source(
 /// `sources.GitserverPushConfig`'s authenticator dispatch: the push credential
 /// derived from a resolved source connection.
 ///
-/// GitHub App installation tokens are read from the currently-held token; the
-/// baseline refreshes inside `GitserverPushConfig`, which needs a mutable
-/// authenticator and is therefore left to the push seam.
+/// GitHub App installation tokens are read from the currently-held token; use
+/// [`push_authenticator_for_source_auth_refreshed`] on the push path to mirror
+/// the baseline's `NeedsRefresh`/`Refresh` before reading it.
 pub fn push_authenticator_for_source_auth(auth: &SourceAuth) -> Option<PushAuthenticator> {
     match auth {
         SourceAuth::None => None,
@@ -4352,6 +4352,29 @@ pub fn push_authenticator_for_source_auth(auth: &SourceAuth) -> Option<PushAuthe
                 token: auth.get_token().token,
             })
         }
+    }
+}
+
+/// `sources.GitserverPushConfig`'s on-demand installation-token refresh.
+///
+/// The baseline refreshes inside `GitserverPushConfig` when the authenticator
+/// is a `*ghauth.InstallationAuthenticator` and `NeedsRefresh()` is true.
+/// Refresh errors are returned verbatim (not wrapped), and only GitHub App
+/// installation credentials participate; every other credential is unchanged.
+pub async fn push_authenticator_for_source_auth_refreshed(
+    auth: &SourceAuth,
+) -> Result<Option<PushAuthenticator>, SourceError> {
+    match auth {
+        SourceAuth::GitHubAppInstallation(installation) => {
+            let token = installation
+                .refresh_if_needed()
+                .await
+                .map_err(SourceError::other)?;
+            Ok(Some(PushAuthenticator::GitHubAppInstallationToken {
+                token: token.token,
+            }))
+        }
+        _ => Ok(push_authenticator_for_source_auth(auth)),
     }
 }
 

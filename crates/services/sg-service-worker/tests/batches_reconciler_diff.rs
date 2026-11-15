@@ -35,7 +35,8 @@ use sg_service_worker::jobs::batches_reconciler::{
     calculate_publication_state, compare_changeset_specs, determine_plan, execute_plan,
     is_non_retryable, reopen_after_detach, BatchChangeAssoc, Changeset, ChangesetExternalState,
     ChangesetPublicationState, ChangesetSource, ChangesetSourceFactory, ChangesetSpec,
-    ChangesetUiPublicationState, Operations, Plan, PublishedValue, ReconcilerError,
+    ChangesetUiPublicationState, CommitVerification, Operations, Plan, PublishedValue,
+    ReconcilerError,
     ReconcilerHandler, ReconcilerOperation, ReconcilerStore, ReconcilerStoreFactory, Repo,
     SourceChangeset, SourceError, WebhookKind, CANNOT_PUSH_TO_ARCHIVED_REPO, NO_DRAFT_SUPPORT,
     NO_SSH_CREDENTIAL, PUBLISH_SAME_BRANCH,
@@ -463,6 +464,18 @@ impl ReconcilerStore for FakeStore {
 
     async fn upsert_changeset_events(&mut self, _changeset: &Changeset) -> Result<(), String> {
         self.calls.lock().unwrap().push("upsert_events".to_owned());
+        Ok(())
+    }
+
+    async fn update_changeset_commit_verification(
+        &mut self,
+        changeset_id: i64,
+        verification: Option<&CommitVerification>,
+    ) -> Result<(), String> {
+        self.calls.lock().unwrap().push(format!(
+            "update_commit_verification:{changeset_id}:{}",
+            verification.map(|v| v.verified).unwrap_or(false)
+        ));
         Ok(())
     }
 
