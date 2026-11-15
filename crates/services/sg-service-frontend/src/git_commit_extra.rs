@@ -329,7 +329,7 @@ async fn prefetch_ancestors(
     }
 }
 
-async fn compute_ancestors(
+pub(crate) async fn compute_ancestors(
     extra: &dyn GitCommitExtraSource,
     source: &dyn GitObjectSource,
     prefetch: &mut GitPrefetch,

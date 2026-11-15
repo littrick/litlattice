@@ -19,8 +19,11 @@
 //! their content-backed heavy fields (`content`/`byteSize`/`totalLines`/
 //! `binary`/`highlight`; `prefetch_listed_entry_fields`).
 //!
-//! Out of scope: `history`/`languages`/`ownership`/`blame`/`richHTML`/
-//! `rawZipArchiveURL` and the
+//! M9.45a adds `history` (`git_tree_history.go`), `languages`
+//! (`git_tree_entry.go:297-326`, [`crate::enry_languages`]) and makes `blame`
+//! reachable on history nodes (the `GitBlobD` wrapper from M9.19a).
+//!
+//! Out of scope: `ownership`/`richHTML`/`rawZipArchiveURL` and the
 //! zoekt symbol index branch (`search.ListAllIndexed`, not ported — the
 //! baseline falls back to the symbols service when it returns nothing).
 //! `symbols` is synchronous at execution time via `prefetch.symbols`, so it
@@ -41,9 +44,10 @@ use crate::git_comparison_graphql::{
     compute_highlight, parse_highlight_args, split_highlighted_rows, HighlightArgsKey,
     HighlightError, HighlightKey, HighlightRequest, HighlightedFile,
 };
+use crate::git_commit_extra::AncestorsKey;
 use crate::git_graphql::{
-    ContentLookup, DirEntriesLookup, DirLookup, GitCommitResolverObject, GitObjectSource,
-    GitPrefetch, TreeEntryLookup, MAX_COMMIT_DEPTH,
+    BlameKey, BlameLookup, CommitLookup, ContentLookup, DirEntriesLookup, DirLookup,
+    GitCommitResolverObject, GitObjectSource, GitPrefetch, TreeEntryLookup, MAX_COMMIT_DEPTH,
 };
 use crate::graphql_resolvers::{CloneUrlResolver, PageInfoObject, RepositoryObject};
 use crate::search_searcher_client::{SymbolsParameters, SymbolsResponse};
@@ -146,6 +150,298 @@ async fn prefetch_dir_entries(
     prefetch.dir_entries.insert(key, lookup);
 }
 
+// ---------------------------------------------------------------------------
+// M9.45a: `history` / `languages` / `blame` prefetch
+// ---------------------------------------------------------------------------
+
+/// `GitTreeEntryResolver.History` → `GitCommit.Ancestors`,
+/// (`git_tree_history.go:14-26`). Go puts the schema `after` argument into
+/// `AncestorsArgs.AfterCursor` (a pagination offset) and sets `Path` to the
+/// entry's full path; `follow` is not implemented by the baseline.
+pub(crate) fn history_key(
+    oid: &str,
+    path: &str,
+    first: Option<i32>,
+    after: Option<String>,
+) -> AncestorsKey {
+    AncestorsKey {
+        oid: oid.to_owned(),
+        first,
+        query: None,
+        path: Some(path.to_owned()),
+        follow: false,
+        after: None,
+        after_cursor: after,
+        before: None,
+    }
+}
+
+/// Prefetch a tree entry `history` connection and the selected node fields.
+async fn prefetch_history(
+    source: &dyn GitObjectSource,
+    prefetch: &mut GitPrefetch,
+    repo: &MinimalRepo,
+    oid: &str,
+    stat: &FileStat,
+    history: &RootField,
+    depth: usize,
+) {
+    if depth > MAX_COMMIT_DEPTH {
+        return;
+    }
+    let key = history_key(
+        oid,
+        &stat.name,
+        history.arguments.i64("first").map(|value| value as i32),
+        history.arguments.string("after").map(str::to_owned),
+    );
+    if !prefetch.extra.ancestors.contains_key(&key) {
+        let result = match source.commit_extra() {
+            Some(extra) => {
+                crate::git_commit_extra::compute_ancestors(extra, source, prefetch, repo, oid, &key)
+                    .await
+            }
+            None => Err(
+                "history requires the commit log source (not wired for this request)".to_owned(),
+            ),
+        };
+        prefetch.extra.ancestors.insert(key.clone(), result);
+    }
+    let Ok(commits) = prefetch.extra.ancestors[&key].clone() else {
+        return;
+    };
+    let Some(nodes) = flattened_selections(history)
+        .into_iter()
+        .find(|field| field.name == "nodes")
+    else {
+        return;
+    };
+    let fields = flattened_selections(nodes);
+    for commit in &commits {
+        // `gitCommitConnectionResolver.Nodes` presets the ancestor commit data.
+        prefetch
+            .commits
+            .entry((repo.id, commit.oid.clone()))
+            .or_insert_with(|| CommitLookup::Found(commit.clone()));
+        Box::pin(prefetch_history_node(
+            source,
+            prefetch,
+            repo,
+            &commit.oid,
+            stat,
+            &fields,
+            depth + 1,
+        ))
+        .await;
+    }
+}
+
+/// Prefetch the fields selected on one `history` node. The node reuses the
+/// original entry's `stat` and only changes the commit oid.
+async fn prefetch_history_node(
+    source: &dyn GitObjectSource,
+    prefetch: &mut GitPrefetch,
+    repo: &MinimalRepo,
+    oid: &str,
+    stat: &FileStat,
+    fields: &[&RootField],
+    depth: usize,
+) {
+    if depth > MAX_COMMIT_DEPTH {
+        return;
+    }
+    let path = stat.name.as_str();
+    if !stat.is_dir() {
+        let needs_content = fields.iter().any(|field| {
+            CONTENT_BACKED_FIELDS.contains(&field.name.as_str()) || field.name == "languages"
+        });
+        let key = (repo.id, oid.to_owned(), path.to_owned());
+        if needs_content && !prefetch.contents.contains_key(&key) {
+            let lookup = match source.read_file(repo.id, &repo.name, oid, path).await {
+                Ok(bytes) => ContentLookup::Found(bytes),
+                Err(error) => ContentLookup::Error(error.message),
+            };
+            prefetch.contents.insert(key.clone(), lookup);
+        }
+        for highlight_field in fields.iter().filter(|field| field.name == "highlight") {
+            prefetch_entry_highlight(source, prefetch, repo, oid, path, highlight_field).await;
+        }
+        if let Some(blame) = fields.iter().find(|field| field.name == "blame") {
+            prefetch_entry_blame(source, prefetch, repo, oid, path, blame).await;
+        }
+    } else {
+        for listing in fields.iter().filter(|field| {
+            matches!(
+                field.name.as_str(),
+                "entries" | "files" | "directories"
+            )
+        }) {
+            let recursive = listing.arguments.bool("recursive").unwrap_or(false);
+            prefetch_dir_entries(source, prefetch, repo, oid, path, recursive).await;
+            let kind = match listing.name.as_str() {
+                "files" => EntryKind::Files,
+                "directories" => EntryKind::Directories,
+                _ => EntryKind::All,
+            };
+            let ancestors =
+                kind == EntryKind::All && listing.arguments.bool("ancestors").unwrap_or(false);
+            if ancestors && !is_root_path(path) {
+                let mut parent = path.to_owned();
+                loop {
+                    parent = go_path_dir(&parent);
+                    prefetch_dir_entries(source, prefetch, repo, oid, &parent, false).await;
+                    if is_root_path(&parent) {
+                        break;
+                    }
+                }
+            }
+            let first = listing.arguments.i64("first").map(|value| value as i32);
+            if let Ok(nested) = resolve_listing(
+                prefetch, repo.id, oid, path, recursive, ancestors, first, kind,
+            ) {
+                Box::pin(prefetch_listed_entry_fields(
+                    source,
+                    prefetch,
+                    repo,
+                    oid,
+                    &nested,
+                    listing,
+                    depth + 1,
+                ))
+                .await;
+            }
+        }
+    }
+    if let Some(history) = fields.iter().find(|field| field.name == "history") {
+        Box::pin(prefetch_history(
+            source, prefetch, repo, oid, stat, history, depth + 1,
+        ))
+        .await;
+    }
+    if let Some(commit_field) = fields.iter().find(|field| field.name == "commit") {
+        Box::pin(crate::git_graphql::prefetch_commit_data(
+            source,
+            prefetch,
+            repo,
+            oid,
+            &commit_field.selections,
+            depth + 1,
+        ))
+        .await;
+    }
+}
+
+/// Prefetch one tree-entry `highlight` selection (shared by history nodes).
+async fn prefetch_entry_highlight(
+    source: &dyn GitObjectSource,
+    prefetch: &mut GitPrefetch,
+    repo: &MinimalRepo,
+    oid: &str,
+    path: &str,
+    highlight_field: &RootField,
+) {
+    let raw_args = parse_highlight_args(&highlight_field.arguments);
+    let content_key = (repo.id, oid.to_owned(), path.to_owned());
+    if !prefetch.contents.contains_key(&content_key) {
+        let lookup = match source.read_file(repo.id, &repo.name, oid, path).await {
+            Ok(bytes) => ContentLookup::Found(bytes),
+            Err(error) => ContentLookup::Error(error.message),
+        };
+        prefetch.contents.insert(content_key.clone(), lookup);
+    }
+    let (highlight_key, result) = if highlight_pagination_unsupported(&raw_args) {
+        (
+            HighlightKey {
+                repo_id: repo.id,
+                oid: oid.to_owned(),
+                path: path.to_owned(),
+                args: raw_args.clone(),
+            },
+            Err(HIGHLIGHT_PAGINATION_ERROR.to_owned()),
+        )
+    } else {
+        let args = normalized_tree_highlight_args(path, &raw_args);
+        let highlight_key = HighlightKey {
+            repo_id: repo.id,
+            oid: oid.to_owned(),
+            path: path.to_owned(),
+            args: args.clone(),
+        };
+        let result = match prefetch.contents.get(&content_key) {
+            Some(ContentLookup::Found(bytes)) => {
+                let request = HighlightRequest {
+                    content: bytes.clone(),
+                    filepath: path.to_owned(),
+                    disable_timeout: args.disable_timeout,
+                    highlight_long_lines: args.highlight_long_lines,
+                    format: args.format.clone(),
+                    start_line: args.start_line,
+                    end_line: args.end_line,
+                    keep_final_newline: false,
+                };
+                match compute_highlight(source, &request).await {
+                    Ok(highlighted) => Ok(highlighted),
+                    Err(HighlightError::Binary) => Err("cannot render binary file".to_owned()),
+                    Err(HighlightError::Message(message)) => Err(message),
+                }
+            }
+            Some(ContentLookup::Error(message)) => Err(message.clone()),
+            None => Err("tree entry content is not prefetched".to_owned()),
+        };
+        (highlight_key, result)
+    };
+    prefetch
+        .tree_highlights
+        .entry(highlight_key)
+        .or_insert(result);
+}
+
+/// Prefetch `GitTreeEntryResolver.Blame` for one entry (`git_blob.go:18-56`).
+/// The both-or-neither `startLine`/`endLine` validation happens at resolve
+/// time in Go, so a mismatched pair is not fetched here.
+async fn prefetch_entry_blame(
+    source: &dyn GitObjectSource,
+    prefetch: &mut GitPrefetch,
+    repo: &MinimalRepo,
+    oid: &str,
+    path: &str,
+    blame: &RootField,
+) {
+    let start_line = blame.arguments.i64("startLine").map(|line| line as i32);
+    let end_line = blame.arguments.i64("endLine").map(|line| line as i32);
+    if start_line.is_some() != end_line.is_some() {
+        return;
+    }
+    let ignore_whitespace = blame.arguments.bool("ignoreWhitespace").unwrap_or(false);
+    let key = BlameKey {
+        repo_id: repo.id,
+        oid: oid.to_owned(),
+        path: path.to_owned(),
+        start_line,
+        end_line,
+        ignore_whitespace,
+    };
+    if prefetch.blame.contains_key(&key) {
+        return;
+    }
+    let lookup = match source
+        .blame(
+            repo.id,
+            &repo.name,
+            oid,
+            path,
+            start_line,
+            end_line,
+            ignore_whitespace,
+        )
+        .await
+    {
+        Ok(hunks) => BlameLookup::Found(hunks),
+        Err(error) => BlameLookup::Error(error.message),
+    };
+    prefetch.blame.insert(key, lookup);
+}
+
 /// Prefetch `Stat`/`NewFileReader`/`ReadDir`/`GetCommit` for every
 /// `tree`/`blob`/`file`/`path` field of one commit (`GitCommit.path`).
 // The `contains_key`/`insert` pair cannot use `HashMap::entry` because the
@@ -187,6 +483,7 @@ pub async fn prefetch_commit_entries(
             || selected(field, "byteSize")
             || selected(field, "totalLines")
             || selected(field, "binary")
+            || selected(field, "languages")
             || selected(field, "highlight"))
             && !prefetch.contents.contains_key(&key)
         {
@@ -324,6 +621,19 @@ pub async fn prefetch_commit_entries(
             }
         }
 
+        if let Some(history_field) = selected_field(field, "history") {
+            Box::pin(prefetch_history(
+                source,
+                prefetch,
+                repo,
+                oid,
+                &stat,
+                history_field,
+                depth + 1,
+            ))
+            .await;
+        }
+
         if let Some(commit_field) = selected_field(field, "commit") {
             Box::pin(crate::git_graphql::prefetch_commit_data(
                 source,
@@ -368,9 +678,9 @@ async fn prefetch_listed_entry_fields(
     // Selections of the element node, including inline fragments (`TreeEntry`
     // is an interface; `files` elements are the concrete `File` type).
     let fields = flattened_selections(selection);
-    let wants_content = fields
-        .iter()
-        .any(|field| CONTENT_BACKED_FIELDS.contains(&field.name.as_str()));
+    let wants_content = fields.iter().any(|field| {
+        CONTENT_BACKED_FIELDS.contains(&field.name.as_str()) || field.name == "languages"
+    });
     let highlight_fields: Vec<&RootField> = fields
         .iter()
         .copied()
@@ -444,6 +754,9 @@ async fn prefetch_listed_entry_fields(
                     .entry(highlight_key)
                     .or_insert(result);
             }
+            if let Some(blame) = fields.iter().find(|field| field.name == "blame") {
+                prefetch_entry_blame(source, prefetch, repo, oid, path, blame).await;
+            }
         } else {
             for listing in &listing_fields {
                 let recursive = listing.arguments.bool("recursive").unwrap_or(false);
@@ -475,6 +788,29 @@ async fn prefetch_listed_entry_fields(
                     .await;
                 }
             }
+        }
+        if let Some(history) = fields.iter().find(|field| field.name == "history") {
+            Box::pin(prefetch_history(
+                source,
+                prefetch,
+                repo,
+                oid,
+                stat,
+                history,
+                depth + 1,
+            ))
+            .await;
+        }
+        if let Some(commit_field) = fields.iter().find(|field| field.name == "commit") {
+            Box::pin(crate::git_graphql::prefetch_commit_data(
+                source,
+                prefetch,
+                repo,
+                oid,
+                &commit_field.selections,
+                depth + 1,
+            ))
+            .await;
         }
     }
 }
@@ -1110,6 +1446,78 @@ impl GitTreeEntryObject {
         )))))
     }
 
+    /// `GitTreeEntryResolver.Languages` (`git_tree_entry.go:297-326`).
+    ///
+    /// Directories resolve to an empty list without reading content. For a
+    /// file the detector runs on the prefetched `NewFileReader` bytes; the
+    /// content is only required when the filename/extension decision is
+    /// ambiguous, so an unreadable file with an unambiguous extension still
+    /// resolves exactly like Go.
+    fn languages_field(&self) -> Result<Option<FieldValue>, ExecError> {
+        if self.stat.is_dir() {
+            return Ok(Some(FieldValue::List {
+                items: Vec::new(),
+                element_type: Some("String"),
+            }));
+        }
+        let name = go_path_base(self.path());
+        let content = if crate::enry_languages::needs_content(&name) {
+            let Some(git) = &self.git else {
+                return Err(ExecError::new(
+                    "languages requires the gitserver GitSource (not wired for this request)",
+                ));
+            };
+            match git.content(self.repo.id, &self.oid, self.path()) {
+                Some(ContentLookup::Found(bytes)) => Some(bytes.as_slice()),
+                Some(ContentLookup::Error(message)) => {
+                    return Err(ExecError::new(message.clone()))
+                }
+                None => return Err(ExecError::new("languages content is not prefetched")),
+            }
+        } else {
+            None
+        };
+        let languages = crate::enry_languages::get_languages(&name, content);
+        Ok(Some(FieldValue::List {
+            items: languages
+                .into_iter()
+                .map(|language| FieldValue::Json(Json::Str(language)))
+                .collect(),
+            element_type: Some("String"),
+        }))
+    }
+
+    /// `GitTreeEntryResolver.History` (`git_tree_history.go:9-26`).
+    fn history_field(&self, arguments: &Arguments) -> Result<Option<FieldValue>, ExecError> {
+        let Some(git) = &self.git else {
+            return Err(ExecError::new(
+                "history requires the gitserver GitSource (not wired for this request)",
+            ));
+        };
+        let first = arguments.i64("first").map(|value| value as i32);
+        let after = arguments.string("after").map(str::to_owned);
+        let key = history_key(&self.oid, self.path(), first, after.clone());
+        let commits = match git.extra.ancestors.get(&key) {
+            Some(result) => result.clone(),
+            None => return Err(ExecError::new("history is not prefetched")),
+        };
+        let after_cursor = after
+            .as_deref()
+            .filter(|value| !value.is_empty())
+            .and_then(|value| value.parse::<i32>().ok())
+            .unwrap_or(0);
+        Ok(Some(FieldValue::Object(Arc::new(
+            TreeEntryHistoryConnectionObject {
+                repo: self.repo.clone(),
+                stat: self.stat.clone(),
+                commits,
+                first,
+                after_cursor,
+                git: self.git.clone(),
+            },
+        ))))
+    }
+
     /// `GitTreeEntryResolver.entries`/`files`/`directories`
     /// (`git_tree.go:31-128`).
     fn entries_field(
@@ -1332,8 +1740,106 @@ impl ObjectValue for GitTreeEntryObject {
             "totalLines" => self.total_lines_field(),
             "binary" => self.binary_field(),
             "highlight" => self.highlight_field(arguments),
+            "languages" => self.languages_field(),
+            "history" => self.history_field(arguments),
             "symbols" => self.symbols_field(arguments),
             "symbol" => self.symbol_field(arguments),
+            _ => Ok(None),
+        }
+    }
+}
+
+/// `treeEntryHistoryConnection` (`git_tree_history.go:28-56`): the nodes are
+/// tree entries for each ancestor commit, reusing the original entry's `stat`.
+pub struct TreeEntryHistoryConnectionObject {
+    pub repo: MinimalRepo,
+    pub stat: FileStat,
+    pub commits: Result<Vec<sg_git::CommitDetails>, String>,
+    pub first: Option<i32>,
+    pub after_cursor: i32,
+    pub git: Option<Arc<GitPrefetch>>,
+}
+
+impl ObjectValue for TreeEntryHistoryConnectionObject {
+    fn type_name(&self) -> &'static str {
+        "TreeEntryConnection"
+    }
+
+    fn field(
+        &self,
+        field: &str,
+        _arguments: &Arguments,
+        _actor: Actor,
+    ) -> Result<Option<FieldValue>, ExecError> {
+        // Every member fails together (`compute()` in `git_commits.go`).
+        let commits = self
+            .commits
+            .as_ref()
+            .map_err(|message| ExecError::new(message.clone()))?;
+        match field {
+            "nodes" => {
+                let nodes = match self.first {
+                    Some(first) if commits.len() > first.max(0) as usize => {
+                        &commits[..first.max(0) as usize]
+                    }
+                    _ => commits.as_slice(),
+                };
+                Ok(Some(FieldValue::List {
+                    element_type: Some("TreeEntry"),
+                    items: nodes
+                        .iter()
+                        .map(|commit| {
+                            let entry = GitTreeEntryObject {
+                                repo: self.repo.clone(),
+                                oid: commit.oid.clone(),
+                                input_rev: None,
+                                stat: self.stat.clone(),
+                                git: self.git.clone(),
+                            };
+                            if self.stat.is_dir() {
+                                FieldValue::Object(Arc::new(entry))
+                            } else {
+                                // `GitBlob` also exposes `blame` (M9.45a).
+                                FieldValue::Object(Arc::new(
+                                    crate::graphql_inventory_d::GitBlobD {
+                                        inner: Arc::new(entry),
+                                        repo: self.repo.clone(),
+                                        oid: commit.oid.clone(),
+                                        path: self.stat.name.clone(),
+                                        git: self.git.clone(),
+                                    },
+                                ))
+                            }
+                        })
+                        .collect(),
+                }))
+            }
+            "totalCount" => {
+                if self.first.is_some() {
+                    Ok(Some(FieldValue::Null))
+                } else {
+                    Ok(Some(FieldValue::Json(Json::Int(commits.len() as i64))))
+                }
+            }
+            "pageInfo" => {
+                let page_info = match self.first {
+                    None => PageInfoObject::new(false, None),
+                    Some(first) => {
+                        let limit = first.max(0) as usize;
+                        let total = commits.len();
+                        let got_single = limit == 1 && total == limit;
+                        if total > limit || got_single {
+                            PageInfoObject::new(
+                                true,
+                                Some((limit as i32 + self.after_cursor).to_string()),
+                            )
+                        } else {
+                            PageInfoObject::new(false, None)
+                        }
+                    }
+                };
+                Ok(Some(FieldValue::Object(Arc::new(page_info))))
+            }
             _ => Ok(None),
         }
     }

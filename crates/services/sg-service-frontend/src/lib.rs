@@ -58,6 +58,8 @@ pub mod configuration_startup;
 pub mod configuration_watch;
 pub mod debug;
 pub mod deploy_defaults;
+mod enry_data;
+pub mod enry_languages;
 pub mod external_accounts_graphql;
 pub mod external_api;
 pub mod external_service_mutations;
