@@ -31,8 +31,14 @@ use sg_graphql::schema::assemble_sdl;
 use sg_service_frontend::git_commit_extra::{GitCommitExtraSource, OwnershipSummary};
 use sg_service_frontend::git_graphql::{prefetch_git, GitObjectSource, GitSourceError};
 use sg_service_frontend::graphql_resolvers::{
-    FrontendRootResolver, NodeRoots, RepoKey, RepoLookup, RepositoryData,
+    FrontendRootResolver, NodeRoots, RepoKey, RepoLookup, RepositoryData, UserData,
 };
+use sg_service_frontend::own_graphql::{
+    CodeownersFileRow, OwnGraphqlDatabase, OwnRuleset, OwnStatsCounts, OwnTeamRow, RecentAuthor,
+    RecentView,
+};
+use sg_service_frontend::search_owners::{AssignedOwners, AssignedTeams};
+use time::OffsetDateTime;
 use sg_service_frontend::search_graphql::LanguageStat;
 
 const SDL: &str = "
@@ -180,7 +186,7 @@ enum OwnershipReasonType {
 }
 ";
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 struct RepoFixture {
     id: i32,
     name: String,
@@ -502,6 +508,163 @@ impl GitCommitExtraSource for FakeGit {
     }
 }
 
+
+/// M9.48c moved `GitCommit.ownership` onto the own GraphQL seam. Commit
+/// ownership only reads the recent-contributor and recent-view signals (the
+/// baseline `GitCommitOwnership` never evaluates CODEOWNERS/assigned owners),
+/// so this fake supplies exactly those.
+struct FakeOwn {
+    repo: RepositoryData,
+    viewer: UserData,
+}
+
+impl OwnGraphqlDatabase for FakeOwn {
+    fn sourcegraph_dotcom_mode(&self) -> bool {
+        false
+    }
+    fn current_user(&self, _actor: Actor) -> Result<Option<UserData>, String> {
+        Ok(None)
+    }
+    fn check_ownership_assign_permission(&self, _actor: Actor) -> Result<(), String> {
+        Ok(())
+    }
+    fn load_signal_configurations(
+        &self,
+    ) -> Result<Vec<sg_db::own_signal_configurations::SignalConfiguration>, String> {
+        Ok(Vec::new())
+    }
+    fn update_signal_configuration(
+        &self,
+        _name: &str,
+        _excluded_repo_patterns: &[String],
+        _enabled: bool,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+    fn signal_enabled(&self, _name: &str) -> Result<bool, String> {
+        Ok(true)
+    }
+    fn recent_authors(&self, _repo_id: i32, _path: &str) -> Result<Vec<RecentAuthor>, String> {
+        Ok(vec![
+            RecentAuthor { author_email: "alice@example.com".to_owned(), contribution_count: 2 },
+            RecentAuthor { author_email: "bob@example.com".to_owned(), contribution_count: 1 },
+        ])
+    }
+    fn recent_views(&self, _repo_id: i32, _path: &str) -> Result<Vec<RecentView>, String> {
+        Ok(vec![RecentView { user_id: self.viewer.id, views_count: 1 }])
+    }
+    fn repo_by_id(&self, _actor: Actor, id: i32) -> Result<Option<RepositoryData>, String> {
+        Ok((id == self.repo.id).then(|| self.repo.clone()))
+    }
+    fn repo_by_name(&self, _actor: Actor, name: &str) -> Result<Option<RepositoryData>, String> {
+        Ok((name == self.repo.name).then(|| self.repo.clone()))
+    }
+    fn ruleset(
+        &self,
+        _repo_id: i32,
+        _repo_name: &str,
+        _commit: &str,
+    ) -> Result<Option<OwnRuleset>, String> {
+        Ok(None)
+    }
+    fn assigned_owners(&self, _repo_id: i32) -> Result<AssignedOwners, String> {
+        Ok(AssignedOwners::new())
+    }
+    fn assigned_teams(&self, _repo_id: i32) -> Result<AssignedTeams, String> {
+        Ok(AssignedTeams::new())
+    }
+    fn user_by_id(&self, id: i32) -> Result<Option<UserData>, String> {
+        Ok((id == self.viewer.id).then(|| self.viewer.clone()))
+    }
+    fn user_by_username(&self, _username: &str) -> Result<Option<UserData>, String> {
+        Ok(None)
+    }
+    fn user_by_verified_email(&self, _email: &str) -> Result<Option<UserData>, String> {
+        Ok(None)
+    }
+    fn team_by_id(&self, _id: i32) -> Result<Option<OwnTeamRow>, String> {
+        Ok(None)
+    }
+    fn team_by_name(&self, _name: &str) -> Result<Option<OwnTeamRow>, String> {
+        Ok(None)
+    }
+    fn ownership_stats(
+        &self,
+        _location: Option<(i32, String)>,
+    ) -> Result<OwnStatsCounts, String> {
+        Ok(OwnStatsCounts::default())
+    }
+    fn total_files(&self, _location: Option<(i32, String)>) -> Result<i32, String> {
+        Ok(0)
+    }
+    fn list_codeowners(
+        &self,
+        _cursor: i32,
+        _limit: Option<i32>,
+    ) -> Result<(Vec<CodeownersFileRow>, i32), String> {
+        Ok((Vec::new(), 0))
+    }
+    fn count_codeowners(&self) -> Result<i32, String> {
+        Ok(0)
+    }
+    fn codeowners_for_repo(&self, _repo_id: i32) -> Result<Option<CodeownersFileRow>, String> {
+        Ok(None)
+    }
+    fn create_codeowners(
+        &self,
+        _repo_id: i32,
+        _contents: &str,
+        _proto: &[u8],
+    ) -> Result<CodeownersFileRow, String> {
+        Err("not implemented".to_owned())
+    }
+    fn update_codeowners(
+        &self,
+        _repo_id: i32,
+        _contents: &str,
+        _proto: &[u8],
+    ) -> Result<CodeownersFileRow, String> {
+        Err("not implemented".to_owned())
+    }
+    fn delete_codeowners(&self, _repo_ids: &[i32]) -> Result<(), String> {
+        Ok(())
+    }
+    fn insert_assigned_owner(
+        &self,
+        _user_id: i32,
+        _repo_id: i32,
+        _path: &str,
+        _who: i32,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+    fn delete_assigned_owner(
+        &self,
+        _user_id: i32,
+        _repo_id: i32,
+        _path: &str,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+    fn insert_assigned_team(
+        &self,
+        _team_id: i32,
+        _repo_id: i32,
+        _path: &str,
+        _who: i32,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+    fn delete_assigned_team(
+        &self,
+        _team_id: i32,
+        _repo_id: i32,
+        _path: &str,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+}
+
 #[tokio::test]
 async fn git_commit_extra_harness() {
     if std::env::var("SG_M9IZ_DIFF").as_deref() != Ok("1") {
@@ -548,7 +711,36 @@ async fn git_commit_extra_harness() {
             actor: Actor::Anonymous,
         };
         let fields = root_fields(&schema, &request);
-        let git = prefetch_git(&fake, &repositories, &HashMap::new(), &nodes, None, &fields).await;
+        let mut git =
+            prefetch_git(&fake, &repositories, &HashMap::new(), &nodes, None, &fields).await;
+        if let Some(repo_fixture) = corpus.repos.first().cloned() {
+            git.own = Some(Arc::new(FakeOwn {
+                repo: RepositoryData {
+                    id: repo_fixture.id,
+                    name: repo_fixture.name.clone(),
+                    uri: repo_fixture.uri.clone(),
+                    description: String::new(),
+                    fork: false,
+                    archived: false,
+                    private: false,
+                    stars: 0,
+                    external_id: String::new(),
+                    external_service_type: "github".to_owned(),
+                    external_service_id: String::new(),
+                },
+                viewer: UserData {
+                    id: 9001,
+                    username: "viewer".to_owned(),
+                    display_name: "Viewer".to_owned(),
+                    avatar_url: String::new(),
+                    created_at: OffsetDateTime::UNIX_EPOCH,
+                    updated_at: OffsetDateTime::UNIX_EPOCH,
+                    site_admin: false,
+                    tos_accepted: false,
+                    primary_email: String::new(),
+                },
+            }));
+        }
         let roots = FrontendRootResolver::with_prefetched_organizations(
             None,
             repositories.clone(),
