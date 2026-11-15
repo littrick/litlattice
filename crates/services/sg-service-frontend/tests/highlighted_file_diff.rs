@@ -186,6 +186,8 @@ impl HighlightSource for FakeHighlighter {
                     lines: Vec::new(),
                     aborted: self.mock.aborted,
                     html: Some(html),
+                    code: Some(code),
+                    lsif: None,
                 })
             }
         }

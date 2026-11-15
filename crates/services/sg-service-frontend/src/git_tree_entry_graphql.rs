@@ -41,8 +41,9 @@ use sg_graphql::exec::{
 use sg_graphql::json::Json;
 
 use crate::git_comparison_graphql::{
-    compute_highlight, parse_highlight_args, split_highlighted_rows, HighlightArgsKey,
-    HighlightError, HighlightKey, HighlightRequest, HighlightedFile,
+    compute_highlight, document_to_html, lines_for_ranges, lsif_document_json,
+    parse_highlight_args, split_highlighted_rows, HighlightArgsKey, HighlightError, HighlightKey,
+    HighlightRequest, HighlightedFile,
 };
 use crate::git_commit_extra::AncestorsKey;
 use crate::git_graphql::{
@@ -2015,32 +2016,54 @@ fn parse_line_ranges(arguments: &Arguments) -> Vec<(i32, i32)> {
 }
 
 impl HighlightedFileObject {
-    /// `highlight.SplitLineRanges`: clamp each range
-    /// (`start<0→0`, `end>lines→lines`, `start>end→(0,0)`, in that order)
-    /// then return the rendered `<tr>` rows.
+    /// `HighlightedFileResolver.LineRanges` (`graphqlbackend/highlight.go:76`):
+    /// if `response.LSIF() != nil` use `LinesForRanges` (SCIP), otherwise
+    /// `SplitLineRanges(response.HTML())`. `SplitLineRanges` clamps each range
+    /// (`start<0→0`, `end>lines→lines`, `start>end→(0,0)`, in that order) then
+    /// returns the rendered `<tr>` rows.
     fn line_ranges_field(&self, arguments: &Arguments) -> Result<Option<FieldValue>, ExecError> {
         let ranges = parse_line_ranges(arguments);
-        let rows = split_highlighted_rows(self.file.html.as_deref().unwrap_or(""));
-        let mut line_ranges: Vec<FieldValue> = Vec::with_capacity(ranges.len());
-        for (start_line, end_line) in ranges {
-            let mut start = start_line.max(0);
-            let mut end = end_line;
-            if end > rows.len() as i32 {
-                end = rows.len() as i32;
+        let line_ranges: Vec<FieldValue> = match &self.file.lsif {
+            Some(document) => {
+                let code = self.file.code.as_deref().unwrap_or("");
+                lines_for_ranges(code, document, &ranges)
+                    .map_err(ExecError::new)?
+                    .into_iter()
+                    .map(|rows| FieldValue::List {
+                        items: rows
+                            .into_iter()
+                            .map(|row| FieldValue::Json(Json::Str(row)))
+                            .collect(),
+                        element_type: Some("String"),
+                    })
+                    .collect()
             }
-            if start > end {
-                start = 0;
-                end = 0;
+            None => {
+                let rows = split_highlighted_rows(self.file.html.as_deref().unwrap_or(""));
+                ranges
+                    .iter()
+                    .map(|&(start_line, end_line)| {
+                        let mut start = start_line.max(0);
+                        let mut end = end_line;
+                        if end > rows.len() as i32 {
+                            end = rows.len() as i32;
+                        }
+                        if start > end {
+                            start = 0;
+                            end = 0;
+                        }
+                        let items = rows[start as usize..end as usize]
+                            .iter()
+                            .map(|row| FieldValue::Json(Json::Str(row.clone())))
+                            .collect();
+                        FieldValue::List {
+                            items,
+                            element_type: Some("String"),
+                        }
+                    })
+                    .collect()
             }
-            let items = rows[start as usize..end as usize]
-                .iter()
-                .map(|row| FieldValue::Json(Json::Str(row.clone())))
-                .collect();
-            line_ranges.push(FieldValue::List {
-                items,
-                element_type: Some("String"),
-            });
-        }
+        };
         Ok(Some(FieldValue::List {
             items: line_ranges,
             element_type: None,
@@ -2060,13 +2083,30 @@ impl ObjectValue for HighlightedFileObject {
         _actor: Actor,
     ) -> Result<Option<FieldValue>, ExecError> {
         match field {
-            "html" => Ok(Some(FieldValue::Json(Json::Str(
-                self.file.html.clone().unwrap_or_default(),
-            )))),
+            // `HighlightedCode.HTML()`: a non-nil SCIP document renders the
+            // table from the code; otherwise the stored syntect/plain HTML.
+            "html" => {
+                let html = match &self.file.lsif {
+                    Some(document) => {
+                        document_to_html(self.file.code.as_deref().unwrap_or(""), document)
+                    }
+                    None => self.file.html.clone().unwrap_or_default(),
+                };
+                Ok(Some(FieldValue::Json(Json::Str(html))))
+            }
             "aborted" => Ok(Some(FieldValue::Json(Json::Bool(self.file.aborted)))),
             // `response == nil` → "{}"; a nil `scip.Document` also fails
-            // `jsonpb.Marshal` and yields "{}". Rust has no SCIP documents.
-            "lsif" => Ok(Some(FieldValue::Json(Json::Str("{}".to_owned())))),
+            // `jsonpb.Marshal` and yields "{}". An empty document marshals to
+            // "{}" as well.
+            "lsif" => {
+                let text = self
+                    .file
+                    .lsif
+                    .as_ref()
+                    .map(lsif_document_json)
+                    .unwrap_or_else(|| "{}".to_owned());
+                Ok(Some(FieldValue::Json(Json::Str(text))))
+            }
             "lineRanges" => self.line_ranges_field(arguments),
             _ => Ok(None),
         }
