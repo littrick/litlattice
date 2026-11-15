@@ -17,7 +17,10 @@ pub fn migration_schemas(allow_code_insights: bool) -> Vec<String> {
 }
 
 pub trait Migrator {
-    fn up(&mut self, schema: &str) -> Result<(), String>;
+    /// Run `migrator up -db <schema>`. `env` is the final environment after
+    /// `SetDefaultEnv`, mirroring the baseline where the migrator inherits the
+    /// mutated process environment.
+    fn up(&mut self, schema: &str, env: &[(String, String)]) -> Result<(), String>;
 }
 
 /// Runs the Go `migrator` binary found in `PATH` (or `MIGRATOR_PATH`).
@@ -46,11 +49,12 @@ impl Default for CommandMigrator {
 }
 
 impl Migrator for CommandMigrator {
-    fn up(&mut self, schema: &str) -> Result<(), String> {
+    fn up(&mut self, schema: &str, env: &[(String, String)]) -> Result<(), String> {
         let status = std::process::Command::new(&self.program)
             .arg("up")
             .arg("-db")
             .arg(schema)
+            .envs(env.iter().map(|(key, value)| (key, value)))
             .status()
             .map_err(|error| format!("failed to run {}: {error}", self.program))?;
         if status.success() {
