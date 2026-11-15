@@ -37,7 +37,9 @@ pub mod env;
 pub mod framework;
 pub mod health;
 pub mod jobs;
-pub mod paths;
+// M9.44c: the glob compiler moved to `sg-service-frontend` so the frontend
+// runtime can share it; keep `crate::paths` working for `jobs::repo_embedding_job`.
+pub use sg_service_frontend::autoindexing_runtime::paths;
 pub mod registry;
 pub mod telemetry;
 

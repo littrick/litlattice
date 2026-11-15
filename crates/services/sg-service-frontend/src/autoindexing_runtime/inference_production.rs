@@ -45,12 +45,12 @@ use tokio::sync::Mutex;
 use tokio::time::{sleep_until, Instant};
 use tokio_stream::StreamExt;
 
-use super::codeintel_autoindexing_enqueuer::{ResolveRevisionError, RevisionResolver};
-use super::codeintel_autoindexing_inference::{
+use super::enqueuer::{ResolveRevisionError, RevisionResolver};
+use super::inference::{
     ArchiveOptions, DirEntry, GitService, InferenceService, InferenceSettings, RateLimiter,
     DEFAULT_MAXIMUM_FILES_WITH_CONTENT_COUNT, DEFAULT_MAXIMUM_FILE_WITH_CONTENT_SIZE_BYTES,
 };
-use super::codeintel_autoindexing_jobselector::{
+use super::jobselector::{
     FileReadError, InferenceResult, InferenceService as JobSelectorInferenceService,
     SourcegraphYamlReader,
 };

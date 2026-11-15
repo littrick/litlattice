@@ -51,7 +51,17 @@ pub mod authz_gitlab;
 pub mod authz_gitlab_client;
 pub mod authz_perforce;
 pub mod authz_providers;
-pub mod autoindex_config;
+// M9.44c: the autoindexing inference/selection/enqueue modules moved to
+// `sg-service-frontend` (which the worker already depends on) so the frontend
+// production runtime can share them. Re-export under the previous module
+// names; every `super::codeintel_autoindexing_*` / `crate::jobs::*` path keeps
+// resolving.
+pub use sg_service_frontend::autoindexing_runtime::autoindex_config;
+pub use sg_service_frontend::autoindexing_runtime::enqueuer as codeintel_autoindexing_enqueuer;
+pub use sg_service_frontend::autoindexing_runtime::inference as codeintel_autoindexing_inference;
+pub use sg_service_frontend::autoindexing_runtime::inference_production as codeintel_autoindexing_inference_production;
+pub use sg_service_frontend::autoindexing_runtime::jobselector as codeintel_autoindexing_jobselector;
+pub use sg_service_frontend::autoindexing_runtime::path_patterns as codeintel_autoindexing_path_patterns;
 pub mod batches;
 pub mod batches_bulk_processor;
 pub mod batches_reconciler;
@@ -68,12 +78,7 @@ pub mod codehost_version_syncing;
 pub mod codeintel_autoindexing_dependency_indexing_scheduler;
 pub mod codeintel_autoindexing_dependency_scheduler;
 pub mod codeintel_autoindexing_dependency_sync_scheduler;
-pub mod codeintel_autoindexing_enqueuer;
-pub mod codeintel_autoindexing_inference;
-pub mod codeintel_autoindexing_inference_production;
-pub mod codeintel_autoindexing_jobselector;
 pub mod codeintel_autoindexing_package_inference;
-pub mod codeintel_autoindexing_path_patterns;
 pub mod codeintel_autoindexing_scheduler;
 pub mod codeintel_autoindexing_summary_builder;
 pub mod codeintel_commitgraph_updater;

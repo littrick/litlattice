@@ -22,6 +22,7 @@ pub mod audit;
 pub mod auth;
 pub mod auth_providers_graphql;
 pub mod authz;
+pub mod autoindexing_runtime;
 pub mod batches_graphql;
 pub mod batches_graphql_store;
 pub mod batches_apply_preview;
