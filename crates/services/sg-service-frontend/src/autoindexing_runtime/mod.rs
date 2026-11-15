@@ -27,6 +27,7 @@ pub mod enqueuer;
 pub mod inference;
 pub mod inference_production;
 pub mod jobselector;
+pub mod package_inference;
 pub mod path_patterns;
 pub mod paths;
 pub mod runtime;
@@ -46,4 +47,5 @@ pub use inference_production::{
 pub use jobselector::{
     FileReadError, InferenceResult, JobSelector, JobSelectorSettings, SourcegraphYamlReader,
 };
+pub use package_inference::{infer_repository_and_revision, DefaultPackageRepoInference};
 pub use runtime::{ProductionAutoindexingJobsRuntime, RepositoryGit};
