@@ -18,9 +18,11 @@
 //! * When the default branch has no commit the baseline returns `(nil, nil)`
 //!   and its GraphQL resolver dereferences the nil result (panic); this port
 //!   returns an empty outcome, i.e. "nothing to infer" (recorded erratum).
-//! * `QueueAutoIndexJobsForPackage` is not part of the GraphQL runtime; the
-//!   enqueuer is constructed with a package inference that returns `None`, so
-//!   the two exposed mutations are unaffected.
+//! * `QueueAutoIndexJobsForPackage` is not exposed by GraphQL (the Go worker's
+//!   dependency index scheduler calls it); this runtime carries the same
+//!   enqueuer with the shared [`DefaultPackageRepoInference`] and exposes
+//!   [`ProductionAutoindexingJobsRuntime::queue_auto_index_jobs_for_package`]
+//!   so the frontend process and the worker use one implementation.
 //! * Newly inserted index records always have `execution_logs = NULL`, so the
 //!   returned rows carry an empty execution-log list.
 
@@ -38,7 +40,7 @@ use sg_luasandbox::Service as LuaSandboxService;
 
 use crate::autoindexing_runtime::autoindex_config::{AutoIndexJobSpec, DockerStep as ConfigDockerStep};
 use crate::autoindexing_runtime::enqueuer::{
-    IndexEnqueuer, PackageRepoInference, QueueAutoIndexJobsError, VersionedPackageRepo,
+    IndexEnqueuer, QueueAutoIndexJobsError, VersionedPackageRepo,
 };
 use crate::autoindexing_runtime::inference_production::{
     inference_environment, GitserverGitService, GitserverRevisionResolver, GitserverYamlReader,
@@ -49,6 +51,7 @@ use crate::autoindexing_runtime::jobselector::{
     InferenceService as JobSelectorInferenceService, JobSelector, JobSelectorSettings,
     SourcegraphYamlReader,
 };
+use crate::autoindexing_runtime::package_inference::DefaultPackageRepoInference;
 use crate::codeintel_autoindexing_graphql::{
     CodeIntelAutoindexingJobsRuntime, InferenceOutcome, InferredJobRow,
 };
@@ -103,19 +106,6 @@ impl RepositoryGit for GitserverRepositoryGit {
             Err(sg_git::Error::RevisionNotFound { .. }) => Err(CommitCheckError::RevisionNotFound),
             Err(error) => Err(CommitCheckError::Other(error.to_string())),
         }
-    }
-}
-
-/// `inference.InferRepositoryAndRevision` is only used by the package enqueue
-/// path, which the GraphQL mutations do not expose.
-struct NoPackageInference;
-
-impl PackageRepoInference for NoPackageInference {
-    fn infer_repository_and_revision(
-        &self,
-        _package: &VersionedPackageRepo,
-    ) -> Option<(String, String)> {
-        None
     }
 }
 
@@ -181,7 +171,7 @@ impl ProductionAutoindexingJobsRuntime {
         let enqueuer = Arc::new(IndexEnqueuer::new(
             pool.clone(),
             Arc::new(GitserverRevisionResolver::new(Arc::clone(&client))),
-            Arc::new(NoPackageInference),
+            Arc::new(DefaultPackageRepoInference),
             make_selector(),
         ));
 
@@ -280,6 +270,20 @@ impl ProductionAutoindexingJobsRuntime {
                 QueueAutoIndexJobsError::RevisionNotFound => "revision not found".to_owned(),
             })?;
         Ok(jobs.into_iter().map(auto_index_job_row).collect())
+    }
+
+    /// `Service.QueueAutoIndexJobsForPackage`. The Go baseline reaches this
+    /// through the worker's dependency index scheduler, not GraphQL; the
+    /// inherent method keeps the same implementation available to the
+    /// frontend process and the differential harness. `Ok(())` covers both
+    /// "no repository mapping" and "revision not found", matching the
+    /// baseline's silent no-ops; every other failure is an error and no job is
+    /// fabricated.
+    pub fn queue_auto_index_jobs_for_package(
+        &self,
+        package: &VersionedPackageRepo,
+    ) -> Result<(), String> {
+        block_on(self.enqueuer.queue_auto_index_jobs_for_package(package))
     }
 }
 
