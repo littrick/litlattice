@@ -27,7 +27,75 @@ use crate::insights_graphql::{
     InsightViewFilters, LineChartMutationInput, PieChartCreateInput, PieChartUpdateInput,
     SaveAsNewViewInput, SeriesMutationInput, SeriesPointData,
 };
+use sg_config::LiveConfig;
+use sg_redis::KeyValue;
 use time::{Date, Duration, Month, OffsetDateTime, PrimitiveDateTime, Time};
+
+/// `licensing.Check(licensing.FeatureCodeInsights)`: the single source of
+/// truth for Limited Access Mode (M9.47c). `is_licensed() == false` makes
+/// [`crate::insights_graphql::InsightsDatabase::limited_access_mode`] true and
+/// drives the create-mutation rejections.
+///
+/// The baseline re-reads `conf.Get().LicenseKey` and
+/// `licensing.IsLicenseValid()` on every check, so production builds wire
+/// [`LiveCodeInsightsLicense`]; tests use [`FixedCodeInsightsLicense`].
+pub trait CodeInsightsLicense: Send + Sync {
+    /// `licensing.Check(licensing.FeatureCodeInsights) == nil`.
+    fn is_licensed(&self) -> bool;
+}
+
+/// A fixed answer for tests/differentials (the Go oracle's
+/// `licensing.MockCheckFeature`).
+#[derive(Debug, Clone, Copy)]
+pub struct FixedCodeInsightsLicense(pub bool);
+
+impl CodeInsightsLicense for FixedCodeInsightsLicense {
+    fn is_licensed(&self) -> bool {
+        self.0
+    }
+}
+
+/// Production adapter: `licensing.Check(FeatureCodeInsights)` over the live
+/// site configuration's `licenseKey` plus the Redis validity flag
+/// (`licensing:is_license_valid`, absent/unreadable means valid). Mirrors
+/// `cmd/worker/internal/insights`'s license monitor assembly.
+pub struct LiveCodeInsightsLicense {
+    live: Arc<LiveConfig>,
+    /// `redispool.Store`; `None` is a frontend without Redis, where the
+    /// baseline's nil value also means valid.
+    kv: Option<Arc<KeyValue>>,
+}
+
+impl LiveCodeInsightsLicense {
+    pub fn new(live: Arc<LiveConfig>, kv: Option<Arc<KeyValue>>) -> Self {
+        Self { live, kv }
+    }
+}
+
+/// `licensing.IsLicenseValid` (`redispool.Store` `licensing:is_license_valid`):
+/// nil/read error/unknown value all mean valid.
+fn license_valid_flag(kv: &KeyValue) -> bool {
+    match block_on(kv.get_string(sg_licensing::LICENSE_VALIDITY_STORE_KEY)) {
+        Ok(None) => true,
+        Ok(Some(raw)) => match raw.as_str() {
+            "1" => true,
+            "0" => false,
+            _ => true,
+        },
+        Err(_) => true,
+    }
+}
+
+impl CodeInsightsLicense for LiveCodeInsightsLicense {
+    fn is_licensed(&self) -> bool {
+        let license_key = self.live.current().site.license_key();
+        let valid = match &self.kv {
+            Some(kv) => license_valid_flag(kv),
+            None => true,
+        };
+        sg_licensing::check_code_insights(&license_key, valid).is_ok()
+    }
+}
 
 #[derive(Clone)]
 pub struct PgInsightsStore {
@@ -36,12 +104,11 @@ pub struct PgInsightsStore {
     /// The frontend database, used only for `getUserPermissions`' org lookup.
     /// `None` reproduces an anonymous/internal actor (no user/org grants).
     frontend_pool: Option<PgPool>,
-    /// `licensing.Check(FeatureCodeInsights) != nil` (Limited Access Mode).
-    /// Gates the delete/add/remove mutations. Defaults to licensed.
-    limited_access_mode: bool,
-    /// `licensing.Check(FeatureCodeInsights) == nil`; `false` drives the
-    /// Limited Access Mode branches of the create mutations.
-    code_insights_licensed: bool,
+    /// `licensing.Check(FeatureCodeInsights)` (M9.47c). The default is
+    /// *unlicensed*: an instance without a configured license key runs the
+    /// free plan, which does not include Code Insights, so the baseline is in
+    /// Limited Access Mode. Production wires [`LiveCodeInsightsLicense`].
+    license: Arc<dyn CodeInsightsLicense>,
     /// M9.33a: the live-preview search/repository/gitserver seam assembled by
     /// the frontend combination root. `None` keeps the explicit
     /// `search execution is not connected` errors.
@@ -61,10 +128,28 @@ impl PgInsightsStore {
         Self {
             pool,
             frontend_pool: None,
-            limited_access_mode: false,
-            code_insights_licensed: true,
+            license: Arc::new(FixedCodeInsightsLicense(false)),
             preview_seam: None,
         }
+    }
+
+    /// Replace the license seam (`licensing.Check(FeatureCodeInsights)`).
+    pub fn with_license_provider(
+        mut self,
+        license: Arc<dyn CodeInsightsLicense>,
+    ) -> Self {
+        self.license = license;
+        self
+    }
+
+    /// Wire the production check: live site configuration `licenseKey` plus
+    /// the Redis validity flag.
+    pub fn with_live_license(
+        self,
+        live: Arc<LiveConfig>,
+        kv: Option<Arc<KeyValue>>,
+    ) -> Self {
+        self.with_license_provider(Arc::new(LiveCodeInsightsLicense::new(live, kv)))
     }
 
     /// Wire the production search combination root's live-preview seam
@@ -83,15 +168,19 @@ impl PgInsightsStore {
         self
     }
 
-    /// Reproduce `licensing.Check(FeatureCodeInsights) != nil`.
-    pub fn with_limited_access_mode(mut self, limited_access_mode: bool) -> Self {
-        self.limited_access_mode = limited_access_mode;
-        self
+    /// Test seam: reproduce `licensing.Check(FeatureCodeInsights) != nil`.
+    pub fn with_limited_access_mode(self, limited_access_mode: bool) -> Self {
+        self.with_license_provider(Arc::new(FixedCodeInsightsLicense(!limited_access_mode)))
     }
 
-    pub fn with_code_insights_licensed(mut self, licensed: bool) -> Self {
-        self.code_insights_licensed = licensed;
-        self
+    /// Test seam: reproduce `licensing.Check(FeatureCodeInsights) == nil`.
+    pub fn with_code_insights_licensed(self, licensed: bool) -> Self {
+        self.with_license_provider(Arc::new(FixedCodeInsightsLicense(licensed)))
+    }
+
+    /// `licensing.Check(FeatureCodeInsights)` evaluated now.
+    fn is_code_insights_licensed(&self) -> bool {
+        self.license.is_licensed()
     }
 }
 
@@ -671,7 +760,7 @@ LIMIT $6::int
     // -- M9.30a dashboard writes. -----------------------------------------
 
     fn limited_access_mode(&self) -> bool {
-        self.limited_access_mode
+        !self.is_code_insights_licensed()
     }
 
     fn create_dashboard(
@@ -825,6 +914,13 @@ LIMIT $6::int
                 .await
                 .map_err(stringify)?;
             }
+            // The baseline re-reads `GetDashboards(IDs, UserIDs, OrgIDs)` inside
+            // the same transaction; when the (soft-deleted) dashboard is not
+            // visible the resolver returns "dashboard not found" and `Done`
+            // rolls the insert back.
+            if !dashboard_visible_tx(&mut tx, dashboard_id, user_ids, org_ids).await? {
+                return Err("dashboard not found".to_owned());
+            }
             tx.commit().await.map_err(stringify)?;
             Ok::<(), String>(())
         })?;
@@ -865,6 +961,11 @@ LIMIT $6::int
             .execute(&mut *tx)
             .await
             .map_err(stringify)?;
+            // Same transaction boundary as `AddInsightViewToDashboard`: the
+            // post-removal `GetDashboards` failure rolls the delete back.
+            if !dashboard_visible_tx(&mut tx, dashboard_id, user_ids, org_ids).await? {
+                return Err("dashboard not found".to_owned());
+            }
             tx.commit().await.map_err(stringify)?;
             Ok::<(), String>(())
         })?;
@@ -954,6 +1055,32 @@ async fn ensure_limited_access_mode(tx: &mut sqlx::PgConnection) -> Result<i32, 
 }
 
 /// `HasDashboardPermission` inside the Add/Remove transaction.
+/// `GetDashboards(IDs: [id], UserIDs, OrgIDs)` visibility inside the caller's
+/// transaction: the dashboard exists, is not soft-deleted and has a matching
+/// user/org/global grant.
+async fn dashboard_visible_tx(
+    tx: &mut sqlx::PgConnection,
+    dashboard_id: i32,
+    user_ids: &[i32],
+    org_ids: &[i32],
+) -> Result<bool, String> {
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM dashboard
+         WHERE id = $1
+           AND deleted_at IS NULL
+           AND id IN (
+               SELECT dashboard_id FROM dashboard_grants
+               WHERE org_id = ANY($2) OR user_id = ANY($3) OR global IS TRUE)",
+    )
+    .bind(dashboard_id)
+    .bind(org_ids)
+    .bind(user_ids)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(|err| err.to_string())?;
+    Ok(count == 1)
+}
+
 async fn has_dashboard_permission_tx(
     tx: &mut sqlx::PgConnection,
     dashboard_id: i32,
@@ -1698,7 +1825,7 @@ async fn apply_dashboards(
 
 impl InsightsWriteDatabase for PgInsightsStore {
     fn code_insights_licensed(&self) -> bool {
-        self.code_insights_licensed
+        self.is_code_insights_licensed()
     }
 
     fn actor_is_site_admin(&self, actor: Actor) -> Result<bool, String> {
@@ -1742,7 +1869,7 @@ impl InsightsWriteDatabase for PgInsightsStore {
         input: &LineChartMutationInput,
     ) -> Result<String, String> {
         let pool = self.pool.clone();
-        let licensed = self.code_insights_licensed;
+        let licensed = self.is_code_insights_licensed();
         let uid = actor.uid().unwrap_or(0);
         let (user_ids, org_ids) = self.user_permission_ids(actor)?;
         block_on(async move {
@@ -1835,7 +1962,7 @@ impl InsightsWriteDatabase for PgInsightsStore {
         input: &PieChartCreateInput,
     ) -> Result<String, String> {
         let pool = self.pool.clone();
-        let licensed = self.code_insights_licensed;
+        let licensed = self.is_code_insights_licensed();
         let uid = actor.uid().unwrap_or(0);
         let (user_ids, org_ids) = self.user_permission_ids(actor)?;
         block_on(async move {
@@ -1999,7 +2126,7 @@ WHERE series_id = $3
         input: &SaveAsNewViewInput,
     ) -> Result<String, String> {
         let pool = self.pool.clone();
-        let licensed = self.code_insights_licensed;
+        let licensed = self.is_code_insights_licensed();
         let uid = actor.uid().unwrap_or(0);
         let unique_id = input.unique_id.clone();
         let input = input.clone();
@@ -2237,5 +2364,50 @@ impl DashboardRow {
             granted_orgs: row.try_get("granted_orgs")?,
             granted_global: row.try_get("granted_global")?,
         })
+    }
+}
+
+#[cfg(test)]
+mod license_seam_tests {
+    use super::*;
+    use sqlx::postgres::PgPoolOptions;
+
+    fn pool() -> PgPool {
+        PgPoolOptions::new()
+            .max_connections(1)
+            .connect_lazy("postgres://sourcegraph@127.0.0.1:1/sourcegraph")
+            .expect("lazy pool")
+    }
+
+    #[test]
+    fn default_is_unlicensed_like_the_free_plan() {
+        // `licensing.Check(FeatureCodeInsights)` against an empty license key
+        // resolves the free-1 plan, which does not include Code Insights.
+        assert!(!PgInsightsStore::new(pool()).code_insights_licensed());
+        assert!(PgInsightsStore::new(pool()).limited_access_mode());
+    }
+
+    #[test]
+    fn explicit_seams_drive_both_views() {
+        let licensed = PgInsightsStore::new(pool()).with_code_insights_licensed(true);
+        assert!(licensed.code_insights_licensed());
+        assert!(!licensed.limited_access_mode());
+
+        let limited = PgInsightsStore::new(pool()).with_limited_access_mode(true);
+        assert!(!limited.code_insights_licensed());
+        assert!(limited.limited_access_mode());
+
+        let fixed = PgInsightsStore::new(pool())
+            .with_license_provider(Arc::new(FixedCodeInsightsLicense(true)));
+        assert!(fixed.code_insights_licensed());
+    }
+
+    #[test]
+    fn check_code_insights_produces_the_expected_answers() {
+        // The seam delegates to the licensing port; empty/unparseable keys are
+        // Limited Access Mode, an invalidated license is an error too.
+        assert!(sg_licensing::check_code_insights("", true).is_err());
+        assert!(sg_licensing::check_code_insights("not a key", true).is_err());
+        assert!(sg_licensing::check_code_insights("", false).is_err());
     }
 }

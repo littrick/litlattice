@@ -92,6 +92,10 @@ struct Case {
     actor_uid: i32,
     #[serde(default, rename = "limitedAccess")]
     limited_access: bool,
+    /// M9.47c: extra SQL appended after the base fixtures to set up
+    /// licensing-specific preconditions (e.g. a single global unfrozen view).
+    #[serde(default)]
+    extra: String,
     #[serde(default, rename = "viewUniqueId")]
     view_unique_id: Option<String>,
     #[serde(default, rename = "viewIdOverride")]
@@ -739,6 +743,12 @@ async fn insights_view_mutations_harness() {
             .execute(&pool)
             .await
             .expect("seed codeinsights");
+        if !case.extra.is_empty() {
+            sqlx::raw_sql(&case.extra)
+                .execute(&pool)
+                .await
+                .expect("seed codeinsights extra");
+        }
         sqlx::raw_sql(&frontend_fixtures)
             .execute(&frontend_pool)
             .await
@@ -747,7 +757,11 @@ async fn insights_view_mutations_harness() {
         let handle: InsightsHandle = Arc::new(
             PgInsightsStore::new(pool.clone())
                 .with_frontend_pool(frontend_pool.clone())
-                .with_code_insights_licensed(!case.limited_access),
+                .with_license_provider(Arc::new(
+                    sg_service_frontend::insights_store::FixedCodeInsightsLicense(
+                        !case.limited_access,
+                    ),
+                )),
         );
         let actor = if case.actor_uid == 0 {
             Actor::Internal
