@@ -2379,16 +2379,16 @@ mod license_seam_tests {
             .expect("lazy pool")
     }
 
-    #[test]
-    fn default_is_unlicensed_like_the_free_plan() {
+    #[tokio::test]
+    async fn default_is_unlicensed_like_the_free_plan() {
         // `licensing.Check(FeatureCodeInsights)` against an empty license key
         // resolves the free-1 plan, which does not include Code Insights.
         assert!(!PgInsightsStore::new(pool()).code_insights_licensed());
         assert!(PgInsightsStore::new(pool()).limited_access_mode());
     }
 
-    #[test]
-    fn explicit_seams_drive_both_views() {
+    #[tokio::test]
+    async fn explicit_seams_drive_both_views() {
         let licensed = PgInsightsStore::new(pool()).with_code_insights_licensed(true);
         assert!(licensed.code_insights_licensed());
         assert!(!licensed.limited_access_mode());
