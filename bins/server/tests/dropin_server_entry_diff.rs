@@ -60,6 +60,13 @@ fn base_env(command: &mut Command, home: &PathBuf) {
     command.env_remove("PGHOST");
 }
 
+fn write_stub(dir: &std::path::Path, name: &str) {
+    let path = dir.join(name);
+    std::fs::write(&path, "#!/bin/sh\nexit 0\n").expect("stub");
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod stub");
+}
+
 fn run_case(scenario: &str) -> i32 {
     let root = temp_dir("m918c_server");
     let home = root.join("home");
@@ -80,8 +87,32 @@ fn run_case(scenario: &str) -> i32 {
         "local-postgres-without-migration-flag" => {
             // Local Postgres without the marker -> reindex required; without
             // `SOURCEGRAPH_5_1_DB_MIGRATION=true` -> os.Exit(101).
+            //
+            // Go `shared.Main` provisions the local database
+            // (`maybePostgresProcFile`, `shared.go:200-241`) before `run`
+            // evaluates the 5.1 gate, and only an *upgraded* install (existing
+            // data directory) reaches the gate without a marker. Model that:
+            // pre-create the data/marker layout so provisioning takes the
+            // existing-database path (no fresh init, hence no 5.1 marker), and
+            // stub the root-only local tools so provisioning succeeds here.
+            let data = root.join("data");
+            std::fs::create_dir_all(data.join("postgresql")).expect("postgres data dir");
+            let markers = data.join("postgresql-markers");
+            std::fs::create_dir_all(&markers).expect("markers dir");
+            for database in ["sourcegraph", "sourcegraph-codeintel", "sourcegraph-codeinsights"] {
+                std::fs::write(markers.join(database), b"").expect("marker");
+            }
+            let stubs = root.join("stubs");
+            std::fs::create_dir_all(&stubs).expect("stubs");
+            for tool in ["mkdir", "chown", "su-exec"] {
+                write_stub(&stubs, tool);
+            }
+            command.env(
+                "PATH",
+                format!("{}:/usr/local/bin:/usr/bin:/bin", stubs.display()),
+            );
             command.env("CONFIG_DIR", root.join("config"));
-            command.env("DATA_DIR", root.join("data"));
+            command.env("DATA_DIR", data);
             command.env("PGHOST", "");
         }
         other => panic!("unknown scenario {other}"),
