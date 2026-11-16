@@ -589,6 +589,14 @@ pub struct RepoListOptions {
     /// `0` means "no search-context join".
     pub search_context_id: i64,
     pub order_by: Vec<RepoListSort>,
+    /// `AuthzQueryConds`: the authenticated user ID (`0` = anonymous).
+    /// Defaults keep the historical anonymous predicate.
+    pub authz_actor_uid: i32,
+    /// `AuthzQueryConds`: internal actors always bypass the predicate.
+    pub authz_internal: bool,
+    /// `AuthzQueryConds`: site admins bypass unless
+    /// `authz.enforceForSiteAdmins` is enabled.
+    pub authz_enforce_for_site_admins: bool,
 }
 
 /// `types.MinimalRepo` fields the resolver reads.
@@ -610,23 +618,54 @@ pub struct RepoChangelistIDs {
     pub changelist_ids: Vec<i64>,
 }
 
-/// `AuthzQueryConds` for the fixed anonymous actor (`BypassAuthz=false`,
-/// `AuthenticatedUserID=0`), identical to [`super::repos`]'s
-/// `search_runtime::PgPrivateRepoLister` condition.
-const AUTHZ_CONDITION: &str = r#"(
-    EXISTS (SELECT 1 FROM user_repo_permissions WHERE repo_id = repo.id AND user_id IS NULL)
-    OR NOT repo.private
-    OR EXISTS (
-        SELECT 1 FROM external_services es
-        JOIN external_service_repos esr ON (
-            esr.external_service_id = es.id AND esr.repo_id = repo.id
-            AND es.unrestricted = TRUE AND es.deleted_at IS NULL
-        )
-    )
-    OR EXISTS (
-        SELECT 1 FROM user_repo_permissions WHERE repo_id = repo.id AND user_id = 0
-    )
-)"#;
+/// `authzQuery` (`internal/database/repos_perm.go:104-121`) with the
+/// `GetAuthzQueryParameters` actor resolution (`:32-70`):
+///
+/// * internal actors bypass entirely (`TRUE`);
+/// * otherwise an authenticated site admin bypasses unless
+///   `authz.enforceForSiteAdmins` is enabled (the baseline loads the `users`
+///   row via `actor.User`);
+/// * all actors fall back to unrestricted markers, non-private repositories,
+///   unrestricted external services, and explicit `user_repo_permissions`
+///   rows for their own user ID.
+///
+/// `uid` is an `i32` and the flags are booleans, so interpolating them keeps
+/// the bound-string argument list of [`list_minimal_repos`] unchanged and
+/// cannot inject SQL.
+fn authz_condition(options: &RepoListOptions) -> String {
+    if options.authz_internal {
+        return "(TRUE)".to_owned();
+    }
+    let uid = options.authz_actor_uid;
+    let mut parts: Vec<String> = Vec::new();
+    if !options.authz_enforce_for_site_admins {
+        // `GetAuthzQueryParameters` loads the current user and checks
+        // `SiteAdmin`; `GetByID` excludes soft-deleted rows. Anonymous
+        // actors (uid 0) never match a real user.
+        parts.push(format!(
+            "EXISTS (SELECT 1 FROM users su WHERE su.id = {uid} AND su.site_admin AND su.deleted_at IS NULL)"
+        ));
+    }
+    parts.push(
+        "EXISTS (SELECT 1 FROM user_repo_permissions WHERE repo_id = repo.id AND user_id IS NULL)"
+            .to_owned(),
+    );
+    parts.push("NOT repo.private".to_owned());
+    parts.push(
+        "EXISTS (
+            SELECT 1 FROM external_services es
+            JOIN external_service_repos esr ON (
+                esr.external_service_id = es.id AND esr.repo_id = repo.id
+                AND es.unrestricted = TRUE AND es.deleted_at IS NULL
+            )
+        )"
+        .to_owned(),
+    );
+    parts.push(format!(
+        "EXISTS (SELECT 1 FROM user_repo_permissions WHERE repo_id = repo.id AND user_id = {uid})"
+    ));
+    format!("({})", parts.join(" OR "))
+}
 
 /// `(*repoStore).ListMinimalRepos` for the repository resolver.
 ///
@@ -804,7 +843,7 @@ pub async fn list_minimal_repos(
     }
 
     sql.push_str(" AND ");
-    sql.push_str(AUTHZ_CONDITION);
+    sql.push_str(&authz_condition(options));
 
     if options.order_by.is_empty() {
         sql.push_str(" ORDER BY repo.id");

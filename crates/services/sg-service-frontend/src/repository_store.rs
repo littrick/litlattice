@@ -111,11 +111,28 @@ impl RepoRevResolver for GitserverRepoRevResolver {
 
 pub struct PgRepositoryStore {
     pool: PgPool,
+    /// `conf.Get()`: the site configuration read for
+    /// `authz.enforceForSiteAdmins` (`internal/database/repos_perm.go:34`).
+    /// `None` keeps Go's default (`false`).
+    live: Option<Arc<sg_config::LiveConfig>>,
 }
 
 impl PgRepositoryStore {
     pub fn new(pool: PgPool) -> Self {
-        Self { pool }
+        Self { pool, live: None }
+    }
+
+    /// Read `authz.enforceForSiteAdmins` from the live site configuration.
+    pub fn with_live(mut self, live: Arc<sg_config::LiveConfig>) -> Self {
+        self.live = Some(live);
+        self
+    }
+
+    fn enforce_for_site_admins(&self) -> bool {
+        self.live
+            .as_ref()
+            .map(|live| live.current().site.authz_enforce_for_site_admins())
+            .unwrap_or(false)
     }
 }
 
@@ -220,5 +237,29 @@ impl RepositoryLookup for PgRepositoryStore {
             });
         }
         Ok(RepoLookup::Found(to_repo_data(record)))
+    }
+
+    fn authz_enforce_for_site_admins(&self) -> bool {
+        self.enforce_for_site_admins()
+    }
+
+    /// `GetAuthzQueryParameters` (`internal/database/repos_perm.go:32-70`):
+    /// internal actors bypass; authenticated site admins bypass unless
+    /// `authz.enforceForSiteAdmins` is enabled.
+    async fn authz_bypass(
+        &self,
+        actor_is_internal: bool,
+        authenticated_user_id: i32,
+    ) -> bool {
+        if actor_is_internal {
+            return true;
+        }
+        if authenticated_user_id == 0 || self.enforce_for_site_admins() {
+            return false;
+        }
+        matches!(
+            sg_db::users::get_site_admin(&self.pool, authenticated_user_id).await,
+            Ok(Some(true))
+        )
     }
 }

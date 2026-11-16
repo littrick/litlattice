@@ -2206,6 +2206,22 @@ pub trait RepositoryLookup: Send + Sync {
         authenticated_user_id: i32,
         bypass_authz: bool,
     ) -> Result<RepoLookup, String>;
+
+    /// `GetAuthzQueryParameters`'s `conf.Get().AuthzEnforceForSiteAdmins`
+    /// (`internal/database/repos_perm.go:34`). The default `false` is the Go
+    /// default; the production store reads the live site configuration.
+    fn authz_enforce_for_site_admins(&self) -> bool {
+        false
+    }
+
+    /// Whether the actor bypasses the repository authz predicate:
+    /// `GetAuthzQueryParameters` (`internal/database/repos_perm.go:32-70`)
+    /// bypasses for internal actors, and for authenticated site admins unless
+    /// `authz.enforceForSiteAdmins` is enabled. The production store loads
+    /// `users.site_admin`; fakes keep the conservative anonymous behavior.
+    async fn authz_bypass(&self, actor_is_internal: bool, _authenticated_user_id: i32) -> bool {
+        actor_is_internal
+    }
 }
 
 /// `cloneurls.RepoSourceCloneURLToRepoName`'s seam: map a git clone URL to a
@@ -2380,8 +2396,12 @@ pub async fn prefetch_repositories(
 ) -> HashMap<RepoKey, RepoLookup> {
     let authenticated_user_id = actor.uid().unwrap_or(0);
     // `GetAuthzQueryParameters` bypasses authz for internal actors
-    // (`internal/database/repos_perm.go:42-45`) and for site admins.
-    let bypass_authz = actor.is_internal() || (actor.is_authenticated() && actor_site_admin);
+    // (`internal/database/repos_perm.go:42-45`) and for site admins unless
+    // `authz.enforceForSiteAdmins` is enabled.
+    let bypass_authz = actor.is_internal()
+        || (actor.is_authenticated()
+            && actor_site_admin
+            && !store.authz_enforce_for_site_admins());
     let mut repositories = HashMap::new();
     for field in fields {
         if field.name != "repository" {
@@ -2486,8 +2506,12 @@ pub async fn prefetch_repository_redirects(
     actor_site_admin: bool,
 ) -> HashMap<RepositoryRedirectKey, RepoLookup> {
     let authenticated_user_id = actor.uid().unwrap_or(0);
-    // Internal actors bypass authz (`internal/database/repos_perm.go:42-45`).
-    let bypass_authz = actor.is_internal() || (actor.is_authenticated() && actor_site_admin);
+    // Internal actors bypass authz (`internal/database/repos_perm.go:42-45`);
+    // site admins bypass unless `authz.enforceForSiteAdmins` is enabled.
+    let bypass_authz = actor.is_internal()
+        || (actor.is_authenticated()
+            && actor_site_admin
+            && !store.authz_enforce_for_site_admins());
     let mut redirects = HashMap::new();
     for field in fields {
         if field.name != "repositoryRedirect" {

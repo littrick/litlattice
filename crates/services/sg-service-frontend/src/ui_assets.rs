@@ -609,12 +609,20 @@ async fn serve_repo_page<B>(
         return shell_response(&input, StatusCode::OK);
     }
 
-    // `handlerutil.GetRepo` → `repoStore.GetByName` with the authz predicate.
-    // The actor's UID is filled per request by the middleware; 0 is anonymous.
-    let actor_uid = deps.more.actor.uid().unwrap_or(0);
+    // `handlerutil.GetRepo` → `repoStore.GetByName` with the authz
+    // predicate. The actor's UID is filled per request by the middleware; 0
+    // is anonymous. `GetAuthzQueryParameters` bypasses for internal actors
+    // and for site admins unless `authz.enforceForSiteAdmins` is enabled
+    // (the store resolves `users.site_admin` and reads the live config).
+    let actor = deps.more.actor;
+    let actor_uid = actor.uid().unwrap_or(0);
+    let bypass_authz = wiring
+        .repositories
+        .authz_bypass(actor.is_internal(), actor_uid)
+        .await;
     let lookup = match wiring
         .repositories
-        .lookup(repo, actor_uid, false)
+        .lookup(repo, actor_uid, bypass_authz)
         .await
     {
         Ok(lookup) => lookup,

@@ -480,10 +480,13 @@ pub fn external_handler_with_live(
             None => deps,
         };
         // M9.49d: `newCommon`'s repo lookup + gitserver rev resolution.
+        // M9.50c: the store reads `authz.enforceForSiteAdmins` from the same
+        // live configuration (`GetAuthzQueryParameters`).
         let deps = match repo_pages_pool {
             Some(pool) => deps.with_repo_pages(crate::repository_store::RepoPagesWiring {
                 repositories: Arc::new(
-                    crate::repository_store::PgRepositoryStore::new(pool),
+                    crate::repository_store::PgRepositoryStore::new(pool)
+                        .with_live(Arc::clone(&live)),
                 ),
                 resolver: Some(Arc::new(
                     crate::repository_store::GitserverRepoRevResolver::new(Arc::clone(&live)),
