@@ -11,8 +11,10 @@
 //! child that exits on its own shuts the group down unless
 //! `IGNORE_PROCESS_DEATH` is set.
 
+use std::process::Stdio;
 use std::time::Duration;
 
+use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 use tokio::task::JoinSet;
 
 /// Goreman's shutdown grace period (`proc.go`).
@@ -144,6 +146,46 @@ pub fn simulate(
     outcome
 }
 
+/// `HH:MM:SS` with the same shape as `log.go`'s `time.Now().Format("15:04:05")`
+/// (UTC here; the timestamp is informational, only the name prefix is part of
+/// the supervisor contract).
+fn now_hhmmss() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
+        % 86_400;
+    format!(
+        "{:02}:{:02}:{:02}",
+        seconds / 3600,
+        (seconds % 3600) / 60,
+        seconds % 60
+    )
+}
+
+/// `createLogger`/`clogger`: print every child line as
+/// `HH:MM:SS <right-aligned name> | <line>`.
+///
+/// The baseline flushes partial lines after 2ms; here a line is emitted when
+/// its newline arrives. All service loggers write newline-terminated records.
+fn spawn_log_reader<R>(stream: R, name: String, width: usize)
+where
+    R: AsyncRead + Unpin + Send + 'static,
+{
+    tokio::spawn(async move {
+        let mut lines = BufReader::new(stream).lines();
+        loop {
+            match lines.next_line().await {
+                Ok(Some(line)) => {
+                    println!("{} {:>width$} | {}", now_hhmmss(), name, line, width = width);
+                }
+                Ok(None) | Err(_) => return,
+            }
+        }
+    });
+}
+
 fn signal_group(pid: u32, signal: &str) {
     // Negative pid addresses the process group created by `process_group(0)`.
     let _ = std::process::Command::new("kill")
@@ -163,6 +205,9 @@ struct Supervisor {
     env: Vec<(String, String)>,
     tasks: JoinSet<String>,
     pids: Vec<(String, u32)>,
+    /// `goreman`'s `maxProcNameLength`: the widest process name read from the
+    /// Procfiles so far. Log prefixes right-align names to this width.
+    max_name_len: usize,
 }
 
 impl Supervisor {
@@ -172,15 +217,29 @@ impl Supervisor {
             env,
             tasks: JoinSet::new(),
             pids: Vec::new(),
+            max_name_len: 0,
         }
     }
 
     fn start(&mut self, entries: &[ProcfileEntry]) -> bool {
+        // `readProcfile` records the widest name before any process starts, so
+        // every line of this group uses the same width (`log.go`).
+        self.max_name_len = entries
+            .iter()
+            .map(|entry| entry.name.len())
+            .chain(std::iter::once(self.max_name_len))
+            .max()
+            .unwrap_or(0);
+        let name_width = self.max_name_len;
+
         let mut all_spawned = true;
         for entry in entries {
             let mut command = tokio::process::Command::new("/bin/sh");
             command.arg("-c").arg(entry.shell_command());
             command.envs(self.env.iter().map(|(key, value)| (key, value)));
+            // `spawnProc` sets `cmd.Stdout`/`cmd.Stderr` to a logger that
+            // prefixes every line with the process name.
+            command.stdout(Stdio::piped()).stderr(Stdio::piped());
             #[cfg(unix)]
             {
                 command.process_group(0);
@@ -188,6 +247,12 @@ impl Supervisor {
             match command.spawn() {
                 Ok(mut child) => {
                     let pid = child.id().unwrap_or(0);
+                    if let Some(stdout) = child.stdout.take() {
+                        spawn_log_reader(stdout, entry.name.clone(), name_width);
+                    }
+                    if let Some(stderr) = child.stderr.take() {
+                        spawn_log_reader(stderr, entry.name.clone(), name_width);
+                    }
                     self.pids.push((entry.name.clone(), pid));
                     let name = entry.name.clone();
                     self.tasks.spawn(async move {
