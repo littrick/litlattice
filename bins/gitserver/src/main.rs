@@ -6,6 +6,11 @@ use sg_core::Service;
 
 #[tokio::main]
 async fn main() {
+    // Baseline `cmd/gitserver/main.go:11` calls `sanitycheck.Pass()` before
+    // `svcmain.SingleServiceMain`. The image tests run every service with
+    // `SANITY_CHECK=true`, so this must stay first.
+    sg_core::sanity_check();
+
     sg_log::init("gitserver");
 
     // Rust-only rollout knob: listen on a side port while the Go binary keeps
