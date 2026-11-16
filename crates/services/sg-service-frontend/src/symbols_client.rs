@@ -12,7 +12,11 @@
 //!   context errors) and the `executing symbols search request` wrap;
 //! * `response.Err` propagation and `LimitHit`;
 //! * the sub-repo permissions seam (`ActorPermissions` in the baseline),
-//!   injected as [`SubRepoPermsChecker`] and disabled by default.
+//!   injected as [`SubRepoPermsChecker`] and disabled by default;
+//! * `LocalCodeIntel` (`internal/symbols/client.go:124-176`, server-streaming;
+//!   `Unimplemented` becomes `Ok(None)`) and `SymbolInfo` (`:178-229`, single
+//!   RPC with `authz.FilterActorPath` filtering), which back
+//!   `GitBlob.localCodeIntel` / `GitBlob.symbolInfo` (M9.51a).
 //!
 //! Since M9.18b `search_runtime::assemble` always constructs
 //! [`GrpcSymbolsClient`]; with no endpoints the `search` call fails with Go's
@@ -43,6 +47,120 @@ pub const NO_SYMBOLS_ENDPOINTS_MESSAGE: &str = "endpoint.Map(conf-based) is empt
 /// is identical for printable ASCII.
 fn go_quote(value: &str) -> String {
     serde_json::to_string(value).unwrap_or_else(|_| format!("{value:?}"))
+}
+
+// ---------------------------------------------------------------------------
+// `internal/types/codeintel.go` codenav payload types (M9.51a)
+// ---------------------------------------------------------------------------
+
+/// `types.RepoCommitPath` (`internal/types/codeintel.go:132-140`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RepoCommitPath {
+    pub repo: String,
+    pub commit: String,
+    pub path: String,
+}
+
+/// `types.RepoCommitPathPoint` (`internal/types/codeintel.go:156-164`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RepoCommitPathPoint {
+    pub repo: String,
+    pub commit: String,
+    pub path: String,
+    pub row: i32,
+    pub column: i32,
+}
+
+/// `types.Range` (`internal/types/codeintel.go:177-181`): `row`/`column`/
+/// `length`, not a start/end pair.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CodeIntelRange {
+    pub row: i32,
+    pub column: i32,
+    pub length: i32,
+}
+
+/// `types.Symbol` (`internal/types/codeintel.go:166-171`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LocalCodeIntelSymbol {
+    pub name: String,
+    pub hover: String,
+    /// Go `Def Range` is a value field: `omitempty` never omits a struct, so
+    /// `def` is always present in the JSON payload.
+    pub def: CodeIntelRange,
+    pub refs: Vec<CodeIntelRange>,
+}
+
+/// `types.LocalCodeIntelPayload` (`internal/types/codeintel.go:142-144`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LocalCodeIntelPayload {
+    pub symbols: Vec<LocalCodeIntelSymbol>,
+}
+
+/// `types.RepoCommitPathMaybeRange` (`internal/types/codeintel.go:151-154`):
+/// the embedded `*Range` is `None` when the definition point is a directory.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RepoCommitPathMaybeRange {
+    pub repo: String,
+    pub commit: String,
+    pub path: String,
+    pub range: Option<CodeIntelRange>,
+}
+
+/// `types.SymbolInfo` (`internal/types/codeintel.go:187-190`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SymbolInfoResult {
+    pub definition: RepoCommitPathMaybeRange,
+    pub hover: Option<String>,
+}
+
+impl LocalCodeIntelSymbol {
+    /// `json.Marshal` of one `types.Symbol`: field order `name`, `hover`,
+    /// `def`, `refs`; `hover` omitted when empty, `refs` omitted when empty,
+    /// `def` always present.
+    fn to_json(&self) -> sg_graphql::json::Json {
+        use sg_graphql::json::Json;
+        let mut entries = vec![
+            ("name", Json::Str(self.name.clone())),
+        ];
+        if !self.hover.is_empty() {
+            entries.push(("hover", Json::Str(self.hover.clone())));
+        }
+        entries.push(("def", range_json(self.def)));
+        if !self.refs.is_empty() {
+            entries.push((
+                "refs",
+                Json::Arr(self.refs.iter().copied().map(range_json).collect()),
+            ));
+        }
+        Json::obj(entries)
+    }
+}
+
+fn range_json(range: CodeIntelRange) -> sg_graphql::json::Json {
+    use sg_graphql::json::Json;
+    Json::obj(vec![
+        ("row", Json::Int(i64::from(range.row))),
+        ("column", Json::Int(i64::from(range.column))),
+        ("length", Json::Int(i64::from(range.length))),
+    ])
+}
+
+impl LocalCodeIntelPayload {
+    /// `json.Marshal` of `*types.LocalCodeIntelPayload`.
+    ///
+    /// The baseline client builds `out.Symbols` with `append`, so a payload
+    /// with no symbols marshals `symbols` as `null` (not `[]`); an empty
+    /// stream still returns the non-nil `&out`, i.e. `{"symbols":null}`.
+    pub fn to_go_json(&self) -> String {
+        use sg_graphql::json::Json;
+        let symbols = if self.symbols.is_empty() {
+            Json::Null
+        } else {
+            Json::Arr(self.symbols.iter().map(LocalCodeIntelSymbol::to_json).collect())
+        };
+        Json::obj(vec![("symbols", symbols)]).to_compact_string()
+    }
 }
 
 /// Sub-repo permission seam standing in for
@@ -201,6 +319,128 @@ impl GrpcSymbolsClient {
     /// `endpoint.Map.Get(repo)`: the first endpoint in rendezvous order.
     pub fn route(&self, repo: &str) -> Option<String> {
         rendezvous_order(&self.endpoints, repo).into_iter().next()
+    }
+
+    /// `Client.LocalCodeIntel` (`internal/symbols/client.go:124-176`): a
+    /// server-streaming RPC whose chunks are concatenated. `Unimplemented`
+    /// (on the initial call or mid-stream) becomes `Ok(None)`, matching the
+    /// baseline's deliberate error swallow.
+    pub fn local_code_intel(
+        &self,
+        path: &RepoCommitPath,
+    ) -> Result<Option<LocalCodeIntelPayload>, SearcherError> {
+        let connector = Arc::clone(&self.connector);
+        let endpoint = self.route(&path.repo);
+        let path = path.clone();
+        run_to_completion(async move {
+            let Some(endpoint) = endpoint else {
+                return Err(SearcherError::other(format!(
+                    "getting gRPC symbols client: getting symbols server address for repo {}: \
+                     {NO_SYMBOLS_ENDPOINTS_MESSAGE}",
+                    go_quote(&path.repo)
+                )));
+            };
+            let mut client = connect_symbol_client(connector, &endpoint)?;
+            let request = pb::LocalCodeIntelRequest {
+                repo_commit_path: Some(pb::RepoCommitPath {
+                    repo: path.repo,
+                    commit: path.commit,
+                    path: path.path,
+                }),
+            };
+            let mut stream = match client.local_code_intel(request).await {
+                Ok(response) => response.into_inner(),
+                Err(status) if status.code() == tonic::Code::Unimplemented => return Ok(None),
+                Err(status) => return Err(translate_status(&status)),
+            };
+            let mut symbols = Vec::new();
+            loop {
+                match stream.message().await {
+                    Ok(Some(response)) => {
+                        symbols.extend(
+                            response
+                                .symbols
+                                .into_iter()
+                                .map(convert_local_code_intel_symbol),
+                        );
+                    }
+                    Ok(None) => return Ok(Some(LocalCodeIntelPayload { symbols })),
+                    Err(status) if status.code() == tonic::Code::Unimplemented => {
+                        // The baseline discards any partially received chunks.
+                        return Ok(None);
+                    }
+                    Err(status) => return Err(translate_status(&status)),
+                }
+            }
+        })
+    }
+
+    /// `Client.SymbolInfo` (`internal/symbols/client.go:178-229`): one RPC,
+    /// `Unimplemented` -> `Ok(None)`, then `authz.FilterActorPath` filtering
+    /// (which the baseline applies even when the RPC returned no result).
+    pub fn symbol_info(
+        &self,
+        point: &RepoCommitPathPoint,
+    ) -> Result<Option<SymbolInfoResult>, SearcherError> {
+        let result = self
+            .symbol_info_grpc(point)
+            .map_err(|error| {
+                SearcherError::new(
+                    error.kind,
+                    format!("executing symbol info request: {}", error.message),
+                )
+            })?;
+
+        // `authz.FilterActorPath`: disabled checker allows everything.
+        if self.sub_repo_perms.enabled() {
+            match self.sub_repo_perms.include(&point.repo, &point.path) {
+                Ok(true) => {}
+                Ok(false) => return Ok(None),
+                Err(error) => {
+                    return Err(SearcherError::other(format!(
+                        "checking sub-repo permissions: {error}"
+                    )))
+                }
+            }
+        }
+
+        Ok(result)
+    }
+
+    fn symbol_info_grpc(
+        &self,
+        point: &RepoCommitPathPoint,
+    ) -> Result<Option<SymbolInfoResult>, SearcherError> {
+        let connector = Arc::clone(&self.connector);
+        let endpoint = self.route(&point.repo);
+        let point = point.clone();
+        run_to_completion(async move {
+            let Some(endpoint) = endpoint else {
+                return Err(SearcherError::other(format!(
+                    "getting gRPC symbols client: getting symbols server address for repo {}: \
+                     {NO_SYMBOLS_ENDPOINTS_MESSAGE}",
+                    go_quote(&point.repo)
+                )));
+            };
+            let mut client = connect_symbol_client(connector, &endpoint)?;
+            let request = pb::SymbolInfoRequest {
+                repo_commit_path: Some(pb::RepoCommitPath {
+                    repo: point.repo,
+                    commit: point.commit,
+                    path: point.path,
+                }),
+                point: Some(pb::Point {
+                    row: point.row,
+                    column: point.column,
+                }),
+            };
+            let response = match client.symbol_info(request).await {
+                Ok(response) => response.into_inner(),
+                Err(status) if status.code() == tonic::Code::Unimplemented => return Ok(None),
+                Err(status) => return Err(translate_status(&status)),
+            };
+            Ok(convert_symbol_info(response))
+        })
     }
 
     async fn search_endpoint(
@@ -373,6 +613,67 @@ fn duration_to_proto(duration: Duration) -> ProtoDuration {
         seconds: duration.as_secs() as i64,
         nanos: duration.subsec_nanos() as i32,
     }
+}
+
+/// `gRPCClient`'s connection step (`internal/symbols/client.go:231-243`):
+/// `getting gRPC symbols client: getting gRPC connection to symbols server at
+/// "<address>": ...`.
+fn connect_symbol_client(
+    connector: Arc<dyn SymbolsConnector>,
+    endpoint: &str,
+) -> Result<pb::symbols_service_client::SymbolsServiceClient<Channel>, SearcherError> {
+    connector.connect(endpoint).map_err(|error| {
+        SearcherError::new(
+            error.kind,
+            format!(
+                "getting gRPC symbols client: getting gRPC connection to symbols server at {}: {}",
+                go_quote(endpoint),
+                error.message
+            ),
+        )
+    })
+}
+
+/// `proto.Range.ToInternal` (`internal/symbols/v1/conversion.go`).
+fn convert_range(range: pb::Range) -> CodeIntelRange {
+    CodeIntelRange {
+        row: range.row,
+        column: range.column,
+        length: range.length,
+    }
+}
+
+/// `LocalCodeIntelResponse_Symbol.ToInternal`. A missing proto `def` message
+/// becomes the zero `types.Range` (Go `GetDef().ToInternal()` on nil).
+fn convert_local_code_intel_symbol(
+    symbol: pb::local_code_intel_response::Symbol,
+) -> LocalCodeIntelSymbol {
+    LocalCodeIntelSymbol {
+        name: symbol.name,
+        hover: symbol.hover,
+        def: symbol.def.map(convert_range).unwrap_or_default(),
+        refs: symbol.refs.into_iter().map(convert_range).collect(),
+    }
+}
+
+/// `SymbolInfoResponse.ToInternal`: a nil `result` means "no symbol" (GraphQL
+/// `null`); otherwise the definition is always present (empty strings when
+/// the proto definition is missing).
+fn convert_symbol_info(response: pb::SymbolInfoResponse) -> Option<SymbolInfoResult> {
+    let result = response.result?;
+    let definition = result.definition.unwrap_or_default();
+    let path = definition.repo_commit_path.unwrap_or_default();
+    Some(SymbolInfoResult {
+        definition: RepoCommitPathMaybeRange {
+            repo: path.repo,
+            commit: path.commit,
+            path: path.path,
+            range: definition.range.map(convert_range),
+        },
+        // `Hover` keeps the proto presence: `Some("")` renders an empty
+        // string, `None` renders GraphQL null.
+        hover: result.hover,
+    })
 }
 
 /// `errors.Wrap(err, "executing symbols search request")`; connection failures
@@ -555,5 +856,81 @@ mod tests {
         assert_eq!(checker.include("r", "hidden"), Ok(false));
         assert_eq!(checker.include("r", "secret"), Err("boom".to_owned()));
         assert!(!NoSubRepoPerms.enabled());
+    }
+
+    #[test]
+    fn local_code_intel_payload_marshals_like_go() {
+        // `append` into a nil slice, then `json.Marshal`: null, not [].
+        assert_eq!(
+            LocalCodeIntelPayload::default().to_go_json(),
+            r#"{"symbols":null}"#
+        );
+
+        // Field order name/hover/def/refs, `omitempty` on hover/refs, and Go's
+        // HTML escaping inside the strings.
+        let payload = LocalCodeIntelPayload {
+            symbols: vec![LocalCodeIntelSymbol {
+                name: "f".to_owned(),
+                hover: "a b".to_owned(),
+                def: CodeIntelRange {
+                    row: 1,
+                    column: 2,
+                    length: 3,
+                },
+                refs: vec![CodeIntelRange {
+                    row: 4,
+                    column: 5,
+                    length: 6,
+                }],
+            }],
+        };
+        assert_eq!(
+            payload.to_go_json(),
+            concat!(
+                r#"{"symbols":[{"name":"f","hover":"a b","#,
+                r#""def":{"row":1,"column":2,"length":3},"#,
+                r#""refs":[{"row":4,"column":5,"length":6}]}]}"#
+            )
+        );
+
+        // `Def` is a value field: it is always present, even when zero.
+        let no_hover = LocalCodeIntelPayload {
+            symbols: vec![LocalCodeIntelSymbol {
+                name: "g".to_owned(),
+                ..Default::default()
+            }],
+        };
+        assert_eq!(
+            no_hover.to_go_json(),
+            r#"{"symbols":[{"name":"g","def":{"row":0,"column":0,"length":0}}]}"#
+        );
+    }
+
+    #[test]
+    fn symbol_info_conversion_keeps_proto_presence() {
+        assert_eq!(
+            convert_symbol_info(pb::SymbolInfoResponse { result: None }),
+            None
+        );
+
+        let info = convert_symbol_info(pb::SymbolInfoResponse {
+            result: Some(pb::symbol_info_response::DefinitionResult {
+                definition: Some(pb::symbol_info_response::Definition {
+                    repo_commit_path: Some(pb::RepoCommitPath {
+                        repo: "r".to_owned(),
+                        commit: "c".to_owned(),
+                        path: "p".to_owned(),
+                    }),
+                    range: None,
+                }),
+                hover: None,
+            }),
+        })
+        .expect("result");
+        assert_eq!(info.definition.repo, "r");
+        assert_eq!(info.definition.commit, "c");
+        assert_eq!(info.definition.path, "p");
+        assert_eq!(info.definition.range, None);
+        assert_eq!(info.hover, None);
     }
 }

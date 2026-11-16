@@ -464,6 +464,10 @@ pub struct SchemaGraphqlDeps {
     /// `None` makes `symbols`/`symbol` report `symbols: no endpoints
     /// configured`.
     symbols: Option<Arc<dyn crate::search_searcher_client::SymbolsClient + Send + Sync>>,
+    /// `symbols.DefaultClient`'s code-intel seam (M9.51a): the concrete gRPC
+    /// client used by `GitBlob.localCodeIntel` / `GitBlob.symbolInfo`. `None`
+    /// reproduces the baseline's absent client (nil payload / `null`).
+    symbols_service: Option<Arc<crate::symbols_client::GrpcSymbolsClient>>,
     /// `Query.slowRequests`'s capture-list seam (M9.8jf). `None` keeps the
     /// field unported (the pre-wiring frontend).
     slow_requests: Option<Arc<crate::slow_requests_tracer::SlowRequestsSurface>>,
@@ -612,6 +616,7 @@ impl SchemaGraphqlDeps {
             search_executor: None,
             git_objects: None,
             symbols: None,
+            symbols_service: None,
             slow_requests: None,
             auth_providers: None,
             external_accounts: None,
@@ -690,6 +695,7 @@ impl SchemaGraphqlDeps {
             search_executor: None,
             git_objects: None,
             symbols: None,
+            symbols_service: None,
             slow_requests: None,
             auth_providers: None,
             external_accounts: None,
@@ -865,6 +871,16 @@ impl SchemaGraphqlDeps {
         client: Arc<dyn crate::search_searcher_client::SymbolsClient + Send + Sync>,
     ) -> Self {
         self.symbols = Some(client);
+        self
+    }
+
+    /// Enable `GitBlob.localCodeIntel` / `GitBlob.symbolInfo` through the
+    /// concrete symbols gRPC client (M9.51a).
+    pub fn with_symbols_service(
+        mut self,
+        client: Arc<crate::symbols_client::GrpcSymbolsClient>,
+    ) -> Self {
+        self.symbols_service = Some(client);
         self
     }
 
@@ -1564,6 +1580,7 @@ impl SchemaGraphqlDeps {
             search_executor: None,
             git_objects: None,
             symbols: None,
+            symbols_service: None,
             slow_requests: None,
             auth_providers: None,
             external_accounts: None,
@@ -2013,6 +2030,9 @@ impl GraphqlDeps for SchemaGraphqlDeps {
                 // M9.48b: `GitBlob.lsif`/`codeGraphData` read through the
                 // optional code-navigation seam.
                 prefetch.codenav = self.codeintel_codenav.clone();
+                // M9.51a: `GitBlob.localCodeIntel`/`symbolInfo` read through
+                // the concrete symbols gRPC client.
+                prefetch.symbols_service = self.symbols_service.clone();
                 Some(Arc::new(prefetch))
             }
             None => None,

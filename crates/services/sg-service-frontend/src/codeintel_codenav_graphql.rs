@@ -23,9 +23,9 @@
 //!
 //! Deviations (also recorded in
 //! `dev/rs/docs/overviews/m9_48b_codeintel_codenav_overview.md`):
-//! - `GitBlob.localCodeIntel` / `GitBlob.symbolInfo` need the symbols gRPC
-//!   `LocalCodeIntel`/`SymbolInfo` methods (the Rust client only exposes
-//!   `search`), so they stay unassembled;
+//! - `GitBlob.localCodeIntel` / `GitBlob.symbolInfo` (M9.51a) are backed by
+//!   the symbols gRPC client; the `symbols` deps seam being absent renders
+//!   the baseline's nil-payload/null shapes;
 //! - `Query.usagesForSymbol` implements local precise usages; syntactic and
 //!   search-based results and the cross-index symbol trie remain out of scope;
 //! - the `experimentalFeatures.scipBasedAPIs` site-config gate is not wired.
@@ -1567,10 +1567,13 @@ impl ObjectValue for SnapshotDataObject {
     }
 }
 
-/// `LineRange`.
+/// `LineRange` (`lineRangeResolver` in `git_tree_entry.go:646-651`): the
+/// `SymbolLocation` range carries an explicit `row`/`column`/`length` triple.
 #[derive(Clone)]
 pub struct LineRangeObject {
-    pub range: SymbolRange,
+    pub line: i32,
+    pub character: i32,
+    pub length: i32,
 }
 
 impl ObjectValue for LineRangeObject {
@@ -1585,23 +1588,21 @@ impl ObjectValue for LineRangeObject {
         _actor: Actor,
     ) -> Result<Option<FieldValue>, ExecError> {
         match field {
-            "line" => Ok(Some(int_field(i64::from(self.range.start.line)))),
-            "character" => Ok(Some(int_field(i64::from(self.range.start.character)))),
-            "length" => Ok(Some(int_field(i64::from(
-                self.range.end.character - self.range.start.character,
-            )))),
+            "line" => Ok(Some(int_field(i64::from(self.line)))),
+            "character" => Ok(Some(int_field(i64::from(self.character)))),
+            "length" => Ok(Some(int_field(i64::from(self.length)))),
             _ => Ok(None),
         }
     }
 }
 
-/// `SymbolLocation`.
+/// `SymbolLocation` (`symbolLocationResolver` in `git_tree_entry.go:611-644`).
 #[derive(Clone)]
 pub struct SymbolLocationObject {
     pub repo: String,
     pub commit: String,
     pub path: String,
-    pub range: Option<SymbolRange>,
+    pub range: Option<crate::symbols_client::CodeIntelRange>,
 }
 
 impl ObjectValue for SymbolLocationObject {
@@ -1615,18 +1616,19 @@ impl ObjectValue for SymbolLocationObject {
         _arguments: &Arguments,
         _actor: Actor,
     ) -> Result<Option<FieldValue>, ExecError> {
-        let line = self.range.map(|range| range.start.line).unwrap_or(0);
-        let character = self.range.map(|range| range.start.character).unwrap_or(0);
-        let length = self
-            .range
-            .map(|range| range.end.character - range.start.character)
-            .unwrap_or(0);
+        let line = self.range.map(|range| range.row).unwrap_or(0);
+        let character = self.range.map(|range| range.column).unwrap_or(0);
+        let length = self.range.map(|range| range.length).unwrap_or(0);
         match field {
             "repo" => Ok(Some(string_field(self.repo.clone()))),
             "commit" => Ok(Some(string_field(self.commit.clone()))),
             "path" => Ok(Some(string_field(self.path.clone()))),
             "range" => Ok(Some(match self.range {
-                Some(range) => FieldValue::Object(Arc::new(LineRangeObject { range })),
+                Some(range) => FieldValue::Object(Arc::new(LineRangeObject {
+                    line: range.row,
+                    character: range.column,
+                    length: range.length,
+                })),
                 None => FieldValue::Null,
             })),
             "line" => Ok(Some(int_field(i64::from(line)))),
@@ -2413,10 +2415,76 @@ pub fn prefer_uploads_with_longest_roots(uploads: Vec<UploadRecord>) -> Vec<Uplo
     chosen.into_iter().flatten().collect()
 }
 
-/// `GitBlob.symbolInfo` / `GitBlob.localCodeIntel` are service gaps; this
-/// returns the unassembled (`null`) shape for callers that still expose them.
-pub fn symbol_info_gap() -> FieldValue {
-    FieldValue::Null
+/// `GitTreeEntryResolver.LocalCodeIntel` (`git_tree_entry.go:510-531`).
+///
+/// The baseline marshals the (possibly nil) `*types.LocalCodeIntelPayload`,
+/// stores the bytes in a `JSONValue.Value` **string**, and the scalar's
+/// `MarshalJSON` marshals that string again. The legacy clients therefore
+/// receive a JSON string which they `JSON.parse` (`client/shared/src/
+/// codeintel/legacy-extensions/util/api.ts:140`). A nil payload (gRPC
+/// `Unimplemented` or an unassembled client) becomes the string `"null"`;
+/// an empty symbol list becomes `"{\"symbols\":null}"`.
+pub fn local_code_intel_field(
+    client: Option<&crate::symbols_client::GrpcSymbolsClient>,
+    repo: &str,
+    commit: &str,
+    path: &str,
+) -> Result<Option<FieldValue>, ExecError> {
+    let payload = match client {
+        Some(client) => client
+            .local_code_intel(&crate::symbols_client::RepoCommitPath {
+                repo: repo.to_owned(),
+                commit: commit.to_owned(),
+                path: path.to_owned(),
+            })
+            .map_err(|error| ExecError::new(error.message))?,
+        None => None,
+    };
+    let json = match payload {
+        Some(payload) => payload.to_go_json(),
+        None => "null".to_owned(),
+    };
+    Ok(Some(FieldValue::Json(Json::Str(json))))
+}
+
+/// `GitTreeEntryResolver.SymbolInfo` (`git_tree_entry.go:533-565`).
+///
+/// `line`/`character` are the GraphQL `Int!` arguments converted to Go
+/// `int32`; a nil result is GraphQL `null`. The definition is always a
+/// `SymbolLocation` object; `range` is `null` when the definition point has no
+/// range (`git_tree_entry.go:639-644`).
+pub fn symbol_info_field(
+    client: Option<&crate::symbols_client::GrpcSymbolsClient>,
+    repo: &str,
+    commit: &str,
+    path: &str,
+    line: i64,
+    character: i64,
+) -> Result<Option<FieldValue>, ExecError> {
+    let Some(client) = client else {
+        return Ok(Some(FieldValue::Null));
+    };
+    let info = client
+        .symbol_info(&crate::symbols_client::RepoCommitPathPoint {
+            repo: repo.to_owned(),
+            commit: commit.to_owned(),
+            path: path.to_owned(),
+            row: line as i32,
+            column: character as i32,
+        })
+        .map_err(|error| ExecError::new(error.message))?;
+    let Some(info) = info else {
+        return Ok(Some(FieldValue::Null));
+    };
+    Ok(Some(FieldValue::Object(Arc::new(SymbolInfoObject {
+        definition: Some(SymbolLocationObject {
+            repo: info.definition.repo,
+            commit: info.definition.commit,
+            path: info.definition.path,
+            range: info.definition.range,
+        }),
+        hover: info.hover,
+    }))))
 }
 
 /// Render the `CodeIntelGitBlob` resource for a location (used by tests).

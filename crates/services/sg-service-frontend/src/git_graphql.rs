@@ -770,6 +770,11 @@ pub struct GitPrefetch {
     /// `symbol.DefaultZoektSymbolsClient()` injection point. `GitTreeEntry` /
     /// `GitCommit` `symbols` call the (synchronous) gRPC client here.
     pub symbols: Option<Arc<dyn crate::search_searcher_client::SymbolsClient + Send + Sync>>,
+    /// M9.51a: the concrete symbols gRPC client used by
+    /// `GitBlob.localCodeIntel` / `GitBlob.symbolInfo`
+    /// (`symbols.DefaultClient` in the baseline). `None` renders the
+    /// unassembled nil-payload/null shapes.
+    pub symbols_service: Option<Arc<crate::symbols_client::GrpcSymbolsClient>>,
     /// M9.37c: `GitBlob.highlight` / `GitTreeEntry.highlight` results, keyed
     /// like the comparison file-diff highlights.
     pub tree_highlights: HashMap<
@@ -809,6 +814,7 @@ impl Clone for GitPrefetch {
             default_branches: self.default_branches.clone(),
             contributors: self.contributors.clone(),
             symbols: self.symbols.clone(),
+            symbols_service: self.symbols_service.clone(),
             tree_highlights: self.tree_highlights.clone(),
             external_url: self.external_url.clone(),
             own: self.own.clone(),
@@ -838,6 +844,10 @@ impl std::fmt::Debug for GitPrefetch {
             .field(
                 "symbols",
                 &self.symbols.as_ref().map(|_| "<symbols client>"),
+            )
+            .field(
+                "symbols_service",
+                &self.symbols_service.as_ref().map(|_| "<symbols service>"),
             )
             .field("tree_highlights", &self.tree_highlights)
             .field("external_url", &self.external_url)

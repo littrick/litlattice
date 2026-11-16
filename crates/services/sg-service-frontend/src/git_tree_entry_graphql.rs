@@ -1931,11 +1931,30 @@ impl ObjectValue for GitTreeEntryObject {
                     arguments,
                 )
             }
-            // `GitBlob.localCodeIntel` / `GitBlob.symbolInfo` need the symbols
-            // gRPC `LocalCodeIntel`/`SymbolInfo` methods, which the Rust
-            // client does not expose (SERVICE_GAP, see the overview).
-            "localCodeIntel" | "symbolInfo" => {
-                Ok(Some(crate::codeintel_codenav_graphql::symbol_info_gap()))
+            // `GitBlob.localCodeIntel` / `GitBlob.symbolInfo`
+            // (`git_tree_entry.go:510-565`), backed by the symbols gRPC
+            // `LocalCodeIntel`/`SymbolInfo` methods (M9.51a).
+            "localCodeIntel" => {
+                let client = self.git.as_ref().and_then(|git| git.symbols_service.as_deref());
+                crate::codeintel_codenav_graphql::local_code_intel_field(
+                    client,
+                    &self.repo.name,
+                    &self.oid,
+                    self.path(),
+                )
+            }
+            "symbolInfo" => {
+                let client = self.git.as_ref().and_then(|git| git.symbols_service.as_deref());
+                let line = arguments.i64("line").unwrap_or(0);
+                let character = arguments.i64("character").unwrap_or(0);
+                crate::codeintel_codenav_graphql::symbol_info_field(
+                    client,
+                    &self.repo.name,
+                    &self.oid,
+                    self.path(),
+                    line,
+                    character,
+                )
             }
             _ => Ok(None),
         }
