@@ -6,10 +6,16 @@
 //! The baseline (`cmd/server/shared/shared.go`) mutates the process
 //! environment and shells out while building the Procfile. This port keeps the
 //! same observable ordering in a deterministic [`EnvMap`]; the only injected
-//! input is the environment map and the two data directories. Local Postgres
-//! `initdb`/`createdb` provisioning is part of the container image, not of the
-//! entry binary (see the slice overview), so the plan emits the final
-//! `postgres:` supervisor line directly.
+//! input is the environment map and the two data directories.
+//!
+//! `maybePostgresProcFile` (`cmd/server/shared/postgres.go:16-199`) both
+//! provisions an in-container Postgres data directory (`/run/postgresql`,
+//! markers, `initdb`, `createdb`, the 5.1 reindex marker) and returns the final
+//! `postgres:` supervisor line. [`plan_postgres_setup`] models that provisioning
+//! as an ordered, inspectable list of actions and [`execute_postgres_setup`]
+//! runs it; keeping planning and execution separate lets the differential
+//! harness compare the command sequence/file semantics without requiring root
+//! or a local Postgres server.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -353,6 +359,9 @@ pub struct ServerPlan {
     pub reindex: ReindexPlan,
     pub config_files: Vec<ConfigFile>,
     pub prof_services: Vec<ProfService>,
+    /// Local Postgres provisioning (`cmd/server/shared/postgres.go:67-199`).
+    /// `None` when every database is configured to use an external server.
+    pub postgres_setup: Option<PostgresSetup>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -744,9 +753,288 @@ fn is_postgres_configured(env: &EnvMap, prefix: &str) -> bool {
         || !env.value(&format!("{prefix}PGDATASOURCE")).is_empty()
 }
 
-/// The final `postgres:` supervisor line from `postgresProcfile`. The
-/// `initdb`/`createdb`/`chown` provisioning sequence belongs to the container
-/// image and is not ported here (see the slice overview).
+/// One command run through Go's `execer` in `postgresProcfile`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PostgresCommand {
+    pub program: String,
+    pub args: Vec<String>,
+    /// `CommandWithFilter`: a failure whose combined output contains this text
+    /// is ignored (the `createdb ... already exists` upgrade path,
+    /// `postgres.go:161-172`).
+    pub ignore_error_contains: Option<String>,
+    /// `os.RemoveAll` of this path when the command fails (`postgres.go:92,120`).
+    pub cleanup_path: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PostgresAction {
+    Run(PostgresCommand),
+    /// `os.Create` + `WriteString` (`postgres.go:125-134`).
+    WriteFile { path: String, contents: String },
+    /// `pgPrintf` line, printed as `✱ <message>`.
+    Message(String),
+}
+
+/// Ordered local-Postgres provisioning actions plus their log messages.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PostgresSetup {
+    pub actions: Vec<PostgresAction>,
+}
+
+fn run_command(program: &str, args: &[&str]) -> PostgresAction {
+    PostgresAction::Run(PostgresCommand {
+        program: program.to_owned(),
+        args: args.iter().map(|arg| (*arg).to_owned()).collect(),
+        ignore_error_contains: None,
+        cleanup_path: None,
+    })
+}
+
+fn run_command_cleanup(program: &str, args: &[&str], cleanup: &Path) -> PostgresAction {
+    PostgresAction::Run(PostgresCommand {
+        program: program.to_owned(),
+        args: args.iter().map(|arg| (*arg).to_owned()).collect(),
+        ignore_error_contains: None,
+        cleanup_path: Some(cleanup.display().to_string()),
+    })
+}
+
+/// `fileExists` (`postgres.go:201-211`): only `NotExist` is a false result.
+fn file_exists(path: &Path) -> Result<bool, String> {
+    match fs::metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(format!("failed to stat {}: {error}", path.display())),
+    }
+}
+
+/// `postgresProcfile` file/setup half (`cmd/server/shared/postgres.go:67-199`).
+///
+/// The plan is deterministic: `databases` follows the Go map's insertion order
+/// (`""`, `CODEINTEL_`, optional `CODEINSIGHTS_`) instead of Go's randomized
+/// map iteration, which only affects the order of independent `createdb`
+/// calls.
+pub fn plan_postgres_setup(
+    env: &EnvMap,
+    databases: &[(&str, &str)],
+) -> Result<PostgresSetup, String> {
+    let data_dir = Path::new(&env.value("DATA_DIR")).to_path_buf();
+    let path = data_dir.join("postgresql");
+    let markers_path = data_dir.join("postgresql-markers");
+    let marker_sourcegraph = markers_path.join("sourcegraph");
+
+    let mut actions = Vec::new();
+
+    // Postgres needs to be able to write to run.
+    actions.push(run_command("mkdir", &["-p", "/run/postgresql"]));
+    actions.push(run_command("chown", &["-R", "postgres", "/run/postgresql"]));
+
+    if !file_exists(&markers_path)? {
+        let (mkdir_path, touch_path) = (
+            markers_path.display().to_string(),
+            marker_sourcegraph.display().to_string(),
+        );
+        actions.push(run_command_cleanup("mkdir", &["-p", &mkdir_path], &path));
+        actions.push(run_command_cleanup("touch", &[&touch_path], &path));
+    }
+
+    if !file_exists(&path)? {
+        let path_text = path.display().to_string();
+        if matches!(env.value("SRC_LOG_LEVEL").as_str(), "dbug" | "info") {
+            actions.push(PostgresAction::Message(format!(
+                "Setting up PostgreSQL at {path_text}"
+            )));
+        }
+        actions.push(PostgresAction::Message(
+            "Sourcegraph is initializing the internal database... (may take 15-20 seconds)"
+                .to_owned(),
+        ));
+
+        actions.push(run_command_cleanup("mkdir", &["-p", &path_text], &path));
+        actions.push(run_command_cleanup("chown", &["postgres", &path_text], &path));
+        // initdb --nosync saves ~3-15s on macOS during initial startup.
+        actions.push(run_command_cleanup(
+            "su-exec",
+            &["postgres", "initdb", "-D", &path_text, "--nosync"],
+            &path,
+        ));
+        actions.push(run_command_cleanup(
+            "su-exec",
+            &[
+                "postgres",
+                "pg_ctl",
+                "-D",
+                &path_text,
+                "-o -c listen_addresses=127.0.0.1",
+                "-l",
+                "/tmp/pgsql.log",
+                "-w",
+                "start",
+            ],
+            &path,
+        ));
+        for (_, database) in databases {
+            let marker = markers_path.join(database).display().to_string();
+            actions.push(run_command_cleanup(
+                "su-exec",
+                &["postgres", "createdb", database],
+                &path,
+            ));
+            actions.push(run_command_cleanup("touch", &[&marker], &path));
+        }
+        actions.push(run_command_cleanup(
+            "su-exec",
+            &[
+                "postgres",
+                "pg_ctl",
+                "-D",
+                &path_text,
+                "-m",
+                "fast",
+                "-l",
+                "/tmp/pgsql.log",
+                "-w",
+                "stop",
+            ],
+            &path,
+        ));
+
+        // The DB was initialized by Sourcegraph >=5.1, so reindexing is not
+        // required (`postgresReindexMarkerFile`).
+        actions.push(PostgresAction::WriteFile {
+            path: path.join("5.1-reindex.completed").display().to_string(),
+            contents: "Database initialised by Sourcegraph 5.1 or later\n".to_owned(),
+        });
+    } else {
+        // Between restarts the owner of the volume may have changed.
+        let path_text = path.display().to_string();
+        actions.push(run_command("chown", &["-R", "postgres", &path_text]));
+
+        let mut missing_databases: Vec<&str> = Vec::new();
+        for (_, database) in databases {
+            if !file_exists(&markers_path.join(database))? {
+                missing_databases.push(database);
+            }
+        }
+        if !missing_databases.is_empty() {
+            actions.push(PostgresAction::Message(format!(
+                "Sourcegraph is creating missing databases {}... (may take 15-20 seconds)",
+                missing_databases.join(", ")
+            )));
+            actions.push(run_command(
+                "su-exec",
+                &[
+                    "postgres",
+                    "pg_ctl",
+                    "-D",
+                    &path_text,
+                    "-o -c listen_addresses=127.0.0.1",
+                    "-l",
+                    "/tmp/pgsql.log",
+                    "-w",
+                    "start",
+                ],
+            ));
+            for database in &missing_databases {
+                // Ignore the 3.21.0 -> 3.21.1 upgrade path where the database
+                // exists but its marker file does not.
+                actions.push(PostgresAction::Run(PostgresCommand {
+                    program: "su-exec".to_owned(),
+                    args: vec![
+                        "postgres".to_owned(),
+                        "createdb".to_owned(),
+                        (*database).to_owned(),
+                    ],
+                    ignore_error_contains: Some(format!(
+                        "ERROR:  database \"{database}\" already exists"
+                    )),
+                    cleanup_path: None,
+                }));
+                actions.push(run_command(
+                    "touch",
+                    &[&markers_path.join(database).display().to_string()],
+                ));
+            }
+            actions.push(run_command(
+                "su-exec",
+                &[
+                    "postgres",
+                    "pg_ctl",
+                    "-D",
+                    &path_text,
+                    "-m",
+                    "fast",
+                    "-l",
+                    "/tmp/pgsql.log",
+                    "-w",
+                    "stop",
+                ],
+            ));
+        }
+    }
+
+    actions.push(PostgresAction::Message(
+        "Finished initializing the internal database.".to_owned(),
+    ));
+
+    Ok(PostgresSetup { actions })
+}
+
+/// Execute a [`PostgresSetup`] with the same command/output semantics as Go's
+/// `execer` + `pgPrintf`. Returns the error that `shared.Main` would have
+/// turned into `log.Fatal`.
+pub fn execute_postgres_setup(setup: &PostgresSetup) -> Result<(), String> {
+    for action in &setup.actions {
+        match action {
+            PostgresAction::Message(message) => eprintln!("✱ {message}"),
+            PostgresAction::WriteFile { path, contents } => {
+                fs::write(path, contents)
+                    .map_err(|error| format!("failed to write {path}: {error}"))?;
+            }
+            PostgresAction::Run(command) => {
+                let output = std::process::Command::new(&command.program)
+                    .args(&command.args)
+                    .output();
+                let (failed, combined) = match &output {
+                    Ok(output) => {
+                        let mut bytes = output.stdout.clone();
+                        bytes.extend_from_slice(&output.stderr);
+                        (
+                            !output.status.success(),
+                            String::from_utf8_lossy(&bytes).into_owned(),
+                        )
+                    }
+                    Err(error) => (true, error.to_string()),
+                };
+                if !failed {
+                    continue;
+                }
+                if let Some(needle) = &command.ignore_error_contains {
+                    if combined.contains(needle.as_str()) {
+                        continue;
+                    }
+                }
+                if let Some(path) = &command.cleanup_path {
+                    // `os.RemoveAll`: remove either kind, ignoring errors.
+                    match fs::symlink_metadata(path) {
+                        Ok(metadata) if metadata.is_dir() => {
+                            let _ = fs::remove_dir_all(path);
+                        }
+                        Ok(_) => {
+                            let _ = fs::remove_file(path);
+                        }
+                        Err(_) => {}
+                    }
+                }
+                eprintln!("✱ Setting up postgres failed:\n{combined}");
+                return Err(combined.trim_end().to_owned());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The final `postgres:` supervisor line from `postgresProcfile`.
 fn local_postgres_line(data_dir: &Path) -> String {
     let path = data_dir.join("postgresql");
     let ignored_logs = [
@@ -874,7 +1162,7 @@ pub fn build_plan(
     let missing_external_config = databases
         .iter()
         .any(|(prefix, _)| !is_postgres_configured(env, prefix));
-    let postgres_line = if missing_external_config {
+    let (postgres_line, postgres_setup) = if missing_external_config {
         for (prefix, database) in &databases {
             if !is_postgres_configured(env, prefix) {
                 env.set_default(format!("{prefix}PGHOST"), "127.0.0.1");
@@ -883,9 +1171,12 @@ pub fn build_plan(
                 env.set_default(format!("{prefix}PGSSLMODE"), "disable");
             }
         }
-        Some(local_postgres_line(&paths.data_dir))
+        (
+            Some(local_postgres_line(&paths.data_dir)),
+            Some(plan_postgres_setup(env, &databases)?),
+        )
     } else {
-        None
+        (None, None)
     };
 
     let restore = parse_go_bool(&env.value("PGRESTORE")).unwrap_or(false);
@@ -927,6 +1218,7 @@ pub fn build_plan(
         reindex,
         config_files,
         prof_services: applied.prof_services.clone(),
+        postgres_setup,
     })
 }
 
@@ -1033,13 +1325,29 @@ pub async fn run_from_env() -> i32 {
         return EXIT_ASSEMBLY_FAILURE;
     }
 
-    let plan = match build_plan(&mut env, &applied, &extras) {
+    let mut plan = match build_plan(&mut env, &applied, &extras) {
         Ok(plan) => plan,
         Err(error) => {
             eprintln!("{error}");
             return EXIT_ASSEMBLY_FAILURE;
         }
     };
+
+    // `maybePostgresProcFile` provisions the local database while the Procfile
+    // is assembled, before `run` checks the 5.1 reindex gate. The gate must be
+    // evaluated after provisioning because a fresh init writes the marker.
+    if let Some(setup) = &plan.postgres_setup {
+        if let Err(error) = execute_postgres_setup(setup) {
+            eprintln!("✱ {error}");
+            return EXIT_ASSEMBLY_FAILURE;
+        }
+        plan.reindex.required = should_postgres_reindex(&env);
+        plan.reindex.exit_code = if plan.reindex.required && !plan.reindex.allowed {
+            Some(EXIT_MIGRATION_REQUIRED)
+        } else {
+            None
+        };
+    }
 
     if plan.reindex.required {
         if let Some(code) = run_postgres_reindex(&env) {
@@ -1096,5 +1404,230 @@ mod tests {
         assert_eq!(convert_log_level("dbug"), "debug");
         assert_eq!(convert_log_level("crit"), "fatal");
         assert_eq!(convert_log_level("nope"), "warn");
+    }
+
+    fn temp_data_dir(tag: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "m949a-sg-entry-{}-{tag}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("create temp data dir");
+        root
+    }
+
+    fn run(program: &str, args: &[&str]) -> PostgresAction {
+        PostgresAction::Run(PostgresCommand {
+            program: program.to_owned(),
+            args: args.iter().map(|arg| (*arg).to_owned()).collect(),
+            ignore_error_contains: None,
+            cleanup_path: None,
+        })
+    }
+
+    fn run_cleanup(program: &str, args: &[&str], cleanup: &str) -> PostgresAction {
+        PostgresAction::Run(PostgresCommand {
+            program: program.to_owned(),
+            args: args.iter().map(|arg| (*arg).to_owned()).collect(),
+            ignore_error_contains: None,
+            cleanup_path: Some(cleanup.to_owned()),
+        })
+    }
+
+    fn databases() -> Vec<(&'static str, &'static str)> {
+        vec![("", "sourcegraph"), ("CODEINTEL_", "sourcegraph-codeintel")]
+    }
+
+    #[test]
+    fn postgres_setup_fresh_init_matches_go() {
+        let data_dir = temp_data_dir("fresh");
+        let env = EnvMap::from_pairs([("DATA_DIR", data_dir.display().to_string())]);
+        let setup = plan_postgres_setup(&env, &databases()).expect("plan");
+        let path = data_dir.join("postgresql");
+        let markers = data_dir.join("postgresql-markers");
+        let path_text = path.display().to_string();
+        let markers_text = markers.display().to_string();
+
+        let expected = vec![
+            run("mkdir", &["-p", "/run/postgresql"]),
+            run("chown", &["-R", "postgres", "/run/postgresql"]),
+            run_cleanup("mkdir", &["-p", &markers_text], &path_text),
+            run_cleanup(
+                "touch",
+                &[&markers.join("sourcegraph").display().to_string()],
+                &path_text,
+            ),
+            PostgresAction::Message(
+                "Sourcegraph is initializing the internal database... (may take 15-20 seconds)"
+                    .to_owned(),
+            ),
+            run_cleanup("mkdir", &["-p", &path_text], &path_text),
+            run_cleanup("chown", &["postgres", &path_text], &path_text),
+            run_cleanup(
+                "su-exec",
+                &["postgres", "initdb", "-D", &path_text, "--nosync"],
+                &path_text,
+            ),
+            run_cleanup(
+                "su-exec",
+                &[
+                    "postgres",
+                    "pg_ctl",
+                    "-D",
+                    &path_text,
+                    "-o -c listen_addresses=127.0.0.1",
+                    "-l",
+                    "/tmp/pgsql.log",
+                    "-w",
+                    "start",
+                ],
+                &path_text,
+            ),
+            run_cleanup(
+                "su-exec",
+                &["postgres", "createdb", "sourcegraph"],
+                &path_text,
+            ),
+            run_cleanup(
+                "touch",
+                &[&markers.join("sourcegraph").display().to_string()],
+                &path_text,
+            ),
+            run_cleanup(
+                "su-exec",
+                &["postgres", "createdb", "sourcegraph-codeintel"],
+                &path_text,
+            ),
+            run_cleanup(
+                "touch",
+                &[&markers.join("sourcegraph-codeintel").display().to_string()],
+                &path_text,
+            ),
+            run_cleanup(
+                "su-exec",
+                &[
+                    "postgres",
+                    "pg_ctl",
+                    "-D",
+                    &path_text,
+                    "-m",
+                    "fast",
+                    "-l",
+                    "/tmp/pgsql.log",
+                    "-w",
+                    "stop",
+                ],
+                &path_text,
+            ),
+            PostgresAction::WriteFile {
+                path: path.join("5.1-reindex.completed").display().to_string(),
+                contents: "Database initialised by Sourcegraph 5.1 or later\n".to_owned(),
+            },
+            PostgresAction::Message("Finished initializing the internal database.".to_owned()),
+        ];
+        assert_eq!(setup.actions, expected);
+        let _ = fs::remove_dir_all(&data_dir);
+    }
+
+    #[test]
+    fn postgres_setup_existing_complete_only_reclaims_owner() {
+        let data_dir = temp_data_dir("existing-complete");
+        let path = data_dir.join("postgresql");
+        let markers = data_dir.join("postgresql-markers");
+        fs::create_dir_all(&path).unwrap();
+        fs::create_dir_all(&markers).unwrap();
+        for database in ["sourcegraph", "sourcegraph-codeintel"] {
+            fs::write(markers.join(database), b"").unwrap();
+        }
+        let env = EnvMap::from_pairs([("DATA_DIR", data_dir.display().to_string())]);
+        let setup = plan_postgres_setup(&env, &databases()).expect("plan");
+        let path_text = path.display().to_string();
+        assert_eq!(
+            setup.actions,
+            vec![
+                run("mkdir", &["-p", "/run/postgresql"]),
+                run("chown", &["-R", "postgres", "/run/postgresql"]),
+                run("chown", &["-R", "postgres", &path_text]),
+                PostgresAction::Message(
+                    "Finished initializing the internal database.".to_owned()
+                ),
+            ]
+        );
+        let _ = fs::remove_dir_all(&data_dir);
+    }
+
+    #[test]
+    fn postgres_setup_missing_database_uses_filtered_createdb() {
+        let data_dir = temp_data_dir("existing-missing");
+        let path = data_dir.join("postgresql");
+        let markers = data_dir.join("postgresql-markers");
+        fs::create_dir_all(&path).unwrap();
+        fs::create_dir_all(&markers).unwrap();
+        fs::write(markers.join("sourcegraph"), b"").unwrap();
+        let env = EnvMap::from_pairs([("DATA_DIR", data_dir.display().to_string())]);
+        let setup = plan_postgres_setup(&env, &databases()).expect("plan");
+        let path_text = path.display().to_string();
+
+        assert!(setup.actions.contains(&PostgresAction::Message(
+            "Sourcegraph is creating missing databases sourcegraph-codeintel... (may take 15-20 seconds)"
+                .to_owned()
+        )));
+        let createdb = setup
+            .actions
+            .iter()
+            .find_map(|action| match action {
+                PostgresAction::Run(command) if command.program == "su-exec" && command.args[1] == "createdb" => Some(command),
+                _ => None,
+            })
+            .expect("createdb command");
+        assert_eq!(
+            createdb.args,
+            vec![
+                "postgres".to_owned(),
+                "createdb".to_owned(),
+                "sourcegraph-codeintel".to_owned()
+            ]
+        );
+        assert_eq!(
+            createdb.ignore_error_contains.as_deref(),
+            Some("ERROR:  database \"sourcegraph-codeintel\" already exists")
+        );
+        // Both start and stop happen around the single missing database.
+        let pg_ctl_verbs: Vec<&str> = setup
+            .actions
+            .iter()
+            .filter_map(|action| match action {
+                PostgresAction::Run(command) if command.program == "su-exec" && command.args[1] == "pg_ctl" => {
+                    command.args.last().map(String::as_str)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(pg_ctl_verbs, vec!["start", "stop"]);
+        assert!(setup.actions.contains(&run(
+            "touch",
+            &[&markers.join("sourcegraph-codeintel").display().to_string()],
+        )));
+        assert_eq!(path_text, path.display().to_string());
+        let _ = fs::remove_dir_all(&data_dir);
+    }
+
+    #[test]
+    fn postgres_setup_verbose_message_uses_src_log_level() {
+        let data_dir = temp_data_dir("verbose");
+        let env = EnvMap::from_pairs([
+            ("DATA_DIR", data_dir.display().to_string()),
+            ("SRC_LOG_LEVEL", "dbug".to_owned()),
+        ]);
+        let setup = plan_postgres_setup(&env, &databases()).expect("plan");
+        assert_eq!(
+            setup.actions.first(),
+            Some(&run("mkdir", &["-p", "/run/postgresql"]))
+        );
+        let path_text = data_dir.join("postgresql").display().to_string();
+        assert!(setup.actions.contains(&PostgresAction::Message(format!(
+            "Setting up PostgreSQL at {path_text}"
+        ))));
+        let _ = fs::remove_dir_all(&data_dir);
     }
 }
