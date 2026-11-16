@@ -28,6 +28,8 @@ use sg_ui::{
 };
 
 use crate::app_handlers::{self, AppConfig, AppDeps, AppEnv};
+use crate::graphql_resolvers::RepoLookup;
+use crate::repository_store::RepoRevResolution;
 
 const DEV_VERSION: &str = "0.0.0+dev";
 /// `error.html` hardcodes the product name instead of `conf.Branding()`.
@@ -503,6 +505,353 @@ pub fn serve_ui<B>(
     ui_not_found(env, config, assets)
 }
 
+/// Async `RouteName::Ui` dispatch (M9.49d). It is identical to [`serve_ui`]
+/// except that repository pages go through `newCommon`'s DB/gitserver checks
+/// (`serveRepoOrBlob`/`serveRepoLanding`) instead of the offline 404 fallback.
+pub async fn serve_ui_async<B>(
+    req: &Request<B>,
+    path: &str,
+    env: &AppEnv,
+    config: &AppConfig,
+    deps: &AppDeps,
+) -> Response<BoxBody> {
+    let Some(assets) = deps.ui_assets.as_deref() else {
+        return app_handlers::not_found();
+    };
+    let path = if path.is_empty() { "/" } else { path };
+
+    // `mux.Router.ServeHTTP`'s `cleanPath` redirect (no body, no content type).
+    let cleaned = crate::mux::clean_path(path);
+    if cleaned != path {
+        return clean_path_redirect(req, &cleaned);
+    }
+
+    let candidates = ui_candidates(path, env);
+    let mut method_mismatch = false;
+    for candidate in candidates {
+        if candidate.method != req.method() {
+            method_mismatch = true;
+            continue;
+        }
+        if let UiAction::RepoPage { repo, rev, page } = &candidate.action {
+            return serve_repo_page(
+                req,
+                env,
+                config,
+                assets,
+                deps,
+                repo,
+                rev.as_deref(),
+                page,
+            )
+            .await;
+        }
+        return candidate.serve(req, env, config, assets, deps);
+    }
+    if method_mismatch {
+        return empty_response(StatusCode::METHOD_NOT_ALLOWED);
+    }
+    ui_not_found(env, config, assets)
+}
+
+/// The repository route's page kind, mirroring the gorilla route table
+/// (`router.go:249-307`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum RepoPageKind {
+    /// `serveRepoOrBlob(routeRepo)` (`router.go:249`).
+    Root,
+    /// `serveTree` (`router.go:269`).
+    Tree { path: String },
+    /// `serveRepoOrBlob(routeBlob)` (`router.go:278`).
+    Blob { path: String },
+    /// `brandedIndex`/`brandedNoIndex` subroutes: an unconditional SPA shell
+    /// (`router.go:290-307`), no repo/rev lookup.
+    Subroute { title: &'static str, indexed: bool },
+    /// dotcom-only `serveRepoLanding` (`router.go:320`): 301 to
+    /// `/{repo}@{commit}`.
+    Landing,
+}
+
+/// `serveRepoOrBlob`/`serveTree`/`serveRepoLanding`'s shared `newCommon` +
+/// per-route logic (`handlers.go:214-292`, `:469-550`).
+async fn serve_repo_page<B>(
+    req: &Request<B>,
+    env: &AppEnv,
+    config: &AppConfig,
+    assets: &dyn sg_ui::AssetsProvider,
+    deps: &AppDeps,
+    repo: &str,
+    rev: Option<&str>,
+    page: &RepoPageKind,
+) -> Response<BoxBody> {
+    // Without production wiring the async path keeps the historical 404, so
+    // the offline router/UI differentials stay byte-identical.
+    let Some(wiring) = deps.repo_pages.as_deref() else {
+        return ui_not_found(env, config, assets);
+    };
+
+    // `newCommon` loads the manifest first: a missing/broken manifest is a
+    // 500 even for repository routes (handlers.go:153).
+    let manifest = match assets.load_web_build_manifest() {
+        Ok(manifest) => manifest,
+        Err(error) => return manifest_error_response(env, config, &error),
+    };
+
+    // `brandedIndex`/`brandedNoIndex` (`router.go:290-307`) only call
+    // `serveBasicPage`: unlike root/tree/blob they run no `newCommon` lookup,
+    // so their shell is unconditional (even for an unknown repo) and must not
+    // consult Postgres or gitserver.
+    if matches!(page, RepoPageKind::Subroute { .. }) {
+        let indexed = rev.is_none()
+            && !matches!(page, RepoPageKind::Subroute { indexed: false, .. });
+        let title = repo_page_title(page, repo, config);
+        let input = shell_input(env, config, &manifest, title, indexed);
+        return shell_response(&input, StatusCode::OK);
+    }
+
+    // `handlerutil.GetRepo` → `repoStore.GetByName` with the authz predicate.
+    // The actor's UID is filled per request by the middleware; 0 is anonymous.
+    let actor_uid = deps.more.actor.uid().unwrap_or(0);
+    let lookup = match wiring
+        .repositories
+        .lookup(repo, actor_uid, false)
+        .await
+    {
+        Ok(lookup) => lookup,
+        // `errcode.IsUnauthorized(err)` → 401 (handlers.go:285). The PG store
+        // maps authz-filtered rows to `NotFound` (Go's repoStore behaves the
+        // same), so this branch is only reachable through an injected error.
+        Err(error) if is_unauthorized_error(&error) => {
+            return ui_error_shell(StatusCode::UNAUTHORIZED, env, config, assets);
+        }
+        Err(error) => {
+            let shown = env.insecure_dev.then_some(error.as_str());
+            return error_page_response(StatusCode::INTERNAL_SERVER_ERROR, shown);
+        }
+    };
+    match lookup {
+        RepoLookup::Found(_) => {}
+        // errcode.IsNotFound / errcode.IsBlocked → 404 (`handlers.go:279-283`).
+        RepoLookup::NotFound | RepoLookup::Blocked { .. } => {
+            return ui_not_found(env, config, assets);
+        }
+        // `URLMovedError` is not modelled by `PgRepositoryStore` (it returns
+        // the canonical row); a see-other redirect is also outside this slice.
+        RepoLookup::Redirect { .. } => return ui_not_found(env, config, assets),
+        RepoLookup::Error(error) => {
+            if is_unauthorized_error(&error) {
+                return ui_error_shell(StatusCode::UNAUTHORIZED, env, config, assets);
+            }
+            let shown = env.insecure_dev.then_some(error.as_str());
+            return error_page_response(StatusCode::INTERNAL_SERVER_ERROR, shown);
+        }
+    }
+
+    let resolved = match &wiring.resolver {
+        Some(resolver) => Some(resolver.resolve(repo, rev).await),
+        // No gitserver configured: do not misclassify an existing repository
+        // as 404 (the baseline's clone-in-progress branch also replies 200).
+        None => None,
+    };
+    match &resolved {
+        Some(RepoRevResolution::RevisionNotFound) if rev.is_some() => {
+            // `errors.HasType[*gitdomain.RevisionNotFoundError]` → 404.
+            return ui_not_found(env, config, assets);
+        }
+        // `isRepoEmptyError`: no explicit rev + RevisionNotFound → 200.
+        Some(RepoRevResolution::RevisionNotFound) => {}
+        // `gitdomain.IsCloneInProgress` → 200 (`handlers.go:275`).
+        Some(RepoRevResolution::RepoNotExist {
+            clone_in_progress: true,
+        }) => {}
+        Some(RepoRevResolution::RepoNotExist { .. }) => {
+            return ui_not_found(env, config, assets);
+        }
+        Some(RepoRevResolution::Error(error)) => {
+            let shown = env.insecure_dev.then_some(error.as_str());
+            return error_page_response(StatusCode::INTERNAL_SERVER_ERROR, shown);
+        }
+        Some(RepoRevResolution::Resolved { .. }) | None => {}
+    }
+
+    if let RepoPageKind::Landing = page {
+        // `serveRepoLanding`: 301 `/<repo>@<resolved commit>`; a failed
+        // `GetRepoAndRev` is 404 for HTTP errors and 500 otherwise.
+        return match resolved {
+            Some(RepoRevResolution::Resolved { commit }) => app_handlers::redirect(
+                req,
+                &format!("/{repo}@{commit}"),
+                StatusCode::MOVED_PERMANENTLY.as_u16(),
+            ),
+            Some(RepoRevResolution::RevisionNotFound)
+            | Some(RepoRevResolution::RepoNotExist { .. }) => {
+                ui_not_found(env, config, assets)
+            }
+            _ => ui_error_shell(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                env,
+                config,
+                assets,
+            ),
+        };
+    }
+
+    // `serveRepoOrBlob`'s legacy `?q=` redirect (handlers.go:529-550): only
+    // the root and blob routes, and only when no `sq` parameter is present.
+    if matches!(page, RepoPageKind::Root | RepoPageKind::Blob { .. }) {
+        if let Some(location) = legacy_search_redirect(req, repo) {
+            return app_handlers::redirect(req, &location, 308);
+        }
+    }
+
+    let indexed = rev.is_none()
+        && !matches!(page, RepoPageKind::Subroute { indexed: false, .. });
+    let title = repo_page_title(page, repo, config);
+    let input = shell_input(env, config, &manifest, title, indexed);
+    shell_response(&input, StatusCode::OK)
+}
+
+/// `repoShortName` (`handlers.go:92-98`): trim the first path component when
+/// the name has at least two.
+fn repo_short_name(name: &str) -> String {
+    let mut split = name.splitn(2, '/');
+    let _first = split.next().unwrap_or("");
+    match split.next() {
+        Some(rest) => rest.to_owned(),
+        None => name.to_owned(),
+    }
+}
+
+/// `path.Base` for page titles.
+fn go_path_base(path: &str) -> String {
+    if path.is_empty() {
+        return ".".to_owned();
+    }
+    let trimmed = path.trim_end_matches('/');
+    if trimmed.is_empty() {
+        return "/".to_owned();
+    }
+    trimmed
+        .rfind('/')
+        .map(|index| trimmed[index + 1..].to_owned())
+        .unwrap_or_else(|| trimmed.to_owned())
+}
+
+fn repo_page_title(page: &RepoPageKind, repo: &str, config: &AppConfig) -> String {
+    let short = repo_short_name(repo);
+    match page {
+        RepoPageKind::Root => format!("{} - {}", short, config.brand_name),
+        RepoPageKind::Tree { path } | RepoPageKind::Blob { path } => format!(
+            "{} - {} - {}",
+            go_path_base(path),
+            short,
+            config.brand_name
+        ),
+        RepoPageKind::Subroute { title, .. } => {
+            format!("{} - {}", title, config.brand_name)
+        }
+        RepoPageKind::Landing => format!("{} - {}", short, config.brand_name),
+    }
+}
+
+/// `errcode.IsUnauthorized` reduced to the injected error text. The production
+/// PG store never emits it (authz-filtered rows are `NotFound`, exactly like
+/// Go's `repoStore`), so the 401 branch is covered by unit tests only.
+fn is_unauthorized_error(error: &str) -> bool {
+    error.to_ascii_lowercase().contains("unauthorized")
+}
+
+/// `serveError(w, r, ..., statusCode)` for a repository route: the SPA error
+/// shell when the manifest loads, `error.html` otherwise.
+fn ui_error_shell(
+    status: StatusCode,
+    env: &AppEnv,
+    config: &AppConfig,
+    assets: &dyn sg_ui::AssetsProvider,
+) -> Response<BoxBody> {
+    match assets.load_web_build_manifest() {
+        Ok(manifest) => {
+            let title = format!(
+                "{} {} - {}",
+                status.as_u16(),
+                status_text(status.as_u16()),
+                config.brand_name
+            );
+            let input = shell_input(env, config, &manifest, title, false);
+            shell_response(&input, status)
+        }
+        Err(_) => error_page_response(status, None),
+    }
+}
+
+/// `serveRepoOrBlob`'s `?q=` → `/search` 308 (`handlers.go:529-550`).
+fn legacy_search_redirect<B>(req: &Request<B>, repo: &str) -> Option<String> {
+    let query = req.uri().query()?;
+    let pairs: Vec<(String, String)> = url::form_urlencoded::parse(query.as_bytes())
+        .map(|(key, value)| (key.into_owned(), value.into_owned()))
+        .collect();
+    let search = pairs
+        .iter()
+        .find(|(key, _)| key == "q")
+        .map(|(_, value)| value.clone())
+        .unwrap_or_default();
+    if search.is_empty() || pairs.iter().any(|(key, _)| key == "sq") {
+        return None;
+    }
+
+    // `url.Values.Encode`: keys sorted, values in insertion order, `QueryEscape`.
+    let mut values: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
+    for (key, value) in pairs {
+        values.entry(key).or_default().push(value);
+    }
+    values
+        .entry("sq".to_owned())
+        .or_default()
+        .push(format!("repo:^{}$", regexp_quote_meta(repo)));
+    let encoded = values
+        .iter()
+        .flat_map(|(key, values)| {
+            values.iter().map(move |value| {
+                format!("{}={}", go_query_escape(key), go_query_escape(value))
+            })
+        })
+        .collect::<Vec<_>>()
+        .join("&");
+    Some(format!("/search?{encoded}"))
+}
+
+/// `regexp.QuoteMeta` (`regexp/regexp.go`).
+fn regexp_quote_meta(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        if matches!(
+            ch,
+            '\\' | '.' | '+' | '*' | '?' | '(' | ')' | '|' | '[' | ']' | '{' | '}' | '^' | '$'
+        ) {
+            escaped.push('\\');
+        }
+        escaped.push(ch);
+    }
+    escaped
+}
+
+/// `url.QueryEscape`: unreserved characters are `A-Za-z0-9-_.~`; a space
+/// becomes `+`; everything else is `%XX` (upper-case hex).
+fn go_query_escape(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for byte in value.as_bytes() {
+        match *byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                escaped.push(*byte as char)
+            }
+            b' ' => escaped.push('+'),
+            byte => escaped.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    escaped
+}
+
 /// One candidate route that matched the request path.
 struct UiCandidate {
     method: Method,
@@ -525,9 +874,18 @@ enum UiAction {
     PingSelfHosted,
     /// One `/githubapp/` subroute (`githubapp/httpapi.go:64-68`).
     GitHubApp(GitHubAppRoute),
-    /// The repository routes (`router.go:244-330`). The DB/gitserver part is
-    /// not available, so the handler keeps the `ui_not_found` fallback; the
-    /// routing (GET-only, `StrictSlash`) still matches the baseline.
+    /// A repository page/subroute (`router.go:244-330`). The async dispatcher
+    /// resolves the repository and revision against Postgres/gitserver
+    /// ([`serve_ui_async`]); the sync `serve_ui` keeps the historical
+    /// `ui_not_found` fallback when no [`RepoPagesWiring`] is injected.
+    RepoPage {
+        repo: String,
+        rev: Option<String>,
+        page: RepoPageKind,
+    },
+    /// Routes whose handlers are still out of scope here: `/-/raw` (a file
+    /// response, not an SPA shell) and the dotcom-only legacy pages. They keep
+    /// the `ui_not_found` fallback.
     RepoUnavailable,
     /// `http.Redirect` (`net/http/server.go`). `keep_query` mirrors the
     /// baseline handlers that re-serialize `r.URL` (StrictSlash,
@@ -573,7 +931,12 @@ impl UiCandidate {
             UiAction::Embed => empty_response(StatusCode::NOT_FOUND),
             UiAction::PingSelfHosted => serve_ping_from_self_hosted(req, env, config, assets),
             UiAction::GitHubApp(route) => serve_github_app(req, *route, deps),
-            UiAction::RepoUnavailable => ui_not_found(env, config, assets),
+            // The sync entry point cannot query Postgres/gitserver; keep the
+            // M9.8iu differential oracle's 404 for repo pages. The live
+            // dispatcher calls [`serve_ui_async`], which overrides this arm.
+            UiAction::RepoPage { .. } | UiAction::RepoUnavailable => {
+                ui_not_found(env, config, assets)
+            }
             UiAction::Redirect {
                 location,
                 code,
@@ -994,7 +1357,23 @@ fn ui_candidates(path: &str, env: &AppEnv) -> Vec<UiCandidate> {
         }
     }
     if repo_route_like(path) {
+        if let Some((repo, rev)) = parse_repo_rev(path) {
+            return vec![UiCandidate::get(UiAction::RepoPage {
+                repo,
+                rev,
+                page: RepoPageKind::Root,
+            })];
+        }
         return vec![UiCandidate::get(UiAction::RepoUnavailable)];
+    }
+    if let Some((left, rest)) = path.split_once("/-/") {
+        if repo_route_like(left) {
+            if let (Some((repo, rev)), Some(page)) =
+                (parse_repo_rev(left), repo_subroute_page(rest, env))
+            {
+                return vec![UiCandidate::get(UiAction::RepoPage { repo, rev, page })];
+            }
+        }
     }
     if let Some(kind) = repo_subroute_kind(path, env) {
         return match kind {
@@ -1268,6 +1647,66 @@ enum RepoSubroute {
     Get,
 }
 
+/// `routevar.ToRepoRev`: split `/<repo>[@<rev>]` (the repo route's `Repo` +
+/// `Rev` variables; a repo name cannot contain `@`).
+fn parse_repo_rev(path: &str) -> Option<(String, Option<String>)> {
+    let segment = path.strip_prefix('/')?;
+    if segment.is_empty() || !repo_route_like(path) {
+        return None;
+    }
+    match segment.split_once('@') {
+        Some((repo, rev)) if !repo.is_empty() && !rev.is_empty() => {
+            Some((repo.to_owned(), Some(rev.to_owned())))
+        }
+        Some(_) => None,
+        None => Some((segment.to_owned(), None)),
+    }
+}
+
+/// The repository `/-/` subroutes that render the SPA shell (`router.go`).
+/// `raw` (a file response) and the dotcom-only legacy `def`/`refs`/`land`
+/// pages stay out of scope and return `None`.
+fn repo_subroute_page(rest: &str, env: &AppEnv) -> Option<RepoPageKind> {
+    if rest == "raw" || rest.starts_with("raw") {
+        return None;
+    }
+    if let Some(path) = rest.strip_prefix("tree") {
+        return Some(RepoPageKind::Tree {
+            path: path.to_owned(),
+        });
+    }
+    if let Some(path) = rest.strip_prefix("blob") {
+        return Some(RepoPageKind::Blob {
+            path: path.to_owned(),
+        });
+    }
+    // Registration order matters: `/commits` is registered before `/commit`.
+    const BRANDED: &[(&str, &str, bool)] = &[
+        ("batch-changes", "Batch Changes", true),
+        ("settings", "Repository settings", false),
+        ("code-graph", "Code graph", false),
+        ("commits", "Commits", false),
+        ("commit", "Commit", false),
+        ("branches", "Branches", false),
+        ("tags", "Tags", false),
+        ("compare", "Compare", false),
+        ("stats", "Stats", false),
+        ("own", "Ownership", false),
+    ];
+    for (prefix, title, indexed) in BRANDED {
+        if rest.starts_with(prefix) {
+            return Some(RepoPageKind::Subroute {
+                title,
+                indexed: *indexed,
+            });
+        }
+    }
+    if env.dotcom && rest == "info" {
+        return Some(RepoPageKind::Landing);
+    }
+    None
+}
+
 /// `Some` when `path` is `<repo>/-/<known subroute>`. Unknown `/-/` paths do
 /// not match a gorilla route and keep the outer NotFoundHandler.
 fn repo_subroute_kind(path: &str, env: &AppEnv) -> Option<RepoSubroute> {
@@ -1329,6 +1768,7 @@ fn status_text(code: u16) -> &'static str {
         200 => "OK",
         301 => "Moved Permanently",
         307 => "Temporary Redirect",
+        401 => "Unauthorized",
         404 => "Not Found",
         405 => "Method Not Allowed",
         500 => "Internal Server Error",
@@ -1735,5 +2175,264 @@ mod tests {
         assert!(repo_route_like("/foo@master"));
         assert!(!repo_route_like("/nope@@x"));
         assert!(!repo_route_like("/x/-/y"));
+    }
+
+    // -----------------------------------------------------------------
+    // M9.49d: repository page shell (`serve_ui_async`/`newCommon`).
+    // -----------------------------------------------------------------
+
+    use crate::graphql_resolvers::{RepositoryData, RepositoryLookup};
+    use crate::repository_store::{RepoPagesWiring, RepoRevResolver};
+
+    fn repo_data() -> RepositoryData {
+        RepositoryData {
+            id: 1,
+            name: "m949d/repo".to_owned(),
+            uri: "https://example.com/m949d/repo".to_owned(),
+            description: String::new(),
+            fork: false,
+            archived: false,
+            private: false,
+            stars: 0,
+            external_id: String::new(),
+            external_service_type: "other".to_owned(),
+            external_service_id: "m949d".to_owned(),
+        }
+    }
+
+    struct FakeLookup(Result<RepoLookup, String>);
+
+    impl FakeLookup {
+        fn found() -> Self {
+            Self(Ok(RepoLookup::Found(repo_data())))
+        }
+
+        fn result(result: Result<RepoLookup, String>) -> Self {
+            Self(result)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl RepositoryLookup for FakeLookup {
+        async fn lookup(
+            &self,
+            _name_or_uri: &str,
+            _authenticated_user_id: i32,
+            _bypass_authz: bool,
+        ) -> Result<RepoLookup, String> {
+            self.0.clone()
+        }
+
+        async fn by_id(
+            &self,
+            _repo_id: i32,
+            _authenticated_user_id: i32,
+            _bypass_authz: bool,
+        ) -> Result<RepoLookup, String> {
+            self.0.clone()
+        }
+
+        async fn by_hashed_name(
+            &self,
+            _hashed_name: &str,
+            _authenticated_user_id: i32,
+            _bypass_authz: bool,
+        ) -> Result<RepoLookup, String> {
+            self.0.clone()
+        }
+    }
+
+    struct FakeResolver(RepoRevResolution);
+
+    #[async_trait::async_trait]
+    impl RepoRevResolver for FakeResolver {
+        async fn resolve(&self, _repo: &str, _rev: Option<&str>) -> RepoRevResolution {
+            self.0.clone()
+        }
+    }
+
+    fn repo_deps(
+        lookup: FakeLookup,
+        resolver: Option<FakeResolver>,
+        files: &[(&str, &[u8])],
+    ) -> (AppEnv, AppConfig, AppDeps, TestDir) {
+        let (env, config, mut deps, dir) = ui_fixture(files);
+        deps.repo_pages = Some(Arc::new(RepoPagesWiring {
+            repositories: Arc::new(lookup),
+            resolver: resolver
+                .map(|resolver| Arc::new(resolver) as Arc<dyn RepoRevResolver>),
+        }));
+        (env, config, deps, dir)
+    }
+
+    fn resolves() -> Option<FakeResolver> {
+        Some(FakeResolver(RepoRevResolution::Resolved {
+            commit: "abc123".to_owned(),
+        }))
+    }
+
+    async fn get(path: &str, env: &AppEnv, config: &AppConfig, deps: &AppDeps) -> Response<BoxBody> {
+        serve_ui_async(&request(Method::GET, path), path, env, config, deps).await
+    }
+
+    #[tokio::test]
+    async fn repo_page_renders_the_shell_with_go_titles() {
+        let (env, config, deps, _dir) = repo_deps(FakeLookup::found(), resolves(), &[]);
+
+        let response = get("/m949d/repo", &env, &config, &deps).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response.headers().get("x-robots-tag").is_none());
+        let html = String::from_utf8(body(response).await).unwrap();
+        assert!(html.contains("<title>repo - Sourcegraph</title>"), "{html}");
+        assert!(html.contains("<div id=\"root\"></div>"));
+
+        let response = get("/m949d/repo/-/blob/README.md", &env, &config, &deps).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let html = String::from_utf8(body(response).await).unwrap();
+        assert!(
+            html.contains("<title>README.md - repo - Sourcegraph</title>"),
+            "{html}"
+        );
+
+        let response = get("/m949d/repo/-/tree/src", &env, &config, &deps).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let html = String::from_utf8(body(response).await).unwrap();
+        assert!(
+            html.contains("<title>src - repo - Sourcegraph</title>"),
+            "{html}"
+        );
+    }
+
+    #[tokio::test]
+    async fn repo_page_rev_sets_noindex_and_commit_subroute_is_unconditional() {
+        let (env, config, deps, _dir) = repo_deps(FakeLookup::found(), resolves(), &[]);
+
+        let response = get("/m949d/repo@main/-/blob/README.md", &env, &config, &deps).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers().get("x-robots-tag").unwrap(), "noindex");
+
+        // `/commit` is a `brandedNoIndex` shell: no repo/rev lookup in Go.
+        // A `NotFound` lookup proves the subroute never calls `newCommon`.
+        let (env, config, deps, _dir) =
+            repo_deps(FakeLookup::result(Ok(RepoLookup::NotFound)), resolves(), &[]);
+        let response = get("/m949d/repo/-/commit/HEAD", &env, &config, &deps).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers().get("x-robots-tag").unwrap(), "noindex");
+        let html = String::from_utf8(body(response).await).unwrap();
+        assert!(html.contains("<title>Commit - Sourcegraph</title>"), "{html}");
+    }
+
+    #[tokio::test]
+    async fn repo_page_lookup_errors_map_to_404_and_401() {
+        let (env, config, deps, _dir) =
+            repo_deps(FakeLookup::result(Ok(RepoLookup::NotFound)), resolves(), &[]);
+        let response = get("/m949d/repo", &env, &config, &deps).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let html = String::from_utf8(body(response).await).unwrap();
+        assert!(html.contains("<title>404 Not Found - Sourcegraph</title>"));
+
+        let (env, config, deps, _dir) = repo_deps(
+            FakeLookup::result(Ok(RepoLookup::Blocked {
+                name: "m949d/repo".to_owned(),
+                reason: "dmca".to_owned(),
+            })),
+            resolves(),
+            &[],
+        );
+        let response = get("/m949d/repo/-/blob/README.md", &env, &config, &deps).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let (env, config, deps, _dir) = repo_deps(
+            FakeLookup::result(Err("unauthorized: no access".to_owned())),
+            resolves(),
+            &[],
+        );
+        let response = get("/m949d/repo", &env, &config, &deps).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn repo_page_rev_resolution_branches() {
+        // `RevisionNotFound` with an explicit rev → 404 (`serveError`).
+        let (env, config, deps, _dir) = repo_deps(
+            FakeLookup::found(),
+            Some(FakeResolver(RepoRevResolution::RevisionNotFound)),
+            &[],
+        );
+        let response = get("/m949d/repo@nope/-/blob/README.md", &env, &config, &deps).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        // Empty repository with no rev → 200 (`isRepoEmptyError`).
+        let response = get("/m949d/repo", &env, &config, &deps).await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // Clone in progress → 200 (`handlers.go:275`).
+        let (env, config, deps, _dir) = repo_deps(
+            FakeLookup::found(),
+            Some(FakeResolver(RepoRevResolution::RepoNotExist {
+                clone_in_progress: true,
+            })),
+            &[],
+        );
+        let response = get("/m949d/repo/-/tree/src", &env, &config, &deps).await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // Repo missing from gitserver and not cloning → 404.
+        let (env, config, deps, _dir) = repo_deps(
+            FakeLookup::found(),
+            Some(FakeResolver(RepoRevResolution::RepoNotExist {
+                clone_in_progress: false,
+            })),
+            &[],
+        );
+        let response = get("/m949d/repo", &env, &config, &deps).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        // No gitserver configured: an existing repo row stays a 200 shell.
+        let (env, config, deps, _dir) = repo_deps(FakeLookup::found(), None, &[]);
+        let response = get("/m949d/repo@main", &env, &config, &deps).await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn repo_page_legacy_q_redirect_and_sync_fallback() {
+        let (env, config, deps, _dir) = repo_deps(FakeLookup::found(), resolves(), &[]);
+        let response = serve_ui_async(
+            &request(Method::GET, "/m949d/repo/-/blob/README.md?q=M949D_MARKER"),
+            "/m949d/repo/-/blob/README.md",
+            &env,
+            &config,
+            &deps,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::PERMANENT_REDIRECT);
+        assert_eq!(
+            response.headers().get(header::LOCATION).unwrap(),
+            "/search?q=M949D_MARKER&sq=repo%3A%5Em949d%2Frepo%24"
+        );
+
+        // A present `sq` (even empty) suppresses the legacy redirect.
+        let response = serve_ui_async(
+            &request(
+                Method::GET,
+                "/m949d/repo/-/blob/README.md?q=x&sq=",
+            ),
+            "/m949d/repo/-/blob/README.md",
+            &env,
+            &config,
+            &deps,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // The synchronous entry point keeps the offline 404.
+        let response = serve_ui(
+            &request(Method::GET, "/m949d/repo"),
+            "/m949d/repo",
+            &env,
+            &config,
+            &deps,
+        );
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 }

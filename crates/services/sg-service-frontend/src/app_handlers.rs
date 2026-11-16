@@ -392,6 +392,10 @@ pub struct AppDeps {
     /// `/githubapp/*` production wiring (real Redis/Postgres/HTTP). `None`
     /// keeps the offline-deterministic M9.31d branches used by the UI tests.
     pub github_app: Option<Arc<crate::githubapp_http_api::GitHubAppServer>>,
+    /// Repository-page SPA shell wiring (`repoStore.GetByName` + gitserver
+    /// `ResolveRevision`). `None` keeps the offline router/UI tests on the
+    /// historical `ui_not_found` fallback for `/{repo}` style routes.
+    pub repo_pages: Option<Arc<crate::repository_store::RepoPagesWiring>>,
 }
 
 impl AppDeps {
@@ -413,6 +417,7 @@ impl AppDeps {
             more: crate::app_handlers_more::MoreDeps::default(),
             ui_assets: Some(sg_ui::provider()),
             github_app: None,
+            repo_pages: None,
         }
     }
 
@@ -425,6 +430,7 @@ impl AppDeps {
             more: crate::app_handlers_more::MoreDeps::default(),
             ui_assets: None,
             github_app: None,
+            repo_pages: None,
         }
     }
 
@@ -452,6 +458,16 @@ impl AppDeps {
         server: Arc<crate::githubapp_http_api::GitHubAppServer>,
     ) -> Self {
         self.github_app = Some(server);
+        self
+    }
+
+    /// Attach the repository-page shell wiring (M9.49d). Without it the UI
+    /// route keeps the historical `RepoUnavailable` 404 for `/{repo}`.
+    pub fn with_repo_pages(
+        mut self,
+        wiring: crate::repository_store::RepoPagesWiring,
+    ) -> Self {
+        self.repo_pages = Some(Arc::new(wiring));
         self
     }
 }

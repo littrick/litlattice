@@ -300,8 +300,10 @@ pub async fn dispatch_route<B>(
             vars.rev.as_deref().unwrap_or(""),
             vars.path.as_deref().unwrap_or(""),
         ),
-        // `ui.Router()`: static pages, legacy redirects and the SPA shell.
-        RouteName::Ui => crate::ui_assets::serve_ui(req, path, env, config, deps),
+        // `ui.Router()`: static pages, legacy redirects and the SPA shell. The
+        // async entry resolves repository pages against Postgres/gitserver
+        // (`newCommon`); without `AppDeps::repo_pages` it keeps the old 404.
+        RouteName::Ui => crate::ui_assets::serve_ui_async(req, path, env, config, deps).await,
         // Built-in auth handlers are wired per configuration generation; an
         // unwired process (e.g. the router differential) keeps the mux 404.
         RouteName::SignUp => match deps.userpasswd.as_deref() {

@@ -5,10 +5,109 @@
 //! repository permission predicate (`internal/database/repos_perm.go`), and
 //! `repoStore.Get` by ID for `Query.node` (`internal/database/repos.go:145-166`).
 
+use std::collections::HashMap;
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use sqlx::PgPool;
 
 use crate::graphql_resolvers::{RepoLookup, RepositoryData, RepositoryLookup};
+
+/// The repository-page UI's gitserver rev resolution (`backend.Repos.ResolveRev`
+/// → `gitserver.Client.ResolveRevision(EnsureRevision=true)`), reduced to the
+/// outcomes `cmd/frontend/internal/app/ui/handlers.go` branches on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RepoRevResolution {
+    /// The revision (or `HEAD` when none was requested) resolved to a commit.
+    Resolved { commit: String },
+    /// `gitdomain.RevisionNotFoundError` (also the empty-repository case for an
+    /// unqualified `HEAD`).
+    RevisionNotFound,
+    /// `gitdomain.RepoNotExistError`; `clone_in_progress` mirrors
+    /// `gitdomain.IsCloneInProgress` (`RepoNotFoundPayload`).
+    RepoNotExist { clone_in_progress: bool },
+    /// Any other gitserver failure (connection, protocol, …).
+    Error(String),
+}
+
+/// The gitserver half of [`RepoPagesWiring`]. Production uses
+/// [`GitserverRepoRevResolver`]; the UI unit tests inject fakes.
+#[async_trait]
+pub trait RepoRevResolver: Send + Sync {
+    async fn resolve(&self, repo: &str, rev: Option<&str>) -> RepoRevResolution;
+}
+
+/// The dependencies the repository-page SPA shell needs (M9.49d):
+/// `repoStore.GetByName` (with the authz predicate) and gitserver
+/// `ResolveRevision`.
+pub struct RepoPagesWiring {
+    pub repositories: Arc<dyn RepositoryLookup>,
+    /// `None` means no gitserver is configured; the page then stays a 200
+    /// shell for existing repositories instead of being misclassified as 404.
+    pub resolver: Option<Arc<dyn RepoRevResolver>>,
+}
+
+/// Production [`RepoRevResolver`] over the live site configuration's gitserver
+/// shards (the same shard selection as [`crate::git_graphql::GitserverGitObjects`]).
+pub struct GitserverRepoRevResolver {
+    live: Arc<sg_config::LiveConfig>,
+    clients: tokio::sync::Mutex<HashMap<Vec<String>, Arc<sg_git::GitserverClient>>>,
+}
+
+impl GitserverRepoRevResolver {
+    pub fn new(live: Arc<sg_config::LiveConfig>) -> Self {
+        Self {
+            live,
+            clients: tokio::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    async fn client_for(
+        &self,
+        repo: &str,
+    ) -> Result<(Arc<sg_git::GitserverClient>, String), String> {
+        let unified = self.live.current();
+        let addresses = sg_git::addresses::GitserverAddresses::from_unified(&unified);
+        let addr = addresses
+            .addr_for_repo(repo)
+            .ok_or_else(|| "no gitserver configured".to_owned())?
+            .to_owned();
+        let mut clients = self.clients.lock().await;
+        let client = match clients.get(&addresses.addresses) {
+            Some(client) => Arc::clone(client),
+            None => {
+                let client = Arc::new(sg_git::GitserverClient::new(addresses.addresses.clone()));
+                clients.insert(addresses.addresses.clone(), Arc::clone(&client));
+                client
+            }
+        };
+        Ok((client, addr))
+    }
+}
+
+#[async_trait]
+impl RepoRevResolver for GitserverRepoRevResolver {
+    async fn resolve(&self, repo: &str, rev: Option<&str>) -> RepoRevResolution {
+        let (client, addr) = match self.client_for(repo).await {
+            Ok(pair) => pair,
+            Err(error) => return RepoRevResolution::Error(error),
+        };
+        // `backend.Repos.ResolveRev` always passes `EnsureRevision: true` and
+        // leaves the spec empty for the default branch (`ResolveRevision` maps
+        // that to `HEAD`, like the baseline).
+        match client
+            .resolve_revision_at(&addr, repo, rev.unwrap_or(""), true)
+            .await
+        {
+            Ok(commit) => RepoRevResolution::Resolved { commit },
+            Err(sg_git::Error::RevisionNotFound { .. }) => RepoRevResolution::RevisionNotFound,
+            Err(sg_git::Error::RepoNotFound {
+                clone_in_progress, ..
+            }) => RepoRevResolution::RepoNotExist { clone_in_progress },
+            Err(error) => RepoRevResolution::Error(error.to_string()),
+        }
+    }
+}
 
 pub struct PgRepositoryStore {
     pool: PgPool,

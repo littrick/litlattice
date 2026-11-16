@@ -1954,6 +1954,8 @@ impl Service for FrontendService {
                 Some(oauth_factory),
                 Some(saml_factory),
                 Some(chain_pool.clone()),
+                // M9.49d: repository-page shell (`newCommon`) DB wiring.
+                Some(chain_pool.clone()),
                 github_app,
                 self.version.bytes(),
                 blame_deps,
