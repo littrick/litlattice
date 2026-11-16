@@ -352,6 +352,9 @@ pub struct ShellInput<'a> {
     /// `(as, href)` preload pairs (`Common.PreloadedAssets`).
     pub preloads: Vec<(String, String)>,
     pub indexed: bool,
+    /// `Common.Context` (`window.context`). `None` keeps the offline shell's
+    /// historical `window.context = {}` (no database in sync tests).
+    pub js_context: Option<&'a crate::jscontext::JsContext>,
 }
 
 impl ShellInput<'_> {
@@ -361,10 +364,11 @@ impl ShellInput<'_> {
 }
 
 /// Render the `app.html` SPA shell (`cmd/frontend/internal/app/ui/app.html`)
-/// for the fields this slice owns: title, hashed bundles and preloads.
+/// for the fields this slice owns: title, hashed bundles, preloads and
+/// `window.context`.
 ///
-/// The full `JSContext`/injected HTML/SvelteKit payloads are follow-up slices;
-/// `window.context` is left as an empty object.
+/// `window.context = {{.Context}}` (`app.html:67`) is emitted with
+/// `html/template`'s JS escaping; an absent context keeps `{}`.
 pub fn render_shell(input: &ShellInput<'_>) -> String {
     let mut html = String::new();
     html.push_str("<!doctype html>\n<html lang=\"en\" class=\"base\">\n\n<head>\n");
@@ -395,7 +399,14 @@ pub fn render_shell(input: &ShellInput<'_>) -> String {
         ));
     }
     html.push_str("\t<script ignore-csp>\n");
-    html.push_str("\t\twindow.context = {}\n");
+    match input.js_context {
+        Some(context) => {
+            html.push_str("\t\twindow.context = ");
+            html.push_str(&context.json_for_script());
+            html.push('\n');
+        }
+        None => html.push_str("\t\twindow.context = {}\n"),
+    }
     html.push_str("\t\twindow.pageError = null\n");
     html.push_str("\t</script>\n");
     html.push_str("</head>\n\n<body>\n\t<div id=\"root\"></div>\n");
@@ -496,13 +507,42 @@ pub fn serve_ui<B>(
             method_mismatch = true;
             continue;
         }
-        return candidate.serve(req, env, config, assets, deps);
+        return candidate.serve(req, env, config, assets, deps, None);
     }
     if method_mismatch {
         // `gorilla/mux`'s `methodNotAllowedHandler`: an empty 405.
         return empty_response(StatusCode::METHOD_NOT_ALLOWED);
     }
-    ui_not_found(env, config, assets)
+    ui_not_found(env, config, assets, None)
+}
+
+/// Per-request inputs for [`crate::jscontext::new_js_context`].
+fn js_context_meta<B>(req: &Request<B>) -> crate::jscontext::RequestMeta<'_> {
+    let headers = req.headers();
+    crate::jscontext::RequestMeta {
+        user_agent: headers
+            .get(header::USER_AGENT)
+            .and_then(|value| value.to_str().ok()),
+        cache_control: headers
+            .get(header::CACHE_CONTROL)
+            .and_then(|value| value.to_str().ok()),
+        from_session_cookie: crate::actor_middleware::session_cookie(headers).is_some(),
+    }
+}
+
+/// Builds `window.context` when the frontend pool is wired (`AppDeps::
+/// with_js_context_pool`). Without it the shell keeps `window.context = {}`.
+async fn build_js_context<B>(
+    req: &Request<B>,
+    env: &AppEnv,
+    config: &AppConfig,
+    deps: &AppDeps,
+) -> Option<crate::jscontext::JsContext> {
+    let pool = deps.js_context_pool.as_ref()?;
+    Some(
+        crate::jscontext::new_js_context(pool, deps.more.actor, js_context_meta(req), env, config)
+            .await,
+    )
 }
 
 /// Async `RouteName::Ui` dispatch (M9.49d). It is identical to [`serve_ui`]
@@ -526,6 +566,10 @@ pub async fn serve_ui_async<B>(
         return clean_path_redirect(req, &cleaned);
     }
 
+    // `newCommon` builds the same context for every routed page, repo or not
+    // (handlers.go:193), so `/search` and repository shells share it.
+    let js_context = build_js_context(req, env, config, deps).await;
+
     let candidates = ui_candidates(path, env);
     let mut method_mismatch = false;
     for candidate in candidates {
@@ -543,15 +587,16 @@ pub async fn serve_ui_async<B>(
                 repo,
                 rev.as_deref(),
                 page,
+                js_context.as_ref(),
             )
             .await;
         }
-        return candidate.serve(req, env, config, assets, deps);
+        return candidate.serve(req, env, config, assets, deps, js_context.as_ref());
     }
     if method_mismatch {
         return empty_response(StatusCode::METHOD_NOT_ALLOWED);
     }
-    ui_not_found(env, config, assets)
+    ui_not_found(env, config, assets, js_context.as_ref())
 }
 
 /// The repository route's page kind, mirroring the gorilla route table
@@ -583,11 +628,12 @@ async fn serve_repo_page<B>(
     repo: &str,
     rev: Option<&str>,
     page: &RepoPageKind,
+    js_context: Option<&crate::jscontext::JsContext>,
 ) -> Response<BoxBody> {
     // Without production wiring the async path keeps the historical 404, so
     // the offline router/UI differentials stay byte-identical.
     let Some(wiring) = deps.repo_pages.as_deref() else {
-        return ui_not_found(env, config, assets);
+        return ui_not_found(env, config, assets, js_context);
     };
 
     // `newCommon` loads the manifest first: a missing/broken manifest is a
@@ -605,7 +651,7 @@ async fn serve_repo_page<B>(
         let indexed = rev.is_none()
             && !matches!(page, RepoPageKind::Subroute { indexed: false, .. });
         let title = repo_page_title(page, repo, config);
-        let input = shell_input(env, config, &manifest, title, indexed);
+        let input = shell_input(env, config, &manifest, title, indexed, js_context);
         return shell_response(&input, StatusCode::OK);
     }
 
@@ -630,7 +676,13 @@ async fn serve_repo_page<B>(
         // maps authz-filtered rows to `NotFound` (Go's repoStore behaves the
         // same), so this branch is only reachable through an injected error.
         Err(error) if is_unauthorized_error(&error) => {
-            return ui_error_shell(StatusCode::UNAUTHORIZED, env, config, assets);
+            return ui_error_shell(
+                StatusCode::UNAUTHORIZED,
+                env,
+                config,
+                assets,
+                js_context,
+            );
         }
         Err(error) => {
             let shown = env.insecure_dev.then_some(error.as_str());
@@ -641,14 +693,20 @@ async fn serve_repo_page<B>(
         RepoLookup::Found(_) => {}
         // errcode.IsNotFound / errcode.IsBlocked → 404 (`handlers.go:279-283`).
         RepoLookup::NotFound | RepoLookup::Blocked { .. } => {
-            return ui_not_found(env, config, assets);
+            return ui_not_found(env, config, assets, js_context);
         }
         // `URLMovedError` is not modelled by `PgRepositoryStore` (it returns
         // the canonical row); a see-other redirect is also outside this slice.
-        RepoLookup::Redirect { .. } => return ui_not_found(env, config, assets),
+        RepoLookup::Redirect { .. } => return ui_not_found(env, config, assets, js_context),
         RepoLookup::Error(error) => {
             if is_unauthorized_error(&error) {
-                return ui_error_shell(StatusCode::UNAUTHORIZED, env, config, assets);
+                return ui_error_shell(
+                    StatusCode::UNAUTHORIZED,
+                    env,
+                    config,
+                    assets,
+                    js_context,
+                );
             }
             let shown = env.insecure_dev.then_some(error.as_str());
             return error_page_response(StatusCode::INTERNAL_SERVER_ERROR, shown);
@@ -664,7 +722,7 @@ async fn serve_repo_page<B>(
     match &resolved {
         Some(RepoRevResolution::RevisionNotFound) if rev.is_some() => {
             // `errors.HasType[*gitdomain.RevisionNotFoundError]` → 404.
-            return ui_not_found(env, config, assets);
+            return ui_not_found(env, config, assets, js_context);
         }
         // `isRepoEmptyError`: no explicit rev + RevisionNotFound → 200.
         Some(RepoRevResolution::RevisionNotFound) => {}
@@ -673,7 +731,7 @@ async fn serve_repo_page<B>(
             clone_in_progress: true,
         }) => {}
         Some(RepoRevResolution::RepoNotExist { .. }) => {
-            return ui_not_found(env, config, assets);
+            return ui_not_found(env, config, assets, js_context);
         }
         Some(RepoRevResolution::Error(error)) => {
             let shown = env.insecure_dev.then_some(error.as_str());
@@ -693,13 +751,14 @@ async fn serve_repo_page<B>(
             ),
             Some(RepoRevResolution::RevisionNotFound)
             | Some(RepoRevResolution::RepoNotExist { .. }) => {
-                ui_not_found(env, config, assets)
+                ui_not_found(env, config, assets, js_context)
             }
             _ => ui_error_shell(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 env,
                 config,
                 assets,
+                js_context,
             ),
         };
     }
@@ -715,7 +774,7 @@ async fn serve_repo_page<B>(
     let indexed = rev.is_none()
         && !matches!(page, RepoPageKind::Subroute { indexed: false, .. });
     let title = repo_page_title(page, repo, config);
-    let input = shell_input(env, config, &manifest, title, indexed);
+    let input = shell_input(env, config, &manifest, title, indexed, js_context);
     shell_response(&input, StatusCode::OK)
 }
 
@@ -776,6 +835,7 @@ fn ui_error_shell(
     env: &AppEnv,
     config: &AppConfig,
     assets: &dyn sg_ui::AssetsProvider,
+    js_context: Option<&crate::jscontext::JsContext>,
 ) -> Response<BoxBody> {
     match assets.load_web_build_manifest() {
         Ok(manifest) => {
@@ -785,7 +845,7 @@ fn ui_error_shell(
                 status_text(status.as_u16()),
                 config.brand_name
             );
-            let input = shell_input(env, config, &manifest, title, false);
+            let input = shell_input(env, config, &manifest, title, false, js_context);
             shell_response(&input, status)
         }
         Err(_) => error_page_response(status, None),
@@ -921,12 +981,21 @@ impl UiCandidate {
         config: &AppConfig,
         assets: &dyn sg_ui::AssetsProvider,
         deps: &AppDeps,
+        js_context: Option<&crate::jscontext::JsContext>,
     ) -> Response<BoxBody> {
         match &self.action {
             UiAction::Home => serve_home(req, env, config, assets),
             UiAction::Search => {
                 let title = search_title(req, config);
-                shell_with_manifest(env, config, assets, title, true, StatusCode::OK)
+                shell_with_manifest(
+                    env,
+                    config,
+                    assets,
+                    title,
+                    true,
+                    StatusCode::OK,
+                    js_context,
+                )
             }
             UiAction::Shell { title, indexed } => shell_with_manifest(
                 env,
@@ -935,6 +1004,7 @@ impl UiCandidate {
                 format!("{} - {}", title, config.brand_name),
                 *indexed,
                 StatusCode::OK,
+                js_context,
             ),
             UiAction::Embed => empty_response(StatusCode::NOT_FOUND),
             UiAction::PingSelfHosted => serve_ping_from_self_hosted(req, env, config, assets),
@@ -943,7 +1013,7 @@ impl UiCandidate {
             // M9.8iu differential oracle's 404 for repo pages. The live
             // dispatcher calls [`serve_ui_async`], which overrides this arm.
             UiAction::RepoPage { .. } | UiAction::RepoUnavailable => {
-                ui_not_found(env, config, assets)
+                ui_not_found(env, config, assets, js_context)
             }
             UiAction::Redirect {
                 location,
@@ -991,12 +1061,13 @@ fn shell_with_manifest(
     title: String,
     indexed: bool,
     status: StatusCode,
+    js_context: Option<&crate::jscontext::JsContext>,
 ) -> Response<BoxBody> {
     let manifest = match assets.load_web_build_manifest() {
         Ok(manifest) => manifest,
         Err(error) => return manifest_error_response(env, config, &error),
     };
-    let input = shell_input(env, config, &manifest, title, indexed);
+    let input = shell_input(env, config, &manifest, title, indexed, js_context);
     shell_response(&input, status)
 }
 
@@ -1016,11 +1087,12 @@ fn ui_not_found(
     env: &AppEnv,
     config: &AppConfig,
     assets: &dyn sg_ui::AssetsProvider,
+    js_context: Option<&crate::jscontext::JsContext>,
 ) -> Response<BoxBody> {
     match assets.load_web_build_manifest() {
         Ok(manifest) => {
             let title = format!("404 Not Found - {}", config.brand_name);
-            let input = shell_input(env, config, &manifest, title, true);
+            let input = shell_input(env, config, &manifest, title, true, js_context);
             shell_response(&input, StatusCode::NOT_FOUND)
         }
         Err(_) => error_page_response(StatusCode::NOT_FOUND, None),
@@ -1033,6 +1105,7 @@ fn shell_input<'a>(
     manifest: &'a WebBuildManifest,
     title: String,
     indexed: bool,
+    js_context: Option<&'a crate::jscontext::JsContext>,
 ) -> ShellInput<'a> {
     // `newCommon`: the default mark is preloaded unless custom branding defines
     // a light or dark logo.
@@ -1053,6 +1126,7 @@ fn shell_input<'a>(
         assets_root: &env.assets_root,
         preloads,
         indexed,
+        js_context,
     }
 }
 

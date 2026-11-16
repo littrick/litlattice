@@ -126,6 +126,11 @@ pub struct AppConfig {
     /// `branding.light != nil || branding.dark != nil` — suppresses the
     /// default mark preload in `newCommon`.
     pub branding_has_theme: bool,
+    /// The raw site configuration as JSON (`conf.Get()`). The `window.context`
+    /// builder reads the fields `AppConfig` does not project (auth providers,
+    /// policies, feature flags, …); `site` is still trimmed to the public
+    /// subset by `jscontext::public_site_configuration`.
+    pub site_raw: String,
 }
 
 impl Default for AppConfig {
@@ -136,6 +141,7 @@ impl Default for AppConfig {
             cors_origin: String::new(),
             brand_name: "Sourcegraph".to_owned(),
             branding_has_theme: false,
+            site_raw: "{}".to_owned(),
         }
     }
 }
@@ -178,6 +184,7 @@ impl AppConfig {
             cors_origin,
             brand_name,
             branding_has_theme,
+            site_raw: serde_json::to_string(raw).unwrap_or_else(|_| "{}".to_owned()),
         }
     }
 
@@ -396,6 +403,9 @@ pub struct AppDeps {
     /// `ResolveRevision`). `None` keeps the offline router/UI tests on the
     /// historical `ui_not_found` fallback for `/{repo}` style routes.
     pub repo_pages: Option<Arc<crate::repository_store::RepoPagesWiring>>,
+    /// Frontend Postgres pool for the `window.context` user/site reads
+    /// (`jscontext`). `None` keeps the offline shell on `window.context = {}`.
+    pub js_context_pool: Option<sqlx::PgPool>,
 }
 
 impl AppDeps {
@@ -420,6 +430,7 @@ impl AppDeps {
             ui_assets: Some(sg_ui::provider()),
             github_app: None,
             repo_pages: None,
+            js_context_pool: None,
         }
     }
 
@@ -433,7 +444,14 @@ impl AppDeps {
             ui_assets: None,
             github_app: None,
             repo_pages: None,
+            js_context_pool: None,
         }
+    }
+
+    /// Attach the frontend pool used to build `window.context` per request.
+    pub fn with_js_context_pool(mut self, pool: sqlx::PgPool) -> Self {
+        self.js_context_pool = Some(pool);
+        self
     }
 
     /// Attach the per-generation sign-out wiring.
