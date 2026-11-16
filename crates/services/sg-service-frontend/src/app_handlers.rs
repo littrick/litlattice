@@ -402,8 +402,10 @@ impl AppDeps {
         // `WEB_BUILDER_DEV_SERVER` switch is `shared/service.go:24-26`.
         if !sg_ui::is_configured() {
             // The process never called `sg_ui::init()` (tests, embedders):
-            // keep the historical path-based default rather than failing the
-            // UI route outright.
+            // install the same `/assets-dist` DirProvider Go's `assets.Init()`
+            // does. A missing manifest is then the shell's 500, not a silent
+            // embedded fallback; `SG_UI_EMBEDDED_ASSETS=1` is the explicit
+            // opt-in for checkout-only runs.
             sg_ui::init_from_env();
         }
         Self {

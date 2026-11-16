@@ -587,20 +587,43 @@ pub fn set_provider(provider: Arc<dyn AssetsProvider>) {
     CONFIGURED.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// `assets.Init()` (`ui/assets/assets.go:19-21`, called from
-/// `cmd/frontend/main.go:11`).
+/// Rust-only opt-in for the compiled-in tree, used by source checkouts with no
+/// web build on disk.
 ///
-/// The baseline always installs a [`DirProvider`] for [`DEFAULT_ASSET_PATH`]
-/// because Bazel bakes `/assets-dist` into the image. This crate ships the
-/// same tree as [`EMBEDDED_ASSETS`]; a real `/assets-dist` directory (official
-/// container, operator override) still wins, otherwise the compiled-in
-/// provider is installed.
+/// The baseline has no equivalent: the `sourcegraph/server` image always ships
+/// `/assets-dist` (at minimum the `//client/web/dist:tar_dummy_manifest` `{}`
+/// manifest), so `assets.Init()` always installs a `DirProvider`. Setting
+/// `SG_UI_EMBEDDED_ASSETS=1` makes [`init_from_env`] emulate that image layout
+/// without a disk directory. When unset, [`init`] follows the baseline and
+/// always installs the on-disk provider; a missing `web.manifest.json` then
+/// makes the SPA shell answer 500, exactly like Go.
+pub const EMBEDDED_ASSETS_ENV: &str = "SG_UI_EMBEDDED_ASSETS";
+
+/// `assets.Init()` (`ui/assets/assets.go:19-21`, called from
+/// `cmd/frontend/main.go:11` and `cmd/server/main.go`).
+///
+/// Always installs a [`DirProvider`] for [`DEFAULT_ASSET_PATH`], matching the
+/// baseline. Go does not check whether the directory or `web.manifest.json`
+/// exists at startup: a missing manifest is reported by
+/// `LoadWebBuildManifest` when a shell is rendered, which is a 500 response.
+///
+/// The earlier Rust port instead silently installed [`EMBEDDED_ASSETS`]
+/// (manifest `{}`) when `/assets-dist` was absent. That difference mattered
+/// only when no disk assets were packaged, and it hid a broken image (a shell
+/// that boots with no bundles). It is now an explicit opt-in through
+/// [`init_embedded`] / [`EMBEDDED_ASSETS_ENV`] and is recorded as
+/// `KNOWN_DIFF` in the M9.49b overview.
 pub fn init() {
-    if Path::new(DEFAULT_ASSET_PATH).is_dir() {
-        use_assets_provider_for_path(DEFAULT_ASSET_PATH);
-    } else {
-        use_embedded_assets_provider();
-    }
+    use_assets_provider_for_path(DEFAULT_ASSET_PATH);
+}
+
+/// Install the compiled-in provider ([`EMBEDDED_ASSETS`], manifest `{}`).
+///
+/// This reproduces the baseline image's `no_client_bundle.image` layout: the
+/// directory exists and carries a valid dummy manifest, so the SPA shell is a
+/// 200 without hashed bundle URLs. It is not the production default.
+pub fn init_embedded() {
+    use_embedded_assets_provider();
 }
 
 /// Install the compiled-in provider ([`EMBEDDED_ASSETS`]).
@@ -621,9 +644,17 @@ pub fn use_assets_provider_for_path(path: impl Into<PathBuf>) {
 
 /// The shared `cmd/frontend/shared/service.go:24-26` choice: dev assets when
 /// `WEB_BUILDER_DEV_SERVER=1`, otherwise the binary's default path.
+///
+/// Rust adds one explicit seam on top of the baseline: `SG_UI_EMBEDDED_ASSETS=1`
+/// selects the compiled-in tree instead (see [`EMBEDDED_ASSETS_ENV`]). This is
+/// used by source checkouts/tests that have no `client/web/dist`; production
+/// (`bins/server`, the frontend service) leaves it unset and gets Go's
+/// `DirProvider` → 500-on-missing-manifest semantics.
 pub fn init_from_env() {
     if std::env::var("WEB_BUILDER_DEV_SERVER").as_deref() == Ok("1") {
         use_dev_assets_provider();
+    } else if std::env::var(EMBEDDED_ASSETS_ENV).as_deref() == Ok("1") {
+        init_embedded();
     } else {
         init();
     }

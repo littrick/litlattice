@@ -10,8 +10,10 @@
 #[tokio::main]
 async fn main() {
     // Baseline `cmd/server/main.go`: `assets.Init(); sanitycheck.Pass()`.
-    // `sg_ui::init()` prefers a real `/assets-dist` and otherwise installs the
-    // compiled-in tree.
+    // `sg_ui::init()` installs the `/assets-dist` DirProvider, exactly like Go;
+    // a missing manifest surfaces as the UI shell's 500 rather than silently
+    // falling back to the embedded dummy manifest. Set `SG_UI_EMBEDDED_ASSETS=1`
+    // to opt into the compiled-in tree for source checkouts without a build.
     sg_ui::init();
     sg_core::sanity_check();
 
