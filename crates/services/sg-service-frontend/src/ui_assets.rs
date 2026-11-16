@@ -1601,6 +1601,84 @@ mod tests {
         );
     }
 
+    /// M9.49b: Go always installs a `DirProvider`; when `/assets-dist` has no
+    /// `web.manifest.json`, `newCommon` fails and the shell is a 500. The Rust
+    /// `sg_ui::init()` now does the same, and this pins the HTTP-level result.
+    #[tokio::test]
+    async fn dir_provider_without_manifest_renders_a_500_shell() {
+        let dir = TestDir::new("m949b_no_manifest");
+        let assets = sg_ui::UiAssets::for_path(dir.path());
+        let deps = AppDeps {
+            ui_assets: Some(Arc::new(assets) as Arc<dyn sg_ui::AssetsProvider>),
+            ..AppDeps::default()
+        };
+        let response = serve_ui(
+            &request(Method::GET, "/search"),
+            "/search",
+            &AppEnv::default(),
+            &AppConfig::default(),
+            &deps,
+        );
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "text/html; charset=utf-8"
+        );
+        let html = String::from_utf8(body(response).await).unwrap();
+        assert!(
+            html.contains("<title>500 Internal Server Error - Sourcegraph</title>"),
+            "{html}"
+        );
+    }
+
+    /// The explicit Rust-only embedded opt-in (`EMBEDDED_ASSETS = {}`) is the
+    /// `no_client_bundle.image` layout: a valid dummy manifest renders a 200
+    /// shell with no hashed bundle URLs.
+    #[tokio::test]
+    async fn embedded_dummy_manifest_renders_a_200_shell_without_bundles() {
+        let deps = AppDeps {
+            ui_assets: Some(Arc::new(sg_ui::EmbeddedProvider::new())
+                as Arc<dyn sg_ui::AssetsProvider>),
+            ..AppDeps::default()
+        };
+        let response = serve_ui(
+            &request(Method::GET, "/search"),
+            "/search",
+            &AppEnv::default(),
+            &AppConfig::default(),
+            &deps,
+        );
+        assert_eq!(response.status(), StatusCode::OK);
+        let html = String::from_utf8(body(response).await).unwrap();
+        assert!(html.contains("<title>Sourcegraph</title>"), "{html}");
+        assert!(!html.contains("main.abc.js"), "{html}");
+        assert!(!html.contains("main.def.css"), "{html}");
+    }
+
+    /// A real (fixture) manifest bundled with hashed names is the production
+    /// success path: 200 shell that references the hashed bundles.
+    #[tokio::test]
+    async fn fixture_manifest_renders_a_200_shell_with_hashed_bundles() {
+        let (env, config, deps, _dir) = ui_fixture(&[]);
+        let response = serve_ui(
+            &request(Method::GET, "/search"),
+            "/search",
+            &env,
+            &config,
+            &deps,
+        );
+        assert_eq!(response.status(), StatusCode::OK);
+        let html = String::from_utf8(body(response).await).unwrap();
+        assert!(
+            html.contains("href=\"/.assets/main.def.css\""),
+            "{html}"
+        );
+        assert!(
+            html.contains("src=\"/.assets/main.abc.js\" type=\"module\""),
+            "{html}"
+        );
+    }
+
     #[tokio::test]
     async fn method_mismatch_is_an_empty_405() {
         let (env, config, deps, _dir) = ui_fixture(&[]);
