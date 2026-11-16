@@ -382,6 +382,7 @@ fn assemble_inner(
                 db: Arc::new(PgRepoResolverDb {
                     pool: pool.clone(),
                     search_contexts: Arc::new(PgSearchContextsStore::new(pool.clone())),
+                    enforce_for_site_admins: site.authz_enforce_for_site_admins(),
                 }),
                 gitserver: Arc::new(GitResolverGitserver {
                     client: Arc::clone(&gitserver),
@@ -473,6 +474,7 @@ pub fn assemble_exhaustive_with_encryption_key(
         db: Arc::new(PgRepoResolverDb {
             pool: pool.clone(),
             search_contexts: Arc::new(PgSearchContextsStore::new(pool.clone())),
+            enforce_for_site_admins: site.authz_enforce_for_site_admins(),
         }),
         gitserver: Arc::new(GitResolverGitserver {
             client: Arc::clone(&gitserver),
@@ -512,6 +514,10 @@ pub fn assemble_exhaustive_with_encryption_key(
 struct PgRepoResolverDb {
     pool: PgPool,
     search_contexts: Arc<PgSearchContextsStore>,
+    /// `conf.Get().AuthzEnforceForSiteAdmins`, snapshotted when the runtime
+    /// is assembled (the baseline reads it per query; the frontend rebuilds
+    /// the runtime on generation changes).
+    enforce_for_site_admins: bool,
 }
 
 impl crate::search_repos::RepoResolverDb for PgRepoResolverDb {
@@ -533,7 +539,10 @@ impl crate::search_repos::RepoResolverDb for PgRepoResolverDb {
         options: &db_repos::RepoListOptions,
     ) -> Result<Vec<db_repos::RepoListItem>, JobError> {
         let pool = self.pool.clone();
-        let options = options.clone();
+        let mut options = options.clone();
+        // `GetAuthzQueryParameters`'s `conf.Get().AuthzEnforceForSiteAdmins`
+        // (`internal/database/repos_perm.go:34`).
+        options.authz_enforce_for_site_admins = self.enforce_for_site_admins;
         run_to_completion(async move { db_repos::list_minimal_repos(&pool, &options).await })
             .map_err(|error| JobError(error.to_string()))
     }
@@ -807,6 +816,7 @@ pub fn assemble_commit_search_with_encryption_key(
         db: Arc::new(PgRepoResolverDb {
             pool: pool.clone(),
             search_contexts: Arc::new(PgSearchContextsStore::new(pool.clone())),
+            enforce_for_site_admins: site.authz_enforce_for_site_admins(),
         }),
         gitserver: Arc::new(GitResolverGitserver {
             client: Arc::clone(&gitserver),

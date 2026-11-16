@@ -195,6 +195,13 @@ pub fn repo_list_options(
             RepoListSort::stars_desc_nulls_last(),
             RepoListSort::id_desc(),
         ],
+        // `AuthzQueryConds` reads the request actor (`ResolveOptions`
+        // carries `actor.FromContext(ctx)`). The production DB adapter
+        // overrides `authz_enforce_for_site_admins` from the live site
+        // configuration; `false` is Go's default.
+        authz_actor_uid: options.request_context.actor_uid,
+        authz_internal: options.request_context.internal,
+        authz_enforce_for_site_admins: false,
     }
 }
 
