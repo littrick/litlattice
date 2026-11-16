@@ -198,6 +198,7 @@ pub mod temporary_settings;
 pub mod tenant;
 pub mod trace_headers;
 pub mod trace_policy;
+pub mod jscontext;
 pub mod ui_assets;
 pub mod user_admin_graphql;
 pub mod user_emails_graphql;
