@@ -454,6 +454,9 @@ pub fn external_handler_with_live(
     // PostgreSQL pool for the per-request verify-email store (its
     // `conf.Get()` values are read from the live configuration).
     verify_email_pool: Option<sqlx::PgPool>,
+    // PostgreSQL pool for the repository-page shell's `repoStore.GetByName`
+    // (`newCommon`, M9.49d). `None` keeps the offline 404 fallback.
+    repo_pages_pool: Option<sqlx::PgPool>,
     // Production `/githubapp/*` wiring (real Redis/Postgres/HTTP), built once
     // by the caller; `None` keeps the offline M9.31d branches.
     github_app: Option<Arc<crate::githubapp_http_api::GitHubAppServer>>,
@@ -472,10 +475,23 @@ pub fn external_handler_with_live(
     let app_env = Arc::new(AppEnv::from_env());
     let app_deps = {
         let deps = AppDeps::production();
-        Arc::new(match github_app {
+        let deps = match github_app {
             Some(server) => deps.with_github_app(server),
             None => deps,
-        })
+        };
+        // M9.49d: `newCommon`'s repo lookup + gitserver rev resolution.
+        let deps = match repo_pages_pool {
+            Some(pool) => deps.with_repo_pages(crate::repository_store::RepoPagesWiring {
+                repositories: Arc::new(
+                    crate::repository_store::PgRepositoryStore::new(pool),
+                ),
+                resolver: Some(Arc::new(
+                    crate::repository_store::GitserverRepoRevResolver::new(Arc::clone(&live)),
+                )),
+            }),
+            None => deps,
+        };
+        Arc::new(deps)
     };
     let middleware = Arc::new(LiveMiddleware::new(
         live,
