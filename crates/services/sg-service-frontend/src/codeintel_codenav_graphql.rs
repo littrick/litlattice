@@ -1105,6 +1105,37 @@ impl ObjectValue for LocationConnectionObject {
     }
 }
 
+/// `Markdown` (`schema.graphql:2737`; Go `resolverstubs.Markdown`).
+///
+/// Go serializes hover text as an object with `text`/`html`, not as a bare
+/// string, so `hover { markdown }` must select the `text` subfield.
+#[derive(Clone)]
+pub struct MarkdownObject {
+    pub text: String,
+}
+
+impl ObjectValue for MarkdownObject {
+    fn type_name(&self) -> &'static str {
+        "Markdown"
+    }
+
+    fn field(
+        &self,
+        field: &str,
+        _arguments: &Arguments,
+        _actor: Actor,
+    ) -> Result<Option<FieldValue>, ExecError> {
+        match field {
+            "text" => Ok(Some(string_field(self.text.clone()))),
+            "html" => Ok(Some(string_field(
+                crate::search_graphql::markdown_html(&self.text)
+                    .map_err(|message| ExecError::new(message.as_str()))?,
+            ))),
+            _ => Ok(None),
+        }
+    }
+}
+
 /// `Hover`.
 #[derive(Clone)]
 pub struct HoverObject {
@@ -1124,7 +1155,9 @@ impl ObjectValue for HoverObject {
         _actor: Actor,
     ) -> Result<Option<FieldValue>, ExecError> {
         match field {
-            "markdown" => Ok(Some(string_field(self.markdown.clone()))),
+            "markdown" => Ok(Some(FieldValue::Object(Arc::new(MarkdownObject {
+                text: self.markdown.clone(),
+            })))),
             "range" => Ok(Some(FieldValue::Object(Arc::new(RangeObject {
                 range: self.range,
             })))),
@@ -1827,18 +1860,20 @@ impl GitBlobLSIFDataObject {
         upload: &UploadRecord,
         kind: UsageKind,
     ) -> Result<Vec<UploadLocation>, String> {
-        let mut locations = Vec::new();
-        for usage in usages {
-            let Some(adjusted) = self.adjust_range(upload, usage.range)? else {
-                continue;
-            };
-            locations.push(UploadLocation {
+        // `document()` translates every occurrence into the requested commit
+        // (Go's `Service.SCIPDocument`), exactly like Go's
+        // `getUploadLocations`/`getSourceRange`, which translate once from the
+        // indexed document. Translating again here would double-shift ranges
+        // for uploads from an ancestor commit.
+        let locations = usages
+            .into_iter()
+            .map(|usage| UploadLocation {
                 upload: upload.clone(),
                 path: self.path.clone(),
                 target_commit: self.commit.clone(),
-                range: adjusted,
-            });
-        }
+                range: usage.range,
+            })
+            .collect();
         let _ = kind;
         Ok(sort_and_dedup_locations(locations))
     }
@@ -1861,13 +1896,13 @@ impl ObjectValue for GitBlobLSIFDataObject {
                 let mut ranges = Vec::new();
                 for upload in &self.uploads {
                     if let Some(document) = self.document(upload).map_err(ExecError::new)? {
-                        for range in get_stencil(&document) {
-                            if let Some(adjusted) =
-                                self.adjust_range(upload, range).map_err(ExecError::new)?
-                            {
-                                ranges.push(adjusted);
-                            }
-                        }
+                        // `document()` already translated the occurrences into the
+                        // requested commit (`Service.SCIPDocument`), so the
+                        // stencil ranges are target-commit ranges. Translating
+                        // them again would shift them twice (Go
+                        // `GetStencil` -> `getSourceRange` translates exactly
+                        // once from the indexed document).
+                        ranges.extend(get_stencil(&document));
                     }
                 }
                 Ok(Some(FieldValue::List {
@@ -1890,11 +1925,7 @@ impl ObjectValue for GitBlobLSIFDataObject {
                         continue;
                     };
                     for range in get_ranges(&document, start_line, end_line) {
-                        let Some(adjusted) =
-                            self.adjust_range(upload, range.range).map_err(ExecError::new)?
-                        else {
-                            continue;
-                        };
+                        // The document is already in target-commit coordinates.
                         let definitions = self
                             .upload_usage_locations(
                                 range.definitions,
@@ -1917,7 +1948,7 @@ impl ObjectValue for GitBlobLSIFDataObject {
                             )
                             .map_err(ExecError::new)?;
                         nodes.push(CodeIntelligenceRangeObject {
-                            range: adjusted,
+                            range: range.range,
                             definitions: definitions
                                 .iter()
                                 .map(location_from_upload_location)
@@ -1955,17 +1986,13 @@ impl ObjectValue for GitBlobLSIFDataObject {
                                     continue;
                                 }
                             }
-                            let Some(adjusted) = self
-                                .adjust_range(upload, builder.range)
-                                .map_err(ExecError::new)?
-                            else {
-                                continue;
-                            };
+                            // `document()` already translated the occurrence
+                            // ranges into the requested commit.
                             all.push(UploadLocation {
                                 upload: upload.clone(),
                                 path: self.path.clone(),
                                 target_commit: self.commit.clone(),
-                                range: adjusted,
+                                range: builder.range,
                             });
                         }
                         // Only the first matching occurrence contributes.
@@ -1989,14 +2016,11 @@ impl ObjectValue for GitBlobLSIFDataObject {
                         continue;
                     };
                     if let Some((text, range)) = get_hover(&document, line, character) {
-                        let Some(adjusted) =
-                            self.adjust_range(upload, range).map_err(ExecError::new)?
-                        else {
-                            continue;
-                        };
+                        // The hover range comes from the already translated
+                        // document, so it is in requested-commit coordinates.
                         return Ok(Some(FieldValue::Object(Arc::new(HoverObject {
                             markdown: text,
-                            range: adjusted,
+                            range,
                         }))));
                     }
                 }

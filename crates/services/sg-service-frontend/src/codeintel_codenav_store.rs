@@ -52,8 +52,16 @@ pub(crate) fn block_on<F: Future>(future: F) -> F::Output {
 }
 
 /// Production adapter.
+///
+/// `pool` is the frontend database (`lsif_uploads` and the nearest-uploads
+/// graph); `scip_pool` is the codeintel database holding
+/// `codeintel_scip_documents` / `codeintel_scip_document_lookup`. The Go
+/// baseline uses two connections too (`codenav.NewService(..., db,
+/// codeIntelDB, ...)` and `lsifstore.New(..., codeIntelDB)`), so a split
+/// deployment must not look for SCIP documents in the frontend schema.
 pub struct PgCodeIntelCodenavStore {
     pool: PgPool,
+    scip_pool: PgPool,
     git: Option<Arc<dyn GitObjectSource>>,
     diff: Option<Arc<dyn GitCommitExtraSource>>,
     uploads: Option<CodeIntelUploadsHandle>,
@@ -68,11 +76,20 @@ impl std::fmt::Debug for PgCodeIntelCodenavStore {
 impl PgCodeIntelCodenavStore {
     pub fn new(pool: PgPool) -> Self {
         Self {
+            scip_pool: pool.clone(),
             pool,
             git: None,
             diff: None,
             uploads: None,
         }
+    }
+
+    /// Use a separate pool for the codeintel database that stores the SCIP
+    /// documents. Without it the store falls back to the frontend pool (the
+    /// single-database test deployments).
+    pub fn with_scip_pool(mut self, scip_pool: PgPool) -> Self {
+        self.scip_pool = scip_pool;
+        self
     }
 
     pub fn with_git(mut self, git: Arc<dyn GitObjectSource>) -> Self {
@@ -300,7 +317,7 @@ LIMIT 1
             )
             .bind(upload.id)
             .bind(upload_path)
-            .fetch_optional(&self.pool),
+            .fetch_optional(&self.scip_pool),
         )
         .map_err(|error| error.to_string())?;
         let Some(row) = row else {
@@ -354,7 +371,7 @@ LIMIT 1
             )
             .bind(upload.id)
             .bind(format!("{upload_prefix}%"))
-            .fetch_all(&self.pool),
+            .fetch_all(&self.scip_pool),
         )
         .map_err(|error| error.to_string())?;
         let mut out = Vec::new();
@@ -501,63 +518,57 @@ fn usages_for_symbol_impl(
         let Some(document) = store.scip_document(&upload, &commit, path)? else {
             continue;
         };
-        for occurrence in &document.occurrences {
-            if codeintel_codenav_graphql::symbol_range_from_scip(&occurrence.range) != target_range
-            {
-                continue;
-            }
-            if let Some(symbol) = &symbol {
-                if &occurrence.symbol != symbol {
-                    continue;
-                }
-            }
-            let data = codeintel_codenav_graphql::extract_occurrence_data(&document, occurrence);
-            let kind = if codeintel_codenav_graphql::occurrence_has_role(
-                occurrence,
-                codeintel_codenav_graphql::SYMBOL_ROLE_DEFINITION,
-            ) {
-                codeintel_codenav_graphql::UsageKind::Definition
-            } else {
-                codeintel_codenav_graphql::UsageKind::Reference
-            };
-            let mut builders = vec![(occurrence.symbol.clone(), kind)];
-            for builder in data.implementations {
-                builders.push((
-                    builder.symbol,
-                    codeintel_codenav_graphql::UsageKind::Implementation,
-                ));
-            }
-            for builder in data.prototypes {
-                builders.push((builder.symbol, codeintel_codenav_graphql::UsageKind::Super));
-            }
-            for (symbol_name, kind) in builders {
-                let Some(adjusted) = store.translate_range(
-                    &upload.commit,
-                    &commit,
-                    upload.repository_id,
-                    &upload.repository_name,
-                    path,
-                    target_range,
-                )? else {
-                    continue;
-                };
-                let contents = store
-                    .file_content(&upload.repository_name, &commit, path)?
-                    .unwrap_or_default();
-                let lines: Vec<&str> = contents.split('\n').collect();
-                let line_index = adjusted.start.line;
+        let Some(lookup) = document.occurrences.iter().find(|occurrence| {
+            codeintel_codenav_graphql::symbol_range_from_scip(&occurrence.range) == target_range
+                && symbol
+                    .as_ref()
+                    .map(|symbol| &occurrence.symbol == symbol)
+                    .unwrap_or(true)
+        }) else {
+            continue;
+        };
+        let data = codeintel_codenav_graphql::extract_occurrence_data(&document, lookup);
+        let contents = store
+            .file_content(&upload.repository_name, &commit, path)?
+            .unwrap_or_default();
+        let lines: Vec<&str> = contents.split('\n').collect();
+        // Go's `Service.PreciseUsages` walks Definitions -> Implementations
+        // -> Prototypes -> References. `scip_document` already translated the
+        // occurrence ranges into `commit` (Go `Service.SCIPDocument`), so the
+        // builders must not be translated a second time.
+        let phases = [
+            (
+                data.definitions,
+                codeintel_codenav_graphql::UsageKind::Definition,
+            ),
+            (
+                data.implementations,
+                codeintel_codenav_graphql::UsageKind::Implementation,
+            ),
+            (
+                data.prototypes,
+                codeintel_codenav_graphql::UsageKind::Super,
+            ),
+            (
+                data.references,
+                codeintel_codenav_graphql::UsageKind::Reference,
+            ),
+        ];
+        for (builders, kind) in phases {
+            for builder in builders {
+                let line_index = builder.range.start.line;
                 if line_index < 0 || line_index as usize >= lines.len() {
                     continue;
                 }
                 usages.push(codeintel_codenav_graphql::UsageObject {
-                    symbol: Some(symbol_name),
+                    symbol: Some(builder.symbol),
                     provenance: "PRECISE",
                     surrounding_content: lines[line_index as usize].to_owned(),
                     usage_range: codeintel_codenav_graphql::UsageRangeObject {
                         repository: upload.repository_name.clone(),
                         revision: commit.clone(),
                         path: path.clone(),
-                        range: adjusted,
+                        range: builder.range,
                     },
                     kind,
                 });

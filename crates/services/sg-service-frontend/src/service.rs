@@ -1541,6 +1541,22 @@ impl Service for FrontendService {
                 )
                 .with_git(Arc::clone(&codeintel_git_source)),
             );
+        // M9.50b: SCIP documents live in the codeintel database, not the
+        // frontend schema. The Go baseline passes `codeIntelDB` separately
+        // (`codenav.NewService(..., db, codeIntelDB, ...)` and
+        // `lsifstore.New(..., codeIntelDB)`), so reading
+        // `codeintel_scip_documents` from the frontend pool can never see an
+        // upload in a split deployment. Connect lazily so a single-database
+        // frontend that never serves `GitBlob.lsif` still starts.
+        let scip_dsn = crate::service_connections::service_connections()
+            .map(|connections| connections.code_intel_postgres_dsn)
+            .unwrap_or_default();
+        let scip_pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(5)
+            .connect_lazy(&scip_dsn)
+            .map_err(|err| {
+                ServiceError::new(format!("configuring the code intel database: {err}"))
+            })?;
         let graphql_deps = graphql_deps
             .with_batches(Arc::new(
                 crate::batches_graphql_store::PgBatchesGraphqlStore::new(session_pool.clone())
@@ -1577,7 +1593,8 @@ impl Service for FrontendService {
                     )
                     .with_git(Arc::clone(&codeintel_git_source))
                     .with_diff_source(Arc::clone(&codeintel_git_extra))
-                    .with_uploads(Arc::clone(&codeintel_uploads_handle)),
+                    .with_uploads(Arc::clone(&codeintel_uploads_handle))
+                    .with_scip_pool(scip_pool.clone()),
                 ))
             })
             .map_err(|err| {
