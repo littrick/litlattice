@@ -1466,10 +1466,20 @@ impl Service for FrontendService {
         // endpoints leaves the fields reporting the symbols error.
         let graphql_deps = match crate::service_connections::service_connections() {
             Ok(connections) => {
-                match crate::symbols_client::default_symbols_client(connections.symbols) {
-                    Some(client) => graphql_deps.with_symbols(Arc::from(client)),
-                    None => graphql_deps,
-                }
+                // M9.51a: `GitBlob.localCodeIntel`/`symbolInfo` use the same
+                // always-present `symbols.DefaultClient`, constructed even with
+                // an empty endpoint map so an unconfigured symbols service
+                // reports the baseline `endpoint.Map(conf-based) is empty`
+                // error at call time instead of silently resolving null.
+                let symbols_service = Arc::new(crate::symbols_client::GrpcSymbolsClient::new(
+                    connections.symbols.clone(),
+                ));
+                let deps =
+                    match crate::symbols_client::default_symbols_client(connections.symbols) {
+                        Some(client) => graphql_deps.with_symbols(Arc::from(client)),
+                        None => graphql_deps,
+                    };
+                deps.with_symbols_service(symbols_service)
             }
             Err(_) => graphql_deps,
         };
