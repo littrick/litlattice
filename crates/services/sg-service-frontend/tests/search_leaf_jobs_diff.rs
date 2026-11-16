@@ -333,7 +333,10 @@ fn run_structural(case: &Case) -> Value {
             .collect(),
         indexed: None,
     };
-    let ctx = JobContext { deadline: None };
+    let ctx = JobContext {
+        deadline: None,
+        ..JobContext::default()
+    };
     let mut events = Vec::new();
     let error = job
         .run(&ctx, &clients, &mut |event| events.push(event))

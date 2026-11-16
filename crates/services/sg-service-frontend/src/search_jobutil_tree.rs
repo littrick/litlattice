@@ -930,7 +930,10 @@ impl JobNode {
         clients: &RuntimeClients<'_>,
         stream: &mut dyn FnMut(SearchEvent),
     ) -> (Option<comb::Alert>, Option<comb::JobFailure>) {
-        let run_ctx = comb::RunContext::new(ctx.deadline);
+        let run_ctx = comb::RunContext::new_with_request_context(
+            ctx.deadline,
+            ctx.request_context,
+        );
         match self.to_combinator() {
             Ok(mut job) => job.run(&run_ctx, clients, stream),
             Err(err) => (None, Some(comb::JobFailure::Message(err.0))),
@@ -1851,6 +1854,10 @@ fn compute_excluded_repos(
         only_private: opts.visibility == RepoVisibility::Private,
         no_private: opts.visibility == RepoVisibility::Public,
         search_context_id,
+        // `db.Repos().Count(ctx, ...)` uses the same request actor predicate
+        // (`repos.go:1066-1081`).
+        authz_actor_uid: ctx.request_context().actor_uid,
+        authz_internal: ctx.request_context().internal,
         ..crate::search_job::ReposListOptions::default()
     };
 

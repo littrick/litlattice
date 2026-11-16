@@ -43,11 +43,23 @@ pub enum Verbosity {
     Max,
 }
 
-/// The only part of `context.Context` these jobs consume: the deadline that
-/// `zoektSearch` / `DoZoektSearchGlobal` turn into `SearchOptions.MaxWallTime`.
+/// The parts of `context.Context` these jobs consume: the deadline that
+/// `zoektSearch` / `DoZoektSearchGlobal` turn into `SearchOptions.MaxWallTime`,
+/// and the request actor (`actor.FromContext`) `privateReposForActor`
+/// (`indexed_search.go:697-724`) uses for its `ListMinimalRepos` read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct JobContext {
     pub deadline: Option<Instant>,
+    /// `actor.FromContext(ctx)`. Defaults to the zero actor for
+    /// `context.Background()`, preserving the pre-M9.51b anonymous read.
+    pub request_context: crate::search_contexts::RequestContext,
+}
+
+impl JobContext {
+    /// `context.Background()`: anonymous actor and no deadline.
+    pub fn anonymous() -> Self {
+        Self::default()
+    }
 }
 
 /// Error returned by a [`SearchJob`]. The baseline returns the underlying Go
@@ -148,6 +160,12 @@ pub struct ReposListOptions {
     pub include_patterns: Vec<String>,
     /// `SearchContextID` resolved by `searchcontexts.ResolveSearchContextSpec`.
     pub search_context_id: i64,
+    /// `AuthzQueryConds`: authenticated user ID (`0` = anonymous). Filled from
+    /// [`JobContext::request_context`] so the private-repo read applies the
+    /// same visibility predicate as the baseline (`repos_perm.go:32-121`).
+    pub authz_actor_uid: i32,
+    /// `AuthzQueryConds`: internal actors bypass the repository predicate.
+    pub authz_internal: bool,
 }
 
 /// Read-only `db.Repos().ListMinimalRepos`/`Repos().Count` semantics used by
@@ -358,7 +376,7 @@ impl SearchJob for GlobalTextSearchJob {
         clients: &RuntimeClients<'_>,
         mut stream: &mut dyn FnMut(SearchEvent),
     ) -> Result<(), JobError> {
-        let user_private_repos = private_repos_for_actor(clients, &self.repo_opts);
+        let user_private_repos = private_repos_for_actor(ctx, clients, &self.repo_opts);
         self.global_zoekt_query
             .apply_private_filter(&user_private_repos);
         self.zoekt_params.query = self.global_zoekt_query.generate();
@@ -515,6 +533,7 @@ impl SearchJob for SymbolSearchJob {
 /// `ListMinimalRepos` options, call the injected read-only lister, and, on
 /// error, log and fall back to the (empty) result. Errors never propagate.
 fn private_repos_for_actor(
+    ctx: &JobContext,
     clients: &RuntimeClients<'_>,
     repo_opts: &RepoOptions,
 ) -> Vec<(u32, String)> {
@@ -526,6 +545,11 @@ fn private_repos_for_actor(
         only_archived: repo_opts.only_archived,
         no_archived: repo_opts.no_archived,
         exclude_pattern: sg_zoekt::languages::union_regexps(&repo_opts.minus_repo_filters),
+        // `actor.FromContext(ctx)` (`indexed_search.go:697-724`): the store
+        // applies `AuthzQueryConds` for this actor. Anonymous (uid 0,
+        // `internal=false`) keeps the historical predicate.
+        authz_actor_uid: ctx.request_context.actor_uid,
+        authz_internal: ctx.request_context.internal,
         ..ReposListOptions::default()
     };
     match clients.db.list_minimal_repos(&options) {

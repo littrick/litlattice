@@ -741,7 +741,10 @@ fn run_hook(case: &Case) -> serde_json::Value {
             Err(JobError(case.do_search_error.clone()))
         }
     };
-    let ctx = JobContext { deadline: None };
+    let ctx = JobContext {
+        deadline: None,
+        ..JobContext::default()
+    };
     let result = hook_with_id(
         &ctx,
         &store,

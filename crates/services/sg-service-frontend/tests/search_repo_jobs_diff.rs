@@ -542,7 +542,10 @@ fn run_case(case: &Case) -> Value {
         commit: None,
         repo_pager: Some(&pager),
     };
-    let ctx = JobContext { deadline: None };
+    let ctx = JobContext {
+        deadline: None,
+        ..JobContext::default()
+    };
 
     let mut tree = match case.kind.as_str() {
         "compute_excluded" => JobNode::compute_excluded(repo_opts(&case.repo_opts)),

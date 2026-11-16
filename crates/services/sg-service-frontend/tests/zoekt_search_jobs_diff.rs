@@ -581,6 +581,7 @@ fn run_job(case: &Case) -> Value {
     };
     let ctx = JobContext {
         deadline: deadline(&case.deadline),
+        ..JobContext::default()
     };
     let since_ms = case.since_ms.max(0) as u64;
     let since = move |_: Instant| Duration::from_millis(since_ms);

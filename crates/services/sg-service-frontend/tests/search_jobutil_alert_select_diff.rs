@@ -969,6 +969,7 @@ fn run_node(
 ) -> (Vec<SearchEvent>, Option<Alert>, Option<JobFailure>) {
     let ctx = JobContext {
         deadline: deadline_instant(&case.deadline),
+        ..JobContext::default()
     };
     let mut events = Vec::new();
     let (alert, error) = node.run_with_alert(&ctx, clients, &mut |event| events.push(event));

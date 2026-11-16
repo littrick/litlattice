@@ -449,13 +449,14 @@ impl CancelNode {
     }
 }
 
-/// The runtime context a combinator passes down. `JobContext` only models the
-/// deadline; combinators additionally need the baseline's dynamic
-/// cancellation, so this type wraps a `JobContext`-compatible deadline and a
+/// The runtime context a combinator passes down. Combinators need the
+/// baseline's dynamic cancellation in addition to the `JobContext` fields, so
+/// this type wraps a `JobContext`-compatible deadline/request actor and a
 /// parent-linked cancel flag.
 #[derive(Debug, Clone)]
 pub struct RunContext {
     deadline: Option<Instant>,
+    request_context: crate::search_contexts::RequestContext,
     cancel: Arc<CancelNode>,
 }
 
@@ -463,6 +464,7 @@ impl Default for RunContext {
     fn default() -> Self {
         Self {
             deadline: None,
+            request_context: crate::search_contexts::RequestContext::anonymous(),
             cancel: Arc::new(CancelNode {
                 canceled: AtomicBool::new(false),
                 parent: None,
@@ -480,6 +482,24 @@ impl RunContext {
         }
     }
 
+    /// A fresh root context with the request actor
+    /// (`actor.FromContext(ctx)`), propagated to nested jobs.
+    pub fn new_with_request_context(
+        deadline: Option<Instant>,
+        request_context: crate::search_contexts::RequestContext,
+    ) -> Self {
+        Self {
+            deadline,
+            request_context,
+            ..Self::default()
+        }
+    }
+
+    /// `actor.FromContext(ctx)` for this subtree.
+    pub fn request_context(&self) -> crate::search_contexts::RequestContext {
+        self.request_context
+    }
+
     /// `context.WithCancel`: the returned handle cancels only the derived
     /// context (and its descendants).
     pub fn with_cancel(&self) -> (RunContext, CancelHandle) {
@@ -490,6 +510,7 @@ impl RunContext {
         (
             RunContext {
                 deadline: self.deadline,
+                request_context: self.request_context,
                 cancel: node.clone(),
             },
             CancelHandle { node },
@@ -505,6 +526,7 @@ impl RunContext {
         };
         RunContext {
             deadline,
+            request_context: self.request_context,
             cancel: self.cancel.clone(),
         }
     }
@@ -540,6 +562,7 @@ impl RunContext {
     pub fn as_job_context(&self) -> JobContext {
         JobContext {
             deadline: self.deadline,
+            request_context: self.request_context,
         }
     }
 }

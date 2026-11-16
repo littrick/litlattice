@@ -632,7 +632,7 @@ pub struct RepoChangelistIDs {
 /// `uid` is an `i32` and the flags are booleans, so interpolating them keeps
 /// the bound-string argument list of [`list_minimal_repos`] unchanged and
 /// cannot inject SQL.
-fn authz_condition(options: &RepoListOptions) -> String {
+pub fn authz_condition(options: &RepoListOptions) -> String {
     if options.authz_internal {
         return "(TRUE)".to_owned();
     }

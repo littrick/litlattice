@@ -144,6 +144,20 @@ pub struct JobRunOutput {
 /// [`ExecuteItem::Error`] items.
 pub trait JobRunner: Send + Sync {
     fn run(&self, job: &mut JobNode, sender: &mut dyn FnMut(SearchEvent)) -> JobRunOutput;
+
+    /// [`JobRunner::run`] with the request actor (`actor.FromContext(ctx)`),
+    /// threaded into the job tree so `privateReposForActor`
+    /// (`indexed_search.go:697-724`) reads the actor's visible private repos.
+    /// The default ignores the actor, preserving existing runners.
+    fn run_with_context(
+        &self,
+        job: &mut JobNode,
+        request_context: crate::search_contexts::RequestContext,
+        sender: &mut dyn FnMut(SearchEvent),
+    ) -> JobRunOutput {
+        let _ = request_context;
+        self.run(job, sender)
+    }
 }
 
 /// Default runner: job execution is not ported yet.
@@ -280,8 +294,13 @@ impl TreeJobRunner {
     }
 }
 
-impl JobRunner for TreeJobRunner {
-    fn run(&self, job: &mut JobNode, sender: &mut dyn FnMut(SearchEvent)) -> JobRunOutput {
+impl TreeJobRunner {
+    fn run_job(
+        &self,
+        job: &mut JobNode,
+        ctx: &crate::search_job::JobContext,
+        sender: &mut dyn FnMut(SearchEvent),
+    ) -> JobRunOutput {
         let Some(runtime) = self.runtime.as_ref() else {
             return JobRunOutput {
                 alert: None,
@@ -291,9 +310,8 @@ impl JobRunner for TreeJobRunner {
                 }),
             };
         };
-        let ctx = crate::search_job::JobContext { deadline: None };
         runtime.with_clients(|clients| {
-            let (alert, failure) = job.run_with_alert(&ctx, clients, sender);
+            let (alert, failure) = job.run_with_alert(ctx, clients, sender);
             JobRunOutput {
                 alert: alert.map(event_alert_from_comb),
                 error: failure.map(|err| ExecuteError {
@@ -302,6 +320,25 @@ impl JobRunner for TreeJobRunner {
                 }),
             }
         })
+    }
+}
+
+impl JobRunner for TreeJobRunner {
+    fn run(&self, job: &mut JobNode, sender: &mut dyn FnMut(SearchEvent)) -> JobRunOutput {
+        self.run_job(job, &crate::search_job::JobContext::anonymous(), sender)
+    }
+
+    fn run_with_context(
+        &self,
+        job: &mut JobNode,
+        request_context: crate::search_contexts::RequestContext,
+        sender: &mut dyn FnMut(SearchEvent),
+    ) -> JobRunOutput {
+        let ctx = crate::search_job::JobContext {
+            deadline: None,
+            request_context,
+        };
+        self.run_job(job, &ctx, sender)
     }
 }
 
@@ -617,7 +654,7 @@ pub fn run_inputs_with_context(
     let mut events = Vec::new();
     let output = {
         let mut sender = |event: SearchEvent| events.push(event);
-        runner.run(&mut job, &mut sender)
+        runner.run_with_context(&mut job, request_context, &mut sender)
     };
     Ok(TreeRunOutcome {
         events,

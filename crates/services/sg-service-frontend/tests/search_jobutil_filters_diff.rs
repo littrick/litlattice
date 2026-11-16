@@ -869,7 +869,10 @@ fn run_contributor(case: &Case) -> Value {
         commit: None,
         repo_pager: None,
     };
-    let ctx = JobContext { deadline };
+    let ctx = JobContext {
+        deadline,
+        ..JobContext::default()
+    };
     let mut out = Vec::new();
     let result = job.run(&ctx, &clients, &mut |event| out.push(event));
     let mut map = base(case);

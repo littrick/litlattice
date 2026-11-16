@@ -355,7 +355,10 @@ fn assemble_inner(
             IndexedError::Endpoint(message) => RuntimeConfigError::ZoektEndpoint(message),
         })?,
     );
-    let db = Arc::new(PgPrivateRepoLister::new(pool.clone()));
+    let db = Arc::new(PgPrivateRepoLister::with_enforce_for_site_admins(
+        pool.clone(),
+        site.authz_enforce_for_site_admins(),
+    ));
 
     let gitserver = Arc::new(GitClient::new(connections.git_servers.clone()));
     let gitserver_addrs = gitserver_addresses(connections, site);
@@ -450,7 +453,10 @@ pub fn assemble_exhaustive_with_encryption_key(
     user_external_account_key: Option<Arc<dyn Key>>,
 ) -> ExhaustiveRuntime {
     let max_repos = max_repos_from_site(site);
-    let db = Arc::new(PgPrivateRepoLister::new(pool.clone()));
+    let db = Arc::new(PgPrivateRepoLister::with_enforce_for_site_admins(
+        pool.clone(),
+        site.authz_enforce_for_site_admins(),
+    ));
     let gitserver = Arc::new(GitClient::new(connections.git_servers.clone()));
     let gitserver_addrs = gitserver_addresses(connections, site);
 
@@ -796,7 +802,10 @@ pub fn assemble_commit_search_with_encryption_key(
     site: &SiteConfiguration,
     user_external_account_key: Option<Arc<dyn Key>>,
 ) -> TreeRuntimeClients {
-    let db = Arc::new(PgPrivateRepoLister::new(pool.clone()));
+    let db = Arc::new(PgPrivateRepoLister::with_enforce_for_site_admins(
+        pool.clone(),
+        site.authz_enforce_for_site_admins(),
+    ));
     let gitserver = Arc::new(GitClient::new(connections.git_servers.clone()));
     let gitserver_addrs = gitserver_addresses(connections, site);
     let searcher = assemble_searcher_clients(connections, &gitserver);
@@ -870,30 +879,83 @@ impl crate::search_jobutil_repos::ZoektRepoLister for UnconfiguredResolverZoekt 
 /// `db.Repos().ListMinimalRepos` for `privateReposForActor`.
 pub struct PgPrivateRepoLister {
     pool: PgPool,
+    /// `conf.Get().AuthzEnforceForSiteAdmins`
+    /// (`internal/database/repos_perm.go:34`), read once at assemble time
+    /// from the live site configuration.
+    enforce_for_site_admins: bool,
 }
 
 impl PgPrivateRepoLister {
     pub fn new(pool: PgPool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            enforce_for_site_admins: false,
+        }
+    }
+
+    /// [`PgPrivateRepoLister::new`] with the live
+    /// `authz.enforceForSiteAdmins` setting.
+    pub fn with_enforce_for_site_admins(pool: PgPool, enforce_for_site_admins: bool) -> Self {
+        Self {
+            pool,
+            enforce_for_site_admins,
+        }
+    }
+
+    /// Convert the job-tree options into the shared `sg-db` store options,
+    /// applying the actor predicate (`GetAuthzQueryParameters`).
+    fn db_options(&self, options: &ReposListOptions) -> db_repos::RepoListOptions {
+        db_repos::RepoListOptions {
+            only_private: options.only_private,
+            no_private: options.no_private,
+            limit: options.limit.unwrap_or(0),
+            no_forks: options.no_forks,
+            only_forks: options.only_forks,
+            no_archived: options.no_archived,
+            only_archived: options.only_archived,
+            include_patterns: options.include_patterns.clone(),
+            exclude_pattern: options.exclude_pattern.clone(),
+            search_context_id: options.search_context_id,
+            authz_actor_uid: options.authz_actor_uid,
+            authz_internal: options.authz_internal,
+            authz_enforce_for_site_admins: self.enforce_for_site_admins,
+            ..db_repos::RepoListOptions::default()
+        }
     }
 }
 
 impl PrivateRepoLister for PgPrivateRepoLister {
     fn list_minimal_repos(&self, options: &ReposListOptions) -> Result<Vec<MinimalRepo>, JobError> {
         let pool = self.pool.clone();
-        let options = options.clone();
-        run_to_completion(async move { list_minimal_repos(&pool, &options).await })
-            .map_err(|error| JobError(error.to_string()))
+        let options = self.db_options(options);
+        run_to_completion(async move {
+            db_repos::list_minimal_repos(&pool, &options)
+                .await
+                .map(|repos| {
+                    repos
+                        .into_iter()
+                        .map(|repo| MinimalRepo {
+                            id: repo.id as u32,
+                            name: repo.name,
+                        })
+                        .collect()
+                })
+        })
+        .map_err(|error| JobError(error.to_string()))
     }
 
     /// `db.Repos().Count` (`internal/database/repos.go:322-335`) for
-    /// `computeExcludedRepos`. Applies the same visibility/fork/archive and
-    /// pattern filters as [`list_minimal_repos`], but no limit/order.
+    /// `computeExcludedRepos`. Applies the same visibility/fork/archive,
+    /// pattern and actor filters as [`Self::list_minimal_repos`], but no
+    /// limit/order.
     fn count_repos(&self, options: &ReposListOptions) -> Result<i64, JobError> {
         let pool = self.pool.clone();
         let options = options.clone();
-        run_to_completion(async move { count_repos(&pool, &options).await })
-            .map_err(|error| JobError(error.to_string()))
+        let enforce_for_site_admins = self.enforce_for_site_admins;
+        run_to_completion(async move {
+            count_repos(&pool, &options, enforce_for_site_admins).await
+        })
+        .map_err(|error| JobError(error.to_string()))
     }
 
     /// `searchcontexts.ResolveSearchContextSpec(ctx, ...)` for
@@ -956,7 +1018,11 @@ async fn count_code_host_external_services(pool: &PgPool) -> Result<i64, sqlx::E
     .await
 }
 
-async fn count_repos(pool: &PgPool, options: &ReposListOptions) -> Result<i64, sqlx::Error> {
+async fn count_repos(
+    pool: &PgPool,
+    options: &ReposListOptions,
+    enforce_for_site_admins: bool,
+) -> Result<i64, sqlx::Error> {
     let mut sql = String::from("SELECT count(*) FROM repo");
     if options.search_context_id != 0 {
         // `repos.go:1198-1202`: join the context's repo list when set.
@@ -1001,89 +1067,21 @@ async fn count_repos(pool: &PgPool, options: &ReposListOptions) -> Result<i64, s
         ));
     }
     sql.push_str(" AND ");
-    sql.push_str(AUTHZ_CONDITION);
+    // `AuthzQueryConds` for the request actor (`repos_perm.go:104-121`); the
+    // shared `sg-db` helper keeps this predicate identical to
+    // `ListMinimalRepos`.
+    sql.push_str(&db_repos::authz_condition(&db_repos::RepoListOptions {
+        authz_actor_uid: options.authz_actor_uid,
+        authz_internal: options.authz_internal,
+        authz_enforce_for_site_admins: enforce_for_site_admins,
+        ..db_repos::RepoListOptions::default()
+    }));
 
     let mut query = sqlx::query_scalar::<_, i64>(&sql);
     for argument in &arguments {
         query = query.bind(argument);
     }
     query.fetch_one(pool).await
-}
-
-/// Unrestricted/restricted repo visibility for an anonymous actor
-/// (`AuthzQueryConds` with `BypassAuthz=false`, `AuthenticatedUserID=0`).
-const AUTHZ_CONDITION: &str = r#"(
-    EXISTS (SELECT 1 FROM user_repo_permissions WHERE repo_id = repo.id AND user_id IS NULL)
-    OR NOT repo.private
-    OR EXISTS (
-        SELECT 1 FROM external_services es
-        JOIN external_service_repos esr ON (
-            esr.external_service_id = es.id AND esr.repo_id = repo.id
-            AND es.unrestricted = TRUE AND es.deleted_at IS NULL
-        )
-    )
-    OR EXISTS (
-        SELECT 1 FROM user_repo_permissions WHERE repo_id = repo.id AND user_id = 0
-    )
-)"#;
-
-async fn list_minimal_repos(
-    pool: &PgPool,
-    options: &ReposListOptions,
-) -> Result<Vec<MinimalRepo>, sqlx::Error> {
-    let mut sql = String::from(
-        "SELECT repo.id, repo.name FROM repo \
-         WHERE repo.deleted_at IS NULL AND repo.blocked IS NULL",
-    );
-    let mut arguments: Vec<String> = Vec::new();
-
-    if options.only_private {
-        sql.push_str(" AND repo.private");
-    }
-    if options.no_forks {
-        sql.push_str(" AND NOT repo.fork");
-    }
-    if options.only_forks {
-        sql.push_str(" AND repo.fork");
-    }
-    if options.no_archived {
-        sql.push_str(" AND NOT repo.archived");
-    }
-    if options.only_archived {
-        sql.push_str(" AND repo.archived");
-    }
-    if !options.exclude_pattern.is_empty() {
-        arguments.push(options.exclude_pattern.clone());
-        sql.push_str(&format!(" AND lower(repo.name) !~* ${}", arguments.len()));
-    }
-
-    sql.push_str(" AND ");
-    sql.push_str(AUTHZ_CONDITION);
-    sql.push_str(" ORDER BY repo.id");
-    if options.limit.is_some() {
-        sql.push_str(&format!(" LIMIT ${}", arguments.len() + 1));
-    }
-
-    let mut query = sqlx::query(&sql);
-    for argument in &arguments {
-        query = query.bind(argument);
-    }
-    if let Some(limit) = options.limit {
-        query = query.bind(limit);
-    }
-
-    let rows = query.fetch_all(pool).await?;
-    let mut repos = Vec::with_capacity(rows.len());
-    for row in rows {
-        use sqlx::Row;
-        let id: i32 = row.try_get("id")?;
-        let name: String = row.try_get("name")?;
-        repos.push(MinimalRepo {
-            id: id as u32,
-            name,
-        });
-    }
-    Ok(repos)
 }
 
 /// `db.Users().GetByUsername`/`db.UserEmails().ListByUser`.

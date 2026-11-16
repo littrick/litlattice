@@ -181,7 +181,7 @@ pub fn search(
         .map_err(|error| TriggerSearchFailure::non_retryable(error.0))?;
 
     let mut results = Vec::new();
-    let failure = run_tree(runtime, &mut tree, &mut |event| {
+    let failure = run_tree(runtime, &mut tree, request_context, &mut |event| {
         results.extend(event.results);
     });
     if let Some(failure) = failure {
@@ -261,7 +261,7 @@ pub fn snapshot(
     };
 
     let mut tree = add_code_monitor_hook(&tree, hook)?;
-    let failure = run_tree(runtime, &mut tree, &mut |_event| {});
+    let failure = run_tree(runtime, &mut tree, request_context, &mut |_event| {});
     if let Some(failure) = failure {
         return Err(JobError(failure.to_string()));
     }
@@ -280,9 +280,13 @@ pub fn snapshot(
 fn run_tree(
     runtime: &TreeRuntimeClients,
     tree: &mut JobNode,
+    request_context: crate::search_contexts::RequestContext,
     stream: &mut dyn FnMut(crate::search_stream::progress::SearchEvent),
 ) -> Option<JobFailure> {
-    let ctx = JobContext { deadline: None };
+    let ctx = JobContext {
+        deadline: None,
+        request_context,
+    };
     runtime.with_clients(|clients| tree.run_with_alert(&ctx, clients, stream).1)
 }
 

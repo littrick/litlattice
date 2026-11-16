@@ -624,6 +624,7 @@ fn run_case(case: &Case) -> Value {
     };
     let ctx = JobContext {
         deadline: deadline(&case.deadline),
+        ..JobContext::default()
     };
 
     let mut events: Vec<SearchEvent> = Vec::new();
