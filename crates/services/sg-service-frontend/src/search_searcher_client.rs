@@ -376,6 +376,108 @@ impl RetryConfig {
             .saturating_mul(factor.min(u64::from(u32::MAX)) as u32)
             .min(self.backoff_max)
     }
+
+    /// Total RPC attempts, matching `retry.WithMax` (`max` is a call count,
+    /// not a retry count; `0` still makes the baseline call once).
+    pub(crate) fn max_attempts(&self) -> u32 {
+        self.max_attempts.max(1)
+    }
+
+    /// The shared unary/`Search` retry loop: up to [`Self::max_attempts`]
+    /// calls, sleeping [`Self::backoff`] before each retry, retrying only
+    /// `SearcherErrorKind::Temporary` (`Unavailable`/`ResourceExhausted`) and
+    /// stopping at `deadline` exactly like the baseline middleware.
+    ///
+    /// `deadline_prefix` keeps the call site's pre-existing error text: the
+    /// symbols search loop wrapped a deadline noticed *before* the retry sleep
+    /// with `executing symbols search request: `, while a deadline noticed
+    /// after it (or before the first attempt) stayed unwrapped.
+    pub(crate) async fn run_unary<T, F, Fut>(
+        &self,
+        deadline: Option<Instant>,
+        deadline_prefix: Option<&str>,
+        mut attempt_fn: F,
+    ) -> Result<T, SearcherError>
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = Result<T, SearcherError>>,
+    {
+        let max_attempts = self.max_attempts();
+        for attempt in 0..max_attempts {
+            if attempt > 0 {
+                if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                    let message = "context deadline exceeded";
+                    let message = match deadline_prefix {
+                        Some(prefix) => format!("{prefix}{message}"),
+                        None => message.to_owned(),
+                    };
+                    return Err(SearcherError::new(SearcherErrorKind::Timeout, message));
+                }
+                tokio::time::sleep(self.backoff(attempt)).await;
+            }
+            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                return Err(SearcherError::new(
+                    SearcherErrorKind::Timeout,
+                    "context deadline exceeded",
+                ));
+            }
+            match attempt_fn().await {
+                Ok(value) => return Ok(value),
+                Err(error) => {
+                    if error.kind == SearcherErrorKind::Temporary && attempt + 1 < max_attempts {
+                        continue;
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        unreachable!("the retry loop always returns on its final attempt")
+    }
+
+    /// The shared server-streaming retry loop (`LocalCodeIntel`): the caller's
+    /// attempt reports whether the failure happened before any message was
+    /// received, which is the only case the baseline middleware retries
+    /// (`internal/grpc/defaults/retry.go:31-34`).
+    pub(crate) async fn run_stream<T, F, Fut>(
+        &self,
+        mut attempt_fn: F,
+    ) -> Result<Option<T>, SearcherError>
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = RetryStreamAttempt<T>>,
+    {
+        let max_attempts = self.max_attempts();
+        for attempt in 0..max_attempts {
+            if attempt > 0 {
+                tokio::time::sleep(self.backoff(attempt)).await;
+            }
+            match attempt_fn().await {
+                RetryStreamAttempt::Done(Ok(value)) => return Ok(Some(value)),
+                RetryStreamAttempt::Done(Err(error)) => return Err(error),
+                RetryStreamAttempt::Unimplemented => return Ok(None),
+                RetryStreamAttempt::Retry(error) => {
+                    if attempt + 1 < max_attempts {
+                        continue;
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        unreachable!("the retry loop always returns on its final attempt")
+    }
+}
+
+/// One server-streaming attempt's result for [`RetryConfig::run_stream`].
+pub(crate) enum RetryStreamAttempt<T> {
+    /// The attempt finished: success (possibly an empty stream) or a
+    /// non-retriable error, both returned unchanged to the caller.
+    Done(Result<T, SearcherError>),
+    /// A retriable status arrived before the first message; the baseline
+    /// middleware re-establishes the stream.
+    Retry(SearcherError),
+    /// `codes.Unimplemented`: the symbols client deliberately swallows it as
+    /// `(nil, nil)` and never retries it (not a retriable code).
+    Unimplemented,
 }
 
 /// `time.ParseDuration` subset covering the baseline defaults and suffixes.
@@ -674,7 +776,7 @@ pub fn classify_status(status: &tonic::Status) -> SearcherError {
     SearcherError::new(kind, message)
 }
 
-fn is_retriable(code: tonic::Code) -> bool {
+pub(crate) fn is_retriable(code: tonic::Code) -> bool {
     matches!(
         code,
         tonic::Code::Unavailable | tonic::Code::ResourceExhausted

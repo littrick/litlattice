@@ -34,8 +34,9 @@ use tonic::transport::Channel;
 
 use crate::search_env::{GrpcChannelSource, GrpcConnectionCache, SearcherGrpcConnectionCache};
 use crate::search_searcher_client::{
-    classify_status, rendezvous_order, run_to_completion, RetryConfig, SearcherError,
-    SearcherErrorKind, SymbolsClient, SymbolsParameters, SymbolsResponse,
+    classify_status, is_retriable, rendezvous_order, run_to_completion, RetryConfig,
+    RetryStreamAttempt, SearcherError, SearcherErrorKind, SymbolsClient, SymbolsParameters,
+    SymbolsResponse,
 };
 use crate::search_stream::convert;
 
@@ -325,6 +326,11 @@ impl GrpcSymbolsClient {
     /// server-streaming RPC whose chunks are concatenated. `Unimplemented`
     /// (on the initial call or mid-stream) becomes `Ok(None)`, matching the
     /// baseline's deliberate error swallow.
+    ///
+    /// `defaults.RetryPolicy` retries `Unavailable`/`ResourceExhausted` only
+    /// until the first message arrives (`internal/grpc/defaults/retry.go:31-34`);
+    /// mid-stream failures are returned to the caller unchanged. The connection
+    /// step itself is outside the retry loop, as in `Client.gRPCClient`.
     pub fn local_code_intel(
         &self,
         path: &RepoCommitPath,
@@ -332,6 +338,7 @@ impl GrpcSymbolsClient {
         let connector = Arc::clone(&self.connector);
         let endpoint = self.route(&path.repo);
         let path = path.clone();
+        let retry = self.retry;
         run_to_completion(async move {
             let Some(endpoint) = endpoint else {
                 return Err(SearcherError::other(format!(
@@ -340,7 +347,7 @@ impl GrpcSymbolsClient {
                     go_quote(&path.repo)
                 )));
             };
-            let mut client = connect_symbol_client(connector, &endpoint)?;
+            let client = connect_symbol_client(connector, &endpoint)?;
             let request = pb::LocalCodeIntelRequest {
                 repo_commit_path: Some(pb::RepoCommitPath {
                     repo: path.repo,
@@ -348,30 +355,61 @@ impl GrpcSymbolsClient {
                     path: path.path,
                 }),
             };
-            let mut stream = match client.local_code_intel(request).await {
-                Ok(response) => response.into_inner(),
-                Err(status) if status.code() == tonic::Code::Unimplemented => return Ok(None),
-                Err(status) => return Err(translate_status(&status)),
-            };
-            let mut symbols = Vec::new();
-            loop {
-                match stream.message().await {
-                    Ok(Some(response)) => {
-                        symbols.extend(
-                            response
-                                .symbols
-                                .into_iter()
-                                .map(convert_local_code_intel_symbol),
-                        );
+            retry
+                .run_stream(|| {
+                    let mut client = client.clone();
+                    let request = request.clone();
+                    async move {
+                        let mut stream = match client.local_code_intel(request).await {
+                            Ok(response) => response.into_inner(),
+                            Err(status) if status.code() == tonic::Code::Unimplemented => {
+                                return RetryStreamAttempt::Unimplemented;
+                            }
+                            Err(status) if is_retriable(status.code()) => {
+                                // No message has been received yet.
+                                return RetryStreamAttempt::Retry(translate_status(&status));
+                            }
+                            Err(status) => {
+                                return RetryStreamAttempt::Done(Err(translate_status(&status)));
+                            }
+                        };
+                        let mut symbols = Vec::new();
+                        let mut received_first = false;
+                        loop {
+                            match stream.message().await {
+                                Ok(Some(response)) => {
+                                    received_first = true;
+                                    symbols.extend(
+                                        response
+                                            .symbols
+                                            .into_iter()
+                                            .map(convert_local_code_intel_symbol),
+                                    );
+                                }
+                                Ok(None) => {
+                                    return RetryStreamAttempt::Done(Ok(LocalCodeIntelPayload {
+                                        symbols,
+                                    }));
+                                }
+                                Err(status) if status.code() == tonic::Code::Unimplemented => {
+                                    // The baseline discards any partially
+                                    // received chunks.
+                                    return RetryStreamAttempt::Unimplemented;
+                                }
+                                Err(status) if !received_first && is_retriable(status.code()) => {
+                                    // Only the first-message window is retried.
+                                    return RetryStreamAttempt::Retry(translate_status(&status));
+                                }
+                                Err(status) => {
+                                    return RetryStreamAttempt::Done(Err(translate_status(
+                                        &status,
+                                    )));
+                                }
+                            }
+                        }
                     }
-                    Ok(None) => return Ok(Some(LocalCodeIntelPayload { symbols })),
-                    Err(status) if status.code() == tonic::Code::Unimplemented => {
-                        // The baseline discards any partially received chunks.
-                        return Ok(None);
-                    }
-                    Err(status) => return Err(translate_status(&status)),
-                }
-            }
+                })
+                .await
         })
     }
 
@@ -414,6 +452,7 @@ impl GrpcSymbolsClient {
         let connector = Arc::clone(&self.connector);
         let endpoint = self.route(&point.repo);
         let point = point.clone();
+        let retry = self.retry;
         run_to_completion(async move {
             let Some(endpoint) = endpoint else {
                 return Err(SearcherError::other(format!(
@@ -422,7 +461,7 @@ impl GrpcSymbolsClient {
                     go_quote(&point.repo)
                 )));
             };
-            let mut client = connect_symbol_client(connector, &endpoint)?;
+            let client = connect_symbol_client(connector, &endpoint)?;
             let request = pb::SymbolInfoRequest {
                 repo_commit_path: Some(pb::RepoCommitPath {
                     repo: point.repo,
@@ -434,12 +473,23 @@ impl GrpcSymbolsClient {
                     column: point.column,
                 }),
             };
-            let response = match client.symbol_info(request).await {
-                Ok(response) => response.into_inner(),
-                Err(status) if status.code() == tonic::Code::Unimplemented => return Ok(None),
-                Err(status) => return Err(translate_status(&status)),
-            };
-            Ok(convert_symbol_info(response))
+            // `automaticRetryClient.SymbolInfo`: one unary RPC with
+            // `defaults.RetryPolicy`. `Unimplemented` is not a retriable code
+            // and the baseline client turns it into `(nil, nil)`.
+            let response = retry
+                .run_unary(None, None, || {
+                    let mut client = client.clone();
+                    let request = request.clone();
+                    async move {
+                        match client.symbol_info(request).await {
+                            Ok(response) => Ok(Some(response.into_inner())),
+                            Err(status) if status.code() == tonic::Code::Unimplemented => Ok(None),
+                            Err(status) => Err(translate_status(&status)),
+                        }
+                    }
+                })
+                .await?;
+            Ok(response.and_then(convert_symbol_info))
         })
     }
 
@@ -493,48 +543,24 @@ impl SymbolsClient for GrpcSymbolsClient {
         let retry = self.retry;
         let deadline = params.deadline;
 
+        // `automaticRetryClient.Search`: the shared unary policy
+        // (`Unavailable`/`ResourceExhausted`, bounded attempts, exponential
+        // backoff). `search_endpoint` keeps the Go result/error text.
         let response = run_to_completion(async move {
-            let max_attempts = retry.max_attempts.max(1);
-            let mut last_error = None;
-            for attempt in 0..max_attempts {
-                if attempt > 0 {
-                    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-                        return Err(with_rpc_context(SearcherError::new(
-                            SearcherErrorKind::Timeout,
-                            "context deadline exceeded",
-                        )));
-                    }
-                    tokio::time::sleep(retry.backoff(attempt)).await;
-                }
-                if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-                    return Err(SearcherError::new(
-                        SearcherErrorKind::Timeout,
-                        "context deadline exceeded",
-                    ));
-                }
-                match Self::search_endpoint(
-                    Arc::clone(&connector),
-                    endpoint.clone(),
-                    &request,
+            retry
+                .run_unary(
                     deadline,
+                    Some("executing symbols search request: "),
+                    || {
+                        Self::search_endpoint(
+                            Arc::clone(&connector),
+                            endpoint.clone(),
+                            &request,
+                            deadline,
+                        )
+                    },
                 )
                 .await
-                {
-                    Ok(response) => return Ok(response),
-                    Err(error) => {
-                        // `defaults.RetryPolicy` only retries
-                        // `Unavailable`/`ResourceExhausted`, which
-                        // `classify_status` maps to `Temporary`.
-                        if error.kind == SearcherErrorKind::Temporary && attempt + 1 < max_attempts
-                        {
-                            last_error = Some(error);
-                            continue;
-                        }
-                        return Err(error);
-                    }
-                }
-            }
-            Err(last_error.unwrap_or_else(|| SearcherError::other(NO_SYMBOLS_ENDPOINTS_MESSAGE)))
         })?;
 
         if let Some(error) = response.error.as_deref() {
