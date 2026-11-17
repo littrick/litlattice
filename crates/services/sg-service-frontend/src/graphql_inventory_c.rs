@@ -299,6 +299,35 @@ impl ExternalServiceDiscovery for UnimplementedDiscovery {
     }
 }
 
+/// Production [`RepoMirrorChecker`]: `gitserver.Client.IsRepoCloneable`.
+pub struct GitserverMirrorChecker {
+    client: Arc<sg_git::GitserverClient>,
+}
+
+impl GitserverMirrorChecker {
+    pub fn new(addresses: Vec<String>) -> Self {
+        Self {
+            client: Arc::new(sg_git::GitserverClient::new(addresses)),
+        }
+    }
+}
+
+impl std::fmt::Debug for GitserverMirrorChecker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GitserverMirrorChecker").finish()
+    }
+}
+
+#[async_trait::async_trait]
+impl RepoMirrorChecker for GitserverMirrorChecker {
+    async fn is_repo_cloneable(&self, repo_name: &str) -> Result<(), String> {
+        self.client
+            .is_repo_cloneable(repo_name)
+            .await
+            .map_err(|error| error.to_string())
+    }
+}
+
 #[derive(Debug, Default, Clone, Copy)]
 pub struct UnconfiguredMirrorChecker;
 
@@ -306,6 +335,43 @@ pub struct UnconfiguredMirrorChecker;
 impl RepoMirrorChecker for UnconfiguredMirrorChecker {
     async fn is_repo_cloneable(&self, _repo_name: &str) -> Result<(), String> {
         Err("repository mirror checks are not available in this frontend build".to_owned())
+    }
+}
+
+/// Production [`RepoUpdateEnqueuer`]: repo-updater gRPC
+/// `EnqueueRepoUpdate` (`REPO_UPDATER_URL`, default `http://127.0.0.1:3182`).
+pub struct RepoupdaterMirrorEnqueuer {
+    url: String,
+}
+
+impl RepoupdaterMirrorEnqueuer {
+    pub fn new(url: impl Into<String>) -> Self {
+        Self { url: url.into() }
+    }
+}
+
+impl std::fmt::Debug for RepoupdaterMirrorEnqueuer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RepoupdaterMirrorEnqueuer").finish()
+    }
+}
+
+#[async_trait::async_trait]
+impl RepoUpdateEnqueuer for RepoupdaterMirrorEnqueuer {
+    async fn enqueue_repo_update(&self, repo_name: &str) -> Result<(), String> {
+        use sg_proto::repoupdater as pb;
+        let mut client = pb::repo_updater_service_client::RepoUpdaterServiceClient::connect(
+            self.url.clone(),
+        )
+        .await
+        .map_err(|error| format!("connect to repo-updater: {error}"))?;
+        client
+            .enqueue_repo_update(pb::EnqueueRepoUpdateRequest {
+                repo: repo_name.to_owned(),
+            })
+            .await
+            .map(|_| ())
+            .map_err(|error| error.to_string())
     }
 }
 

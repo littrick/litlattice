@@ -1458,6 +1458,26 @@ impl Service for FrontendService {
         // read through gitserver via the shared `sg-git` client. The
         // constructor is shared with the M9.9d wiring differential so the
         // production assembly and its live address resolution stay testable.
+        // `Repository.checkMirrorRepositoryConnection` /
+        // `Repository.updateMirrorRepository` use gitserver
+        // `IsRepoCloneable`/`RepoCloneProgress` through this seam
+        // (`repository_mirror.go:306-328`).
+        let mirror_addresses = crate::service_connections::service_connections()
+            .map(|connections| connections.git_servers.clone())
+            .unwrap_or_default();
+        let mut inventory_c = crate::graphql_inventory_c::InventoryCDeps::default();
+        inventory_c.mirror_checker = Arc::new(
+            crate::graphql_inventory_c::GitserverMirrorChecker::new(mirror_addresses),
+        );
+        // `Repository.updateMirrorRepository` ("Refresh now") enqueues an
+        // update in repo-updater (`repository_mirror.go:342-359`).
+        inventory_c.repo_updater = Arc::new(
+            crate::graphql_inventory_c::RepoupdaterMirrorEnqueuer::new(
+                std::env::var("REPO_UPDATER_URL")
+                    .unwrap_or_else(|_| "http://127.0.0.1:3182".to_owned()),
+            ),
+        );
+        let graphql_deps = graphql_deps.with_inventory_c_deps(inventory_c);
         let graphql_deps = graphql_deps.with_git_objects(
             crate::git_graphql::production_git_source(Arc::clone(wiring.live())),
         );

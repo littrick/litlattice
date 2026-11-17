@@ -490,6 +490,26 @@ impl GitserverClient {
             .map_err(|error| Error::Message(error.to_string()))
     }
 
+    /// `gitserver.Client.IsRepoCloneable`: `Ok(())` when the remote can be
+    /// reached, otherwise the server's reason.
+    pub async fn is_repo_cloneable(&self, repo: &str) -> Result<(), Error> {
+        let mut client = self.client_for(repo).await?;
+        let response = client
+            .is_repo_cloneable(pb::IsRepoCloneableRequest {
+                repo: repo.to_owned(),
+            })
+            .await
+            .map_err(|error| Error::Message(error.to_string()))?
+            .into_inner();
+        if response.cloneable {
+            Ok(())
+        } else if response.reason.is_empty() {
+            Err(Error::Message("repository is not cloneable".to_owned()))
+        } else {
+            Err(Error::Message(response.reason))
+        }
+    }
+
     fn addr_for(&self, repo: &str) -> Option<&str> {
         // `connection.AddrForRepo` without the site-config pins: the callers
         // of this client receive the shard list, not the unified config.
