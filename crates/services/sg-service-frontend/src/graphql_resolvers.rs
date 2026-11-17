@@ -6273,6 +6273,24 @@ impl ObjectValue for SiteObject {
                     None => Ok(None),
                 }
             }
+            // `siteResolver.ExternalServicesFromFile` / `AllowEditExternalSer-
+            // vicesWithFile` (`site_flags.go:72-75`): the advanced config file
+            // env vars (`envvar.go:21-35`).
+            "externalServicesFromFile" => Ok(Some(FieldValue::Json(Json::Bool(
+                std::env::var("EXTSVC_CONFIG_FILE")
+                    .map(|value| !value.is_empty())
+                    .unwrap_or(false),
+            )))),
+            "allowEditExternalServicesWithFile" => Ok(Some(FieldValue::Json(Json::Bool(
+                std::env::var("EXTSVC_CONFIG_ALLOW_EDITS")
+                    .ok()
+                    .and_then(|value| match value.as_str() {
+                        "1" | "t" | "T" | "TRUE" | "true" | "True" => Some(true),
+                        "0" | "f" | "F" | "FALSE" | "false" | "False" => Some(false),
+                        _ => None,
+                    })
+                    .unwrap_or(false),
+            )))),
             // `siteResolver.BuildVersion` (`site.go:182`).
             "buildVersion" => Ok(Some(FieldValue::Json(Json::Str(
                 String::from_utf8_lossy(crate::version::Version::load().as_bytes()).into_owned(),
