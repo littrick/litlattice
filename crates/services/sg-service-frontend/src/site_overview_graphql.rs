@@ -133,6 +133,36 @@ impl ObjectValue for UpdateCheckObject {
     }
 }
 
+/// An empty `RecordedCommandConnection` (`recorded_commands.go:34-90`). The
+/// command recorder's Redis FIFO is not ported; when `gitRecorder` is unset
+/// the baseline also returns an empty connection.
+pub struct EmptyRecordedCommandsConnectionObject;
+
+impl ObjectValue for EmptyRecordedCommandsConnectionObject {
+    fn type_name(&self) -> &'static str {
+        "RecordedCommandConnection"
+    }
+
+    fn field(
+        &self,
+        field: &str,
+        _arguments: &Arguments,
+        _actor: Actor,
+    ) -> Result<Option<FieldValue>, ExecError> {
+        match field {
+            "nodes" => Ok(Some(FieldValue::List {
+                items: Vec::new(),
+                element_type: Some("RecordedCommand"),
+            })),
+            "totalCount" => Ok(Some(FieldValue::Json(Json::Int(0)))),
+            "pageInfo" => Ok(Some(FieldValue::Object(Arc::new(
+                crate::graphql_resolvers::PageInfoObject::new(false, None),
+            )))),
+            _ => Ok(None),
+        }
+    }
+}
+
 /// An empty `AccessRequestConnection` (the requests store is not ported; a
 /// fresh instance has no requests).
 pub struct EmptyAccessRequestsConnectionObject;

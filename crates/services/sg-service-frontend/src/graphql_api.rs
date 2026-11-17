@@ -2811,6 +2811,32 @@ impl GraphqlDeps for SchemaGraphqlDeps {
                     crate::site_overview_graphql::prefetch_site_flags(pool).await;
             }
         }
+        // `Repository.isRecordingEnabled`: `gitRecorder.repos` from the live
+        // Site configuration (`recorded_commands.go:133-148`).
+        if let Some(deps) = &self.config_graphql {
+            if crate::site_overview_graphql::selects(&fields, &["isRecordingEnabled"]) {
+                let repos = deps
+                    .store
+                    .last_valid()
+                    .and_then(|unified| {
+                        unified
+                            .site
+                            .raw()
+                            .get("gitRecorder")
+                            .and_then(|recorder| recorder.get("repos"))
+                            .and_then(serde_json::Value::as_array)
+                            .map(|repos| {
+                                repos
+                                    .iter()
+                                    .filter_map(serde_json::Value::as_str)
+                                    .map(str::to_owned)
+                                    .collect::<Vec<_>>()
+                            })
+                    })
+                    .unwrap_or_default();
+                Arc::make_mut(&mut nested).git_recorder_repos = repos;
+            }
+        }
         // `Repository.mirrorInfo`: prefetch the gitserver rows for repository
         // objects reached through `Query.repository`, `Query.node`,
         // `Query.repositoryRedirect` or the `Query.repositories` connection.

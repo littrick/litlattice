@@ -1054,6 +1054,9 @@ pub struct NestedPrefetch {
     /// `Repository.mirrorInfo` rows keyed by repo id, for repository objects
     /// reached through `Query.repository` / `Query.node`.
     pub mirror_infos: HashMap<i32, crate::mirror_info_graphql::MirrorInfoLookup>,
+    /// `gitRecorder.repos` from the live Site configuration
+    /// (`recorded_commands.go:133-148`).
+    pub git_recorder_repos: Vec<String>,
     /// `Repository.externalServices` rows keyed by repo id.
     pub repo_external_services:
         HashMap<i32, Result<Vec<crate::external_services::ExternalServiceNodeData>, String>>,
@@ -3998,7 +4001,8 @@ impl QueryRoot {
                             )
                             .with_repo_external_services(
                                 self.nested.repo_external_services.get(&data.id).cloned(),
-                            ),
+                            )
+                            .with_nested(self.nested.clone()),
                     )))),
                     Some(RepoLookup::NotFound) => Ok(Some(FieldValue::Null)),
                     Some(RepoLookup::Blocked { name, reason }) => Err(ExecError::new(format!(
@@ -4544,7 +4548,8 @@ impl ObjectValue for QueryRoot {
                             )
                             .with_repo_external_services(
                                 self.nested.repo_external_services.get(&data.id).cloned(),
-                            );
+                            )
+                            .with_nested(self.nested.clone());
                         // `Repository.batchChanges` (M9.24c): the batch-changes
                         // resolver is attached to the object, like the
                         // `User`/`Org` root fields which get it through
@@ -4583,7 +4588,8 @@ impl ObjectValue for QueryRoot {
                                 )
                             .with_repo_external_services(
                                 self.nested.repo_external_services.get(&data.id).cloned(),
-                            );
+                            )
+                            .with_nested(self.nested.clone());
                             if let Some(batches) = self.batches.clone() {
                                 object = object.with_batches(batches);
                             }
@@ -4626,7 +4632,8 @@ impl ObjectValue for QueryRoot {
                             )
                             .with_repo_external_services(
                                 self.nested.repo_external_services.get(&data.id).cloned(),
-                            ),
+                            )
+                            .with_nested(self.nested.clone()),
                     )))),
                     Some(RepoLookup::NotFound) => Ok(Some(FieldValue::Null)),
                     Some(RepoLookup::Blocked { name, reason }) => Err(ExecError::new(format!(
@@ -7454,6 +7461,8 @@ pub struct RepositoryObject {
     repo_external_services: Option<
         Result<Vec<crate::external_services::ExternalServiceNodeData>, String>,
     >,
+    /// The request's nested prefetch (for `isRecordingEnabled`).
+    nested: Arc<NestedPrefetch>,
 }
 
 impl RepositoryObject {
@@ -7471,11 +7480,14 @@ impl RepositoryObject {
             viewer_site_admin: false,
             mirror_info: None,
             repo_external_services: None,
+            nested: Arc::new(NestedPrefetch::default()),
         }
     }
 
-    fn nested_prefetch_placeholder(&self) -> Arc<NestedPrefetch> {
-        Arc::new(NestedPrefetch::default())
+    /// Attach the request's nested prefetch data.
+    pub fn with_nested(mut self, nested: Arc<NestedPrefetch>) -> Self {
+        self.nested = nested;
+        self
     }
 
     /// Attach the prefetched `externalServices` rows.
@@ -7902,6 +7914,27 @@ impl ObjectValue for RepositoryObject {
                 "/{}",
                 self.data.name
             )))))),
+            // `RepositoryResolver.RecordedCommands`
+            // (`recorded_commands.go:34-90`): site admins only. The command
+            // recorder's Redis FIFO is not ported; without `gitRecorder`
+            // configured the baseline returns an empty connection too.
+            "recordedCommands" => {
+                if !self.viewer_site_admin {
+                    return Err(ExecError::new(MUST_BE_SITE_ADMIN));
+                }
+                Ok(Some(FieldValue::Object(Arc::new(
+                    crate::site_overview_graphql::EmptyRecordedCommandsConnectionObject,
+                ))))
+            }
+            // `RepositoryResolver.IsRecordingEnabled`
+            // (`recorded_commands.go:133-148`): `gitRecorder.repos` contains
+            // "*" or this repository name (case-insensitive).
+            "isRecordingEnabled" => {
+                let enabled = self.nested.git_recorder_repos.iter().any(|repo| {
+                    repo == "*" || repo.eq_ignore_ascii_case(&self.data.name)
+                });
+                Ok(Some(FieldValue::Json(Json::Bool(enabled))))
+            }
             // `RepositoryResolver.ExternalServices` (`repository_external.go:45-75`):
             // site admins only (the configs contain secrets).
             "externalServices" => {
@@ -7915,7 +7948,7 @@ impl ObjectValue for RepositoryObject {
                         crate::external_services::RepositoryExternalServicesConnectionObject::new(
                             services.clone(),
                             self.viewer_site_admin,
-                            self.nested_prefetch_placeholder(),
+                            self.nested.clone(),
                         ),
                     )))),
                 }

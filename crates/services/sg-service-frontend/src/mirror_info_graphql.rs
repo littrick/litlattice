@@ -38,6 +38,8 @@ pub struct MirrorInfoData {
     /// `repo.CloneURLs()[0]` with the userinfo removed, from
     /// `external_service_repos.clone_url`.
     pub remote_url: Option<String>,
+    /// `GitserverRepos().GetLastSyncOutput` (`gitserver_repos_sync_output`).
+    pub last_sync_output: Option<String>,
 }
 
 fn parse_corruption_logs(value: &serde_json::Value) -> Vec<OffsetDateTime> {
@@ -86,6 +88,7 @@ fn mirror_info_from_row(row: &GitserverRepo) -> MirrorInfoData {
         byte_size: row.repo_size_bytes.unwrap_or(0),
         shard: (!row.shard_id.is_empty()).then(|| row.shard_id.clone()),
         remote_url: None,
+        last_sync_output: None,
     }
 }
 
@@ -122,6 +125,13 @@ pub async fn prefetch_mirror_infos(
                 .ok()
                 .flatten()
                 .map(|url| strip_userinfo(&url));
+                if !row.name.is_empty() {
+                    data.last_sync_output = store
+                        .get_last_sync_output(&row.name)
+                        .await
+                        .ok()
+                        .flatten();
+                }
                 Ok(data)
             }
             // No row means "not yet in the gitserver schedule": the baseline
@@ -138,6 +148,7 @@ pub async fn prefetch_mirror_infos(
                 byte_size: 0,
                 shard: None,
                 remote_url: None,
+                last_sync_output: None,
             }),
             Err(error) => Err(error.to_string()),
         };
@@ -211,9 +222,11 @@ impl ObjectValue for MirrorInfoObject {
                 Some(value) => FieldValue::Json(Json::Str(value.clone())),
                 None => FieldValue::Null,
             })),
-            // `GetLastSyncOutput` is not prefetched (the admin page does not
-            // select it).
-            "lastSyncOutput" => Ok(Some(FieldValue::Null)),
+            // `LastSyncOutput` (`repository_mirror.go:145-155`).
+            "lastSyncOutput" => Ok(Some(match &data.last_sync_output {
+                Some(output) => FieldValue::Json(Json::Str(output.clone())),
+                None => FieldValue::Null,
+            })),
             "byteSize" => Ok(Some(FieldValue::Json(Json::Int(data.byte_size)))),
             // `Shard` (`repository_mirror.go:229-246`): site admins only.
             "shard" => {
