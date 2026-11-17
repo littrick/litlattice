@@ -6763,6 +6763,8 @@ impl ObjectValue for UsersConnectionObject {
                 Ok(Some(FieldValue::Object(Arc::new(PageInfoObject {
                     has_next_page,
                     end_cursor,
+                    has_previous_page: false,
+                    start_cursor: None,
                 }))))
             }
             _ => Ok(None),
@@ -6775,6 +6777,8 @@ impl ObjectValue for UsersConnectionObject {
 pub struct PageInfoObject {
     has_next_page: bool,
     end_cursor: Option<String>,
+    has_previous_page: bool,
+    start_cursor: Option<String>,
 }
 
 impl PageInfoObject {
@@ -6783,7 +6787,21 @@ impl PageInfoObject {
         Self {
             has_next_page,
             end_cursor,
+            has_previous_page: false,
+            start_cursor: None,
         }
+    }
+
+    /// Fill the fields the 5.5 UI also selects. Connections that do not track
+    /// the corresponding boundary keep the defaults (`false`/`null`).
+    pub fn with_page_edges(
+        mut self,
+        has_previous_page: bool,
+        start_cursor: Option<String>,
+    ) -> Self {
+        self.has_previous_page = has_previous_page;
+        self.start_cursor = start_cursor;
+        self
     }
 }
 
@@ -6801,6 +6819,13 @@ impl ObjectValue for PageInfoObject {
         match field {
             "hasNextPage" => Ok(Some(FieldValue::Json(Json::Bool(self.has_next_page)))),
             "endCursor" => Ok(Some(match &self.end_cursor {
+                Some(cursor) => FieldValue::Json(Json::Str(cursor.clone())),
+                None => FieldValue::Null,
+            })),
+            "hasPreviousPage" => Ok(Some(FieldValue::Json(Json::Bool(
+                self.has_previous_page,
+            )))),
+            "startCursor" => Ok(Some(match &self.start_cursor {
                 Some(cursor) => FieldValue::Json(Json::Str(cursor.clone())),
                 None => FieldValue::Null,
             })),

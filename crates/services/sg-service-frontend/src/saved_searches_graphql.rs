@@ -66,6 +66,9 @@ pub struct SavedSearchRow {
     pub created_at: OffsetDateTime,
     pub updated_by_user: Option<i32>,
     pub updated_at: OffsetDateTime,
+    pub notify_owner: bool,
+    pub notify_slack: bool,
+    pub slack_webhook_url: Option<String>,
 }
 
 impl SavedSearchRow {
@@ -238,6 +241,9 @@ pub trait SavedSearchesGraphqlDatabase: Send + Sync {
         owner: NamespaceIds,
         visibility_secret: bool,
         actor_uid: i32,
+        notify_owner: bool,
+        notify_slack: bool,
+        slack_webhook_url: Option<&str>,
     ) -> Result<SavedSearchRow, String>;
 
     fn update_saved_search(
@@ -247,6 +253,9 @@ pub trait SavedSearchesGraphqlDatabase: Send + Sync {
         query: &str,
         draft: bool,
         actor_uid: i32,
+        notify_owner: bool,
+        notify_slack: bool,
+        slack_webhook_url: Option<&str>,
     ) -> Result<SavedSearchRow, String>;
 
     fn update_saved_search_owner(
@@ -536,6 +545,21 @@ impl ObjectValue for SavedSearchObject {
             )))),
             "query" => Ok(Some(FieldValue::Json(Json::Str(self.row.query.clone())))),
             "draft" => Ok(Some(FieldValue::Json(Json::Bool(self.row.draft)))),
+            "notify" => Ok(Some(FieldValue::Json(Json::Bool(self.row.notify_owner)))),
+            "notifySlack" => Ok(Some(FieldValue::Json(Json::Bool(self.row.notify_slack)))),
+            "slackWebhookURL" => Ok(Some(match &self.row.slack_webhook_url {
+                Some(url) => FieldValue::Json(Json::Str(url.clone())),
+                None => FieldValue::Null,
+            })),
+            "namespace" => {
+                if let Some(user) = self.row.user_id {
+                    return self.user_object(user, actor).map(Some);
+                }
+                if let Some(org) = self.row.org_id {
+                    return self.org_object(org, actor).map(Some);
+                }
+                Err(ExecError::new("no owner"))
+            }
             "visibility" => Ok(Some(FieldValue::Json(Json::Str(
                 if self.row.visibility_secret {
                     "SECRET".to_owned()
@@ -834,7 +858,10 @@ pub fn saved_searches(
         ..SavedSearchListArgs::default()
     };
 
-    if let Some(owner) = arguments.string("owner") {
+    if let Some(owner) = arguments
+        .string("owner")
+        .or_else(|| arguments.string("namespace"))
+    {
         let namespace = check_authorized_for_namespace(db.as_ref(), actor, owner)?;
         list_args.owner = Some(namespace);
     }
@@ -907,45 +934,76 @@ fn get_existing(
         .ok_or_else(|| ExecError::new("saved search not found"))
 }
 
-/// `Mutation.createSavedSearch` (`resolvers.go:230-261`).
+/// Parse one namespace ID argument (`userID`/`orgID`): Relay ID, or a plain
+/// database ID string.
+fn namespace_id_argument(arguments: &Arguments, name: &str) -> Option<i32> {
+    let value = arguments.string(name)?;
+    unmarshal_relay_id(value)
+        .or_else(|_| value.parse::<i32>().map_err(|error| error.to_string()))
+        .ok()
+}
+
+/// Owner from the flat 5.5 arguments (`userID`/`orgID`), if supplied.
+fn flat_owner(arguments: &Arguments) -> Option<NamespaceIds> {
+    if let Some(user) = namespace_id_argument(arguments, "userID") {
+        return Some(NamespaceIds {
+            user: Some(user),
+            org: None,
+        });
+    }
+    namespace_id_argument(arguments, "orgID").map(|org| NamespaceIds {
+        user: None,
+        org: Some(org),
+    })
+}
+
+/// `Mutation.createSavedSearch` (`resolvers.go:230-261`). Supports both the
+/// baseline `input` argument and the flat 5.5 UI arguments.
 pub fn create_saved_search(
     db: &SavedSearchesHandle,
     arguments: &Arguments,
     actor: Actor,
 ) -> Result<FieldValue, ExecError> {
-    let input = arguments
-        .get("input")
-        .ok_or_else(|| ExecError::new("missing input"))?;
-    let sg_graphql::exec::InputValue::Object(input) = input else {
-        return Err(ExecError::new("missing input"));
+    let input = match arguments.get("input") {
+        Some(sg_graphql::exec::InputValue::Object(input)) => Some(input),
+        _ => None,
     };
-    let owner_id = input
-        .get("owner")
+    let namespace = if let Some(owner) = flat_owner(arguments) {
+        check_authorized_for_namespace_by_ids(db.as_ref(), actor, owner)?;
+        owner
+    } else if let Some(input) = input {
+        let owner_id = input
+            .get("owner")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| ExecError::new("missing owner"))?;
+        check_authorized_for_namespace(db.as_ref(), actor, owner_id)?
+    } else {
+        return Err(ExecError::new("missing owner"));
+    };
+    let field = |name: &str| input.and_then(|input| input.get(name));
+    let query = field("query")
         .and_then(|value| value.as_str())
-        .ok_or_else(|| ExecError::new("missing owner"))?;
-    let namespace = check_authorized_for_namespace(db.as_ref(), actor, owner_id)?;
-    let query = input
-        .get("query")
-        .and_then(|value| value.as_str())
+        .or_else(|| arguments.string("query"))
         .unwrap_or_default();
     if !query_has_pattern_type(query) {
         return Err(ExecError::new(ERR_MISSING_PATTERN_TYPE));
     }
-    let visibility = input
-        .get("visibility")
+    let visibility = field("visibility")
         .and_then(|value| value.as_str())
         .unwrap_or("SECRET");
     if !is_secret(visibility) {
         check_current_user_is_site_admin(db.as_ref(), actor)?;
     }
-    let description = input
-        .get("description")
+    let description = field("description")
         .and_then(|value| value.as_str())
+        .or_else(|| arguments.string("description"))
         .unwrap_or_default();
-    let draft = input
-        .get("draft")
+    let draft = field("draft")
         .and_then(|value| value.as_bool())
         .unwrap_or(false);
+    let notify_owner = arguments.bool("notifyOwner").unwrap_or(false);
+    let notify_slack = arguments.bool("notifySlack").unwrap_or(false);
+    let slack_webhook_url = arguments.string("slackWebhookURL");
     let row = db
         .create_saved_search(
             description,
@@ -954,6 +1012,9 @@ pub fn create_saved_search(
             namespace,
             is_secret(visibility),
             actor.uid().unwrap_or(0),
+            notify_owner,
+            notify_slack,
+            slack_webhook_url,
         )
         .map_err(exec_error)?;
     Ok(FieldValue::Object(Arc::new(SavedSearchObject::new(
@@ -962,7 +1023,8 @@ pub fn create_saved_search(
     ))))
 }
 
-/// `Mutation.updateSavedSearch` (`resolvers.go:263-296`).
+/// `Mutation.updateSavedSearch` (`resolvers.go:263-296`). Supports both the
+/// baseline `input` argument and the flat 5.5 UI arguments.
 pub fn update_saved_search(
     db: &SavedSearchesHandle,
     arguments: &Arguments,
@@ -977,24 +1039,35 @@ pub fn update_saved_search(
         .map_err(|error| ExecError::new(format!("get existing saved search: {error}")))?
         .ok_or_else(|| ExecError::new("get existing saved search: saved search not found"))?;
     check_authorized_for_namespace_by_ids(db.as_ref(), actor, old.owner())?;
-    let Some(sg_graphql::exec::InputValue::Object(input)) = arguments.get("input") else {
-        return Err(ExecError::new("missing input"));
+    let input = match arguments.get("input") {
+        Some(sg_graphql::exec::InputValue::Object(input)) => Some(input),
+        _ => None,
     };
-    let query = input
-        .get("query")
+    let field = |name: &str| input.and_then(|input| input.get(name));
+    let query = field("query")
         .and_then(|value| value.as_str())
-        .unwrap_or_default();
+        .or_else(|| arguments.string("query"))
+        .unwrap_or(old.query.as_str());
     if !query_has_pattern_type(query) {
         return Err(ExecError::new(ERR_MISSING_PATTERN_TYPE));
     }
-    let description = input
-        .get("description")
+    let description = field("description")
         .and_then(|value| value.as_str())
-        .unwrap_or_default();
-    let draft = input
-        .get("draft")
+        .or_else(|| arguments.string("description"))
+        .unwrap_or(old.description.as_str());
+    let draft = field("draft")
         .and_then(|value| value.as_bool())
-        .unwrap_or(false);
+        .unwrap_or(old.draft);
+    let notify_owner = arguments
+        .bool("notifyOwner")
+        .unwrap_or(old.notify_owner);
+    let notify_slack = arguments
+        .bool("notifySlack")
+        .unwrap_or(old.notify_slack);
+    let slack_webhook_url = arguments
+        .string("slackWebhookURL")
+        .map(str::to_owned)
+        .or_else(|| old.slack_webhook_url.clone());
     let row = db
         .update_saved_search(
             saved_search_id,
@@ -1002,8 +1075,20 @@ pub fn update_saved_search(
             query,
             draft,
             actor.uid().unwrap_or(0),
+            notify_owner,
+            notify_slack,
+            slack_webhook_url.as_deref(),
         )
         .map_err(exec_error)?;
+    // The 5.5 UI may move the saved search to another namespace.
+    let row = match flat_owner(arguments) {
+        Some(owner) if owner != old.owner() => {
+            check_authorized_for_namespace_by_ids(db.as_ref(), actor, owner)?;
+            db.update_saved_search_owner(saved_search_id, owner, actor.uid().unwrap_or(0))
+                .map_err(exec_error)?
+        }
+        _ => row,
+    };
     Ok(FieldValue::Object(Arc::new(SavedSearchObject::new(
         row,
         Arc::clone(db),

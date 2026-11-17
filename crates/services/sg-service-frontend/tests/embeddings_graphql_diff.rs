@@ -331,7 +331,7 @@ async fn embeddings_graphql_diff_harness() {
 
         let repositories = prefetch_repositories(&repo_store, None, &fields, actor, site_admin).await;
         let repositories_connections =
-            prefetch_repositories_connections(&connection_store, &fields, actor, site_admin).await;
+            prefetch_repositories_connections(&connection_store, &fields, actor, site_admin, None).await;
 
         let mut repo_ids: Vec<i32> = Vec::new();
         for lookup in repositories.values() {

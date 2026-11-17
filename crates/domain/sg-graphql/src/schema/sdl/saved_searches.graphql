@@ -2,12 +2,58 @@ extend type Mutation {
     """
     Creates a saved search.
     """
-    createSavedSearch(input: SavedSearchInput!): SavedSearch!
+    createSavedSearch(
+        """
+        The input for the saved search (legacy argument set).
+        """
+        input: SavedSearchInput
+        """
+        A description of the saved search.
+        """
+        description: String
+        """
+        The search query.
+        """
+        query: String
+        """
+        Notify the owner by email when the saved search matches.
+        """
+        notifyOwner: Boolean
+        """
+        Notify a Slack webhook when the saved search matches.
+        """
+        notifySlack: Boolean
+        """
+        The Slack webhook URL.
+        """
+        slackWebhookURL: String
+        """
+        The user that owns the saved search.
+        """
+        userID: ID
+        """
+        The organization that owns the saved search.
+        """
+        orgID: ID
+    ): SavedSearch!
 
     """
     Updates a saved search.
     """
-    updateSavedSearch(id: ID!, input: SavedSearchUpdateInput!): SavedSearch!
+    updateSavedSearch(
+        id: ID!
+        """
+        The input for the saved search (legacy argument set).
+        """
+        input: SavedSearchUpdateInput
+        description: String
+        query: String
+        notifyOwner: Boolean
+        notifySlack: Boolean
+        slackWebhookURL: String
+        userID: ID
+        orgID: ID
+    ): SavedSearch!
 
     """
     Deletes a saved search.
@@ -44,6 +90,11 @@ extend type Query {
         Filter by saved search owner (a namespace, either a user or organization).
         """
         owner: ID
+
+        """
+        The namespace ID to filter by (5.5 UI name for `owner`).
+        """
+        namespace: ID
 
         """
         Filter to only saved searches owned by the viewer or one of viewer's organizations. All
@@ -195,6 +246,26 @@ type SavedSearch implements Node {
     The search query.
     """
     query: String!
+
+    """
+    Whether the owner is notified by email when the saved search matches.
+    """
+    notify: Boolean!
+
+    """
+    Whether a Slack webhook is notified when the saved search matches.
+    """
+    notifySlack: Boolean!
+
+    """
+    The Slack webhook URL used for notifications.
+    """
+    slackWebhookURL: String
+
+    """
+    The namespace (user or organization) that owns the saved search.
+    """
+    namespace: Namespace!
 
     """
     Whether the saved search is a draft.

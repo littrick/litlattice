@@ -172,7 +172,7 @@ async fn repositories_harness() {
             actor,
         };
         let fields = root_fields(&schema, &request);
-        let connections = prefetch_repositories_connections(&store, &fields, actor, admin).await;
+        let connections = prefetch_repositories_connections(&store, &fields, actor, admin, None).await;
         let roots = FrontendRootResolver::new().with_repositories_connections(connections);
         let response = execute_with(&schema, request, Some(&roots));
 

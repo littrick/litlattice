@@ -165,6 +165,9 @@ fn saved_search_row(fixture: &SavedSearchFixture) -> SavedSearchRow {
         created_at: parse_time(&fixture.created_at),
         updated_by_user: fixture.updated_by,
         updated_at: parse_time(&fixture.updated_at),
+        notify_owner: false,
+        notify_slack: false,
+        slack_webhook_url: None,
     }
 }
 
@@ -350,6 +353,9 @@ impl SavedSearchesGraphqlDatabase for InMemorySavedSearches {
         owner: NamespaceIds,
         visibility_secret: bool,
         actor_uid: i32,
+        notify_owner: bool,
+        notify_slack: bool,
+        slack_webhook_url: Option<&str>,
     ) -> Result<SavedSearchRow, String> {
         let mut rows = self.rows.lock().unwrap();
         let id = rows.iter().map(|row| row.id).max().unwrap_or(0) + 1;
@@ -365,6 +371,9 @@ impl SavedSearchesGraphqlDatabase for InMemorySavedSearches {
             created_at: self.now,
             updated_by_user: Some(actor_uid),
             updated_at: self.now,
+            notify_owner,
+            notify_slack,
+            slack_webhook_url: slack_webhook_url.map(str::to_owned),
         };
         rows.push(row.clone());
         Ok(row)
@@ -377,6 +386,9 @@ impl SavedSearchesGraphqlDatabase for InMemorySavedSearches {
         query: &str,
         draft: bool,
         actor_uid: i32,
+        notify_owner: bool,
+        notify_slack: bool,
+        slack_webhook_url: Option<&str>,
     ) -> Result<SavedSearchRow, String> {
         let mut rows = self.rows.lock().unwrap();
         let row = rows
@@ -388,6 +400,9 @@ impl SavedSearchesGraphqlDatabase for InMemorySavedSearches {
         row.draft = draft;
         row.updated_by_user = Some(actor_uid);
         row.updated_at = self.now;
+        row.notify_owner = notify_owner;
+        row.notify_slack = notify_slack;
+        row.slack_webhook_url = slack_webhook_url.map(str::to_owned);
         Ok(row.clone())
     }
 

@@ -37,7 +37,8 @@ fn block_on<F: Future>(future: F) -> F::Output {
 
 /// `savedSearchColumns` (`saved_searches.go:61`).
 const SAVED_SEARCH_COLUMNS: &str = "description, query, draft, user_id, org_id, \
-     visibility_secret, created_by, created_at, updated_by, updated_at";
+     visibility_secret, created_by, created_at, updated_by, updated_at, \
+     notify_owner, notify_slack, slack_webhook_url";
 
 fn scan_saved_search(row: &PgRow) -> Result<SavedSearchRow, sqlx::Error> {
     Ok(SavedSearchRow {
@@ -52,6 +53,9 @@ fn scan_saved_search(row: &PgRow) -> Result<SavedSearchRow, sqlx::Error> {
         created_at: row.try_get("created_at")?,
         updated_by_user: row.try_get("updated_by")?,
         updated_at: row.try_get("updated_at")?,
+        notify_owner: row.try_get("notify_owner").unwrap_or(false),
+        notify_slack: row.try_get("notify_slack").unwrap_or(false),
+        slack_webhook_url: row.try_get("slack_webhook_url").ok().flatten(),
     })
 }
 
@@ -319,11 +323,15 @@ impl SavedSearchesGraphqlDatabase for PgSavedSearchesGraphqlStore {
         owner: NamespaceIds,
         visibility_secret: bool,
         actor_uid: i32,
+        notify_owner: bool,
+        notify_slack: bool,
+        slack_webhook_url: Option<&str>,
     ) -> Result<SavedSearchRow, String> {
         let sql = format!(
             "INSERT INTO saved_searches(description, query, draft, user_id, org_id, \
-             visibility_secret, created_by, created_at, updated_by, updated_at) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, DEFAULT, $8, DEFAULT) \
+             visibility_secret, created_by, created_at, updated_by, updated_at, \
+             notify_owner, notify_slack, slack_webhook_url) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, DEFAULT, $8, DEFAULT, $9, $10, $11) \
              RETURNING id, {SAVED_SEARCH_COLUMNS}"
         );
         let row = block_on(
@@ -336,6 +344,9 @@ impl SavedSearchesGraphqlDatabase for PgSavedSearchesGraphqlStore {
                 .bind(visibility_secret)
                 .bind(actor_uid)
                 .bind(actor_uid)
+                .bind(notify_owner)
+                .bind(notify_slack)
+                .bind(slack_webhook_url)
                 .fetch_one(&self.pool),
         )
         .map_err(error)?;
@@ -349,10 +360,14 @@ impl SavedSearchesGraphqlDatabase for PgSavedSearchesGraphqlStore {
         query: &str,
         draft: bool,
         actor_uid: i32,
+        notify_owner: bool,
+        notify_slack: bool,
+        slack_webhook_url: Option<&str>,
     ) -> Result<SavedSearchRow, String> {
         let sql = format!(
             "UPDATE saved_searches SET description=$1, query=$2, draft=$3, \
-             updated_at=now(), updated_by=$4 WHERE id=$5 \
+             updated_at=now(), updated_by=$4, notify_owner=$5, notify_slack=$6, \
+             slack_webhook_url=$7 WHERE id=$8 \
              RETURNING id, {SAVED_SEARCH_COLUMNS}"
         );
         let row = block_on(
