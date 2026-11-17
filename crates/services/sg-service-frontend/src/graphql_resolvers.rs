@@ -1034,6 +1034,12 @@ pub struct NestedPrefetch {
     /// otherwise.
     pub per_user_completions_quota: Option<i32>,
     pub per_user_code_completions_quota: Option<i32>,
+    /// `User.eventLogs` connections keyed by user id and the arguments
+    /// (`event_logs.go:16`).
+    pub user_event_logs: HashMap<
+        (i32, crate::event_logs_graphql::EventLogsArgs),
+        crate::event_logs_graphql::UserEventLogsLookup,
+    >,
     /// `User.externalAccounts` connections keyed by user id and the `first`
     /// argument (M9.8ka).
     pub user_external_accounts:
@@ -5785,6 +5791,37 @@ impl ObjectValue for UserObject {
                         Err(ExecError::new(message.clone()))
                     }
                     None => Ok(None),
+                }
+            }
+            // `UserResolver.EventLogs` (`event_logs.go:16-26`): the
+            // site-admin-or-same-user gate, then the prefetched connection.
+            "eventLogs" => {
+                if !self.can_administer(actor) {
+                    return Err(ExecError::new(MUST_BE_SITE_ADMIN_OR_SAME_USER));
+                }
+                let args =
+                    crate::event_logs_graphql::EventLogsArgs::from_arguments(arguments);
+                let Some(lookup) = self
+                    .nested
+                    .user_event_logs
+                    .get(&(self.data.id, args.clone()))
+                else {
+                    return Ok(None);
+                };
+                match lookup {
+                    crate::event_logs_graphql::UserEventLogsLookup::Found { events, total } => {
+                        Ok(Some(FieldValue::Object(Arc::new(
+                            crate::event_logs_graphql::EventLogsConnectionObject::new(
+                                Arc::new(self.clone()),
+                                events.clone(),
+                                *total,
+                                args.first,
+                            ),
+                        ))))
+                    }
+                    crate::event_logs_graphql::UserEventLogsLookup::Error(message) => {
+                        Err(ExecError::new(message.clone()))
+                    }
                 }
             }
             // `UserResolver.LatestSettings` (`user.go:374-389`): the same

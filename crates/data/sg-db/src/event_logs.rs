@@ -172,6 +172,83 @@ pub async fn count_export_queue(pool: &PgPool, bookmark: i32) -> Result<i64, Str
     .map_err(|err| err.to_string())
 }
 
+/// One `event_logs` row for the user event-log page
+/// (`eventLogStore.ListAll` with `UserID`/`EventName`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct UserEventLogRow {
+    pub id: i64,
+    pub name: String,
+    pub url: String,
+    pub user_id: i32,
+    pub anonymous_user_id: String,
+    pub source: String,
+    pub argument: String,
+    pub version: String,
+    pub timestamp: OffsetDateTime,
+}
+
+/// `eventLogStore.ListAll` restricted to one user, newest first
+/// (`event_logs.go:393-420`): `first` is the `LIMIT` (`None` = unlimited) and
+/// `event_name` is the optional `name` filter.
+pub async fn list_by_user(
+    pool: &PgPool,
+    user_id: i32,
+    event_name: Option<&str>,
+    first: Option<i64>,
+) -> Result<Vec<UserEventLogRow>, String> {
+    let rows = sqlx::query(
+        "SELECT id, name, COALESCE(url, '') AS url, user_id, anonymous_user_id, source, \
+                argument::text AS argument, version, timestamp \
+         FROM event_logs \
+         WHERE user_id = $1 AND ($2::text IS NULL OR name = $2) \
+         ORDER BY id DESC \
+         LIMIT $3",
+    )
+    .bind(user_id)
+    .bind(event_name)
+    .bind(first)
+    .fetch_all(pool)
+    .await
+    .map_err(|error| error.to_string())?;
+    rows.into_iter()
+        .map(|row| {
+            Ok(UserEventLogRow {
+                id: row.try_get("id").map_err(|error| error.to_string())?,
+                name: row.try_get("name").map_err(|error| error.to_string())?,
+                url: row.try_get("url").map_err(|error| error.to_string())?,
+                user_id: row.try_get("user_id").map_err(|error| error.to_string())?,
+                anonymous_user_id: row
+                    .try_get("anonymous_user_id")
+                    .map_err(|error| error.to_string())?,
+                source: row.try_get("source").map_err(|error| error.to_string())?,
+                argument: row.try_get("argument").map_err(|error| error.to_string())?,
+                version: row.try_get("version").map_err(|error| error.to_string())?,
+                timestamp: row
+                    .try_get("timestamp")
+                    .map_err(|error| error.to_string())?,
+            })
+        })
+        .collect()
+}
+
+/// `eventLogStore.CountByUserID` / `CountByUserIDAndEventName`
+/// (`event_logs.go:426-432`).
+pub async fn count_by_user(
+    pool: &PgPool,
+    user_id: i32,
+    event_name: Option<&str>,
+) -> Result<i64, String> {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM event_logs \
+         WHERE user_id = $1 AND ($2::text IS NULL OR name = $2)",
+    )
+    .bind(user_id)
+    .bind(event_name)
+    .fetch_one(pool)
+    .await
+    .map_err(|error| error.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

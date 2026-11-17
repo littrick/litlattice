@@ -2496,6 +2496,19 @@ impl GraphqlDeps for SchemaGraphqlDeps {
             )
             .await;
         }
+        // `User.eventLogs` (`event_logs.go:16`): synchronous resolver over
+        // prefetched rows, for `currentUser` and `node(id: <User>)`.
+        if let Some(pool) = &self.pool {
+            let event_logs = crate::event_logs_graphql::prefetch_user_event_logs(
+                pool,
+                &fields,
+                current_user.as_ref(),
+            )
+            .await;
+            if !event_logs.is_empty() {
+                Arc::make_mut(&mut nested).user_event_logs = event_logs;
+            }
+        }
         // The current user carries the request's viewer context: Go's
         // `UserResolver` authorizes each field against the live session, so
         // `currentUser.roles -> Role.permissions` must see `site_admin`.

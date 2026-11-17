@@ -91,6 +91,7 @@ pub mod embeddings_graphql;
 pub mod embeddings_graphql_surface;
 pub mod webhooks;
 pub mod ipynb_render;
+pub mod event_logs_graphql;
 pub mod executor_secrets_graphql;
 pub mod goimportpath;
 pub mod graphql_api;
