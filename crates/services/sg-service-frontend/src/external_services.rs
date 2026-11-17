@@ -30,6 +30,7 @@ use sg_db::external_services::{ExternalServiceListRecord, ExternalServiceStore};
 use sg_encryption::{maybe_decrypt, Key};
 use sg_graphql::exec::{Actor, Arguments, ExecError, FieldValue, ObjectValue, RootField};
 use sg_graphql::json::Json;
+use sqlx::Row;
 use sg_jsonx::{
     apply_edits, compute_property_edit, go_json_string, parse, EditValue, FormatOptions, JsonValue,
     ParseOptions, Path, Segment,
@@ -828,6 +829,132 @@ fn webhook_url(
         _ => false,
     };
     Ok(enabled.then_some(url))
+}
+
+/// `Repository.externalServices` (`repository_external.go:45-75`): the
+/// external services linked to a repository, ordered by ID.
+pub async fn external_services_for_repo(
+    pool: &sqlx::PgPool,
+    repo_id: i32,
+) -> Result<Vec<ExternalServiceNodeData>, String> {
+    let rows = sqlx::query(
+        "SELECT es.id, es.kind, es.display_name, es.config, es.created_at, \
+                es.updated_at, es.unrestricted \
+         FROM external_services es \
+         JOIN external_service_repos esr ON esr.external_service_id = es.id \
+         WHERE esr.repo_id = $1 AND es.deleted_at IS NULL \
+         ORDER BY es.id ASC",
+    )
+    .bind(repo_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|error| error.to_string())?;
+    rows.into_iter()
+        .map(|row| {
+            let kind: String = row.try_get("kind").map_err(|e| e.to_string())?;
+            let raw_config: String = row.try_get("config").map_err(|e| e.to_string())?;
+            let config = redact_config(&kind, &raw_config).unwrap_or_else(|_| raw_config.clone());
+            Ok(ExternalServiceNodeData {
+                id: row.try_get("id").map_err(|e| e.to_string())?,
+                display_name: row
+                    .try_get("display_name")
+                    .map_err(|e| e.to_string())?,
+                url: unique_code_host_identifier(&kind, &raw_config),
+                webhook_url: Ok(None),
+                created_at: row.try_get("created_at").map_err(|e| e.to_string())?,
+                updated_at: row.try_get("updated_at").map_err(|e| e.to_string())?,
+                creator: None,
+                last_updater: None,
+                warning: None,
+                last_sync_error: None,
+                repo_count: 0,
+                last_sync_at: None,
+                next_sync_at: None,
+                unrestricted: row.try_get("unrestricted").unwrap_or(false),
+                supports_repo_exclusion: supports_repo_exclusion(&kind),
+                has_connection_check: has_connection_check(&kind),
+                check_connection: ConnectionCheckData::Unknown,
+                sync_jobs: SyncJobsData::default(),
+                kind,
+                config,
+            })
+        })
+        .collect()
+}
+
+/// `Repository.externalServices` connection
+/// (`external_services.go` / `ComputedExternalServiceConnectionResolver`).
+pub struct RepositoryExternalServicesConnectionObject {
+    services: Vec<ExternalServiceNodeData>,
+    viewer_site_admin: bool,
+    nested: Arc<crate::graphql_resolvers::NestedPrefetch>,
+}
+
+impl RepositoryExternalServicesConnectionObject {
+    pub fn new(
+        services: Vec<ExternalServiceNodeData>,
+        viewer_site_admin: bool,
+        nested: Arc<crate::graphql_resolvers::NestedPrefetch>,
+    ) -> Self {
+        Self {
+            services,
+            viewer_site_admin,
+            nested,
+        }
+    }
+}
+
+impl ObjectValue for RepositoryExternalServicesConnectionObject {
+    fn type_name(&self) -> &'static str {
+        "ExternalServiceConnection"
+    }
+
+    fn field(
+        &self,
+        field: &str,
+        arguments: &Arguments,
+        _actor: Actor,
+    ) -> Result<Option<FieldValue>, ExecError> {
+        match field {
+            "nodes" => {
+                let first = arguments
+                    .i64("first")
+                    .map(|value| value.max(0) as usize)
+                    .unwrap_or(usize::MAX);
+                Ok(Some(FieldValue::List {
+                    items: self
+                        .services
+                        .iter()
+                        .take(first)
+                        .map(|data| {
+                            FieldValue::Object(Arc::new(ExternalServiceObject::from_data(
+                                data.clone(),
+                                self.viewer_site_admin,
+                                self.nested.clone(),
+                            )))
+                        })
+                        .collect(),
+                    element_type: Some("ExternalService"),
+                }))
+            }
+            "totalCount" => Ok(Some(FieldValue::Json(Json::Int(
+                self.services.len() as i64,
+            )))),
+            "pageInfo" => {
+                let first = arguments
+                    .i64("first")
+                    .map(|value| value as usize)
+                    .unwrap_or(usize::MAX);
+                Ok(Some(FieldValue::Object(Arc::new(
+                    crate::graphql_resolvers::PageInfoObject::new(
+                        self.services.len() > first,
+                        None,
+                    ),
+                ))))
+            }
+            _ => Ok(None),
+        }
+    }
 }
 
 /// Replace the kind's secret properties in the raw JSONC document, keeping

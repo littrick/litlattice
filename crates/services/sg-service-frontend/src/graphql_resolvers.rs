@@ -1051,6 +1051,12 @@ pub struct NestedPrefetch {
     /// Prefetched `Site.siteID` / `needsRepositoryConfiguration` /
     /// `freeUsersExceeded` flags.
     pub site_flags: crate::site_overview_graphql::SiteFlags,
+    /// `Repository.mirrorInfo` rows keyed by repo id, for repository objects
+    /// reached through `Query.repository` / `Query.node`.
+    pub mirror_infos: HashMap<i32, crate::mirror_info_graphql::MirrorInfoLookup>,
+    /// `Repository.externalServices` rows keyed by repo id.
+    pub repo_external_services:
+        HashMap<i32, Result<Vec<crate::external_services::ExternalServiceNodeData>, String>>,
     /// `Site.users` totals keyed by the user-list arguments
     /// (`site_users.go:15-42`).
     pub site_users: HashMap<UsersArgs, UsersConnectionLookup>,
@@ -3986,7 +3992,13 @@ impl QueryRoot {
                             .with_codeintel_policies(self.codeintel_policies.clone())
                             .with_codeintel_uploads(self.codeintel_uploads.clone())
                             .with_authz(self.authz.clone())
-                            .with_viewer_site_admin(self.viewer_site_admin),
+                            .with_viewer_site_admin(self.viewer_site_admin)
+                            .with_mirror_info(
+                                self.nested.mirror_infos.get(&data.id).cloned(),
+                            )
+                            .with_repo_external_services(
+                                self.nested.repo_external_services.get(&data.id).cloned(),
+                            ),
                     )))),
                     Some(RepoLookup::NotFound) => Ok(Some(FieldValue::Null)),
                     Some(RepoLookup::Blocked { name, reason }) => Err(ExecError::new(format!(
@@ -4526,7 +4538,13 @@ impl ObjectValue for QueryRoot {
                             .with_codeintel_policies(self.codeintel_policies.clone())
                             .with_codeintel_uploads(self.codeintel_uploads.clone())
                             .with_authz(self.authz.clone())
-                            .with_viewer_site_admin(self.viewer_site_admin);
+                            .with_viewer_site_admin(self.viewer_site_admin)
+                            .with_mirror_info(
+                                self.nested.mirror_infos.get(&data.id).cloned(),
+                            )
+                            .with_repo_external_services(
+                                self.nested.repo_external_services.get(&data.id).cloned(),
+                            );
                         // `Repository.batchChanges` (M9.24c): the batch-changes
                         // resolver is attached to the object, like the
                         // `User`/`Org` root fields which get it through
@@ -4559,7 +4577,13 @@ impl ObjectValue for QueryRoot {
                                 .with_codeintel_policies(self.codeintel_policies.clone())
                             .with_codeintel_uploads(self.codeintel_uploads.clone())
                                 .with_authz(self.authz.clone())
-                                .with_viewer_site_admin(self.viewer_site_admin);
+                                .with_viewer_site_admin(self.viewer_site_admin)
+                                .with_mirror_info(
+                                    self.nested.mirror_infos.get(&data.id).cloned(),
+                                )
+                            .with_repo_external_services(
+                                self.nested.repo_external_services.get(&data.id).cloned(),
+                            );
                             if let Some(batches) = self.batches.clone() {
                                 object = object.with_batches(batches);
                             }
@@ -4596,7 +4620,13 @@ impl ObjectValue for QueryRoot {
                             .with_codeintel_policies(self.codeintel_policies.clone())
                             .with_codeintel_uploads(self.codeintel_uploads.clone())
                             .with_authz(self.authz.clone())
-                            .with_viewer_site_admin(self.viewer_site_admin),
+                            .with_viewer_site_admin(self.viewer_site_admin)
+                            .with_mirror_info(
+                                self.nested.mirror_infos.get(&data.id).cloned(),
+                            )
+                            .with_repo_external_services(
+                                self.nested.repo_external_services.get(&data.id).cloned(),
+                            ),
                     )))),
                     Some(RepoLookup::NotFound) => Ok(Some(FieldValue::Null)),
                     Some(RepoLookup::Blocked { name, reason }) => Err(ExecError::new(format!(
@@ -7420,6 +7450,10 @@ pub struct RepositoryObject {
     viewer_site_admin: bool,
     /// Prefetched `gitserver_repos` data for `Repository.mirrorInfo`.
     mirror_info: Option<crate::mirror_info_graphql::MirrorInfoLookup>,
+    /// `Repository.externalServices` rows (site-admin only).
+    repo_external_services: Option<
+        Result<Vec<crate::external_services::ExternalServiceNodeData>, String>,
+    >,
 }
 
 impl RepositoryObject {
@@ -7436,7 +7470,23 @@ impl RepositoryObject {
             authz: None,
             viewer_site_admin: false,
             mirror_info: None,
+            repo_external_services: None,
         }
+    }
+
+    fn nested_prefetch_placeholder(&self) -> Arc<NestedPrefetch> {
+        Arc::new(NestedPrefetch::default())
+    }
+
+    /// Attach the prefetched `externalServices` rows.
+    pub fn with_repo_external_services(
+        mut self,
+        services: Option<
+            Result<Vec<crate::external_services::ExternalServiceNodeData>, String>,
+        >,
+    ) -> Self {
+        self.repo_external_services = services;
+        self
     }
 
     /// Attach the prefetched `mirrorInfo` row.
@@ -7852,6 +7902,24 @@ impl ObjectValue for RepositoryObject {
                 "/{}",
                 self.data.name
             )))))),
+            // `RepositoryResolver.ExternalServices` (`repository_external.go:45-75`):
+            // site admins only (the configs contain secrets).
+            "externalServices" => {
+                if !self.viewer_site_admin {
+                    return Err(ExecError::new(MUST_BE_SITE_ADMIN));
+                }
+                match &self.repo_external_services {
+                    None => Ok(None),
+                    Some(Err(message)) => Err(ExecError::new(message.clone())),
+                    Some(Ok(services)) => Ok(Some(FieldValue::Object(Arc::new(
+                        crate::external_services::RepositoryExternalServicesConnectionObject::new(
+                            services.clone(),
+                            self.viewer_site_admin,
+                            self.nested_prefetch_placeholder(),
+                        ),
+                    )))),
+                }
+            }
             // `RepositoryResolver.MirrorInfo` (`repository_mirror.go:23-25`).
             "mirrorInfo" => match &self.mirror_info {
                 None => Ok(None),

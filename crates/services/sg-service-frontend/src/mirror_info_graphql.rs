@@ -26,6 +26,7 @@ pub type MirrorInfoLookup = Result<MirrorInfoData, String>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MirrorInfoData {
+    pub name: String,
     pub cloned: bool,
     pub clone_in_progress: bool,
     pub updated_at: Option<OffsetDateTime>,
@@ -34,6 +35,9 @@ pub struct MirrorInfoData {
     pub last_error: Option<String>,
     pub byte_size: i64,
     pub shard: Option<String>,
+    /// `repo.CloneURLs()[0]` with the userinfo removed, from
+    /// `external_service_repos.clone_url`.
+    pub remote_url: Option<String>,
 }
 
 fn parse_corruption_logs(value: &serde_json::Value) -> Vec<OffsetDateTime> {
@@ -51,8 +55,28 @@ fn parse_corruption_logs(value: &serde_json::Value) -> Vec<OffsetDateTime> {
         .collect()
 }
 
+/// `removeUserinfo` (`repository_mirror.go:71-100`): strip credentials from
+/// an HTTPS/SSH URL, or the SCP-style `user@host:path` prefix.
+fn strip_userinfo(raw: &str) -> String {
+    if raw.contains("://") {
+        match url::Url::parse(raw) {
+            Ok(mut parsed) => {
+                let _ = parsed.set_username("");
+                let _ = parsed.set_password(None);
+                return parsed.to_string();
+            }
+            Err(_) => return raw.to_owned(),
+        }
+    }
+    match raw.split_once('@') {
+        Some((_, rest)) => rest.to_owned(),
+        None => raw.to_owned(),
+    }
+}
+
 fn mirror_info_from_row(row: &GitserverRepo) -> MirrorInfoData {
     MirrorInfoData {
+        name: row.name.clone(),
         cloned: row.clone_status == CloneStatus::Cloned,
         clone_in_progress: row.clone_status == CloneStatus::Cloning,
         updated_at: (row.last_fetched != OffsetDateTime::UNIX_EPOCH).then_some(row.last_fetched),
@@ -61,6 +85,7 @@ fn mirror_info_from_row(row: &GitserverRepo) -> MirrorInfoData {
         last_error: row.last_error.clone(),
         byte_size: row.repo_size_bytes.unwrap_or(0),
         shard: (!row.shard_id.is_empty()).then(|| row.shard_id.clone()),
+        remote_url: None,
     }
 }
 
@@ -88,11 +113,22 @@ pub async fn prefetch_mirror_infos(
             continue;
         }
         let lookup = match store.get_by_id(*repo_id).await {
-            Ok(Some(row)) => Ok(mirror_info_from_row(&row)),
+            Ok(Some(row)) => {
+                let mut data = mirror_info_from_row(&row);
+                data.remote_url = sg_db::external_service_repos::first_clone_url_by_repo_id(
+                    pool, *repo_id,
+                )
+                .await
+                .ok()
+                .flatten()
+                .map(|url| strip_userinfo(&url));
+                Ok(data)
+            }
             // No row means "not yet in the gitserver schedule": the baseline
             // `GetByID` returns a zero row in this case in practice; expose a
             // zeroed mirror info rather than an error.
             Ok(None) => Ok(MirrorInfoData {
+                name: String::new(),
                 cloned: false,
                 clone_in_progress: false,
                 updated_at: None,
@@ -101,6 +137,7 @@ pub async fn prefetch_mirror_infos(
                 last_error: None,
                 byte_size: 0,
                 shard: None,
+                remote_url: None,
             }),
             Err(error) => Err(error.to_string()),
         };
@@ -131,6 +168,20 @@ impl ObjectValue for MirrorInfoObject {
             Err(message) => return Err(ExecError::new(message.clone())),
         };
         match field {
+            // `RemoteURL` (`repository_mirror.go:64-107`): site admins only,
+            // because the URL can contain credentials (stripped here).
+            "remoteURL" => {
+                if !self.viewer_site_admin {
+                    return Err(ExecError::new("must be site admin"));
+                }
+                match &data.remote_url {
+                    Some(url) => Ok(Some(FieldValue::Json(Json::Str(url.clone())))),
+                    None => Err(ExecError::new(format!(
+                        "no sources for {:?}",
+                        data.name
+                    ))),
+                }
+            }
             "cloned" => Ok(Some(FieldValue::Json(Json::Bool(data.cloned)))),
             "cloneInProgress" => Ok(Some(FieldValue::Json(Json::Bool(
                 data.clone_in_progress,

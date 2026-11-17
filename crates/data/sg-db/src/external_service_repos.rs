@@ -626,6 +626,24 @@ fn row_to_stored_repo(row: sqlx::postgres::PgRow) -> Result<StoredRepo, sqlx::Er
 /// this clone URL. Returns `None` when no association matches. Like the
 /// baseline, there is no `deleted_at`/blocked filter here; callers re-apply the
 /// repository lookup semantics afterwards.
+/// The first recorded clone URL for a repository
+/// (`external_service_repos.clone_url`), used by
+/// `Repository.mirrorInfo.remoteURL`.
+pub async fn first_clone_url_by_repo_id(
+    pool: &sqlx::PgPool,
+    repo_id: i32,
+) -> Result<Option<String>, String> {
+    sqlx::query_scalar(
+        "SELECT clone_url FROM external_service_repos \
+         WHERE repo_id = $1 AND clone_url <> '' \
+         ORDER BY clone_url LIMIT 1",
+    )
+    .bind(repo_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|error| error.to_string())
+}
+
 pub async fn first_repo_name_by_clone_url(
     pool: &PgPool,
     clone_url: &str,

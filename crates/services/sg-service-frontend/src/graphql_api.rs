@@ -2811,6 +2811,73 @@ impl GraphqlDeps for SchemaGraphqlDeps {
                     crate::site_overview_graphql::prefetch_site_flags(pool).await;
             }
         }
+        // `Repository.mirrorInfo`: prefetch the gitserver rows for repository
+        // objects reached through `Query.repository`, `Query.node`,
+        // `Query.repositoryRedirect` or the `Query.repositories` connection.
+        if let Some(pool) = &self.pool {
+            if crate::site_overview_graphql::selects(&fields, &["mirrorInfo"]) {
+                let mut ids: Vec<i32> = Vec::new();
+                for lookup in nodes.repositories.values() {
+                    if let crate::graphql_resolvers::RepoLookup::Found(data) = lookup {
+                        ids.push(data.id);
+                    }
+                }
+                for lookup in repositories.values() {
+                    if let crate::graphql_resolvers::RepoLookup::Found(data) = lookup {
+                        ids.push(data.id);
+                    }
+                }
+                for lookup in repository_redirects.values() {
+                    if let crate::graphql_resolvers::RepoLookup::Found(data) = lookup {
+                        ids.push(data.id);
+                    }
+                }
+                for lookup in repositories_connections.values() {
+                    if let crate::repositories::RepositoriesConnectionLookup::Found(data) = lookup {
+                        if let Ok(page) = &data.page {
+                            ids.extend(page.nodes.iter().map(|node| node.id));
+                        }
+                    }
+                }
+                if !ids.is_empty() {
+                    Arc::make_mut(&mut nested).mirror_infos =
+                        crate::mirror_info_graphql::prefetch_mirror_infos(pool, &ids).await;
+                }
+            }
+        }
+        // `Repository.externalServices` (`repository_external.go:45-75`).
+        if let Some(pool) = &self.pool {
+            if crate::site_overview_graphql::selects(&fields, &["externalServices"]) {
+                let mut ids: Vec<i32> = Vec::new();
+                for lookup in nodes.repositories.values() {
+                    if let crate::graphql_resolvers::RepoLookup::Found(data) = lookup {
+                        ids.push(data.id);
+                    }
+                }
+                for lookup in repositories.values() {
+                    if let crate::graphql_resolvers::RepoLookup::Found(data) = lookup {
+                        ids.push(data.id);
+                    }
+                }
+                for lookup in repository_redirects.values() {
+                    if let crate::graphql_resolvers::RepoLookup::Found(data) = lookup {
+                        ids.push(data.id);
+                    }
+                }
+                let mut services = std::collections::HashMap::new();
+                for id in ids {
+                    if services.contains_key(&id) {
+                        continue;
+                    }
+                    let lookup =
+                        crate::external_services::external_services_for_repo(pool, id).await;
+                    services.insert(id, lookup);
+                }
+                if !services.is_empty() {
+                    Arc::make_mut(&mut nested).repo_external_services = services;
+                }
+            }
+        }
         // `providers.BuiltinAuthEnabled()` (M9.56e): the live Site config, not
         // tied to which root fields this operation selected.
         if let Some(deps) = &self.config_graphql {
