@@ -1298,6 +1298,21 @@ fn run_postgres_reindex(env: &EnvMap) -> Option<i32> {
     }
 }
 
+/// Export the applied environment to the process environment, mirroring Go's
+/// `SetDefaultEnv` (`cmd/server/shared/conf_parse.go:8-17`), which calls
+/// `os.Setenv`. The Processfile children already receive the map explicitly,
+/// but the Postgres provisioning commands (`initdb`, `pg_ctl`, `createdb`) and
+/// the reindex helper inherit the process environment. Without this export
+/// they miss e.g. `PGHOST`/`PGPORT`; Debian's `pg_wrapper` then falls back to
+/// its own cluster lookup instead of the local server.
+pub fn export_process_env(env: &EnvMap) {
+    for (key, value) in env.iter() {
+        if std::env::var_os(key).is_none() {
+            std::env::set_var(key, value);
+        }
+    }
+}
+
 /// Full `cmd/server` entry point after `assets.Init`/`sanitycheck.Pass`
 /// (`bins/server/src/main.rs`). Returns the process exit code
 /// ([`EXIT_ASSEMBLY_FAILURE`] or [`EXIT_MIGRATION_REQUIRED`] on the early
@@ -1332,6 +1347,10 @@ pub async fn run_from_env() -> i32 {
             return EXIT_ASSEMBLY_FAILURE;
         }
     };
+    // `build_plan` is where the `PGHOST`/`PGUSER`/`PGDATABASE`/`PGSSLMODE`
+    // defaults and the blobstore/zoekt/redis additions land, so export after
+    // it and before any provisioning command runs.
+    export_process_env(&env);
 
     // `maybePostgresProcFile` provisions the local database while the Procfile
     // is assembled, before `run` checks the 5.1 reindex gate. The gate must be
@@ -1371,6 +1390,23 @@ pub async fn run_from_env() -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn export_process_env_sets_defaults_without_overwriting() {
+        let absent = "SG_ENTRY_TEST_EXPORT_ABSENT";
+        let present = "SG_ENTRY_TEST_EXPORT_PRESENT";
+        std::env::remove_var(absent);
+        std::env::set_var(present, "from-process");
+        let env = EnvMap::from_pairs([
+            (absent, "from-map"),
+            (present, "from-map"),
+        ]);
+        export_process_env(&env);
+        assert_eq!(std::env::var(absent).as_deref(), Ok("from-map"));
+        assert_eq!(std::env::var(present).as_deref(), Ok("from-process"));
+        std::env::remove_var(absent);
+        std::env::remove_var(present);
+    }
 
     #[test]
     fn postgres_dsn_matches_go() {
