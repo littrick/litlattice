@@ -422,10 +422,13 @@ fn head_branch_pattern() -> &'static Regex {
     PATTERN.get_or_init(|| Regex::new(r"HEAD branch: (.+?)\n").expect("valid regex"))
 }
 
-/// `git` in `git_dir` with `GIT_DIR` set and a cleared environment, matching
-/// `common.GitDir.Set` followed by an optional `ConfigureRemoteGitCommand`.
-/// The environment is cleared for determinism; only the variables the
-/// baseline would set for a remote command are added back.
+/// `git` in `git_dir` with `GIT_DIR` set, matching `common.GitDir.Set`
+/// followed by an optional `ConfigureRemoteGitCommand`. Like the baseline's
+/// `exec.Command`, the process environment is inherited: `HOME`, proxy
+/// variables, `GIT_CONFIG_*` (including a system-scope `safe.directory`) and
+/// credential helpers stay visible to `git remote show`/`rev-parse`/
+/// `symbolic-ref`/`init`. Only `GIT_DIR` and the remote command variables are
+/// added (`GIT_LFS_SKIP_SMUDGE` is fetch-only, as in `runFetchCommand`).
 async fn run_bare(
     git_dir: &Path,
     args: &[&str],
@@ -445,7 +448,6 @@ async fn run_bare(
         .args(&configured_args[1..])
         .current_dir(git_dir)
         .kill_on_drop(true)
-        .env_clear()
         .env("GIT_DIR", git_dir)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -464,8 +466,8 @@ async fn run_bare(
 ///
 /// Failure text matches `errors.Wrap(err, "failed to check remote access: " +
 /// httpOutput)`: the combined output comes first, then the exit status. The
-/// environment is inherited (unlike `run_bare`), because `ls-remote` relies on
-/// `HOME`/`SSH_AUTH_SOCK`/credential helpers.
+/// environment is inherited, because `ls-remote` relies on
+/// `HOME`/`SSH_AUTH_SOCK`/credential helpers (same as `run_bare`).
 pub async fn check_cloneable(remote: &VcsUrl, tls: &TlsConfig) -> Result<(), GitError> {
     const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
@@ -1592,7 +1594,9 @@ mod tests {
         let marker = tmp.path().join("custom-fetch-ran");
         let script = tmp.path().join("custom-fetch.sh");
         // The mapping replaces `git fetch` entirely; the baseline does not run
-        // `ConfigureRemoteGitCommand` for it, so `GIT_ASKPASS` is not set.
+        // `ConfigureRemoteGitCommand` for it, so the code must not add
+        // `GIT_ASKPASS`. An ambient value (e.g. VS Code's askpass helper) is
+        // inherited like in Go, so neutralize it for the assertion.
         std::fs::write(
             &script,
             format!(
@@ -1615,15 +1619,20 @@ mod tests {
         let custom = CustomFetch::build(Some(&mappings), true);
         let mut progress = Vec::new();
         let mut on_progress = |line: &[u8]| progress.extend_from_slice(line);
-        clone_repo(
+        let ambient_askpass = std::env::var_os("GIT_ASKPASS");
+        std::env::remove_var("GIT_ASKPASS");
+        let result = clone_repo(
             &git_dir,
             &remote,
             &TlsConfig::default(),
             &custom,
             &mut on_progress,
         )
-        .await
-        .expect("clone");
+        .await;
+        if let Some(value) = ambient_askpass {
+            std::env::set_var("GIT_ASKPASS", value);
+        }
+        result.expect("clone");
 
         assert!(marker.exists(), "the custom command did not run");
         let head = git_output(&git_dir, &["symbolic-ref", "HEAD"]);
@@ -2046,6 +2055,32 @@ mod tests {
             "dir/file",
             &out.to_string_lossy()
         ));
+    }
+
+    #[tokio::test]
+    async fn run_bare_inherits_the_process_environment() {
+        // Regression guard for the M9.56 image smoke: Go runs `git remote
+        // show`/`rev-parse`/`symbolic-ref` with the inherited environment, so
+        // `safe.directory` from a system-scope config file must reach them.
+        // `GIT_CONFIG_*` is the only way to observe inheritance without
+        // touching the repository.
+        std::env::set_var("GIT_CONFIG_COUNT", "1");
+        std::env::set_var("GIT_CONFIG_KEY_0", "m9.test-only.inherited");
+        std::env::set_var("GIT_CONFIG_VALUE_0", "yes");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let output = run_bare(
+            tmp.path(),
+            &["config", "--get", "m9.test-only.inherited"],
+            None,
+            &TlsConfig::default(),
+        )
+        .await
+        .expect("run git");
+        std::env::remove_var("GIT_CONFIG_COUNT");
+        std::env::remove_var("GIT_CONFIG_KEY_0");
+        std::env::remove_var("GIT_CONFIG_VALUE_0");
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "yes");
     }
 
     #[test]
