@@ -595,6 +595,8 @@ pub struct UserSessionRecord {
     pub invalidated_sessions_at: OffsetDateTime,
     pub site_admin: bool,
     pub tos_accepted: bool,
+    pub builtin_auth: bool,
+    pub scim_controlled: bool,
     pub email: String,
 }
 
@@ -613,6 +615,8 @@ fn scan_user_session_row(row: &sqlx::postgres::PgRow) -> UserSessionRecord {
         invalidated_sessions_at: row.get("invalidated_sessions_at"),
         site_admin: row.get("site_admin"),
         tos_accepted: row.get("tos_accepted"),
+        builtin_auth: row.get("builtin_auth"),
+        scim_controlled: row.get("scim_controlled"),
         email: row.get("email"),
     }
 }
@@ -627,6 +631,8 @@ pub async fn get_session_user(
         r#"
 SELECT u.id, u.username, u.display_name, u.avatar_url, u.created_at,
        u.updated_at, u.invalidated_sessions_at, u.site_admin, u.tos_accepted,
+       (u.passwd IS NOT NULL) AS builtin_auth,
+       EXISTS (SELECT 1 FROM user_external_accounts uea2 WHERE uea2.service_type='scim' AND uea2.user_id = u.id AND uea2.deleted_at IS NULL) AS scim_controlled,
        COALESCE(ue.email, '') AS email
 FROM users u
 LEFT JOIN user_emails ue ON (ue.user_id = u.id AND ue.is_primary)
@@ -696,6 +702,8 @@ pub async fn find_user_by_username(
         r#"
 SELECT u.id, u.username, u.display_name, u.avatar_url, u.created_at,
        u.updated_at, u.invalidated_sessions_at, u.site_admin, u.tos_accepted,
+       (u.passwd IS NOT NULL) AS builtin_auth,
+       EXISTS (SELECT 1 FROM user_external_accounts uea2 WHERE uea2.service_type='scim' AND uea2.user_id = u.id AND uea2.deleted_at IS NULL) AS scim_controlled,
        COALESCE(ue.email, '') AS email
 FROM users u
 LEFT JOIN user_emails ue ON (ue.user_id = u.id AND ue.is_primary)
@@ -720,6 +728,8 @@ pub async fn find_user_by_verified_email(
         r#"
 SELECT u.id, u.username, u.display_name, u.avatar_url, u.created_at,
        u.updated_at, u.invalidated_sessions_at, u.site_admin, u.tos_accepted,
+       (u.passwd IS NOT NULL) AS builtin_auth,
+       EXISTS (SELECT 1 FROM user_external_accounts uea2 WHERE uea2.service_type='scim' AND uea2.user_id = u.id AND uea2.deleted_at IS NULL) AS scim_controlled,
        COALESCE(ue.email, '') AS email
 FROM users u
 LEFT JOIN user_emails ue ON (ue.user_id = u.id AND ue.is_primary)

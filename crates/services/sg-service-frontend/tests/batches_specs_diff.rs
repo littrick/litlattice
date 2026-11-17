@@ -96,6 +96,8 @@ fn user_data(id: i32) -> UserData {
         updated_at: parse_time("2024-01-01T00:00:00Z"),
         site_admin: id == 926003,
         tos_accepted: true,
+        builtin_auth: false,
+        scim_controlled: false,
         primary_email: String::new(),
     }
 }

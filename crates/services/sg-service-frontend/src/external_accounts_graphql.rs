@@ -2026,6 +2026,8 @@ mod tests {
             updated_at: created_at,
             site_admin: false,
             tos_accepted: false,
+            builtin_auth: false,
+            scim_controlled: false,
             primary_email: String::new(),
         }
     }

@@ -193,6 +193,7 @@ fn user(
         avatar_url: String::new(),
         site_admin,
         tos_accepted: false,
+        builtin_auth: false,
         scim_controlled: false,
         created_at: OffsetDateTime::UNIX_EPOCH,
         updated_at: OffsetDateTime::UNIX_EPOCH,

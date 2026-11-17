@@ -737,6 +737,8 @@ async fn git_commit_extra_harness() {
                     updated_at: OffsetDateTime::UNIX_EPOCH,
                     site_admin: false,
                     tos_accepted: false,
+                    builtin_auth: false,
+                    scim_controlled: false,
                     primary_email: String::new(),
                 },
             }));

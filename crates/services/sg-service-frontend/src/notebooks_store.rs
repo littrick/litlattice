@@ -194,7 +194,7 @@ impl PgNotebooksStore {
     }
 
     fn user_columns() -> &'static str {
-        "id, username, display_name, avatar_url, created_at, updated_at, site_admin, tos_accepted"
+        "id, username, display_name, avatar_url, created_at, updated_at, site_admin, tos_accepted, (passwd IS NOT NULL) AS builtin_auth, EXISTS (SELECT 1 FROM user_external_accounts uea WHERE uea.service_type='scim' AND uea.user_id = users.id AND uea.deleted_at IS NULL) AS scim_controlled"
     }
 
     fn scan_user(row: &sqlx::postgres::PgRow) -> Result<UserData, sqlx::Error> {
@@ -209,6 +209,8 @@ impl PgNotebooksStore {
             updated_at: row.try_get("updated_at")?,
             site_admin: row.try_get("site_admin")?,
             tos_accepted: row.try_get("tos_accepted")?,
+            builtin_auth: row.try_get("builtin_auth")?,
+            scim_controlled: row.try_get("scim_controlled")?,
             primary_email: String::new(),
         })
     }

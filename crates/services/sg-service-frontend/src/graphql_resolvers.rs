@@ -127,6 +127,9 @@ pub struct UserData {
     pub updated_at: OffsetDateTime,
     pub site_admin: bool,
     pub tos_accepted: bool,
+    pub builtin_auth: bool,
+    /// `users` row `EXISTS(... service_type='scim' ...)`.
+    pub scim_controlled: bool,
     pub primary_email: String,
 }
 
@@ -1015,6 +1018,13 @@ pub struct NestedPrefetch {
     /// Live `auth.providers` snapshot for the Site subject reached through a
     /// settings cascade (M9.8jl); `Site.authProviders`.
     pub auth_providers: Option<Arc<crate::auth_providers_graphql::AuthProvidersRoot>>,
+    /// `providers.BuiltinAuthEnabled()`: whether the current Site
+    /// configuration registers the builtin username-password provider.
+    /// Computed per request from the live `ConfigStore` snapshot (M9.56e).
+    pub builtin_auth_enabled: bool,
+    /// `conf.Get().AuthEnableUsernameChanges`: live Site configuration
+    /// (`auth.enableUsernameChanges`), used by `viewerCanChangeUsername`.
+    pub username_changes_enabled: bool,
     /// `User.externalAccounts` connections keyed by user id and the `first`
     /// argument (M9.8ka).
     pub user_external_accounts:
@@ -5792,6 +5802,21 @@ impl ObjectValue for UserObject {
                 }
             }
             "tosAccepted" => Ok(Some(FieldValue::Json(Json::Bool(self.data.tos_accepted)))),
+            // `UserResolver.BuiltinAuth` (`user.go:159-161`): the row flag AND
+            // the live provider directory, so a site that removes the builtin
+            // provider reports false even for password users.
+            "builtinAuth" => Ok(Some(FieldValue::Json(Json::Bool(
+                self.data.builtin_auth && self.nested.builtin_auth_enabled,
+            )))),
+            // `UserResolver.SCIMControlled` (`user.go:603`): the row flag.
+            "scimControlled" => Ok(Some(FieldValue::Json(Json::Bool(self.data.scim_controlled)))),
+            // `ViewerCanChangeUsername` (`user.go:712-713`, helper at
+            // `user.go:803-813`): same-user/site-admin gate, then
+            // `auth.enableUsernameChanges`, otherwise site admins only.
+            "viewerCanChangeUsername" => Ok(Some(FieldValue::Json(Json::Bool(
+                self.can_administer(actor)
+                    && (self.nested.username_changes_enabled || self.viewer_site_admin),
+            )))),
             // `UserResolver.SettingsCascade` (`user.go:391-401`): the folded
             // access check, then the prefetched cascade.
             "settingsCascade" | "configurationCascade" => {
@@ -8558,6 +8583,7 @@ mod tests {
                          createdAt: DateTime! updatedAt: DateTime \
                          siteAdmin: Boolean! tosAccepted: Boolean! \
                          builtinAuth: Boolean! email: String! \
+                         viewerCanChangeUsername: Boolean! scimControlled: Boolean! \
                          viewerCanAdminister: Boolean! \
                          organizations: OrgConnection! \
                          organizationMemberships: OrganizationMembershipConnection! } \
@@ -8623,6 +8649,8 @@ mod tests {
             updated_at: at("2026-02-03T04:05:06+02:00"),
             site_admin: true,
             tos_accepted: true,
+            builtin_auth: true,
+            scim_controlled: false,
             primary_email: "alice@example.com".to_owned(),
         })
     }
@@ -8766,6 +8794,8 @@ mod tests {
             updated_at: at("2026-01-02T03:04:05Z"),
             site_admin: false,
             tos_accepted: false,
+            builtin_auth: false,
+            scim_controlled: false,
             primary_email: String::new(),
         });
         assert_eq!(
@@ -8817,6 +8847,8 @@ mod tests {
             updated_at: at("2026-01-02T03:04:05Z"),
             site_admin: false,
             tos_accepted: false,
+            builtin_auth: false,
+            scim_controlled: false,
             primary_email: "bob@example.com".to_owned(),
         }
     }
@@ -9139,6 +9171,8 @@ mod tests {
             updated_at: at("2026-01-02T03:04:05Z"),
             site_admin: false,
             tos_accepted: false,
+            builtin_auth: false,
+            scim_controlled: false,
             primary_email: format!("{username}@example.com"),
         }
     }
@@ -9849,16 +9883,75 @@ mod tests {
     }
 
     #[test]
-    fn builtin_auth_is_unported() {
+    fn builtin_auth_requires_the_row_flag_and_the_provider() {
         let schema = schema();
+        let query = "{ currentUser { builtinAuth } }";
+        let actor = Actor::User { uid: 1 };
+
+        // Password user + builtin provider enabled.
+        let mut roots = FrontendRootResolver::with_user(Some(user()));
+        Arc::make_mut(&mut roots.query.nested).builtin_auth_enabled = true;
+        assert_eq!(
+            run(&schema, query, actor, &roots),
+            r#"{"data":{"currentUser":{"builtinAuth":true}}}"#
+        );
+
+        // Password user but the site removed the builtin provider.
+        let roots = FrontendRootResolver::with_user(Some(user()));
+        assert_eq!(
+            run(&schema, query, actor, &roots),
+            r#"{"data":{"currentUser":{"builtinAuth":false}}}"#
+        );
+
+        // OAuth/SCIM user (no builtin password) with the provider enabled.
+        let mut no_password = user();
+        no_password.data.builtin_auth = false;
+        let mut roots = FrontendRootResolver::with_user(Some(no_password));
+        Arc::make_mut(&mut roots.query.nested).builtin_auth_enabled = true;
+        assert_eq!(
+            run(&schema, query, actor, &roots),
+            r#"{"data":{"currentUser":{"builtinAuth":false}}}"#
+        );
+    }
+
+    #[test]
+    fn viewer_can_change_username_and_scim_controlled() {
+        let schema = schema();
+        // Site admin may always change usernames, even with the flag off.
+        let admin_viewer = UserObject::from_data_as_viewer(user().data, true);
+        let roots = FrontendRootResolver::with_user(Some(admin_viewer));
         assert_eq!(
             run(
                 &schema,
-                "{ currentUser { builtinAuth } }",
+                "{ currentUser { viewerCanChangeUsername scimControlled } }",
                 Actor::User { uid: 1 },
-                &FrontendRootResolver::with_user(Some(user()))
+                &roots
             ),
-            r#"{"errors":[{"message":"GraphQL field \"builtinAuth\" of \"User\" has no ported resolver","path":["currentUser","builtinAuth"]}],"data":{"currentUser":null}}"#
+            r#"{"data":{"currentUser":{"viewerCanChangeUsername":true,"scimControlled":false}}}"#
+        );
+
+        // A non-admin falls back to auth.enableUsernameChanges.
+        let bob_obj = UserObject::from_data(bob());
+        let roots = FrontendRootResolver::with_user(Some(bob_obj.clone()));
+        assert_eq!(
+            run(
+                &schema,
+                "{ currentUser { viewerCanChangeUsername } }",
+                Actor::User { uid: 2 },
+                &roots
+            ),
+            r#"{"data":{"currentUser":{"viewerCanChangeUsername":false}}}"#
+        );
+        let mut roots = FrontendRootResolver::with_user(Some(bob_obj));
+        Arc::make_mut(&mut roots.query.nested).username_changes_enabled = true;
+        assert_eq!(
+            run(
+                &schema,
+                "{ currentUser { viewerCanChangeUsername } }",
+                Actor::User { uid: 2 },
+                &roots
+            ),
+            r#"{"data":{"currentUser":{"viewerCanChangeUsername":true}}}"#
         );
     }
 

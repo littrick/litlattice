@@ -42,6 +42,8 @@ pub(crate) fn to_user_data(record: sg_db::users::UserSessionRecord) -> UserData 
         updated_at: record.updated_at,
         site_admin: record.site_admin,
         tos_accepted: record.tos_accepted,
+        builtin_auth: record.builtin_auth,
+        scim_controlled: record.scim_controlled,
         primary_email: record.email,
     }
 }

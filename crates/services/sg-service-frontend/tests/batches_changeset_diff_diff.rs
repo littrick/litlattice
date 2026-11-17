@@ -315,6 +315,8 @@ fn user_data(fixture: &UserFixture) -> UserData {
         updated_at: parse_time(&fixture.updated_at),
         site_admin: fixture.site_admin,
         tos_accepted: fixture.tos_accepted,
+        builtin_auth: false,
+        scim_controlled: false,
         primary_email: fixture.primary_email.clone(),
     }
 }

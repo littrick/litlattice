@@ -520,6 +520,8 @@ fn user_data(fixture: &UserFixture) -> UserData {
         updated_at: parse_time("2024-02-03T04:05:06Z"),
         site_admin: fixture.site_admin,
         tos_accepted: false,
+        builtin_auth: false,
+        scim_controlled: false,
         primary_email: String::new(),
     }
 }

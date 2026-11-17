@@ -102,6 +102,7 @@ pub struct UserRow {
     pub avatar_url: String,
     pub site_admin: bool,
     pub tos_accepted: bool,
+    pub builtin_auth: bool,
     /// `EXISTS(... service_type='scim' ...)`.
     pub scim_controlled: bool,
     pub created_at: OffsetDateTime,
@@ -122,6 +123,8 @@ impl UserRow {
             updated_at: self.updated_at,
             site_admin: self.site_admin,
             tos_accepted: self.tos_accepted,
+            builtin_auth: self.builtin_auth,
+            scim_controlled: self.scim_controlled,
             primary_email: self.primary_email.clone(),
         }
     }
@@ -165,6 +168,7 @@ impl Default for UserRow {
             avatar_url: String::new(),
             site_admin: false,
             tos_accepted: false,
+            builtin_auth: false,
             scim_controlled: false,
             created_at: OffsetDateTime::UNIX_EPOCH,
             updated_at: OffsetDateTime::UNIX_EPOCH,
@@ -719,6 +723,7 @@ fn row_to_user(row: &sqlx::postgres::PgRow) -> Result<UserRow, String> {
             .unwrap_or_default(),
         site_admin: row.try_get("site_admin").map_err(|e| e.to_string())?,
         tos_accepted: row.try_get("tos_accepted").map_err(|e| e.to_string())?,
+        builtin_auth: row.try_get("builtin_auth").map_err(|e| e.to_string())?,
         scim_controlled: row.try_get("scim_controlled").map_err(|e| e.to_string())?,
         created_at: row.try_get("created_at").map_err(|e| e.to_string())?,
         updated_at: row.try_get("updated_at").map_err(|e| e.to_string())?,
@@ -745,7 +750,7 @@ fn row_to_email(row: &sqlx::postgres::PgRow) -> Result<UserEmailRow, String> {
 }
 
 const SCIM_EXPR: &str = "EXISTS (SELECT 1 FROM user_external_accounts uea      WHERE uea.service_type='scim' AND uea.user_id=users.id AND uea.deleted_at IS NULL) AS scim_controlled";
-const USER_COLUMNS: &str = "id, username, display_name, avatar_url, site_admin, tos_accepted, \
+const USER_COLUMNS: &str = "id, username, display_name, avatar_url, site_admin, tos_accepted, (passwd IS NOT NULL) AS builtin_auth, EXISTS (SELECT 1 FROM user_external_accounts uea WHERE uea.service_type='scim' AND uea.user_id = users.id AND uea.deleted_at IS NULL) AS scim_controlled, \
      created_at, updated_at";
 const EMAIL_COLUMNS: &str =
     "user_id, email, is_primary, verified_at, verification_code, \
@@ -795,7 +800,7 @@ impl AdminStore for PgAdminStore {
     async fn get_by_verified_email(&self, email: &str) -> Result<Option<UserRow>, String> {
         let row = sqlx::query(&format!(
             "SELECT u.id, u.username, u.display_name, u.avatar_url, u.site_admin, \
-             u.tos_accepted, \
+             u.tos_accepted, (u.passwd IS NOT NULL) AS builtin_auth, \
              EXISTS (SELECT 1 FROM user_external_accounts uea WHERE uea.service_type='scim' \
              AND uea.user_id=u.id AND uea.deleted_at IS NULL) AS scim_controlled, \
              u.created_at, u.updated_at, ue.email AS primary_email \

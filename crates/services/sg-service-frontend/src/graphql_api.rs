@@ -2778,6 +2778,33 @@ impl GraphqlDeps for SchemaGraphqlDeps {
         // The Site subject reached through a settings cascade replays the
         // prefetched configuration from `NestedPrefetch` (M9.8jl).
         Arc::make_mut(&mut nested).cascade_site_configuration = cascade_site_configuration;
+        // `providers.BuiltinAuthEnabled()` (M9.56e): the live Site config, not
+        // tied to which root fields this operation selected.
+        if let Some(deps) = &self.config_graphql {
+            let enabled = deps
+                .store
+                .last_valid()
+                .map(|unified| {
+                    crate::auth_providers_graphql::AuthProvidersRoot::from_site(&unified.site)
+                        .providers
+                        .iter()
+                        .any(|provider| provider.is_builtin)
+                })
+                .unwrap_or(false);
+            Arc::make_mut(&mut nested).builtin_auth_enabled = enabled;
+            let username_changes = deps
+                .store
+                .last_valid()
+                .and_then(|unified| {
+                    unified
+                        .site
+                        .raw()
+                        .get("auth.enableUsernameChanges")
+                        .and_then(serde_json::Value::as_bool)
+                })
+                .unwrap_or(false);
+            Arc::make_mut(&mut nested).username_changes_enabled = username_changes;
+        }
         // `Query.slowRequests` (`slow_requests_tracer.go:63`): the `after`
         // cursor and the nodes' `user`/`repository` rows are async, so resolve
         // whole connections before the sync executor replays the fields.
@@ -4421,6 +4448,8 @@ mod tests {
                 updated_at: fixed_created_at(),
                 site_admin: false,
                 tos_accepted: false,
+                builtin_auth: false,
+                scim_controlled: false,
                 primary_email: String::new(),
             }))
         }

@@ -287,6 +287,8 @@ fn viewer_user(case: &Case) -> Option<UserData> {
         updated_at: created_at,
         site_admin: case.viewer == "admin",
         tos_accepted: false,
+        builtin_auth: false,
+        scim_controlled: false,
         primary_email: String::new(),
     })
 }

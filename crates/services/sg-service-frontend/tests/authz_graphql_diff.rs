@@ -63,6 +63,8 @@ fn user_data(id: i32, username: &str, display_name: &str, site_admin: bool) -> U
         updated_at: OffsetDateTime::from_unix_timestamp(1_704_153_600).unwrap(),
         site_admin,
         tos_accepted: false,
+        builtin_auth: false,
+        scim_controlled: false,
         primary_email: String::new(),
     }
 }

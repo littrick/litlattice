@@ -131,6 +131,8 @@ fn user(id: i32, username: &str, display_name: &str, site_admin: bool) -> UserDa
         updated_at: time(0),
         site_admin,
         tos_accepted: false,
+        builtin_auth: false,
+        scim_controlled: false,
         primary_email: String::new(),
     }
 }

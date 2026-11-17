@@ -336,6 +336,8 @@ fn user_data(id: i32, username: &str) -> UserData {
         updated_at: epoch,
         site_admin: false,
         tos_accepted: false,
+        builtin_auth: false,
+        scim_controlled: false,
         primary_email: String::new(),
     }
 }
