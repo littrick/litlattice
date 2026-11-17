@@ -7786,6 +7786,11 @@ impl ObjectValue for RepositoryObject {
                 "/{}",
                 self.data.name
             )))))),
+            // `RepositoryResolver.CreatedAt` (`repository.go:470-477`):
+            // deprecated, returns `time.Now()` rather than the row's value.
+            "createdAt" => Ok(Some(FieldValue::Json(Json::Str(datetime_rfc3339(
+                OffsetDateTime::now_utc(),
+            ))))),
             // `UpdatedAt` always returns nil.
             "updatedAt" => Ok(Some(FieldValue::Null)),
             "enabled" => Ok(Some(FieldValue::Json(Json::Bool(true)))),
