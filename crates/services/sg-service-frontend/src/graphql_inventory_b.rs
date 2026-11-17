@@ -1306,6 +1306,41 @@ fn scan_invitation(row: &sqlx::postgres::PgRow) -> Result<InvitationData, String
     })
 }
 
+/// `OrgInvitations().GetPending(orgID, recipientUserID)`
+/// (`org_invitations.go:183-198`): the latest pending row; expired rows are
+/// treated as absent by the resolver.
+pub async fn pending_invitation_for_user(
+    pool: &PgPool,
+    org_id: i32,
+    recipient_user_id: i32,
+) -> Result<Option<InvitationData>, String> {
+    let rows = sqlx::query(
+        "SELECT i.id, i.org_id, i.sender_user_id, i.recipient_user_id, i.recipient_email, \
+                i.created_at, i.notified_at, i.responded_at, i.response_type, i.revoked_at, \
+                i.expires_at, o.name AS org_name \
+         FROM org_invitations i LEFT JOIN orgs o ON o.id = i.org_id \
+         WHERE i.org_id = $1 AND i.recipient_user_id = $2 \
+           AND i.responded_at IS NULL AND i.revoked_at IS NULL AND i.deleted_at IS NULL \
+         ORDER BY i.id ASC",
+    )
+    .bind(org_id)
+    .bind(recipient_user_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|error| error.to_string())?;
+    let Some(row) = rows.last() else {
+        return Ok(None);
+    };
+    let invitation = scan_invitation(row)?;
+    if invitation
+        .expires_at
+        .is_some_and(|expires_at| OffsetDateTime::now_utc() > expires_at)
+    {
+        return Ok(None);
+    }
+    Ok(Some(invitation))
+}
+
 /// `checkEmail` (`org_invitations.go:67-105`): case-insensitive match against
 /// the current user's emails; `Ok(true)` means the matching email is unverified.
 async fn check_email(pool: &PgPool, uid: i32, invite_email: &str) -> Result<bool, String> {

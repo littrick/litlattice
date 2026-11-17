@@ -6945,6 +6945,33 @@ impl ObjectValue for OrgObject {
             "viewerIsMember" => Ok(Some(FieldValue::Json(Json::Bool(
                 self.data.viewer_is_member,
             )))),
+            // `OrgResolver.ViewerPendingInvitation` (`org.go:207-224`):
+            // authenticated viewers only; expired invitations resolve null.
+            "viewerPendingInvitation" => {
+                let Some(uid) = actor.uid() else {
+                    return Ok(Some(FieldValue::Null));
+                };
+                let Some(pool) = &self.nested.users_pool.0 else {
+                    return Ok(None);
+                };
+                let mut invitation = crate::codeintel_uploads_graphql_store::block_on(
+                    crate::graphql_inventory_b::pending_invitation_for_user(
+                        pool,
+                        self.data.id,
+                        uid,
+                    ),
+                )
+                .map_err(ExecError::new)?;
+                Ok(Some(match invitation.take() {
+                    Some(data) => FieldValue::Object(Arc::new(
+                        crate::graphql_inventory_b::OrganizationInvitationObject {
+                            data,
+                            config: None,
+                        },
+                    )),
+                    None => FieldValue::Null,
+                }))
+            }
             // `OrgResolver.SettingsCascade` (`org.go:194-204`): the org
             // access check, then the prefetched cascade.
             "settingsCascade" | "configurationCascade" => {
