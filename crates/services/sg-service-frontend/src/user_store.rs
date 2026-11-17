@@ -108,6 +108,7 @@ impl UsersConnectionStore for PgUserStore {
             query: args.query.clone(),
             query_id: args.query.as_deref().and_then(maybe_query_is_id),
             exclude_sourcegraph_operators: true,
+            site_admin: args.site_admin,
             ..UsersListOptions::default()
         };
         if let Some(inactive_since) = &args.inactive_since {

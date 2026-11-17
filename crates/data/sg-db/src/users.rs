@@ -771,6 +771,8 @@ pub struct UsersListOptions {
     pub inactive_since: Option<OffsetDateTime>,
     /// `ExcludeSourcegraphOperators`.
     pub exclude_sourcegraph_operators: bool,
+    /// `SiteAdmin`: only site admins (`users.go:17-23`).
+    pub site_admin: Option<bool>,
     /// `LimitOffset.SQL()`: `Some((limit, offset))` emits
     /// `LIMIT ... OFFSET ...`; `None` emits nothing.
     pub limit_offset: Option<(i32, i32)>,
@@ -823,6 +825,9 @@ fn push_users_where(builder: &mut QueryBuilder<'_, sqlx::Postgres>, opt: &UsersL
             .push_bind(inactive_since)
             .push(")");
     }
+    if let Some(site_admin) = opt.site_admin {
+        builder.push(" AND u.site_admin = ").push_bind(site_admin);
+    }
     if opt.exclude_sourcegraph_operators {
         builder
             .push(" AND NOT EXISTS (SELECT FROM user_external_accounts WHERE service_type = ")
@@ -840,6 +845,9 @@ pub async fn list_users(
     let mut builder: QueryBuilder<'_, sqlx::Postgres> = QueryBuilder::new(
         "SELECT u.id, u.username, u.display_name, u.avatar_url, u.created_at, \
          u.updated_at, u.invalidated_sessions_at, u.site_admin, u.tos_accepted, \
+         (u.passwd IS NOT NULL) AS builtin_auth, \
+         EXISTS (SELECT 1 FROM user_external_accounts uea2 WHERE uea2.service_type='scim' AND uea2.user_id = u.id AND uea2.deleted_at IS NULL) AS scim_controlled, \
+         u.completions_quota, u.code_completions_quota, \
          COALESCE(ue.email, '') AS email \
          FROM users u \
          LEFT JOIN user_emails ue ON (ue.user_id = u.id AND ue.is_primary) \
@@ -895,6 +903,9 @@ pub async fn list_users_by_org(
     let mut builder: QueryBuilder<'_, sqlx::Postgres> = QueryBuilder::new(
         "SELECT u.id, u.username, u.display_name, u.avatar_url, u.created_at, \
          u.updated_at, u.invalidated_sessions_at, u.site_admin, u.tos_accepted, \
+         (u.passwd IS NOT NULL) AS builtin_auth, \
+         EXISTS (SELECT 1 FROM user_external_accounts uea2 WHERE uea2.service_type='scim' AND uea2.user_id = u.id AND uea2.deleted_at IS NULL) AS scim_controlled, \
+         u.completions_quota, u.code_completions_quota, \
          COALESCE(ue.email, '') AS email \
          FROM users u \
          LEFT JOIN user_emails ue ON (ue.user_id = u.id AND ue.is_primary) \

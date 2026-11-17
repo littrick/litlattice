@@ -245,6 +245,8 @@ pub struct UsersArgs {
     /// `gqlutil.DateTime` input; parsed by the store so invalid scalar input
     /// surfaces as a database-seam error.
     pub inactive_since: Option<String>,
+    /// `usersArgs.siteAdmin`: restrict to site admins (`users.go:17-23`).
+    pub site_admin: Option<bool>,
 }
 
 /// `userConnectionResolver.compute`'s result: the node rows and the count for
@@ -284,6 +286,7 @@ pub fn users_args(arguments: &Arguments) -> UsersArgs {
         query: arguments.string("query").map(str::to_owned),
         active_period: arguments.string("activePeriod").map(str::to_owned),
         inactive_since: arguments.string("inactiveSince").map(str::to_owned),
+        site_admin: arguments.bool("siteAdmin"),
     }
 }
 
@@ -309,11 +312,22 @@ pub async fn prefetch_users_connections(
     fields: &[RootField],
 ) -> HashMap<UsersArgs, UsersConnectionLookup> {
     let mut connections = HashMap::new();
+    let mut wanted: Vec<UsersArgs> = Vec::new();
     for field in fields {
-        if field.name != "users" {
-            continue;
+        if field.name == "users" {
+            wanted.push(users_args(&field.arguments));
         }
-        let args = users_args(&field.arguments);
+        // `Site.users` (`site_users.go:15-42`) is a different GraphQL type but
+        // shares the `users` SQL filters, including `siteAdmin`.
+        if field.name == "site" {
+            for selection in &field.selections {
+                if selection.name == "users" {
+                    wanted.push(users_args(&selection.arguments));
+                }
+            }
+        }
+    }
+    for args in wanted {
         if connections.contains_key(&args) {
             continue;
         }
@@ -1034,6 +1048,9 @@ pub struct NestedPrefetch {
     /// otherwise.
     pub per_user_completions_quota: Option<i32>,
     pub per_user_code_completions_quota: Option<i32>,
+    /// `Site.users` totals keyed by the user-list arguments
+    /// (`site_users.go:15-42`).
+    pub site_users: HashMap<UsersArgs, UsersConnectionLookup>,
     /// `User.eventLogs` connections keyed by user id and the arguments
     /// (`event_logs.go:16`).
     pub user_event_logs: HashMap<
@@ -4385,6 +4402,17 @@ impl ObjectValue for QueryRoot {
                     crate::diagnostics_graphql::RepositoryStatsObject { data },
                 )))),
             },
+            // `schemaResolver.AccessRequests` (`access_requests.go:21-30`):
+            // site-admin only; the requests store is not ported (M9.57), so the
+            // connection is empty on this image.
+            "accessRequests" => {
+                if !self.viewer_site_admin {
+                    return Err(ExecError::new(MUST_BE_SITE_ADMIN));
+                }
+                Ok(Some(FieldValue::Object(Arc::new(
+                    crate::site_overview_graphql::EmptyAccessRequestsConnectionObject,
+                ))))
+            }
             "backgroundJobs" => {
                 let args =
                     crate::diagnostics_graphql::BackgroundJobsArgs::from_arguments(arguments);
@@ -6227,6 +6255,47 @@ impl ObjectValue for SiteObject {
                 "/site-admin/global-settings".to_owned(),
             )))),
             "viewerCanAdminister" => Ok(Some(FieldValue::Json(Json::Bool(self.viewer_site_admin)))),
+            // `siteResolver.Users` (`site_users.go:15-42`): site admin only.
+            "users" => {
+                if !self.viewer_site_admin {
+                    return Err(ExecError::new(MUST_BE_SITE_ADMIN));
+                }
+                let args = users_args(arguments);
+                match self.nested.site_users.get(&args) {
+                    Some(UsersConnectionLookup::Found(data)) => Ok(Some(FieldValue::Object(
+                        Arc::new(crate::site_overview_graphql::SiteUsersObject {
+                            total_count: i64::from(data.total_count),
+                        }),
+                    ))),
+                    Some(UsersConnectionLookup::Error(message)) => {
+                        Err(ExecError::new(message.clone()))
+                    }
+                    None => Ok(None),
+                }
+            }
+            // `siteResolver.ProductVersion` (`site.go:183`).
+            "productVersion" => Ok(Some(FieldValue::Json(Json::Str(
+                String::from_utf8_lossy(crate::version::Version::load().as_bytes()).into_owned(),
+            )))),
+            // `siteResolver.UpdateCheck` (`site.go`): no update checker runs.
+            "updateCheck" => Ok(Some(FieldValue::Object(Arc::new(
+                crate::site_overview_graphql::UpdateCheckObject,
+            )))),
+            // `siteResolver.ProductSubscription` (`site.go:190-192`): the
+            // implicit free plan.
+            "productSubscription" => Ok(Some(FieldValue::Object(Arc::new(
+                crate::site_overview_graphql::ProductSubscriptionStatusObject,
+            )))),
+            // `siteResolver.Analytics` (`site_analytics.go:19-30`): site-admin
+            // only; aggregates are shape-only until adminanalytics is ported.
+            "analytics" => {
+                if !self.viewer_site_admin {
+                    return Err(ExecError::new(MUST_BE_SITE_ADMIN));
+                }
+                Ok(Some(FieldValue::Object(Arc::new(
+                    crate::site_overview_graphql::AnalyticsObject,
+                ))))
+            }
             // `siteResolver.PerUserCompletionsQuota` / `PerUserCodeCompletionsQuota`
             // (`site.go:597-611`).
             "perUserCompletionsQuota" => Ok(Some(FieldValue::Json(
@@ -9148,6 +9217,7 @@ mod tests {
             query: None,
             active_period: None,
             inactive_since: None,
+            site_admin: None,
         };
         (
             args,

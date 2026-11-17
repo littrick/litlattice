@@ -2253,6 +2253,10 @@ impl GraphqlDeps for SchemaGraphqlDeps {
             ),
             _ => Arc::new(crate::graphql_resolvers::NestedPrefetch::default()),
         };
+        if !users_connections.is_empty() {
+            // `Site.users` (`site_users.go:15-42`) shares the users list seam.
+            Arc::make_mut(&mut nested).site_users = users_connections.clone();
+        }
         // M9.18a `User.emails` / `primaryEmail` / `accessTokens` / `session` /
         // `hasVerifiedEmail`: prefetch the account data for every user the
         // operation can reach.
