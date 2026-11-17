@@ -51,6 +51,11 @@ pub fn service_name() -> &'static str {
 /// (`conf.Get` retries in the baseline).
 const CONFIG_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 
+/// `initializeUploadStore`'s `time.After(250 * time.Millisecond)`: the upload
+/// store's `Init` is retried at this interval while it keeps failing with a
+/// request-send error.
+const STORE_INIT_RETRY_INTERVAL: Duration = Duration::from_millis(250);
+
 /// `processor.NewUploadResetter`'s `Interval`.
 const RESETTER_INTERVAL: Duration = Duration::from_secs(30);
 
@@ -158,7 +163,7 @@ impl Service for PreciseWorkerService {
 
         // `lsifuploadstore.New` + `initializeUploadStore` (S3/blobstore/GCS).
         let upload_store = Arc::new(
-            initialize_upload_store(&config.upload_store)
+            initialize_upload_store(&config.upload_store, &ctx.shutdown)
                 .await
                 .map_err(|message| {
                     ServiceError::new(format!("initializing upload store: {message}"))
@@ -268,11 +273,48 @@ pub fn upload_storage_config(
     sg_codeintel::lsifuploadstore::storage_config(config)
 }
 
-/// `initializeUploadStore`: `object.Storage.Init` for every supported backend.
+/// `initializeUploadStore` (`cmd/precise-code-intel-worker/shared/shared.go:123-137`):
+/// create the store once (`lsifuploadstore.New`, no network) and then call
+/// `Init`, retrying every 250ms while the failure is a request-send error
+/// (`smithyhttp.RequestSendError`; Rust `DispatchFailure`/`TimeoutError`).
+/// Non-retryable errors return immediately. `shutdown` is the baseline `ctx`:
+/// when it is cancelled the loop returns `context canceled`, which the caller
+/// wraps as `initializing upload store: ...`.
+///
+/// Unlike [`sg_codeintel::lsifuploadstore::initialize_store`], this keeps the
+/// retry loop out of the shared helper: the baseline's upload-store expirer
+/// uses a lazy store with no such loop.
 pub async fn initialize_upload_store(
     config: &config::UploadStoreConfig,
+    shutdown: &CancellationToken,
 ) -> Result<sg_objectstorage::ObjectStore, String> {
-    sg_codeintel::lsifuploadstore::initialize_store(config).await
+    let storage_config = upload_storage_config(config)?;
+    let store = sg_objectstorage::ObjectStore::new(storage_config)
+        .await
+        .map_err(|err| err.to_string())?;
+
+    let mut attempt: u64 = 0;
+    loop {
+        match store.init().await {
+            Ok(()) => return Ok(store),
+            Err(err) if !err.is_request_error() => return Err(err.to_string()),
+            Err(err) => {
+                attempt += 1;
+                // The baseline loop is silent; this warn line is the only
+                // observable difference and does not affect the success path.
+                tracing::warn!(
+                    attempt,
+                    retry_interval = ?STORE_INIT_RETRY_INTERVAL,
+                    error = %err,
+                    "failed to initialize upload store, retrying"
+                );
+                tokio::select! {
+                    _ = shutdown.cancelled() => return Err("context canceled".to_owned()),
+                    _ = sleep(STORE_INIT_RETRY_INTERVAL) => {}
+                }
+            }
+        }
+    }
 }
 
 /// `hostname.Get`: `HOSTNAME` when set, otherwise the kernel hostname

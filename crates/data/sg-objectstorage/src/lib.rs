@@ -83,6 +83,12 @@ impl StorageConfig {
 pub enum Error {
     /// `failed to create bucket: ...`
     CreateBucket(String),
+    /// `failed to create bucket: ...` where the request could not be sent or
+    /// no response arrived (`SdkError::DispatchFailure`/`TimeoutError`). The
+    /// baseline classifies this as `smithyhttp.RequestSendError` and the
+    /// precise worker retries it every 250ms; the display text is identical
+    /// to [`Error::CreateBucket`].
+    CreateBucketRequestSend(String),
     /// `failed to get object: ...`
     GetObject(String),
     /// `failed to upload object: ...`
@@ -103,7 +109,9 @@ pub enum Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::CreateBucket(message) => write!(f, "failed to create bucket: {message}"),
+            Self::CreateBucket(message) | Self::CreateBucketRequestSend(message) => {
+                write!(f, "failed to create bucket: {message}")
+            }
             Self::GetObject(message) => write!(f, "failed to get object: {message}"),
             Self::UploadObject(message) => write!(f, "failed to upload object: {message}"),
             Self::DeleteObject(message) => write!(f, "failed to delete object: {message}"),
@@ -114,6 +122,16 @@ impl fmt::Display for Error {
                 write!(f, "unknown upload store backend '{backend}'")
             }
         }
+    }
+}
+
+impl Error {
+    /// `errors.HasType[*smithyhttp.RequestSendError]`: the S3/blobstore
+    /// `Init` request could not be sent or no HTTP response arrived. This is
+    /// the only retryable `Init` failure in the baseline; HTTP/service errors
+    /// and GCS failures are returned immediately by the caller.
+    pub fn is_request_error(&self) -> bool {
+        matches!(self, Self::CreateBucketRequestSend(_))
     }
 }
 
@@ -203,6 +221,9 @@ impl S3Store {
         {
             Ok(_) => Ok(()),
             Err(err) if is_bucket_already_exists(&err) => Ok(()),
+            Err(err) if is_request_send_error(&err) => {
+                Err(Error::CreateBucketRequestSend(err.to_string()))
+            }
             Err(err) => Err(Error::CreateBucket(err.to_string())),
         }
     }
@@ -506,6 +527,20 @@ pub struct ObjectInfo {
     pub last_modified_secs: Option<i64>,
 }
 
+/// `smithyhttp.RequestSendError`: the request could not be sent or no HTTP
+/// response arrived. Rust's AWS SDK reports these as `DispatchFailure`
+/// (connection refused/reset/DNS/TLS) or `TimeoutError`; a `ResponseError`
+/// (unparseable response) or `ServiceError` (HTTP error status) is *not*
+/// retryable, matching the baseline's typed check.
+fn is_request_send_error(
+    err: &SdkError<CreateBucketError, aws_sdk_s3::config::http::HttpResponse>,
+) -> bool {
+    matches!(
+        err,
+        SdkError::DispatchFailure(_) | SdkError::TimeoutError(_)
+    )
+}
+
 /// `errors.HasType[*s3types.BucketAlreadyExists] || HasType[OwnedByYou]`.
 /// S3-compatible servers may surface the condition as an unhandled error code,
 /// so check both the typed variants and the error code.
@@ -601,9 +636,31 @@ mod tests {
     }
 
     #[test]
+    fn init_request_send_errors_are_classified_for_retry() {
+        use aws_sdk_s3::error::ConnectorError;
+
+        assert!(Error::CreateBucketRequestSend("x".to_owned()).is_request_error());
+        assert!(!Error::CreateBucket("x".to_owned()).is_request_error());
+        assert!(!Error::Gcs("x".to_owned()).is_request_error());
+
+        type CreateError = SdkError<CreateBucketError, aws_sdk_s3::config::http::HttpResponse>;
+        let dispatch: CreateError =
+            SdkError::dispatch_failure(ConnectorError::io("connection refused".into()));
+        assert!(is_request_send_error(&dispatch));
+        let timeout: CreateError = SdkError::timeout_error("timed out");
+        assert!(is_request_send_error(&timeout));
+        let construction: CreateError = SdkError::construction_failure("bad request");
+        assert!(!is_request_send_error(&construction));
+    }
+
+    #[test]
     fn error_messages_match_baseline_wraps() {
         assert_eq!(
             Error::CreateBucket("x".to_owned()).to_string(),
+            "failed to create bucket: x"
+        );
+        assert_eq!(
+            Error::CreateBucketRequestSend("x".to_owned()).to_string(),
             "failed to create bucket: x"
         );
         assert_eq!(
