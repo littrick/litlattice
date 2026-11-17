@@ -375,6 +375,34 @@ async fn termination_signal() {
     }
 }
 
+/// Wait up to `DB_STARTUP_TIMEOUT`'s default (10s) for the local Postgres to
+/// accept connections, using `pg_isready` against `PGHOST`/`PGPORT`.
+///
+/// Mirrors the startup window the Go baseline gets from the migrator's retry
+/// loop; see the comment in [`run_staged`].
+fn wait_for_postgres_ready(env: &[(String, String)]) {
+    let value = |key: &str| {
+        env.iter()
+            .find(|(name, _)| name == key)
+            .map(|(_, value)| value.as_str())
+            .filter(|value| !value.is_empty())
+    };
+    let host = value("PGHOST").unwrap_or("127.0.0.1");
+    let port = value("PGPORT").unwrap_or("5432");
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let ready = std::process::Command::new("pg_isready")
+            .args(["-h", host, "-p", port, "-q"])
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false);
+        if ready || std::time::Instant::now() >= deadline {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
 /// Run the two `shared.run` process groups exactly like the baseline's
 /// `errgroup`: start Postgres, run migrations when enabled, then start the
 /// application group and supervise both.
@@ -395,6 +423,17 @@ pub async fn run_staged<M: crate::migrator::Migrator>(
         println!("Starting postgres processes");
     }
     supervisor.start(postgres);
+
+    // The Go baseline relies on the migrator's own startup retry
+    // (`openDBWithStartupWait`, `DB_STARTUP_TIMEOUT` = 10s) after starting
+    // Postgres (`shared.go:250-258`). PostgreSQL 15+ reports "the database
+    // system is not yet accepting connections (57P03)" during crash recovery,
+    // which that retry does not match, so give the local database the same
+    // window before invoking the migrator. On timeout the migrator reports the
+    // real error, as in the baseline.
+    if !postgres.is_empty() && schemas.is_some() {
+        wait_for_postgres_ready(&env);
+    }
 
     if let Some(schemas) = schemas {
         println!("Starting migrator");
