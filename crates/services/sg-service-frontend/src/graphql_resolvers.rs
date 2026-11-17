@@ -7786,6 +7786,12 @@ impl ObjectValue for RepositoryObject {
                 "/{}",
                 self.data.name
             )))))),
+            // `RepositoryResolver.ViewerCanAdminister`
+            // (`repository.go:246-254`): site admins only; the baseline
+            // returns false (not an error) for everyone else.
+            "viewerCanAdminister" => Ok(Some(FieldValue::Json(Json::Bool(
+                self.viewer_site_admin,
+            )))),
             // `RepositoryResolver.CreatedAt` (`repository.go:470-477`):
             // deprecated, returns `time.Now()` rather than the row's value.
             "createdAt" => Ok(Some(FieldValue::Json(Json::Str(datetime_rfc3339(
