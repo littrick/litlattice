@@ -9,9 +9,10 @@
 //! This module implements the page-startup subset of the baseline context.
 //! Fields that depend on subsystems outside this slice (license-key parsing,
 //! SvelteKit route discovery, Cody Pro/dotcom configuration, restart markers,
-//! non-builtin auth-provider runtime info) keep their zero/empty values and
-//! are recorded as GAP/KNOWN_DIFF in the overview. Private site configuration
-//! is never copied into the public `site` subset.
+//! non-builtin auth providers other than http-header/openidconnect, authz
+//! `requiredForAuthz` matching) keep their zero/empty values and are recorded
+//! as GAP/KNOWN_DIFF in the overview. Private site configuration is never
+//! copied into the public `site` subset.
 //!
 //! No new tables, columns or Redis keys: user/org/settings/temporary-settings
 //! reads go through the existing M6 storage in `sg-db`; the two queries that
@@ -674,60 +675,233 @@ fn branding(raw: &Value) -> Branding {
     }
 }
 
-/// `providers.SortedProviders()` (`auth/providers/providers.go:216-247`).
-///
-/// GAP: the baseline sorts the *registered* provider objects (`CachedInfo`,
-/// `ConfigID().ID`, authz `requiredForAuthz`). The raw `auth.providers`
-/// configuration is a faithful stand-in for `type`/`order`/common fields and
-/// the builtin provider's info; other providers' runtime-generated names,
-/// authentication URLs and service/client IDs are zero-valued here.
-fn auth_providers(raw: &Value) -> Vec<AuthProviderInfo> {
-    let mut infos: Vec<(i64, bool, String, AuthProviderInfo)> = Vec::new();
-    for provider in auth_provider_entries(raw) {
-        // `NewJSContextFromRequest` skips `commonConfig.Hidden`
-        // (`jscontext.go:405-407`); `noSignIn` providers stay listed.
-        if get_bool(provider, "hidden") {
-            continue;
+/// `schema.AuthProviderCommon` (`schema/schema.go:148-159`) extracted the way
+/// `providers.GetAuthProviderCommon` (`auth/providers/providers.go:253-291`)
+/// does: only providers whose typed config embeds the common properties have
+/// them; `BuiltinAuthProvider` and `HTTPHeaderAuthProvider` do not.
+struct AuthProviderCommonConfig {
+    display_name: Option<String>,
+    display_prefix: Option<String>,
+    hidden: bool,
+    order: i64,
+    no_sign_in: bool,
+}
+
+fn auth_provider_common(provider: &Value, service_type: &str) -> AuthProviderCommonConfig {
+    if matches!(service_type, "builtin" | "http-header") {
+        return AuthProviderCommonConfig {
+            display_name: None,
+            display_prefix: None,
+            hidden: false,
+            order: 0,
+            no_sign_in: false,
+        };
+    }
+    AuthProviderCommonConfig {
+        display_name: get_str(provider, "displayName")
+            .filter(|name| !name.is_empty())
+            .map(str::to_owned),
+        display_prefix: get_str(provider, "displayPrefix").map(str::to_owned),
+        hidden: get_bool(provider, "hidden"),
+        order: get_i64(provider, "order"),
+        no_sign_in: get_bool(provider, "noSignIn"),
+    }
+}
+
+/// `providers.Info` (`auth/providers/providers.go:82-94`).
+struct ProviderCachedInfo {
+    display_name: String,
+    service_id: String,
+    client_id: String,
+    authentication_url: String,
+}
+
+/// `p.CachedInfo()` for the modeled providers.
+fn auth_provider_cached_info(provider: &Value, service_type: &str) -> Option<ProviderCachedInfo> {
+    match service_type {
+        "builtin" => Some(ProviderCachedInfo {
+            display_name: "Builtin username-password authentication".to_owned(),
+            service_id: String::new(),
+            client_id: String::new(),
+            authentication_url: String::new(),
+        }),
+        "http-header" => {
+            let header = get_str(provider, "usernameHeader").unwrap_or_default();
+            Some(ProviderCachedInfo {
+                display_name: format!(
+                    "HTTP authentication proxy (\"{}\" header)",
+                    canonical_mime_header_key(header)
+                ),
+                service_id: String::new(),
+                client_id: String::new(),
+                authentication_url: String::new(),
+            })
         }
+        "openidconnect" => Some(ProviderCachedInfo {
+            display_name: get_str(provider, "displayName")
+                .filter(|name| !name.is_empty())
+                .unwrap_or("OpenID Connect")
+                .to_owned(),
+            service_id: get_str(provider, "issuer").unwrap_or_default().to_owned(),
+            client_id: get_str(provider, "clientID").unwrap_or_default().to_owned(),
+            authentication_url: openidconnect_authentication_url(provider),
+        }),
+        // GAP: SAML/OAuth/... CachedInfo values are provider-specific
+        // (SAML metadata probing, OAuth auth prefixes); only the raw config
+        // stand-ins are used here. See the overview §5.
+        _ => Some(ProviderCachedInfo {
+            display_name: get_str(provider, "displayName")
+                .filter(|name| !name.is_empty())
+                .unwrap_or(service_type)
+                .to_owned(),
+            service_id: get_str(provider, "issuer").unwrap_or_default().to_owned(),
+            client_id: get_str(provider, "clientID").unwrap_or_default().to_owned(),
+            authentication_url: String::new(),
+        }),
+    }
+}
+
+/// `(*Provider).CachedInfo`'s authentication URL
+/// (`auth/openidconnect/provider.go:66-79`):
+/// `path.Join(authPrefix, "login")` + `pc=<providerConfigID>`.
+fn openidconnect_authentication_url(provider: &Value) -> String {
+    let config_id = openidconnect_provider_config_id(provider);
+    let mut query = url::form_urlencoded::Serializer::new(String::new());
+    query.append_pair("pc", &config_id);
+    format!("/.auth/openidconnect/login?{}", query.finish())
+}
+
+/// `providerConfigID` (`auth/openidconnect/config.go:134-148`): the explicit
+/// `configID`, otherwise `base64.RawURLEncoding(sha256(json.Marshal(config))[:16])`.
+fn openidconnect_provider_config_id(provider: &Value) -> String {
+    if let Some(config_id) = get_str(provider, "configID").filter(|value| !value.is_empty()) {
+        return config_id.to_owned();
+    }
+    let canonical = openidconnect_config_json(provider);
+    let digest = Sha256::digest(canonical.as_bytes());
+    use base64::Engine as _;
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&digest[..16])
+}
+
+/// The typed `schema.OpenIDConnectAuthProvider` re-marshaled by Go: struct
+/// field order, `omitempty` for the optional fields, unknown keys dropped.
+#[derive(Serialize)]
+struct OpenIDConnectConfigJson {
+    #[serde(rename = "allowSignup", skip_serializing_if = "Option::is_none")]
+    allow_signup: Option<bool>,
+    #[serde(rename = "clientID")]
+    client_id: String,
+    #[serde(rename = "clientSecret")]
+    client_secret: String,
+    #[serde(rename = "configID", skip_serializing_if = "String::is_empty")]
+    config_id: String,
+    #[serde(rename = "displayName", skip_serializing_if = "String::is_empty")]
+    display_name: String,
+    #[serde(rename = "displayPrefix", skip_serializing_if = "Option::is_none")]
+    display_prefix: Option<String>,
+    #[serde(rename = "hidden", skip_serializing_if = "is_false")]
+    hidden: bool,
+    #[serde(rename = "issuer")]
+    issuer: String,
+    #[serde(rename = "noSignIn", skip_serializing_if = "is_false")]
+    no_sign_in: bool,
+    #[serde(rename = "order", skip_serializing_if = "is_zero")]
+    order: i64,
+    #[serde(rename = "requireEmailDomain", skip_serializing_if = "String::is_empty")]
+    require_email_domain: String,
+    #[serde(rename = "singleIdentityPerUser", skip_serializing_if = "is_false")]
+    single_identity_per_user: bool,
+    #[serde(rename = "type")]
+    service_type: String,
+}
+
+fn is_zero(value: &i64) -> bool {
+    *value == 0
+}
+
+fn openidconnect_config_json(provider: &Value) -> String {
+    let config = OpenIDConnectConfigJson {
+        allow_signup: get_bool_opt(provider, "allowSignup"),
+        client_id: get_str(provider, "clientID").unwrap_or_default().to_owned(),
+        client_secret: get_str(provider, "clientSecret").unwrap_or_default().to_owned(),
+        config_id: get_str(provider, "configID").unwrap_or_default().to_owned(),
+        display_name: get_str(provider, "displayName").unwrap_or_default().to_owned(),
+        display_prefix: get_str(provider, "displayPrefix").map(str::to_owned),
+        hidden: get_bool(provider, "hidden"),
+        issuer: get_str(provider, "issuer").unwrap_or_default().to_owned(),
+        no_sign_in: get_bool(provider, "noSignIn"),
+        order: get_i64(provider, "order"),
+        require_email_domain: get_str(provider, "requireEmailDomain")
+            .unwrap_or_default()
+            .to_owned(),
+        single_identity_per_user: get_bool(provider, "singleIdentityPerUser"),
+        service_type: "openidconnect".to_owned(),
+    };
+    // `encoding/json` HTML-escapes these; the hash must cover the same bytes.
+    serde_json::to_string(&config)
+        .unwrap_or_else(|_| "null".to_owned())
+        .replace('<', "\\u003c")
+        .replace('>', "\\u003e")
+        .replace('&', "\\u0026")
+        .replace('\u{2028}', "\\u2028")
+        .replace('\u{2029}', "\\u2029")
+}
+
+/// `ConfigID().ID` for the sort tie-break (only OIDC has a modeled ID).
+fn auth_provider_config_id(provider: &Value, service_type: &str) -> String {
+    match service_type {
+        "openidconnect" => openidconnect_provider_config_id(provider),
+        _ => String::new(),
+    }
+}
+
+/// `providers.SortedProviders()` (`auth/providers/providers.go:216-247`) and
+/// the `NewJSContextFromRequest` projection (`jscontext.go:297-330`).
+///
+/// GAP: `requiredForAuthz` is always false here because the modeled providers
+/// (builtin/http-header/openidconnect) are never authz providers; authz
+/// provider matching (`jscontext.go:317-321`) for GitHub/GitLab/... remains a
+/// GAP, as do their `CachedInfo` runtime values.
+fn auth_providers(raw: &Value) -> Vec<AuthProviderInfo> {
+    let mut infos: Vec<(i64, bool, String, String, AuthProviderInfo)> = Vec::new();
+    for provider in auth_provider_entries(raw) {
         let service_type = match get_str(provider, "type").filter(|value| !value.is_empty()) {
             Some(service_type) => service_type.to_owned(),
             None => continue,
         };
-        let display_name = match service_type.as_str() {
-            "builtin" => "Builtin username-password authentication".to_owned(),
-            "http-header" => {
-                let header = get_str(provider, "usernameHeader").unwrap_or_default();
-                format!(
-                    "HTTP authentication proxy (\"{}\" header)",
-                    canonical_mime_header_key(header)
-                )
-            }
-            _ => get_str(provider, "displayName")
-                .filter(|name| !name.is_empty())
-                .unwrap_or(service_type.as_str())
-                .to_owned(),
+        // `GetAuthProviderCommon` + the `Hidden` skip (`jscontext.go:310-315`);
+        // `noSignIn` providers stay listed.
+        let common = auth_provider_common(provider, &service_type);
+        if common.hidden {
+            continue;
+        }
+        // `info := p.CachedInfo(); if info == nil { continue }`
+        // (`jscontext.go:317-319`) — no modeled provider returns nil.
+        let Some(cached) = auth_provider_cached_info(provider, &service_type) else {
+            continue;
         };
         let info = AuthProviderInfo {
             is_builtin: service_type == "builtin",
-            no_sign_in: get_bool(provider, "noSignIn"),
-            display_name,
-            display_prefix: get_str(provider, "displayPrefix").map(str::to_owned),
+            no_sign_in: common.no_sign_in,
+            display_name: common.display_name.unwrap_or(cached.display_name),
+            display_prefix: common.display_prefix,
             service_type: service_type.clone(),
-            authentication_url: String::new(),
-            service_id: get_str(provider, "issuer").unwrap_or_default().to_owned(),
-            client_id: get_str(provider, "clientID").unwrap_or_default().to_owned(),
+            authentication_url: cached.authentication_url,
+            service_id: cached.service_id,
+            client_id: cached.client_id,
             required_for_authz: false,
         };
         infos.push((
-            get_i64(provider, "order"),
+            common.order,
             service_type == "builtin",
-            service_type,
+            service_type.clone(),
+            auth_provider_config_id(provider, &service_type),
             info,
         ));
     }
     infos.sort_by(|left, right| {
-        let (left_order, left_builtin, left_type, _) = left;
-        let (right_order, right_builtin, right_type, _) = right;
+        let (left_order, left_builtin, left_type, left_id, _) = left;
+        let (right_order, right_builtin, right_type, right_id, _) = right;
         if *left_order != 0 && *right_order != 0 {
             return left_order.cmp(right_order);
         }
@@ -743,9 +917,11 @@ fn auth_providers(raw: &Value) -> Vec<AuthProviderInfo> {
         if *right_builtin && !*left_builtin {
             return std::cmp::Ordering::Greater;
         }
-        left_type.cmp(right_type)
+        left_type
+            .cmp(right_type)
+            .then_with(|| left_id.cmp(right_id))
     });
-    infos.into_iter().map(|(_, _, _, info)| info).collect()
+    infos.into_iter().map(|(_, _, _, _, info)| info).collect()
 }
 
 /// `textproto.CanonicalMIMEHeaderKey` for the HTTP-header provider name.
