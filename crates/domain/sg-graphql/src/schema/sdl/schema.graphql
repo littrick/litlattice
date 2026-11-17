@@ -3184,6 +3184,13 @@ type ExternalService implements Node {
     displayName: String!
 
     """
+    The webhook URL for the external service, if the configuration enables
+    webhooks. `externalServiceResolver.WebhookURL` (`external_service.go:208`):
+    empty/null when no webhook URL can be built for the kind.
+    """
+    webhookURL: String
+
+    """
     The current rate limiter state for the external service.
     """
     rateLimiterState: RateLimiterState
