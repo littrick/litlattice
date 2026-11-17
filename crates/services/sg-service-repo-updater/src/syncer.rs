@@ -839,7 +839,13 @@ fn repo_to_write(repo: &Repo) -> RepoWrite {
 
 /// `calcSyncInterval`: use the minimum interval when the service was never
 /// synced or the sync changed something; otherwise double the time since the
-/// last sync, clamped to `[min, 8h]`. Errors back off the same way.
+/// last sync, clamped to `[min, 8h]`.
+///
+/// The baseline computes the doubled interval in `time.Duration` (int64
+/// nanoseconds). `now.Sub(lastSync)` saturates at `math.MaxInt64` for a zero
+/// (never synced) or very old `lastSync`, and the subsequent `* 2` overflows
+/// into a negative duration, which is below the minimum. A failed first sync
+/// therefore backs off to the *minimum* interval, not the maximum.
 pub fn calc_sync_interval(
     now: SystemTime,
     last_sync: Option<SystemTime>,
@@ -853,12 +859,23 @@ pub fn calc_sync_interval(
 
     let interval = match last_sync {
         Some(last) => match now.duration_since(last) {
-            Ok(elapsed) => elapsed.saturating_mul(2),
-            // `now.Sub(lastSync)` is negative → below the minimum.
+            Ok(elapsed) => {
+                let elapsed_ns = elapsed.as_nanos();
+                // Go's `elapsed * 2` overflows int64 nanoseconds to a negative
+                // duration (→ below the minimum) once the elapsed time exceeds
+                // half of MaxInt64 nanoseconds. This includes the saturated
+                // value Go uses for a zero `lastSync`.
+                if elapsed_ns > (i64::MAX as u128) / 2 {
+                    return min_sync_interval;
+                }
+                Duration::from_nanos((elapsed_ns * 2) as u64)
+            }
+            // `now.Sub(lastSync)` is negative → negative after `* 2` too.
             Err(_) => return min_sync_interval,
         },
-        // `now.Sub(time.Time{})` is enormous → clamped to the maximum.
-        None => MAX_SYNC_INTERVAL,
+        // `now.Sub(time.Time{})` saturates at MaxInt64, then `* 2` overflows
+        // negative → below the minimum.
+        None => return min_sync_interval,
     };
 
     interval.clamp(min_sync_interval, MAX_SYNC_INTERVAL)
@@ -895,15 +912,26 @@ mod tests {
             calc_sync_interval(now, Some(last), min, false, false),
             MAX_SYNC_INTERVAL
         );
-        // Errors back off even when never synced.
-        assert_eq!(
-            calc_sync_interval(now, None, min, false, true),
-            MAX_SYNC_INTERVAL
-        );
+        // Errors on a never-synced service: Go's saturated `Sub` times two
+        // overflows int64 nanoseconds negative, so the minimum is used.
+        assert_eq!(calc_sync_interval(now, None, min, false, true), min);
         // A future last-sync is negative in Go → minimum.
         assert_eq!(
             calc_sync_interval(now, Some(now + Duration::from_secs(5)), min, false, false),
             min
+        );
+        // An elapsed time beyond half of MaxInt64 nanoseconds overflows when
+        // doubled in Go → minimum (200 years > 146.2 years).
+        let last = now - Duration::from_secs(200 * 365 * 24 * 60 * 60);
+        assert_eq!(
+            calc_sync_interval(now, Some(last), min, false, true),
+            min
+        );
+        // Half of MaxInt64 is ~146.2 years; just below it still clamps to 8h.
+        let last = now - Duration::from_secs(140 * 365 * 24 * 60 * 60);
+        assert_eq!(
+            calc_sync_interval(now, Some(last), min, false, true),
+            MAX_SYNC_INTERVAL
         );
     }
 

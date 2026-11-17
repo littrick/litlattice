@@ -564,11 +564,17 @@ pub struct RateLimitState {
     pub used: i64,
     pub reset: Option<OffsetDateTime>,
     pub retry_after: Option<time::Duration>,
+    /// `Monitor.known`: both `RateLimit-Limit` and `RateLimit-Remaining`
+    /// parsed successfully in the latest response.
+    pub known: bool,
+    /// `Monitor.retry`, the absolute `Retry-After` deadline.
+    pub retry_at: Option<OffsetDateTime>,
 }
 
 impl RateLimitState {
     /// `Monitor.Update`.
     pub fn update(&mut self, state: &ResponseState) {
+        let now = OffsetDateTime::now_utc();
         if let Some(value) = state.header("X-RateLimit-Remaining") {
             if let Ok(remaining) = value.trim().parse() {
                 self.remaining = remaining;
@@ -591,9 +597,57 @@ impl RateLimitState {
         }
         if let Some(value) = state.header("Retry-After") {
             if let Ok(seconds) = value.trim().parse::<i64>() {
-                self.retry_after = Some(time::Duration::seconds(seconds));
+                if seconds > 0 {
+                    self.retry_after = Some(time::Duration::seconds(seconds));
+                    self.retry_at = Some(now + time::Duration::seconds(seconds));
+                }
             }
         }
+
+        // `Monitor.Update` marks the monitor unknown unless all three headers
+        // parse; `X-RateLimit-Used` is informational only.
+        let known = state
+            .header("X-RateLimit-Limit")
+            .and_then(|value| value.trim().parse::<i64>().ok())
+            .is_some()
+            && state
+                .header("X-RateLimit-Remaining")
+                .and_then(|value| value.trim().parse::<i64>().ok())
+                .is_some()
+            && state
+                .header("X-RateLimit-Reset")
+                .and_then(|value| value.trim().parse::<i64>().ok())
+                .is_some();
+        self.known = known;
+    }
+
+    /// `Monitor.calcRateLimitWaitTime`, in nanoseconds (Go `time.Duration`).
+    /// Returns 0 when no wait is warranted.
+    pub fn calc_rate_limit_wait_time(&self, cost: i64) -> i64 {
+        let now = OffsetDateTime::now_utc();
+        if let Some(retry_at) = self.retry_at {
+            let remaining = retry_at - now;
+            if remaining > time::Duration::ZERO {
+                return remaining.whole_nanoseconds() as i64;
+            }
+        }
+
+        // Unknown limit, enough remaining tokens, or a cost larger than the
+        // entire limit (there will never be enough): no wait.
+        if !self.known || self.remaining >= cost || cost > self.limit {
+            return 0;
+        }
+
+        // Only wait when the reset is still in the future; a past reset is
+        // stale information.
+        if let Some(reset) = self.reset {
+            let remaining = reset - now;
+            if remaining > time::Duration::ZERO {
+                return remaining.whole_nanoseconds() as i64;
+            }
+        }
+
+        0
     }
 }
 
@@ -817,6 +871,21 @@ impl V3Client {
         self.state.lock().expect("rate limit state").clone()
     }
 
+    /// `Monitor.WaitForRateLimit`: sleeps when the latest rate-limit headers
+    /// warrant it and reports whether a wait happened.
+    async fn wait_for_rate_limit(&self, cost: i64) -> bool {
+        let wait = self
+            .state
+            .lock()
+            .expect("rate limit state")
+            .calc_rate_limit_wait_time(cost);
+        if wait <= 0 {
+            return false;
+        }
+        tokio::time::sleep(std::time::Duration::from_nanos(wait as u64)).await;
+        true
+    }
+
     async fn get(&self, request_uri: &str) -> Result<(ResponseState, Vec<u8>), GithubError> {
         self.request("GET", request_uri, Vec::new()).await
     }
@@ -840,18 +909,49 @@ impl V3Client {
         request_uri: &str,
         body: Vec<u8>,
     ) -> Result<(ResponseState, Vec<u8>), GithubError> {
-        let response = send(
+        // `V3Client.request`: the external rate limiter's preventative wait,
+        // then retry 403s while `WaitForRateLimit` says the limit is being
+        // applied, up to `maxRateLimitRetries`.
+        const MAX_RATE_LIMIT_RETRIES: i32 = 2;
+
+        self.wait_for_rate_limit(1).await;
+
+        let mut response = send(
             &self.http,
             &self.api_url,
             self.auth.as_ref(),
             method,
             request_uri,
-            body,
+            body.clone(),
             false,
             &self.state,
         )
-        .await?;
-        Ok(response)
+        .await;
+
+        let mut num_retries = 0;
+        while num_retries < MAX_RATE_LIMIT_RETRIES
+            && matches!(&response, Err(GithubError::Api(api)) if api.code == 403)
+        {
+            // The response's rate-limit headers were already recorded by
+            // `send`; a wait here means the 403 really is rate limiting.
+            if !self.wait_for_rate_limit(1).await {
+                break;
+            }
+            response = send(
+                &self.http,
+                &self.api_url,
+                self.auth.as_ref(),
+                method,
+                request_uri,
+                body.clone(),
+                false,
+                &self.state,
+            )
+            .await;
+            num_retries += 1;
+        }
+
+        response
     }
 
     async fn get_json<T: serde::de::DeserializeOwned>(
