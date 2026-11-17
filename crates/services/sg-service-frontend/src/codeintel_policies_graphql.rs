@@ -283,7 +283,11 @@ pub fn code_intelligence_configuration_policies(
     }
     opts.protected = arguments.bool("protected");
     opts.for_data_retention = arguments.bool("forDataRetention");
-    opts.for_precise_indexing = arguments.bool("forPreciseIndexing");
+    // The 5.5 UI sends `forIndexing`; `forPreciseIndexing` is the older
+    // name kept for compatibility.
+    opts.for_precise_indexing = arguments
+        .bool("forIndexing")
+        .or_else(|| arguments.bool("forPreciseIndexing"));
     // NOTE: `forSyntacticIndexing` is declared in the schema but the baseline
     // resolver never copies it into the store options.
     opts.for_embeddings = arguments.bool("forEmbeddings");

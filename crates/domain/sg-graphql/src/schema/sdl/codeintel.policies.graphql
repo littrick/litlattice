@@ -30,6 +30,12 @@ extend type Query {
         forPreciseIndexing: Boolean
 
         """
+        If set to true, then only configuration policies with precise indexing enabled are returned.
+        If set to false, then configuration policies with precise indexing enabled are filtered out.
+        """
+        forIndexing: Boolean
+
+        """
         If set to true, then only configuration policies with syntactic indexing enabled are returned.
         If set to false, then configuration policies with syntactic indexing enabled are filtered out.
         """
