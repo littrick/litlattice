@@ -6273,6 +6273,20 @@ impl ObjectValue for SiteObject {
                     None => Ok(None),
                 }
             }
+            // `siteResolver.BuildVersion` (`site.go:182`).
+            "buildVersion" => Ok(Some(FieldValue::Json(Json::Str(
+                String::from_utf8_lossy(crate::version::Version::load().as_bytes()).into_owned(),
+            )))),
+            // `siteResolver.CanReloadSite` (`site.go:176-179`): site admin AND
+            // `processrestart.CanRestart()`, which is true only when the
+            // supervisor runs a goreman RPC server (`GOREMAN_RPC_ADDR`). This
+            // supervisor has no such RPC, so the flag stays false.
+            "canReloadSite" => Ok(Some(FieldValue::Json(Json::Bool(
+                self.viewer_site_admin
+                    && std::env::var("GOREMAN_RPC_ADDR")
+                        .map(|value| !value.is_empty())
+                        .unwrap_or(false),
+            )))),
             // `siteResolver.ProductVersion` (`site.go:183`).
             "productVersion" => Ok(Some(FieldValue::Json(Json::Str(
                 String::from_utf8_lossy(crate::version::Version::load().as_bytes()).into_owned(),
