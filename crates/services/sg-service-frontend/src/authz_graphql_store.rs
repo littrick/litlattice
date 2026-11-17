@@ -187,7 +187,7 @@ async fn load_user_data(
 ) -> Result<Option<crate::graphql_resolvers::UserData>, String> {
     let row = sqlx::query(
         "SELECT id, username::text AS username, display_name, avatar_url, created_at, updated_at, \
-         site_admin, tos_accepted, (passwd IS NOT NULL) AS builtin_auth, EXISTS (SELECT 1 FROM user_external_accounts uea WHERE uea.service_type='scim' AND uea.user_id = users.id AND uea.deleted_at IS NULL) AS scim_controlled FROM users WHERE id = $1 AND deleted_at IS NULL",
+         site_admin, tos_accepted, (passwd IS NOT NULL) AS builtin_auth, EXISTS (SELECT 1 FROM user_external_accounts uea WHERE uea.service_type='scim' AND uea.user_id = users.id AND uea.deleted_at IS NULL) AS scim_controlled, completions_quota, code_completions_quota FROM users WHERE id = $1 AND deleted_at IS NULL",
     )
     .bind(user_id)
     .fetch_optional(pool)
@@ -212,6 +212,8 @@ async fn load_user_data(
         tos_accepted: row.try_get("tos_accepted").unwrap_or(false),
             builtin_auth: row.try_get("builtin_auth").unwrap_or(false),
             scim_controlled: row.try_get("scim_controlled").unwrap_or(false),
+            completions_quota: row.try_get("completions_quota").unwrap_or(None),
+            code_completions_quota: row.try_get("code_completions_quota").unwrap_or(None),
         primary_email: String::new(),
     }))
 }
@@ -1070,6 +1072,7 @@ async fn permissions_info_users(
         "SELECT users.id, users.username::text AS username, users.display_name, users.avatar_url, \
          users.created_at, users.updated_at, users.site_admin, users.tos_accepted, (users.passwd IS NOT NULL) AS builtin_auth, \
          EXISTS (SELECT 1 FROM user_external_accounts uea WHERE uea.service_type='scim' AND uea.user_id = users.id AND uea.deleted_at IS NULL) AS scim_controlled, \
+         users.completions_quota, users.code_completions_quota, \
          urp.updated_at AS permission_updated_at, urp.source \
          FROM users \
          LEFT JOIN user_repo_permissions urp ON urp.user_id = users.id AND urp.repo_id = $1::int \
@@ -1118,6 +1121,8 @@ async fn permissions_info_users(
             tos_accepted: row.try_get("tos_accepted").unwrap_or(false),
             builtin_auth: row.try_get("builtin_auth").unwrap_or(false),
             scim_controlled: row.try_get("scim_controlled").unwrap_or(false),
+            completions_quota: row.try_get("completions_quota").unwrap_or(None),
+            code_completions_quota: row.try_get("code_completions_quota").unwrap_or(None),
             primary_email: String::new(),
         };
         let source: Option<String> = row.try_get("source").ok().flatten();
@@ -1346,7 +1351,7 @@ async fn user_connection(
     }
     let rows = sqlx::query(
         "SELECT id, username::text AS username, display_name, avatar_url, created_at, updated_at, \
-         site_admin, tos_accepted, (passwd IS NOT NULL) AS builtin_auth, EXISTS (SELECT 1 FROM user_external_accounts uea WHERE uea.service_type='scim' AND uea.user_id = users.id AND uea.deleted_at IS NULL) AS scim_controlled FROM users WHERE id = ANY($1) AND deleted_at IS NULL ORDER BY id",
+         site_admin, tos_accepted, (passwd IS NOT NULL) AS builtin_auth, EXISTS (SELECT 1 FROM user_external_accounts uea WHERE uea.service_type='scim' AND uea.user_id = users.id AND uea.deleted_at IS NULL) AS scim_controlled, completions_quota, code_completions_quota FROM users WHERE id = ANY($1) AND deleted_at IS NULL ORDER BY id",
     )
     .bind(&id_subset)
     .fetch_all(pool)
@@ -1373,6 +1378,8 @@ async fn user_connection(
             tos_accepted: row.try_get("tos_accepted").unwrap_or(false),
             builtin_auth: row.try_get("builtin_auth").unwrap_or(false),
             scim_controlled: row.try_get("scim_controlled").unwrap_or(false),
+            completions_quota: row.try_get("completions_quota").unwrap_or(None),
+            code_completions_quota: row.try_get("code_completions_quota").unwrap_or(None),
             primary_email: String::new(),
         })
         .collect();

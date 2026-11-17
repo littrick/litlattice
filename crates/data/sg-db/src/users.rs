@@ -597,6 +597,8 @@ pub struct UserSessionRecord {
     pub tos_accepted: bool,
     pub builtin_auth: bool,
     pub scim_controlled: bool,
+    pub completions_quota: Option<i32>,
+    pub code_completions_quota: Option<i32>,
     pub email: String,
 }
 
@@ -617,6 +619,8 @@ fn scan_user_session_row(row: &sqlx::postgres::PgRow) -> UserSessionRecord {
         tos_accepted: row.get("tos_accepted"),
         builtin_auth: row.get("builtin_auth"),
         scim_controlled: row.get("scim_controlled"),
+        completions_quota: row.get("completions_quota"),
+        code_completions_quota: row.get("code_completions_quota"),
         email: row.get("email"),
     }
 }
@@ -633,6 +637,7 @@ SELECT u.id, u.username, u.display_name, u.avatar_url, u.created_at,
        u.updated_at, u.invalidated_sessions_at, u.site_admin, u.tos_accepted,
        (u.passwd IS NOT NULL) AS builtin_auth,
        EXISTS (SELECT 1 FROM user_external_accounts uea2 WHERE uea2.service_type='scim' AND uea2.user_id = u.id AND uea2.deleted_at IS NULL) AS scim_controlled,
+       u.completions_quota, u.code_completions_quota,
        COALESCE(ue.email, '') AS email
 FROM users u
 LEFT JOIN user_emails ue ON (ue.user_id = u.id AND ue.is_primary)
@@ -704,6 +709,7 @@ SELECT u.id, u.username, u.display_name, u.avatar_url, u.created_at,
        u.updated_at, u.invalidated_sessions_at, u.site_admin, u.tos_accepted,
        (u.passwd IS NOT NULL) AS builtin_auth,
        EXISTS (SELECT 1 FROM user_external_accounts uea2 WHERE uea2.service_type='scim' AND uea2.user_id = u.id AND uea2.deleted_at IS NULL) AS scim_controlled,
+       u.completions_quota, u.code_completions_quota,
        COALESCE(ue.email, '') AS email
 FROM users u
 LEFT JOIN user_emails ue ON (ue.user_id = u.id AND ue.is_primary)
@@ -730,6 +736,7 @@ SELECT u.id, u.username, u.display_name, u.avatar_url, u.created_at,
        u.updated_at, u.invalidated_sessions_at, u.site_admin, u.tos_accepted,
        (u.passwd IS NOT NULL) AS builtin_auth,
        EXISTS (SELECT 1 FROM user_external_accounts uea2 WHERE uea2.service_type='scim' AND uea2.user_id = u.id AND uea2.deleted_at IS NULL) AS scim_controlled,
+       u.completions_quota, u.code_completions_quota,
        COALESCE(ue.email, '') AS email
 FROM users u
 LEFT JOIN user_emails ue ON (ue.user_id = u.id AND ue.is_primary)

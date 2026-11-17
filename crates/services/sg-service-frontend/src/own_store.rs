@@ -73,6 +73,8 @@ fn user_data(record: sg_db::users::UserSessionRecord, primary_email: String) -> 
         tos_accepted: record.tos_accepted,
         builtin_auth: record.builtin_auth,
         scim_controlled: record.scim_controlled,
+        completions_quota: record.completions_quota,
+        code_completions_quota: record.code_completions_quota,
         primary_email,
     }
 }

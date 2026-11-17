@@ -225,6 +225,8 @@ impl UserLookupStore for FakeUsers {
             tos_accepted: false,
             builtin_auth: false,
             scim_controlled: false,
+            completions_quota: None,
+            code_completions_quota: None,
             primary_email: String::new(),
         }))
     }

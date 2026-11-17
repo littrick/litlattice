@@ -130,6 +130,9 @@ pub struct UserData {
     pub builtin_auth: bool,
     /// `users` row `EXISTS(... service_type='scim' ...)`.
     pub scim_controlled: bool,
+    /// `users.completions_quota` / `code_completions_quota` overrides.
+    pub completions_quota: Option<i32>,
+    pub code_completions_quota: Option<i32>,
     pub primary_email: String,
 }
 
@@ -1025,6 +1028,12 @@ pub struct NestedPrefetch {
     /// `conf.Get().AuthEnableUsernameChanges`: live Site configuration
     /// (`auth.enableUsernameChanges`), used by `viewerCanChangeUsername`.
     pub username_changes_enabled: bool,
+    /// `siteResolver.PerUserCompletionsQuota` / `PerUserCodeCompletionsQuota`
+    /// (`site.go:597-611`): `completions.perUserDailyLimit` /
+    /// `perUserCodeCompletionsDailyLimit` when Cody is enabled, `None` (null)
+    /// otherwise.
+    pub per_user_completions_quota: Option<i32>,
+    pub per_user_code_completions_quota: Option<i32>,
     /// `User.externalAccounts` connections keyed by user id and the `first`
     /// argument (M9.8ka).
     pub user_external_accounts:
@@ -5817,6 +5826,24 @@ impl ObjectValue for UserObject {
                 self.can_administer(actor)
                     && (self.nested.username_changes_enabled || self.viewer_site_admin),
             )))),
+            // `CompletionsQuotaOverride` / `CodeCompletionsQuotaOverride`
+            // (`user.go:717-752`): the site-admin-or-same-user gate, then the
+            // `users.completions_quota` / `code_completions_quota` override
+            // (NULL means unset).
+            "completionsQuotaOverride" | "codeCompletionsQuotaOverride" => {
+                if !self.can_administer(actor) {
+                    return Err(ExecError::new(MUST_BE_SITE_ADMIN_OR_SAME_USER));
+                }
+                let quota = if field == "completionsQuotaOverride" {
+                    self.data.completions_quota
+                } else {
+                    self.data.code_completions_quota
+                };
+                Ok(Some(FieldValue::Json(match quota {
+                    Some(value) => Json::Int(i64::from(value)),
+                    None => Json::Null,
+                })))
+            }
             // `UserResolver.SettingsCascade` (`user.go:391-401`): the folded
             // access check, then the prefetched cascade.
             "settingsCascade" | "configurationCascade" => {
@@ -6163,6 +6190,18 @@ impl ObjectValue for SiteObject {
                 "/site-admin/global-settings".to_owned(),
             )))),
             "viewerCanAdminister" => Ok(Some(FieldValue::Json(Json::Bool(self.viewer_site_admin)))),
+            // `siteResolver.PerUserCompletionsQuota` / `PerUserCodeCompletionsQuota`
+            // (`site.go:597-611`).
+            "perUserCompletionsQuota" => Ok(Some(FieldValue::Json(
+                self.nested
+                    .per_user_completions_quota
+                    .map_or(Json::Null, |value| Json::Int(i64::from(value))),
+            ))),
+            "perUserCodeCompletionsQuota" => Ok(Some(FieldValue::Json(
+                self.nested
+                    .per_user_code_completions_quota
+                    .map_or(Json::Null, |value| Json::Int(i64::from(value))),
+            ))),
             "latestSettings" => self.latest_settings(),
             // `siteResolver.SettingsCascade` (`site.go:161-171`): no access
             // check for the site subject.
@@ -8584,6 +8623,7 @@ mod tests {
                          siteAdmin: Boolean! tosAccepted: Boolean! \
                          builtinAuth: Boolean! email: String! \
                          viewerCanChangeUsername: Boolean! scimControlled: Boolean! \
+                         completionsQuotaOverride: Int codeCompletionsQuotaOverride: Int \
                          viewerCanAdminister: Boolean! \
                          organizations: OrgConnection! \
                          organizationMemberships: OrganizationMembershipConnection! } \
@@ -8651,6 +8691,8 @@ mod tests {
             tos_accepted: true,
             builtin_auth: true,
             scim_controlled: false,
+            completions_quota: None,
+            code_completions_quota: None,
             primary_email: "alice@example.com".to_owned(),
         })
     }
@@ -8796,6 +8838,8 @@ mod tests {
             tos_accepted: false,
             builtin_auth: false,
             scim_controlled: false,
+            completions_quota: None,
+            code_completions_quota: None,
             primary_email: String::new(),
         });
         assert_eq!(
@@ -8849,6 +8893,8 @@ mod tests {
             tos_accepted: false,
             builtin_auth: false,
             scim_controlled: false,
+            completions_quota: None,
+            code_completions_quota: None,
             primary_email: "bob@example.com".to_owned(),
         }
     }
@@ -9173,6 +9219,8 @@ mod tests {
             tos_accepted: false,
             builtin_auth: false,
             scim_controlled: false,
+            completions_quota: None,
+            code_completions_quota: None,
             primary_email: format!("{username}@example.com"),
         }
     }
@@ -9952,6 +10000,35 @@ mod tests {
                 &roots
             ),
             r#"{"data":{"currentUser":{"viewerCanChangeUsername":true}}}"#
+        );
+    }
+
+    #[test]
+    fn quota_overrides_are_null_without_a_row_value() {
+        let schema = schema();
+        let roots = FrontendRootResolver::with_user(Some(user()));
+        assert_eq!(
+            run(
+                &schema,
+                "{ currentUser { completionsQuotaOverride codeCompletionsQuotaOverride } }",
+                Actor::User { uid: 1 },
+                &roots
+            ),
+            r#"{"data":{"currentUser":{"completionsQuotaOverride":null,"codeCompletionsQuotaOverride":null}}}"#
+        );
+
+        let mut with_quota = user();
+        with_quota.data.completions_quota = Some(42);
+        with_quota.data.code_completions_quota = Some(7);
+        let roots = FrontendRootResolver::with_user(Some(with_quota));
+        assert_eq!(
+            run(
+                &schema,
+                "{ currentUser { completionsQuotaOverride codeCompletionsQuotaOverride } }",
+                Actor::User { uid: 1 },
+                &roots
+            ),
+            r#"{"data":{"currentUser":{"completionsQuotaOverride":42,"codeCompletionsQuotaOverride":7}}}"#
         );
     }
 

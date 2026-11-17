@@ -2804,6 +2804,35 @@ impl GraphqlDeps for SchemaGraphqlDeps {
                 })
                 .unwrap_or(false);
             Arc::make_mut(&mut nested).username_changes_enabled = username_changes;
+            // `siteResolver.PerUserCompletionsQuota` / `PerUserCodeCompletionsQuota`
+            // (`site.go:597-611`): Cody must be enabled, then the positive
+            // `completions.perUser*DailyLimit` values become the quotas.
+            let raw = deps
+                .store
+                .last_valid()
+                .map(|unified| unified.site.raw().clone())
+                .unwrap_or(serde_json::Value::Null);
+            let cody_enabled = match raw.get("cody.enabled").and_then(serde_json::Value::as_bool) {
+                Some(value) => value,
+                None => raw
+                    .get("completions")
+                    .and_then(|completions| completions.get("enabled"))
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false),
+            };
+            let quota = |key: &str| -> Option<i32> {
+                if !cody_enabled {
+                    return None;
+                }
+                raw.get("completions")
+                    .and_then(|completions| completions.get(key))
+                    .and_then(serde_json::Value::as_i64)
+                    .filter(|value| *value > 0)
+                    .map(|value| value as i32)
+            };
+            Arc::make_mut(&mut nested).per_user_completions_quota = quota("perUserDailyLimit");
+            Arc::make_mut(&mut nested).per_user_code_completions_quota =
+                quota("perUserCodeCompletionsDailyLimit");
         }
         // `Query.slowRequests` (`slow_requests_tracer.go:63`): the `after`
         // cursor and the nodes' `user`/`repository` rows are async, so resolve
@@ -4450,6 +4479,8 @@ mod tests {
                 tos_accepted: false,
                 builtin_auth: false,
                 scim_controlled: false,
+                completions_quota: None,
+                code_completions_quota: None,
                 primary_email: String::new(),
             }))
         }

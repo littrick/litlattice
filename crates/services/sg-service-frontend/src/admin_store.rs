@@ -125,6 +125,8 @@ impl UserRow {
             tos_accepted: self.tos_accepted,
             builtin_auth: self.builtin_auth,
             scim_controlled: self.scim_controlled,
+            completions_quota: None,
+            code_completions_quota: None,
             primary_email: self.primary_email.clone(),
         }
     }

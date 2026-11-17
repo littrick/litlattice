@@ -130,12 +130,14 @@ impl PgTeamsGraphqlStore {
             tos_accepted: row.try_get("tos_accepted")?,
             builtin_auth: row.try_get("builtin_auth")?,
             scim_controlled: row.try_get("scim_controlled")?,
+            completions_quota: row.try_get("completions_quota")?,
+            code_completions_quota: row.try_get("code_completions_quota")?,
             primary_email: String::new(),
         })
     }
 
     const USER_COLUMNS: &'static str = "id, username, display_name, avatar_url, created_at, \
-         updated_at, site_admin, tos_accepted, (passwd IS NOT NULL) AS builtin_auth, EXISTS (SELECT 1 FROM user_external_accounts uea WHERE uea.service_type='scim' AND uea.user_id = users.id AND uea.deleted_at IS NULL) AS scim_controlled";
+         updated_at, site_admin, tos_accepted, (passwd IS NOT NULL) AS builtin_auth, EXISTS (SELECT 1 FROM user_external_accounts uea WHERE uea.service_type='scim' AND uea.user_id = users.id AND uea.deleted_at IS NULL) AS scim_controlled, completions_quota, code_completions_quota";
 }
 
 impl TeamsGraphqlDatabase for PgTeamsGraphqlStore {

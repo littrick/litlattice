@@ -138,6 +138,8 @@ impl UserProfiles for PgSessionUsers {
                     tos_accepted: record.tos_accepted,
                     builtin_auth: record.builtin_auth,
         scim_controlled: record.scim_controlled,
+        completions_quota: record.completions_quota,
+        code_completions_quota: record.code_completions_quota,
                     primary_email: record.email,
                 })
             })

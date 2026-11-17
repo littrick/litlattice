@@ -96,6 +96,8 @@ fn graphql_user_harness() {
             tos_accepted: case.user.tos_accepted,
             builtin_auth: false,
             scim_controlled: false,
+            completions_quota: None,
+            code_completions_quota: None,
             primary_email: String::new(),
         });
         let roots = FrontendRootResolver::with_user(Some(user));

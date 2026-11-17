@@ -291,6 +291,8 @@ fn user_data(fixture: &UserFixture) -> UserData {
         tos_accepted: false,
         builtin_auth: false,
         scim_controlled: false,
+        completions_quota: None,
+        code_completions_quota: None,
         primary_email: fixture.primary_email.clone(),
     }
 }

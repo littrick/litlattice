@@ -338,6 +338,8 @@ fn user_data(id: i32, username: &str) -> UserData {
         tos_accepted: false,
         builtin_auth: false,
         scim_controlled: false,
+        completions_quota: None,
+        code_completions_quota: None,
         primary_email: String::new(),
     }
 }
