@@ -1651,14 +1651,20 @@ impl AdminStore for PgAdminStore {
     }
 
     async fn create_external_service(&self, new: &NewExternalService) -> Result<i64, String> {
+        // `recalculateFields` (`internal/database/external_services.go:1662-1675`)
+        // writes `calcUnrestricted(config)`; for `OTHER` without an
+        // `authorization` block that is `true`. `has_webhooks` stays false:
+        // `OTHER` has no webhook array.
+        let unrestricted = calc_unrestricted(&new.config);
         let row = sqlx::query(
             "INSERT INTO external_services (kind, display_name, config, created_at, updated_at, \
              unrestricted, has_webhooks, creator_id, last_updater_id) \
-             VALUES ($1, $2, $3, now(), now(), FALSE, FALSE, $4, $5) RETURNING id",
+             VALUES ($1, $2, $3, now(), now(), $4, FALSE, $5, $6) RETURNING id",
         )
         .bind(&new.kind)
         .bind(&new.display_name)
         .bind(&new.config)
+        .bind(unrestricted)
         .bind(new.creator_id)
         .bind(new.last_updater_id)
         .fetch_one(&self.pool)
@@ -1674,17 +1680,37 @@ impl AdminStore for PgAdminStore {
         config: Option<&str>,
         updater_id: Option<i32>,
     ) -> Result<(), String> {
-        let result = sqlx::query(
-            "UPDATE external_services SET display_name=COALESCE($2, display_name), \
-             config=COALESCE($3, config), last_updater_id=COALESCE($4, last_updater_id), \
-             updated_at=now() WHERE id=$1 AND deleted_at IS NULL",
-        )
-        .bind(id)
-        .bind(display_name)
-        .bind(config)
-        .bind(updater_id)
-        .execute(&self.pool)
-        .await
+        // `Update` (`internal/database/external_services.go:814-937`): a new
+        // config recomputes `unrestricted`; every update sets
+        // `next_sync_at = NOW()` so the scheduler picks the service up again.
+        let result = match config {
+            Some(config) => {
+                sqlx::query(
+                    "UPDATE external_services SET display_name=COALESCE($2, display_name), \
+                     config=$3, unrestricted=$4, last_updater_id=COALESCE($5, last_updater_id), \
+                     next_sync_at=now(), updated_at=now() WHERE id=$1 AND deleted_at IS NULL",
+                )
+                .bind(id)
+                .bind(display_name)
+                .bind(config)
+                .bind(calc_unrestricted(config))
+                .bind(updater_id)
+                .execute(&self.pool)
+                .await
+            }
+            None => {
+                sqlx::query(
+                    "UPDATE external_services SET display_name=COALESCE($2, display_name), \
+                     last_updater_id=COALESCE($3, last_updater_id), next_sync_at=now(), \
+                     updated_at=now() WHERE id=$1 AND deleted_at IS NULL",
+                )
+                .bind(id)
+                .bind(display_name)
+                .bind(updater_id)
+                .execute(&self.pool)
+                .await
+            }
+        }
         .map_err(|e| e.to_string())?;
         if result.rows_affected() == 0 {
             return Err(format!("external service not found: {id}"));
@@ -1693,17 +1719,44 @@ impl AdminStore for PgAdminStore {
     }
 
     async fn delete_external_service(&self, id: i64, _async_delete: bool) -> Result<(), String> {
+        // `Delete` (`internal/database/external_services.go:947-1053`): collect
+        // the associated repo ids while removing the associations, soft delete
+        // repos that are now orphans, then soft delete the service itself.
         let mut tx = self.pool.begin().await.map_err(|e| e.to_string())?;
-        sqlx::query("DELETE FROM external_service_repos WHERE external_service_id=$1")
-            .bind(id)
+        let repo_rows = sqlx::query(
+            "DELETE FROM external_service_repos WHERE external_service_id=$1 RETURNING repo_id",
+        )
+        .bind(id)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|e| e.to_string())?;
+        let repo_ids: Vec<i32> = repo_rows
+            .iter()
+            .map(|row| row.try_get("repo_id").map_err(|e| e.to_string()))
+            .collect::<Result<_, _>>()?;
+        if !repo_ids.is_empty() {
+            // `deleteRepoIfOrphanQuery`; `soft_deleted_repository_name`
+            // prefixes `DELETED-<epoch>-` once.
+            sqlx::query(
+                "UPDATE repo SET name=soft_deleted_repository_name(name), deleted_at=now() \
+                 WHERE deleted_at IS NULL AND id = ANY($1) \
+                 AND NOT EXISTS (SELECT 1 FROM external_service_repos WHERE repo_id = repo.id)",
+            )
+            .bind(&repo_ids)
             .execute(&mut *tx)
             .await
             .map_err(|e| e.to_string())?;
-        sqlx::query("UPDATE external_services SET deleted_at=now(), updated_at=now() WHERE id=$1")
-            .bind(id)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| e.to_string())?;
+        }
+        let result = sqlx::query(
+            "UPDATE external_services SET deleted_at=now() WHERE id=$1 AND deleted_at IS NULL",
+        )
+        .bind(id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| e.to_string())?;
+        if result.rows_affected() == 0 {
+            return Err(format!("external service not found: {id}"));
+        }
         tx.commit().await.map_err(|e| e.to_string())
     }
 
@@ -1811,6 +1864,20 @@ fn token_row(row: &sqlx::postgres::PgRow) -> Result<AccessTokenRow, String> {
         expires_at: row.try_get("expires_at").map_err(|e| e.to_string())?,
         value: String::new(),
     })
+}
+
+/// `calcUnrestricted` (`internal/database/external_services.go:1633-1660`) with
+/// `permissions.userMapping` disabled: an `enforcePermissions` flag inverts the
+/// value; otherwise a config with an `authorization` block is restricted and
+/// everything else (including `OTHER`) is unrestricted.
+fn calc_unrestricted(config: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(config) else {
+        return true;
+    };
+    match value.get("enforcePermissions") {
+        Some(enforce_permissions) => !enforce_permissions.as_bool().unwrap_or(false),
+        None => value.get("authorization").is_none(),
+    }
 }
 
 fn external_service_row(row: &sqlx::postgres::PgRow) -> Result<ExternalServiceRow, String> {
@@ -1995,8 +2062,15 @@ impl AdminEffects for PgAdminEffects {
         Ok(())
     }
 
-    async fn enqueue_external_service_sync(&self, _id: i64) -> Result<(), String> {
-        Ok(())
+    async fn enqueue_external_service_sync(&self, id: i64) -> Result<(), String> {
+        // `EnqueueSingleSyncJob` (`internal/repos/store.go:568-590`) only
+        // inserts when no `queued`/`processing` job exists; the job scheduler
+        // retries otherwise, so the mutation treats errors as non-fatal.
+        sg_db::external_service_sync_jobs::SyncJobsStore::new(self.pool.clone())
+            .enqueue_single_sync_job(id)
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string())
     }
 
     async fn reset_password_url(
