@@ -357,6 +357,37 @@ WHERE repo_id = (SELECT id FROM repo WHERE name = $4::citext)
         Ok(())
     }
 
+    /// `GetByID` (`internal/database/gitserver_repos.go`): the row for one
+    /// repository, including `repo.name` for the sync-output lookup.
+    pub async fn get_by_id(&self, repo_id: i32) -> Result<Option<GitserverRepo>, sqlx::Error> {
+        let row = sqlx::query(
+            r#"
+SELECT
+	gr.repo_id,
+	r.name::text as name,
+	gr.clone_status,
+	gr.shard_id,
+	gr.last_error,
+	gr.last_fetched,
+	gr.last_changed,
+	gr.repo_size_bytes,
+	gr.updated_at,
+	gr.corrupted_at,
+	gr.corruption_logs
+FROM gitserver_repos gr
+JOIN repo r ON r.id = gr.repo_id
+WHERE gr.repo_id = $1
+"#,
+        )
+        .bind(repo_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        Ok(Some(scan_gitserver_repo(&row)?))
+    }
+
     /// `GetByName` (the baseline selects `'' as name` for this lookup).
     pub async fn get_by_name(&self, repo: &str) -> Result<Option<GitserverRepo>, sqlx::Error> {
         let row = sqlx::query(

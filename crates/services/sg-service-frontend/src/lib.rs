@@ -110,6 +110,7 @@ pub mod internal_api;
 pub mod ipallowlist;
 pub mod license_config;
 pub mod llm_api;
+pub mod mirror_info_graphql;
 pub mod log_events;
 pub mod log_events_metrics;
 pub mod markdown_graphql;

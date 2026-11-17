@@ -292,6 +292,9 @@ pub struct RepositoriesPage {
 pub struct RepositoriesConnectionData {
     pub page: Result<RepositoriesPage, String>,
     pub total_count: Result<i64, String>,
+    /// `Repository.mirrorInfo` rows keyed by repo id; empty when the
+    /// selection does not include it.
+    pub mirror_infos: std::collections::HashMap<i32, crate::mirror_info_graphql::MirrorInfoLookup>,
 }
 
 /// The result of resolving one `Query.repositories` field.
@@ -425,6 +428,7 @@ pub async fn repositories(
             return RepositoriesConnectionLookup::Found(RepositoriesConnectionData {
                 page: Err(message),
                 total_count,
+                mirror_infos: std::collections::HashMap::new(),
             })
         }
     };
@@ -432,6 +436,7 @@ pub async fn repositories(
     RepositoriesConnectionLookup::Found(RepositoriesConnectionData {
         page: Ok(page),
         total_count,
+        mirror_infos: std::collections::HashMap::new(),
     })
 }
 
@@ -571,6 +576,7 @@ pub async fn prefetch_repositories_connections(
     fields: &[RootField],
     actor: Actor,
     viewer_site_admin: bool,
+    pool: Option<&sqlx::PgPool>,
 ) -> std::collections::HashMap<RepositoriesArgs, RepositoriesConnectionLookup> {
     let mut connections = std::collections::HashMap::new();
     for field in fields {
@@ -581,7 +587,20 @@ pub async fn prefetch_repositories_connections(
         if connections.contains_key(&args) {
             continue;
         }
-        let lookup = repositories(&args, store, actor, viewer_site_admin).await;
+        let mut lookup = repositories(&args, store, actor, viewer_site_admin).await;
+        // `Repository.mirrorInfo` needs the gitserver row per returned repo.
+        if let (Some(pool), RepositoriesConnectionLookup::Found(data)) = (pool, &mut lookup) {
+            if crate::mirror_info_graphql::selects_mirror_info(&field.selections) {
+                let ids = match &data.page {
+                    Ok(page) => page.nodes.iter().map(|node| node.id).collect::<Vec<_>>(),
+                    Err(_) => Vec::new(),
+                };
+                if !ids.is_empty() {
+                    data.mirror_infos =
+                        crate::mirror_info_graphql::prefetch_mirror_infos(pool, &ids).await;
+                }
+            }
+        }
         connections.insert(args, lookup);
     }
     connections
@@ -591,6 +610,11 @@ pub async fn prefetch_repositories_connections(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RepositoriesConnectionObject {
     data: RepositoriesConnectionData,
+    /// Prefetched `mirrorInfo` rows keyed by repo id.
+    mirror_infos: std::collections::HashMap<i32, crate::mirror_info_graphql::MirrorInfoLookup>,
+    /// The viewer's `users.site_admin`, replayed by each node's
+    /// `viewerCanAdminister` / `mirrorInfo.shard`.
+    viewer_site_admin: bool,
     /// The request's embeddings snapshot (M9.14c), replayed by each node's
     /// `embeddingExists`. `None` keeps the field unported.
     embeddings: Option<Arc<crate::embeddings_graphql::EmbeddingsPrefetch>>,
@@ -600,11 +624,20 @@ pub struct RepositoriesConnectionObject {
 
 impl RepositoriesConnectionObject {
     pub fn from_data(data: RepositoriesConnectionData) -> Self {
+        let mirror_infos = data.mirror_infos.clone();
         Self {
             data,
+            mirror_infos,
+            viewer_site_admin: false,
             embeddings: None,
             authz: None,
         }
+    }
+
+    /// Attach the viewer's site-admin flag for node-level fields.
+    pub fn with_viewer_site_admin(mut self, viewer_site_admin: bool) -> Self {
+        self.viewer_site_admin = viewer_site_admin;
+        self
     }
 
     /// Attach the request's prefetched embeddings data (M9.14c).
@@ -646,10 +679,15 @@ impl ObjectValue for RepositoriesConnectionObject {
                         .iter()
                         .cloned()
                         .map(|data| {
+                            let repo_id = data.id;
                             FieldValue::Object(Arc::new(
                                 RepositoryObject::from_data(data)
                                     .with_embeddings(self.embeddings.clone())
-                                    .with_authz(self.authz.clone()),
+                                    .with_authz(self.authz.clone())
+                                    .with_viewer_site_admin(self.viewer_site_admin)
+                                    .with_mirror_info(
+                                        self.mirror_infos.get(&repo_id).cloned(),
+                                    ),
                             ))
                         })
                         .collect(),

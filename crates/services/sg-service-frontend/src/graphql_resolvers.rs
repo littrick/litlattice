@@ -1048,6 +1048,9 @@ pub struct NestedPrefetch {
     /// otherwise.
     pub per_user_completions_quota: Option<i32>,
     pub per_user_code_completions_quota: Option<i32>,
+    /// Prefetched `Site.siteID` / `needsRepositoryConfiguration` /
+    /// `freeUsersExceeded` flags.
+    pub site_flags: crate::site_overview_graphql::SiteFlags,
     /// `Site.users` totals keyed by the user-list arguments
     /// (`site_users.go:15-42`).
     pub site_users: HashMap<UsersArgs, UsersConnectionLookup>,
@@ -4649,7 +4652,8 @@ impl ObjectValue for QueryRoot {
                                 data.clone(),
                             )
                             .with_embeddings(self.nested.repo_embeddings.clone())
-                            .with_authz(self.authz.clone()),
+                            .with_authz(self.authz.clone())
+                            .with_viewer_site_admin(self.viewer_site_admin),
                         ))))
                     }
                     Some(crate::repositories::RepositoriesConnectionLookup::Error(message)) => {
@@ -6273,6 +6277,56 @@ impl ObjectValue for SiteObject {
                     None => Ok(None),
                 }
             }
+            // `siteResolver.Alerts` (`site_flags.go` / `graphqlbackend.Alerts`):
+            // the baseline aggregates alert functions (license, repo updater,
+            // search) here. Those alert sources are not ported; an empty list
+            // is rendered as "no active alerts" (ENV_GAP, no false warnings).
+            "alerts" => Ok(Some(FieldValue::List {
+                items: Vec::new(),
+                element_type: Some("Alert"),
+            })),
+            // `siteResolver.SiteID` (`site.go:94`): `siteid.Get`.
+            "siteID" => Ok(Some(match &self.nested.site_flags.site_id {
+                Some(value) => FieldValue::Json(Json::Str(value.clone())),
+                None => FieldValue::Null,
+            })),
+            // `siteResolver.NeedsRepositoryConfiguration`
+            // (`site_flags.go:15-41`): site admins only; others get false.
+            "needsRepositoryConfiguration" => {
+                if !self.viewer_site_admin {
+                    return Ok(Some(FieldValue::Json(Json::Bool(false))));
+                }
+                Ok(Some(FieldValue::Json(Json::Bool(
+                    self.nested
+                        .site_flags
+                        .needs_repository_configuration
+                        .unwrap_or(false),
+                ))))
+            }
+            // `siteResolver.FreeUsersExceeded` (`site_flags.go:45-69`).
+            "freeUsersExceeded" => Ok(Some(FieldValue::Json(Json::Bool(
+                self.nested.site_flags.free_users_exceeded.unwrap_or(false),
+            )))),
+            // `siteResolver.SendsEmailVerificationEmails`
+            // (`site_flags.go:43`): `conf.CanSendEmail()`; no SMTP here.
+            "sendsEmailVerificationEmails" => {
+                Ok(Some(FieldValue::Json(Json::Bool(false))))
+            }
+            // `siteResolver.AllowSiteSettingsEdits` (`site.go:194-196`).
+            "allowSiteSettingsEdits" => {
+                let editable = std::env::var("SITE_CONFIG_FILE")
+                    .map(|value| value.is_empty())
+                    .unwrap_or(true)
+                    || std::env::var("SITE_CONFIG_ALLOW_EDITS")
+                        .ok()
+                        .and_then(|value| match value.as_str() {
+                            "1" | "t" | "T" | "TRUE" | "true" | "True" => Some(true),
+                            "0" | "f" | "F" | "FALSE" | "false" | "False" => Some(false),
+                            _ => None,
+                        })
+                        .unwrap_or(false);
+                Ok(Some(FieldValue::Json(Json::Bool(editable))))
+            }
             // `siteResolver.ExternalServicesFromFile` / `AllowEditExternalSer-
             // vicesWithFile` (`site_flags.go:72-75`): the advanced config file
             // env vars (`envvar.go:21-35`).
@@ -7364,6 +7418,8 @@ pub struct RepositoryObject {
     /// The viewer's `users.site_admin`, needed by the authz gates reached
     /// through `Repository` (the root resolver knows it per request).
     viewer_site_admin: bool,
+    /// Prefetched `gitserver_repos` data for `Repository.mirrorInfo`.
+    mirror_info: Option<crate::mirror_info_graphql::MirrorInfoLookup>,
 }
 
 impl RepositoryObject {
@@ -7379,7 +7435,17 @@ impl RepositoryObject {
             codeintel_uploads: None,
             authz: None,
             viewer_site_admin: false,
+            mirror_info: None,
         }
+    }
+
+    /// Attach the prefetched `mirrorInfo` row.
+    pub fn with_mirror_info(
+        mut self,
+        mirror_info: Option<crate::mirror_info_graphql::MirrorInfoLookup>,
+    ) -> Self {
+        self.mirror_info = mirror_info;
+        self
     }
 
     /// Attach the authz surface (M9.48a).
@@ -7786,6 +7852,16 @@ impl ObjectValue for RepositoryObject {
                 "/{}",
                 self.data.name
             )))))),
+            // `RepositoryResolver.MirrorInfo` (`repository_mirror.go:23-25`).
+            "mirrorInfo" => match &self.mirror_info {
+                None => Ok(None),
+                Some(data) => Ok(Some(FieldValue::Object(Arc::new(
+                    crate::mirror_info_graphql::MirrorInfoObject {
+                        data: data.clone(),
+                        viewer_site_admin: self.viewer_site_admin,
+                    },
+                )))),
+            },
             // `RepositoryResolver.ViewerCanAdminister`
             // (`repository.go:246-254`): site admins only; the baseline
             // returns false (not an error) for everyone else.

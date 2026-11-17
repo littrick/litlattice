@@ -2584,6 +2584,7 @@ impl GraphqlDeps for SchemaGraphqlDeps {
                     &fields,
                     request.actor,
                     site_admin,
+                    self.pool.as_ref(),
                 )
                 .await
             }
@@ -2795,6 +2796,21 @@ impl GraphqlDeps for SchemaGraphqlDeps {
         // The Site subject reached through a settings cascade replays the
         // prefetched configuration from `NestedPrefetch` (M9.8jl).
         Arc::make_mut(&mut nested).cascade_site_configuration = cascade_site_configuration;
+        // `Site.siteID` / `needsRepositoryConfiguration` / `freeUsersExceeded`
+        // (M9.56o): prefetched once when the operation selects any of them.
+        if let Some(pool) = &self.pool {
+            if crate::site_overview_graphql::selects(
+                &fields,
+                &[
+                    "siteID",
+                    "needsRepositoryConfiguration",
+                    "freeUsersExceeded",
+                ],
+            ) {
+                Arc::make_mut(&mut nested).site_flags =
+                    crate::site_overview_graphql::prefetch_site_flags(pool).await;
+            }
+        }
         // `providers.BuiltinAuthEnabled()` (M9.56e): the live Site config, not
         // tied to which root fields this operation selected.
         if let Some(deps) = &self.config_graphql {

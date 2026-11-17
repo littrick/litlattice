@@ -193,6 +193,92 @@ impl ObjectValue for SiteUsersObject {
     }
 }
 
+/// `database.ExternalServiceKinds` entries with `CodeHost: true`
+/// (`internal/database/external_services.go:205-224`).
+const CODE_HOST_KINDS: &[&str] = &[
+    "AWSCodeCommit",
+    "AzureDevOps",
+    "BitbucketCloud",
+    "BitbucketServer",
+    "Gerrit",
+    "GitHub",
+    "GitLab",
+    "Gitolite",
+    "GoModules",
+    "JVMPackages",
+    "NpmPackages",
+    "OTHER",
+    "Pagure",
+    "Perforce",
+    "Phabricator",
+    "PythonPackages",
+    "RustPackages",
+    "RubyPackages",
+];
+
+/// The site flags `SiteObject` replays.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SiteFlags {
+    pub site_id: Option<String>,
+    pub needs_repository_configuration: Option<bool>,
+    pub free_users_exceeded: Option<bool>,
+}
+
+/// True when any of `names` is selected anywhere under `fields`.
+pub fn selects(fields: &[sg_graphql::exec::RootField], names: &[&str]) -> bool {
+    fields.iter().any(|field| {
+        names.contains(&field.name.as_str())
+            || selects(&field.selections, names)
+            || field
+                .type_conditions
+                .iter()
+                .any(|(_, nested)| selects(nested, names))
+    })
+}
+
+/// Prefetch `Site.siteID`, `needsRepositoryConfiguration` and
+/// `freeUsersExceeded` (`site.go:94`, `site_flags.go:15-75`).
+pub async fn prefetch_site_flags(pool: &sqlx::PgPool) -> SiteFlags {
+    let site_id = match std::env::var("TRACKING_APP_ID") {
+        Ok(value) if !value.is_empty() => Some(value),
+        _ => sg_db::global_state::get(pool)
+            .await
+            .ok()
+            .map(|state| state.site_id)
+            .filter(|value| !value.is_empty()),
+    };
+
+    // `needsRepositoryConfiguration`: no code-host external services exist.
+    let needs = sqlx::query_scalar::<_, i64>(
+        "SELECT count(*) FROM external_services \
+         WHERE deleted_at IS NULL AND kind = ANY($1)",
+    )
+    .bind(CODE_HOST_KINDS)
+    .fetch_one(pool)
+    .await
+    .ok()
+    .map(|count| count == 0);
+
+    // `freeUsersExceeded`: the free plan warns from 10 users
+    // (`licensing/user_count.go:68`).
+    let users = sg_db::users::count_users(
+        pool,
+        &sg_db::users::UsersListOptions {
+            exclude_sourcegraph_operators: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .ok();
+    let free_exceeded = users.map(|count| count >= 10);
+
+    SiteFlags {
+        site_id,
+        needs_repository_configuration: needs,
+        free_users_exceeded: free_exceeded,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Admin analytics placeholders (shape-only; ENV_GAP)
 // ---------------------------------------------------------------------------
