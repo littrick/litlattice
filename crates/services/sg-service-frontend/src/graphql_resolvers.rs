@@ -1051,6 +1051,8 @@ pub struct NestedPrefetch {
     /// Prefetched `Site.siteID` / `needsRepositoryConfiguration` /
     /// `freeUsersExceeded` flags.
     pub site_flags: crate::site_overview_graphql::SiteFlags,
+    /// The frontend pool for `Site.users` (`site_users.go:15-42`).
+    pub users_pool: crate::site_overview_graphql::PoolHandle,
     /// `Repository.mirrorInfo` rows keyed by repo id, for repository objects
     /// reached through `Query.repository` / `Query.node`.
     pub mirror_infos: HashMap<i32, crate::mirror_info_graphql::MirrorInfoLookup>,
@@ -6301,18 +6303,12 @@ impl ObjectValue for SiteObject {
                 if !self.viewer_site_admin {
                     return Err(ExecError::new(MUST_BE_SITE_ADMIN));
                 }
-                let args = users_args(arguments);
-                match self.nested.site_users.get(&args) {
-                    Some(UsersConnectionLookup::Found(data)) => Ok(Some(FieldValue::Object(
-                        Arc::new(crate::site_overview_graphql::SiteUsersObject {
-                            total_count: i64::from(data.total_count),
-                        }),
-                    ))),
-                    Some(UsersConnectionLookup::Error(message)) => {
-                        Err(ExecError::new(message.clone()))
-                    }
-                    None => Ok(None),
-                }
+                Ok(Some(FieldValue::Object(Arc::new(
+                    crate::site_overview_graphql::SiteUsersObject {
+                        pool: self.nested.users_pool.0.clone(),
+                        filters: crate::site_overview_graphql::site_users_filters(arguments),
+                    },
+                ))))
             }
             // `siteResolver.Alerts` (`site_flags.go` / `graphqlbackend.Alerts`):
             // the baseline aggregates alert functions (license, repo updater,

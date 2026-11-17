@@ -2796,6 +2796,10 @@ impl GraphqlDeps for SchemaGraphqlDeps {
         // The Site subject reached through a settings cascade replays the
         // prefetched configuration from `NestedPrefetch` (M9.8jl).
         Arc::make_mut(&mut nested).cascade_site_configuration = cascade_site_configuration;
+        if let Some(pool) = &self.pool {
+            Arc::make_mut(&mut nested).users_pool =
+                crate::site_overview_graphql::PoolHandle(Some(pool.clone()));
+        }
         // `Site.siteID` / `needsRepositoryConfiguration` / `freeUsersExceeded`
         // (M9.56o): prefetched once when the operation selects any of them.
         if let Some(pool) = &self.pool {
