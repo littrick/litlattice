@@ -1145,6 +1145,10 @@ pub struct NestedPrefetch {
     /// `User.emails` / `primaryEmail` / `accessTokens` / `session` /
     /// `hasVerifiedEmail` per-user account data (M9.18a).
     pub user_accounts: HashMap<i32, crate::graphql_inventory_c::UserAccountsData>,
+    /// `Site.accessTokens` (site-admin only), prefetched for the root `site`
+    /// field (`access_tokens.go:267-279`).
+    pub site_access_tokens:
+        Option<Result<crate::graphql_inventory_c::AccessTokenConnectionFull, String>>,
     /// `Webhook.webhookLogs` connections keyed by webhook id and argument set
     /// (M9.19a). Always queried with `WebhookLogsAllExternalServices`.
     pub webhook_webhook_logs: HashMap<
@@ -6486,6 +6490,22 @@ impl ObjectValue for SiteObject {
                     .map_or(Json::Null, |value| Json::Int(i64::from(value))),
             ))),
             "latestSettings" => self.latest_settings(),
+            // `siteResolver.AccessTokens` (`access_tokens.go:267-279`):
+            // site-admin only; the prefetch stores the gate's error.
+            "accessTokens" => match &self.nested.site_access_tokens {
+                None => Ok(None),
+                Some(Err(message)) => Err(ExecError::new(message.clone())),
+                Some(Ok(full)) => Ok(Some(FieldValue::Object(Arc::new(
+                    crate::graphql_inventory_c::AccessTokenConnectionObject {
+                        full: full.clone(),
+                        first: arguments
+                            .i64("first")
+                            .and_then(|first| i32::try_from(first).ok()),
+                        viewer_site_admin: self.viewer_site_admin,
+                        nested: self.nested.clone(),
+                    },
+                )))),
+            },
             // `siteResolver.SettingsCascade` (`site.go:161-171`): no access
             // check for the site subject.
             "settingsCascade" | "configurationCascade" => cascade_field(
@@ -8099,6 +8119,67 @@ impl ObjectValue for RepositoryObject {
                     service_id: self.data.external_service_id.clone(),
                 },
             )))),
+            // `Repository.Changelist` (`repository.go:270-279`): Perforce
+            // depots only; every repository in this image is git.
+            "changelist" => Ok(Some(FieldValue::Null)),
+            // `Repository.ChangesetsStats` (`repository.go:281-284`): the
+            // enterprise batch-changes resolver; no changesets are ported, so
+            // the counts are zero.
+            "changesetsStats" => Ok(Some(FieldValue::Object(Arc::new(
+                RepoChangesetsStatsObject,
+            )))),
+            // `RepositoryResolver.Topics` (`repository.go:554-561`):
+            // `r.getRepo(ctx)` then `repo.Topics`, i.e. the `repo.topics`
+            // column.
+            "topics" => {
+                let Some(pool) = &self.nested.users_pool.0 else {
+                    return Ok(None);
+                };
+                let topics: Option<Vec<String>> =
+                    crate::codeintel_uploads_graphql_store::block_on(async {
+                        sqlx::query_scalar::<_, Vec<String>>(
+                            "SELECT topics FROM repo \
+                             WHERE id = $1 AND deleted_at IS NULL",
+                        )
+                        .bind(self.data.id)
+                        .fetch_optional(pool)
+                        .await
+                    })
+                    .map_err(|error| ExecError::new(error.to_string()))?;
+                Ok(Some(FieldValue::List {
+                    items: topics
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|topic| FieldValue::Json(Json::Str(topic)))
+                        .collect(),
+                    element_type: Some("String"),
+                }))
+            }
+            _ => Ok(None),
+        }
+    }
+}
+
+/// `RepoChangesetsStats` (`batches.graphql:582-607`): counts of changesets in
+/// each state. The batch-changes store is not ported, so all counts are zero
+/// (what the baseline returns for a repository with no changesets).
+struct RepoChangesetsStatsObject;
+
+impl ObjectValue for RepoChangesetsStatsObject {
+    fn type_name(&self) -> &'static str {
+        "RepoChangesetsStats"
+    }
+
+    fn field(
+        &self,
+        field: &str,
+        _arguments: &Arguments,
+        _actor: Actor,
+    ) -> Result<Option<FieldValue>, ExecError> {
+        match field {
+            "unpublished" | "draft" | "open" | "merged" | "closed" | "total" => {
+                Ok(Some(FieldValue::Json(Json::Int(0))))
+            }
             _ => Ok(None),
         }
     }

@@ -2331,6 +2331,24 @@ impl GraphqlDeps for SchemaGraphqlDeps {
                 }
             }
         }
+        // `Site.accessTokens` (`access_tokens.go:267-279`): site admin only.
+        if let Some(pool) = &self.pool {
+            let wants_site_tokens = fields.iter().any(|field| {
+                field.name == "site"
+                    && field
+                        .selections
+                        .iter()
+                        .any(|selection| selection.name == "accessTokens")
+            });
+            if wants_site_tokens {
+                let result = if site_admin {
+                    crate::graphql_inventory_c::load_site_access_tokens(pool).await
+                } else {
+                    Err(crate::admin_store::MUST_BE_SITE_ADMIN.to_owned())
+                };
+                Arc::make_mut(&mut nested).site_access_tokens = Some(result);
+            }
+        }
         // `User.externalAccounts` (M9.8ka): prefetch every selected connection
         // and the `CodySubscription` inputs the node objects replay.
         if let (Some(deps), Some(registry)) = (&self.external_accounts, &external_accounts_registry)

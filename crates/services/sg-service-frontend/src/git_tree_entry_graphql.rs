@@ -1859,6 +1859,10 @@ impl ObjectValue for GitTreeEntryObject {
             "highlight" => self.highlight_field(arguments),
             "languages" => self.languages_field(),
             "richHTML" => self.rich_html_field(arguments),
+            // `GitBlob.LFS` (`git_tree_entry.go`): `null` unless the file is
+            // stored in LFS. The LFS table is not read here, so every file is
+            // reported as non-LFS (the common case).
+            "lfs" => Ok(Some(FieldValue::Null)),
             "rawZipArchiveURL" => Ok(Some(FieldValue::Json(Json::Str(
                 self.raw_zip_archive_url(),
             )))),

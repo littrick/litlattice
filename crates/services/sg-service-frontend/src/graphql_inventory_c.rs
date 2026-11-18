@@ -1900,6 +1900,42 @@ async fn load_access_tokens(
     .await
     .map_err(|error| error.to_string())?;
 
+    access_tokens_from_rows(pool, rows, total).await
+}
+
+/// `siteResolver.AccessTokens` (`access_tokens.go:267-279`): the site admin's
+/// unfiltered list (`database.AccessTokensListOptions{}`).
+pub async fn load_site_access_tokens(
+    pool: &PgPool,
+) -> Result<AccessTokenConnectionFull, String> {
+    const CONDITIONS: &str = "deleted_at IS NULL \
+         AND (expires_at IS NULL OR expires_at > NOW()) \
+         AND internal IS FALSE";
+    let rows = sqlx::query(&format!(
+        "SELECT id, subject_user_id, scopes, note, creator_user_id, created_at, \
+                last_used_at, expires_at FROM access_tokens \
+         WHERE ({CONDITIONS}) \
+         ORDER BY now() - created_at < interval '5 minutes' DESC, \
+                  last_used_at DESC NULLS FIRST, created_at DESC"
+    ))
+    .fetch_all(pool)
+    .await
+    .map_err(|error| error.to_string())?;
+    let total: i64 = sqlx::query_scalar(&format!(
+        "SELECT COUNT(*) FROM access_tokens WHERE ({CONDITIONS})"
+    ))
+    .fetch_one(pool)
+    .await
+    .map_err(|error| error.to_string())?;
+
+    access_tokens_from_rows(pool, rows, total).await
+}
+
+async fn access_tokens_from_rows(
+    pool: &PgPool,
+    rows: Vec<sqlx::postgres::PgRow>,
+    total: i64,
+) -> Result<AccessTokenConnectionFull, String> {
     let mut users: HashMap<i32, Result<UserData, String>> = HashMap::new();
     let mut tokens = Vec::with_capacity(rows.len());
     for row in rows {

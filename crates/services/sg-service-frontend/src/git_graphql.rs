@@ -530,6 +530,40 @@ impl GitObjectSource for GitserverGitObjects {
         Ok(entries.into_iter().map(|entry| entry.name).collect())
     }
 
+    /// `Repository.contributors` (`repository_contributors.go:23-31`):
+    /// `gitdomain.ParseGitDate` then `gitserver.ContributorCount`.
+    async fn contributor_count(
+        &self,
+        _repo_id: i32,
+        repo_name: &str,
+        revision_range: Option<&str>,
+        after_date: Option<&str>,
+        path: Option<&str>,
+    ) -> Result<Vec<ContributorCountData>, GitSourceError> {
+        let (client, addr) = self.client_for(repo_name).await?;
+        let options = sg_git::ContributorOptions {
+            range: revision_range.unwrap_or_default().to_owned(),
+            after: after_date
+                .and_then(crate::search_commit_job::parse_git_date)
+                .map(|datetime| datetime.unix_timestamp()),
+            path: path.unwrap_or_default().to_owned(),
+        };
+        client
+            .contributor_count_at(&addr, repo_name, &options)
+            .await
+            .map(|counts| {
+                counts
+                    .into_iter()
+                    .map(|count| ContributorCountData {
+                        name: count.name,
+                        email: count.email,
+                        count: count.count,
+                    })
+                    .collect()
+            })
+            .map_err(GitSourceError::from)
+    }
+
     /// M9.43b: `GitTree.entries`/`files`/`directories`. gitserver already
     /// returns full paths and the directory bit, which is all the list
     /// resolvers read.
@@ -1479,11 +1513,19 @@ pub async fn prefetch_git(
                         RepositoryRedirectArg::Missing => None,
                     };
                 if let Some(RepoLookup::Found(data)) = lookup {
+                    // `repositoryRedirect` is the `RepositoryRedirect` union:
+                    // the `Repository` fields (including `defaultBranch`) live
+                    // in the `... on Repository` inline fragment.
+                    let selections: Vec<RootField> =
+                        selections_for_type(field, "Repository")
+                            .into_iter()
+                            .cloned()
+                            .collect();
                     prefetch_repository_selections(
                         source,
                         &mut prefetch,
                         &repo_of(data),
-                        &field.selections,
+                        &selections,
                     )
                     .await;
                 }
