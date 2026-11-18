@@ -1844,6 +1844,33 @@ pub async fn prefetch_nested(
                     nested.settings_cascades.insert(key, cascade);
                 }
             }
+            // `Query.site` returns the singleton `Site`; its
+            // `settingsCascade` has no access check (`site.go:161-171`).
+            "site" => {
+                let wants_cascade = field.selections.iter().any(|selection| {
+                    matches!(
+                        selection.name.as_str(),
+                        "settingsCascade" | "configurationCascade"
+                    )
+                });
+                if wants_cascade
+                    && !nested.settings_cascades.contains_key(&CascadeKey::Site)
+                {
+                    let cascade = prefetch_cascade(
+                        store,
+                        memberships_store,
+                        CascadeKey::Site,
+                        None,
+                        None,
+                        &mut nested,
+                        viewer_uid(actor),
+                        viewer_site_admin,
+                        actor,
+                    )
+                    .await;
+                    nested.settings_cascades.insert(CascadeKey::Site, cascade);
+                }
+            }
             _ => {}
         }
     }

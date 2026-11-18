@@ -117,6 +117,25 @@ fn scan_event(row: &sqlx::postgres::PgRow) -> Result<EventRow, String> {
     })
 }
 
+/// `eventLogStore.LatestPing(ctx)` (`internal/database/event_logs.go:415-424`):
+/// the `argument` of the newest `name = 'ping'` row, or `None` when there is
+/// no such row (`sql.ErrNoRows`). A NULL argument scans as an empty string,
+/// matching Go's `json.RawMessage` scan.
+pub async fn latest_ping(pool: &PgPool) -> Result<Option<String>, String> {
+    let row = sqlx::query(
+        "SELECT argument::text AS argument FROM event_logs \
+         WHERE name = 'ping' ORDER BY id DESC LIMIT 1",
+    )
+    .fetch_optional(pool)
+    .await
+    .map_err(|err| err.to_string())?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let argument: Option<String> = row.try_get("argument").map_err(|err| err.to_string())?;
+    Ok(Some(argument.unwrap_or_default()))
+}
+
 /// `bmStore.GetBookmark`: read the first scrape-state row, or insert one
 /// seeded with `MAX(event_logs.id)`. Both statements share one transaction,
 /// so a failed insert (e.g. an empty `event_logs` table makes `MAX(id)` NULL

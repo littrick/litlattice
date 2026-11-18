@@ -22,9 +22,11 @@ use hyper::body::Incoming;
 use tonic::body::BoxBody;
 
 use sg_config::LiveConfig;
+use sg_graphql::exec::Actor;
 
 use crate::actor_chain::{ChainActor, ChainConfig, ChainDeps, ChainOutcome, ExternalMode};
 use crate::app_handlers::{AppConfig, AppDeps, AppEnv, SignOutFactory};
+use crate::app_handlers_more::{LatestPing, LatestPingResult, SiteAdminCheck};
 use crate::app_router;
 use crate::auth;
 use crate::blame::BlameDeps;
@@ -743,6 +745,19 @@ pub fn external_handler_with_live(
                                                                     ),
                                                                 ),
                                                             );
+                                                            // `/-/debug*` and
+                                                            // `/site-admin/pings/latest` were
+                                                            // left on the mux 404 until the
+                                                            // pool was available per request.
+                                                            request_deps.more.admin = Some(Arc::new(
+                                                                PgSiteAdminCheck {
+                                                                    pool: pool.clone(),
+                                                                },
+                                                            ));
+                                                            request_deps.more.latest_ping =
+                                                                Some(Arc::new(PgLatestPing {
+                                                                    pool: pool.clone(),
+                                                                }));
                                                         }
                                                         let request_deps = Arc::new(request_deps);
                                                         app_router::dispatch_async_with_body(
@@ -831,6 +846,56 @@ pub fn internal_handler(
             response
         })
     })
+}
+
+// ---------------------------------------------------------------------------
+// Per-request app-handler stores backed by the frontend pool
+// ---------------------------------------------------------------------------
+
+/// `auth.CheckCurrentUserIsSiteAdmin` (`internal/auth/site_admin.go:17-34`):
+/// internal actors pass, anonymous actors are unauthenticated, and a session
+/// user is looked up in `users.site_admin`.
+struct PgSiteAdminCheck {
+    pool: sqlx::PgPool,
+}
+
+#[async_trait::async_trait]
+impl SiteAdminCheck for PgSiteAdminCheck {
+    async fn check_site_admin(&self, actor: Actor) -> Result<(), String> {
+        let Actor::User { uid } = actor else {
+            return match actor {
+                Actor::Internal => Ok(()),
+                _ => Err("not authenticated".to_owned()),
+            };
+        };
+        let site_admin: Option<bool> = sqlx::query_scalar(
+            "SELECT site_admin FROM users WHERE id = $1 AND deleted_at IS NULL",
+        )
+        .bind(uid)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|error| error.to_string())?;
+        match site_admin {
+            Some(true) => Ok(()),
+            Some(false) => Err("must be site admin".to_owned()),
+            None => Err("not authenticated".to_owned()),
+        }
+    }
+}
+
+/// `db.EventLogs().LatestPing` (`internal/database/event_logs.go:415-424`).
+struct PgLatestPing {
+    pool: sqlx::PgPool,
+}
+
+#[async_trait::async_trait]
+impl LatestPing for PgLatestPing {
+    async fn latest_ping(&self) -> Result<LatestPingResult, String> {
+        match sg_db::event_logs::latest_ping(&self.pool).await? {
+            Some(argument) => Ok(LatestPingResult::Found(argument.into_bytes())),
+            None => Ok(LatestPingResult::NoRows),
+        }
+    }
 }
 
 #[cfg(test)]

@@ -20,6 +20,7 @@ use http_body_util::Full;
 use serde::Deserialize;
 use sqlx::Row;
 use tonic::body::BoxBody;
+use url::Url;
 
 use sg_graphql::exec::Actor;
 
@@ -1107,49 +1108,46 @@ pub async fn debug<B>(req: &Request<B>, deps: &MoreDeps, env: &AppEnv) -> Respon
         // `StrictSlash` on the subrouter's `Path` routes.
         "" => debug_redirect(req, "/-/debug/"),
         "/" => {
-            let body = if is_kubernetes(&env.deploy_type) {
-                NO_ENDPOINTS_BODY
+            let services = prof_services();
+            if services.is_empty() {
+                let body = if is_kubernetes(&env.deploy_type) {
+                    NO_ENDPOINTS_BODY
+                } else {
+                    NO_K8S_BODY
+                };
+                debug_admin(admin, deps.actor, body).await
             } else {
-                NO_K8S_BODY
-            };
-            debug_admin(admin, deps.actor, body).await
-        }
-        "/grafana" => {
-            if env_value("GRAFANA_SERVER_URL").is_some() {
-                return not_found();
+                debug_admin(admin, deps.actor, &prof_services_index(&services)).await
             }
-            debug_admin(
-                admin,
-                deps.actor,
-                "Grafana endpoint proxying: Please set env var GRAFANA_SERVER_URL",
-            )
-            .await
         }
-        "/jaeger" => {
-            if env_value("JAEGER_SERVER_URL").is_some() {
-                return not_found();
+        "/grafana" | "/grafana/" => match proxy_target("GRAFANA_SERVER_URL") {
+            Some(target) => {
+                debug_proxy(admin, deps.actor, req, &target, "/grafana", true).await
             }
-            debug_admin(
-                admin,
-                deps.actor,
-                "Jaeger endpoint proxying: Please set env var JAEGER_SERVER_URL",
-            )
-            .await
-        }
-        // `StrictSlash` on the `Path` routes above; with the env vars set the
-        // routes are `PathPrefix`es, which do not redirect.
-        "/grafana/" => {
-            if env_value("GRAFANA_SERVER_URL").is_some() {
-                return not_found();
+            None if sub == "/grafana/" => debug_redirect(req, "/-/debug/grafana"),
+            None => {
+                debug_admin(
+                    admin,
+                    deps.actor,
+                    "Grafana endpoint proxying: Please set env var GRAFANA_SERVER_URL",
+                )
+                .await
             }
-            debug_redirect(req, "/-/debug/grafana")
-        }
-        "/jaeger/" => {
-            if env_value("JAEGER_SERVER_URL").is_some() {
-                return not_found();
+        },
+        "/jaeger" | "/jaeger/" => match proxy_target("JAEGER_SERVER_URL") {
+            Some(target) => {
+                debug_proxy(admin, deps.actor, req, &target, "/jaeger", false).await
             }
-            debug_redirect(req, "/-/debug/jaeger")
-        }
+            None if sub == "/jaeger/" => debug_redirect(req, "/-/debug/jaeger"),
+            None => {
+                debug_admin(
+                    admin,
+                    deps.actor,
+                    "Jaeger endpoint proxying: Please set env var JAEGER_SERVER_URL",
+                )
+                .await
+            }
+        },
         "/sentry_tunnel/" => debug_redirect(req, "/-/debug/sentry_tunnel"),
         "/sentry_tunnel" => {
             if req.method() != http::Method::POST {
@@ -1160,9 +1158,24 @@ pub async fn debug<B>(req: &Request<B>, deps: &MoreDeps, env: &AppEnv) -> Respon
                 not_found()
             }
         }
-        "/proxies" | "/proxies/" => debug_proxy_missing(admin, deps.actor, env).await,
-        // `PathPrefix("/proxies")` is unanchored in the baseline.
-        sub if sub.starts_with("/proxies") => debug_proxy_missing(admin, deps.actor, env).await,
+        // `PathPrefix("/proxies")` is unanchored in the baseline:
+        // `StripPrefix("/-/debug/proxies")` leaves `/<displayName>/...`.
+        sub if sub.starts_with("/proxies") => {
+            let rest = &sub["/proxies".len()..];
+            let mut parts = rest.splitn(3, '/');
+            let _leading = parts.next();
+            let display = parts.next().unwrap_or("");
+            match prof_services()
+                .iter()
+                .find(|(name, _)| name == display)
+                .map(|(_, host)| host.clone())
+            {
+                Some(host) => {
+                    debug_proxy(admin, deps.actor, req, &host, display, false).await
+                }
+                None => debug_proxy_missing(admin, deps.actor, env).await,
+            }
+        }
         sub if sub.starts_with("/otlp") => {
             if env_value("OTEL_EXPORTER_OTLP_ENDPOINT").is_some() {
                 // Seam: the real adapter forwards to the configured backend.
@@ -1190,6 +1203,156 @@ fn debug_redirect<B>(req: &Request<B>, target: &str) -> Response<BoxBody> {
     redirect(req, &location, 301)
 }
 
+/// `debugserver.Services` (`internal/debugserver/debug.go:19-40`): the
+/// `SRC_PROF_SERVICES` JSON list, reduced to the display name used by
+/// `debugproxies.displayNameFromEndpoint` plus the `host:port` target.
+fn prof_services() -> Vec<(String, String)> {
+    #[derive(Deserialize)]
+    struct Service {
+        #[serde(rename = "Name")]
+        name: String,
+        #[serde(rename = "Host")]
+        host: String,
+    }
+    let Some(raw) = env_value("SRC_PROF_SERVICES") else {
+        return Vec::new();
+    };
+    let Ok(services) = serde_json::from_str::<Vec<Service>>(&raw) else {
+        return Vec::new();
+    };
+    services
+        .into_iter()
+        .map(|service| {
+            let hostname = service.host.split(':').next().unwrap_or("").to_owned();
+            let display = if hostname.starts_with(&service.name) {
+                hostname
+            } else {
+                format!("{}-{hostname}", service.name)
+            };
+            (display, service.host)
+        })
+        .collect()
+}
+
+/// `ReverseProxyHandler.serveIndex` (`debugproxies/handler.go:53-73`).
+fn prof_services_index(services: &[(String, String)]) -> String {
+    let mut names: Vec<&str> = services.iter().map(|(name, _)| name.as_str()).collect();
+    names.sort_unstable();
+    let mut body = String::new();
+    for name in names {
+        body.push_str(&format!("<a href=\"proxies/{name}/\">{name}</a><br>"));
+    }
+    body.push_str("<br><br><a href=\"headers\">headers</a><br>");
+    body
+}
+
+/// `addGrafana` / `addJaeger` (`debug.go:79-120`): the configured URL's
+/// `host:port`. The scheme is forced to `http`, like both directors.
+fn proxy_target(env_name: &str) -> Option<String> {
+    let raw = env_value(env_name)?;
+    let url = Url::parse(&raw).ok()?;
+    let host = url.host_str()?;
+    let port = url.port_or_known_default()?;
+    Some(format!("{host}:{port}"))
+}
+
+/// `httputil.ReverseProxy` for the debug subroutes: admin-gated, path prefix
+/// stripped, and buffered (the debug UIs are small).
+async fn debug_proxy<B>(
+    admin: &dyn SiteAdminCheck,
+    actor: Actor,
+    req: &Request<B>,
+    target: &str,
+    prefix: &str,
+    strip_authorization: bool,
+) -> Response<BoxBody> {
+    if let Err(message) = admin.check_site_admin(actor).await {
+        return http_error(403, &message);
+    }
+    let path = req.uri().path();
+    let stripped = match path.find(prefix) {
+        Some(index) => &path[index + prefix.len()..],
+        None => path,
+    };
+    let mut path_and_query = if stripped.is_empty() {
+        "/".to_owned()
+    } else {
+        stripped.to_owned()
+    };
+    if let Some(query) = req.uri().query() {
+        path_and_query.push('?');
+        path_and_query.push_str(query);
+    }
+    forward_get(target, &path_and_query, req.headers(), strip_authorization).await
+}
+
+/// Buffer one GET through the target. Connection failures are the baseline's
+/// 502 (`httputil.ReverseProxy`'s `DefaultErrorHandler` writes an empty body).
+async fn forward_get(
+    target: &str,
+    path_and_query: &str,
+    headers: &http::HeaderMap,
+    strip_authorization: bool,
+) -> Response<BoxBody> {
+    let client = match reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+    {
+        Ok(client) => client,
+        Err(_) => return status_only(502),
+    };
+    let mut request = client.get(format!("http://{target}{path_and_query}"));
+    for (name, value) in headers {
+        // Host is the target's, and hop-by-hop headers are not forwarded.
+        if is_hop_by_hop(name)
+            || name == header::HOST
+            || name == header::CONTENT_LENGTH
+            || (strip_authorization && name == header::AUTHORIZATION)
+        {
+            continue;
+        }
+        if let Ok(value) = reqwest::header::HeaderValue::from_bytes(value.as_bytes()) {
+            request = request.header(name.as_str(), value);
+        }
+    }
+    let response = match request.send().await {
+        Ok(response) => response,
+        Err(_) => return status_only(502),
+    };
+    let status = response.status();
+    let response_headers = response.headers().clone();
+    let body = match response.bytes().await {
+        Ok(body) => body,
+        Err(_) => return status_only(502),
+    };
+    let mut out = Response::new(tonic::body::boxed(Full::new(body)));
+    *out.status_mut() = status;
+    for (name, value) in response_headers.iter() {
+        if is_hop_by_hop(name) {
+            continue;
+        }
+        if let Ok(value) = HeaderValue::from_bytes(value.as_bytes()) {
+            out.headers_mut().append(name, value);
+        }
+    }
+    out
+}
+
+fn is_hop_by_hop(name: &header::HeaderName) -> bool {
+    matches!(
+        name.as_str(),
+        "connection"
+            | "keep-alive"
+            | "proxy-authenticate"
+            | "proxy-authorization"
+            | "te"
+            | "trailer"
+            | "transfer-encoding"
+            | "upgrade"
+    )
+}
+
 async fn debug_admin(admin: &dyn SiteAdminCheck, actor: Actor, body: &str) -> Response<BoxBody> {
     if let Err(message) = admin.check_site_admin(actor).await {
         return http_error(403, &message);
@@ -1215,6 +1378,20 @@ fn env_value(name: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn debug_index_sorts_endpoints_like_the_baseline() {
+        let services = vec![
+            ("worker-127.0.0.1".to_owned(), "127.0.0.1:6089".to_owned()),
+            ("frontend-127.0.0.1".to_owned(), "127.0.0.1:6063".to_owned()),
+        ];
+        assert_eq!(
+            prof_services_index(&services),
+            "<a href=\"proxies/frontend-127.0.0.1/\">frontend-127.0.0.1</a><br>\
+             <a href=\"proxies/worker-127.0.0.1/\">worker-127.0.0.1</a><br>\
+             <br><br><a href=\"headers\">headers</a><br>"
+        );
+    }
 
     #[test]
     fn old_tree_cleans_the_path() {
