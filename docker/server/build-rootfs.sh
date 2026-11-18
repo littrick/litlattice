@@ -219,9 +219,15 @@ done
 
 # ---------------------------------------------------------------------------
 # Version stamps (`internal/version/BUILD.bazel:23-54` defaults).
+#
+# The upstream release image bakes the release version into the Go binary with
+# ldflags; the Rust frontend reads `/version.txt` instead. Keep the default in
+# step with the bundled web assets: a dev stamp makes `/help` (and other
+# version-gated UI) behave like an unreleased build, e.g. redirecting to the
+# local docs server at http://localhost:3000.
 # ---------------------------------------------------------------------------
-write_file "$STAGE/version.txt" 0644 '0.0.0+dev'
-write_file "$STAGE/timestamp.txt" 0644 ''
+write_file "$STAGE/version.txt" 0644 "${SOURCEGRAPH_VERSION:-5.5.0}"
+write_file "$STAGE/timestamp.txt" 0644 "${SOURCEGRAPH_BUILD_TIMESTAMP:-}"
 
 # ---------------------------------------------------------------------------
 # Web assets: no `client/` in this workspace (`ENV_GAP`), so ship the same

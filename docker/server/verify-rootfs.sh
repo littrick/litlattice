@@ -132,7 +132,7 @@ done
 # Version stamps and web assets.
 # ---------------------------------------------------------------------------
 check_exists '/version.txt exists' "$STAGE/version.txt"
-check_content '/version.txt default version' "$STAGE/version.txt" '0.0.0+dev'
+check_content '/version.txt default version' "$STAGE/version.txt" "${SOURCEGRAPH_VERSION:-5.5.0}"
 check_exists '/timestamp.txt exists' "$STAGE/timestamp.txt"
 if [ -e "$STAGE/timestamp.txt" ] && [ -s "$STAGE/timestamp.txt" ]; then
   bad '/timestamp.txt is empty by default'

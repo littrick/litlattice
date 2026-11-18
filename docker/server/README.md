@@ -30,7 +30,7 @@ Contract source of truth (`dev/origin/repo`):
 /postgres-optimize.sh
 /reindex.sh
 /opt/image_tests/{test_services.sh,test_packages.sh,test_zoekt.sh}
-/version.txt        0.0.0+dev
+/version.txt        5.5.0 (overridable via SOURCEGRAPH_VERSION)
 /timestamp.txt      empty
 /assets-dist/web.manifest.json   staged from client/web/dist (see below)
 /var/lib/nginx/tmp, /var/run, /sg_grafana_additional_dashboards
