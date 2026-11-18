@@ -1747,6 +1747,58 @@ impl crate::graphql_inventory_c::CodeHighlighter for SyntectCodeHighlighter {
             false,
         ))
     }
+
+    /// `gosyntect.Client.Highlight(..., FormatJSONSCIP)`: POST the same
+    /// query to `/scip` and return the `scip` field (base64 `scip.Document`).
+    async fn highlight_scip(
+        &self,
+        code: &str,
+        filepath: &str,
+        disable_timeout: bool,
+    ) -> Result<String, String> {
+        let filepath = normalize_filepath(filepath);
+        let language = detect_language(&filepath, code);
+        let mut code = code.to_string();
+        if let Some(stripped) = code.strip_suffix('\n') {
+            code = stripped.to_string();
+        }
+        let body = build_highlight_request(&filepath, &language, &code, false);
+        let mut request = self
+            .client
+            .post(format!("{}/scip", self.base_url))
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(body);
+        if disable_timeout {
+            request = request.header("X-Stabilize-Timeout", "30s");
+        }
+        let send = request.send();
+        let response = if disable_timeout {
+            send.await.map_err(|error| error.to_string())?
+        } else {
+            match tokio::time::timeout(Duration::from_secs(3), send).await {
+                Ok(response) => response.map_err(|error| error.to_string())?,
+                Err(_) => return Err("syntax highlighting timed out".to_owned()),
+            }
+        };
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|error| error.to_string())?;
+        let decoded: serde_json::Value =
+            serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+        let error = decoded
+            .get("error")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
+        if !error.is_empty() {
+            return Err(error.to_owned());
+        }
+        Ok(decoded
+            .get("scip")
+            .and_then(|value| value.as_str())
+            .unwrap_or("")
+            .to_owned())
+    }
 }
 
 pub(crate) fn normalize_filepath(filepath: &str) -> String {

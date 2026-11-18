@@ -287,7 +287,7 @@ impl HighlightSource for CodeHighlighterSource {
         if request.format == "HTML_PLAINTEXT" {
             return offline_highlight(request);
         }
-        if request.format != "HTML_HIGHLIGHT" {
+        if request.format != "HTML_HIGHLIGHT" && request.format != "JSON_SCIP" {
             return Err(HighlightError::Message(format!(
                 "syntax highlighting for format {} is not available",
                 request.format
@@ -296,7 +296,9 @@ impl HighlightSource for CodeHighlighterSource {
 
         let code = String::from_utf8_lossy(content).into_owned();
         let normalized = crate::markdown_graphql::normalize_filepath(&request.filepath);
-        if crate::markdown_graphql::detect_language(&normalized, &code).is_empty() {
+        if request.format != "JSON_SCIP"
+            && crate::markdown_graphql::detect_language(&normalized, &code).is_empty()
+        {
             // Unknown language: the syntect server renders a plain-text table.
             // Reproduce that offline (`HTML_PLAINTEXT`) instead of sending an
             // empty `filetype`.
@@ -313,6 +315,54 @@ impl HighlightSource for CodeHighlighterSource {
         } else {
             code.clone()
         };
+
+        if request.format == "JSON_SCIP" {
+            // `highlight.Code` with `FormatJSONSCIP`: the server returns a
+            // base64 `scip.Document`; errors fall back to unhighlighted code
+            // with `aborted=true`.
+            return match self
+                .highlighter
+                .highlight_scip(&input, &request.filepath, request.disable_timeout)
+                .await
+            {
+                Ok(encoded) if !encoded.is_empty() => {
+                    use base64::Engine as _;
+                    let bytes = base64::engine::general_purpose::STANDARD
+                        .decode(encoded.as_bytes())
+                        .map_err(|error| HighlightError::Message(error.to_string()))?;
+                    let document = <sg_scip::scip::Document as sg_scip::Message>::decode(
+                        bytes.as_slice(),
+                    )
+                    .map_err(|error| HighlightError::Message(error.to_string()))?;
+                    Ok(HighlightedFile {
+                        lines: Vec::new(),
+                        aborted: false,
+                        html: Some(String::new()),
+                        code: Some(code),
+                        lsif: Some(lsif_from_scip(&document)),
+                    })
+                }
+                Ok(_) => Ok(HighlightedFile {
+                    // Unknown language: `/scip` returns an empty `scip`
+                    // string, which Go decodes into an empty (but valid)
+                    // document with `aborted=false`.
+                    lines: Vec::new(),
+                    aborted: false,
+                    html: Some(String::new()),
+                    code: Some(code),
+                    lsif: Some(LsifDocument::default()),
+                }),
+                Err(_) => Ok(HighlightedFile {
+                    // `unhighlightedCode`: server error/timeout.
+                    lines: Vec::new(),
+                    aborted: true,
+                    html: Some(String::new()),
+                    code: Some(code),
+                    lsif: Some(LsifDocument::default()),
+                }),
+            };
+        }
+
         let (html, aborted) = self
             .highlighter
             .highlight_with_options(
@@ -330,6 +380,27 @@ impl HighlightSource for CodeHighlighterSource {
             code: Some(code),
             lsif: None,
         })
+    }
+}
+
+/// `scip.Document` → the portable [`LsifDocument`] subset rendered by
+/// `lsif_document_json` / `document_to_html`.
+fn lsif_from_scip(document: &sg_scip::scip::Document) -> LsifDocument {
+    LsifDocument {
+        language: (!document.language.is_empty()).then(|| document.language.clone()),
+        relative_path: (!document.relative_path.is_empty())
+            .then(|| document.relative_path.clone()),
+        occurrences: document
+            .occurrences
+            .iter()
+            .map(|occurrence| LsifOccurrence {
+                range: occurrence.range.clone(),
+                symbol: (!occurrence.symbol.is_empty()).then(|| occurrence.symbol.clone()),
+                symbol_roles: occurrence.symbol_roles,
+                override_documentation: occurrence.override_documentation.clone(),
+                syntax_kind: occurrence.syntax_kind,
+            })
+            .collect(),
     }
 }
 

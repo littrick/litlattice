@@ -153,6 +153,18 @@ pub trait CodeHighlighter: Send + Sync {
     ) -> Result<(String, bool), String> {
         Ok((self.highlight(code, filepath, disable_timeout).await?, false))
     }
+
+    /// `format=JSON_SCIP`: POST `/scip` and return the base64-encoded
+    /// `scip.Document` (`gosyntect.Client.Highlight` with
+    /// `FormatJSONSCIP`). Empty when the server could not detect a language.
+    async fn highlight_scip(
+        &self,
+        _code: &str,
+        _filepath: &str,
+        _disable_timeout: bool,
+    ) -> Result<String, String> {
+        Err("JSON_SCIP highlighting is not supported by this highlighter".to_owned())
+    }
 }
 
 /// `backend.ExternalServicesService.ListNamespaces` / `DiscoverRepos`
