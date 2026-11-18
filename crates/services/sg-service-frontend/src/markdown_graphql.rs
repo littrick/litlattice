@@ -1687,7 +1687,15 @@ impl crate::graphql_inventory_c::CodeHighlighter for SyntectCodeHighlighter {
             code = stripped.to_string();
         }
 
-        let body = build_highlight_request(&filepath, &language, &code, highlight_long_lines);
+        // HTML highlighting uses the syntect `/` endpoint; the tree-sitter
+        // engines are only consulted for JSON_SCIP below.
+        let body = build_highlight_request(
+            &filepath,
+            &language,
+            &code,
+            highlight_long_lines,
+            "syntect",
+        );
         let mut request = self
             .client
             .post(format!("{}/", self.base_url))
@@ -1762,7 +1770,13 @@ impl crate::graphql_inventory_c::CodeHighlighter for SyntectCodeHighlighter {
         if let Some(stripped) = code.strip_suffix('\n') {
             code = stripped.to_string();
         }
-        let body = build_highlight_request(&filepath, &language, &code, false);
+        let body = build_highlight_request(
+            &filepath,
+            &language,
+            &code,
+            false,
+            syntax_engine(&language),
+        );
         let mut request = self
             .client
             .post(format!("{}/scip", self.base_url))
@@ -1890,6 +1904,7 @@ fn build_highlight_request(
     language: &str,
     code: &str,
     highlight_long_lines: bool,
+    engine: &str,
 ) -> String {
     let mut body = String::from("{\"filepath\":");
     body.push_str(&go_json_string(filepath));
@@ -1903,8 +1918,57 @@ fn build_highlight_request(
         body.push_str(",\"line_length_limit\":");
         body.push_str(&LINE_LENGTH_LIMIT.to_string());
     }
-    body.push_str(",\"engine\":\"syntect\"}");
+    body.push_str(",\"engine\":");
+    body.push_str(&go_json_string(engine));
+    body.push('}');
     body
+}
+
+/// `gosyntect.treesitterSupportedFiletypes` (`internal/gosyntect/languages.go`).
+const TREESITTER_SUPPORTED: &[&str] = &[
+    "c",
+    "c++",
+    "c_sharp",
+    "cpp",
+    "dart",
+    "hack",
+    "go",
+    "java",
+    "javascript",
+    "jsonnet",
+    "jsx",
+    "kotlin",
+    "magik",
+    "matlab",
+    "nickel",
+    "pkl",
+    "perl",
+    "python",
+    "ruby",
+    "rust",
+    "scala",
+    "tsx",
+    "typescript",
+    "xlsg",
+    "zig",
+];
+
+/// `highlight.DetectSyntaxHighlightingLanguage`'s engine half
+/// (`internal/highlight/language.go:114-136,235-254`): the server's base
+/// config defaults to tree-sitter, with `scip-syntax` overrides for
+/// perl/matlab/java/go; languages without a tree-sitter grammar fall back to
+/// syntect.
+///
+/// Site-config `syntaxHighlighting.engine` overrides are not read here
+/// (ENV_GAP); the defaults match a stock instance.
+fn syntax_engine(language: &str) -> &'static str {
+    if !TREESITTER_SUPPORTED.contains(&language) {
+        return "syntect";
+    }
+    match language {
+        "perl" | "matlab" | "java" | "go" => "scip-syntax",
+        _ => "tree-sitter",
+    }
 }
 
 /// `generatePlainTable` (`highlight.go:539-580`).
