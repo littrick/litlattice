@@ -1,10 +1,8 @@
 # tree-sitter-ruby
 
-This crate provides a Ruby grammar for the [tree-sitter][] parsing library.
-To use this crate, add it to the `[dependencies]` section of your `Cargo.toml`
-file.  (Note that you will probably also need to depend on the
-[`tree-sitter`][tree-sitter crate] crate to use the parsed result in any useful
-way.)
+本 crate 为 [tree-sitter][] 解析库提供 Ruby 语法。要使用本 crate，请将其添加到
+`Cargo.toml` 文件的 `[dependencies]` 段中。（注意：若要以任何有意义的方式使用
+解析结果，你可能还需要依赖 [`tree-sitter`][tree-sitter crate] crate。）
 
 ``` toml
 [dependencies]
@@ -12,8 +10,8 @@ tree-sitter = "0.17"
 tree-sitter-ruby = "0.16"
 ```
 
-Typically, you will use the [language][language func] function to add this
-grammar to a tree-sitter [Parser][], and then use the parser to parse some code:
+通常，你会使用 [language][language func] 函数将此语法添加到 tree-sitter
+[Parser][]，然后使用该解析器解析代码：
 
 ``` rust
 let code = r#"
@@ -26,8 +24,7 @@ parser.set_language(tree_sitter_ruby::language()).expect("Error loading Ruby gra
 let parsed = parser.parse(code, None);
 ```
 
-If you have any questions, please reach out to us in the [tree-sitter
-discussions] page.
+如有任何问题，请通过 [tree-sitter discussions] 页面与我们联系。
 
 [Language]: https://docs.rs/tree-sitter/*/tree_sitter/struct.Language.html
 [language func]: https://docs.rs/tree-sitter-ruby/*/tree_sitter_ruby/fn.language.html

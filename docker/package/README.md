@@ -1,60 +1,57 @@
-# Standalone packaging (filesystem image)
+# 独立打包（文件系统镜像）
 
-Clone the `package` branch (it contains the latest Rust port plus this
-packaging flow) and build a self-contained `sourcegraph/server` replacement as
-a **root filesystem tarball** that `docker import` accepts:
+克隆 `package` 分支（包含最新的 Rust 移植版以及本打包流程），构建一个自包含的
+`sourcegraph/server` 替代品，形式为 `docker import` 可接受的**根文件系统 tarball**：
 
 ```sh
 git clone -b package <this-repository-url>
 cd <repository>
 ```
 
-This directory is the only packaging
-entry point: a fresh clone of this repository can build the image without a
-Dockerfile or any prebuilt artifacts.
+本目录是唯一的打包入口：全新克隆本仓库即可构建镜像，无需 Dockerfile，也无需任何
+预构建产物。
 
-Everything external is fetched/built during packaging:
+所有外部内容均在打包期间获取/构建：
 
-| Component | Source at package time |
+| 组件 | 打包时的来源 |
 | --- | --- |
-| Rust service binaries | this repository (`cargo build --release --bins`) |
-| Web UI (`/assets-dist`) | `sourcegraph/sourcegraph-public-snapshot` @ pinned commit, `pnpm` build |
-| Go sidecars (`migrator-go`, `blobstore`, `zoekt-*`, `prom-wrapper`) | same Sourcegraph source |
-| `syntect_server`, `scip-ctags` | `docker-images/syntax-highlighter` in that source |
-| Postgres, Redis, nginx, git, tini, gosu, … | Ubuntu 24.04 via `debootstrap`/apt |
-| Root filesystem | assembled directly, no `docker build` |
+| Rust 服务二进制 | 本仓库（`cargo build --release --bins`） |
+| Web UI（`/assets-dist`） | 固定提交的 `sourcegraph/sourcegraph-public-snapshot`，`pnpm` 构建 |
+| Go sidecar（`migrator-go`、`blobstore`、`zoekt-*`、`prom-wrapper`） | 同一份 Sourcegraph 源码 |
+| `syntect_server`、`scip-ctags` | 该源码中的 `docker-images/syntax-highlighter` |
+| Postgres、Redis、nginx、git、tini、gosu 等 | 通过 `debootstrap`/apt 安装的 Ubuntu 24.04 |
+| 根文件系统 | 直接组装，不使用 `docker build` |
 
-## Requirements
+## 要求
 
-- Linux host with root (or passwordless `sudo`); `debootstrap` installed
-  (`apt-get install debootstrap`).
-- `git`, `node >= 20.8`, `pnpm 8.9.2` (or `corepack`), `go 1.22.x`,
-  `cargo`/`rustup` (the repository's `rust-toolchain.toml` pins 1.78.0).
-- Network access for: the Sourcegraph clone, npm registry, Go modules,
-  crates.io, the Ubuntu mirror. Set `PACKAGE_PROXY=host:port` when a proxy is
-  required.
-- Disk: roughly 8–12 GiB for the build workspace (node_modules + targets +
-  rootfs), plus the output tarball (~450 MiB).
+- Linux 主机，具有 root（或免密 `sudo`）；已安装 `debootstrap`
+  （`apt-get install debootstrap`）。
+- `git`、`node >= 20.8`、`pnpm 8.9.2`（或 `corepack`）、`go 1.22.x`、
+  `cargo`/`rustup`（仓库的 `rust-toolchain.toml` 固定为 1.78.0）。
+- 需要网络访问：Sourcegraph 克隆、npm registry、Go modules、crates.io、
+  Ubuntu 镜像源。需要代理时设置 `PACKAGE_PROXY=host:port`。
+- 磁盘：构建工作区约需 8–12 GiB（node_modules + targets + rootfs），
+  外加输出 tarball（约 450 MiB）。
 
-## Usage
+## 用法
 
 ```sh
-# full build (rootfs/debootstrap need root; the rest can run as your user)
+# 完整构建（rootfs/debootstrap 需要 root；其余步骤可以以你的用户身份运行）
 PACKAGE_PROXY=172.17.0.1:7890 sudo -E ./docker/package/package.sh
 
-# or run the network/compile stages as your user, then the root stages
+# 或者以你的用户身份运行网络/编译阶段，然后再运行需要 root 的阶段
 PACKAGE_PROXY=172.17.0.1:7890 ./docker/package/package.sh --only fetch,frontend,rust,go,syntect
 sudo -E ./docker/package/package.sh --from rootfs
 ```
 
-Artifacts land in `.package-build/out/`:
+产物位于 `.package-build/out/`：
 
 ```
 sourcegraph-server-rust-5.5.0-fs.tar.gz
 sourcegraph-server-rust-5.5.0-fs.tar.gz.sha256
 ```
 
-Import and run:
+导入并运行：
 
 ```sh
 ./docker/package/import-image.sh \
@@ -65,39 +62,37 @@ docker run -d --name sg-rust -p 7080:7080 \
   -v sg-rust-data:/var/opt/sourcegraph sourcegraph/server:rust
 ```
 
-`import-image.sh` applies the metadata `docker import` cannot infer:
-`ENTRYPOINT ["/sbin/tini","--","/server"]`, `EXPOSE 7080`, the runtime `PATH`
-and the image environment (`DISABLE_OBSERVABILITY=1`,
-`DISABLE_HYBRID_SEARCH=true`, `BAZEL_SKIP_OOB_INFER_VERSION=1`).
+`import-image.sh` 会补上 `docker import` 无法推断的元数据：
+`ENTRYPOINT ["/sbin/tini","--","/server"]`、`EXPOSE 7080`、运行时 `PATH`
+以及镜像环境变量（`DISABLE_OBSERVABILITY=1`、
+`DISABLE_HYBRID_SEARCH=true`、`BAZEL_SKIP_OOB_INFER_VERSION=1`）。
 
-## Stages
+## 阶段
 
-`package.sh --only <list>` / `--from <stage>` select stages; defaults are
-driven by `docker/package/versions.env`:
+`package.sh --only <list>` / `--from <stage>` 用于选择阶段；默认流程由
+`docker/package/versions.env` 驱动：
 
-1. `fetch` — clone/checkout `SOURCEGRAPH_COMMIT` (web UI + Go sidecars).
-2. `frontend` — `pnpm install --frozen-lockfile`, `pnpm run generate`,
-   `pnpm --filter @sourcegraph/web run build`; copies `client/web/dist`.
-3. `rust` — `cargo build --release --bins`; stages the 10 service binaries.
-4. `go` — builds `migrator`, `blobstore`, `prom-wrapper` and the four
-   `zoekt-*` commands from the pinned module dependency.
-5. `syntect` — builds `syntect_server`/`scip-ctags`, strips debug info.
-6. `rootfs` — `debootstrap noble` with the stock packages, users/groups,
-   runtime directories, application files, `/version.txt` = `SOURCEGRAPH_VERSION`,
-   and the web bundle (`docker/server/stage-assets.sh`).
-7. `package` — `tar --numeric-owner` + gzip and sha256.
+1. `fetch` — 克隆/检出 `SOURCEGRAPH_COMMIT`（Web UI + Go sidecar）。
+2. `frontend` — `pnpm install --frozen-lockfile`、`pnpm run generate`、
+   `pnpm --filter @sourcegraph/web run build`；复制 `client/web/dist`。
+3. `rust` — `cargo build --release --bins`；暂存 10 个服务二进制。
+4. `go` — 从固定的模块依赖构建 `migrator`、`blobstore`、`prom-wrapper` 以及
+   四个 `zoekt-*` 命令。
+5. `syntect` — 构建 `syntect_server`/`scip-ctags`，并去除调试信息。
+6. `rootfs` — 使用标准软件包执行 `debootstrap noble`，配置用户/组、
+   运行时目录、应用文件、`/version.txt` = `SOURCEGRAPH_VERSION`，
+   以及 Web 包（`docker/server/stage-assets.sh`）。
+7. `package` — `tar --numeric-owner` + gzip 和 sha256。
 
-## Fidelity notes
+## 保真度说明
 
-- Observability is disabled (no Grafana/Prometheus packages); the Procfile's
-  monitoring lines resolve to the file-existence contract only.
-- Hybrid/zoekt search is disabled (`DISABLE_HYBRID_SEARCH=true`); zoekt
-  binaries are shipped for parity, but the index server is not run.
-- `/var/opt/sourcegraph/postgresql{,-markers}` are intentionally **not**
-  pre-created: `/server` uses their existence to decide whether to run
-  `initdb`.
-- The database schema/migrations are still owned by the Go `migrator`
-  (`migrator-go`), matching the project's storage contract.
-- The web bundle is built from the pinned Sourcegraph commit; changing
-  `SOURCEGRAPH_COMMIT`/`SOURCEGRAPH_VERSION` in `versions.env` is the only
-  switch needed for another release.
+- 可观测性已禁用（无 Grafana/Prometheus 软件包）；Procfile 中的监控行仅满足
+  文件存在性契约。
+- 混合/zoekt 搜索已禁用（`DISABLE_HYBRID_SEARCH=true`）；为保持一致性仍随附
+  zoekt 二进制，但不运行索引服务器。
+- `/var/opt/sourcegraph/postgresql{,-markers}` 有意**不**预先创建：`/server`
+  依据它们是否存在来决定是否运行 `initdb`。
+- 数据库 schema/迁移仍由 Go `migrator`（`migrator-go`）负责，符合项目的
+  存储契约。
+- Web 包由固定的 Sourcegraph 提交构建；要切换到另一个发布版本，只需修改
+  `versions.env` 中的 `SOURCEGRAPH_COMMIT`/`SOURCEGRAPH_VERSION`。
