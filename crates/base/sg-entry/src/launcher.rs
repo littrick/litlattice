@@ -403,6 +403,69 @@ fn wait_for_postgres_ready(env: &[(String, String)]) {
     }
 }
 
+/// The release version stamped in `/version.txt`, or `None` for a dev image.
+///
+/// Go's `internal/version` reads the same file; `version.IsDev` is an exact
+/// comparison against `0.0.0+dev`.
+fn release_version_stamp() -> Option<String> {
+    release_version_stamp_from(&std::fs::read_to_string("/version.txt").ok()?)
+}
+
+fn release_version_stamp_from(raw: &str) -> Option<String> {
+    if raw.is_empty() || raw == "0.0.0+dev" {
+        return None;
+    }
+    Some(raw.to_owned())
+}
+
+/// Re-stamp `versions.version` rows written by earlier images of this project.
+///
+/// Those images pinned `/version.txt` to `0.0.0+dev`, so both the Go migrator
+/// and the frontend recorded that version. Go's upgrade policy
+/// (`upgradestore.IsValidUpgrade`) rejects `0.0.0+dev` -> release as an
+/// unsupported jump. The schema is identical (the same baseline migrations
+/// ran), so rewrite the marker to the image's release version before the
+/// migrator validates it. No-op for dev builds and on first boots (the table
+/// does not exist yet, and psql's failure is ignored).
+fn reconcile_prerelease_version(env: &[(String, String)]) {
+    let Some(version) = release_version_stamp() else {
+        return;
+    };
+    let value = |key: &str| {
+        env.iter()
+            .find(|(name, _)| name == key)
+            .map(|(_, value)| value.as_str())
+            .filter(|value| !value.is_empty())
+    };
+    let host = value("PGHOST").unwrap_or("127.0.0.1");
+    let port = value("PGPORT").unwrap_or("5432");
+    let user = value("PGUSER").unwrap_or("postgres");
+    let database = value("PGDATABASE").unwrap_or("sourcegraph");
+    let quoted = version.replace('\'', "''");
+    // `first_version` matters too: `oobmigration.ValidateOutOfBandMigrationRunner`
+    // compares it against the deprecation points of unfinished out-of-band
+    // migrations. A dev `first_version` would require every pre-5.5 migration
+    // to be at 100%, which a fresh instance never had to do.
+    let sql = format!(
+        "UPDATE versions SET version = '{quoted}', first_version = '{quoted}', \
+         updated_at = now() \
+         WHERE version = '0.0.0+dev' OR first_version = '0.0.0+dev'"
+    );
+    let mut command = std::process::Command::new("psql");
+    command.args([
+        "-h", host, "-p", port, "-U", user, "-d", database, "-Atc", &sql,
+    ]);
+    if let Some(password) = value("PGPASSWORD") {
+        command.env("PGPASSWORD", password);
+    }
+    // Best effort: missing database/table on a fresh volume is expected.
+    let _ = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
 /// Run the two `shared.run` process groups exactly like the baseline's
 /// `errgroup`: start Postgres, run migrations when enabled, then start the
 /// application group and supervise both.
@@ -433,6 +496,7 @@ pub async fn run_staged<M: crate::migrator::Migrator>(
     // real error, as in the baseline.
     if !postgres.is_empty() && schemas.is_some() {
         wait_for_postgres_ready(&env);
+        reconcile_prerelease_version(&env);
     }
 
     if let Some(schemas) = schemas {
@@ -510,6 +574,16 @@ mod tests {
         assert!(outcome.sigint_targets.is_empty());
         assert_eq!(outcome.actions, vec!["a died.".to_owned()]);
         assert_eq!(outcome.exit_code, 0);
+    }
+
+    #[test]
+    fn release_version_stamp_skips_dev() {
+        assert_eq!(release_version_stamp_from("0.0.0+dev"), None);
+        assert_eq!(release_version_stamp_from(""), None);
+        assert_eq!(
+            release_version_stamp_from("5.5.0").as_deref(),
+            Some("5.5.0")
+        );
     }
 
     #[test]
