@@ -1253,9 +1253,14 @@ impl gpb::gitserver_service_server::GitserverService for Grpc {
         }
         let repo = self.repo(&request.repo_name)?;
         let range = String::from_utf8_lossy(&request.range).into_owned();
-        // A missing timestamp arrives as `None`; the baseline calls `AsTime()`
-        // on the nil pointer, which is the Unix epoch.
-        let after_seconds = request.after.as_ref().map_or(0, |time| time.seconds);
+        // The Rust client sends Go's zero `time.Time` sentinel
+        // (`GO_ZERO_TIME_UNIX_SECONDS`) for "no after date"; the baseline
+        // skips the `--after` argument in that case.
+        let after_seconds = request
+            .after
+            .as_ref()
+            .map(|time| time.seconds)
+            .filter(|seconds| *seconds != sg_git::GO_ZERO_TIME_UNIX_SECONDS);
         let counts = match repo
             .contributor_counts(&range, after_seconds, &request.path)
             .await

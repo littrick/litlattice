@@ -1512,7 +1512,7 @@ impl GitRepo {
     pub async fn contributor_counts(
         &self,
         range: &str,
-        after_seconds: i64,
+        after_seconds: Option<i64>,
         path: &[u8],
     ) -> Result<Vec<ContributorCount>, GitError> {
         let op = metrics::backend_started("contributor-counts", "ContributorCounts");
@@ -1528,7 +1528,7 @@ impl GitRepo {
     async fn contributor_counts_inner(
         &self,
         range: &str,
-        after_seconds: i64,
+        after_seconds: Option<i64>,
         path: &[u8],
     ) -> Result<Vec<ContributorCount>, GitError> {
         let range = if range.is_empty() { "HEAD" } else { range };
@@ -1540,11 +1540,13 @@ impl GitRepo {
             "--email".into(),
             "--no-merges".into(),
         ];
-        // The gRPC handler passes `GetAfter().AsTime()`; a nil timestamp is the
-        // Unix epoch (not Go's zero time), so `--after` is always emitted. Git's
-        // approxidate reads a bare `0` as "now", so requests without `after`
-        // only see commits dated in the current second.
-        args.push(format!("--after={after_seconds}").into());
+        // Go skips `--after` when the option is the zero `time.Time`
+        // (`!opt.After.IsZero()`); the gRPC client sends the year-1 sentinel
+        // for "no after date". Emitting `--after=<negative>` or `--after=0`
+        // would filter out everything (git's approxidate reads `0` as now).
+        if let Some(seconds) = after_seconds {
+            args.push(format!("--after={seconds}").into());
+        }
         args.push(range.into());
         args.push("--".into());
         if !path.is_empty() {
@@ -3381,7 +3383,7 @@ mod tests {
         // (`--after` is always emitted: an unset timestamp arrives as the Unix
         // epoch, which git's approxidate reads as "now".)
         let counts = repo
-            .contributor_counts("", 1_000_000_000, b"")
+            .contributor_counts("", Some(1_000_000_000), b"")
             .await
             .expect("counts");
         assert_eq!(
@@ -3393,12 +3395,12 @@ mod tests {
             }]
         );
         assert!(repo
-            .contributor_counts("", now_seconds() + 86_400, b"")
+            .contributor_counts("", Some(now_seconds() + 86_400), b"")
             .await
             .expect("counts")
             .is_empty());
         assert!(matches!(
-            repo.contributor_counts("missing", 1_000_000_000, b"").await,
+            repo.contributor_counts("missing", Some(1_000_000_000), b"").await,
             Err(GitError::RevisionNotFound(_))
         ));
 
