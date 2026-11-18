@@ -2196,6 +2196,18 @@ pub async fn prefetch_nested(
     nested
 }
 
+/// gitserver errors meaning the repository is not on disk yet (still
+/// cloning). The baseline surfaces them as errors on nullable fields and keeps
+/// the `Repository` object; this executor treats a resolver error as fatal for
+/// the parent, which would turn the page into "Repository not found" instead
+/// of "Cloning in progress".
+fn repo_unavailable(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    message.contains("repo not found")
+        || message.contains("repository not found")
+        || message.contains("clone in progress")
+}
+
 /// The `repo` row fields the `Repository` resolvers read (one
 /// `repoStore.GetByName` row).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -7876,6 +7888,11 @@ impl ObjectValue for RepositoryObject {
                     Some(crate::git_graphql::RevisionLookup::NotFound) => {
                         Ok(Some(FieldValue::Null))
                     }
+                    Some(crate::git_graphql::RevisionLookup::Error(message))
+                        if repo_unavailable(message) =>
+                    {
+                        Ok(Some(FieldValue::Null))
+                    }
                     Some(crate::git_graphql::RevisionLookup::Error(message)) => {
                         Err(ExecError::new(message.clone()))
                     }
@@ -7938,6 +7955,12 @@ impl ObjectValue for RepositoryObject {
                     return Ok(None);
                 };
                 match inventory.repo_external_links.get(&self.data.id) {
+                    // Not-cloned repository: the Phabricator linker cannot
+                    // resolve a default branch. Keep the object renderable.
+                    Some(Err(message)) if repo_unavailable(message) => Ok(Some(FieldValue::List {
+                        element_type: Some("ExternalLink"),
+                        items: Vec::new(),
+                    })),
                     Some(Err(message)) => Err(ExecError::new(message.clone())),
                     Some(Ok(links)) => Ok(Some(FieldValue::List {
                         element_type: Some("ExternalLink"),
@@ -7974,6 +7997,15 @@ impl ObjectValue for RepositoryObject {
                         ))))
                     }
                     Some(crate::git_graphql::DefaultBranchLookup::NotFound) => {
+                        Ok(Some(FieldValue::Null))
+                    }
+                    Some(crate::git_graphql::DefaultBranchLookup::Error(message))
+                        if repo_unavailable(message) =>
+                    {
+                        // Repo still cloning / not on disk: the baseline
+                        // surfaces a resolver error on this nullable field;
+                        // keep the Repository object so the UI can read
+                        // `mirrorInfo.cloneInProgress` ("Cloning in progress").
                         Ok(Some(FieldValue::Null))
                     }
                     Some(crate::git_graphql::DefaultBranchLookup::Error(message)) => {
