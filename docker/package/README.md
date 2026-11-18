@@ -18,7 +18,7 @@ Everything external is fetched/built during packaging:
 | Component | Source at package time |
 | --- | --- |
 | Rust service binaries | this repository (`cargo build --release --bins`) |
-| Web UI (`/assets-dist`) | `sourcegraph/sourcegraph` @ pinned commit, `pnpm` build |
+| Web UI (`/assets-dist`) | `sourcegraph/sourcegraph-public-snapshot` @ pinned commit, `pnpm` build |
 | Go sidecars (`migrator-go`, `blobstore`, `zoekt-*`, `prom-wrapper`) | same Sourcegraph source |
 | `syntect_server`, `scip-ctags` | `docker-images/syntax-highlighter` in that source |
 | Postgres, Redis, nginx, git, tini, gosu, … | Ubuntu 24.04 via `debootstrap`/apt |
