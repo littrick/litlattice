@@ -3,11 +3,12 @@
 //! `Repository.mirrorInfo` (`cmd/frontend/graphqlbackend/repository_mirror.go`).
 //!
 //! The row-backed fields come from `gitserver_repos` (clone status, last
-//! fetch, size, shard, last error, corruption log). The scheduler fields
-//! (`nextSyncAt`, `updateSchedule`, `updateQueue`) need the repo-updater RPC
-//! and `cloneProgress` needs the gitserver `RepoCloneProgress` RPC; neither is
-//! wired in this frontend, so they resolve to null/absent like a scheduler
-//! without state.
+//! fetch, size, shard, last error, corruption log). `cloneProgress` comes from
+//! the gitserver `RepoCloneProgress` RPC through
+//! [`crate::git_graphql::GitObjectSource::repo_clone_progress`]. The
+//! scheduler fields (`nextSyncAt`, `updateSchedule`, `updateQueue`) still need
+//! the repo-updater RPC and resolve to null/absent like a scheduler without
+//! state.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -29,6 +30,8 @@ pub struct MirrorInfoData {
     pub name: String,
     pub cloned: bool,
     pub clone_in_progress: bool,
+    /// `gitserver.RepoCloneProgress` while a clone/fetch is running.
+    pub clone_progress: Option<String>,
     pub updated_at: Option<OffsetDateTime>,
     pub is_corrupted: bool,
     pub corruption_logs: Vec<OffsetDateTime>,
@@ -81,6 +84,7 @@ fn mirror_info_from_row(row: &GitserverRepo) -> MirrorInfoData {
         name: row.name.clone(),
         cloned: row.clone_status == CloneStatus::Cloned,
         clone_in_progress: row.clone_status == CloneStatus::Cloning,
+        clone_progress: None,
         updated_at: (row.last_fetched != OffsetDateTime::UNIX_EPOCH).then_some(row.last_fetched),
         is_corrupted: row.corrupted_at.is_some(),
         corruption_logs: parse_corruption_logs(&row.corruption_logs),
@@ -107,6 +111,7 @@ pub fn selects_mirror_info(selections: &[sg_graphql::exec::RootField]) -> bool {
 /// Prefetch the gitserver rows for the repositories selected by a request.
 pub async fn prefetch_mirror_infos(
     pool: &PgPool,
+    git: Option<&dyn crate::git_graphql::GitObjectSource>,
     repo_ids: &[i32],
 ) -> HashMap<i32, MirrorInfoLookup> {
     let store = GitserverReposStore::new(pool.clone());
@@ -118,6 +123,11 @@ pub async fn prefetch_mirror_infos(
         let lookup = match store.get_by_id(*repo_id).await {
             Ok(Some(row)) => {
                 let mut data = mirror_info_from_row(&row);
+                if data.clone_in_progress {
+                    if let Some(git) = git {
+                        data.clone_progress = git.repo_clone_progress(&data.name).await;
+                    }
+                }
                 data.remote_url = sg_db::external_service_repos::first_clone_url_by_repo_id(
                     pool, *repo_id,
                 )
@@ -141,6 +151,7 @@ pub async fn prefetch_mirror_infos(
                 name: String::new(),
                 cloned: false,
                 clone_in_progress: false,
+                clone_progress: None,
                 updated_at: None,
                 is_corrupted: false,
                 corruption_logs: Vec::new(),
@@ -197,8 +208,12 @@ impl ObjectValue for MirrorInfoObject {
             "cloneInProgress" => Ok(Some(FieldValue::Json(Json::Bool(
                 data.clone_in_progress,
             )))),
-            // `RepoCloneProgress` needs the gitserver RPC, not wired here.
-            "cloneProgress" => Ok(Some(FieldValue::Null)),
+            // `RepoCloneProgress` (`repository_mirror.go:127-134`): the
+            // gitserver locker's current progress line while cloning.
+            "cloneProgress" => Ok(Some(match &data.clone_progress {
+                Some(progress) => FieldValue::Json(Json::Str(progress.clone())),
+                None => FieldValue::Null,
+            })),
             "updatedAt" => Ok(Some(match data.updated_at {
                 Some(value) => FieldValue::Json(Json::Str(datetime_rfc3339(value))),
                 None => FieldValue::Null,

@@ -137,6 +137,13 @@ pub trait GitObjectSource: Send + Sync {
         rev: &str,
     ) -> Result<String, GitSourceError>;
 
+    /// `gitserver.RepoCloneProgress` (`repository_mirror.go:127-134`): the
+    /// current `git --progress` line while a clone/fetch holds the locker.
+    /// `None` when the repository is not locked (queued/idle).
+    async fn repo_clone_progress(&self, _repo_name: &str) -> Option<String> {
+        None
+    }
+
     /// `gitserver.Client.GetCommit`.
     async fn get_commit(
         &self,
@@ -475,6 +482,13 @@ impl GitObjectSource for GitserverGitObjects {
             .get_commit_details_at(&addr, repo_name, oid)
             .await
             .map_err(GitSourceError::from)
+    }
+
+    async fn repo_clone_progress(&self, repo_name: &str) -> Option<String> {
+        let (client, _addr) = self.client_for(repo_name).await.ok()?;
+        let response = client.repo_clone_progress(repo_name).await.ok()?;
+        (response.clone_in_progress && !response.clone_progress.is_empty())
+            .then_some(response.clone_progress)
     }
 
     async fn get_object(

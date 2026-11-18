@@ -597,7 +597,7 @@ pub async fn prefetch_repositories_connections(
                 };
                 if !ids.is_empty() {
                     data.mirror_infos =
-                        crate::mirror_info_graphql::prefetch_mirror_infos(pool, &ids).await;
+                        crate::mirror_info_graphql::prefetch_mirror_infos(pool, None, &ids).await;
                 }
             }
         }

@@ -510,6 +510,22 @@ impl GitserverClient {
         }
     }
 
+    /// `gitserver.RepoCloneProgress` (`repository_mirror.go:127-134`): the
+    /// cloned flag and the locker's current `git --progress` line.
+    pub async fn repo_clone_progress(
+        &self,
+        repo: &str,
+    ) -> Result<pb::RepoCloneProgressResponse, Error> {
+        let mut client = self.client_for(repo).await?;
+        client
+            .repo_clone_progress(pb::RepoCloneProgressRequest {
+                repo_name: repo.to_owned(),
+            })
+            .await
+            .map(|response| response.into_inner())
+            .map_err(|error| Error::Message(error.to_string()))
+    }
+
     fn addr_for(&self, repo: &str) -> Option<&str> {
         // `connection.AddrForRepo` without the site-config pins: the callers
         // of this client receive the shard list, not the unified config.

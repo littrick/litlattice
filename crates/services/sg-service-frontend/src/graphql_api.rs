@@ -2889,7 +2889,12 @@ impl GraphqlDeps for SchemaGraphqlDeps {
                 }
                 if !ids.is_empty() {
                     Arc::make_mut(&mut nested).mirror_infos =
-                        crate::mirror_info_graphql::prefetch_mirror_infos(pool, &ids).await;
+                        crate::mirror_info_graphql::prefetch_mirror_infos(
+                            pool,
+                            self.git_objects.as_deref(),
+                            &ids,
+                        )
+                        .await;
                 }
             }
         }
