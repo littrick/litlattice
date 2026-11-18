@@ -782,7 +782,7 @@ fn resolve_path(base: &str, reference: &str) -> String {
     }
 
     let mut dest: Vec<&str> = Vec::new();
-    let mut last_element = "";
+    let mut last_element;
     let mut remaining = full.as_str();
     loop {
         let (element, rest) = match remaining.find('/') {

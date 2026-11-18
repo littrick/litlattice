@@ -797,7 +797,6 @@ fn reason_group_reasons(group: &str) -> Option<&'static [&'static str]> {
 enum JobParam {
     Int(i32),
     Text(String),
-    Bool(bool),
 }
 
 struct JobQuery {
@@ -834,7 +833,6 @@ impl JobQuery {
             query = match param {
                 JobParam::Int(value) => query.bind(*value),
                 JobParam::Text(value) => query.bind(value.clone()),
-                JobParam::Bool(value) => query.bind(*value),
             };
         }
         query
@@ -997,7 +995,7 @@ pub async fn list_permission_sync_jobs(
              ON queue_ranks.id = permission_sync_jobs.id",
         );
     }
-    let mut has_where = job_conditions(&mut query, opts);
+    let has_where = job_conditions(&mut query, opts);
 
     // `database.PaginationArgs.SQL()` where clause. The jobs connection keeps
     // the default `ConnectionResolverOptions.Ascending == false`, so `first`
@@ -1023,7 +1021,6 @@ pub async fn list_permission_sync_jobs(
             query.sql.push_str(" AND ");
         } else {
             query.sql.push_str(" WHERE ");
-            has_where = true;
         }
         query.sql.push_str(&pagination_conditions.join(" AND "));
     }
