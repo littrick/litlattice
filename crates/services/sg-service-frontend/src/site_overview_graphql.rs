@@ -133,6 +133,37 @@ impl ObjectValue for UpdateCheckObject {
     }
 }
 
+/// `siteResolver.UpgradeReadiness` (`site.go:358-368`): admin-only. Schema
+/// drift detection and the out-of-band migration store are not ported; both
+/// lists are empty (no drift / nothing required), which is the state of a
+/// healthy instance at the installed version.
+pub struct UpgradeReadinessObject;
+
+impl ObjectValue for UpgradeReadinessObject {
+    fn type_name(&self) -> &'static str {
+        "UpgradeReadiness"
+    }
+
+    fn field(
+        &self,
+        field: &str,
+        _arguments: &Arguments,
+        _actor: Actor,
+    ) -> Result<Option<FieldValue>, ExecError> {
+        match field {
+            "schemaDrift" => Ok(Some(FieldValue::List {
+                items: Vec::new(),
+                element_type: Some("SchemaDriftSummary"),
+            })),
+            "requiredOutOfBandMigrations" => Ok(Some(FieldValue::List {
+                items: Vec::new(),
+                element_type: Some("OutOfBandMigration"),
+            })),
+            _ => Ok(None),
+        }
+    }
+}
+
 /// An empty `RecordedCommandConnection` (`recorded_commands.go:34-90`). The
 /// command recorder's Redis FIFO is not ported; when `gitRecorder` is unset
 /// the baseline also returns an empty connection.

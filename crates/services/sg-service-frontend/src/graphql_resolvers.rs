@@ -6405,6 +6405,37 @@ impl ObjectValue for SiteObject {
             "productSubscription" => Ok(Some(FieldValue::Object(Arc::new(
                 crate::site_overview_graphql::ProductSubscriptionStatusObject,
             )))),
+            // `siteResolver.AutoUpgradeEnabled` (`site.go:573-582`):
+            // site admin only; reads `versions.auto_upgrade` for the
+            // frontend service (`upgradestore.GetAutoUpgrade`).
+            "autoUpgradeEnabled" => {
+                if !self.viewer_site_admin {
+                    return Err(ExecError::new(MUST_BE_SITE_ADMIN));
+                }
+                let Some(pool) = &self.nested.users_pool.0 else {
+                    return Ok(None);
+                };
+                let enabled = crate::codeintel_uploads_graphql_store::block_on(async {
+                    sqlx::query_scalar::<_, bool>(
+                        "SELECT auto_upgrade FROM versions WHERE service = 'frontend'",
+                    )
+                    .fetch_optional(pool)
+                    .await
+                })
+                .map_err(|error| ExecError::new(error.to_string()))?
+                .unwrap_or(false);
+                Ok(Some(FieldValue::Json(Json::Bool(enabled))))
+            }
+            // `siteResolver.UpgradeReadiness` (`site.go:358-368`): site admin
+            // only; drift/oob-migration detection is not ported (empty lists).
+            "upgradeReadiness" => {
+                if !self.viewer_site_admin {
+                    return Err(ExecError::new(MUST_BE_SITE_ADMIN));
+                }
+                Ok(Some(FieldValue::Object(Arc::new(
+                    crate::site_overview_graphql::UpgradeReadinessObject,
+                ))))
+            }
             // `siteResolver.Analytics` (`site_analytics.go:19-30`): site-admin
             // only; aggregates are shape-only until adminanalytics is ported.
             "analytics" => {
