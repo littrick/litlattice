@@ -2,3 +2,6 @@ target/
 **/target/
 __pycache__/
 *.pyc
+
+# standalone packaging workspace
+.package-build/
