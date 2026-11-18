@@ -262,9 +262,11 @@ mod tests {
         assert_eq!(schema_value["mutationType"]["name"], "Mutation");
         assert!(schema_value["subscriptionType"].is_null());
         let types = schema_value["types"].as_array().unwrap();
-        // 330 user types + 5 built-in scalars + 7 __* introspection types +
-        // _Service (graph-gophers meta schema), sorted by name.
-        assert_eq!(types.len(), 343);
+        // 340 user types (330 OSS + the 10 `telemetry.graphql` types the
+        // frontend always registers) + 5 built-in scalars + 7 __*
+        // introspection types + _Service (graph-gophers meta schema), sorted
+        // by name.
+        assert_eq!(types.len(), 353);
         let names: Vec<&str> = types.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(names.windows(2).all(|pair| pair[0] < pair[1]));
         assert!(names.contains(&"_Service"));

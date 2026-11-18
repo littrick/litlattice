@@ -51,7 +51,8 @@ pub use sdl::{
     CODEINTEL_CODENAV_SCHEMA, CODEINTEL_POLICIES_SCHEMA, CODE_MONITORS_SCHEMA,
     CODY_CONTEXT_SCHEMA, EMBEDDINGS_SCHEMA, GITHUB_APPS_SCHEMA,
     INSIGHTS_AGGREGATIONS_SCHEMA, INSIGHTS_SCHEMA, MAIN_SCHEMA, NOTEBOOKS_SCHEMA,
-    OUTBOUND_WEBHOOKS_SCHEMA, OWN_SCHEMA, SAVED_SEARCHES_SCHEMA, VIEWER_SCHEMA,
+    OUTBOUND_WEBHOOKS_SCHEMA, OWN_SCHEMA, SAVED_SEARCHES_SCHEMA, TELEMETRY_SCHEMA,
+    VIEWER_SCHEMA,
 };
 
 /// Built-in scalars provided by the GraphQL runtime (graph-gophers preloads
@@ -397,10 +398,17 @@ fn join_sorted(values: &[String]) -> String {
     sorted.join(",")
 }
 
-/// Assemble the OSS schema exactly like `graphqlbackend.NewSchema` does for a
-/// build whose enterprise resolvers are all nil.
+/// Assemble the OSS schema like `graphqlbackend.NewSchema` does for a build
+/// whose enterprise resolvers are all nil. The telemetry document is always
+/// present: `cmd/frontend/internal/telemetry` registers
+/// `TelemetryRootResolver` for every frontend process.
 pub fn assemble_oss() -> Result<Schema, SchemaError> {
-    assemble(&[MAIN_SCHEMA, OUTBOUND_WEBHOOKS_SCHEMA, VIEWER_SCHEMA])
+    assemble(&[
+        MAIN_SCHEMA,
+        OUTBOUND_WEBHOOKS_SCHEMA,
+        VIEWER_SCHEMA,
+        TELEMETRY_SCHEMA,
+    ])
 }
 
 /// Join the documents with `"\n"` (as `strings.Join(schemas, "\n")` does) and

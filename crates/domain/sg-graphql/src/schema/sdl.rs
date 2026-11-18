@@ -17,6 +17,13 @@ pub const OUTBOUND_WEBHOOKS_SCHEMA: &str = include_str!("sdl/outbound_webhooks.g
 /// `Viewer` interface.
 pub const VIEWER_SCHEMA: &str = include_str!("sdl/viewer.graphql");
 
+/// `//go:embed telemetry.graphql` — Telemetry V2
+/// (`Query.telemetry`, `Mutation.telemetry.recordEvents`). `NewSchema`
+/// appends it whenever the frontend's
+/// `cmd/frontend/internal/telemetry` init registers
+/// `TelemetryRootResolver`, which the server always does.
+pub const TELEMETRY_SCHEMA: &str = include_str!("sdl/telemetry.graphql");
+
 /// `//go:embed code_monitors.graphql` — `OptionalResolver.CodeMonitorsResolver`
 /// SDL. `NewSchema` appends it before the saved-searches document when both
 /// resolvers are present.

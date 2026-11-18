@@ -3619,6 +3619,13 @@ impl ObjectValue for MutationRoot {
         arguments: &Arguments,
         actor: Actor,
     ) -> Result<Option<FieldValue>, ExecError> {
+        // Telemetry V2 (`telemetry.graphql`): the web client exports every
+        // interaction batch here; events are accepted and dropped.
+        if field == "telemetry" {
+            return Ok(Some(FieldValue::Object(Arc::new(
+                crate::telemetry_graphql::TelemetryMutationObject,
+            ))));
+        }
         // M9.48d embeddings scheduling/cancellation mutations.
         if let Some(graphql) = self
             .business_c_nested
@@ -4408,6 +4415,10 @@ impl ObjectValue for QueryRoot {
                     Some(Ok(html)) => Ok(Some(FieldValue::Json(Json::Str(html.clone())))),
                 }
             }
+            // `Query.telemetry` (`telemetry.graphql`): Telemetry V2 reads.
+            "telemetry" => Ok(Some(FieldValue::Object(Arc::new(
+                crate::telemetry_graphql::TelemetryQueryObject,
+            )))),
             // `schemaResolver.Site` (`site.go:74-76`): no arguments and no
             // access check; `Site.configuration` re-checks admin itself.
             "site" => Ok(Some(FieldValue::Object(Arc::new(SiteObject {
