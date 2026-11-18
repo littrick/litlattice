@@ -557,7 +557,6 @@ pub async fn site_users_list(
     rows.into_iter()
         .map(|row| {
             use sqlx::Row;
-            serde_json::Value::Null; // keep imports deterministic
             Ok(SiteUserData {
                 id: row.try_get("id").map_err(|e| e.to_string())?,
                 username: row.try_get("username").map_err(|e| e.to_string())?,

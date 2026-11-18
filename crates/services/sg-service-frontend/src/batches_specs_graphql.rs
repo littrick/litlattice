@@ -2152,7 +2152,7 @@ pub struct BatchSpecWorkspaceObject {
 }
 
 /// One `batcheslib.Step` as parsed from `batch_specs.spec`.
-struct StepSpec {
+pub struct StepSpec {
     run: String,
     container: String,
     if_condition: Option<String>,

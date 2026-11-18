@@ -1226,8 +1226,8 @@ async fn authorized_user_repositories(
     pool: &PgPool,
     args: &AuthorizedUserRepositoriesArgs,
 ) -> Result<AuthorizedRepositoriesData, String> {
-    let mut user_id: Option<i32> = None;
-    let mut bind_id = String::new();
+    let user_id: Option<i32>;
+    let bind_id: String;
     if let Some(email) = &args.email {
         bind_id = email.clone();
         user_id = sqlx::query_scalar(
