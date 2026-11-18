@@ -71,7 +71,7 @@ commands:
                                   store normalized responses into fixtures
   replay-write --addr URL --repo NAME --phase clone|fetch|delete
                                   run one gitserver write scenario and print it
-                                  as normalized JSON (for scripts/gitserver)
+                                  as normalized JSON (for dev/rs/scripts/gitserver)
   canary --addr URL --repo NAME   health check: clone progress, HEAD, repo list
 "
     .to_owned()

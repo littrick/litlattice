@@ -3868,14 +3868,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "sg-actor"
-version = "0.1.0"
-
-[[package]]
-name = "sg-auth"
-version = "0.1.0"
-
-[[package]]
 name = "sg-bin-embeddings"
 version = "0.1.0"
 dependencies = [
@@ -4126,10 +4118,6 @@ name = "sg-env"
 version = "0.1.0"
 
 [[package]]
-name = "sg-errors"
-version = "0.1.0"
-
-[[package]]
 name = "sg-extsvc"
 version = "0.1.0"
 dependencies = [
@@ -4150,10 +4138,6 @@ dependencies = [
  "tracing",
  "url",
 ]
-
-[[package]]
-name = "sg-featureflag"
-version = "0.1.0"
 
 [[package]]
 name = "sg-git"
@@ -4179,10 +4163,6 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
 ]
-
-[[package]]
-name = "sg-grpc"
-version = "0.1.0"
 
 [[package]]
 name = "sg-http"
@@ -4693,10 +4673,6 @@ dependencies = [
  "serde_json",
  "sg-settings-schema",
 ]
-
-[[package]]
-name = "sg-trace"
-version = "0.1.0"
 
 [[package]]
 name = "sg-txemail"

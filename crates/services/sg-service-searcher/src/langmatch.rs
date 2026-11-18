@@ -4,7 +4,7 @@
 //! `lib/codeintel/languages` wrapper around go-enry v2.8.8.
 //!
 //! The data tables in [`enry_data`] are generated from the vendored go-enry
-//! module and the Sourcegraph overrides by `scripts/searcher/gen_enry_data.py`.
+//! module and the Sourcegraph overrides by `dev/rs/scripts/searcher/gen_enry_data.py`.
 //!
 //! Known gaps (documented in `dev/rs/docs/modules/04_searcher.md`): the naive
 //! Bayes classifier is not ported, so ambiguous extensions whose content

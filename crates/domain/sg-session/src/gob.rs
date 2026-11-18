@@ -678,7 +678,7 @@ mod tests {
     }
 
     // Reference vectors produced by Go 1.22 encoding/gob
-    // (test_ws/p4-gob, see poc/p4-session/go-fixture for the checked-in
+    // (test_ws/p4-gob, see dev/rs/poc/p4-session/go-fixture for the checked-in
     // generator).
     #[test]
     fn decodes_go_string() {
