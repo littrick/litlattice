@@ -283,6 +283,19 @@ pub trait GitObjectSource: Send + Sync {
         ))
     }
 
+    /// `gitserver.Client.Commits` with full commit details, used by
+    /// `RepositoryContributor.commits` (`repository_contributors.go:43-59`).
+    async fn commits_details(
+        &self,
+        _repo_id: i32,
+        _repo_name: &str,
+        _options: &sg_git::CommitsOptions,
+    ) -> Result<Vec<sg_git::CommitDetails>, GitSourceError> {
+        Err(GitSourceError::new(
+            "GitObjectSource::commits_details is not implemented",
+        ))
+    }
+
     /// `gitserver.Client.ListRefs(TagsOnly:true, PointsAtCommit:[oid])`
     /// (M9.30d, `gitresolvers/commit.go:58-76`). An empty result is
     /// `Ok(vec![])`, never an error.
@@ -366,6 +379,17 @@ pub struct ContributorsKey {
     pub revision_range: Option<String>,
     pub after_date: Option<String>,
     pub path: Option<String>,
+}
+
+/// One `RepositoryContributor.commits(first)` lookup.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ContributorCommitsKey {
+    pub repo_id: i32,
+    pub email: String,
+    pub revision_range: Option<String>,
+    pub after_date: Option<String>,
+    pub path: Option<String>,
+    pub first: Option<i32>,
 }
 
 /// One `Repository.contributors` gitserver lookup. An unparseable
@@ -656,6 +680,19 @@ impl GitObjectSource for GitserverGitObjects {
             .map_err(GitSourceError::from)
     }
 
+    async fn commits_details(
+        &self,
+        _repo_id: i32,
+        repo_name: &str,
+        options: &sg_git::CommitsOptions,
+    ) -> Result<Vec<sg_git::CommitDetails>, GitSourceError> {
+        let (client, _addr) = self.client_for(repo_name).await?;
+        client
+            .commits_details(repo_name, options)
+            .await
+            .map_err(GitSourceError::from)
+    }
+
     async fn list_refs_at_commit(
         &self,
         _repo_id: i32,
@@ -815,6 +852,12 @@ pub struct GitPrefetch {
     pub default_branches: HashMap<i32, DefaultBranchLookup>,
     /// `gitserver.ContributorCount` results (M9.19a).
     pub contributors: HashMap<ContributorsKey, ContributorLookup>,
+    /// `RepositoryContributor.commits` (`repository_contributors.go:43-59`),
+    /// keyed by contributor email and the inherited contributors arguments.
+    pub contributor_commits: HashMap<
+        ContributorCommitsKey,
+        Result<Vec<sg_git::CommitDetails>, String>,
+    >,
     /// `symbol.DefaultZoektSymbolsClient()` injection point. `GitTreeEntry` /
     /// `GitCommit` `symbols` call the (synchronous) gRPC client here.
     pub symbols: Option<Arc<dyn crate::search_searcher_client::SymbolsClient + Send + Sync>>,
@@ -861,6 +904,7 @@ impl Clone for GitPrefetch {
             refs: self.refs.clone(),
             default_branches: self.default_branches.clone(),
             contributors: self.contributors.clone(),
+            contributor_commits: self.contributor_commits.clone(),
             symbols: self.symbols.clone(),
             symbols_service: self.symbols_service.clone(),
             tree_highlights: self.tree_highlights.clone(),
@@ -971,6 +1015,31 @@ impl GitPrefetch {
 
 fn find_field<'a>(selections: &'a [RootField], name: &str) -> Option<&'a RootField> {
     selections.iter().find(|field| field.name == name)
+}
+
+/// Find a field anywhere in the subtree, including inline-fragment
+/// conditions. `contributors { nodes { commits } }` nests `commits` under
+/// `nodes`, so a direct-child search is not enough.
+fn find_nested_field<'a>(field: &'a RootField, name: &str) -> Option<&'a RootField> {
+    for selection in &field.selections {
+        if selection.name == name {
+            return Some(selection);
+        }
+        if let Some(found) = find_nested_field(selection, name) {
+            return Some(found);
+        }
+    }
+    for (_, selections) in &field.type_conditions {
+        for selection in selections {
+            if selection.name == name {
+                return Some(selection);
+            }
+            if let Some(found) = find_nested_field(selection, name) {
+                return Some(found);
+            }
+        }
+    }
+    None
 }
 
 /// Selections that apply to `type_name` at a field that may hold inline
@@ -1422,30 +1491,97 @@ async fn prefetch_repository_inventory_d(
                     after_date: after_date.clone(),
                     path: field.arguments.string("path").map(str::to_owned),
                 };
-                if prefetch.contributors.contains_key(&key) {
-                    continue;
-                }
-                let lookup = match &after_date {
-                    Some(value) if crate::search_commit_job::parse_git_date(value).is_none() => {
-                        ContributorLookup::InvalidDate(
-                            "failed to parse after date: invalid date format".to_owned(),
-                        )
+                let lookup = match prefetch.contributors.get(&key) {
+                    Some(lookup) => lookup.clone(),
+                    None => {
+                        let lookup = match &after_date {
+                            Some(value)
+                                if crate::search_commit_job::parse_git_date(value).is_none() =>
+                            {
+                                ContributorLookup::InvalidDate(
+                                    "failed to parse after date: invalid date format".to_owned(),
+                                )
+                            }
+                            _ => match source
+                                .contributor_count(
+                                    repo.id,
+                                    &repo.name,
+                                    key.revision_range.as_deref(),
+                                    key.after_date.as_deref(),
+                                    key.path.as_deref(),
+                                )
+                                .await
+                            {
+                                Ok(counts) => ContributorLookup::Counts(Ok(counts)),
+                                Err(error) => ContributorLookup::Counts(Err(error.message)),
+                            },
+                        };
+                        prefetch.contributors.insert(key.clone(), lookup.clone());
+                        lookup
                     }
-                    _ => match source
-                        .contributor_count(
-                            repo.id,
-                            &repo.name,
-                            key.revision_range.as_deref(),
-                            key.after_date.as_deref(),
-                            key.path.as_deref(),
-                        )
-                        .await
-                    {
-                        Ok(counts) => ContributorLookup::Counts(Ok(counts)),
-                        Err(error) => ContributorLookup::Counts(Err(error.message)),
-                    },
                 };
-                prefetch.contributors.insert(key, lookup);
+                // `RepositoryContributor.commits` (repository_contributors.go:43-59):
+                // `git log` restricted to the contributor's author email, with
+                // the contributors query's revision range/path/after date.
+                if let Some(commits) = find_nested_field(field, "commits") {
+                    if let ContributorLookup::Counts(Ok(counts)) = &lookup {
+                        let first = commits
+                            .arguments
+                            .i64("first")
+                            .and_then(|value| i32::try_from(value).ok());
+                        let after = key
+                            .after_date
+                            .as_deref()
+                            .and_then(crate::search_commit_job::parse_git_date)
+                            .map(|datetime| prost_types::Timestamp {
+                                seconds: datetime.unix_timestamp(),
+                                nanos: datetime.nanosecond() as i32,
+                            });
+                        for count in counts {
+                            let commits_key = ContributorCommitsKey {
+                                repo_id: repo.id,
+                                email: count.email.clone(),
+                                revision_range: key.revision_range.clone(),
+                                after_date: key.after_date.clone(),
+                                path: key.path.clone(),
+                                first,
+                            };
+                            if prefetch.contributor_commits.contains_key(&commits_key) {
+                                continue;
+                            }
+                            // Go requests one extra commit when `first > 1`
+                            // (only to answer `hasNextPage`).
+                            let n = first.unwrap_or(0).max(0) as u32;
+                            let max_commits = if n > 1 { n + 1 } else { n };
+                            let options = sg_git::CommitsOptions {
+                                all_refs: false,
+                                // Go: `cmp.Or(revisionRange, "HEAD")`, so an
+                                // explicit empty range is HEAD too.
+                                ranges: vec![key
+                                    .revision_range
+                                    .clone()
+                                    .filter(|range| !range.is_empty())
+                                    .unwrap_or_else(|| "HEAD".to_owned())],
+                                after: after.clone(),
+                                before: None,
+                                max_commits,
+                                skip: 0,
+                                order: None,
+                                message_query: String::new(),
+                                author: count.email.clone(),
+                                path: key.path.clone().unwrap_or_default(),
+                                follow_path_renames: false,
+                            };
+                            let result = source
+                                .commits_details(repo.id, &repo.name, &options)
+                                .await
+                                .map_err(|error| error.message);
+                            prefetch
+                                .contributor_commits
+                                .insert(commits_key, result);
+                        }
+                    }
+                }
             }
             _ => {}
         }

@@ -774,6 +774,9 @@ pub struct RepositoryContributorConnectionObject {
     pub git: Option<Arc<crate::git_graphql::GitPrefetch>>,
     pub data: ContributorsConnectionData,
     pub inventory_d: Option<Arc<InventoryDRoots>>,
+    pub revision_range: Option<String>,
+    pub after_date: Option<String>,
+    pub path: Option<String>,
 }
 
 /// `gqlutil.ConnectionResolver` for `Repository.contributors`. A gitserver
@@ -836,6 +839,12 @@ pub fn contributors_connection(
         git: Some(git),
         data,
         inventory_d,
+        revision_range: arguments.string("revisionRange").map(str::to_owned),
+        after_date: arguments
+            .string("afterDate")
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned),
+        path: arguments.string("path").map(str::to_owned),
     }))
 }
 
@@ -865,6 +874,9 @@ impl ObjectValue for RepositoryContributorConnectionObject {
                                 git: self.git.clone(),
                                 data: contributor.clone(),
                                 inventory_d: self.inventory_d.clone(),
+                                revision_range: self.revision_range.clone(),
+                                after_date: self.after_date.clone(),
+                                path: self.path.clone(),
                             }))
                         })
                         .collect(),
@@ -888,6 +900,11 @@ pub struct RepositoryContributorObject {
     pub git: Option<Arc<crate::git_graphql::GitPrefetch>>,
     pub data: ContributorCountData,
     pub inventory_d: Option<Arc<InventoryDRoots>>,
+    /// The `Repository.contributors` arguments inherited by `commits`
+    /// (`repository_contributors.go:43-59`).
+    pub revision_range: Option<String>,
+    pub after_date: Option<String>,
+    pub path: Option<String>,
 }
 
 impl ObjectValue for RepositoryContributorObject {
@@ -929,11 +946,40 @@ impl ObjectValue for RepositoryContributorObject {
                 .with_git(self.git.clone())
                 .with_inventory_d(self.inventory_d.clone()),
             )))),
-            // `repositoryContributorResolver.Commits` needs a `git log`
-            // author search; no such seam exists in this snapshot.
-            "commits" => Err(ExecError::new(
-                "RepositoryContributor.commits is not ported (M9.19a)",
-            )),
+            // `repositoryContributorResolver.Commits`
+            // (`repository_contributors.go:43-59`): `git log` restricted to
+            // the contributor's email with the contributors query's range,
+            // path and after date.
+            "commits" => {
+                let Some(git) = &self.git else {
+                    return Ok(None);
+                };
+                let first = _arguments
+                    .i64("first")
+                    .and_then(|value| i32::try_from(value).ok());
+                let key = crate::git_graphql::ContributorCommitsKey {
+                    repo_id: self.repo.id,
+                    email: self.data.email.clone(),
+                    revision_range: self.revision_range.clone(),
+                    after_date: self.after_date.clone(),
+                    path: self.path.clone(),
+                    first,
+                };
+                let commits = match git.contributor_commits.get(&key) {
+                    Some(Ok(commits)) => Ok(commits.clone()),
+                    Some(Err(message)) => Err(message.clone()),
+                    None => Err("contributor commits are not prefetched".to_owned()),
+                };
+                Ok(Some(FieldValue::Object(Arc::new(
+                    crate::git_commit_extra::CommitConnectionObject {
+                        repo: self.repo.clone(),
+                        commits,
+                        first,
+                        after_cursor: 0,
+                        git: Some(Arc::clone(git)),
+                    },
+                ))))
+            }
             _ => Ok(None),
         }
     }
