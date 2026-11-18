@@ -26,8 +26,13 @@ cd <repository>
 
 - Linux 主机，具有 root（或免密 `sudo`）；已安装 `debootstrap`
   （`apt-get install debootstrap`）。
-- `git`、`node >= 20.8`、`pnpm 8.9.2`（或 `corepack`）、`go 1.22.x`、
-  `cargo`/`rustup`（仓库的 `rust-toolchain.toml` 固定为 1.78.0）。
+- `git`、`node 20.8–24`（Sourcegraph 5.5 的 `engines` 为 `^v20.8`；Node 25 起
+  移除了 `buffer.SlowBuffer`，`pnpm run generate` 会失败）、`pnpm 8.9.2`
+  （或 `corepack`）、`go 1.22.x`、`cargo`/`rustup`
+  （仓库的 `rust-toolchain.toml` 固定工具链版本）。
+- 编译阶段（`frontend`/`rust`/`go`/`syntect`）建议以普通用户身份运行：
+  `sudo` 会按 `secure_path` 重置 `PATH`，用户级安装的 `node`/`cargo`
+  （如 `~/.cargo/bin`）在 root 下不可见。
 - 需要网络访问：Sourcegraph 克隆、npm registry、Go modules、crates.io、
   Ubuntu 镜像源。需要代理时设置 `PACKAGE_PROXY=host:port`。
 - 磁盘：构建工作区约需 8–12 GiB（node_modules + targets + rootfs），

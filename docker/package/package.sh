@@ -23,6 +23,11 @@
 #   CARGO_PROFILE    release (default) or debug
 #   JOBS             parallel build jobs
 #
+# The web bundle needs Node 20.8–24. Sourcegraph 5.5 declares
+# "node": "^v20.8.0", and the upper bound matters: Node 25 removed
+# buffer.SlowBuffer, which its dependency tree (jwa ->
+# buffer-equal-constant-time) still dereferences.
+#
 # The rootfs stages require root (debootstrap, chown, tar --numeric-owner).
 # Non-root builds are fine for `fetch`, `frontend`, `rust`, `go`, `syntect`.
 set -euo pipefail
@@ -141,12 +146,20 @@ stage_fetch() {
 # ---------------------------------------------------------------------------
 stage_frontend() {
     log "building the web bundle from source"
-    command -v node >/dev/null || fail "node is required (>= 20.8)"
-    local node_major node_minor
+    command -v node >/dev/null || fail "node 20.8–24 is required"
+    local node_major node_minor node_patch
     node_major=$(node -p 'process.versions.node.split(".")[0]')
     node_minor=$(node -p 'process.versions.node.split(".")[1]')
-    if [ "$node_major" -lt 20 ] || { [ "$node_major" -eq 20 ] && [ "$node_minor" -lt 8 ]; }; then
-        fail "node >= 20.8 is required (found $(node --version))"
+    node_patch=$(node -p 'process.versions.node.split(".")[2]')
+    # Sourcegraph's engines field pins "^v20.8.0". Do not relax the upper
+    # bound: Node 25 removed buffer.SlowBuffer (Node 24.0.0 removed it by
+    # accident; 24.0.1 restored it), and buffer-equal-constant-time@1.0.1,
+    # pulled in by jwa/jws, dereferences it during `pnpm run generate`.
+    if [ "$node_major" -lt 20 ] ||
+       { [ "$node_major" -eq 20 ] && [ "$node_minor" -lt 8 ]; } ||
+       [ "$node_major" -ge 25 ] ||
+       { [ "$node_major" -eq 24 ] && [ "$node_minor" -eq 0 ] && [ "$node_patch" -lt 1 ]; }; then
+        fail "node 20.8–24 is required (found $(node --version); buffer.SlowBuffer was removed in Node 25)"
     fi
     if ! command -v pnpm >/dev/null; then
         command -v corepack >/dev/null || fail "pnpm/corepack is required"
@@ -175,6 +188,8 @@ stage_frontend() {
 # ---------------------------------------------------------------------------
 stage_rust() {
     log "building Rust binaries ($CARGO_PROFILE)"
+    command -v cargo >/dev/null ||
+        fail "cargo is required; run compile stages as your user (sudo resets PATH and drops ~/.cargo/bin)"
     local profile_flag=(--release)
     [ "$CARGO_PROFILE" = debug ] && profile_flag=()
     (
@@ -226,6 +241,8 @@ stage_go() {
 # ---------------------------------------------------------------------------
 stage_syntect() {
     log "building syntect_server and scip-ctags from source"
+    command -v cargo >/dev/null ||
+        fail "cargo is required; run compile stages as your user (sudo resets PATH and drops ~/.cargo/bin)"
     local src="$SRC_DIR/docker-images/syntax-highlighter"
     [ -f "$src/Cargo.toml" ] || fail "missing syntax-highlighter source: $src"
     (
