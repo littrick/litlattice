@@ -179,6 +179,7 @@ stage_rust() {
     [ "$CARGO_PROFILE" = debug ] && profile_flag=()
     (
         cd "$REPO_ROOT"
+        export CARGO_TARGET_DIR="$RUST_TARGET_DIR"
         if [ -n "$JOBS" ]; then
             CARGO_BUILD_JOBS="$JOBS" cargo build "${profile_flag[@]}" --bins
         else

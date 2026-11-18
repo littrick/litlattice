@@ -1,5 +1,11 @@
 # `sourcegraph/server` image (Rust rewrite)
 
+> **Standalone packaging:** `docker/package/` is the canonical end-to-end flow.
+> It fetches Sourcegraph source (web UI + Go sidecars) and Ubuntu packages at
+> packaging time and writes a `docker import`-able filesystem tarball without
+> a Dockerfile. See [`../package/README.md`](../package/README.md).
+
+
 Packaging for the single-container image. The Go process set is replaced by the
 Rust binaries under `bins/`; zoekt, syntect_server, scip-ctags, prom-wrapper,
 nginx, Postgres and Redis remain external (Go binaries/packages). The A slice

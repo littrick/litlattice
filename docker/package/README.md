@@ -1,7 +1,15 @@
 # Standalone packaging (filesystem image)
 
-Build a self-contained `sourcegraph/server` replacement as a **root filesystem
-tarball** that `docker import` accepts. This directory is the only packaging
+Clone the `package` branch (it contains the latest Rust port plus this
+packaging flow) and build a self-contained `sourcegraph/server` replacement as
+a **root filesystem tarball** that `docker import` accepts:
+
+```sh
+git clone -b package <this-repository-url>
+cd <repository>
+```
+
+This directory is the only packaging
 entry point: a fresh clone of this repository can build the image without a
 Dockerfile or any prebuilt artifacts.
 
