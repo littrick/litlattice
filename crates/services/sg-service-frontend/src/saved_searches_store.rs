@@ -376,6 +376,9 @@ impl SavedSearchesGraphqlDatabase for PgSavedSearchesGraphqlStore {
                 .bind(query)
                 .bind(draft)
                 .bind(actor_uid)
+                .bind(notify_owner)
+                .bind(notify_slack)
+                .bind(slack_webhook_url)
                 .bind(id)
                 .fetch_optional(&self.pool),
         )
