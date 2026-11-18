@@ -9,8 +9,9 @@
 //! - `/.api/lsif/upload` (POST) -> `lsifDeprecationHandler` (501, fixed text);
 //! - `/.api/scip/upload` (POST) -> enterprise `code intel upload` 404;
 //!   (HEAD) -> `noopHandler` 200;
-//! - `/.api/compute/stream` (GET/POST) -> enterprise `compute streaming
-//!   endpoint` 404;
+//! - `/.api/compute/stream` (GET/POST) -> the ported SSE handler
+//!   ([`crate::compute_stream`]); the compute search pipeline is narrowed to
+//!   a recent `(repo, path)` example (see that module's ENV_GAP);
 //! - `/.api/registry*` (GET) -> non-dotcom `no local extension registry
 //!   exists` 404 (`nosniff`);
 //! - `/.api/files/batch-changes/{spec}/{file}` (GET/HEAD) and
@@ -311,6 +312,9 @@ where
         Err(response) => response,
         Ok(Route::BlameStream { repo, rev, path }) => {
             crate::blame::blame_response(req, &repo, rev.as_deref(), &path, deps).await
+        }
+        Ok(Route::ComputeStream) => {
+            crate::compute_stream::compute_stream_response(req, search_deps).await
         }
         Ok(Route::SearchStream) => crate::search_stream::search_response(req, search_deps).await,
         Ok(Route::Graphql) => graphql_api::graphql_response(req, live, false, graphql_deps).await,

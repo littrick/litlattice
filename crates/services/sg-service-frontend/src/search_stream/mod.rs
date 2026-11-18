@@ -158,6 +158,12 @@ pub trait JobRunner: Send + Sync {
         let _ = request_context;
         self.run(job, sender)
     }
+
+    /// The commit-search gitserver client, when the runtime was assembled.
+    /// Used by the search-home compute example (`/.api/compute/stream`).
+    fn gitserver(&self) -> Option<&(dyn crate::search_commit_job::GitserverClient + Send + Sync)> {
+        None
+    }
 }
 
 /// Default runner: job execution is not ported yet.
@@ -340,6 +346,13 @@ impl JobRunner for TreeJobRunner {
         };
         self.run_job(job, &ctx, sender)
     }
+
+    fn gitserver(&self) -> Option<&(dyn crate::search_commit_job::GitserverClient + Send + Sync)> {
+        self.runtime
+            .as_ref()
+            .and_then(|runtime| runtime.commit.as_ref())
+            .map(|commit| commit.gitserver.as_ref())
+    }
 }
 
 /// `eventWriter.Alert` conversion of a baseline `search.Alert`.
@@ -424,6 +437,13 @@ pub trait SearchDeps: Send + Sync {
     /// `None` (direct callers/tests) models the anonymous actor.
     fn is_authenticated(&self, actor: Option<&crate::actor_middleware::Actor>) -> bool {
         actor.is_some_and(crate::actor_middleware::Actor::is_authenticated)
+    }
+
+    /// A recent `(repository, path)` pair for the search-home compute
+    /// example (`/.api/compute/stream`). `None` keeps the endpoint's
+    /// empty-result fallback.
+    async fn compute_example(&self) -> Option<(String, String)> {
+        None
     }
 }
 
@@ -846,6 +866,34 @@ impl SearchDeps for BackendDeps {
                 Vec::new()
             }
         }
+    }
+
+    /// Recent change from the commit gitserver client: first visible
+    /// repository, `HEAD`, its parent and the first changed path.
+    async fn compute_example(&self) -> Option<(String, String)> {
+        let repo: Option<String> = sqlx::query_scalar(
+            "SELECT r.name FROM repo r \
+             WHERE r.deleted_at IS NULL AND r.blocked IS NULL \
+               AND (NOT r.private \
+                    OR EXISTS (SELECT 1 FROM external_services es \
+                               JOIN external_service_repos esr \
+                                 ON esr.external_service_id = es.id \
+                                AND esr.repo_id = r.id \
+                               WHERE es.unrestricted AND es.deleted_at IS NULL) \
+                    OR EXISTS (SELECT 1 FROM user_repo_permissions up \
+                               WHERE up.repo_id = r.id AND up.user_id IS NULL)) \
+             ORDER BY r.id LIMIT 1",
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .ok()?;
+        let repo = repo?;
+        let gitserver = self.runner.gitserver()?;
+        let head = gitserver.resolve_revision(&repo, "HEAD", false).ok()?;
+        let parents = gitserver.commit_parents(&repo, &head).ok()?;
+        let base = parents.first()?;
+        let path = gitserver.changed_files(&repo, base, &head).ok()?.into_iter().next()?;
+        Some((repo, path))
     }
 }
 

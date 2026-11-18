@@ -140,6 +140,28 @@ pub trait GitserverClient {
             "gitserver ResolveRevision is not supported by this client",
         ))
     }
+
+    /// `gitserver.GetCommitDetails(repo, oid).Parents`, used by the
+    /// search-home compute example (a recent changed path).
+    fn commit_parents(&self, repo: &str, oid: &str) -> Result<Vec<String>, SearcherError> {
+        let _ = (repo, oid);
+        Err(SearcherError::other(
+            "gitserver GetCommitDetails is not supported by this client",
+        ))
+    }
+
+    /// `gitserver.ChangedFiles(repo, base, head)`.
+    fn changed_files(
+        &self,
+        repo: &str,
+        base: &str,
+        head: &str,
+    ) -> Result<Vec<String>, SearcherError> {
+        let _ = (repo, base, head);
+        Err(SearcherError::other(
+            "gitserver ChangedFiles is not supported by this client",
+        ))
+    }
 }
 
 /// The subset of `db.Users()`/`db.UserEmails()` username expansion reads.

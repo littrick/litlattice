@@ -176,6 +176,7 @@ pub mod search_runtime;
 pub mod search_searcher_client;
 pub mod search_searcher_jobs;
 pub mod search_source;
+pub mod compute_stream;
 pub mod search_stream;
 pub mod service;
 pub mod sub_repo_perms_checker;

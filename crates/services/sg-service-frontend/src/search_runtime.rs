@@ -1202,6 +1202,38 @@ impl crate::search_commit_job::GitserverClient for GitCommitGitserver {
                 .map_err(searcher_error_from_git)
         })
     }
+
+    fn commit_parents(&self, repo: &str, oid: &str) -> Result<Vec<String>, SearcherError> {
+        let client = Arc::clone(&self.client);
+        let repo = repo.to_owned();
+        let oid = oid.to_owned();
+        run_to_completion(async move {
+            client
+                .get_commit_details(&repo, &oid)
+                .await
+                .map(|details| details.parents)
+                .map_err(searcher_error_from_git)
+        })
+    }
+
+    fn changed_files(
+        &self,
+        repo: &str,
+        base: &str,
+        head: &str,
+    ) -> Result<Vec<String>, SearcherError> {
+        let client = Arc::clone(&self.client);
+        let repo = repo.to_owned();
+        let base = base.to_owned();
+        let head = head.to_owned();
+        run_to_completion(async move {
+            client
+                .changed_files(&repo, &base, &head)
+                .await
+                .map(|files| files.into_iter().map(|file| file.path).collect())
+                .map_err(searcher_error_from_git)
+        })
+    }
 }
 
 /// `gitserver.Client.ResolveRevision(..., false)` / `GetDefaultBranch(repo, false)`.
