@@ -561,6 +561,9 @@ pub struct PermissionsSyncJobObject {
     job: sg_db::permission_sync_jobs::PermissionSyncJobListRow,
     subject: SubjectData,
     triggered_by_user: Option<crate::graphql_resolvers::UserData>,
+    /// The viewer's site-admin status; the subject/triggered-by `User`
+    /// objects need it for `User.email`/`siteAdmin` (`user.go:136-148`).
+    viewer_site_admin: bool,
 }
 
 impl PermissionsSyncJobObject {
@@ -605,7 +608,10 @@ impl ObjectValue for PermissionsSyncJobObject {
             // user is an error, which the store already rejects.
             "triggeredByUser" => match &self.triggered_by_user {
                 Some(user) => FieldValue::Object(Arc::new(
-                    crate::graphql_resolvers::UserObject::from_data(user.clone()),
+                    crate::graphql_resolvers::UserObject::from_data_as_viewer(
+                        user.clone(),
+                        self.viewer_site_admin,
+                    ),
                 )),
                 None => FieldValue::Null,
             },
@@ -621,10 +627,14 @@ impl ObjectValue for PermissionsSyncJobObject {
             "cancel" => FieldValue::Json(Json::Bool(self.job.cancel)),
             "subject" => match &self.subject {
                 SubjectData::Repository(repo) => FieldValue::Object(Arc::new(
-                    crate::graphql_resolvers::RepositoryObject::from_data(repo.clone()),
+                    crate::graphql_resolvers::RepositoryObject::from_data(repo.clone())
+                        .with_viewer_site_admin(self.viewer_site_admin),
                 )),
                 SubjectData::User(user) => FieldValue::Object(Arc::new(
-                    crate::graphql_resolvers::UserObject::from_data(user.clone()),
+                    crate::graphql_resolvers::UserObject::from_data_as_viewer(
+                        user.clone(),
+                        self.viewer_site_admin,
+                    ),
                 )),
             },
             "priority" => FieldValue::Json(Json::Str(
@@ -671,6 +681,7 @@ impl ObjectValue for PermissionsSyncJobObject {
 
 struct PermissionsSyncJobsConnectionObject {
     data: PermissionsSyncJobsConnectionData,
+    viewer_site_admin: bool,
 }
 
 impl ObjectValue for PermissionsSyncJobsConnectionObject {
@@ -702,6 +713,7 @@ impl ObjectValue for PermissionsSyncJobsConnectionObject {
                                     "subjects are resolved before the connection is built",
                                 ),
                                 triggered_by_user: node.triggered_by_user.clone(),
+                                viewer_site_admin: self.viewer_site_admin,
                             }))
                         })
                         .collect(),
@@ -1362,7 +1374,10 @@ pub fn root_field(
                 .permissions_sync_jobs(&args)
                 .map_err(ExecError::new)?;
             Ok(Some(FieldValue::Object(Arc::new(
-                PermissionsSyncJobsConnectionObject { data: connection },
+                PermissionsSyncJobsConnectionObject {
+                    data: connection,
+                    viewer_site_admin,
+                },
             ))))
         }
         "permissionsSyncingStats" => {
