@@ -193,6 +193,9 @@ stage_rust() {
                migrator precise-code-intel-worker embeddings; do
         [ -x "$dir/$bin" ] || fail "missing Rust binary: $dir/$bin"
         install -m 0755 "$dir/$bin" "$RUST_BIN/$bin"
+        # The workspace builds release with debug = 1; the shipped image does
+        # not need line tables.
+        strip --strip-debug "$RUST_BIN/$bin" 2>/dev/null || true
     done
 }
 
@@ -256,9 +259,21 @@ stage_rootfs() {
     log "configuring users, locale and runtime directories"
     run_root chroot "$ROOTFS" localedef -i en_US -f UTF-8 en_US.UTF-8
     run_root chroot "$ROOTFS" sh -c '
+        set -e
+        # Ubuntu 24.04 prometheus-postgres-exporter creates a prometheus
+        # user/group at exactly the image sourcegraph ids (100:101).
+        # Keep the exporter binary but free the ids first.
+        if getent passwd prometheus >/dev/null 2>&1 &&
+           [ "$(id -u prometheus)" = 100 ]; then
+            userdel prometheus
+        fi
+        if getent group prometheus >/dev/null 2>&1 &&
+           [ "$(getent group prometheus | cut -d: -f3)" = 101 ]; then
+            groupdel prometheus
+        fi
         getent group sourcegraph >/dev/null || groupadd -g 101 sourcegraph
         id -u sourcegraph >/dev/null 2>&1 ||
-          useradd -u 100 -g sourcegraph -d /home/sourcegraph -s /usr/sbin/nologin sourcegraph
+          useradd -u 100 -g sourcegraph -m -d /home/sourcegraph -s /usr/sbin/nologin sourcegraph
         getent group redis >/dev/null || groupadd -g 103 redis
         ln -sf /usr/bin/tini /sbin/tini
         ln -sf /usr/sbin/gosu /usr/local/bin/su-exec
@@ -335,7 +350,11 @@ chmod 0755 '$ROOTFS/opt/s3proxy/run-docker-container.sh'"
     run_root chroot "$ROOTFS" chown -R sourcegraph:sourcegraph /assets-dist
 
     # The image serves the front door on nginx :7080 and runs as root.
-    run_root chmod 0755 "$ROOTFS/server" "$ROOTFS/usr/local/bin/"* "$ROOTFS/bin/prom-wrapper"
+    # Only regular files: /usr/local/bin also holds symlinks into the rootfs
+    # (postgres_exporter, su-exec) that are dangling from the host namespace,
+    # and chmod would follow them.
+    run_root find "$ROOTFS/usr/local/bin" -maxdepth 1 -type f -exec chmod 0755 {} +
+    run_root chmod 0755 "$ROOTFS/server" "$ROOTFS/bin/prom-wrapper"
     run_root chmod 0755 "$ROOTFS/postgres-optimize.sh" "$ROOTFS/reindex.sh"
     run_root touch "$ROOTFS/var/lib/nginx/tmp/.keep" "$ROOTFS/var/run/.keep"
     run_root chmod 0644 "$ROOTFS/var/lib/nginx/tmp/.keep" "$ROOTFS/var/run/.keep"
