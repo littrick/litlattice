@@ -760,13 +760,27 @@ pub fn external_handler_with_live(
                                                                 }));
                                                         }
                                                         let request_deps = Arc::new(request_deps);
-                                                        app_router::dispatch_async_with_body(
-                                                            request,
-                                                            &app_env,
-                                                            &app_config,
-                                                            &request_deps,
-                                                        )
-                                                        .await
+                                                        // `/search/stream` (`ui/router.go:207`):
+                                                        // the web app's EventSource streams
+                                                        // search results from this root path,
+                                                        // not `/.api/search/stream`.
+                                                        if request.method() == http::Method::GET
+                                                            && request.uri().path() == "/search/stream"
+                                                        {
+                                                            crate::search_stream::search_response(
+                                                                request,
+                                                                Arc::clone(&search_deps),
+                                                            )
+                                                            .await
+                                                        } else {
+                                                            app_router::dispatch_async_with_body(
+                                                                request,
+                                                                &app_env,
+                                                                &app_config,
+                                                                &request_deps,
+                                                            )
+                                                            .await
+                                                        }
                                                     }
                                                 };
                                                 for value in vary {
