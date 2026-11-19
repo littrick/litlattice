@@ -267,7 +267,7 @@ stage_rootfs() {
     if [ "${REUSE_ROOTFS:-0}" = 1 ] && [ -x "$ROOTFS/bin/bash" ]; then
         log "reusing existing rootfs at $ROOTFS"
     else
-        rm -rf "$ROOTFS"
+        run_root rm -rf "$ROOTFS"
         mkdir -p "$ROOTFS"
         run_root debootstrap --variant=minbase --components=main,universe \
             --include="$packages" "$UBUNTU_SUITE" "$ROOTFS" "$UBUNTU_MIRROR"
