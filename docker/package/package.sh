@@ -339,7 +339,9 @@ stage_rootfs() {
                precise-code-intel-worker embeddings; do
         run_root install -m 0755 "$RUST_BIN/$bin" "$ROOTFS/usr/local/bin/$bin"
     done
-    # Go sidecars.
+    # Go sidecars. A reused rootfs may still carry the Go migrator from an
+    # earlier package; all migration commands now run in the Rust binary.
+    run_root rm -f "$ROOTFS/usr/local/bin/migrator-go"
     run_root install -m 0755 "$GO_BIN/blobstore" "$ROOTFS/usr/local/bin/blobstore"
     for zoekt in zoekt-archive-index zoekt-git-index zoekt-sourcegraph-indexserver zoekt-webserver; do
         run_root install -m 0755 "$GO_BIN/$zoekt" "$ROOTFS/usr/local/bin/$zoekt"
