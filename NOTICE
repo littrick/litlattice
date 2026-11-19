@@ -1,0 +1,22 @@
+Sourcegraph Rust Rewrite
+Copyright 2026 The Sourcegraph Rust Rewrite Authors
+
+This product includes software developed at Sourcegraph, Inc.
+(https://sourcegraph.com/).
+
+Portions of this repository reproduce material from
+github.com/sourcegraph/sourcegraph-public-snapshot up to commit
+1cd36d2dbbd2a9ab638cc437d208d2717eaefb0b, the last commit published under the
+Apache License, Version 2.0.
+
+This product also includes:
+
+  * tree-sitter grammars (vendor/tree-sitter-*), MIT License;
+  * the smacker/go-tree-sitter wrapper, MIT License;
+  * protobuf definitions from github.com/sourcegraph/zoekt, Apache License 2.0;
+  * protobuf definitions from github.com/sourcegraph/scip, Apache License 2.0.
+
+See THIRD_PARTY.md and third_party/ for the file-level provenance and the full
+license texts. Files marked "enterprise-only" in third_party/provenance.tsv are
+NOT covered by this repository's Apache-2.0 grant and must be replaced or
+re-derived before redistribution.

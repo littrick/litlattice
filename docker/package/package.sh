@@ -475,6 +475,15 @@ chmod 0755 '$ROOTFS/opt/s3proxy/run-docker-container.sh'"
     run_root install -m 0644 "$BUILD_DIR/version.txt" "$ROOTFS/version.txt"
     run_root install -m 0644 "$BUILD_DIR/timestamp.txt" "$ROOTFS/timestamp.txt"
 
+    # License and third-party notices (Apache-2.0 §4). The provenance table is
+    # shipped alongside the licenses so recipients can audit what came from
+    # where.
+    local doc_dir="$ROOTFS/usr/share/doc/sourcegraph-rust"
+    run_root install -d -m 0755 "$doc_dir"
+    run_root install -m 0644 "$REPO_ROOT/LICENSE" "$REPO_ROOT/NOTICE" \
+        "$REPO_ROOT/THIRD_PARTY.md" "$doc_dir/"
+    run_root cp -a "$REPO_ROOT/third_party" "$doc_dir/third_party"
+
     if has_feature observability; then
         # Observability: prom-wrapper starts these scripts. They come from the
         # pinned Sourcegraph source and expect `prometheus`/`alertmanager` on PATH
