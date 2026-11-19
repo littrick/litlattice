@@ -655,9 +655,12 @@ fn maybe_observability(env: &EnvMap) -> Vec<String> {
         return vec![String::new()];
     }
 
-    // The packaged rootfs carries prom-wrapper + Prometheus/Alertmanager from
-    // Ubuntu, but not Grafana. Starting the missing binary would take the
-    // whole container down, so only add its Procfile line when present.
+    // The observability feature may not have been packaged at all. Starting a
+    // missing binary would take the whole container down, so only add the
+    // prom-wrapper line when it is present; Grafana is likewise optional.
+    if !std::path::Path::new("/bin/prom-wrapper").is_file() {
+        return vec![String::new()];
+    }
     let mut lines = vec![PROMETHEUS_LINE.to_owned()];
     if std::path::Path::new("/usr/share/grafana/bin/grafana-server").is_file() {
         lines.push(GRAFANA_LINE.to_owned());

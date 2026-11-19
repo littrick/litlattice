@@ -47,6 +47,9 @@ PACKAGE_PROXY=172.17.0.1:7890 sudo -E ./docker/package/package.sh
 # 或者以你的用户身份运行网络/编译阶段，然后再运行需要 root 的阶段
 PACKAGE_PROXY=172.17.0.1:7890 ./docker/package/package.sh --only fetch,frontend,rust,go,syntect
 sudo -E ./docker/package/package.sh --from rootfs
+
+# 需要观测栈（Prometheus/Alertmanager/prom-wrapper）时：
+sudo -E ./docker/package/package.sh --features observability
 ```
 
 产物位于 `.package-build/out/`：
@@ -92,12 +95,15 @@ docker run -d --name sg-rust -p 7080:7080 \
 
 ## 保真度说明
 
-- 可观测性默认关闭；rootfs 现在包含 Prometheus、Alertmanager、基线
-  `prometheus.yml`/`alertmanager.yml`、生成的告警规则与单容器 target 列表，
-  以及 Rust `prom-wrapper`。设置 `DISABLE_OBSERVABILITY=`（空值）即可启动
-  Prometheus `:9090`（prom-wrapper 反代）与 Alertmanager `:9093`。Grafana
-  未打包；`/server` 检测到 `/usr/share/grafana/bin/grafana-server` 不存在时
-  会自动跳过 grafana 进程，不再导致整容器退出。
+- 可观测性是**可选打包特性，默认不包含**。默认镜像不安装
+  Prometheus/Alertmanager、不复制 prom-wrapper/配置/规则/target，也不创建
+  `/var/opt/sourcegraph/prometheus`；即使误设 `DISABLE_OBSERVABILITY=`，
+  `/server` 检测到 `/bin/prom-wrapper` 缺失也会跳过观测进程。
+- 需要观测时使用 `--features observability` 打包：安装 Prometheus、
+  Alertmanager、基线配置、23 个告警规则、单容器 target 列表与 Rust
+  `prom-wrapper`；运行时设置 `DISABLE_OBSERVABILITY=`（空值）启动
+  Prometheus/Alertmanager，并用 `-p 9091:9090` 暴露 Prometheus。
+  Grafana 仍未打包，`/server` 在二进制缺失时跳过 grafana 进程。
 - 混合/zoekt 搜索已禁用（`DISABLE_HYBRID_SEARCH=true`）；为保持一致性仍随附
   zoekt 二进制，但不运行索引服务器。
 - `/var/opt/sourcegraph/postgresql{,-markers}` 有意**不**预先创建：`/server`

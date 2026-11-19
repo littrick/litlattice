@@ -517,10 +517,11 @@ Procfile 不再添加这两个进程。
   `ALERTMANAGER_ENABLE_CLUSTER`、`DISABLE_ALERTMANAGER`、
   `DISABLE_SOURCEGRAPH_CONFIG`、`OPSGENIE_API_KEY`、
   `SRC_FRONTEND_INTERNAL`
-- rootfs 已包含 Ubuntu 的 Prometheus、Alertmanager、基线配置、生成的告警
-  规则与 `dev/prometheus/linux` target 列表；Grafana 未打包（`/server` 检测到
-  二进制缺失时跳过 grafana 进程）。默认 `DISABLE_OBSERVABILITY=1`，设置空值
-  即可启动观测。
+- 观测栈是可选打包特性：默认镜像不包含 Prometheus/Alertmanager/
+  prom-wrapper/配置/规则/target；使用
+  `./docker/package/package.sh --features observability` 打包后才会安装。
+  启用特性的镜像仍默认 `DISABLE_OBSERVABILITY=1`，设置空值即可启动观测。
+  Grafana 未打包（`/server` 检测到二进制缺失时跳过 grafana 进程）。
 
 ---
 

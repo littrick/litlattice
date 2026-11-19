@@ -14,7 +14,12 @@
 #   ./docker/package/package.sh                 # all stages
 #   ./docker/package/package.sh --only frontend
 #   ./docker/package/package.sh --from rootfs
+#   ./docker/package/package.sh --features observability
 #   sudo ./docker/package/package.sh            # rootfs stages need root
+#
+# Optional features (comma-separated); observability is the only feature and is
+# OFF by default. It adds Prometheus, Alertmanager, prom-wrapper, the baseline
+# configs, alert rules and the metrics target list to the image.
 #
 # Important environment:
 #   BUILD_DIR        build workspace (default <repo>/.package-build)
@@ -108,16 +113,32 @@ usage() {
 
 ONLY=""
 FROM=""
+FEATURES=""
 CLEAN=0
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --only) ONLY=${2:?--only needs a stage list}; shift 2 ;;
         --from) FROM=${2:?--from needs a stage}; shift 2 ;;
+        --features) FEATURES=${2:?--features needs a list}; shift 2 ;;
         --clean) CLEAN=1; shift ;;
         -h|--help) usage 0 ;;
         *) usage 2 ;;
     esac
 done
+
+# Comma-separated feature list, validated once.
+FEATURES=${FEATURES// /}
+for feature in ${FEATURES//,/ }; do
+    case "$feature" in
+        observability) ;;
+        *) fail "unknown feature: $feature (supported: observability)" ;;
+    esac
+done
+
+has_feature() {
+    case ",$FEATURES," in *",$1,"*) return 0 ;; esac
+    return 1
+}
 
 want() {
     local stage=$1
@@ -225,8 +246,12 @@ stage_rust() {
     rm -rf "$RUST_BIN"
     mkdir -p "$RUST_BIN"
     local dir="$RUST_TARGET_DIR/$CARGO_PROFILE"
-    for bin in server frontend gitserver searcher symbols worker repo-updater \
-               migrator blobstore prom-wrapper precise-code-intel-worker embeddings; do
+    local rust_bins="server frontend gitserver searcher symbols worker repo-updater
+               migrator blobstore precise-code-intel-worker embeddings"
+    if has_feature observability; then
+        rust_bins="$rust_bins prom-wrapper"
+    fi
+    for bin in $rust_bins; do
         [ -x "$dir/$bin" ] || fail "missing Rust binary: $dir/$bin"
         install -m 0755 "$dir/$bin" "$RUST_BIN/$bin"
         # The workspace builds release with debug = 1; the shipped image does
@@ -281,8 +306,19 @@ stage_rootfs() {
         fail "debootstrap is required (apt-get install debootstrap)"
     [ "$(id -u)" = 0 ] || [ -n "$SUDO" ] || fail "rootfs staging needs root"
     fetch_universal_ctags
-    local packages="bash,ca-certificates,curl,git,git-lfs,gosu,openssh-client,nginx,postgresql,postgresql-contrib,redis-server,prometheus,prometheus-alertmanager,prometheus-postgres-exporter,locales,tini,python3,procps"
+    local packages="bash,ca-certificates,curl,git,git-lfs,gosu,openssh-client,nginx,postgresql,postgresql-contrib,redis-server,prometheus-postgres-exporter,locales,tini,python3,procps"
+    if has_feature observability; then
+        packages="$packages,prometheus,prometheus-alertmanager"
+    fi
     if [ "${REUSE_ROOTFS:-0}" = 1 ] && [ -x "$ROOTFS/bin/bash" ]; then
+        # Feature sets change the installed packages; reusing a rootfs built
+        # for the other set would silently ship the wrong image.
+        if has_feature observability && [ ! -x "$ROOTFS/usr/bin/prometheus" ]; then
+            fail "REUSE_ROOTFS=1 rootfs lacks observability packages; rebuild without reuse"
+        fi
+        if ! has_feature observability && [ -x "$ROOTFS/usr/bin/prometheus" ]; then
+            fail "REUSE_ROOTFS=1 rootfs contains observability packages; rebuild without reuse"
+        fi
         log "reusing existing rootfs at $ROOTFS"
     else
         run_root rm -rf "$ROOTFS"
@@ -318,18 +354,21 @@ stage_rootfs() {
                  /var/opt/sourcegraph/repos /var/opt/sourcegraph/cache \
                  /var/opt/sourcegraph/blobstore /var/opt/sourcegraph/redis \
                  /var/opt/sourcegraph/redis-cache /var/opt/sourcegraph/zoekt/index \
-                 /var/opt/sourcegraph/prometheus \
                  /opt/image_tests /opt/s3proxy
         chmod 0755 /var/lib/nginx/tmp
         chown -R postgres:postgres /run/postgresql
         chown -R sourcegraph:sourcegraph /assets-dist \
                  /var/opt/sourcegraph/repos /var/opt/sourcegraph/cache \
-                 /var/opt/sourcegraph/blobstore /var/opt/sourcegraph/zoekt \
-                 /var/opt/sourcegraph/prometheus
+                 /var/opt/sourcegraph/blobstore /var/opt/sourcegraph/zoekt
         chown -R redis:redis /var/opt/sourcegraph/redis /var/opt/sourcegraph/redis-cache
         apt-get clean
         rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
     '
+
+    if has_feature observability; then
+        run_root mkdir -p "$ROOTFS/var/opt/sourcegraph/prometheus"
+        run_root chroot "$ROOTFS" chown -R sourcegraph:sourcegraph /var/opt/sourcegraph/prometheus
+    fi
 
     log "staging application files"
     # Rust binaries.
@@ -338,9 +377,13 @@ stage_rootfs() {
                precise-code-intel-worker embeddings; do
         run_root install -m 0755 "$RUST_BIN/$bin" "$ROOTFS/usr/local/bin/$bin"
     done
-    # prom-wrapper is a one-shot/observability helper installed at /bin, the
-    # path the Procfile expects.
-    run_root install -m 0755 "$RUST_BIN/prom-wrapper" "$ROOTFS/bin/prom-wrapper"
+    # prom-wrapper is the observability helper installed at /bin, the path the
+    # Procfile expects.
+    if has_feature observability; then
+        run_root install -m 0755 "$RUST_BIN/prom-wrapper" "$ROOTFS/bin/prom-wrapper"
+    else
+        run_root rm -f "$ROOTFS/bin/prom-wrapper"
+    fi
     # Go sidecars. A reused rootfs may still carry binaries replaced by Rust
     # implementations (migrator, blobstore); remove those stale copies.
     run_root rm -f "$ROOTFS/usr/local/bin/migrator-go"
@@ -378,24 +421,26 @@ chmod 0755 '$ROOTFS/opt/s3proxy/run-docker-container.sh'"
     run_root install -m 0644 "$BUILD_DIR/version.txt" "$ROOTFS/version.txt"
     run_root install -m 0644 "$BUILD_DIR/timestamp.txt" "$ROOTFS/timestamp.txt"
 
-    # Observability: prom-wrapper starts these scripts. They come from the
-    # pinned Sourcegraph source and expect `prometheus`/`alertmanager` on PATH
-    # (Ubuntu's Alertmanager binary is `prometheus-alertmanager`).
-    run_root install -m 0755 "$SRC_DIR/docker-images/prometheus/prometheus.sh" \
-        "$ROOTFS/prometheus.sh"
-    run_root install -m 0755 "$SRC_DIR/docker-images/prometheus/alertmanager.sh" \
-        "$ROOTFS/alertmanager.sh"
-    run_root ln -sf /usr/bin/prometheus-alertmanager "$ROOTFS/usr/bin/alertmanager"
-    run_root mkdir -p "$ROOTFS/sg_config_prometheus" "$ROOTFS/sg_prometheus_add_ons"
-    # Baseline single-container configs + generated rule/target files.
-    run_root cp "$SRC_DIR/docker-images/prometheus/config/prometheus.yml" \
-        "$ROOTFS/sg_config_prometheus/prometheus.yml"
-    run_root cp "$SRC_DIR/docker-images/prometheus/config/alertmanager.yml" \
-        "$ROOTFS/sg_config_prometheus/alertmanager.yml"
-    run_root cp "$REPO_ROOT/docker/package/monitoring/"*_alert_rules.yml \
-        "$ROOTFS/sg_config_prometheus/"
-    run_root cp "$REPO_ROOT/docker/package/monitoring/prometheus_targets.yml" \
-        "$ROOTFS/sg_prometheus_add_ons/prometheus_targets.yml"
+    if has_feature observability; then
+        # Observability: prom-wrapper starts these scripts. They come from the
+        # pinned Sourcegraph source and expect `prometheus`/`alertmanager` on PATH
+        # (Ubuntu's Alertmanager binary is `prometheus-alertmanager`).
+        run_root install -m 0755 "$SRC_DIR/docker-images/prometheus/prometheus.sh" \
+            "$ROOTFS/prometheus.sh"
+        run_root install -m 0755 "$SRC_DIR/docker-images/prometheus/alertmanager.sh" \
+            "$ROOTFS/alertmanager.sh"
+        run_root ln -sf /usr/bin/prometheus-alertmanager "$ROOTFS/usr/bin/alertmanager"
+        run_root mkdir -p "$ROOTFS/sg_config_prometheus" "$ROOTFS/sg_prometheus_add_ons"
+        # Baseline single-container configs + generated rule/target files.
+        run_root cp "$SRC_DIR/docker-images/prometheus/config/prometheus.yml" \
+            "$ROOTFS/sg_config_prometheus/prometheus.yml"
+        run_root cp "$SRC_DIR/docker-images/prometheus/config/alertmanager.yml" \
+            "$ROOTFS/sg_config_prometheus/alertmanager.yml"
+        run_root cp "$REPO_ROOT/docker/package/monitoring/"*_alert_rules.yml \
+            "$ROOTFS/sg_config_prometheus/"
+        run_root cp "$REPO_ROOT/docker/package/monitoring/prometheus_targets.yml" \
+            "$ROOTFS/sg_prometheus_add_ons/prometheus_targets.yml"
+    fi
     run_root sh -c ": >'$ROOTFS/postgres_exporter.yaml'"
 
     # Web bundle (stage-assets enforces a real web.manifest.json). It writes
@@ -424,7 +469,10 @@ chmod 0755 '$ROOTFS/opt/s3proxy/run-docker-container.sh'"
     # (postgres_exporter, su-exec) that are dangling from the host namespace,
     # and chmod would follow them.
     run_root find "$ROOTFS/usr/local/bin" -maxdepth 1 -type f -exec chmod 0755 {} +
-    run_root chmod 0755 "$ROOTFS/server" "$ROOTFS/bin/prom-wrapper"
+    run_root chmod 0755 "$ROOTFS/server"
+    if has_feature observability; then
+        run_root chmod 0755 "$ROOTFS/bin/prom-wrapper"
+    fi
     run_root chmod 0755 "$ROOTFS/postgres-optimize.sh" "$ROOTFS/reindex.sh"
     run_root touch "$ROOTFS/var/lib/nginx/tmp/.keep" "$ROOTFS/var/run/.keep"
     run_root chmod 0644 "$ROOTFS/var/lib/nginx/tmp/.keep" "$ROOTFS/var/run/.keep"
