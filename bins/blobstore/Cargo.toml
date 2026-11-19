@@ -1,0 +1,17 @@
+[package]
+name = "sg-bin-blobstore"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "blobstore"
+path = "src/main.rs"
+
+[dependencies]
+sg-core = { path = "../../crates/base/sg-core" }
+sg-log = { path = "../../crates/base/sg-log" }
+sg-service-blobstore = { path = "../../crates/services/sg-service-blobstore" }
+tokio = { workspace = true }

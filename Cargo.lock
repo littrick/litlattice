@@ -3868,6 +3868,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "sg-bin-blobstore"
+version = "0.1.0"
+dependencies = [
+ "sg-core",
+ "sg-log",
+ "sg-service-blobstore",
+ "tokio",
+]
+
+[[package]]
 name = "sg-bin-embeddings"
 version = "0.1.0"
 dependencies = [
@@ -4359,6 +4369,37 @@ dependencies = [
  "serde",
  "serde_json",
  "sg-jsonx",
+]
+
+[[package]]
+name = "sg-service-blobstore"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "aws-config",
+ "aws-sdk-s3",
+ "bytes",
+ "http 1.5.0",
+ "http-body-util",
+ "hyper 1.12.0",
+ "hyper-util",
+ "md5",
+ "percent-encoding",
+ "quick-xml",
+ "serde",
+ "serde_json",
+ "sg-core",
+ "sg-http",
+ "tempfile",
+ "thiserror 1.0.69",
+ "time",
+ "tokio",
+ "tokio-stream",
+ "tokio-util",
+ "tonic 0.12.3",
+ "tracing",
+ "url",
+ "uuid",
 ]
 
 [[package]]

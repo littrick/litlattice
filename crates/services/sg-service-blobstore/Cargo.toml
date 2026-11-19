@@ -1,0 +1,36 @@
+[package]
+name = "sg-service-blobstore"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+sg-core = { path = "../../base/sg-core" }
+sg-http = { path = "../../net/sg-http" }
+async-trait = { workspace = true }
+bytes = { workspace = true }
+http = { workspace = true }
+http-body-util = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+md5 = { workspace = true }
+percent-encoding = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+time = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+tokio-util = { workspace = true }
+tonic = { workspace = true }
+tracing = { workspace = true }
+url = { workspace = true }
+uuid = { workspace = true }
+quick-xml = "0.29"
+
+[dev-dependencies]
+aws-config = { workspace = true }
+aws-sdk-s3 = { workspace = true }
+tempfile = "3"

@@ -226,7 +226,7 @@ stage_rust() {
     mkdir -p "$RUST_BIN"
     local dir="$RUST_TARGET_DIR/$CARGO_PROFILE"
     for bin in server frontend gitserver searcher symbols worker repo-updater \
-               migrator precise-code-intel-worker embeddings; do
+               migrator blobstore precise-code-intel-worker embeddings; do
         [ -x "$dir/$bin" ] || fail "missing Rust binary: $dir/$bin"
         install -m 0755 "$dir/$bin" "$RUST_BIN/$bin"
         # The workspace builds release with debug = 1; the shipped image does
@@ -245,7 +245,6 @@ stage_go() {
     (
         cd "$SRC_DIR"
         export CGO_ENABLED=0
-        go build -trimpath -buildvcs=false -ldflags="-s -w" -o "$GO_BIN/blobstore" ./cmd/blobstore
         go build -trimpath -buildvcs=false -ldflags="-s -w" -o "$GO_BIN/prom-wrapper" \
             ./docker-images/prometheus/cmd/prom-wrapper
         # The zoekt binaries live in the pinned module dependency (cmd/server/BUILD.bazel ZOEKT_DEPS).
@@ -335,14 +334,13 @@ stage_rootfs() {
     log "staging application files"
     # Rust binaries.
     run_root install -m 0755 "$RUST_BIN/server" "$ROOTFS/server"
-    for bin in frontend gitserver searcher symbols worker repo-updater migrator \
+    for bin in frontend gitserver searcher symbols worker repo-updater migrator blobstore \
                precise-code-intel-worker embeddings; do
         run_root install -m 0755 "$RUST_BIN/$bin" "$ROOTFS/usr/local/bin/$bin"
     done
-    # Go sidecars. A reused rootfs may still carry the Go migrator from an
-    # earlier package; all migration commands now run in the Rust binary.
+    # Go sidecars. A reused rootfs may still carry binaries replaced by Rust
+    # implementations (migrator, blobstore); remove those stale copies.
     run_root rm -f "$ROOTFS/usr/local/bin/migrator-go"
-    run_root install -m 0755 "$GO_BIN/blobstore" "$ROOTFS/usr/local/bin/blobstore"
     for zoekt in zoekt-archive-index zoekt-git-index zoekt-sourcegraph-indexserver zoekt-webserver; do
         run_root install -m 0755 "$GO_BIN/$zoekt" "$ROOTFS/usr/local/bin/$zoekt"
     done
