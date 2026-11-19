@@ -29,6 +29,7 @@ use std::collections::BTreeMap;
 use std::future::Future;
 use std::sync::{Arc, OnceLock};
 
+use async_trait::async_trait;
 use base64::Engine as _;
 use sg_graphql::exec::{Actor, Arguments, ExecError, FieldValue, InputValue, ObjectValue};
 use sg_graphql::json::Json;
@@ -74,6 +75,8 @@ pub trait SearchJobsDatabase: Send + Sync {
         args: &StoreListArgs,
     ) -> Result<Vec<ExhaustiveSearchJob>, String>;
     fn get(&self, actor: StoreActor, id: i64) -> Result<ExhaustiveSearchJob, String>;
+    /// `Store.UserHasAccess`: checked before deleting object storage keys.
+    fn can_access(&self, actor: StoreActor, id: i64) -> Result<(), String>;
     fn create(&self, actor: StoreActor, query: &str, initiator_id: i32) -> Result<i64, String>;
     fn cancel(&self, actor: StoreActor, id: i64, now: OffsetDateTime) -> Result<(), String>;
     fn delete(&self, actor: StoreActor, id: i64) -> Result<(), String>;
@@ -91,11 +94,193 @@ pub trait SearchJobQueryValidator: Send + Sync {
     fn validate(&self, query: &str) -> Result<(), String>;
 }
 
+/// `object.Storage`: the subset `service.DeleteSearchJob` uses for the job's
+/// result and log blobs (`service.go:314-348`).
+#[async_trait]
+pub trait SearchJobsBlobStore: Send + Sync {
+    async fn list(&self, prefix: &str) -> Result<Vec<String>, String>;
+    async fn delete(&self, key: &str) -> Result<(), String>;
+}
+
+/// `search.ObjectStorageConfig` (`internal/search/object_storage.go:17-63`):
+/// `SEARCH_JOBS_UPLOAD_*` with the same defaults as the baseline.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SearchJobsObjectStorageConfig {
+    pub backend: String,
+    pub manage_bucket: bool,
+    pub bucket: String,
+    pub s3: sg_objectstorage::S3Config,
+    pub gcs: sg_objectstorage::GcsConfig,
+}
+
+impl SearchJobsObjectStorageConfig {
+    pub fn from_env() -> Result<Self, String> {
+        let get = |name: &str, default: &str| {
+            std::env::var(name).unwrap_or_else(|_| default.to_owned())
+        };
+        let get_optional = |name: &str| std::env::var(name).ok().filter(|v| !v.is_empty());
+        let get_bool = |name: &str, default: bool| match std::env::var(name) {
+            Ok(value) => parse_go_bool(&value).unwrap_or(default),
+            Err(_) => default,
+        };
+
+        let backend = std::env::var("SEARCH_JOBS_UPLOAD_BACKEND")
+            .unwrap_or_else(|_| "blobstore".to_owned())
+            .to_ascii_lowercase();
+        if !matches!(backend.as_str(), "blobstore" | "s3" | "gcs") {
+            return Err(format!(
+                "invalid backend {backend:?} for SEARCH_JOBS_UPLOAD_BACKEND: must be S3, GCS, or Blobstore"
+            ));
+        }
+
+        let deploy_type = std::env::var("DEPLOY_TYPE").unwrap_or_default();
+        let blobstore_endpoint = if deploy_type == "docker-container" {
+            "http://127.0.0.1:9000"
+        } else {
+            "http://blobstore:9000"
+        };
+
+        let (s3, gcs) = if backend == "gcs" {
+            (
+                sg_objectstorage::S3Config::default(),
+                sg_objectstorage::GcsConfig {
+                    project_id: get("SEARCH_JOBS_UPLOAD_GCP_PROJECT_ID", ""),
+                    credentials_file: get_optional(
+                        "SEARCH_JOBS_UPLOAD_GOOGLE_APPLICATION_CREDENTIALS_FILE",
+                    )
+                    .unwrap_or_default(),
+                    credentials_file_contents: get_optional(
+                        "SEARCH_JOBS_UPLOAD_GOOGLE_APPLICATION_CREDENTIALS_FILE_CONTENT",
+                    )
+                    .unwrap_or_default(),
+                },
+            )
+        } else {
+            let use_ec2_role = get_bool(
+                "SEARCH_JOBS_UPLOAD_AWS_USE_EC2_ROLE_CREDENTIALS",
+                false,
+            );
+            (
+                sg_objectstorage::S3Config {
+                    is_blobstore: false,
+                    region: get("SEARCH_JOBS_UPLOAD_AWS_REGION", "us-east-1"),
+                    endpoint: get("SEARCH_JOBS_UPLOAD_AWS_ENDPOINT", blobstore_endpoint),
+                    use_path_style: get_bool("SEARCH_JOBS_UPLOAD_AWS_USE_PATH_STYLE", false),
+                    access_key_id: if use_ec2_role {
+                        String::new()
+                    } else {
+                        get(
+                            "SEARCH_JOBS_UPLOAD_AWS_ACCESS_KEY_ID",
+                            "AKIAIOSFODNN7EXAMPLE",
+                        )
+                    },
+                    secret_access_key: if use_ec2_role {
+                        String::new()
+                    } else {
+                        get(
+                            "SEARCH_JOBS_UPLOAD_AWS_SECRET_ACCESS_KEY",
+                            "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+                        )
+                    },
+                    session_token: if use_ec2_role {
+                        String::new()
+                    } else {
+                        get_optional("SEARCH_JOBS_UPLOAD_AWS_SESSION_TOKEN").unwrap_or_default()
+                    },
+                },
+                sg_objectstorage::GcsConfig::default(),
+            )
+        };
+
+        Ok(Self {
+            backend,
+            manage_bucket: get_bool("SEARCH_JOBS_UPLOAD_MANAGE_BUCKET", false),
+            bucket: get("SEARCH_JOBS_UPLOAD_BUCKET", "search-jobs"),
+            s3,
+            gcs,
+        })
+    }
+
+    fn storage_config(&self) -> sg_objectstorage::StorageConfig {
+        sg_objectstorage::StorageConfig {
+            backend: self.backend.clone(),
+            manage_bucket: self.manage_bucket,
+            bucket: self.bucket.clone(),
+            s3: self.s3.clone(),
+            gcs: self.gcs.clone(),
+        }
+    }
+}
+
+/// Go `strconv.ParseBool` without the error (the baseline falls back to the
+/// default on malformed values via `env.GetBool`'s error handling).
+fn parse_go_bool(value: &str) -> Option<bool> {
+    match value {
+        "1" | "t" | "T" | "TRUE" | "true" | "True" => Some(true),
+        "0" | "f" | "F" | "FALSE" | "false" | "False" => Some(false),
+        _ => None,
+    }
+}
+
+/// `object.CreateLazyStorage`: construct and `Init` the bucket on first use so
+/// an unreachable blobstore does not fail frontend startup.
+pub struct S3SearchJobsBlobStore {
+    config: sg_objectstorage::StorageConfig,
+    store: tokio::sync::OnceCell<sg_objectstorage::ObjectStore>,
+}
+
+impl S3SearchJobsBlobStore {
+    pub fn new(config: SearchJobsObjectStorageConfig) -> Self {
+        Self {
+            config: config.storage_config(),
+            store: tokio::sync::OnceCell::new(),
+        }
+    }
+
+    async fn ensure_initialized(&self) -> Result<(), String> {
+        self.store
+            .get_or_try_init(|| async {
+                let store = sg_objectstorage::ObjectStore::new(self.config.clone())
+                    .await
+                    .map_err(|error| error.to_string())?;
+                store
+                    .init()
+                    .await
+                    .map_err(|error| error.to_string())?;
+                Ok(store)
+            })
+            .await
+            .map(|_| ())
+    }
+}
+
+#[async_trait]
+impl SearchJobsBlobStore for S3SearchJobsBlobStore {
+    async fn list(&self, prefix: &str) -> Result<Vec<String>, String> {
+        self.ensure_initialized().await?;
+        let store = self.store.get().expect("initialized above");
+        store
+            .list_objects(prefix)
+            .await
+            .map(|objects| objects.into_iter().map(|object| object.key).collect())
+            .map_err(|error| error.to_string())
+    }
+
+    async fn delete(&self, key: &str) -> Result<(), String> {
+        self.ensure_initialized().await?;
+        let store = self.store.get().expect("initialized above");
+        store.delete(key).await.map_err(|error| error.to_string())
+    }
+}
+
 pub struct SearchJobsResolver {
     db: Arc<dyn SearchJobsDatabase>,
     validator: Option<Arc<dyn SearchJobQueryValidator>>,
     /// `conf.Get().ExternalURL` (live).
     external_url: Arc<dyn Fn() -> String + Send + Sync>,
+    /// Search-job result/log blobs (`object.Storage`). `None` keeps the
+    /// database-only behaviour used by transport tests.
+    blobs: Option<Arc<dyn SearchJobsBlobStore>>,
 }
 
 pub type SearchJobsHandle = Arc<SearchJobsResolver>;
@@ -105,12 +290,33 @@ impl SearchJobsResolver {
         db: Arc<dyn SearchJobsDatabase>,
         validator: Option<Arc<dyn SearchJobQueryValidator>>,
         external_url: Arc<dyn Fn() -> String + Send + Sync>,
+        blobs: Option<Arc<dyn SearchJobsBlobStore>>,
     ) -> Self {
         Self {
             db,
             validator,
             external_url,
+            blobs,
         }
+    }
+
+    /// `service.DeleteSearchJob` (`service.go:314-348`): access check, delete
+    /// every result blob under `<id>-`, delete `log-<id>.csv` (best effort),
+    /// then the database rows.
+    fn delete_job(&self, actor: Actor, id: i64) -> Result<(), String> {
+        let db_actor = store_actor(actor);
+        self.db.can_access(db_actor, id)?;
+        if let Some(blobs) = &self.blobs {
+            let keys = block_on(blobs.list(&format!("{id}-")))?;
+            for key in keys {
+                block_on(blobs.delete(&key))
+                    .map_err(|error| format!("deleting key {key:?}: {error}"))?;
+            }
+            // The log file is not guaranteed to exist; the baseline ignores
+            // this error.
+            let _ = block_on(blobs.delete(&format!("log-{id}.csv")));
+        }
+        self.db.delete(db_actor, id)
     }
 
     fn external_url(&self) -> String {
@@ -820,8 +1026,7 @@ pub fn mutation_field(
             let id = arguments.string("id").unwrap_or_default();
             let job_id = unmarshal_search_job_id(id).map_err(ExecError::new)?;
             handle
-                .db
-                .delete(store_actor(actor), job_id)
+                .delete_job(actor, job_id)
                 .map_err(ExecError::new)?;
             Ok(Some(empty_response()))
         }
@@ -891,6 +1096,15 @@ impl SearchJobsDatabase for PgSearchJobsDatabase {
         let pool = self.pool.clone();
         block_on(async move {
             store::get_exhaustive_search_job(&pool, actor, id)
+                .await
+                .map_err(|error| error.to_string())
+        })
+    }
+
+    fn can_access(&self, actor: StoreActor, id: i64) -> Result<(), String> {
+        let pool = self.pool.clone();
+        block_on(async move {
+            store::user_has_access(&pool, actor, id)
                 .await
                 .map_err(|error| error.to_string())
         })
@@ -1086,6 +1300,10 @@ mod tests {
             Ok(jobs)
         }
 
+        fn can_access(&self, _actor: StoreActor, _id: i64) -> Result<(), String> {
+            Ok(())
+        }
+
         fn get(&self, _actor: StoreActor, id: i64) -> Result<ExhaustiveSearchJob, String> {
             self.jobs
                 .iter()
@@ -1174,6 +1392,7 @@ mod tests {
             Arc::new(db),
             Some(validator(true)),
             Arc::new(|| "https://sg.example.com".to_owned()),
+            None,
         ))
     }
 
@@ -1314,6 +1533,7 @@ mod tests {
             db.clone(),
             Some(validator(true)),
             Arc::new(String::new),
+            None,
         ));
         let roots = FrontendRootResolver::with_user(Some(user())).with_search_jobs(Some(handle));
         let response = execute(
@@ -1351,6 +1571,72 @@ mod tests {
                 "delete:42".to_owned()
             ]
         );
+    }
+
+    struct FakeBlobs {
+        keys: Vec<String>,
+        deleted: Mutex<Vec<String>>,
+        fail_keys: Vec<String>,
+    }
+
+    #[async_trait]
+    impl SearchJobsBlobStore for FakeBlobs {
+        async fn list(&self, prefix: &str) -> Result<Vec<String>, String> {
+            Ok(self
+                .keys
+                .iter()
+                .filter(|key| key.starts_with(prefix))
+                .cloned()
+                .collect())
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), String> {
+            if self.fail_keys.iter().any(|fail| fail == key) {
+                return Err("missing".to_owned());
+            }
+            self.deleted.lock().unwrap().push(key.to_owned());
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn delete_removes_result_blobs_before_database_rows() {
+        let db = Arc::new(FakeDb {
+            jobs: vec![job(42, "foo", "completed", 100)],
+            calls: Mutex::new(Vec::new()),
+        });
+        let blobs = Arc::new(FakeBlobs {
+            keys: vec![
+                "42-1".to_owned(),
+                "42-2".to_owned(),
+                "7-other".to_owned(),
+                "log-42.csv".to_owned(),
+            ],
+            deleted: Mutex::new(Vec::new()),
+            // The baseline ignores a missing log object.
+            fail_keys: vec!["log-42.csv".to_owned()],
+        });
+        let handle: SearchJobsHandle = Arc::new(SearchJobsResolver::new(
+            db.clone(),
+            Some(validator(true)),
+            Arc::new(String::new),
+            Some(blobs.clone()),
+        ));
+        let roots = FrontendRootResolver::with_user(Some(user())).with_search_jobs(Some(handle));
+        let response = execute(
+            &roots,
+            &format!(
+                r#"mutation {{ deleteSearchJob(id: "{}") {{ alwaysNil }} }}"#,
+                marshal_search_job_id(42)
+            ),
+            Actor::User { uid: 1 },
+        );
+        assert!(response.errors.is_empty(), "errors: {:?}", response.errors);
+        assert_eq!(
+            *blobs.deleted.lock().unwrap(),
+            vec!["42-1".to_owned(), "42-2".to_owned()]
+        );
+        assert_eq!(*db.calls.lock().unwrap(), vec!["delete:42".to_owned()]);
     }
 
     #[test]

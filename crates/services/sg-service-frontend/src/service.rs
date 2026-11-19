@@ -1780,6 +1780,18 @@ impl Service for FrontendService {
                     .to_owned()
             }) as Arc<dyn Fn() -> String + Send + Sync>
         };
+        let search_jobs_blobs: Option<
+            Arc<dyn crate::search_jobs_graphql::SearchJobsBlobStore>,
+        > = Some(Arc::new(
+            crate::search_jobs_graphql::S3SearchJobsBlobStore::new(
+                crate::search_jobs_graphql::SearchJobsObjectStorageConfig::from_env()
+                    .map_err(|err| {
+                        ServiceError::new(format!(
+                            "search jobs object storage is misconfigured: {err}"
+                        ))
+                    })?,
+            ),
+        ));
         let search_jobs = Arc::new(crate::search_jobs_graphql::SearchJobsResolver::new(
             Arc::new(crate::search_jobs_graphql::PgSearchJobsDatabase::new(
                 session_pool.clone(),
@@ -1790,6 +1802,7 @@ impl Service for FrontendService {
                 )),
             )),
             search_jobs_external_url,
+            search_jobs_blobs,
         ));
         let graphql_deps = graphql_deps.with_search_jobs(search_jobs).map_err(|err| {
             ServiceError::new(format!(

@@ -4377,6 +4377,7 @@ dependencies = [
  "sg-licensing",
  "sg-luasandbox",
  "sg-metrics",
+ "sg-objectstorage",
  "sg-proto",
  "sg-rcache",
  "sg-redis",

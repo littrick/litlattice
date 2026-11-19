@@ -22,6 +22,7 @@ sg-http = { path = "../../net/sg-http" }
 sg-httpcli = { path = "../../net/sg-httpcli" }
 sg-jsonx = { path = "../../domain/sg-jsonx" }
 sg-luasandbox = { path = "../../domain/sg-luasandbox" }
+sg-objectstorage = { path = "../../data/sg-objectstorage" }
 sg-keyring = { path = "../../domain/sg-keyring" }
 sg-licensing = { path = "../../domain/sg-licensing" }
 sg-metrics = { path = "../../base/sg-metrics" }
