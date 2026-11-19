@@ -80,9 +80,10 @@ docker run -d --name sg-rust -p 7080:7080 \
 1. `fetch` — 克隆/检出 `SOURCEGRAPH_COMMIT`（Web UI + Go sidecar）。
 2. `frontend` — `pnpm install --frozen-lockfile`、`pnpm run generate`、
    `pnpm --filter @sourcegraph/web run build`；复制 `client/web/dist`。
-3. `rust` — `cargo build --release --bins`；暂存 10 个服务二进制。
-4. `go` — 从固定的模块依赖构建 `migrator`、`blobstore`、`prom-wrapper` 以及
-   四个 `zoekt-*` 命令。
+3. `rust` — `cargo build --release --bins`；暂存 10 个服务二进制（含
+   `migrator`，数据库迁移已全部由 Rust 实现）。
+4. `go` — 从固定的模块依赖构建 `blobstore`、`prom-wrapper` 以及四个
+   `zoekt-*` 命令。
 5. `syntect` — 构建 `syntect_server`/`scip-ctags`，并去除调试信息。
 6. `rootfs` — 使用标准软件包执行 `debootstrap noble`，配置用户/组、
    运行时目录、应用文件、`/version.txt` = `SOURCEGRAPH_VERSION`，
