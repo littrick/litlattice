@@ -380,8 +380,13 @@ chmod 0755 '$ROOTFS/opt/s3proxy/run-docker-container.sh'"
     run_root sh -c "printf '#!/bin/sh\nexec prometheus \"\$@\"\n' >'$ROOTFS/prometheus.sh'"
     run_root sh -c "printf '#!/bin/sh\nexec alertmanager \"\$@\"\n' >'$ROOTFS/alertmanager.sh'"
     run_root mkdir -p "$ROOTFS/sg_config_prometheus"
-    run_root sh -c "printf 'global: {}\n' >'$ROOTFS/sg_config_prometheus/prometheus.yml'"
-    run_root sh -c "printf 'route: {}\n' >'$ROOTFS/sg_config_prometheus/alertmanager.yml'"
+    # Baseline single-container configs: Alertmanager needs a root route and a
+    # matching receiver, and Prometheus needs the builtin scrape/alertmanager
+    # wiring (prom-wrapper replaces alertmanager.yml on config changes).
+    run_root cp "$SRC_DIR/docker-images/prometheus/config/prometheus.yml" \
+        "$ROOTFS/sg_config_prometheus/prometheus.yml"
+    run_root cp "$SRC_DIR/docker-images/prometheus/config/alertmanager.yml" \
+        "$ROOTFS/sg_config_prometheus/alertmanager.yml"
     run_root sh -c ": >'$ROOTFS/postgres_exporter.yaml'"
     run_root chmod 0755 "$ROOTFS/prometheus.sh" "$ROOTFS/alertmanager.sh"
 
