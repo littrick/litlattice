@@ -327,6 +327,16 @@ stage_syntect() {
     [ -f "$src/Cargo.toml" ] || fail "missing syntax-highlighter source: $src"
     (
         cd "$src"
+        # oniguruma 6.9.x predates GCC 14, which turns several C type
+        # diagnostics into errors by default. Keep them as warnings so the
+        # vendored onig_sys build works on newer Ubuntu runners.
+        export CFLAGS="${CFLAGS:-} -Wno-error=incompatible-pointer-types -Wno-error=implicit-function-declaration -Wno-error=int-conversion"
+        # `-Wreturn-mismatch` only exists on GCC 14+; older compilers treat an
+        # unknown -Wno-error= option as an error.
+        cc_major=$(cc -dumpfullversion -dumpversion 2>/dev/null | cut -d. -f1 || true)
+        if [ "${cc_major:-0}" -ge 14 ] 2>/dev/null; then
+            export CFLAGS="$CFLAGS -Wno-error=return-mismatch"
+        fi
         cargo build --release --locked --bin syntect_server --bin scip-ctags
     )
     mkdir -p "$EXT_DIR"
