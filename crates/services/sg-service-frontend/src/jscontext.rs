@@ -366,6 +366,11 @@ pub struct JsContext {
     /// `frontendCodyProConfig` is only set on dotcom; GAP: always null here.
     #[serde(rename = "frontendCodyProConfig")]
     pub frontend_cody_pro_config: Option<Value>,
+
+    /// SvelteKit `_sk/index.html` fragments when this request should render the
+    /// Svelte app. Not part of `window.context`.
+    #[serde(skip)]
+    pub svelte_shell: Option<crate::svelte_kit::SvelteShell>,
 }
 
 /// `schema.Branding` (`schema/schema.go:586-596`), declaration order.
@@ -1388,6 +1393,7 @@ pub async fn new_js_context(
         },
 
         frontend_cody_pro_config: None,
+        svelte_shell: None,
     };
     cody_gate(context, cody_licensed)
 }

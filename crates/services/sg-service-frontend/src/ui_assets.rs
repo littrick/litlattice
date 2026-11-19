@@ -355,6 +355,8 @@ pub struct ShellInput<'a> {
     /// `Common.Context` (`window.context`). `None` keeps the offline shell's
     /// historical `window.context = {}` (no database in sync tests).
     pub js_context: Option<&'a crate::jscontext::JsContext>,
+    /// SvelteKit injections when this request renders the Svelte app.
+    pub svelte: Option<&'a crate::svelte_kit::SvelteShell>,
 }
 
 impl ShellInput<'_> {
@@ -409,11 +411,23 @@ pub fn render_shell(input: &ShellInput<'_>) -> String {
     }
     html.push_str("\t\twindow.pageError = null\n");
     html.push_str("\t</script>\n");
-    html.push_str("</head>\n\n<body>\n\t<div id=\"root\"></div>\n");
-    html.push_str(&format!(
-        "\t<script src=\"{}\" type=\"module\"></script>\n",
-        input.bundle(BundleField::MainJs)
-    ));
+    if let Some(svelte) = input.svelte {
+        html.push_str(&svelte.head);
+        html.push('\n');
+    }
+    html.push_str("</head>\n\n");
+    if let Some(svelte) = input.svelte {
+        html.push_str("<body data-sveltekit-preload-data data-sveltekit-preload-code=\"hover\">\n");
+        html.push_str("\t<div ignore-csp style=\"display: contents\">");
+        html.push_str(&svelte.body);
+        html.push_str("</div>\n");
+    } else {
+        html.push_str("<body>\n\t<div id=\"root\"></div>\n");
+        html.push_str(&format!(
+            "\t<script src=\"{}\" type=\"module\"></script>\n",
+            input.bundle(BundleField::MainJs)
+        ));
+    }
     html.push_str("\t<noscript>\n\t\t<p>Sourcegraph is a web-based code search and navigation tool for dev teams. Search, navigate, and review code. Find answers.</p>\n\t\t<br><br><br>\n\t\tYou need to enable JavaScript to run this app.\n\t</noscript>\n");
     html.push_str("</body>\n\n</html>\n");
     html
@@ -539,10 +553,28 @@ async fn build_js_context<B>(
     deps: &AppDeps,
 ) -> Option<crate::jscontext::JsContext> {
     let pool = deps.js_context_pool.as_ref()?;
-    Some(
+    let mut context =
         crate::jscontext::new_js_context(pool, deps.more.actor, js_context_meta(req), env, config)
-            .await,
+            .await;
+
+    let shell = deps.ui_assets.as_deref().and_then(crate::svelte_kit::load_shell);
+    context.svelte_kit = crate::svelte_kit::js_context(
+        pool,
+        deps.more.actor.uid(),
+        shell.is_some(),
+        env.dotcom,
     )
+    .await;
+    if let Some(shell) = shell {
+        if crate::svelte_kit::enabled_for_request_path(
+            req.uri().path(),
+            &context.svelte_kit.enabled_routes,
+        ) {
+            context.svelte_shell = Some(shell);
+        }
+    }
+
+    Some(context)
 }
 
 /// Async `RouteName::Ui` dispatch (M9.49d). It is identical to [`serve_ui`]
@@ -1107,6 +1139,7 @@ fn shell_input<'a>(
     indexed: bool,
     js_context: Option<&'a crate::jscontext::JsContext>,
 ) -> ShellInput<'a> {
+    let svelte = js_context.and_then(|context| context.svelte_shell.as_ref());
     // `newCommon`: the default mark is preloaded unless custom branding defines
     // a light or dark logo.
     let preloads = if config.branding_has_theme {
@@ -1127,6 +1160,7 @@ fn shell_input<'a>(
         preloads,
         indexed,
         js_context,
+        svelte,
     }
 }
 

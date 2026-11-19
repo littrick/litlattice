@@ -23,8 +23,10 @@
 #                  alert rules and the metrics target list; output names get a
 #                  `-observability` suffix;
 #   docker         after writing the rootfs tarball, import it as a Docker image
-#                  and save an additional `<name>.docker.tar` artifact.
-# Combine them as `--features observability,docker`.
+#                  and save an additional `<name>.docker.tar` artifact;
+#   sveltekit      build and ship the SvelteKit web app (`_sk`) and expose the
+#                  opt-in "Try a new, faster experience" toggle.
+# Combine them as `--features observability,docker,sveltekit`.
 #
 # Important environment:
 #   BUILD_DIR        build workspace (default <repo>/.package-build)
@@ -138,8 +140,8 @@ done
 FEATURES=${FEATURES// /}
 for feature in ${FEATURES//,/ }; do
     case "$feature" in
-        observability | docker) ;;
-        *) fail "unknown feature: $feature (supported: observability, docker)" ;;
+        observability | docker | sveltekit) ;;
+        *) fail "unknown feature: $feature (supported: observability, docker, sveltekit)" ;;
     esac
 done
 
@@ -152,7 +154,10 @@ has_feature() {
 # image artifact, `observability` changes the rootfs/image contents.
 FEATURE_SUFFIX=""
 if has_feature observability; then
-    FEATURE_SUFFIX="-observability"
+    FEATURE_SUFFIX="$FEATURE_SUFFIX-observability"
+fi
+if has_feature sveltekit; then
+    FEATURE_SUFFIX="$FEATURE_SUFFIX-sveltekit"
 fi
 OUT_NAME=${OUT_NAME:-sourcegraph-server-rust-${SOURCEGRAPH_VERSION}${FEATURE_SUFFIX}-fs.tar.gz}
 IMAGE_TAG=${IMAGE_TAG:-sourcegraph/server:rust-${SOURCEGRAPH_VERSION}${FEATURE_SUFFIX}}
@@ -234,7 +239,18 @@ stage_frontend() {
         # esbuild live-reload EventSource (/.assets/esbuild) in the bundle.
         # The Bazel production build sets NODE_ENV=production; do the same.
         NODE_ENV=production pnpm --filter @sourcegraph/web run build
+        if has_feature sveltekit; then
+            DEPLOY_TYPE=dev pnpm --filter @sourcegraph/web-sveltekit run build
+        fi
     )
+    if has_feature sveltekit; then
+        [ -f "$SRC_DIR/client/web/dist/_sk/index.html" ] ||
+            fail "sveltekit feature enabled but the build did not produce client/web/dist/_sk/index.html"
+    else
+        # The source tree is cached across builds; never leak a previous
+        # SvelteKit build into a feature-off image.
+        rm -rf "$SRC_DIR/client/web/dist/_sk"
+    fi
     [ -f "$SRC_DIR/client/web/dist/web.manifest.json" ] ||
         fail "web build did not produce client/web/dist/web.manifest.json"
     rm -rf "$DIST_DIR"
@@ -515,6 +531,12 @@ stage_package() {
     fi
     if ! has_feature observability && [ -e "$ROOTFS/bin/prom-wrapper" ]; then
         fail "observability content present in $ROOTFS but the feature is off; rebuild the rootfs"
+    fi
+    if has_feature sveltekit && [ ! -f "$ROOTFS/assets-dist/_sk/index.html" ]; then
+        fail "sveltekit feature enabled but the rootfs lacks assets-dist/_sk/index.html; build the frontend stage with the feature"
+    fi
+    if ! has_feature sveltekit && [ -e "$ROOTFS/assets-dist/_sk/index.html" ]; then
+        fail "SvelteKit assets present in the rootfs but the feature is off; rebuild the frontend/rootfs stages"
     fi
 
     log "writing $OUT_NAME"

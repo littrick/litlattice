@@ -196,6 +196,7 @@ pub mod site_configuration_query;
 pub mod site_configuration_secrets;
 pub mod slow_requests_tracer;
 pub mod survey_responses;
+pub mod svelte_kit;
 pub mod symbol_search;
 pub mod symbols_client;
 pub mod teams_graphql;

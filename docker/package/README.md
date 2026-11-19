@@ -65,6 +65,7 @@ sudo -E ./docker/package/package.sh --features observability,docker
 | --- | --- | --- |
 | `observability` | 安装 Prometheus/Alertmanager/prom-wrapper、基线配置、告警规则与 target 列表 | 主包名加 `-observability` 后缀 |
 | `docker` | 用 rootfs tarball 执行 `docker import` | `<name>.docker.tar` 镜像包 + sha256（tag 由 `IMAGE_TAG` 决定） |
+| `sveltekit` | 构建并打包 SvelteKit Web UI（`_sk`），启用 “Try a new, faster experience” opt-in | 主包名加 `-sveltekit` 后缀 |
 
 未开启任何特性时产物位于 `.package-build/out/`：
 
@@ -125,6 +126,10 @@ docker run -d --name sg-rust -p 7080:7080 \
   `DISABLE_OBSERVABILITY=`（空值）启动 Prometheus/Alertmanager，
   并用 `-p 9091:9090` 暴露 Prometheus。Grafana 仍未打包，`/server` 在
   二进制缺失时跳过 grafana 进程。
+- `sveltekit` 特性会构建 `client/web-sveltekit` 并把 `_sk` 放入
+  `/assets-dist`；前端根据用户级 `web-next`/`web-next-rollout` feature flag
+  渲染 Svelte 外壳，顶部 “Try a new, faster UX” 开关可开启/退出。未开启该
+  特性时 `_sk` 不存在，服务端会把 `svelteKit.showToggle` 设为 false。
 - 混合/zoekt 搜索已禁用（`DISABLE_HYBRID_SEARCH=true`）；为保持一致性仍随附
   zoekt 二进制，但不运行索引服务器。
 - `/var/opt/sourcegraph/postgresql{,-markers}` 有意**不**预先创建：`/server`
