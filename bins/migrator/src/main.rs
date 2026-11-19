@@ -34,7 +34,7 @@ pub const DEFAULT_DELEGATE: &str = "migrator-go";
 pub const MIGRATIONS_DIR_ENV: &str = "MIGRATIONS_DIR";
 
 /// Commands implemented by this binary.
-const LOCAL_COMMANDS: &[&str] = &["up", "upto", "downto", "validate"];
+const LOCAL_COMMANDS: &[&str] = &["up", "upto", "downto", "validate", "add-log", "describe"];
 
 fn main() {
     sg_core::sanity_check();
@@ -102,6 +102,66 @@ async fn run_local(command: &str, args: &[String]) -> Result<(), MigratorError> 
                 None,
                 MigrationOptions::default(),
             )
+        }
+        "describe" => {
+            let options = cli::parse_describe_options(args)?;
+            let schema_name = options
+                .schema
+                .ok_or_else(|| MigratorError::new("the -schema flag is required for describe"))?;
+            let format = options
+                .format
+                .ok_or_else(|| MigratorError::new("the -format flag is required for describe"))?;
+            if !matches!(format.as_str(), "psql" | "json") {
+                return Err(MigratorError::new(format!(
+                    "unrecognized format {format:?} (must be json or psql)"
+                )));
+            }
+            let root = migrations_dir();
+            let schema = schemas::resolve_schema_in(&root, &schema_name)?;
+            let dsn = dsn_for_schema(&schema_name);
+            let pool = sqlx::postgres::PgPoolOptions::new()
+                .max_connections(4)
+                .connect(&dsn)
+                .await
+                .map_err(|error| {
+                    MigratorError::new(format!(
+                        "failed to connect to the {schema_name} database: {error}"
+                    ))
+                })?;
+            let store = Store::new(
+                pool,
+                schema.name.clone(),
+                schema.migrations_table_name.clone(),
+            );
+            let description = sg_migrator::describe::describe(&store).await?;
+            let text = if format == "psql" {
+                sg_migrator::describe::format_psql(&description)
+            } else {
+                sg_migrator::describe::format_json(&description)?
+            };
+            if let Some(path) = options.out {
+                if !options.force && std::path::Path::new(&path).exists() {
+                    return Err(MigratorError::new(format!("file {path:?} already exists")));
+                }
+                std::fs::write(&path, text).map_err(|error| {
+                    MigratorError::new(format!("failed to write {path:?}: {error}"))
+                })?;
+            } else {
+                print!("{text}");
+            }
+            return Ok(());
+        }
+        "add-log" => {
+            let options = cli::parse_add_log_options(args)?;
+            let version = options.version.ok_or_else(|| {
+                MigratorError::new("the -version flag is required for add-log")
+            })?;
+            if options.schema.is_none() {
+                return Err(MigratorError::new("the -schema flag is required for add-log"));
+            }
+            let schema_names = split_schema_option(&options.schema);
+            let runner = build_runner(&migrations_dir(), &resolve_schema_names(&schema_names)?).await?;
+            return runner.add_log(&schema_names, version, options.up).await;
         }
         other => {
             return Err(MigratorError::new(format!(

@@ -3,17 +3,158 @@
 //! `internal/database/migration/runner`: apply/revert migrations and validate
 //! schema state.
 //!
-//! Milestone scope: targeted up/down and validation for clean schemas.
-//! Concurrent-index polling (`createIndexConcurrently`) and the stitched
-//! multi-version upgrade/downgrade commands are not implemented here; they are
-//! delegated to `migrator-go` by the binary.
+//! The up path mirrors Go's `runSchema`/`applyMigrations` loop: each pass holds
+//! the schema advisory lock, re-reads the migration logs, and applies as much
+//! as it can. `CREATE INDEX CONCURRENTLY` migrations inspect `pg_index` /
+//! `pg_stat_progress_create_index`, skip creation when a valid index already
+//! exists, repair an invalid idle index, and release the advisory lock before
+//! creating the index (then re-acquire it for the remaining definitions).
+
+use std::collections::BTreeSet;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
 
 use base64::Engine as _;
 use sha1::{Digest, Sha1};
+use sqlx::Row as _;
 
 use crate::error::MigratorError;
-use crate::store::{MigrationVersions, Store};
+use crate::store::{LockGuard, MigrationVersions, Store};
 use crate::types::{Definition, Schema};
+
+/// Go's `indexPollInterval` (`run.go`): wait between system-catalog polls while
+/// an index creation is in progress.
+const INDEX_POLL_INTERVAL: Duration = Duration::from_secs(5);
+
+/// `store.indexStatusQuery` (`store.go`), with stable column aliases.
+const INDEX_STATUS_QUERY: &str = r#"
+SELECT
+	pi.indisvalid AS is_valid,
+	pi.indisready AS is_ready,
+	pi.indislive AS is_live,
+	p.phase AS phase,
+	p.lockers_total AS lockers_total,
+	p.lockers_done AS lockers_done,
+	p.blocks_total AS blocks_total,
+	p.blocks_done AS blocks_done,
+	p.tuples_total AS tuples_total,
+	p.tuples_done AS tuples_done
+FROM pg_catalog.pg_stat_all_indexes ai
+JOIN pg_catalog.pg_index pi ON pi.indexrelid = ai.indexrelid
+LEFT JOIN pg_catalog.pg_stat_progress_create_index p ON p.relid = ai.relid AND p.index_relid = ai.indexrelid
+WHERE
+	ai.relname = $1 AND
+	ai.indexrelname = $2
+"#;
+
+/// `shared.IndexStatus` (`shared/types.go`): validity flags plus the progress
+/// of an in-flight `CREATE INDEX CONCURRENTLY`, if any.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct IndexStatus {
+    is_valid: bool,
+    is_ready: bool,
+    is_live: bool,
+    phase: Option<String>,
+    lockers_done: Option<i64>,
+    lockers_total: Option<i64>,
+    blocks_done: Option<i64>,
+    blocks_total: Option<i64>,
+    tuples_done: Option<i64>,
+    tuples_total: Option<i64>,
+}
+
+/// What [`Runner::create_index_concurrently`] should do for the observed
+/// index state. Mirrors the branches in Go's `createIndexConcurrently`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IndexPlan {
+    /// Index exists and is valid: record a successful log, run no SQL.
+    AlreadyValid,
+    /// Index exists but is invalid and no creation is in progress: drop it via
+    /// the down query, then re-create.
+    RepairThenCreate,
+    /// Index exists and another session is creating it: wait and re-poll.
+    WaitForCreation,
+    /// Index is missing: create it.
+    Create,
+}
+
+fn classify_index_status(exists: bool, status: &IndexStatus) -> IndexPlan {
+    if exists && status.is_valid {
+        IndexPlan::AlreadyValid
+    } else if exists && status.phase.is_none() {
+        IndexPlan::RepairThenCreate
+    } else if exists {
+        IndexPlan::WaitForCreation
+    } else {
+        IndexPlan::Create
+    }
+}
+
+/// `42P07` (`duplicate_table`) means another migrator created the index first.
+fn is_duplicate_object_error(error: &sqlx::Error) -> bool {
+    matches!(
+        error,
+        sqlx::Error::Database(database_error)
+            if database_error.code().as_deref() == Some("42P07")
+    )
+}
+
+fn decode_index_status_error(error: sqlx::Error) -> MigratorError {
+    MigratorError::new(format!("failed to decode index status: {error}"))
+}
+
+/// Best-effort port of Go's `logIndexStatus`; progress is only rendered while a
+/// creation operation is visible in `pg_stat_progress_create_index`.
+fn log_index_status(
+    schema: &str,
+    table_name: &str,
+    index_name: &str,
+    status: &IndexStatus,
+    exists: bool,
+) {
+    match &status.phase {
+        Some(phase) => tracing::info!(
+            schema = %schema,
+            table_name = %table_name,
+            index_name = %index_name,
+            exists,
+            is_valid = status.is_valid,
+            is_ready = status.is_ready,
+            is_live = status.is_live,
+            phase = %phase,
+            lockers = ?(status.lockers_done, status.lockers_total),
+            blocks = ?(status.blocks_done, status.blocks_total),
+            tuples = ?(status.tuples_done, status.tuples_total),
+            "Checked progress of index creation"
+        ),
+        None => tracing::info!(
+            schema = %schema,
+            table_name = %table_name,
+            index_name = %index_name,
+            exists,
+            is_valid = status.is_valid,
+            is_ready = status.is_ready,
+            is_live = status.is_live,
+            "Checked index status"
+        ),
+    }
+}
+
+/// `filterAppliedDefinitions`: keep the definitions that still need work in the
+/// requested direction, preserving order.
+fn filter_applied_definitions(
+    definitions: &[Definition],
+    applied: &[i32],
+    up: bool,
+) -> Vec<Definition> {
+    let applied: BTreeSet<i32> = applied.iter().copied().collect();
+    definitions
+        .iter()
+        .filter(|definition| applied.contains(&definition.id) != up)
+        .cloned()
+        .collect()
+}
 
 /// `runner.PrivilegedMode`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -89,6 +230,31 @@ impl Runner {
         Ok(())
     }
 
+    /// `add-log` (`cliutil/addlog.go`): append a completed migration log row
+    /// to every selected schema, running no migration SQL.
+    ///
+    /// Go's `setupStore` resolves the store through the runner's factory,
+    /// which runs `connections.initStore` (`EnsureSchemaTable` followed by
+    /// `BackfillSchemaVersions`) before the command calls `WithMigrationLog`
+    /// with a no-op callback. This mirrors that path per selected schema via
+    /// [`prepare_store`] and [`Store::add_log`].
+    ///
+    /// Schemas are chosen with [`Runner::selected`], like the other commands;
+    /// the first error aborts the loop. As in Go, no advisory lock is taken
+    /// and duplicate versions are not detected.
+    pub async fn add_log(
+        &self,
+        schema_names: &[String],
+        version: i32,
+        up: bool,
+    ) -> Result<(), MigratorError> {
+        for entry in self.selected(schema_names) {
+            prepare_store(entry).await?;
+            entry.store.add_log(version, up).await?;
+        }
+        Ok(())
+    }
+
     /// `validate`: every leaf migration must be applied, with no dirty state.
     pub async fn validate(&self, schema_names: &[String]) -> Result<(), MigratorError> {
         let options = RunOptions {
@@ -134,55 +300,392 @@ impl Runner {
         options: &RunOptions,
     ) -> Result<(), MigratorError> {
         prepare_store(entry).await?;
-        let guard = entry.store.lock().await?;
 
-        let result = async {
+        // Compute the delta once from the current view of the schema. Each pass
+        // of `apply_migrations` re-reads versions and re-filters this set, so a
+        // concurrent migrator's progress is observed.
+        let versions = entry.store.versions().await?;
+        let (definitions, up) = match direction {
+            Direction::Up => {
+                let targets = match target {
+                    Some(id) => vec![id],
+                    None => entry
+                        .schema
+                        .definitions
+                        .leaves()
+                        .into_iter()
+                        .map(|definition| definition.id)
+                        .collect(),
+                };
+                (entry.schema.definitions.up(&versions.applied, &targets)?, true)
+            }
+            Direction::Down => {
+                let target = target.ok_or_else(|| {
+                    MigratorError::new("downto requires a target migration version")
+                })?;
+                (
+                    entry.schema.definitions.down(&versions.applied, &[target])?,
+                    false,
+                )
+            }
+        };
+
+        // Mirror Go's `runSchema` retry loop: a pass ends early when it must
+        // release the advisory lock to create an index concurrently (or while
+        // waiting for another migrator's index creation). Re-acquire and apply
+        // the remainder.
+        while self.apply_migrations(entry, &definitions, up, options).await? {}
+        Ok(())
+    }
+
+    /// A single iteration of Go's `applyMigrations`.
+    ///
+    /// Returns `true` when the caller should run another pass: either because
+    /// this pass released the advisory lock to create an index concurrently, or
+    /// because another migrator is actively creating an index (in which case
+    /// the pass also sleeps before returning).
+    async fn apply_migrations(
+        &self,
+        entry: &SchemaStore,
+        definitions: &[Definition],
+        up: bool,
+        options: &RunOptions,
+    ) -> Result<bool, MigratorError> {
+        let mut guard = Some(entry.store.lock().await?);
+        let mut retry = false;
+        let mut dropped_lock = false;
+
+        let result: Result<(), MigratorError> = async {
+            // Re-fetch the schema state now that we hold the lock; another
+            // migrator may have made progress since our initial read.
             let versions = entry.store.versions().await?;
-            check_dirty(&entry.schema, &versions, options)?;
 
-            let (definitions, up) = match direction {
-                Direction::Up => {
-                    let targets = match target {
-                        Some(id) => vec![id],
-                        None => entry
-                            .schema
-                            .definitions
-                            .leaves()
-                            .into_iter()
-                            .map(|definition| definition.id)
-                            .collect(),
-                    };
-                    (entry.schema.definitions.up(&versions.applied, &targets)?, true)
+            // Detect dirty state, but tolerate pending logs that correspond to
+            // an index creation in progress (another migrator will finish it).
+            if self
+                .schema_state_requires_retry(entry, &versions, options)
+                .await?
+            {
+                retry = true;
+                return Ok(());
+            }
+
+            let remaining = filter_applied_definitions(definitions, &versions.applied, up);
+            if remaining.is_empty() {
+                return Ok(());
+            }
+
+            self.check_privileged(entry, &remaining, up, options)?;
+
+            for definition in &remaining {
+                if up && definition.is_create_index_concurrently {
+                    // Handle `CREATE INDEX CONCURRENTLY` specially. When this
+                    // returns `true` the lock has been released; stop applying
+                    // and let the next pass re-acquire it.
+                    if self
+                        .create_index_concurrently(entry, definition, &mut guard)
+                        .await?
+                    {
+                        dropped_lock = true;
+                        return Ok(());
+                    }
+                } else {
+                    // All other migrations apply uniformly under the lock.
+                    self.apply(entry, definition, up, options).await?;
                 }
-                Direction::Down => {
-                    let target = target.ok_or_else(|| {
-                        MigratorError::new("downto requires a target migration version")
-                    })?;
-                    (
-                        entry.schema.definitions.down(&versions.applied, &[target])?,
-                        false,
-                    )
-                }
-            };
-
-            self.check_privileged(entry, &definitions, up, options)?;
-
-            for definition in &definitions {
-                self.apply(entry, definition, up, options).await?;
             }
             Ok(())
         }
         .await;
 
-        let unlock = guard.unlock().await;
-        match (result, unlock) {
-            (Ok(()), Ok(())) => Ok(()),
-            (Err(error), Ok(())) => Err(error),
-            (Ok(()), Err(error)) => Err(error),
-            (Err(error), Err(unlock_error)) => Err(MigratorError::new(format!(
-                "{error}; additionally failed to release advisory lock: {unlock_error}"
-            ))),
+        // Release the lock if the concurrent-index path did not already do so.
+        let unlock = match guard.take() {
+            Some(guard) => guard.unlock().await,
+            None => Ok(()),
+        };
+        combine_run(result, unlock)?;
+
+        if retry {
+            // An index creation is in progress elsewhere. Wait before
+            // re-querying so we do not flood the system catalog.
+            tokio::time::sleep(INDEX_POLL_INTERVAL).await;
+            return Ok(true);
         }
+
+        Ok(dropped_lock)
+    }
+
+    /// Go's `validateSchemaState` (the retry-relevant portions): returns `true`
+    /// when the only pending migrations are concurrent-index definitions whose
+    /// creation is visibly in progress, meaning the caller should wait and
+    /// re-invoke. Failed logs (and dead pending logs) surface as dirty errors.
+    async fn schema_state_requires_retry(
+        &self,
+        entry: &SchemaStore,
+        versions: &MigrationVersions,
+        options: &RunOptions,
+    ) -> Result<bool, MigratorError> {
+        // Failed logs require administrator intervention; reuse the existing
+        // error text (honoring `ignore_single_dirty_log`).
+        let failed_only = MigrationVersions {
+            applied: versions.applied.clone(),
+            pending: Vec::new(),
+            failed: versions.failed.clone(),
+        };
+        check_dirty(&entry.schema, &failed_only, options)?;
+
+        if versions.pending.is_empty() || options.ignore_single_pending_log {
+            return Ok(false);
+        }
+
+        let mut active = false;
+        let mut dead: Vec<i32> = Vec::new();
+        for version in &versions.pending {
+            let definition = entry.schema.definitions.get_by_id(*version);
+            let mut active_creation = false;
+            if let Some(definition) = definition {
+                if definition.is_create_index_concurrently {
+                    if let Some((table_name, index_name)) =
+                        crate::definition::index_metadata(&definition.up_sql)
+                    {
+                        let (status, exists) =
+                            self.index_status(entry, &table_name, &index_name).await?;
+                        log_index_status(
+                            &entry.schema.name,
+                            &table_name,
+                            &index_name,
+                            &status,
+                            exists,
+                        );
+                        active_creation = exists && status.phase.is_some();
+                    }
+                }
+            }
+
+            if active_creation {
+                active = true;
+            } else {
+                dead.push(*version);
+            }
+        }
+
+        if !dead.is_empty() {
+            let pending_only = MigrationVersions {
+                applied: Vec::new(),
+                pending: dead,
+                failed: Vec::new(),
+            };
+            check_dirty(&entry.schema, &pending_only, options)?;
+        }
+
+        Ok(active)
+    }
+
+    /// Go's `createIndexConcurrently`. Queries the target index's status,
+    /// records a log without executing SQL when it already exists and is valid,
+    /// repairs an invalid idle index, and otherwise releases the advisory lock
+    /// and (re)creates the index outside a transaction.
+    ///
+    /// Returns `true` when the advisory lock was released; the caller must then
+    /// re-acquire it on the next pass before applying more migrations.
+    async fn create_index_concurrently(
+        &self,
+        entry: &SchemaStore,
+        definition: &Definition,
+        guard: &mut Option<LockGuard>,
+    ) -> Result<bool, MigratorError> {
+        let (table_name, index_name) =
+            crate::definition::index_metadata(&definition.up_sql).ok_or_else(|| {
+                MigratorError::new(format!(
+                    "failed to determine index metadata for concurrent migration {}",
+                    definition.id
+                ))
+            })?;
+
+        let mut unlocked = false;
+        loop {
+            let (status, exists) = self.index_status(entry, &table_name, &index_name).await?;
+            log_index_status(&entry.schema.name, &table_name, &index_name, &status, exists);
+
+            let plan = classify_index_status(exists, &status);
+            match plan {
+                IndexPlan::AlreadyValid => {
+                    // Index exists and is valid. It may have been created out
+                    // of band, so still record a successful migration log.
+                    let version = definition.id;
+                    entry
+                        .store
+                        .with_migration_log(version, true, |_pool| async { Ok(()) })
+                        .await
+                        .map_err(|error| {
+                            MigratorError::new(format!(
+                                "failed to create migration log {version}: {error}"
+                            ))
+                        })?;
+                    return Ok(unlocked);
+                }
+                IndexPlan::RepairThenCreate => {
+                    // Invalid index with no creation in progress: drop it via
+                    // the down query (while still holding the lock), then
+                    // re-create below.
+                    self.drop_invalid_index(entry, definition).await?;
+                }
+                IndexPlan::WaitForCreation | IndexPlan::Create => {}
+            }
+
+            // Concurrent index creation cannot proceed while this session
+            // holds an advisory lock that other transactions may be waiting
+            // on. Release it (idempotent: only the first release acts).
+            if let Some(held) = guard.take() {
+                held.unlock().await?;
+            }
+            unlocked = true;
+
+            if plan == IndexPlan::WaitForCreation {
+                // Another session is creating the index; wait and re-poll.
+                tokio::time::sleep(INDEX_POLL_INTERVAL).await;
+                continue;
+            }
+
+            // Create the index. If another migrator wins the race (42P07), do
+            // not move on: re-poll until the index is usable.
+            if self
+                .create_index(entry, definition, &table_name, &index_name)
+                .await?
+            {
+                continue;
+            }
+
+            return Ok(true);
+        }
+    }
+
+    /// Drop an invalid index using the migration's down query, recording a
+    /// (successful) down log as Go's repair path does.
+    async fn drop_invalid_index(
+        &self,
+        entry: &SchemaStore,
+        definition: &Definition,
+    ) -> Result<(), MigratorError> {
+        let sql = definition.down_sql.clone();
+        let version = definition.id;
+        entry
+            .store
+            .with_migration_log(version, false, move |pool| async move {
+                let mut tx = pool.begin().await.map_err(|error| {
+                    MigratorError::new(format!(
+                        "failed to open transaction to drop invalid index for migration {version}: {error}"
+                    ))
+                })?;
+                sqlx::raw_sql(&sql).execute(&mut *tx).await.map_err(|error| {
+                    MigratorError::new(format!(
+                        "failed to drop invalid index for migration {version}:\n```\n{sql}\n```\n{error}"
+                    ))
+                })?;
+                tx.commit().await.map_err(|error| {
+                    MigratorError::new(format!(
+                        "failed to commit index drop for migration {version}: {error}"
+                    ))
+                })
+            })
+            .await
+    }
+
+    /// Execute the `CREATE INDEX CONCURRENTLY` statement outside a transaction
+    /// and record the migration log. Returns `true` when the statement raced
+    /// with another migrator (`42P07`), meaning the caller should re-poll.
+    async fn create_index(
+        &self,
+        entry: &SchemaStore,
+        definition: &Definition,
+        table_name: &str,
+        index_name: &str,
+    ) -> Result<bool, MigratorError> {
+        let sql = definition.up_sql.clone();
+        let version = definition.id;
+        let raced = Arc::new(AtomicBool::new(false));
+        let raced_in_closure = Arc::clone(&raced);
+
+        tracing::info!(
+            schema = %entry.schema.name,
+            migration_id = version,
+            table_name = %table_name,
+            index_name = %index_name,
+            "Creating index concurrently"
+        );
+
+        entry
+            .store
+            .with_migration_log(version, true, move |pool| async move {
+                match sqlx::raw_sql(&sql).execute(&pool).await {
+                    Ok(_) => Ok(()),
+                    // Another migrator created the index first. Swallow the
+                    // duplicate-object error so we do not write a failed log,
+                    // and let the caller re-poll the catalog.
+                    Err(error) if is_duplicate_object_error(&error) => {
+                        raced_in_closure.store(true, Ordering::SeqCst);
+                        Ok(())
+                    }
+                    Err(error) => Err(MigratorError::new(format!(
+                        "failed to apply migration {version}:\n```\n{sql}\n```\n{error}"
+                    ))),
+                }
+            })
+            .await?;
+
+        Ok(raced.load(Ordering::SeqCst))
+    }
+
+    /// `Store.IndexStatus` (`store.go:420-447`): query the validity flags and,
+    /// if a creation is in flight, its progress. The boolean is Go's `exists`
+    /// flag (whether a matching index row was found).
+    async fn index_status(
+        &self,
+        entry: &SchemaStore,
+        table_name: &str,
+        index_name: &str,
+    ) -> Result<(IndexStatus, bool), MigratorError> {
+        let row = sqlx::query(INDEX_STATUS_QUERY)
+            .bind(table_name)
+            .bind(index_name)
+            .fetch_optional(&entry.store.pool)
+            .await
+            .map_err(|error| {
+                MigratorError::new(format!(
+                    "failed to query state of index {table_name:?}.{index_name:?}: {error}"
+                ))
+            })?;
+
+        let Some(row) = row else {
+            return Ok((IndexStatus::default(), false));
+        };
+
+        let status = IndexStatus {
+            is_valid: row.try_get("is_valid").map_err(decode_index_status_error)?,
+            is_ready: row.try_get("is_ready").map_err(decode_index_status_error)?,
+            is_live: row.try_get("is_live").map_err(decode_index_status_error)?,
+            phase: row.try_get("phase").map_err(decode_index_status_error)?,
+            lockers_done: row
+                .try_get("lockers_done")
+                .map_err(decode_index_status_error)?,
+            lockers_total: row
+                .try_get("lockers_total")
+                .map_err(decode_index_status_error)?,
+            blocks_done: row
+                .try_get("blocks_done")
+                .map_err(decode_index_status_error)?,
+            blocks_total: row
+                .try_get("blocks_total")
+                .map_err(decode_index_status_error)?,
+            tuples_done: row
+                .try_get("tuples_done")
+                .map_err(decode_index_status_error)?,
+            tuples_total: row
+                .try_get("tuples_total")
+                .map_err(decode_index_status_error)?,
+        };
+
+        Ok((status, true))
     }
 
     fn check_privileged(
@@ -323,6 +826,22 @@ async fn prepare_store(entry: &SchemaStore) -> Result<(), MigratorError> {
 pub enum Direction {
     Up,
     Down,
+}
+
+/// Combine a pass's work result with the best-effort lock release, preserving
+/// both errors as Go's deferred `unlock(err)` does.
+fn combine_run(
+    result: Result<(), MigratorError>,
+    unlock: Result<(), MigratorError>,
+) -> Result<(), MigratorError> {
+    match (result, unlock) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(()), Err(error)) => Err(error),
+        (Err(error), Err(unlock_error)) => Err(MigratorError::new(format!(
+            "{error}; additionally failed to release advisory lock: {unlock_error}"
+        ))),
+    }
 }
 
 fn check_dirty(
@@ -486,5 +1005,128 @@ mod tests {
             humanize_migrations(&["1".into(), "2".into(), "3".into()]),
             "migrations 1, 2, and 3"
         );
+    }
+
+    #[test]
+    fn classify_index_status_matches_go() {
+        // Existing and valid: skip creation, even if a progress row lingers.
+        let valid = IndexStatus {
+            is_valid: true,
+            ..IndexStatus::default()
+        };
+        assert_eq!(classify_index_status(true, &valid), IndexPlan::AlreadyValid);
+        let valid_with_phase = IndexStatus {
+            is_valid: true,
+            phase: Some("building index".to_string()),
+            ..IndexStatus::default()
+        };
+        assert_eq!(
+            classify_index_status(true, &valid_with_phase),
+            IndexPlan::AlreadyValid
+        );
+
+        // Invalid with no in-flight creation: drop and re-create.
+        let invalid_idle = IndexStatus {
+            is_valid: false,
+            phase: None,
+            ..IndexStatus::default()
+        };
+        assert_eq!(
+            classify_index_status(true, &invalid_idle),
+            IndexPlan::RepairThenCreate
+        );
+
+        // Invalid with an in-flight creation: wait for the other session.
+        let invalid_in_progress = IndexStatus {
+            is_valid: false,
+            phase: Some("index validation: scanning index".to_string()),
+            ..IndexStatus::default()
+        };
+        assert_eq!(
+            classify_index_status(true, &invalid_in_progress),
+            IndexPlan::WaitForCreation
+        );
+
+        // Missing index: create it.
+        assert_eq!(
+            classify_index_status(false, &IndexStatus::default()),
+            IndexPlan::Create
+        );
+    }
+
+    #[test]
+    fn filter_applied_definitions_respects_direction() {
+        let definitions = definitions();
+        let all = definitions.all();
+        let applied = vec![1, 2];
+
+        let up_ids: Vec<i32> = filter_applied_definitions(all, &applied, true)
+            .iter()
+            .map(|definition| definition.id)
+            .collect();
+        assert_eq!(up_ids, vec![3, 4]);
+
+        let down_ids: Vec<i32> = filter_applied_definitions(all, &applied, false)
+            .iter()
+            .map(|definition| definition.id)
+            .collect();
+        assert_eq!(down_ids, vec![1, 2]);
+    }
+
+    fn schema_store(name: &str) -> SchemaStore {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://localhost/unused")
+            .expect("lazy pool");
+        SchemaStore {
+            schema: Schema::new(
+                name,
+                format!("{name}_schema_migrations"),
+                crate::types::Definitions::default(),
+            ),
+            store: Store::new(pool, name, format!("{name}_schema_migrations")),
+        }
+    }
+
+    #[tokio::test]
+    async fn selected_names_follow_the_runner_convention() {
+        let runner = Runner::new(vec![
+            schema_store("frontend"),
+            schema_store("codeintel"),
+            schema_store("codeinsights"),
+        ]);
+
+        let names = |selected: Vec<&SchemaStore>| -> Vec<String> {
+            selected
+                .into_iter()
+                .map(|entry| entry.schema.name.clone())
+                .collect()
+        };
+
+        assert_eq!(
+            names(runner.selected(&[])),
+            vec!["frontend", "codeintel", "codeinsights"]
+        );
+        assert_eq!(
+            names(runner.selected(&["all".to_string()])),
+            vec!["frontend", "codeintel", "codeinsights"]
+        );
+        assert_eq!(
+            names(runner.selected(&["codeintel".to_string()])),
+            vec!["codeintel"]
+        );
+        // Unknown names are ignored, matching the other runner methods.
+        assert!(runner.selected(&["missing".to_string()]).is_empty());
+    }
+
+    #[tokio::test]
+    async fn add_log_is_a_noop_when_no_schema_is_selected() {
+        let runner = Runner::new(vec![schema_store("frontend")]);
+
+        // Selecting an unknown schema selects nothing, so no database
+        // connection is attempted (the lazy pool would fail if used).
+        runner
+            .add_log(&["missing".to_string()], 42, true)
+            .await
+            .expect("no-op add-log");
     }
 }

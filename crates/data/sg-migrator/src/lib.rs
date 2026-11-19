@@ -9,6 +9,7 @@
 
 pub mod cli;
 pub mod definition;
+pub mod describe;
 pub mod dsn;
 pub mod error;
 pub mod runner;

@@ -542,6 +542,17 @@ fn parse_index_metadata(query_text: &str) -> Option<(String, String)> {
         .map(|(_, _, index_name, table_name)| (index_name, table_name))
 }
 
+/// The `(table_name, index_name)` pair implied by a concurrent-index migration.
+///
+/// Go's `queryFromString` canonicalizes (and stores) the up query before
+/// `parseIndexMetadata` runs, so canonicalize here as well: a [`Definition`]
+/// keeps the raw file contents. Returns `None` when the query does not contain
+/// the canonical `CREATE INDEX CONCURRENTLY` statement.
+pub(crate) fn index_metadata(query_text: &str) -> Option<(String, String)> {
+    let canonical = canonicalize_query(query_text);
+    parse_index_metadata(&canonical).map(|(index_name, table_name)| (table_name, index_name))
+}
+
 /// Greedily match `[^;]+;` at `start`, returning the position just past `;`.
 fn match_statement_tail(bytes: &[u8], start: usize) -> Option<usize> {
     let mut position = start;
@@ -1209,6 +1220,26 @@ mod tests {
             message.contains("require elevated permissions"),
             "unexpected error: {message}"
         );
+    }
+
+    #[test]
+    fn extracts_index_metadata_from_concurrent_up_queries() {
+        assert_eq!(
+            index_metadata("CREATE INDEX CONCURRENTLY IF NOT EXISTS idx ON tbl(col);"),
+            Some(("tbl".to_string(), "idx".to_string()))
+        );
+        assert_eq!(
+            index_metadata("CREATE UNIQUE INDEX CONCURRENTLY idx ON tbl (col);"),
+            Some(("tbl".to_string(), "idx".to_string()))
+        );
+        // The helper canonicalizes historic transaction wrappers first.
+        assert_eq!(
+            index_metadata("BEGIN;\nCREATE INDEX CONCURRENTLY idx ON tbl(col);\nCOMMIT;"),
+            Some(("tbl".to_string(), "idx".to_string()))
+        );
+        // Non-concurrent statements (and unrelated DDL) yield no metadata.
+        assert_eq!(index_metadata("CREATE INDEX idx ON tbl(col);"), None);
+        assert_eq!(index_metadata("ALTER TABLE tbl ADD COLUMN c text;"), None);
     }
 
     #[test]

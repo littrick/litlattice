@@ -487,6 +487,28 @@ impl Store {
         }
     }
 
+    /// `add-log` (`cliutil/addlog.go`): record an already-completed migration
+    /// log entry without running any migration SQL.
+    ///
+    /// Go's command resolves a store (whose factory runs
+    /// `connections.initStore`, ensuring `migration_logs` and backfilling the
+    /// historical versions) and then calls
+    /// `WithMigrationLog(def{ID: version}, up, func() error { return nil })`.
+    /// This method is exactly that `WithMigrationLog` call with a no-op
+    /// callback:
+    ///
+    /// * insert `(migration_logs_schema_version = 2, schema = <migrations
+    ///   table name>, version, up, started_at = NOW())`;
+    /// * immediately close the row with `finished_at = NOW()`, `success =
+    ///   true`, `error_message = NULL`.
+    ///
+    /// As in Go, no advisory lock is taken and duplicate versions are not
+    /// detected: every invocation appends a new completed row.
+    pub async fn add_log(&self, version: i32, up: bool) -> Result<(), MigratorError> {
+        self.with_migration_log(version, up, |_pool| async { Ok(()) })
+            .await
+    }
+
     /// Acquire the schema's advisory lock and then run
     /// [`Store::with_migration_log`], releasing the lock afterwards.
     ///
@@ -945,6 +967,32 @@ mod tests {
             backfill_ancestor_ids(&definitions, &[3, 10]).unwrap(),
             vec![1, 2, 3, 10]
         );
+    }
+
+    #[test]
+    fn add_log_insert_and_close_queries_match_go() {
+        // `createMigrationLog`: the same insert `WithMigrationLog` uses for a
+        // real migration, with `started_at = NOW()` and no finished/success
+        // columns (those are filled in by the closing update).
+        let insert = CREATE_MIGRATION_LOG_QUERY.to_ascii_lowercase();
+        for column in [
+            "migration_logs_schema_version",
+            "schema",
+            "version",
+            "up",
+            "started_at",
+        ] {
+            assert!(insert.contains(column), "missing column: {column}");
+        }
+        assert!(insert.contains("values ($1, $2, $3, $4, now())"));
+        assert!(insert.contains("returning id"));
+        assert!(!insert.contains("finished_at"));
+        assert!(!insert.contains("success"));
+
+        // `errMsgPtr(nil)` is NULL and `err == nil` is true.
+        let update = UPDATE_MIGRATION_LOG_QUERY.to_ascii_lowercase();
+        assert!(update.contains("set finished_at = now(), success = $1, error_message = $2"));
+        assert!(update.contains("where id = $3"));
     }
 
     #[tokio::test]
