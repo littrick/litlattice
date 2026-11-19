@@ -2,8 +2,8 @@
 
 本仓库的可执行文件分为三类：
 
-1. **Rust 重写进程**：`bins/` 下的 11 个二进制，由 `cargo build --release --bins`
-   产出，是 Sourcegraph 服务进程的 Rust 替代品；
+1. **Rust 重写进程**：`bins/` 下的 12 个二进制（其中 11 个安装进镜像），由
+   `cargo build --release --bins` 产出，是 Sourcegraph 服务进程的 Rust 替代品；
 2. **Go 侧车（sidecar）**：打包镜像时从
    `sourcegraph-public-snapshot@c864f15` 构建/复用的 Go 二进制（`zoekt-*`、
    `prom-wrapper`）；
@@ -27,11 +27,12 @@
 | `repo-updater` | `sg-bin-repo-updater` | `/usr/local/bin/repo-updater` | 外部服务/仓库同步、clone 调度、仓库清理 | `:3182` | 是 |
 | `precise-code-intel-worker` | `sg-bin-precise-worker` | `/usr/local/bin/precise-code-intel-worker` | LSIF/SCIP 上传处理、精确代码智能索引 | `:3188` | 是 |
 | `migrator` | `sg-bin-migrator` | `/usr/local/bin/migrator` | 数据库迁移 CLI：`up`/`upto`/`downto`/`validate`/`describe`/`drift`/`add-log`/`upgrade`/`downgrade`/`run-out-of-band-migrations` 全部本地执行（`sg-migrator`） | 无 | 否（一次性） |
+| `blobstore` | `sg-bin-blobstore` | `/usr/local/bin/blobstore` | S3 兼容对象存储（Rust）：桶/对象 CRUD、ListObjectsV2、multipart、Range GET；保存精确代码智能上传与 search jobs 结果（filesystem backend） | `127.0.0.1:9000`（单容器；`DISABLE_BLOBSTORE=1` 时不启动） | 是 |
 | `embeddings` | `sg-bin-embeddings` | `/usr/local/bin/embeddings` | 代码嵌入索引下载与 `POST /search` 接口 | `:9991` | 条件启用（`SRC_ENABLE_EMBEDDINGS=true`） |
 | `sourcegraph` | `sg-bin-sourcegraph` | 不安装进镜像 | 开发用组合二进制：在**一个进程**内跑 frontend + gitserver + repo-updater + searcher + worker（对应 Go `cmd/sourcegraph`） | 取决于内部服务 | 否（镜像不使用） |
 
 `server` 被特意安装在根目录 `/server`（而不是 `/usr/local/bin/server`），与 Go
-镜像的 `tar_server` 布局一致；其余 9 个服务二进制都在 `/usr/local/bin`。
+镜像的 `tar_server` 布局一致；其余 10 个服务二进制都在 `/usr/local/bin`。
 
 ## 1.2 Go 侧车与外部组件
 
@@ -42,7 +43,6 @@
 | `postgres` | Ubuntu `postgresql-16` | `/usr/lib/postgresql/16/bin/postgres` | 本地数据库（sourcegraph / sourcegraph-codeintel / 可选 codeinsights） | `/server` 的 `postgres:` Procfile 行 |
 | `postgres_exporter` | Ubuntu 包 | `/usr/bin/prometheus-postgres-exporter` | 导出 Postgres 指标（观测组件禁用时仍会启动该进程） | `/server` Procfile |
 | `redis-server` | Ubuntu `redis-server` 包 | `/usr/bin/redis-server` | 两个实例：session/持久存储 `:6379`、缓存 `:6380` | `/server` Procfile |
-| `blobstore` | `sg-bin-blobstore` | `/usr/local/bin/blobstore` | S3 兼容对象存储（Rust 实现）：桶/对象 CRUD、ListObjectsV2、multipart、Range GET；保存精确代码智能上传与 search jobs 结果（filesystem backend） | `/server` Procfile（经 `/opt/s3proxy/run-docker-container.sh`） |
 | `syntect_server` | syntax-highlighter 源码构建 | `/usr/local/bin/syntect_server` | 语法高亮服务（Rocket） | `/server` Procfile |
 | `scip-ctags` | syntax-highlighter 源码构建 | `/usr/local/bin/scip-ctags` | 为 scip-ctags 支持语言生成符号/高亮数据 | symbols / syntax-analysis 子进程 |
 | `universal-ctags` | Sourcegraph 补丁版（GCS 固定产物） | `/usr/local/bin/universal-ctags` | symbols 服务对 C/C++、Markdown 等非 scip 语言的解析器 | symbols 子进程 |
