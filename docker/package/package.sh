@@ -492,6 +492,10 @@ chmod 0755 '$ROOTFS/opt/s3proxy/run-docker-container.sh'"
     # Web bundle (stage-assets enforces a real web.manifest.json). It writes
     # into the root-owned rootfs, so run it through the root prefix.
     run_root bash "$REPO_ROOT/docker/server/stage-assets.sh" --dist-dir "$DIST_DIR" "$ROOTFS"
+    if ! has_feature sveltekit; then
+        # The cached web-dist may contain a previous SvelteKit build.
+        run_root rm -rf "$ROOTFS/assets-dist/_sk"
+    fi
     if ! has_feature sourcemaps; then
         # Source maps are ~180 MB of the bundle and unused at runtime.
         run_root find "$ROOTFS/assets-dist" -name '*.map' -delete
