@@ -245,7 +245,6 @@ stage_go() {
     (
         cd "$SRC_DIR"
         export CGO_ENABLED=0
-        go build -trimpath -buildvcs=false -ldflags="-s -w" -o "$GO_BIN/migrator" ./cmd/migrator
         go build -trimpath -buildvcs=false -ldflags="-s -w" -o "$GO_BIN/blobstore" ./cmd/blobstore
         go build -trimpath -buildvcs=false -ldflags="-s -w" -o "$GO_BIN/prom-wrapper" \
             ./docker-images/prometheus/cmd/prom-wrapper
@@ -341,7 +340,6 @@ stage_rootfs() {
         run_root install -m 0755 "$RUST_BIN/$bin" "$ROOTFS/usr/local/bin/$bin"
     done
     # Go sidecars.
-    run_root install -m 0755 "$GO_BIN/migrator" "$ROOTFS/usr/local/bin/migrator-go"
     run_root install -m 0755 "$GO_BIN/blobstore" "$ROOTFS/usr/local/bin/blobstore"
     for zoekt in zoekt-archive-index zoekt-git-index zoekt-sourcegraph-indexserver zoekt-webserver; do
         run_root install -m 0755 "$GO_BIN/$zoekt" "$ROOTFS/usr/local/bin/$zoekt"
@@ -393,7 +391,7 @@ chmod 0755 '$ROOTFS/opt/s3proxy/run-docker-container.sh'"
     run_root chroot "$ROOTFS" chown -R sourcegraph:sourcegraph /assets-dist
 
     # Migration SQL corpus for the Rust migrator (`MIGRATIONS_DIR`,
-    # default /migrations). The Go migrator embeds it; the Rust port reads
+    # default /migrations). The Rust migrator reads
     # the same corpus from disk.
     run_root rm -rf "$ROOTFS/migrations"
     run_root cp -a "$SRC_DIR/migrations" "$ROOTFS/migrations"

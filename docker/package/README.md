@@ -17,7 +17,7 @@ cd <repository>
 | --- | --- |
 | Rust 服务二进制 | 本仓库（`cargo build --release --bins`） |
 | Web UI（`/assets-dist`） | 固定提交的 `sourcegraph/sourcegraph-public-snapshot`，`pnpm` 构建 |
-| Go sidecar（`migrator-go`、`blobstore`、`zoekt-*`、`prom-wrapper`） | 同一份 Sourcegraph 源码 |
+| Go sidecar（`blobstore`、`zoekt-*`、`prom-wrapper`） | 同一份 Sourcegraph 源码 |
 | `syntect_server`、`scip-ctags` | 该源码中的 `docker-images/syntax-highlighter` |
 | Postgres、Redis、nginx、git、tini、gosu 等 | 通过 `debootstrap`/apt 安装的 Ubuntu 24.04 |
 | 根文件系统 | 直接组装，不使用 `docker build` |
@@ -97,7 +97,9 @@ docker run -d --name sg-rust -p 7080:7080 \
   zoekt 二进制，但不运行索引服务器。
 - `/var/opt/sourcegraph/postgresql{,-markers}` 有意**不**预先创建：`/server`
   依据它们是否存在来决定是否运行 `initdb`。
-- 数据库 schema/迁移仍由 Go `migrator`（`migrator-go`）负责，符合项目的
-  存储契约。
+- 数据库 schema/迁移全部由 Rust `migrator`（`sg-bin-migrator` + `sg-migrator`）
+  负责：`up`/`upto`/`downto`/`validate`/`describe`/`drift`/`add-log`/`upgrade`/
+  `downgrade`/`run-out-of-band-migrations` 均在本地执行，镜像不再随附
+  `migrator-go`。`MIGRATOR_DELEGATE` 仍可显式指定外部委托程序。
 - Web 包由固定的 Sourcegraph 提交构建；要切换到另一个发布版本，只需修改
   `versions.env` 中的 `SOURCEGRAPH_COMMIT`/`SOURCEGRAPH_VERSION`。

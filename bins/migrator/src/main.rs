@@ -2,16 +2,15 @@
 
 //! Rust `migrator` process, drop-in for `cmd/migrator`.
 //!
-//! `up` / `upto` / `downto` / `validate` run locally on the Rust migration
-//! engine (`sg-migrator`), reading the SQL corpus from `MIGRATIONS_DIR`
-//! (default `/migrations`). The remaining commands (`describe`, `drift`,
-//! `add-log`, `upgrade`, `downgrade`, `run-out-of-band-migrations`) are
-//! delegated to `MIGRATOR_DELEGATE` (default `migrator-go`), which also keeps
-//! the stitched multi-version and out-of-band migration support.
+//! Every `cliutil` command (`up`, `upto`, `downto`, `validate`, `describe`,
+//! `drift`, `add-log`, `upgrade`, `downgrade`, `run-out-of-band-migrations`)
+//! runs locally on the Rust migration engine (`sg-migrator`), reading the SQL
+//! corpus from `MIGRATIONS_DIR` (default `/migrations`).
 //!
-//! Setting `MIGRATOR_DELEGATE` explicitly delegates **every** command,
-//! preserving the pre-rewrite behavior for mixed deployments. Help is always
-//! served locally (banner + command table), matching `urfave/cli`.
+//! Setting `MIGRATOR_DELEGATE` explicitly forwards every command to another
+//! executable, preserving the pre-rewrite behavior for mixed deployments.
+//! Help is always served locally (banner + command table), matching
+//! `urfave/cli`.
 
 use std::path::PathBuf;
 
@@ -26,9 +25,6 @@ use sg_migrator::MigratorError;
 /// Environment variable naming the migration-runner executable.
 pub const DELEGATE_ENV: &str = "MIGRATOR_DELEGATE";
 
-/// Default delegate: the Go migrator kept for the migration commands the Rust
-/// engine does not implement yet.
-pub const DEFAULT_DELEGATE: &str = "migrator-go";
 
 /// Directory holding `<schema>/<version>_<slug>/{up,down}.sql`.
 pub const MIGRATIONS_DIR_ENV: &str = "MIGRATIONS_DIR";
@@ -69,7 +65,8 @@ fn main() {
                     }
                 }
             } else {
-                run_delegate(DEFAULT_DELEGATE, &name, &command_args);
+                eprintln!("migrator: command {name:?} is not supported");
+                std::process::exit(1);
             }
         }
     }
@@ -555,9 +552,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn delegate_default_is_the_go_migrator() {
-        assert_eq!(DEFAULT_DELEGATE, "migrator-go");
+    fn delegate_is_opt_in_via_environment() {
         assert_eq!(DELEGATE_ENV, "MIGRATOR_DELEGATE");
+        for command in [
+            "up",
+            "upto",
+            "downto",
+            "validate",
+            "describe",
+            "drift",
+            "add-log",
+            "upgrade",
+            "downgrade",
+            "run-out-of-band-migrations",
+        ] {
+            assert!(LOCAL_COMMANDS.contains(&command), "{command} must run locally");
+        }
     }
 
     #[test]

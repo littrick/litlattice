@@ -5,8 +5,8 @@
 1. **Rust 重写进程**：`bins/` 下的 11 个二进制，由 `cargo build --release --bins`
    产出，是 Sourcegraph 服务进程的 Rust 替代品；
 2. **Go 侧车（sidecar）**：打包镜像时从
-   `sourcegraph-public-snapshot@c864f15` 构建/复用的 Go 二进制（`migrator-go`、
-   `blobstore`、`zoekt-*`、`prom-wrapper`）；
+   `sourcegraph-public-snapshot@c864f15` 构建/复用的 Go 二进制（`blobstore`、
+   `zoekt-*`、`prom-wrapper`）；
 3. **系统/第三方进程**：Ubuntu 软件包或 syntax-highlighter 产物（`nginx`、
    `postgres`、`redis-server`、`postgres_exporter`、`syntect_server`、
    `scip-ctags`、`universal-ctags`、`tini`）。
@@ -26,7 +26,7 @@
 | `worker` | `sg-bin-worker` | `/usr/local/bin/worker` | 后台作业（56 个内置 job 组：索引、权限、批量变更、exhaustive、code monitors 等） | 健康检查 `:3189` | 是 |
 | `repo-updater` | `sg-bin-repo-updater` | `/usr/local/bin/repo-updater` | 外部服务/仓库同步、clone 调度、仓库清理 | `:3182` | 是 |
 | `precise-code-intel-worker` | `sg-bin-precise-worker` | `/usr/local/bin/precise-code-intel-worker` | LSIF/SCIP 上传处理、精确代码智能索引 | `:3188` | 是 |
-| `migrator` | `sg-bin-migrator` | `/usr/local/bin/migrator` | 迁移 CLI 门面；数据库命令 `exec` 到 `migrator-go`（`MIGRATOR_DELEGATE`，默认 `migrator-go`） | 无 | 否（一次性） |
+| `migrator` | `sg-bin-migrator` | `/usr/local/bin/migrator` | 数据库迁移 CLI：`up`/`upto`/`downto`/`validate`/`describe`/`drift`/`add-log`/`upgrade`/`downgrade`/`run-out-of-band-migrations` 全部本地执行（`sg-migrator`） | 无 | 否（一次性） |
 | `embeddings` | `sg-bin-embeddings` | `/usr/local/bin/embeddings` | 代码嵌入索引下载与 `POST /search` 接口 | `:9991` | 条件启用（`SRC_ENABLE_EMBEDDINGS=true`） |
 | `sourcegraph` | `sg-bin-sourcegraph` | 不安装进镜像 | 开发用组合二进制：在**一个进程**内跑 frontend + gitserver + repo-updater + searcher + worker（对应 Go `cmd/sourcegraph`） | 取决于内部服务 | 否（镜像不使用） |
 
@@ -50,17 +50,17 @@
 | `zoekt-webserver` | 同上 | `/usr/local/bin/zoekt-webserver` | 提供索引搜索（gRPC/RPC）与索引器代理 | `/server` Procfile |
 | `zoekt-git-index` | 同上 | `/usr/local/bin/zoekt-git-index` | 索引器按需调用的索引构建子命令 | indexserver 子进程 |
 | `zoekt-archive-index` | 同上 | `/usr/local/bin/zoekt-archive-index` | 同上（归档索引） | indexserver 子进程 |
-| `migrator-go` | Sourcegraph Go 源码 | `/usr/local/bin/migrator-go` | 真正的数据库迁移执行器 | Rust `migrator` exec 调用 |
 | `prom-wrapper` | Sourcegraph Go 源码 | `/bin/prom-wrapper` | 生成/托管 Prometheus 配置（默认被禁用） | Procfile（观测开启时） |
 | `prometheus` / `alertmanager` / `grafana-server` | Ubuntu / 镜像包 | 见 `/prometheus.sh` 等 | 观测栈（默认 `DISABLE_OBSERVABILITY=1` 不启动） | Procfile（观测开启时） |
 | `postgres-optimize.sh` / `reindex.sh` | Sourcegraph 源码 | `/postgres-optimize.sh`、`/reindex.sh` | Postgres 参数优化、5.1 版本数据库重建 | `server` / 运维手动 |
 
 ## 1.3 为什么有 Go 侧车
 
-本仓库只重写 Go 服务进程。数据库 schema/迁移、对象存储、zoekt 搜索引擎与
-语法高亮属于「保持不变的组件」：迁移仍然由 Go `migrator` 负责（Rust `migrator`
-只是 CLI 门面，通过 `MIGRATOR_DELEGATE` 委托），以避免出现第二套迁移谱系。
-详见 `docker/package/README.md` 与 `docker/server/README.md`。
+本仓库重写了 Go 服务进程与数据库迁移工具。对象存储、zoekt 搜索引擎与
+语法高亮仍属于「保持不变的组件」，继续复用 Go 侧车；迁移谱系（schema、
+frozen definitions、stitched graph、OOB migrations）已由 `sg-migrator` 原生
+实现，镜像不再包含 `migrator-go`。详见 `docker/package/README.md` 与
+`docker/server/README.md`。
 
 ## 1.4 构建与安装位置
 

@@ -350,14 +350,20 @@
 
 ---
 
-## 12. `migrator` / `migrator-go`
+## 12. `migrator`
 
-- Rust 路径：`/usr/local/bin/migrator`
-- Go 路径：`/usr/local/bin/migrator-go`
-- 调用方式：`migrator up -db <frontend|codeintel|codeinsights>`
-- 行为：Rust 进程负责 banner/CLI 选择，然后把命令 `exec` 给
-  `MIGRATOR_DELEGATE`（默认 `migrator-go`）；退出码与输出原样透传。
-- 环境：`PG*`/`CODEINTEL_PG*`/`CODEINSIGHTS_PG*`，`MIGRATOR_DELEGATE`。
+- 路径：`/usr/local/bin/migrator`（crate `sg-bin-migrator`，引擎 `sg-migrator`）
+- 调用方式：`migrator up -db <frontend|codeintel|codeinsights>`；无参数时默认
+  `up`（与 Go `urfave/cli` 一致）。
+- 本地子命令：`up`、`upto`、`downto`、`validate`、`describe`、`drift`、
+  `add-log`、`upgrade`、`downgrade`、`run-out-of-band-migrations`。
+- 迁移语料：`MIGRATIONS_DIR`（默认 `/migrations`），其中包含各 schema 的
+  `<version>_<slug>/{up,down}.sql`、`metadata.yaml`、`schema*.json` 与
+  `frozen/4.5.0.json`。stitched migration graph 编译时内嵌。
+- 多数据库路由：`run-out-of-band-migrations` 同时连接 frontend、codeintel，
+  必要时连接 codeinsights；每个 migrator 按其 Go 基线选择对应连接池。
+- 环境：`PG*`/`CODEINTEL_PG*`/`CODEINSIGHTS_PG*`、`MIGRATIONS_DIR`；可选的
+  `MIGRATOR_DELEGATE` 会改为把所有命令转发给指定程序（默认不再委托）。
 - 时机：`/server` 在启动应用进程前依次执行；`PGRESTORE=true` 时跳过。
 
 ---

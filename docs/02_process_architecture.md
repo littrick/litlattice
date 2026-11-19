@@ -48,7 +48,7 @@ flowchart TB
             grafana["grafana"]
         end
 
-        migrator["migrator (Rust) → migrator-go (Go)<br/>一次性迁移"]
+        migrator["migrator (Rust)<br/>一次性迁移"]
     end
 
     browser -->|HTTP| nginx
@@ -94,7 +94,7 @@ flowchart LR
     client["客户端 / 浏览器"]
     codehost["code host<br/>(GitHub/GitLab/Bitbucket...)"]
     server["/server 监督器<br/>(Rust bins/server)"]
-    migrator["migrator → migrator-go<br/>（启动时一次性迁移）"]
+    migrator["migrator (Rust)<br/>（启动时一次性迁移）"]
 
     subgraph access["入口层"]
         nginx["nginx<br/>:7080"]
@@ -295,7 +295,7 @@ sequenceDiagram
     participant T as tini
     participant S as /server
     participant PG as postgres
-    participant M as migrator → migrator-go
+    participant M as migrator (Rust)
     participant P as 应用进程组
 
     D->>T: ENTRYPOINT /sbin/tini -- /server
@@ -320,8 +320,8 @@ sequenceDiagram
    `postgresql-markers/*` 记录已创建的数据库（`sourcegraph`、
    `sourcegraph-codeintel`，以及 `ALLOW_SINGLE_DOCKER_CODE_INSIGHTS=true` 时的
    `sourcegraph-codeinsights`）。
-3. **迁移**：`migrator` 是 Rust 门面，执行时 `exec` 成 `migrator-go`；迁移谱系仍由
-   Go migrator 维护。
+3. **迁移**：`migrator` 由 Rust 实现（`sg-bin-migrator` + `sg-migrator`），
+   全部子命令与迁移谱系均在本地执行；镜像不再随附 `migrator-go`。
 4. **5.1 重建门禁**：本地 Postgres 且缺少
    `DATA_DIR/postgresql/5.1-reindex.completed` 时，必须设置
    `SOURCEGRAPH_5_1_DB_MIGRATION=true`，否则进程以退出码 `101` 退出并打印指引。

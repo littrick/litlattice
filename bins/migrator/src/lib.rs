@@ -13,11 +13,10 @@
 //!   `ShowSubcommandHelp` fallback for `--help`/`help`/unknown commands;
 //! * the startup banner (`Sourcegraph migrator <version>`).
 //!
-//! Not ported: the migration runner itself. Migrations are owned by the Go
-//! migrator (the M6 storage contract); this binary never introduces migration
-//! files. Database commands are forwarded to the delegate named by
-//! `MIGRATOR_DELEGATE` (default `migrator-go`) so mixed deployments keep the Go
-//! migration convention.
+//! The migration runner itself is ported in `sg-migrator`; this module only
+//! owns the CLI surface. Every database command runs locally (see the crate's
+//! `main.rs`). An explicit `MIGRATOR_DELEGATE` environment variable can still
+//! forward commands to another executable for mixed deployments.
 
 use serde::Serialize;
 
