@@ -123,12 +123,30 @@ fn route_request<B>(req: &Request<B>) -> Result<Route, Response<BoxBody>> {
         return Err(located(StatusCode::MOVED_PERMANENTLY, location, None));
     }
 
+    // The Go `internalMux` mounts the internal subrouter under
+    // `/.internal/` (`newInternalHTTPHandler`), so internal callers use e.g.
+    // `/.internal/graphql?Changeset` (worker) or `/.internal/search/stream`.
+    // This port historically matched the subrouter's post-prefix paths;
+    // accept both forms by stripping the prefix for matching while keeping it
+    // for redirects.
+    let (match_path, redirect_path) = match decoded.strip_prefix("/.internal") {
+        Some(rest) if rest.is_empty() || rest.starts_with('/') => (
+            if rest.is_empty() {
+                "/".to_owned()
+            } else {
+                rest.to_owned()
+            },
+            decoded.clone(),
+        ),
+        _ => (decoded.clone(), decoded.clone()),
+    };
+
     // `StrictSlash(true)`: the route regexp accepts one optional trailing
     // slash and redirects it away before the handler runs.
-    let (route, matched_path) = match match_route(&decoded) {
-        Some(route) => (route, decoded.as_str()),
-        None => match decoded.strip_suffix('/').map(match_route) {
-            Some(Some(route)) => (route, &decoded[..decoded.len() - 1]),
+    let (route, matched_path) = match match_route(&match_path) {
+        Some(route) => (route, match_path.as_str()),
+        None => match match_path.strip_suffix('/').map(match_route) {
+            Some(Some(route)) => (route, &match_path[..match_path.len() - 1]),
             _ => return Err(no_route()),
         },
     };
@@ -136,10 +154,14 @@ fn route_request<B>(req: &Request<B>) -> Result<Route, Response<BoxBody>> {
         // gorilla `methodNotAllowed`: status only, no body.
         return Err(empty_response(StatusCode::METHOD_NOT_ALLOWED));
     }
-    if matched_path.len() != decoded.len() {
+    if matched_path.len() != match_path.len() {
+        let mut location = redirect_path;
+        if location.ends_with('/') {
+            location.pop();
+        }
         return Err(strict_slash_redirect(
             req.method(),
-            matched_path,
+            &location,
             req.uri().query(),
         ));
     }
@@ -502,6 +524,42 @@ mod tests {
         assert_eq!(
             response.headers().get(header::CONTENT_TYPE).unwrap(),
             "text/plain; charset=utf-8"
+        );
+    }
+
+    #[test]
+    fn internal_prefix_is_accepted() {
+        let response = internal_response(&request(Method::GET, "/.internal/ping"), &live());
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let trailing = internal_response(&request(Method::GET, "/.internal/ping/"), &live());
+        assert_eq!(trailing.status(), StatusCode::MOVED_PERMANENTLY);
+        assert_eq!(
+            trailing.headers().get(header::LOCATION).unwrap(),
+            "/.internal/ping"
+        );
+
+        // `/.internal/graphql` routes like `/graphql`; the sync entry point
+        // has no GraphQL deps, but the method gate runs first.
+        assert_eq!(
+            internal_response(
+                &request(Method::GET, "/.internal/graphql?Changeset"),
+                &live()
+            )
+            .status(),
+            StatusCode::METHOD_NOT_ALLOWED
+        );
+        assert_ne!(
+            internal_response(
+                &request(Method::POST, "/.internal/graphql?Changeset"),
+                &live()
+            )
+            .status(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            internal_response(&request(Method::GET, "/.internal"), &live()).status(),
+            StatusCode::NOT_FOUND
         );
     }
 
