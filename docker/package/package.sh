@@ -392,6 +392,12 @@ chmod 0755 '$ROOTFS/opt/s3proxy/run-docker-container.sh'"
     run_root bash "$REPO_ROOT/docker/server/stage-assets.sh" --dist-dir "$DIST_DIR" "$ROOTFS"
     run_root chroot "$ROOTFS" chown -R sourcegraph:sourcegraph /assets-dist
 
+    # Migration SQL corpus for the Rust migrator (`MIGRATIONS_DIR`,
+    # default /migrations). The Go migrator embeds it; the Rust port reads
+    # the same corpus from disk.
+    run_root rm -rf "$ROOTFS/migrations"
+    run_root cp -a "$SRC_DIR/migrations" "$ROOTFS/migrations"
+
     # The image serves the front door on nginx :7080 and runs as root.
     # Only regular files: /usr/local/bin also holds symlinks into the rootfs
     # (postgres_exporter, su-exec) that are dangling from the host namespace,

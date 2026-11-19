@@ -17,6 +17,9 @@ path = "src/lib.rs"
 [dependencies]
 sg-core = { path = "../../crates/base/sg-core" }
 sg-log = { path = "../../crates/base/sg-log" }
+sg-migrator = { path = "../../crates/data/sg-migrator" }
+tokio = { workspace = true }
+sqlx = { workspace = true }
 serde = { workspace = true }
 
 [dev-dependencies]
