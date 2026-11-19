@@ -212,6 +212,7 @@ pub mod user_provisioning;
 pub mod user_store;
 pub mod userpasswd;
 pub mod viewer_graphql;
+pub mod zoekt_configuration;
 pub mod version;
 pub mod webhook_logs;
 

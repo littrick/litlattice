@@ -1835,14 +1835,38 @@ impl Service for FrontendService {
             let live = Arc::clone(wiring.live());
             let graphql_deps = Arc::clone(&graphql_deps);
             let search_deps = Arc::clone(&search_deps);
+            let zoekt_pool = session_pool.clone();
             background.spawn(async move {
                 // `httpapi.go:397` registers the configuration service on the
                 // internal gRPC server; `serve_cmd.go:397` multiplexes gRPC
                 // and the internal HTTP handler on the same listener
                 // (`internalgrpc.MultiplexHandlers`).
+                // M9.70a: the zoekt-sourcegraph-indexserver configuration
+                // service shares the internal gRPC listener with the
+                // configuration service (`httpapi.go:397`).
+                let zoekt_gitserver_addrs = crate::service_connections::service_connections()
+                    .map(|connections| connections.git_servers)
+                    .unwrap_or_default();
+                let zoekt_contexts: Arc<
+                    dyn crate::search_contexts::SearchContextsDatabase + Send + Sync,
+                > = Arc::new(crate::search_contexts_store::PgSearchContextsStore::new(
+                    zoekt_pool.clone(),
+                ));
+                let zoekt_configuration =
+                    crate::zoekt_configuration::ZoektConfigurationService::new(
+                        zoekt_pool.clone(),
+                        Arc::clone(&live),
+                        zoekt_gitserver_addrs,
+                        zoekt_contexts,
+                    );
                 let routes = tonic::service::Routes::new(
                     sg_proto::internalapi::config_service_server::ConfigServiceServer::new(
                         crate::configuration_api::ConfigApi::new(store),
+                    ),
+                )
+                .add_service(
+                    sg_zoekt::proto::sourcegraph::zoekt::configuration::v1::zoekt_configuration_service_server::ZoektConfigurationServiceServer::new(
+                        zoekt_configuration,
                     ),
                 );
                 let handler =
