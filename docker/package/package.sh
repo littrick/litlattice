@@ -173,7 +173,11 @@ stage_frontend() {
         export CI=true NODE_OPTIONS="${NODE_OPTIONS:---max-old-space-size=8192}"
         pnpm install --frozen-lockfile "${jobs_env[@]}"
         pnpm run generate
-        pnpm --filter @sourcegraph/web run build
+        # The web esbuild config defaults NODE_ENV to "development" when it is
+        # unset, which ships an unminified React dev build and leaves the
+        # esbuild live-reload EventSource (/.assets/esbuild) in the bundle.
+        # The Bazel production build sets NODE_ENV=production; do the same.
+        NODE_ENV=production pnpm --filter @sourcegraph/web run build
     )
     [ -f "$SRC_DIR/client/web/dist/web.manifest.json" ] ||
         fail "web build did not produce client/web/dist/web.manifest.json"
