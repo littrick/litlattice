@@ -134,6 +134,7 @@ where
 
     let (mut parts, body) = response.into_parts();
     strip_hop_by_hop(&mut parts.headers);
+    rewrite_upstream_location(&mut parts.headers, &authority);
 
     // Map body failures to `Status::internal` so the body fits `BoxBody`
     // (and so the server can report a meaningful error).
@@ -142,6 +143,35 @@ where
     });
 
     Ok(Response::from_parts(parts, BoxBody::new(body)))
+}
+
+/// Alertmanager builds redirect URLs from its own listen address
+/// (`http://127.0.0.1:9093/...`), which the browser cannot reach through the
+/// wrapper. Turn those into relative redirects so they resolve against the
+/// public `EXPORT_PORT` instead. Go's `httputil.ReverseProxy` leaks the internal
+/// host here; this is an intentional improvement.
+fn rewrite_upstream_location(headers: &mut http::HeaderMap, authority: &str) {
+    let Some(location) = headers.get(http::header::LOCATION) else {
+        return;
+    };
+    let Ok(value) = location.to_str() else {
+        return;
+    };
+    let prefixes = [
+        format!("http://{authority}"),
+        format!("https://{authority}"),
+        format!("//{authority}"),
+    ];
+    for prefix in prefixes {
+        if let Some(rest) = value.strip_prefix(&prefix) {
+            if rest.starts_with('/') {
+                if let Ok(value) = http::HeaderValue::from_str(rest) {
+                    headers.insert(http::header::LOCATION, value);
+                }
+            }
+            return;
+        }
+    }
 }
 
 fn normalize_authority(target: &str) -> String {
@@ -186,7 +216,7 @@ fn error_response(message: &str) -> Response<BoxBody> {
 
 #[cfg(test)]
 mod tests {
-    use super::{proxy_request, strip_hop_by_hop};
+    use super::{proxy_request, rewrite_upstream_location, strip_hop_by_hop};
     use http::header::{HeaderMap, HeaderValue, CONNECTION};
     use http::{Method, Request, Response, StatusCode};
     use http_body_util::{BodyExt, Full, StreamBody};
@@ -267,6 +297,31 @@ mod tests {
         });
 
         (addr, captured)
+    }
+
+    #[test]
+    fn rewrites_absolute_upstream_redirects_to_relative() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            http::header::LOCATION,
+            HeaderValue::from_static("http://127.0.0.1:9093/alertmanager/"),
+        );
+        rewrite_upstream_location(&mut headers, "127.0.0.1:9093");
+        assert_eq!(
+            headers.get(http::header::LOCATION).unwrap(),
+            "/alertmanager/"
+        );
+
+        let mut untouched = HeaderMap::new();
+        untouched.insert(
+            http::header::LOCATION,
+            HeaderValue::from_static("https://example.com/x"),
+        );
+        rewrite_upstream_location(&mut untouched, "127.0.0.1:9093");
+        assert_eq!(
+            untouched.get(http::header::LOCATION).unwrap(),
+            "https://example.com/x"
+        );
     }
 
     #[tokio::test]
