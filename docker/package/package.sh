@@ -15,11 +15,16 @@
 #   ./docker/package/package.sh --only frontend
 #   ./docker/package/package.sh --from rootfs
 #   ./docker/package/package.sh --features observability
+#   ./docker/package/package.sh --features docker
 #   sudo ./docker/package/package.sh            # rootfs stages need root
 #
-# Optional features (comma-separated); observability is the only feature and is
-# OFF by default. It adds Prometheus, Alertmanager, prom-wrapper, the baseline
-# configs, alert rules and the metrics target list to the image.
+# Optional, independent features (comma-separated, OFF by default):
+#   observability  add Prometheus/Alertmanager/prom-wrapper, baseline configs,
+#                  alert rules and the metrics target list; output names get a
+#                  `-observability` suffix;
+#   docker         after writing the rootfs tarball, import it as a Docker image
+#                  and save an additional `<name>.docker.tar` artifact.
+# Combine them as `--features observability,docker`.
 #
 # Important environment:
 #   BUILD_DIR        build workspace (default <repo>/.package-build)
@@ -51,7 +56,10 @@ EXT_DIR=${EXT_DIR:-$BUILD_DIR/ext}
 ROOTFS=${ROOTFS:-$BUILD_DIR/rootfs}
 OUT_DIR=${OUT_DIR:-$BUILD_DIR/out}
 RUST_TARGET_DIR=${RUST_TARGET_DIR:-$REPO_ROOT/target}
-OUT_NAME=${OUT_NAME:-sourcegraph-server-rust-${SOURCEGRAPH_VERSION}-fs.tar.gz}
+OUT_NAME=${OUT_NAME:-}
+IMAGE_TAG=${IMAGE_TAG:-}
+IMAGE_OUT_NAME=${IMAGE_OUT_NAME:-}
+DOCKER_CMD=${DOCKER:-docker}
 CARGO_PROFILE=${CARGO_PROFILE:-release}
 JOBS=${JOBS:-}
 
@@ -130,8 +138,8 @@ done
 FEATURES=${FEATURES// /}
 for feature in ${FEATURES//,/ }; do
     case "$feature" in
-        observability) ;;
-        *) fail "unknown feature: $feature (supported: observability)" ;;
+        observability | docker) ;;
+        *) fail "unknown feature: $feature (supported: observability, docker)" ;;
     esac
 done
 
@@ -139,6 +147,16 @@ has_feature() {
     case ",$FEATURES," in *",$1,"*) return 0 ;; esac
     return 1
 }
+
+# Feature-specific output suffixes. Features are independent: `docker` adds an
+# image artifact, `observability` changes the rootfs/image contents.
+FEATURE_SUFFIX=""
+if has_feature observability; then
+    FEATURE_SUFFIX="-observability"
+fi
+OUT_NAME=${OUT_NAME:-sourcegraph-server-rust-${SOURCEGRAPH_VERSION}${FEATURE_SUFFIX}-fs.tar.gz}
+IMAGE_TAG=${IMAGE_TAG:-sourcegraph/server:rust-${SOURCEGRAPH_VERSION}${FEATURE_SUFFIX}}
+IMAGE_OUT_NAME=${IMAGE_OUT_NAME:-sourcegraph-server-rust-${SOURCEGRAPH_VERSION}${FEATURE_SUFFIX}.docker.tar}
 
 want() {
     local stage=$1
@@ -482,6 +500,15 @@ chmod 0755 '$ROOTFS/opt/s3proxy/run-docker-container.sh'"
 # 7. Filesystem tarball
 # ---------------------------------------------------------------------------
 stage_package() {
+    # The rootfs must match the selected feature set, otherwise a feature-
+    # suffixed artifact could contain a different image.
+    if has_feature observability && [ ! -x "$ROOTFS/bin/prom-wrapper" ]; then
+        fail "observability feature enabled but $ROOTFS lacks prom-wrapper; run the rootfs stage with --features observability"
+    fi
+    if ! has_feature observability && [ -e "$ROOTFS/bin/prom-wrapper" ]; then
+        fail "observability content present in $ROOTFS but the feature is off; rebuild the rootfs"
+    fi
+
     log "writing $OUT_NAME"
     mkdir -p "$OUT_DIR"
     local tar="$OUT_DIR/$OUT_NAME"
@@ -490,6 +517,30 @@ stage_package() {
     ( cd "$OUT_DIR" && sha256sum "$OUT_NAME" >"$OUT_NAME.sha256" )
     ls -lh "$tar" "$tar.sha256"
     log "import with: $SCRIPT_DIR/import-image.sh $tar <tag>"
+
+    # `docker` is an independent feature: it consumes the rootfs tarball and
+    # adds a Docker image plus a saved image tar artifact.
+    if has_feature docker; then
+        log "importing Docker image $IMAGE_TAG"
+        if [ -n "$SUDO" ]; then
+            $SUDO env DOCKER="$DOCKER_CMD" "$SCRIPT_DIR/import-image.sh" "$tar" "$IMAGE_TAG"
+        else
+            DOCKER="$DOCKER_CMD" "$SCRIPT_DIR/import-image.sh" "$tar" "$IMAGE_TAG"
+        fi
+
+        local image_tar="$OUT_DIR/$IMAGE_OUT_NAME"
+        rm -f "$image_tar" "$image_tar.sha256"
+        log "saving Docker image $IMAGE_TAG -> $IMAGE_OUT_NAME"
+        # Redirect in the caller's shell so the artifact is owned by the
+        # packaging user, not root/docker.
+        if [ -n "$SUDO" ]; then
+            $SUDO "$DOCKER_CMD" save "$IMAGE_TAG" >"$image_tar"
+        else
+            "$DOCKER_CMD" save "$IMAGE_TAG" >"$image_tar"
+        fi
+        ( cd "$OUT_DIR" && sha256sum "$IMAGE_OUT_NAME" >"$IMAGE_OUT_NAME.sha256" )
+        ls -lh "$image_tar" "$image_tar.sha256"
+    fi
 }
 
 # ---------------------------------------------------------------------------

@@ -1,7 +1,8 @@
 # 独立打包（文件系统镜像）
 
 克隆 `package` 分支（包含最新的 Rust 移植版以及本打包流程），构建一个自包含的
-`sourcegraph/server` 替代品，形式为 `docker import` 可接受的**根文件系统 tarball**：
+`sourcegraph/server` 替代品，形式为 `docker import` 可接受的**根文件系统
+tarball**（可选 `--features docker` 同时导入并导出 Docker 镜像）：
 
 ```sh
 git clone -b package <this-repository-url>
@@ -50,14 +51,33 @@ sudo -E ./docker/package/package.sh --from rootfs
 
 # 需要观测栈（Prometheus/Alertmanager/prom-wrapper）时：
 sudo -E ./docker/package/package.sh --features observability
+
+# 需要额外产出 Docker 镜像与镜像 tar 包时：
+sudo -E ./docker/package/package.sh --features docker
+
+# 两个特性互相独立，可组合：
+sudo -E ./docker/package/package.sh --features observability,docker
 ```
 
-产物位于 `.package-build/out/`：
+特性说明：
+
+| feature | 作用 | 额外输出 |
+| --- | --- | --- |
+| `observability` | 安装 Prometheus/Alertmanager/prom-wrapper、基线配置、告警规则与 target 列表 | 主包名加 `-observability` 后缀 |
+| `docker` | 用 rootfs tarball 执行 `docker import` | `<name>.docker.tar` 镜像包 + sha256（tag 由 `IMAGE_TAG` 决定） |
+
+未开启任何特性时产物位于 `.package-build/out/`：
 
 ```
 sourcegraph-server-rust-5.5.0-fs.tar.gz
 sourcegraph-server-rust-5.5.0-fs.tar.gz.sha256
 ```
+
+开启 `observability` 后主包为
+`sourcegraph-server-rust-5.5.0-observability-fs.tar.gz`；开启 `docker` 后
+额外输出 `sourcegraph-server-rust-5.5.0[-observability].docker.tar`（约
+1.2 GB）及 sha256。可用 `IMAGE_TAG`、`IMAGE_OUT_NAME`、`OUT_NAME` 覆盖默认
+名称。
 
 导入并运行：
 
