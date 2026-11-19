@@ -1,0 +1,183 @@
+name: package-rootfs
+
+on:
+  workflow_dispatch:
+    inputs:
+      observability:
+        description: "Build the observability feature (Prometheus/Alertmanager/prom-wrapper/postgres_exporter)"
+        type: boolean
+        default: false
+      sveltekit:
+        description: "Build and ship the SvelteKit web UI (_sk)"
+        type: boolean
+        default: false
+      sourcemaps:
+        description: "Keep *.map files in /assets-dist"
+        type: boolean
+        default: false
+      docker_image:
+        description: "Import the rootfs and also export a Docker image tar (the 'docker' feature)"
+        type: boolean
+        default: true
+      image_tag:
+        description: "Optional Docker image tag (default: sourcegraph/server:rust-<version><feature-suffix>)"
+        type: string
+        required: false
+        default: ""
+      retention_days:
+        description: "Artifact retention in days"
+        type: string
+        required: false
+        default: "7"
+      runner:
+        description: "Runner label (use a larger/self-hosted runner for release builds)"
+        type: string
+        required: false
+        default: "ubuntu-latest"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: package-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  package:
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 360
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: |
+          set -eux
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost || true
+          sudo docker system prune -af || true
+          df -h
+
+      - name: Install system dependencies
+        run: |
+          set -eux
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            debootstrap build-essential pkg-config libssl-dev git
+          df -h
+
+      - name: Use the larger scratch disk when available
+        run: |
+          set -eux
+          # GitHub's /mnt is usually much larger than the root disk (where
+          # /home/runner lives). Package.sh honours RUST_TARGET_DIR.
+          if [ -d /mnt ] && [ -w /mnt ]; then
+            target=/mnt/rust-target
+          elif mountpoint -q /mnt 2>/dev/null; then
+            sudo mkdir -p /mnt/rust-target
+            sudo chown -R "$USER" /mnt/rust-target
+            target=/mnt/rust-target
+          else
+            target="$RUNNER_TEMP/rust-target"
+          fi
+          mkdir -p "$target"
+          echo "RUST_TARGET_DIR=$target" >> "$GITHUB_ENV"
+          df -h "$target"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Set up pnpm 8.9.2
+        run: |
+          set -eux
+          npm install --global pnpm@8.9.2
+          pnpm --version
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.22.x"
+          cache: false
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@1.99.1
+        with:
+          components: rustfmt, clippy
+
+      - name: Resolve features
+        id: features
+        env:
+          OBS: ${{ inputs.observability }}
+          SK: ${{ inputs.sveltekit }}
+          SM: ${{ inputs.sourcemaps }}
+          DOCKER: ${{ inputs.docker_image }}
+        run: |
+          set -euo pipefail
+          features=()
+          [ "$OBS" = "true" ] && features+=(observability)
+          [ "$SK" = "true" ] && features+=(sveltekit)
+          [ "$SM" = "true" ] && features+=(sourcemaps)
+          [ "$DOCKER" = "true" ] && features+=(docker)
+          value="$(IFS=,; echo "${features[*]}")"
+          echo "value=$value" >> "$GITHUB_OUTPUT"
+          echo "docker=$DOCKER" >> "$GITHUB_OUTPUT"
+          echo "Resolved features: '${value:-<none>}'"
+
+      - name: Build rootfs (and Docker image when requested)
+        env:
+          FEATURES: ${{ steps.features.outputs.value }}
+          IMAGE_TAG: ${{ inputs.image_tag }}
+          CARGO_INCREMENTAL: "0"
+          CARGO_PROFILE_RELEASE_DEBUG: "0"
+          CARGO_BUILD_JOBS: "2"
+        run: |
+          set -euxo pipefail
+          args=()
+          if [ -n "$FEATURES" ]; then
+            args+=(--features "$FEATURES")
+          fi
+          if [ -n "$IMAGE_TAG" ]; then
+            export IMAGE_TAG
+          fi
+          # Run as the CI user; package.sh uses `sudo -n` for the rootfs stages.
+          # Keeping the top-level process unprivileged also lets cargo/pnpm use
+          # the runner's caches and keeps the output artifacts user-owned.
+          ./docker/package/package.sh "${args[@]}"
+          ls -lh .package-build/out/
+
+      - name: Write summary
+        run: |
+          set -euo pipefail
+          {
+            echo "## Package result"
+            echo
+            echo "- Features: \`${{ steps.features.outputs.value || '<none>' }}\`"
+            echo
+            echo "| file | size |"
+            echo "| --- | --- |"
+            find .package-build/out -maxdepth 1 -type f \( -name '*.tar.gz' -o -name '*.docker.tar' \) \
+              -printf '| %f | %s bytes |\n' | sort
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload rootfs artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rootfs-${{ github.run_id }}
+          path: |
+            .package-build/out/*-fs.tar.gz
+            .package-build/out/*-fs.tar.gz.sha256
+          retention-days: ${{ inputs.retention_days }}
+          if-no-files-found: error
+
+      - name: Upload Docker image artifact
+        if: ${{ inputs.docker_image }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-image-${{ github.run_id }}
+          path: |
+            .package-build/out/*.docker.tar
+            .package-build/out/*.docker.tar.sha256
+          retention-days: ${{ inputs.retention_days }}
+          if-no-files-found: error

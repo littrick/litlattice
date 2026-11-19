@@ -115,6 +115,25 @@ docker run -d --name sg-rust -p 7080:7080 \
    以及 Web 包（`docker/server/stage-assets.sh`）。
 7. `package` — `tar --numeric-owner` + gzip 和 sha256。
 
+## GitHub Actions
+
+`.github/workflows/package.yml` 提供手动触发（`workflow_dispatch`）的打包流程：
+
+| 输入 | 说明 |
+| --- | --- |
+| `observability` | 对应 `observability` feature |
+| `sveltekit` | 对应 `sveltekit` feature |
+| `sourcemaps` | 对应 `sourcemaps` feature |
+| `docker_image` | 对应 `docker` feature，默认开启：额外导入并导出 Docker 镜像 tar |
+| `image_tag` | 可选镜像 tag；留空时按版本/feature 自动生成 |
+| `retention_days` | artifact 保留天数 |
+| `runner` | runner 标签；发布构建建议使用更大或 self-hosted runner |
+
+流程始终上传 rootfs tarball；`docker_image` 开启时同时上传
+`*.docker.tar`。构建脚本以普通用户运行，rootfs 阶段内部使用 `sudo -n`；
+工作流会优先把 Rust target 放到 `/mnt` 的大磁盘（若可用），并清理预装
+SDK 以腾出空间。
+
 ## 保真度说明
 
 - 可观测性是**可选打包特性，默认不包含**。默认镜像不安装
