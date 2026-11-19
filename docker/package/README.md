@@ -117,7 +117,9 @@ docker run -d --name sg-rust -p 7080:7080 \
 
 ## GitHub Actions
 
-`.github/workflows/package.yml` 提供手动触发（`workflow_dispatch`）的打包流程：
+`.github/workflows/package.yml` 提供手动触发（`workflow_dispatch`）的打包流程；
+runner 上会安装 `protobuf-compiler`（`protoc`），缺少它 `sg-proto` 的
+build script 会失败：
 
 | 输入 | 说明 |
 | --- | --- |
