@@ -159,7 +159,7 @@ impl Service for SearcherService {
             debug::DEFAULT_ADDR,
             "net/http/pprof http bind address.",
         );
-        self.prof_addr = Some(prof_addr).filter(|addr| !addr.is_empty());
+        self.prof_addr = sg_core::prof_http_addr("searcher", &prof_addr);
         let config = SearcherConfig::load(env)?;
         // `SEARCHER_ADDR` is only a fallback default; tests may override it.
         if self.addr == DEFAULT_ADDR {

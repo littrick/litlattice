@@ -1,0 +1,165 @@
+groups:
+- name: otel-collector
+  rules:
+  - alert: warning_otel-collector_otel_span_refused
+    labels:
+      alert_type: builtin
+      description: 'otel-collector: 1+ spans refused per receiver for 5m0s'
+      grafana_panel_id: "100001"
+      level: warning
+      name: otel_span_refused
+      owner: infra-support
+      service_name: otel-collector
+    expr: max((sum by (receiver) (rate(otelcol_receiver_refused_spans[1m]))) > 1)
+    for: 5m
+  - record: alert_count
+    labels:
+      alert_type: builtin
+      description: 'otel-collector: 1+ spans refused per receiver for 5m0s'
+      grafana_panel_id: "100001"
+      level: warning
+      name: otel_span_refused
+      owner: infra-support
+      service_name: otel-collector
+    expr: max(ALERTS{alertname="warning_otel-collector_otel_span_refused",alertstate="firing"}
+      OR on() vector(0))
+  - alert: warning_otel-collector_otel_span_export_failures
+    labels:
+      alert_type: builtin
+      description: 'otel-collector: 1+ span export failures by exporter for 5m0s'
+      grafana_panel_id: "100101"
+      level: warning
+      name: otel_span_export_failures
+      owner: infra-support
+      service_name: otel-collector
+    expr: max((sum by (exporter) (rate(otelcol_exporter_send_failed_spans[1m]))) >
+      1)
+    for: 5m
+  - record: alert_count
+    labels:
+      alert_type: builtin
+      description: 'otel-collector: 1+ span export failures by exporter for 5m0s'
+      grafana_panel_id: "100101"
+      level: warning
+      name: otel_span_export_failures
+      owner: infra-support
+      service_name: otel-collector
+    expr: max(ALERTS{alertname="warning_otel-collector_otel_span_export_failures",alertstate="firing"}
+      OR on() vector(0))
+  - alert: warning_otel-collector_otelcol_exporter_enqueue_failed_spans
+    labels:
+      alert_type: builtin
+      description: 'otel-collector: 0+ exporter enqueue failed spans for 5m0s'
+      grafana_panel_id: "100202"
+      level: warning
+      name: otelcol_exporter_enqueue_failed_spans
+      owner: infra-support
+      service_name: otel-collector
+    expr: max((sum by (exporter) (rate(otelcol_exporter_enqueue_failed_spans{job=~"^.*"}[1m])))
+      > 0)
+    for: 5m
+  - record: alert_count
+    labels:
+      alert_type: builtin
+      description: 'otel-collector: 0+ exporter enqueue failed spans for 5m0s'
+      grafana_panel_id: "100202"
+      level: warning
+      name: otelcol_exporter_enqueue_failed_spans
+      owner: infra-support
+      service_name: otel-collector
+    expr: max(ALERTS{alertname="warning_otel-collector_otelcol_exporter_enqueue_failed_spans",alertstate="firing"}
+      OR on() vector(0))
+  - alert: warning_otel-collector_otelcol_processor_dropped_spans
+    labels:
+      alert_type: builtin
+      description: 'otel-collector: 0+ spans dropped per processor per minute for
+        5m0s'
+      grafana_panel_id: "100300"
+      level: warning
+      name: otelcol_processor_dropped_spans
+      owner: infra-support
+      service_name: otel-collector
+    expr: max((sum by (processor) (rate(otelcol_processor_dropped_spans[1m]))) > 0)
+    for: 5m
+  - record: alert_count
+    labels:
+      alert_type: builtin
+      description: 'otel-collector: 0+ spans dropped per processor per minute for
+        5m0s'
+      grafana_panel_id: "100300"
+      level: warning
+      name: otelcol_processor_dropped_spans
+      owner: infra-support
+      service_name: otel-collector
+    expr: max(ALERTS{alertname="warning_otel-collector_otelcol_processor_dropped_spans",alertstate="firing"}
+      OR on() vector(0))
+  - alert: warning_otel-collector_container_cpu_usage
+    labels:
+      alert_type: builtin
+      description: 'otel-collector: 99%+ container cpu usage total (1m average) across
+        all cores by instance'
+      grafana_panel_id: "100501"
+      level: warning
+      name: container_cpu_usage
+      owner: infra-support
+      service_name: otel-collector
+    expr: max((cadvisor_container_cpu_usage_percentage_total{name=~"^otel-collector.*"})
+      >= 99)
+  - record: alert_count
+    labels:
+      alert_type: builtin
+      description: 'otel-collector: 99%+ container cpu usage total (1m average) across
+        all cores by instance'
+      grafana_panel_id: "100501"
+      level: warning
+      name: container_cpu_usage
+      owner: infra-support
+      service_name: otel-collector
+    expr: max(ALERTS{alertname="warning_otel-collector_container_cpu_usage",alertstate="firing"}
+      OR on() vector(0))
+  - alert: warning_otel-collector_container_memory_usage
+    labels:
+      alert_type: builtin
+      description: 'otel-collector: 99%+ container memory usage by instance'
+      grafana_panel_id: "100502"
+      level: warning
+      name: container_memory_usage
+      owner: infra-support
+      service_name: otel-collector
+    expr: max((cadvisor_container_memory_usage_percentage_total{name=~"^otel-collector.*"})
+      >= 99)
+  - record: alert_count
+    labels:
+      alert_type: builtin
+      description: 'otel-collector: 99%+ container memory usage by instance'
+      grafana_panel_id: "100502"
+      level: warning
+      name: container_memory_usage
+      owner: infra-support
+      service_name: otel-collector
+    expr: max(ALERTS{alertname="warning_otel-collector_container_memory_usage",alertstate="firing"}
+      OR on() vector(0))
+  - alert: critical_otel-collector_pods_available_percentage
+    labels:
+      alert_type: builtin
+      description: 'otel-collector: less than 90% percentage pods available for 10m0s'
+      grafana_panel_id: "100600"
+      level: critical
+      name: pods_available_percentage
+      owner: infra-support
+      service_name: otel-collector
+    expr: min((sum by (app) (up{app=~".*otel-collector"}) / count by (app) (up{app=~".*otel-collector"})
+      * 100) <= 90)
+    for: 10m
+  - record: alert_count
+    labels:
+      alert_type: builtin
+      description: 'otel-collector: less than 90% percentage pods available for 10m0s'
+      grafana_panel_id: "100600"
+      level: critical
+      name: pods_available_percentage
+      owner: infra-support
+      service_name: otel-collector
+    expr: max(ALERTS{alertname="critical_otel-collector_pods_available_percentage",alertstate="firing"}
+      OR on() vector(0))
+  interval: 30s

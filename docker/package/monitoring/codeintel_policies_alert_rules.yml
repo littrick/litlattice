@@ -1,0 +1,4 @@
+groups:
+- name: codeintel-policies
+  rules: []
+  interval: 30s

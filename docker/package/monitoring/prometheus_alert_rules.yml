@@ -1,0 +1,398 @@
+groups:
+- name: prometheus
+  rules:
+  - alert: warning_prometheus_prometheus_rule_eval_duration
+    labels:
+      alert_type: builtin
+      description: 'prometheus: 30s+ average prometheus rule group evaluation duration
+        over 10m by rule group'
+      grafana_panel_id: "100010"
+      level: warning
+      name: prometheus_rule_eval_duration
+      owner: infra-support
+      service_name: prometheus
+    expr: max((sum by (rule_group) (avg_over_time(prometheus_rule_group_last_duration_seconds[10m])))
+      >= 30)
+  - record: alert_count
+    labels:
+      alert_type: builtin
+      description: 'prometheus: 30s+ average prometheus rule group evaluation duration
+        over 10m by rule group'
+      grafana_panel_id: "100010"
+      level: warning
+      name: prometheus_rule_eval_duration
+      owner: infra-support
+      service_name: prometheus
+    expr: max(ALERTS{alertname="warning_prometheus_prometheus_rule_eval_duration",alertstate="firing"}
+      OR on() vector(0))
+  - alert: warning_prometheus_prometheus_rule_eval_failures
+    labels:
+      alert_type: builtin
+      description: 'prometheus: 0+ failed prometheus rule evaluations over 5m by rule
+        group'
+      grafana_panel_id: "100011"
+      level: warning
+      name: prometheus_rule_eval_failures
+      owner: infra-support
+      service_name: prometheus
+    expr: max((sum by (rule_group) (rate(prometheus_rule_evaluation_failures_total[5m])))
+      > 0)
+  - record: alert_count
+    labels:
+      alert_type: builtin
+      description: 'prometheus: 0+ failed prometheus rule evaluations over 5m by rule
+        group'
+      grafana_panel_id: "100011"
+      level: warning
+      name: prometheus_rule_eval_failures
+      owner: infra-support
+      service_name: prometheus
+    expr: max(ALERTS{alertname="warning_prometheus_prometheus_rule_eval_failures",alertstate="firing"}
+      OR on() vector(0))
+  - alert: warning_prometheus_alertmanager_notification_latency
+    labels:
+      alert_type: builtin
+      description: 'prometheus: 1s+ alertmanager notification latency over 1m by integration'
+      grafana_panel_id: "100100"
+      level: warning
+      name: alertmanager_notification_latency
+      owner: infra-support
+      service_name: prometheus
+    expr: max((sum by (integration) (rate(alertmanager_notification_latency_seconds_sum[1m])))
+      >= 1)
+  - record: alert_count
+    labels:
+      alert_type: builtin
+      description: 'prometheus: 1s+ alertmanager notification latency over 1m by integration'
+      grafana_panel_id: "100100"
+      level: warning
+      name: alertmanager_notification_latency
+      owner: infra-support
+      service_name: prometheus
+    expr: max(ALERTS{alertname="warning_prometheus_alertmanager_notification_latency",alertstate="firing"}
+      OR on() vector(0))
+  - alert: warning_prometheus_alertmanager_notification_failures
+    labels:
+      alert_type: builtin
+      description: 'prometheus: 0+ failed alertmanager notifications over 1m by integration'
+      grafana_panel_id: "100101"
+      level: warning
+      name: alertmanager_notification_failures
+      owner: infra-support
+      service_name: prometheus
+    expr: max((sum by (integration) (rate(alertmanager_notifications_failed_total[1m])))
+      > 0)
+  - record: alert_count
+    labels:
+      alert_type: builtin
+      description: 'prometheus: 0+ failed alertmanager notifications over 1m by integration'
+      grafana_panel_id: "100101"
+      level: warning
+      name: alertmanager_notification_failures
+      owner: infra-support
+      service_name: prometheus
+    expr: max(ALERTS{alertname="warning_prometheus_alertmanager_notification_failures",alertstate="firing"}
+      OR on() vector(0))
+  - alert: warning_prometheus_prometheus_config_status
+    labels:
+      alert_type: builtin
+      description: 'prometheus: less than 1 prometheus configuration reload status'
+      grafana_panel_id: "100200"
+      level: warning
+      name: prometheus_config_status
+      owner: infra-support
+      service_name: prometheus
+    expr: min((prometheus_config_last_reload_successful) < 1)
+  - record: alert_count
+    labels:
+      alert_type: builtin
+      description: 'prometheus: less than 1 prometheus configuration reload status'
+      grafana_panel_id: "100200"
+      level: warning
+      name: prometheus_config_status
+      owner: infra-support
+      service_name: prometheus
+    expr: max(ALERTS{alertname="warning_prometheus_prometheus_config_status",alertstate="firing"}
+      OR on() vector(0))
+  - alert: warning_prometheus_alertmanager_config_status
+    labels:
+      alert_type: builtin
+      description: 'prometheus: less than 1 alertmanager configuration reload status'
+      grafana_panel_id: "100201"
+      level: warning
+      name: alertmanager_config_status
+      owner: infra-support
+      service_name: prometheus
+    expr: min((alertmanager_config_last_reload_successful) < 1)
+  - record: alert_count
+    labels:
+      alert_type: builtin
+      description: 'prometheus: less than 1 alertmanager configuration reload status'
+      grafana_panel_id: "100201"
+      level: warning
+      name: alertmanager_config_status
+      owner: infra-support
+      service_name: prometheus
+    expr: max(ALERTS{alertname="warning_prometheus_alertmanager_config_status",alertstate="firing"}
+      OR on() vector(0))
+  - alert: warning_prometheus_prometheus_tsdb_op_failure
+    labels:
+      alert_type: builtin
+      description: 'prometheus: 0+ prometheus tsdb failures by operation over 1m by
+        operation'
+      grafana_panel_id: "100210"
+      level: warning
+      name: prometheus_tsdb_op_failure
+      owner: infra-support
+      service_name: prometheus
+    expr: max((increase(label_replace({__name__=~"prometheus_tsdb_(.*)_failed_total"},
+      "operation", "$1", "__name__", "(.+)s_failed_total")[5m:1m])) > 0)
+  - record: alert_count
+    labels:
+      alert_type: builtin
+      description: 'prometheus: 0+ prometheus tsdb failures by operation over 1m by
+        operation'
+      grafana_panel_id: "100210"
+      level: warning
+      name: prometheus_tsdb_op_failure
+      owner: infra-support
+      service_name: prometheus
+    expr: max(ALERTS{alertname="warning_prometheus_prometheus_tsdb_op_failure",alertstate="firing"}
+      OR on() vector(0))
+  - alert: warning_prometheus_prometheus_target_sample_exceeded
+    labels:
+      alert_type: builtin
+      description: 'prometheus: 0+ prometheus scrapes that exceed the sample limit
+        over 10m'
+      grafana_panel_id: "100211"
+      level: warning
+      name: prometheus_target_sample_exceeded
+      owner: infra-support
+      service_name: prometheus
+    expr: max((increase(prometheus_target_scrapes_exceeded_sample_limit_total[10m]))
+      > 0)
+  - record: alert_count
+    labels:
+      alert_type: builtin
+      description: 'prometheus: 0+ prometheus scrapes that exceed the sample limit
+        over 10m'
+      grafana_panel_id: "100211"
+      level: warning
+      name: prometheus_target_sample_exceeded
+      owner: infra-support
+      service_name: prometheus
+    expr: max(ALERTS{alertname="warning_prometheus_prometheus_target_sample_exceeded",alertstate="firing"}
+      OR on() vector(0))
+  - alert: warning_prometheus_prometheus_target_sample_duplicate
+    labels:
+      alert_type: builtin
+      description: 'prometheus: 0+ prometheus scrapes rejected due to duplicate timestamps
+        over 10m'
+      grafana_panel_id: "100212"
+      level: warning
+      name: prometheus_target_sample_duplicate
+      owner: infra-support
+      service_name: prometheus
+    expr: max((increase(prometheus_target_scrapes_sample_duplicate_timestamp_total[10m]))
+      > 0)
+  - record: alert_count
+    labels:
+      alert_type: builtin
+      description: 'prometheus: 0+ prometheus scrapes rejected due to duplicate timestamps
+        over 10m'
+      grafana_panel_id: "100212"
+      level: warning
+      name: prometheus_target_sample_duplicate
+      owner: infra-support
+      service_name: prometheus
+    expr: max(ALERTS{alertname="warning_prometheus_prometheus_target_sample_duplicate",alertstate="firing"}
+      OR on() vector(0))
+  - alert: warning_prometheus_container_cpu_usage
+    labels:
+      alert_type: builtin
+      description: 'prometheus: 99%+ container cpu usage total (1m average) across
+        all cores by instance'
+      grafana_panel_id: "100301"
+      level: warning
+      name: container_cpu_usage
+      owner: infra-support
+      service_name: prometheus
+    expr: max((cadvisor_container_cpu_usage_percentage_total{name=~"^prometheus.*"})
+      >= 99)
+  - record: alert_count
+    labels:
+      alert_type: builtin
+      description: 'prometheus: 99%+ container cpu usage total (1m average) across
+        all cores by instance'
+      grafana_panel_id: "100301"
+      level: warning
+      name: container_cpu_usage
+      owner: infra-support
+      service_name: prometheus
+    expr: max(ALERTS{alertname="warning_prometheus_container_cpu_usage",alertstate="firing"}
+      OR on() vector(0))
+  - alert: warning_prometheus_container_memory_usage
+    labels:
+      alert_type: builtin
+      description: 'prometheus: 99%+ container memory usage by instance'
+      grafana_panel_id: "100302"
+      level: warning
+      name: container_memory_usage
+      owner: infra-support
+      service_name: prometheus
+    expr: max((cadvisor_container_memory_usage_percentage_total{name=~"^prometheus.*"})
+      >= 99)
+  - record: alert_count
+    labels:
+      alert_type: builtin
+      description: 'prometheus: 99%+ container memory usage by instance'
+      grafana_panel_id: "100302"
+      level: warning
+      name: container_memory_usage
+      owner: infra-support
+      service_name: prometheus
+    expr: max(ALERTS{alertname="warning_prometheus_container_memory_usage",alertstate="firing"}
+      OR on() vector(0))
+  - alert: warning_prometheus_provisioning_container_cpu_usage_long_term
+    labels:
+      alert_type: builtin
+      description: 'prometheus: 80%+ container cpu usage total (90th percentile over
+        1d) across all cores by instance for 336h0m0s'
+      grafana_panel_id: "100400"
+      level: warning
+      name: provisioning_container_cpu_usage_long_term
+      owner: infra-support
+      service_name: prometheus
+    expr: max((quantile_over_time(0.9, cadvisor_container_cpu_usage_percentage_total{name=~"^prometheus.*"}[1d]))
+      >= 80)
+    for: 2w
+  - record: alert_count
+    labels:
+      alert_type: builtin
+      description: 'prometheus: 80%+ container cpu usage total (90th percentile over
+        1d) across all cores by instance for 336h0m0s'
+      grafana_panel_id: "100400"
+      level: warning
+      name: provisioning_container_cpu_usage_long_term
+      owner: infra-support
+      service_name: prometheus
+    expr: max(ALERTS{alertname="warning_prometheus_provisioning_container_cpu_usage_long_term",alertstate="firing"}
+      OR on() vector(0))
+  - alert: warning_prometheus_provisioning_container_memory_usage_long_term
+    labels:
+      alert_type: builtin
+      description: 'prometheus: 80%+ container memory usage (1d maximum) by instance
+        for 336h0m0s'
+      grafana_panel_id: "100401"
+      level: warning
+      name: provisioning_container_memory_usage_long_term
+      owner: infra-support
+      service_name: prometheus
+    expr: max((max_over_time(cadvisor_container_memory_usage_percentage_total{name=~"^prometheus.*"}[1d]))
+      >= 80)
+    for: 2w
+  - record: alert_count
+    labels:
+      alert_type: builtin
+      description: 'prometheus: 80%+ container memory usage (1d maximum) by instance
+        for 336h0m0s'
+      grafana_panel_id: "100401"
+      level: warning
+      name: provisioning_container_memory_usage_long_term
+      owner: infra-support
+      service_name: prometheus
+    expr: max(ALERTS{alertname="warning_prometheus_provisioning_container_memory_usage_long_term",alertstate="firing"}
+      OR on() vector(0))
+  - alert: warning_prometheus_provisioning_container_cpu_usage_short_term
+    labels:
+      alert_type: builtin
+      description: 'prometheus: 90%+ container cpu usage total (5m maximum) across
+        all cores by instance for 30m0s'
+      grafana_panel_id: "100410"
+      level: warning
+      name: provisioning_container_cpu_usage_short_term
+      owner: infra-support
+      service_name: prometheus
+    expr: max((max_over_time(cadvisor_container_cpu_usage_percentage_total{name=~"^prometheus.*"}[5m]))
+      >= 90)
+    for: 30m
+  - record: alert_count
+    labels:
+      alert_type: builtin
+      description: 'prometheus: 90%+ container cpu usage total (5m maximum) across
+        all cores by instance for 30m0s'
+      grafana_panel_id: "100410"
+      level: warning
+      name: provisioning_container_cpu_usage_short_term
+      owner: infra-support
+      service_name: prometheus
+    expr: max(ALERTS{alertname="warning_prometheus_provisioning_container_cpu_usage_short_term",alertstate="firing"}
+      OR on() vector(0))
+  - alert: warning_prometheus_provisioning_container_memory_usage_short_term
+    labels:
+      alert_type: builtin
+      description: 'prometheus: 90%+ container memory usage (5m maximum) by instance'
+      grafana_panel_id: "100411"
+      level: warning
+      name: provisioning_container_memory_usage_short_term
+      owner: infra-support
+      service_name: prometheus
+    expr: max((max_over_time(cadvisor_container_memory_usage_percentage_total{name=~"^prometheus.*"}[5m]))
+      >= 90)
+  - record: alert_count
+    labels:
+      alert_type: builtin
+      description: 'prometheus: 90%+ container memory usage (5m maximum) by instance'
+      grafana_panel_id: "100411"
+      level: warning
+      name: provisioning_container_memory_usage_short_term
+      owner: infra-support
+      service_name: prometheus
+    expr: max(ALERTS{alertname="warning_prometheus_provisioning_container_memory_usage_short_term",alertstate="firing"}
+      OR on() vector(0))
+  - alert: warning_prometheus_container_oomkill_events_total
+    labels:
+      alert_type: builtin
+      description: 'prometheus: 1+ container OOMKILL events total by instance'
+      grafana_panel_id: "100412"
+      level: warning
+      name: container_oomkill_events_total
+      owner: infra-support
+      service_name: prometheus
+    expr: max((max by (name) (container_oom_events_total{name=~"^prometheus.*"}))
+      >= 1)
+  - record: alert_count
+    labels:
+      alert_type: builtin
+      description: 'prometheus: 1+ container OOMKILL events total by instance'
+      grafana_panel_id: "100412"
+      level: warning
+      name: container_oomkill_events_total
+      owner: infra-support
+      service_name: prometheus
+    expr: max(ALERTS{alertname="warning_prometheus_container_oomkill_events_total",alertstate="firing"}
+      OR on() vector(0))
+  - alert: critical_prometheus_pods_available_percentage
+    labels:
+      alert_type: builtin
+      description: 'prometheus: less than 90% percentage pods available for 10m0s'
+      grafana_panel_id: "100500"
+      level: critical
+      name: pods_available_percentage
+      owner: infra-support
+      service_name: prometheus
+    expr: min((sum by (app) (up{app=~".*prometheus"}) / count by (app) (up{app=~".*prometheus"})
+      * 100) <= 90)
+    for: 10m
+  - record: alert_count
+    labels:
+      alert_type: builtin
+      description: 'prometheus: less than 90% percentage pods available for 10m0s'
+      grafana_panel_id: "100500"
+      level: critical
+      name: pods_available_percentage
+      owner: infra-support
+      service_name: prometheus
+    expr: max(ALERTS{alertname="critical_prometheus_pods_available_percentage",alertstate="firing"}
+      OR on() vector(0))
+  interval: 30s

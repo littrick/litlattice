@@ -99,7 +99,7 @@ impl Service for SymbolsService {
             debug::DEFAULT_ADDR,
             "net/http/pprof http bind address.",
         );
-        self.prof_addr = Some(prof_addr).filter(|addr| !addr.is_empty());
+        self.prof_addr = sg_core::prof_http_addr("symbols", &prof_addr);
         self.config = Some(SymbolsConfig::load(env)?);
         Ok(())
     }

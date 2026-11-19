@@ -13,6 +13,7 @@
 
 pub mod error;
 pub mod locked_env;
+pub mod prof;
 pub mod ready;
 pub mod run;
 pub mod sanity;
@@ -20,6 +21,7 @@ pub mod service;
 
 pub use error::{ConfigError, ServiceError};
 pub use locked_env::LockedEnv;
+pub use prof::prof_http_addr;
 pub use ready::ReadyHandle;
 pub use run::{run, run_with_options, RunOptions};
 pub use sanity::sanity_check;

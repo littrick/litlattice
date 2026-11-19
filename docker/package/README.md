@@ -92,8 +92,12 @@ docker run -d --name sg-rust -p 7080:7080 \
 
 ## 保真度说明
 
-- 可观测性已禁用（无 Grafana/Prometheus 软件包）；Procfile 中的监控行仅满足
-  文件存在性契约。
+- 可观测性默认关闭；rootfs 现在包含 Prometheus、Alertmanager、基线
+  `prometheus.yml`/`alertmanager.yml`、生成的告警规则与单容器 target 列表，
+  以及 Rust `prom-wrapper`。设置 `DISABLE_OBSERVABILITY=`（空值）即可启动
+  Prometheus `:9090`（prom-wrapper 反代）与 Alertmanager `:9093`。Grafana
+  未打包；`/server` 检测到 `/usr/share/grafana/bin/grafana-server` 不存在时
+  会自动跳过 grafana 进程，不再导致整容器退出。
 - 混合/zoekt 搜索已禁用（`DISABLE_HYBRID_SEARCH=true`）；为保持一致性仍随附
   zoekt 二进制，但不运行索引服务器。
 - `/var/opt/sourcegraph/postgresql{,-markers}` 有意**不**预先创建：`/server`

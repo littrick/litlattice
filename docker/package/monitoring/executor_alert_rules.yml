@@ -1,0 +1,98 @@
+groups:
+- name: executor
+  rules:
+  - alert: critical_executor_executor_handlers
+    labels:
+      alert_type: builtin
+      description: 'executor: 0 active executor handlers and > 0 queue size for 5m0s'
+      grafana_panel_id: "100200"
+      level: critical
+      name: executor_handlers
+      owner: code-intel
+      service_name: executor
+    expr: min(((sum(src_executor_processor_handlers{sg_job=~"^sourcegraph-executors.*"})
+      or vector(0)) == 0 and (sum by (queue) (src_executor_total{job=~"^sourcegraph-executors.*"}))
+      > 0) <= 0)
+    for: 5m
+  - record: alert_count
+    labels:
+      alert_type: builtin
+      description: 'executor: 0 active executor handlers and > 0 queue size for 5m0s'
+      grafana_panel_id: "100200"
+      level: critical
+      name: executor_handlers
+      owner: code-intel
+      service_name: executor
+    expr: max(ALERTS{alertname="critical_executor_executor_handlers",alertstate="firing"}
+      OR on() vector(0))
+  - alert: warning_executor_executor_processor_error_rate
+    labels:
+      alert_type: builtin
+      description: 'executor: 100%+ executor operation error rate over 5m for 1h0m0s'
+      grafana_panel_id: "100213"
+      level: warning
+      name: executor_processor_error_rate
+      owner: code-intel
+      service_name: executor
+    expr: max((last_over_time(sum(increase(src_executor_processor_errors_total{sg_job=~"^sourcegraph-executors.*"}[5m]))[5h:])
+      / (last_over_time(sum(increase(src_executor_processor_total{sg_job=~"^sourcegraph-executors.*"}[5m]))[5h:])
+      + last_over_time(sum(increase(src_executor_processor_errors_total{sg_job=~"^sourcegraph-executors.*"}[5m]))[5h:]))
+      * 100) >= 100)
+    for: 1h
+  - record: alert_count
+    labels:
+      alert_type: builtin
+      description: 'executor: 100%+ executor operation error rate over 5m for 1h0m0s'
+      grafana_panel_id: "100213"
+      level: warning
+      name: executor_processor_error_rate
+      owner: code-intel
+      service_name: executor
+    expr: max(ALERTS{alertname="warning_executor_executor_processor_error_rate",alertstate="firing"}
+      OR on() vector(0))
+  - alert: warning_executor_go_goroutines
+    labels:
+      alert_type: builtin
+      description: 'executor: 10000+ maximum active goroutines for 10m0s'
+      grafana_panel_id: "101000"
+      level: warning
+      name: go_goroutines
+      owner: code-intel
+      service_name: executor
+    expr: max((max by (sg_instance) (go_goroutines{sg_job=~".*sourcegraph-executors"}))
+      >= 10000)
+    for: 10m
+  - record: alert_count
+    labels:
+      alert_type: builtin
+      description: 'executor: 10000+ maximum active goroutines for 10m0s'
+      grafana_panel_id: "101000"
+      level: warning
+      name: go_goroutines
+      owner: code-intel
+      service_name: executor
+    expr: max(ALERTS{alertname="warning_executor_go_goroutines",alertstate="firing"}
+      OR on() vector(0))
+  - alert: warning_executor_go_gc_duration_seconds
+    labels:
+      alert_type: builtin
+      description: 'executor: 2s+ maximum go garbage collection duration'
+      grafana_panel_id: "101001"
+      level: warning
+      name: go_gc_duration_seconds
+      owner: code-intel
+      service_name: executor
+    expr: max((max by (sg_instance) (go_gc_duration_seconds{sg_job=~".*sourcegraph-executors"}))
+      >= 2)
+  - record: alert_count
+    labels:
+      alert_type: builtin
+      description: 'executor: 2s+ maximum go garbage collection duration'
+      grafana_panel_id: "101001"
+      level: warning
+      name: go_gc_duration_seconds
+      owner: code-intel
+      service_name: executor
+    expr: max(ALERTS{alertname="warning_executor_go_gc_duration_seconds",alertstate="firing"}
+      OR on() vector(0))
+  interval: 30s

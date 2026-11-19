@@ -125,7 +125,7 @@ impl Service for WorkerService {
             debug::DEFAULT_ADDR,
             "net/http/pprof http bind address.",
         );
-        self.prof_addr = Some(prof_addr).filter(|addr| !addr.is_empty());
+        self.prof_addr = sg_core::prof_http_addr("worker", &prof_addr);
         // `loadConfigs`: the worker config first, then every job's configs
         // (regardless of whether the job is enabled).
         let config = WorkerConfigs::load(env, self.addr_override.clone());

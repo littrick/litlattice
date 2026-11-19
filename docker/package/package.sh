@@ -281,7 +281,7 @@ stage_rootfs() {
         fail "debootstrap is required (apt-get install debootstrap)"
     [ "$(id -u)" = 0 ] || [ -n "$SUDO" ] || fail "rootfs staging needs root"
     fetch_universal_ctags
-    local packages="bash,ca-certificates,curl,git,git-lfs,gosu,openssh-client,nginx,postgresql,postgresql-contrib,redis-server,prometheus-postgres-exporter,locales,tini,python3,procps"
+    local packages="bash,ca-certificates,curl,git,git-lfs,gosu,openssh-client,nginx,postgresql,postgresql-contrib,redis-server,prometheus,prometheus-alertmanager,prometheus-postgres-exporter,locales,tini,python3,procps"
     if [ "${REUSE_ROOTFS:-0}" = 1 ] && [ -x "$ROOTFS/bin/bash" ]; then
         log "reusing existing rootfs at $ROOTFS"
     else
@@ -318,12 +318,14 @@ stage_rootfs() {
                  /var/opt/sourcegraph/repos /var/opt/sourcegraph/cache \
                  /var/opt/sourcegraph/blobstore /var/opt/sourcegraph/redis \
                  /var/opt/sourcegraph/redis-cache /var/opt/sourcegraph/zoekt/index \
+                 /var/opt/sourcegraph/prometheus \
                  /opt/image_tests /opt/s3proxy
         chmod 0755 /var/lib/nginx/tmp
         chown -R postgres:postgres /run/postgresql
         chown -R sourcegraph:sourcegraph /assets-dist \
                  /var/opt/sourcegraph/repos /var/opt/sourcegraph/cache \
-                 /var/opt/sourcegraph/blobstore /var/opt/sourcegraph/zoekt
+                 /var/opt/sourcegraph/blobstore /var/opt/sourcegraph/zoekt \
+                 /var/opt/sourcegraph/prometheus
         chown -R redis:redis /var/opt/sourcegraph/redis /var/opt/sourcegraph/redis-cache
         apt-get clean
         rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
@@ -376,19 +378,25 @@ chmod 0755 '$ROOTFS/opt/s3proxy/run-docker-container.sh'"
     run_root install -m 0644 "$BUILD_DIR/version.txt" "$ROOTFS/version.txt"
     run_root install -m 0644 "$BUILD_DIR/timestamp.txt" "$ROOTFS/timestamp.txt"
 
-    # Monitoring file-existence contract (observability stays disabled).
-    run_root sh -c "printf '#!/bin/sh\nexec prometheus \"\$@\"\n' >'$ROOTFS/prometheus.sh'"
-    run_root sh -c "printf '#!/bin/sh\nexec alertmanager \"\$@\"\n' >'$ROOTFS/alertmanager.sh'"
-    run_root mkdir -p "$ROOTFS/sg_config_prometheus"
-    # Baseline single-container configs: Alertmanager needs a root route and a
-    # matching receiver, and Prometheus needs the builtin scrape/alertmanager
-    # wiring (prom-wrapper replaces alertmanager.yml on config changes).
+    # Observability: prom-wrapper starts these scripts. They come from the
+    # pinned Sourcegraph source and expect `prometheus`/`alertmanager` on PATH
+    # (Ubuntu's Alertmanager binary is `prometheus-alertmanager`).
+    run_root install -m 0755 "$SRC_DIR/docker-images/prometheus/prometheus.sh" \
+        "$ROOTFS/prometheus.sh"
+    run_root install -m 0755 "$SRC_DIR/docker-images/prometheus/alertmanager.sh" \
+        "$ROOTFS/alertmanager.sh"
+    run_root ln -sf /usr/bin/prometheus-alertmanager "$ROOTFS/usr/bin/alertmanager"
+    run_root mkdir -p "$ROOTFS/sg_config_prometheus" "$ROOTFS/sg_prometheus_add_ons"
+    # Baseline single-container configs + generated rule/target files.
     run_root cp "$SRC_DIR/docker-images/prometheus/config/prometheus.yml" \
         "$ROOTFS/sg_config_prometheus/prometheus.yml"
     run_root cp "$SRC_DIR/docker-images/prometheus/config/alertmanager.yml" \
         "$ROOTFS/sg_config_prometheus/alertmanager.yml"
+    run_root cp "$REPO_ROOT/docker/package/monitoring/"*_alert_rules.yml \
+        "$ROOTFS/sg_config_prometheus/"
+    run_root cp "$REPO_ROOT/docker/package/monitoring/prometheus_targets.yml" \
+        "$ROOTFS/sg_prometheus_add_ons/prometheus_targets.yml"
     run_root sh -c ": >'$ROOTFS/postgres_exporter.yaml'"
-    run_root chmod 0755 "$ROOTFS/prometheus.sh" "$ROOTFS/alertmanager.sh"
 
     # Web bundle (stage-assets enforces a real web.manifest.json). It writes
     # into the root-owned rootfs, so run it through the root prefix.

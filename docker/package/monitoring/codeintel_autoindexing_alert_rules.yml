@@ -1,0 +1,4 @@
+groups:
+- name: codeintel-autoindexing
+  rules: []
+  interval: 30s

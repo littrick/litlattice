@@ -1,0 +1,466 @@
+groups:
+- name: gitserver
+  rules:
+  - alert: warning_gitserver_cpu_throttling_time
+    labels:
+      alert_type: builtin
+      description: 'gitserver: 75%+ container CPU throttling time % for 2m0s'
+      grafana_panel_id: "100010"
+      level: warning
+      name: cpu_throttling_time
+      owner: source
+      service_name: gitserver
+    expr: max((sum by (container_label_io_kubernetes_pod_name) ((rate(container_cpu_cfs_throttled_periods_total{container_label_io_kubernetes_container_name="gitserver"}[5m])
+      / rate(container_cpu_cfs_periods_total{container_label_io_kubernetes_container_name="gitserver"}[5m]))
+      * 100)) >= 75)
+    for: 2m
+  - record: alert_count
+    labels:
+      alert_type: builtin
+      description: 'gitserver: 75%+ container CPU throttling time % for 2m0s'
+      grafana_panel_id: "100010"
+      level: warning
+      name: cpu_throttling_time
+      owner: source
+      service_name: gitserver
+    expr: max(ALERTS{alertname="warning_gitserver_cpu_throttling_time",alertstate="firing"}
+      OR on() vector(0))
+  - alert: critical_gitserver_cpu_throttling_time
+    labels:
+      alert_type: builtin
+      description: 'gitserver: 90%+ container CPU throttling time % for 5m0s'
+      grafana_panel_id: "100010"
+      level: critical
+      name: cpu_throttling_time
+      owner: source
+      service_name: gitserver
+    expr: max((sum by (container_label_io_kubernetes_pod_name) ((rate(container_cpu_cfs_throttled_periods_total{container_label_io_kubernetes_container_name="gitserver"}[5m])
+      / rate(container_cpu_cfs_periods_total{container_label_io_kubernetes_container_name="gitserver"}[5m]))
+      * 100)) >= 90)
+    for: 5m
+  - record: alert_count
+    labels:
+      alert_type: builtin
+      description: 'gitserver: 90%+ container CPU throttling time % for 5m0s'
+      grafana_panel_id: "100010"
+      level: critical
+      name: cpu_throttling_time
+      owner: source
+      service_name: gitserver
+    expr: max(ALERTS{alertname="critical_gitserver_cpu_throttling_time",alertstate="firing"}
+      OR on() vector(0))
+  - alert: warning_gitserver_disk_space_remaining
+    labels:
+      alert_type: builtin
+      description: 'gitserver: less than 15% disk space remaining'
+      grafana_panel_id: "100020"
+      level: warning
+      name: disk_space_remaining
+      owner: source
+      service_name: gitserver
+    expr: min(((src_gitserver_disk_space_available / src_gitserver_disk_space_total)
+      * 100) < 15)
+  - record: alert_count
+    labels:
+      alert_type: builtin
+      description: 'gitserver: less than 15% disk space remaining'
+      grafana_panel_id: "100020"
+      level: warning
+      name: disk_space_remaining
+      owner: source
+      service_name: gitserver
+    expr: max(ALERTS{alertname="warning_gitserver_disk_space_remaining",alertstate="firing"}
+      OR on() vector(0))
+  - alert: critical_gitserver_disk_space_remaining
+    labels:
+      alert_type: builtin
+      description: 'gitserver: less than 10% disk space remaining for 10m0s'
+      grafana_panel_id: "100020"
+      level: critical
+      name: disk_space_remaining
+      owner: source
+      service_name: gitserver
+    expr: min(((src_gitserver_disk_space_available / src_gitserver_disk_space_total)
+      * 100) < 10)
+    for: 10m
+  - record: alert_count
+    labels:
+      alert_type: builtin
+      description: 'gitserver: less than 10% disk space remaining for 10m0s'
+      grafana_panel_id: "100020"
+      level: critical
+      name: disk_space_remaining
+      owner: source
+      service_name: gitserver
+    expr: max(ALERTS{alertname="critical_gitserver_disk_space_remaining",alertstate="firing"}
+      OR on() vector(0))
+  - alert: warning_gitserver_running_git_commands
+    labels:
+      alert_type: builtin
+      description: 'gitserver: 50+ git commands running on each gitserver instance
+        for 2m0s'
+      grafana_panel_id: "100030"
+      level: warning
+      name: running_git_commands
+      owner: source
+      service_name: gitserver
+    expr: max((sum by (instance, cmd) (src_gitserver_exec_running)) >= 50)
+    for: 2m
+  - record: alert_count
+    labels:
+      alert_type: builtin
+      description: 'gitserver: 50+ git commands running on each gitserver instance
+        for 2m0s'
+      grafana_panel_id: "100030"
+      level: warning
+      name: running_git_commands
+      owner: source
+      service_name: gitserver
+    expr: max(ALERTS{alertname="warning_gitserver_running_git_commands",alertstate="firing"}
+      OR on() vector(0))
+  - alert: critical_gitserver_running_git_commands
+    labels:
+      alert_type: builtin
+      description: 'gitserver: 100+ git commands running on each gitserver instance
+        for 5m0s'
+      grafana_panel_id: "100030"
+      level: critical
+      name: running_git_commands
+      owner: source
+      service_name: gitserver
+    expr: max((sum by (instance, cmd) (src_gitserver_exec_running)) >= 100)
+    for: 5m
+  - record: alert_count
+    labels:
+      alert_type: builtin
+      description: 'gitserver: 100+ git commands running on each gitserver instance
+        for 5m0s'
+      grafana_panel_id: "100030"
+      level: critical
+      name: running_git_commands
+      owner: source
+      service_name: gitserver
+    expr: max(ALERTS{alertname="critical_gitserver_running_git_commands",alertstate="firing"}
+      OR on() vector(0))
+  - alert: warning_gitserver_echo_command_duration_test
+    labels:
+      alert_type: builtin
+      description: 'gitserver: 0.02s+ echo test command duration for 30s'
+      grafana_panel_id: "100040"
+      level: warning
+      name: echo_command_duration_test
+      owner: source
+      service_name: gitserver
+    expr: max((max(src_gitserver_echo_duration_seconds)) >= 0.02)
+    for: 30s
+  - record: alert_count
+    labels:
+      alert_type: builtin
+      description: 'gitserver: 0.02s+ echo test command duration for 30s'
+      grafana_panel_id: "100040"
+      level: warning
+      name: echo_command_duration_test
+      owner: source
+      service_name: gitserver
+    expr: max(ALERTS{alertname="warning_gitserver_echo_command_duration_test",alertstate="firing"}
+      OR on() vector(0))
+  - alert: critical_gitserver_repo_corrupted
+    labels:
+      alert_type: builtin
+      description: 'gitserver: 0+ number of times a repo corruption has been identified'
+      grafana_panel_id: "100041"
+      level: critical
+      name: repo_corrupted
+      owner: source
+      service_name: gitserver
+    expr: max((sum(rate(src_gitserver_repo_corrupted[5m]))) > 0)
+  - record: alert_count
+    labels:
+      alert_type: builtin
+      description: 'gitserver: 0+ number of times a repo corruption has been identified'
+      grafana_panel_id: "100041"
+      level: critical
+      name: repo_corrupted
+      owner: source
+      service_name: gitserver
+    expr: max(ALERTS{alertname="critical_gitserver_repo_corrupted",alertstate="firing"}
+      OR on() vector(0))
+  - alert: warning_gitserver_repository_clone_queue_size
+    labels:
+      alert_type: builtin
+      description: 'gitserver: 25+ repository clone queue size'
+      grafana_panel_id: "100050"
+      level: warning
+      name: repository_clone_queue_size
+      owner: source
+      service_name: gitserver
+    expr: max((sum(src_gitserver_clone_queue)) >= 25)
+  - record: alert_count
+    labels:
+      alert_type: builtin
+      description: 'gitserver: 25+ repository clone queue size'
+      grafana_panel_id: "100050"
+      level: warning
+      name: repository_clone_queue_size
+      owner: source
+      service_name: gitserver
+    expr: max(ALERTS{alertname="warning_gitserver_repository_clone_queue_size",alertstate="firing"}
+      OR on() vector(0))
+  - alert: critical_gitserver_gitserver_site_configuration_duration_since_last_successful_update_by_instance
+    labels:
+      alert_type: builtin
+      description: 'gitserver: 300s+ maximum duration since last successful site configuration
+        update (all "gitserver" instances)'
+      grafana_panel_id: "101701"
+      level: critical
+      name: gitserver_site_configuration_duration_since_last_successful_update_by_instance
+      owner: infra-support
+      service_name: gitserver
+    expr: max((max(max_over_time(src_conf_client_time_since_last_successful_update_seconds{job=~".*gitserver"}[1m])))
+      >= 300)
+  - record: alert_count
+    labels:
+      alert_type: builtin
+      description: 'gitserver: 300s+ maximum duration since last successful site configuration
+        update (all "gitserver" instances)'
+      grafana_panel_id: "101701"
+      level: critical
+      name: gitserver_site_configuration_duration_since_last_successful_update_by_instance
+      owner: infra-support
+      service_name: gitserver
+    expr: max(ALERTS{alertname="critical_gitserver_gitserver_site_configuration_duration_since_last_successful_update_by_instance",alertstate="firing"}
+      OR on() vector(0))
+  - alert: warning_gitserver_mean_blocked_seconds_per_conn_request
+    labels:
+      alert_type: builtin
+      description: 'gitserver: 0.1s+ mean blocked seconds per conn request for 10m0s'
+      grafana_panel_id: "102120"
+      level: warning
+      name: mean_blocked_seconds_per_conn_request
+      owner: source
+      service_name: gitserver
+    expr: max((sum by (app_name, db_name) (increase(src_pgsql_conns_blocked_seconds{app_name="gitserver"}[5m]))
+      / sum by (app_name, db_name) (increase(src_pgsql_conns_waited_for{app_name="gitserver"}[5m])))
+      >= 0.1)
+    for: 10m
+  - record: alert_count
+    labels:
+      alert_type: builtin
+      description: 'gitserver: 0.1s+ mean blocked seconds per conn request for 10m0s'
+      grafana_panel_id: "102120"
+      level: warning
+      name: mean_blocked_seconds_per_conn_request
+      owner: source
+      service_name: gitserver
+    expr: max(ALERTS{alertname="warning_gitserver_mean_blocked_seconds_per_conn_request",alertstate="firing"}
+      OR on() vector(0))
+  - alert: critical_gitserver_mean_blocked_seconds_per_conn_request
+    labels:
+      alert_type: builtin
+      description: 'gitserver: 0.5s+ mean blocked seconds per conn request for 10m0s'
+      grafana_panel_id: "102120"
+      level: critical
+      name: mean_blocked_seconds_per_conn_request
+      owner: source
+      service_name: gitserver
+    expr: max((sum by (app_name, db_name) (increase(src_pgsql_conns_blocked_seconds{app_name="gitserver"}[5m]))
+      / sum by (app_name, db_name) (increase(src_pgsql_conns_waited_for{app_name="gitserver"}[5m])))
+      >= 0.5)
+    for: 10m
+  - record: alert_count
+    labels:
+      alert_type: builtin
+      description: 'gitserver: 0.5s+ mean blocked seconds per conn request for 10m0s'
+      grafana_panel_id: "102120"
+      level: critical
+      name: mean_blocked_seconds_per_conn_request
+      owner: source
+      service_name: gitserver
+    expr: max(ALERTS{alertname="critical_gitserver_mean_blocked_seconds_per_conn_request",alertstate="firing"}
+      OR on() vector(0))
+  - alert: warning_gitserver_container_cpu_usage
+    labels:
+      alert_type: builtin
+      description: 'gitserver: 99%+ container cpu usage total (1m average) across
+        all cores by instance'
+      grafana_panel_id: "102201"
+      level: warning
+      name: container_cpu_usage
+      owner: source
+      service_name: gitserver
+    expr: max((cadvisor_container_cpu_usage_percentage_total{name=~"^gitserver.*"})
+      >= 99)
+  - record: alert_count
+    labels:
+      alert_type: builtin
+      description: 'gitserver: 99%+ container cpu usage total (1m average) across
+        all cores by instance'
+      grafana_panel_id: "102201"
+      level: warning
+      name: container_cpu_usage
+      owner: source
+      service_name: gitserver
+    expr: max(ALERTS{alertname="warning_gitserver_container_cpu_usage",alertstate="firing"}
+      OR on() vector(0))
+  - alert: warning_gitserver_container_memory_usage
+    labels:
+      alert_type: builtin
+      description: 'gitserver: 99%+ container memory usage by instance'
+      grafana_panel_id: "102202"
+      level: warning
+      name: container_memory_usage
+      owner: source
+      service_name: gitserver
+    expr: max((cadvisor_container_memory_usage_percentage_total{name=~"^gitserver.*"})
+      >= 99)
+  - record: alert_count
+    labels:
+      alert_type: builtin
+      description: 'gitserver: 99%+ container memory usage by instance'
+      grafana_panel_id: "102202"
+      level: warning
+      name: container_memory_usage
+      owner: source
+      service_name: gitserver
+    expr: max(ALERTS{alertname="warning_gitserver_container_memory_usage",alertstate="firing"}
+      OR on() vector(0))
+  - alert: warning_gitserver_provisioning_container_cpu_usage_long_term
+    labels:
+      alert_type: builtin
+      description: 'gitserver: 80%+ container cpu usage total (90th percentile over
+        1d) across all cores by instance for 336h0m0s'
+      grafana_panel_id: "102300"
+      level: warning
+      name: provisioning_container_cpu_usage_long_term
+      owner: source
+      service_name: gitserver
+    expr: max((quantile_over_time(0.9, cadvisor_container_cpu_usage_percentage_total{name=~"^gitserver.*"}[1d]))
+      >= 80)
+    for: 2w
+  - record: alert_count
+    labels:
+      alert_type: builtin
+      description: 'gitserver: 80%+ container cpu usage total (90th percentile over
+        1d) across all cores by instance for 336h0m0s'
+      grafana_panel_id: "102300"
+      level: warning
+      name: provisioning_container_cpu_usage_long_term
+      owner: source
+      service_name: gitserver
+    expr: max(ALERTS{alertname="warning_gitserver_provisioning_container_cpu_usage_long_term",alertstate="firing"}
+      OR on() vector(0))
+  - alert: warning_gitserver_provisioning_container_cpu_usage_short_term
+    labels:
+      alert_type: builtin
+      description: 'gitserver: 90%+ container cpu usage total (5m maximum) across
+        all cores by instance for 30m0s'
+      grafana_panel_id: "102310"
+      level: warning
+      name: provisioning_container_cpu_usage_short_term
+      owner: source
+      service_name: gitserver
+    expr: max((max_over_time(cadvisor_container_cpu_usage_percentage_total{name=~"^gitserver.*"}[5m]))
+      >= 90)
+    for: 30m
+  - record: alert_count
+    labels:
+      alert_type: builtin
+      description: 'gitserver: 90%+ container cpu usage total (5m maximum) across
+        all cores by instance for 30m0s'
+      grafana_panel_id: "102310"
+      level: warning
+      name: provisioning_container_cpu_usage_short_term
+      owner: source
+      service_name: gitserver
+    expr: max(ALERTS{alertname="warning_gitserver_provisioning_container_cpu_usage_short_term",alertstate="firing"}
+      OR on() vector(0))
+  - alert: warning_gitserver_container_oomkill_events_total
+    labels:
+      alert_type: builtin
+      description: 'gitserver: 1+ container OOMKILL events total by instance'
+      grafana_panel_id: "102312"
+      level: warning
+      name: container_oomkill_events_total
+      owner: source
+      service_name: gitserver
+    expr: max((max by (name) (container_oom_events_total{name=~"^gitserver.*"})) >=
+      1)
+  - record: alert_count
+    labels:
+      alert_type: builtin
+      description: 'gitserver: 1+ container OOMKILL events total by instance'
+      grafana_panel_id: "102312"
+      level: warning
+      name: container_oomkill_events_total
+      owner: source
+      service_name: gitserver
+    expr: max(ALERTS{alertname="warning_gitserver_container_oomkill_events_total",alertstate="firing"}
+      OR on() vector(0))
+  - alert: warning_gitserver_go_goroutines
+    labels:
+      alert_type: builtin
+      description: 'gitserver: 10000+ maximum active goroutines for 10m0s'
+      grafana_panel_id: "102400"
+      level: warning
+      name: go_goroutines
+      owner: source
+      service_name: gitserver
+    expr: max((max by (instance) (go_goroutines{job=~".*gitserver"})) >= 10000)
+    for: 10m
+  - record: alert_count
+    labels:
+      alert_type: builtin
+      description: 'gitserver: 10000+ maximum active goroutines for 10m0s'
+      grafana_panel_id: "102400"
+      level: warning
+      name: go_goroutines
+      owner: source
+      service_name: gitserver
+    expr: max(ALERTS{alertname="warning_gitserver_go_goroutines",alertstate="firing"}
+      OR on() vector(0))
+  - alert: warning_gitserver_go_gc_duration_seconds
+    labels:
+      alert_type: builtin
+      description: 'gitserver: 2s+ maximum go garbage collection duration'
+      grafana_panel_id: "102401"
+      level: warning
+      name: go_gc_duration_seconds
+      owner: source
+      service_name: gitserver
+    expr: max((max by (instance) (go_gc_duration_seconds{job=~".*gitserver"})) >=
+      2)
+  - record: alert_count
+    labels:
+      alert_type: builtin
+      description: 'gitserver: 2s+ maximum go garbage collection duration'
+      grafana_panel_id: "102401"
+      level: warning
+      name: go_gc_duration_seconds
+      owner: source
+      service_name: gitserver
+    expr: max(ALERTS{alertname="warning_gitserver_go_gc_duration_seconds",alertstate="firing"}
+      OR on() vector(0))
+  - alert: critical_gitserver_pods_available_percentage
+    labels:
+      alert_type: builtin
+      description: 'gitserver: less than 90% percentage pods available for 10m0s'
+      grafana_panel_id: "102500"
+      level: critical
+      name: pods_available_percentage
+      owner: source
+      service_name: gitserver
+    expr: min((sum by (app) (up{app=~".*gitserver"}) / count by (app) (up{app=~".*gitserver"})
+      * 100) <= 90)
+    for: 10m
+  - record: alert_count
+    labels:
+      alert_type: builtin
+      description: 'gitserver: less than 90% percentage pods available for 10m0s'
+      grafana_panel_id: "102500"
+      level: critical
+      name: pods_available_percentage
+      owner: source
+      service_name: gitserver
+    expr: max(ALERTS{alertname="critical_gitserver_pods_available_percentage",alertstate="firing"}
+      OR on() vector(0))
+  interval: 30s

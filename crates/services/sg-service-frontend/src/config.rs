@@ -75,12 +75,12 @@ impl FrontendConfig {
             "HTTP listen address for internal HTTP API. This should never be exposed externally, as it lacks certain authz checks.",
         );
 
-        let prof_http_addr = Some(env.get(
+        let prof_http_raw = env.get(
             PROF_HTTP_VAR,
             DEFAULT_PROF_HTTP_ADDR,
             "net/http/pprof http bind address.",
-        ))
-        .filter(|addr| !addr.is_empty());
+        );
+        let prof_http_addr = sg_core::prof_http_addr("frontend", &prof_http_raw);
 
         Ok(Self {
             insecure_dev,

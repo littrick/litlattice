@@ -49,7 +49,7 @@ impl RepoUpdaterConfig {
             crate::debug::DEFAULT_ADDR,
             "net/http/pprof http bind address.",
         );
-        let prof_addr = Some(prof_addr).filter(|addr| !addr.is_empty());
+        let prof_addr = sg_core::prof_http_addr("repo-updater", &prof_addr);
 
         // The baseline `strconv.ParseBool(os.Getenv("DISABLE_REPO_PURGE"))`
         // ignores parse errors (the purger stays enabled).

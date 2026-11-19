@@ -1,0 +1,12 @@
+groups:
+- name: cadvisor.rules
+  rules:
+  - record: cadvisor_container_cpu_limit
+    expr: avg by (name) (container_spec_cpu_quota) / avg by (name) (container_spec_cpu_period)
+  - record: cadvisor_container_cpu_usage_percentage_total
+    expr: (avg by (name) (rate(container_cpu_usage_seconds_total[1m])) / cadvisor_container_cpu_limit)
+      * 100
+  - record: cadvisor_container_memory_usage_percentage_total
+    expr: max by (name) (container_memory_working_set_bytes / container_spec_memory_limit_bytes)
+      * 100
+  interval: 30s

@@ -1,0 +1,25 @@
+groups:
+- name: codeintel-uploads
+  rules:
+  - alert: warning_codeintel-uploads_codeintel_commit_graph_queued_max_age
+    labels:
+      alert_type: builtin
+      description: 'codeintel-uploads: 3600s+ repository queue longest time in queue'
+      grafana_panel_id: "100402"
+      level: warning
+      name: codeintel_commit_graph_queued_max_age
+      owner: code-intel
+      service_name: codeintel-uploads
+    expr: max((max(src_codeintel_commit_graph_queued_duration_seconds_total)) >= 3600)
+  - record: alert_count
+    labels:
+      alert_type: builtin
+      description: 'codeintel-uploads: 3600s+ repository queue longest time in queue'
+      grafana_panel_id: "100402"
+      level: warning
+      name: codeintel_commit_graph_queued_max_age
+      owner: code-intel
+      service_name: codeintel-uploads
+    expr: max(ALERTS{alertname="warning_codeintel-uploads_codeintel_commit_graph_queued_max_age",alertstate="firing"}
+      OR on() vector(0))
+  interval: 30s

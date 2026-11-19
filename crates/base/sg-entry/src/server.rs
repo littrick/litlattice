@@ -654,7 +654,15 @@ fn maybe_observability(env: &EnvMap) -> Vec<String> {
     if !env.value("DISABLE_OBSERVABILITY").is_empty() {
         return vec![String::new()];
     }
-    vec![PROMETHEUS_LINE.to_owned(), GRAFANA_LINE.to_owned()]
+
+    // The packaged rootfs carries prom-wrapper + Prometheus/Alertmanager from
+    // Ubuntu, but not Grafana. Starting the missing binary would take the
+    // whole container down, so only add its Procfile line when present.
+    let mut lines = vec![PROMETHEUS_LINE.to_owned()];
+    if std::path::Path::new("/usr/share/grafana/bin/grafana-server").is_file() {
+        lines.push(GRAFANA_LINE.to_owned());
+    }
+    lines
 }
 
 fn maybe_blobstore(env: &mut EnvMap, data_dir: &Path) -> Vec<String> {

@@ -1,0 +1,168 @@
+groups:
+- name: telemetry
+  rules:
+  - alert: warning_telemetry_telemetry_gateway_exporter_queue_growth
+    labels:
+      alert_type: builtin
+      description: 'telemetry: 1+ rate of growth of export queue over 30m for 1h0m0s'
+      grafana_panel_id: "100001"
+      level: warning
+      name: telemetry_gateway_exporter_queue_growth
+      owner: data-analytics
+      service_name: telemetry
+    expr: max((max(deriv(src_telemetrygatewayexporter_queue_size[30m]))) > 1)
+    for: 1h
+  - record: alert_count
+    labels:
+      alert_type: builtin
+      description: 'telemetry: 1+ rate of growth of export queue over 30m for 1h0m0s'
+      grafana_panel_id: "100001"
+      level: warning
+      name: telemetry_gateway_exporter_queue_growth
+      owner: data-analytics
+      service_name: telemetry
+    expr: max(ALERTS{alertname="warning_telemetry_telemetry_gateway_exporter_queue_growth",alertstate="firing"}
+      OR on() vector(0))
+  - alert: critical_telemetry_telemetry_gateway_exporter_queue_growth
+    labels:
+      alert_type: builtin
+      description: 'telemetry: 1+ rate of growth of export queue over 30m for 36h0m0s'
+      grafana_panel_id: "100001"
+      level: critical
+      name: telemetry_gateway_exporter_queue_growth
+      owner: data-analytics
+      service_name: telemetry
+    expr: max((max(deriv(src_telemetrygatewayexporter_queue_size[30m]))) > 1)
+    for: 1d12h
+  - record: alert_count
+    labels:
+      alert_type: builtin
+      description: 'telemetry: 1+ rate of growth of export queue over 30m for 36h0m0s'
+      grafana_panel_id: "100001"
+      level: critical
+      name: telemetry_gateway_exporter_queue_growth
+      owner: data-analytics
+      service_name: telemetry
+    expr: max(ALERTS{alertname="critical_telemetry_telemetry_gateway_exporter_queue_growth",alertstate="firing"}
+      OR on() vector(0))
+  - alert: warning_telemetry_telemetrygatewayexporter_exporter_errors_total
+    labels:
+      alert_type: builtin
+      description: 'telemetry: 0+ events exporter operation errors every 30m'
+      grafana_panel_id: "100102"
+      level: warning
+      name: telemetrygatewayexporter_exporter_errors_total
+      owner: data-analytics
+      service_name: telemetry
+    expr: max((sum(increase(src_telemetrygatewayexporter_exporter_errors_total{job=~"^worker.*"}[30m])))
+      > 0)
+  - record: alert_count
+    labels:
+      alert_type: builtin
+      description: 'telemetry: 0+ events exporter operation errors every 30m'
+      grafana_panel_id: "100102"
+      level: warning
+      name: telemetrygatewayexporter_exporter_errors_total
+      owner: data-analytics
+      service_name: telemetry
+    expr: max(ALERTS{alertname="warning_telemetry_telemetrygatewayexporter_exporter_errors_total",alertstate="firing"}
+      OR on() vector(0))
+  - alert: warning_telemetry_telemetrygatewayexporter_queue_cleanup_errors_total
+    labels:
+      alert_type: builtin
+      description: 'telemetry: 0+ export queue cleanup operation errors every 30m'
+      grafana_panel_id: "100202"
+      level: warning
+      name: telemetrygatewayexporter_queue_cleanup_errors_total
+      owner: data-analytics
+      service_name: telemetry
+    expr: max((sum(increase(src_telemetrygatewayexporter_queue_cleanup_errors_total{job=~"^worker.*"}[30m])))
+      > 0)
+  - record: alert_count
+    labels:
+      alert_type: builtin
+      description: 'telemetry: 0+ export queue cleanup operation errors every 30m'
+      grafana_panel_id: "100202"
+      level: warning
+      name: telemetrygatewayexporter_queue_cleanup_errors_total
+      owner: data-analytics
+      service_name: telemetry
+    expr: max(ALERTS{alertname="warning_telemetry_telemetrygatewayexporter_queue_cleanup_errors_total",alertstate="firing"}
+      OR on() vector(0))
+  - alert: warning_telemetry_telemetrygatewayexporter_queue_metrics_reporter_errors_total
+    labels:
+      alert_type: builtin
+      description: 'telemetry: 0+ export backlog metrics reporting operation errors
+        every 30m'
+      grafana_panel_id: "100302"
+      level: warning
+      name: telemetrygatewayexporter_queue_metrics_reporter_errors_total
+      owner: data-analytics
+      service_name: telemetry
+    expr: max((sum(increase(src_telemetrygatewayexporter_queue_metrics_reporter_errors_total{job=~"^worker.*"}[30m])))
+      > 0)
+  - record: alert_count
+    labels:
+      alert_type: builtin
+      description: 'telemetry: 0+ export backlog metrics reporting operation errors
+        every 30m'
+      grafana_panel_id: "100302"
+      level: warning
+      name: telemetrygatewayexporter_queue_metrics_reporter_errors_total
+      owner: data-analytics
+      service_name: telemetry
+    expr: max(ALERTS{alertname="warning_telemetry_telemetrygatewayexporter_queue_metrics_reporter_errors_total",alertstate="firing"}
+      OR on() vector(0))
+  - alert: warning_telemetry_telemetry_job_error_rate
+    labels:
+      alert_type: builtin
+      description: 'telemetry: 0%+ usage data exporter operation error rate over 5m
+        for 30m0s'
+      grafana_panel_id: "100413"
+      level: warning
+      name: telemetry_job_error_rate
+      owner: data-analytics
+      service_name: telemetry
+    expr: max((sum by (op) (increase(src_telemetry_job_errors_total{job=~"^worker.*"}[5m]))
+      / (sum by (op) (increase(src_telemetry_job_total{job=~"^worker.*"}[5m])) + sum
+      by (op) (increase(src_telemetry_job_errors_total{job=~"^worker.*"}[5m]))) *
+      100) > 0)
+    for: 30m
+  - record: alert_count
+    labels:
+      alert_type: builtin
+      description: 'telemetry: 0%+ usage data exporter operation error rate over 5m
+        for 30m0s'
+      grafana_panel_id: "100413"
+      level: warning
+      name: telemetry_job_error_rate
+      owner: data-analytics
+      service_name: telemetry
+    expr: max(ALERTS{alertname="warning_telemetry_telemetry_job_error_rate",alertstate="firing"}
+      OR on() vector(0))
+  - alert: warning_telemetry_telemetry_job_utilized_throughput
+    labels:
+      alert_type: builtin
+      description: 'telemetry: 90%+ utilized percentage of maximum throughput for
+        30m0s'
+      grafana_panel_id: "100600"
+      level: warning
+      name: telemetry_job_utilized_throughput
+      owner: data-analytics
+      service_name: telemetry
+    expr: max((rate(src_telemetry_job_total{op="SendEvents"}[1h]) / on () group_right
+      () src_telemetry_job_max_throughput * 100) > 90)
+    for: 30m
+  - record: alert_count
+    labels:
+      alert_type: builtin
+      description: 'telemetry: 90%+ utilized percentage of maximum throughput for
+        30m0s'
+      grafana_panel_id: "100600"
+      level: warning
+      name: telemetry_job_utilized_throughput
+      owner: data-analytics
+      service_name: telemetry
+    expr: max(ALERTS{alertname="warning_telemetry_telemetry_job_utilized_throughput",alertstate="firing"}
+      OR on() vector(0))
+  interval: 30s

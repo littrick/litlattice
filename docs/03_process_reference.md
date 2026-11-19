@@ -517,8 +517,10 @@ Procfile 不再添加这两个进程。
   `ALERTMANAGER_ENABLE_CLUSTER`、`DISABLE_ALERTMANAGER`、
   `DISABLE_SOURCEGRAPH_CONFIG`、`OPSGENIE_API_KEY`、
   `SRC_FRONTEND_INTERNAL`
-- 注意：本镜像 rootfs 只安装了 `postgres_exporter`，没有 Prometheus/
-  Alertmanager/Grafana 本体；默认观测关闭时该进程不启动。
+- rootfs 已包含 Ubuntu 的 Prometheus、Alertmanager、基线配置、生成的告警
+  规则与 `dev/prometheus/linux` target 列表；Grafana 未打包（`/server` 检测到
+  二进制缺失时跳过 grafana 进程）。默认 `DISABLE_OBSERVABILITY=1`，设置空值
+  即可启动观测。
 
 ---
 

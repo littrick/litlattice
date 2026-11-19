@@ -121,7 +121,7 @@ impl Service for GitserverService {
             debug::DEFAULT_ADDR,
             "net/http/pprof http bind address.",
         );
-        self.prof_addr = Some(prof_addr).filter(|addr| !addr.is_empty());
+        self.prof_addr = sg_core::prof_http_addr("gitserver", &prof_addr);
         let config = GitserverConfig::load(env, self.addr.clone())?;
         self.addr = Some(config.listen_addr.clone());
         // `cleanup.go`'s package-level `env.Get` / `env.MustGetDuration` values

@@ -1,0 +1,1191 @@
+groups:
+- name: frontend
+  rules:
+  - alert: warning_frontend_99th_percentile_search_request_duration
+    labels:
+      alert_type: builtin
+      description: 'frontend: 20s+ 99th percentile successful search request duration
+        over 5m'
+      grafana_panel_id: "100000"
+      level: warning
+      name: 99th_percentile_search_request_duration
+      owner: code-search
+      service_name: frontend
+    expr: max((histogram_quantile(0.99, sum by (le) (rate(src_search_streaming_latency_seconds_bucket{source="browser"}[5m]))))
+      >= 20)
+  - record: alert_count
+    labels:
+      alert_type: builtin
+      description: 'frontend: 20s+ 99th percentile successful search request duration
+        over 5m'
+      grafana_panel_id: "100000"
+      level: warning
+      name: 99th_percentile_search_request_duration
+      owner: code-search
+      service_name: frontend
+    expr: max(ALERTS{alertname="warning_frontend_99th_percentile_search_request_duration",alertstate="firing"}
+      OR on() vector(0))
+  - alert: warning_frontend_90th_percentile_search_request_duration
+    labels:
+      alert_type: builtin
+      description: 'frontend: 15s+ 90th percentile successful search request duration
+        over 5m'
+      grafana_panel_id: "100001"
+      level: warning
+      name: 90th_percentile_search_request_duration
+      owner: code-search
+      service_name: frontend
+    expr: max((histogram_quantile(0.9, sum by (le) (rate(src_search_streaming_latency_seconds_bucket{source="browser"}[5m]))))
+      >= 15)
+  - record: alert_count
+    labels:
+      alert_type: builtin
+      description: 'frontend: 15s+ 90th percentile successful search request duration
+        over 5m'
+      grafana_panel_id: "100001"
+      level: warning
+      name: 90th_percentile_search_request_duration
+      owner: code-search
+      service_name: frontend
+    expr: max(ALERTS{alertname="warning_frontend_90th_percentile_search_request_duration",alertstate="firing"}
+      OR on() vector(0))
+  - alert: warning_frontend_hard_timeout_search_responses
+    labels:
+      alert_type: builtin
+      description: 'frontend: 2%+ hard timeout search responses every 5m for 15m0s'
+      grafana_panel_id: "100010"
+      level: warning
+      name: hard_timeout_search_responses
+      owner: code-search
+      service_name: frontend
+    expr: max(((sum(increase(src_graphql_search_response{request_name!="CodeIntelSearch",source="browser",status="timeout"}[5m]))
+      + sum(increase(src_graphql_search_response{alert_type="timed_out",request_name!="CodeIntelSearch",source="browser",status="alert"}[5m])))
+      / sum(increase(src_graphql_search_response{request_name!="CodeIntelSearch",source="browser"}[5m]))
+      * 100) >= 2)
+    for: 15m
+  - record: alert_count
+    labels:
+      alert_type: builtin
+      description: 'frontend: 2%+ hard timeout search responses every 5m for 15m0s'
+      grafana_panel_id: "100010"
+      level: warning
+      name: hard_timeout_search_responses
+      owner: code-search
+      service_name: frontend
+    expr: max(ALERTS{alertname="warning_frontend_hard_timeout_search_responses",alertstate="firing"}
+      OR on() vector(0))
+  - alert: warning_frontend_hard_error_search_responses
+    labels:
+      alert_type: builtin
+      description: 'frontend: 2%+ hard error search responses every 5m for 15m0s'
+      grafana_panel_id: "100011"
+      level: warning
+      name: hard_error_search_responses
+      owner: code-search
+      service_name: frontend
+    expr: max((sum by (status) (increase(src_graphql_search_response{request_name!="CodeIntelSearch",source="browser",status=~"error"}[5m]))
+      / ignoring (status) group_left () sum(increase(src_graphql_search_response{request_name!="CodeIntelSearch",source="browser"}[5m]))
+      * 100) >= 2)
+    for: 15m
+  - record: alert_count
+    labels:
+      alert_type: builtin
+      description: 'frontend: 2%+ hard error search responses every 5m for 15m0s'
+      grafana_panel_id: "100011"
+      level: warning
+      name: hard_error_search_responses
+      owner: code-search
+      service_name: frontend
+    expr: max(ALERTS{alertname="warning_frontend_hard_error_search_responses",alertstate="firing"}
+      OR on() vector(0))
+  - alert: warning_frontend_partial_timeout_search_responses
+    labels:
+      alert_type: builtin
+      description: 'frontend: 5%+ partial timeout search responses every 5m for 15m0s'
+      grafana_panel_id: "100012"
+      level: warning
+      name: partial_timeout_search_responses
+      owner: code-search
+      service_name: frontend
+    expr: max((sum by (status) (increase(src_graphql_search_response{request_name!="CodeIntelSearch",source="browser",status="partial_timeout"}[5m]))
+      / ignoring (status) group_left () sum(increase(src_graphql_search_response{request_name!="CodeIntelSearch",source="browser"}[5m]))
+      * 100) >= 5)
+    for: 15m
+  - record: alert_count
+    labels:
+      alert_type: builtin
+      description: 'frontend: 5%+ partial timeout search responses every 5m for 15m0s'
+      grafana_panel_id: "100012"
+      level: warning
+      name: partial_timeout_search_responses
+      owner: code-search
+      service_name: frontend
+    expr: max(ALERTS{alertname="warning_frontend_partial_timeout_search_responses",alertstate="firing"}
+      OR on() vector(0))
+  - alert: warning_frontend_search_alert_user_suggestions
+    labels:
+      alert_type: builtin
+      description: 'frontend: 5%+ search alert user suggestions shown every 5m for
+        15m0s'
+      grafana_panel_id: "100013"
+      level: warning
+      name: search_alert_user_suggestions
+      owner: code-search
+      service_name: frontend
+    expr: max((sum by (alert_type) (increase(src_graphql_search_response{alert_type!~"timed_out|no_results__suggest_quotes",request_name!="CodeIntelSearch",source="browser",status="alert"}[5m]))
+      / ignoring (alert_type) group_left () sum(increase(src_graphql_search_response{request_name!="CodeIntelSearch",source="browser"}[5m]))
+      * 100) >= 5)
+    for: 15m
+  - record: alert_count
+    labels:
+      alert_type: builtin
+      description: 'frontend: 5%+ search alert user suggestions shown every 5m for
+        15m0s'
+      grafana_panel_id: "100013"
+      level: warning
+      name: search_alert_user_suggestions
+      owner: code-search
+      service_name: frontend
+    expr: max(ALERTS{alertname="warning_frontend_search_alert_user_suggestions",alertstate="firing"}
+      OR on() vector(0))
+  - alert: warning_frontend_page_load_latency
+    labels:
+      alert_type: builtin
+      description: 'frontend: 2s+ 90th percentile page load latency over all routes
+        over 10m'
+      grafana_panel_id: "100020"
+      level: warning
+      name: page_load_latency
+      owner: source
+      service_name: frontend
+    expr: max((histogram_quantile(0.9, sum by (le) (rate(src_http_request_duration_seconds_bucket{route!="blob",route!="raw",route!~"graphql.*"}[10m]))))
+      >= 2)
+  - record: alert_count
+    labels:
+      alert_type: builtin
+      description: 'frontend: 2s+ 90th percentile page load latency over all routes
+        over 10m'
+      grafana_panel_id: "100020"
+      level: warning
+      name: page_load_latency
+      owner: source
+      service_name: frontend
+    expr: max(ALERTS{alertname="warning_frontend_page_load_latency",alertstate="firing"}
+      OR on() vector(0))
+  - alert: warning_frontend_99th_percentile_search_codeintel_request_duration
+    labels:
+      alert_type: builtin
+      description: 'frontend: 20s+ 99th percentile code-intel successful search request
+        duration over 5m'
+      grafana_panel_id: "100100"
+      level: warning
+      name: 99th_percentile_search_codeintel_request_duration
+      owner: code-search
+      service_name: frontend
+    expr: max((histogram_quantile(0.99, sum by (le) (rate(src_graphql_field_seconds_bucket{error="false",field="results",request_name="CodeIntelSearch",source="browser",type="Search"}[5m]))))
+      >= 20)
+  - record: alert_count
+    labels:
+      alert_type: builtin
+      description: 'frontend: 20s+ 99th percentile code-intel successful search request
+        duration over 5m'
+      grafana_panel_id: "100100"
+      level: warning
+      name: 99th_percentile_search_codeintel_request_duration
+      owner: code-search
+      service_name: frontend
+    expr: max(ALERTS{alertname="warning_frontend_99th_percentile_search_codeintel_request_duration",alertstate="firing"}
+      OR on() vector(0))
+  - alert: warning_frontend_90th_percentile_search_codeintel_request_duration
+    labels:
+      alert_type: builtin
+      description: 'frontend: 15s+ 90th percentile code-intel successful search request
+        duration over 5m'
+      grafana_panel_id: "100101"
+      level: warning
+      name: 90th_percentile_search_codeintel_request_duration
+      owner: code-search
+      service_name: frontend
+    expr: max((histogram_quantile(0.9, sum by (le) (rate(src_graphql_field_seconds_bucket{error="false",field="results",request_name="CodeIntelSearch",source="browser",type="Search"}[5m]))))
+      >= 15)
+  - record: alert_count
+    labels:
+      alert_type: builtin
+      description: 'frontend: 15s+ 90th percentile code-intel successful search request
+        duration over 5m'
+      grafana_panel_id: "100101"
+      level: warning
+      name: 90th_percentile_search_codeintel_request_duration
+      owner: code-search
+      service_name: frontend
+    expr: max(ALERTS{alertname="warning_frontend_90th_percentile_search_codeintel_request_duration",alertstate="firing"}
+      OR on() vector(0))
+  - alert: warning_frontend_hard_timeout_search_codeintel_responses
+    labels:
+      alert_type: builtin
+      description: 'frontend: 2%+ hard timeout search code-intel responses every 5m
+        for 15m0s'
+      grafana_panel_id: "100110"
+      level: warning
+      name: hard_timeout_search_codeintel_responses
+      owner: code-search
+      service_name: frontend
+    expr: max(((sum(increase(src_graphql_search_response{request_name="CodeIntelSearch",source="browser",status="timeout"}[5m]))
+      + sum(increase(src_graphql_search_response{alert_type="timed_out",request_name="CodeIntelSearch",source="browser",status="alert"}[5m])))
+      / sum(increase(src_graphql_search_response{request_name="CodeIntelSearch",source="browser"}[5m]))
+      * 100) >= 2)
+    for: 15m
+  - record: alert_count
+    labels:
+      alert_type: builtin
+      description: 'frontend: 2%+ hard timeout search code-intel responses every 5m
+        for 15m0s'
+      grafana_panel_id: "100110"
+      level: warning
+      name: hard_timeout_search_codeintel_responses
+      owner: code-search
+      service_name: frontend
+    expr: max(ALERTS{alertname="warning_frontend_hard_timeout_search_codeintel_responses",alertstate="firing"}
+      OR on() vector(0))
+  - alert: warning_frontend_hard_error_search_codeintel_responses
+    labels:
+      alert_type: builtin
+      description: 'frontend: 2%+ hard error search code-intel responses every 5m
+        for 15m0s'
+      grafana_panel_id: "100111"
+      level: warning
+      name: hard_error_search_codeintel_responses
+      owner: code-search
+      service_name: frontend
+    expr: max((sum by (status) (increase(src_graphql_search_response{request_name="CodeIntelSearch",source="browser",status=~"error"}[5m]))
+      / ignoring (status) group_left () sum(increase(src_graphql_search_response{request_name="CodeIntelSearch",source="browser"}[5m]))
+      * 100) >= 2)
+    for: 15m
+  - record: alert_count
+    labels:
+      alert_type: builtin
+      description: 'frontend: 2%+ hard error search code-intel responses every 5m
+        for 15m0s'
+      grafana_panel_id: "100111"
+      level: warning
+      name: hard_error_search_codeintel_responses
+      owner: code-search
+      service_name: frontend
+    expr: max(ALERTS{alertname="warning_frontend_hard_error_search_codeintel_responses",alertstate="firing"}
+      OR on() vector(0))
+  - alert: warning_frontend_partial_timeout_search_codeintel_responses
+    labels:
+      alert_type: builtin
+      description: 'frontend: 5%+ partial timeout search code-intel responses every
+        5m for 15m0s'
+      grafana_panel_id: "100112"
+      level: warning
+      name: partial_timeout_search_codeintel_responses
+      owner: code-search
+      service_name: frontend
+    expr: max((sum by (status) (increase(src_graphql_search_response{request_name="CodeIntelSearch",source="browser",status="partial_timeout"}[5m]))
+      / ignoring (status) group_left () sum(increase(src_graphql_search_response{request_name="CodeIntelSearch",source="browser",status="partial_timeout"}[5m]))
+      * 100) >= 5)
+    for: 15m
+  - record: alert_count
+    labels:
+      alert_type: builtin
+      description: 'frontend: 5%+ partial timeout search code-intel responses every
+        5m for 15m0s'
+      grafana_panel_id: "100112"
+      level: warning
+      name: partial_timeout_search_codeintel_responses
+      owner: code-search
+      service_name: frontend
+    expr: max(ALERTS{alertname="warning_frontend_partial_timeout_search_codeintel_responses",alertstate="firing"}
+      OR on() vector(0))
+  - alert: warning_frontend_search_codeintel_alert_user_suggestions
+    labels:
+      alert_type: builtin
+      description: 'frontend: 5%+ search code-intel alert user suggestions shown every
+        5m for 15m0s'
+      grafana_panel_id: "100113"
+      level: warning
+      name: search_codeintel_alert_user_suggestions
+      owner: code-search
+      service_name: frontend
+    expr: max((sum by (alert_type) (increase(src_graphql_search_response{alert_type!~"timed_out",request_name="CodeIntelSearch",source="browser",status="alert"}[5m]))
+      / ignoring (alert_type) group_left () sum(increase(src_graphql_search_response{request_name="CodeIntelSearch",source="browser"}[5m]))
+      * 100) >= 5)
+    for: 15m
+  - record: alert_count
+    labels:
+      alert_type: builtin
+      description: 'frontend: 5%+ search code-intel alert user suggestions shown every
+        5m for 15m0s'
+      grafana_panel_id: "100113"
+      level: warning
+      name: search_codeintel_alert_user_suggestions
+      owner: code-search
+      service_name: frontend
+    expr: max(ALERTS{alertname="warning_frontend_search_codeintel_alert_user_suggestions",alertstate="firing"}
+      OR on() vector(0))
+  - alert: warning_frontend_99th_percentile_search_api_request_duration
+    labels:
+      alert_type: builtin
+      description: 'frontend: 50s+ 99th percentile successful search API request duration
+        over 5m'
+      grafana_panel_id: "100200"
+      level: warning
+      name: 99th_percentile_search_api_request_duration
+      owner: code-search
+      service_name: frontend
+    expr: max((histogram_quantile(0.99, sum by (le) (rate(src_graphql_field_seconds_bucket{error="false",field="results",source="other",type="Search"}[5m]))))
+      >= 50)
+  - record: alert_count
+    labels:
+      alert_type: builtin
+      description: 'frontend: 50s+ 99th percentile successful search API request duration
+        over 5m'
+      grafana_panel_id: "100200"
+      level: warning
+      name: 99th_percentile_search_api_request_duration
+      owner: code-search
+      service_name: frontend
+    expr: max(ALERTS{alertname="warning_frontend_99th_percentile_search_api_request_duration",alertstate="firing"}
+      OR on() vector(0))
+  - alert: warning_frontend_90th_percentile_search_api_request_duration
+    labels:
+      alert_type: builtin
+      description: 'frontend: 40s+ 90th percentile successful search API request duration
+        over 5m'
+      grafana_panel_id: "100201"
+      level: warning
+      name: 90th_percentile_search_api_request_duration
+      owner: code-search
+      service_name: frontend
+    expr: max((histogram_quantile(0.9, sum by (le) (rate(src_graphql_field_seconds_bucket{error="false",field="results",source="other",type="Search"}[5m]))))
+      >= 40)
+  - record: alert_count
+    labels:
+      alert_type: builtin
+      description: 'frontend: 40s+ 90th percentile successful search API request duration
+        over 5m'
+      grafana_panel_id: "100201"
+      level: warning
+      name: 90th_percentile_search_api_request_duration
+      owner: code-search
+      service_name: frontend
+    expr: max(ALERTS{alertname="warning_frontend_90th_percentile_search_api_request_duration",alertstate="firing"}
+      OR on() vector(0))
+  - alert: warning_frontend_hard_error_search_api_responses
+    labels:
+      alert_type: builtin
+      description: 'frontend: 2%+ hard error search API responses every 5m for 15m0s'
+      grafana_panel_id: "100210"
+      level: warning
+      name: hard_error_search_api_responses
+      owner: code-search
+      service_name: frontend
+    expr: max((sum by (status) (increase(src_graphql_search_response{source="other",status=~"error"}[5m]))
+      / ignoring (status) group_left () sum(increase(src_graphql_search_response{source="other"}[5m])))
+      >= 2)
+    for: 15m
+  - record: alert_count
+    labels:
+      alert_type: builtin
+      description: 'frontend: 2%+ hard error search API responses every 5m for 15m0s'
+      grafana_panel_id: "100210"
+      level: warning
+      name: hard_error_search_api_responses
+      owner: code-search
+      service_name: frontend
+    expr: max(ALERTS{alertname="warning_frontend_hard_error_search_api_responses",alertstate="firing"}
+      OR on() vector(0))
+  - alert: warning_frontend_partial_timeout_search_api_responses
+    labels:
+      alert_type: builtin
+      description: 'frontend: 5%+ partial timeout search API responses every 5m for
+        15m0s'
+      grafana_panel_id: "100211"
+      level: warning
+      name: partial_timeout_search_api_responses
+      owner: code-search
+      service_name: frontend
+    expr: max((sum(increase(src_graphql_search_response{source="other",status="partial_timeout"}[5m]))
+      / sum(increase(src_graphql_search_response{source="other"}[5m]))) >= 5)
+    for: 15m
+  - record: alert_count
+    labels:
+      alert_type: builtin
+      description: 'frontend: 5%+ partial timeout search API responses every 5m for
+        15m0s'
+      grafana_panel_id: "100211"
+      level: warning
+      name: partial_timeout_search_api_responses
+      owner: code-search
+      service_name: frontend
+    expr: max(ALERTS{alertname="warning_frontend_partial_timeout_search_api_responses",alertstate="firing"}
+      OR on() vector(0))
+  - alert: warning_frontend_search_api_alert_user_suggestions
+    labels:
+      alert_type: builtin
+      description: 'frontend: 5%+ search API alert user suggestions shown every 5m'
+      grafana_panel_id: "100212"
+      level: warning
+      name: search_api_alert_user_suggestions
+      owner: code-search
+      service_name: frontend
+    expr: max((sum by (alert_type) (increase(src_graphql_search_response{alert_type!~"timed_out|no_results__suggest_quotes",source="other",status="alert"}[5m]))
+      / ignoring (alert_type) group_left () sum(increase(src_graphql_search_response{source="other",status="alert"}[5m])))
+      >= 5)
+  - record: alert_count
+    labels:
+      alert_type: builtin
+      description: 'frontend: 5%+ search API alert user suggestions shown every 5m'
+      grafana_panel_id: "100212"
+      level: warning
+      name: search_api_alert_user_suggestions
+      owner: code-search
+      service_name: frontend
+    expr: max(ALERTS{alertname="warning_frontend_search_api_alert_user_suggestions",alertstate="firing"}
+      OR on() vector(0))
+  - alert: critical_frontend_frontend_site_configuration_duration_since_last_successful_update_by_instance
+    labels:
+      alert_type: builtin
+      description: 'frontend: 300s+ maximum duration since last successful site configuration
+        update (all "frontend" instances)'
+      grafana_panel_id: "100301"
+      level: critical
+      name: frontend_site_configuration_duration_since_last_successful_update_by_instance
+      owner: infra-support
+      service_name: frontend
+    expr: max((max(max_over_time(src_conf_client_time_since_last_successful_update_seconds{job=~"(sourcegraph-)?frontend"}[1m])))
+      >= 300)
+  - record: alert_count
+    labels:
+      alert_type: builtin
+      description: 'frontend: 300s+ maximum duration since last successful site configuration
+        update (all "frontend" instances)'
+      grafana_panel_id: "100301"
+      level: critical
+      name: frontend_site_configuration_duration_since_last_successful_update_by_instance
+      owner: infra-support
+      service_name: frontend
+    expr: max(ALERTS{alertname="critical_frontend_frontend_site_configuration_duration_since_last_successful_update_by_instance",alertstate="firing"}
+      OR on() vector(0))
+  - alert: warning_frontend_internal_indexed_search_error_responses
+    labels:
+      alert_type: builtin
+      description: 'frontend: 5%+ internal indexed search error responses every 5m
+        for 15m0s'
+      grafana_panel_id: "102800"
+      level: warning
+      name: internal_indexed_search_error_responses
+      owner: code-search
+      service_name: frontend
+    expr: max((sum by (code) (increase(src_zoekt_request_duration_seconds_count{code!~"2.."}[5m]))
+      / ignoring (code) group_left () sum(increase(src_zoekt_request_duration_seconds_count[5m]))
+      * 100) >= 5)
+    for: 15m
+  - record: alert_count
+    labels:
+      alert_type: builtin
+      description: 'frontend: 5%+ internal indexed search error responses every 5m
+        for 15m0s'
+      grafana_panel_id: "102800"
+      level: warning
+      name: internal_indexed_search_error_responses
+      owner: code-search
+      service_name: frontend
+    expr: max(ALERTS{alertname="warning_frontend_internal_indexed_search_error_responses",alertstate="firing"}
+      OR on() vector(0))
+  - alert: warning_frontend_internal_unindexed_search_error_responses
+    labels:
+      alert_type: builtin
+      description: 'frontend: 5%+ internal unindexed search error responses every
+        5m for 15m0s'
+      grafana_panel_id: "102801"
+      level: warning
+      name: internal_unindexed_search_error_responses
+      owner: code-search
+      service_name: frontend
+    expr: max((sum by (code) (increase(searcher_service_request_total{code!~"2.."}[5m]))
+      / ignoring (code) group_left () sum(increase(searcher_service_request_total[5m]))
+      * 100) >= 5)
+    for: 15m
+  - record: alert_count
+    labels:
+      alert_type: builtin
+      description: 'frontend: 5%+ internal unindexed search error responses every
+        5m for 15m0s'
+      grafana_panel_id: "102801"
+      level: warning
+      name: internal_unindexed_search_error_responses
+      owner: code-search
+      service_name: frontend
+    expr: max(ALERTS{alertname="warning_frontend_internal_unindexed_search_error_responses",alertstate="firing"}
+      OR on() vector(0))
+  - alert: warning_frontend_99th_percentile_gitserver_duration
+    labels:
+      alert_type: builtin
+      description: 'frontend: 20s+ 99th percentile successful gitserver query duration
+        over 5m'
+      grafana_panel_id: "102810"
+      level: warning
+      name: 99th_percentile_gitserver_duration
+      owner: source
+      service_name: frontend
+    expr: max((histogram_quantile(0.99, sum by (le, category) (rate(src_gitserver_request_duration_seconds_bucket{job=~"(sourcegraph-)?frontend"}[5m]))))
+      >= 20)
+  - record: alert_count
+    labels:
+      alert_type: builtin
+      description: 'frontend: 20s+ 99th percentile successful gitserver query duration
+        over 5m'
+      grafana_panel_id: "102810"
+      level: warning
+      name: 99th_percentile_gitserver_duration
+      owner: source
+      service_name: frontend
+    expr: max(ALERTS{alertname="warning_frontend_99th_percentile_gitserver_duration",alertstate="firing"}
+      OR on() vector(0))
+  - alert: warning_frontend_gitserver_error_responses
+    labels:
+      alert_type: builtin
+      description: 'frontend: 5%+ gitserver error responses every 5m for 15m0s'
+      grafana_panel_id: "102811"
+      level: warning
+      name: gitserver_error_responses
+      owner: source
+      service_name: frontend
+    expr: max((sum by (category) (increase(src_gitserver_request_duration_seconds_count{code!~"2..",job=~"(sourcegraph-)?frontend"}[5m]))
+      / ignoring (code) group_left () sum by (category) (increase(src_gitserver_request_duration_seconds_count{job=~"(sourcegraph-)?frontend"}[5m]))
+      * 100) >= 5)
+    for: 15m
+  - record: alert_count
+    labels:
+      alert_type: builtin
+      description: 'frontend: 5%+ gitserver error responses every 5m for 15m0s'
+      grafana_panel_id: "102811"
+      level: warning
+      name: gitserver_error_responses
+      owner: source
+      service_name: frontend
+    expr: max(ALERTS{alertname="warning_frontend_gitserver_error_responses",alertstate="firing"}
+      OR on() vector(0))
+  - alert: warning_frontend_observability_test_alert_warning
+    labels:
+      alert_type: builtin
+      description: 'frontend: 1+ warning test alert metric'
+      grafana_panel_id: "102820"
+      level: warning
+      name: observability_test_alert_warning
+      owner: infra-support
+      service_name: frontend
+    expr: max((max by (owner) (observability_test_metric_warning)) >= 1)
+  - record: alert_count
+    labels:
+      alert_type: builtin
+      description: 'frontend: 1+ warning test alert metric'
+      grafana_panel_id: "102820"
+      level: warning
+      name: observability_test_alert_warning
+      owner: infra-support
+      service_name: frontend
+    expr: max(ALERTS{alertname="warning_frontend_observability_test_alert_warning",alertstate="firing"}
+      OR on() vector(0))
+  - alert: critical_frontend_observability_test_alert_critical
+    labels:
+      alert_type: builtin
+      description: 'frontend: 1+ critical test alert metric'
+      grafana_panel_id: "102821"
+      level: critical
+      name: observability_test_alert_critical
+      owner: infra-support
+      service_name: frontend
+    expr: max((max by (owner) (observability_test_metric_critical)) >= 1)
+  - record: alert_count
+    labels:
+      alert_type: builtin
+      description: 'frontend: 1+ critical test alert metric'
+      grafana_panel_id: "102821"
+      level: critical
+      name: observability_test_alert_critical
+      owner: infra-support
+      service_name: frontend
+    expr: max(ALERTS{alertname="critical_frontend_observability_test_alert_critical",alertstate="firing"}
+      OR on() vector(0))
+  - alert: warning_frontend_cloudkms_cryptographic_requests
+    labels:
+      alert_type: builtin
+      description: 'frontend: 15000+ cryptographic requests to Cloud KMS every 1m
+        for 5m0s'
+      grafana_panel_id: "103200"
+      level: warning
+      name: cloudkms_cryptographic_requests
+      owner: source
+      service_name: frontend
+    expr: max((sum(increase(src_cloudkms_cryptographic_total[1m]))) >= 15000)
+    for: 5m
+  - record: alert_count
+    labels:
+      alert_type: builtin
+      description: 'frontend: 15000+ cryptographic requests to Cloud KMS every 1m
+        for 5m0s'
+      grafana_panel_id: "103200"
+      level: warning
+      name: cloudkms_cryptographic_requests
+      owner: source
+      service_name: frontend
+    expr: max(ALERTS{alertname="warning_frontend_cloudkms_cryptographic_requests",alertstate="firing"}
+      OR on() vector(0))
+  - alert: critical_frontend_cloudkms_cryptographic_requests
+    labels:
+      alert_type: builtin
+      description: 'frontend: 30000+ cryptographic requests to Cloud KMS every 1m
+        for 5m0s'
+      grafana_panel_id: "103200"
+      level: critical
+      name: cloudkms_cryptographic_requests
+      owner: source
+      service_name: frontend
+    expr: max((sum(increase(src_cloudkms_cryptographic_total[1m]))) >= 30000)
+    for: 5m
+  - record: alert_count
+    labels:
+      alert_type: builtin
+      description: 'frontend: 30000+ cryptographic requests to Cloud KMS every 1m
+        for 5m0s'
+      grafana_panel_id: "103200"
+      level: critical
+      name: cloudkms_cryptographic_requests
+      owner: source
+      service_name: frontend
+    expr: max(ALERTS{alertname="critical_frontend_cloudkms_cryptographic_requests",alertstate="firing"}
+      OR on() vector(0))
+  - alert: critical_frontend_mean_blocked_seconds_per_conn_request
+    labels:
+      alert_type: builtin
+      description: 'frontend: 0.5s+ mean blocked seconds per conn request for 10m0s'
+      grafana_panel_id: "103320"
+      level: critical
+      name: mean_blocked_seconds_per_conn_request
+      owner: infra-support
+      service_name: frontend
+    expr: max((sum by (app_name, db_name) (increase(src_pgsql_conns_blocked_seconds{app_name="frontend"}[5m]))
+      / sum by (app_name, db_name) (increase(src_pgsql_conns_waited_for{app_name="frontend"}[5m])))
+      >= 0.5)
+    for: 10m
+  - record: alert_count
+    labels:
+      alert_type: builtin
+      description: 'frontend: 0.5s+ mean blocked seconds per conn request for 10m0s'
+      grafana_panel_id: "103320"
+      level: critical
+      name: mean_blocked_seconds_per_conn_request
+      owner: infra-support
+      service_name: frontend
+    expr: max(ALERTS{alertname="critical_frontend_mean_blocked_seconds_per_conn_request",alertstate="firing"}
+      OR on() vector(0))
+  - alert: warning_frontend_mean_blocked_seconds_per_conn_request
+    labels:
+      alert_type: builtin
+      description: 'frontend: 0.1s+ mean blocked seconds per conn request for 10m0s'
+      grafana_panel_id: "103320"
+      level: warning
+      name: mean_blocked_seconds_per_conn_request
+      owner: infra-support
+      service_name: frontend
+    expr: max((sum by (app_name, db_name) (increase(src_pgsql_conns_blocked_seconds{app_name="frontend"}[5m]))
+      / sum by (app_name, db_name) (increase(src_pgsql_conns_waited_for{app_name="frontend"}[5m])))
+      >= 0.1)
+    for: 10m
+  - record: alert_count
+    labels:
+      alert_type: builtin
+      description: 'frontend: 0.1s+ mean blocked seconds per conn request for 10m0s'
+      grafana_panel_id: "103320"
+      level: warning
+      name: mean_blocked_seconds_per_conn_request
+      owner: infra-support
+      service_name: frontend
+    expr: max(ALERTS{alertname="warning_frontend_mean_blocked_seconds_per_conn_request",alertstate="firing"}
+      OR on() vector(0))
+  - alert: warning_frontend_container_cpu_usage
+    labels:
+      alert_type: builtin
+      description: 'frontend: 99%+ container cpu usage total (1m average) across all
+        cores by instance'
+      grafana_panel_id: "103401"
+      level: warning
+      name: container_cpu_usage
+      owner: infra-support
+      service_name: frontend
+    expr: max((cadvisor_container_cpu_usage_percentage_total{name=~"^(frontend|sourcegraph-frontend).*"})
+      >= 99)
+  - record: alert_count
+    labels:
+      alert_type: builtin
+      description: 'frontend: 99%+ container cpu usage total (1m average) across all
+        cores by instance'
+      grafana_panel_id: "103401"
+      level: warning
+      name: container_cpu_usage
+      owner: infra-support
+      service_name: frontend
+    expr: max(ALERTS{alertname="warning_frontend_container_cpu_usage",alertstate="firing"}
+      OR on() vector(0))
+  - alert: warning_frontend_container_memory_usage
+    labels:
+      alert_type: builtin
+      description: 'frontend: 99%+ container memory usage by instance'
+      grafana_panel_id: "103402"
+      level: warning
+      name: container_memory_usage
+      owner: infra-support
+      service_name: frontend
+    expr: max((cadvisor_container_memory_usage_percentage_total{name=~"^(frontend|sourcegraph-frontend).*"})
+      >= 99)
+  - record: alert_count
+    labels:
+      alert_type: builtin
+      description: 'frontend: 99%+ container memory usage by instance'
+      grafana_panel_id: "103402"
+      level: warning
+      name: container_memory_usage
+      owner: infra-support
+      service_name: frontend
+    expr: max(ALERTS{alertname="warning_frontend_container_memory_usage",alertstate="firing"}
+      OR on() vector(0))
+  - alert: warning_frontend_provisioning_container_cpu_usage_long_term
+    labels:
+      alert_type: builtin
+      description: 'frontend: 80%+ container cpu usage total (90th percentile over
+        1d) across all cores by instance for 336h0m0s'
+      grafana_panel_id: "103500"
+      level: warning
+      name: provisioning_container_cpu_usage_long_term
+      owner: infra-support
+      service_name: frontend
+    expr: max((quantile_over_time(0.9, cadvisor_container_cpu_usage_percentage_total{name=~"^(frontend|sourcegraph-frontend).*"}[1d]))
+      >= 80)
+    for: 2w
+  - record: alert_count
+    labels:
+      alert_type: builtin
+      description: 'frontend: 80%+ container cpu usage total (90th percentile over
+        1d) across all cores by instance for 336h0m0s'
+      grafana_panel_id: "103500"
+      level: warning
+      name: provisioning_container_cpu_usage_long_term
+      owner: infra-support
+      service_name: frontend
+    expr: max(ALERTS{alertname="warning_frontend_provisioning_container_cpu_usage_long_term",alertstate="firing"}
+      OR on() vector(0))
+  - alert: warning_frontend_provisioning_container_memory_usage_long_term
+    labels:
+      alert_type: builtin
+      description: 'frontend: 80%+ container memory usage (1d maximum) by instance
+        for 336h0m0s'
+      grafana_panel_id: "103501"
+      level: warning
+      name: provisioning_container_memory_usage_long_term
+      owner: infra-support
+      service_name: frontend
+    expr: max((max_over_time(cadvisor_container_memory_usage_percentage_total{name=~"^(frontend|sourcegraph-frontend).*"}[1d]))
+      >= 80)
+    for: 2w
+  - record: alert_count
+    labels:
+      alert_type: builtin
+      description: 'frontend: 80%+ container memory usage (1d maximum) by instance
+        for 336h0m0s'
+      grafana_panel_id: "103501"
+      level: warning
+      name: provisioning_container_memory_usage_long_term
+      owner: infra-support
+      service_name: frontend
+    expr: max(ALERTS{alertname="warning_frontend_provisioning_container_memory_usage_long_term",alertstate="firing"}
+      OR on() vector(0))
+  - alert: warning_frontend_provisioning_container_cpu_usage_short_term
+    labels:
+      alert_type: builtin
+      description: 'frontend: 90%+ container cpu usage total (5m maximum) across all
+        cores by instance for 30m0s'
+      grafana_panel_id: "103510"
+      level: warning
+      name: provisioning_container_cpu_usage_short_term
+      owner: infra-support
+      service_name: frontend
+    expr: max((max_over_time(cadvisor_container_cpu_usage_percentage_total{name=~"^(frontend|sourcegraph-frontend).*"}[5m]))
+      >= 90)
+    for: 30m
+  - record: alert_count
+    labels:
+      alert_type: builtin
+      description: 'frontend: 90%+ container cpu usage total (5m maximum) across all
+        cores by instance for 30m0s'
+      grafana_panel_id: "103510"
+      level: warning
+      name: provisioning_container_cpu_usage_short_term
+      owner: infra-support
+      service_name: frontend
+    expr: max(ALERTS{alertname="warning_frontend_provisioning_container_cpu_usage_short_term",alertstate="firing"}
+      OR on() vector(0))
+  - alert: warning_frontend_provisioning_container_memory_usage_short_term
+    labels:
+      alert_type: builtin
+      description: 'frontend: 90%+ container memory usage (5m maximum) by instance'
+      grafana_panel_id: "103511"
+      level: warning
+      name: provisioning_container_memory_usage_short_term
+      owner: infra-support
+      service_name: frontend
+    expr: max((max_over_time(cadvisor_container_memory_usage_percentage_total{name=~"^(frontend|sourcegraph-frontend).*"}[5m]))
+      >= 90)
+  - record: alert_count
+    labels:
+      alert_type: builtin
+      description: 'frontend: 90%+ container memory usage (5m maximum) by instance'
+      grafana_panel_id: "103511"
+      level: warning
+      name: provisioning_container_memory_usage_short_term
+      owner: infra-support
+      service_name: frontend
+    expr: max(ALERTS{alertname="warning_frontend_provisioning_container_memory_usage_short_term",alertstate="firing"}
+      OR on() vector(0))
+  - alert: warning_frontend_container_oomkill_events_total
+    labels:
+      alert_type: builtin
+      description: 'frontend: 1+ container OOMKILL events total by instance'
+      grafana_panel_id: "103512"
+      level: warning
+      name: container_oomkill_events_total
+      owner: infra-support
+      service_name: frontend
+    expr: max((max by (name) (container_oom_events_total{name=~"^(frontend|sourcegraph-frontend).*"}))
+      >= 1)
+  - record: alert_count
+    labels:
+      alert_type: builtin
+      description: 'frontend: 1+ container OOMKILL events total by instance'
+      grafana_panel_id: "103512"
+      level: warning
+      name: container_oomkill_events_total
+      owner: infra-support
+      service_name: frontend
+    expr: max(ALERTS{alertname="warning_frontend_container_oomkill_events_total",alertstate="firing"}
+      OR on() vector(0))
+  - alert: warning_frontend_go_goroutines
+    labels:
+      alert_type: builtin
+      description: 'frontend: 10000+ maximum active goroutines for 10m0s'
+      grafana_panel_id: "103600"
+      level: warning
+      name: go_goroutines
+      owner: infra-support
+      service_name: frontend
+    expr: max((max by (instance) (go_goroutines{job=~".*(frontend|sourcegraph-frontend)"}))
+      >= 10000)
+    for: 10m
+  - record: alert_count
+    labels:
+      alert_type: builtin
+      description: 'frontend: 10000+ maximum active goroutines for 10m0s'
+      grafana_panel_id: "103600"
+      level: warning
+      name: go_goroutines
+      owner: infra-support
+      service_name: frontend
+    expr: max(ALERTS{alertname="warning_frontend_go_goroutines",alertstate="firing"}
+      OR on() vector(0))
+  - alert: warning_frontend_go_gc_duration_seconds
+    labels:
+      alert_type: builtin
+      description: 'frontend: 2s+ maximum go garbage collection duration'
+      grafana_panel_id: "103601"
+      level: warning
+      name: go_gc_duration_seconds
+      owner: infra-support
+      service_name: frontend
+    expr: max((max by (instance) (go_gc_duration_seconds{job=~".*(frontend|sourcegraph-frontend)"}))
+      >= 2)
+  - record: alert_count
+    labels:
+      alert_type: builtin
+      description: 'frontend: 2s+ maximum go garbage collection duration'
+      grafana_panel_id: "103601"
+      level: warning
+      name: go_gc_duration_seconds
+      owner: infra-support
+      service_name: frontend
+    expr: max(ALERTS{alertname="warning_frontend_go_gc_duration_seconds",alertstate="firing"}
+      OR on() vector(0))
+  - alert: critical_frontend_pods_available_percentage
+    labels:
+      alert_type: builtin
+      description: 'frontend: less than 90% percentage pods available for 10m0s'
+      grafana_panel_id: "103700"
+      level: critical
+      name: pods_available_percentage
+      owner: infra-support
+      service_name: frontend
+    expr: min((sum by (app) (up{app=~".*(frontend|sourcegraph-frontend)"}) / count
+      by (app) (up{app=~".*(frontend|sourcegraph-frontend)"}) * 100) <= 90)
+    for: 10m
+  - record: alert_count
+    labels:
+      alert_type: builtin
+      description: 'frontend: less than 90% percentage pods available for 10m0s'
+      grafana_panel_id: "103700"
+      level: critical
+      name: pods_available_percentage
+      owner: infra-support
+      service_name: frontend
+    expr: max(ALERTS{alertname="critical_frontend_pods_available_percentage",alertstate="firing"}
+      OR on() vector(0))
+  - alert: warning_frontend_email_delivery_failures
+    labels:
+      alert_type: builtin
+      description: 'frontend: 0%+ email delivery failure rate over 30 minutes'
+      grafana_panel_id: "103900"
+      level: warning
+      name: email_delivery_failures
+      owner: infra-support
+      service_name: frontend
+    expr: max((sum(increase(src_email_send{success="false"}[30m])) / sum(increase(src_email_send[30m]))
+      * 100) > 0)
+  - record: alert_count
+    labels:
+      alert_type: builtin
+      description: 'frontend: 0%+ email delivery failure rate over 30 minutes'
+      grafana_panel_id: "103900"
+      level: warning
+      name: email_delivery_failures
+      owner: infra-support
+      service_name: frontend
+    expr: max(ALERTS{alertname="warning_frontend_email_delivery_failures",alertstate="firing"}
+      OR on() vector(0))
+  - alert: critical_frontend_email_delivery_failures
+    labels:
+      alert_type: builtin
+      description: 'frontend: 10%+ email delivery failure rate over 30 minutes'
+      grafana_panel_id: "103900"
+      level: critical
+      name: email_delivery_failures
+      owner: infra-support
+      service_name: frontend
+    expr: max((sum(increase(src_email_send{success="false"}[30m])) / sum(increase(src_email_send[30m]))
+      * 100) >= 10)
+  - record: alert_count
+    labels:
+      alert_type: builtin
+      description: 'frontend: 10%+ email delivery failure rate over 30 minutes'
+      grafana_panel_id: "103900"
+      level: critical
+      name: email_delivery_failures
+      owner: infra-support
+      service_name: frontend
+    expr: max(ALERTS{alertname="critical_frontend_email_delivery_failures",alertstate="firing"}
+      OR on() vector(0))
+  - alert: warning_frontend_mean_successful_sentinel_duration_over_2h
+    labels:
+      alert_type: builtin
+      description: 'frontend: 5s+ mean successful sentinel search duration over 2h
+        for 15m0s'
+      grafana_panel_id: "104000"
+      level: warning
+      name: mean_successful_sentinel_duration_over_2h
+      owner: code-search
+      service_name: frontend
+    expr: max((sum(rate(src_search_response_latency_seconds_sum{source=~"searchblitz.*",status="success"}[2h]))
+      / sum(rate(src_search_response_latency_seconds_count{source=~"searchblitz.*",status="success"}[2h])))
+      >= 5)
+    for: 15m
+  - record: alert_count
+    labels:
+      alert_type: builtin
+      description: 'frontend: 5s+ mean successful sentinel search duration over 2h
+        for 15m0s'
+      grafana_panel_id: "104000"
+      level: warning
+      name: mean_successful_sentinel_duration_over_2h
+      owner: code-search
+      service_name: frontend
+    expr: max(ALERTS{alertname="warning_frontend_mean_successful_sentinel_duration_over_2h",alertstate="firing"}
+      OR on() vector(0))
+  - alert: critical_frontend_mean_successful_sentinel_duration_over_2h
+    labels:
+      alert_type: builtin
+      description: 'frontend: 8s+ mean successful sentinel search duration over 2h
+        for 30m0s'
+      grafana_panel_id: "104000"
+      level: critical
+      name: mean_successful_sentinel_duration_over_2h
+      owner: code-search
+      service_name: frontend
+    expr: max((sum(rate(src_search_response_latency_seconds_sum{source=~"searchblitz.*",status="success"}[2h]))
+      / sum(rate(src_search_response_latency_seconds_count{source=~"searchblitz.*",status="success"}[2h])))
+      >= 8)
+    for: 30m
+  - record: alert_count
+    labels:
+      alert_type: builtin
+      description: 'frontend: 8s+ mean successful sentinel search duration over 2h
+        for 30m0s'
+      grafana_panel_id: "104000"
+      level: critical
+      name: mean_successful_sentinel_duration_over_2h
+      owner: code-search
+      service_name: frontend
+    expr: max(ALERTS{alertname="critical_frontend_mean_successful_sentinel_duration_over_2h",alertstate="firing"}
+      OR on() vector(0))
+  - alert: critical_frontend_mean_sentinel_stream_latency_over_2h
+    labels:
+      alert_type: builtin
+      description: 'frontend: 3s+ mean successful sentinel stream latency over 2h
+        for 30m0s'
+      grafana_panel_id: "104001"
+      level: critical
+      name: mean_sentinel_stream_latency_over_2h
+      owner: code-search
+      service_name: frontend
+    expr: max((sum(rate(src_search_streaming_latency_seconds_sum{source=~"searchblitz.*"}[2h]))
+      / sum(rate(src_search_streaming_latency_seconds_count{source=~"searchblitz.*"}[2h])))
+      >= 3)
+    for: 30m
+  - record: alert_count
+    labels:
+      alert_type: builtin
+      description: 'frontend: 3s+ mean successful sentinel stream latency over 2h
+        for 30m0s'
+      grafana_panel_id: "104001"
+      level: critical
+      name: mean_sentinel_stream_latency_over_2h
+      owner: code-search
+      service_name: frontend
+    expr: max(ALERTS{alertname="critical_frontend_mean_sentinel_stream_latency_over_2h",alertstate="firing"}
+      OR on() vector(0))
+  - alert: warning_frontend_mean_sentinel_stream_latency_over_2h
+    labels:
+      alert_type: builtin
+      description: 'frontend: 2s+ mean successful sentinel stream latency over 2h
+        for 15m0s'
+      grafana_panel_id: "104001"
+      level: warning
+      name: mean_sentinel_stream_latency_over_2h
+      owner: code-search
+      service_name: frontend
+    expr: max((sum(rate(src_search_streaming_latency_seconds_sum{source=~"searchblitz.*"}[2h]))
+      / sum(rate(src_search_streaming_latency_seconds_count{source=~"searchblitz.*"}[2h])))
+      >= 2)
+    for: 15m
+  - record: alert_count
+    labels:
+      alert_type: builtin
+      description: 'frontend: 2s+ mean successful sentinel stream latency over 2h
+        for 15m0s'
+      grafana_panel_id: "104001"
+      level: warning
+      name: mean_sentinel_stream_latency_over_2h
+      owner: code-search
+      service_name: frontend
+    expr: max(ALERTS{alertname="warning_frontend_mean_sentinel_stream_latency_over_2h",alertstate="firing"}
+      OR on() vector(0))
+  - alert: warning_frontend_90th_percentile_successful_sentinel_duration_over_2h
+    labels:
+      alert_type: builtin
+      description: 'frontend: 5s+ 90th percentile successful sentinel search duration
+        over 2h for 15m0s'
+      grafana_panel_id: "104010"
+      level: warning
+      name: 90th_percentile_successful_sentinel_duration_over_2h
+      owner: code-search
+      service_name: frontend
+    expr: max((histogram_quantile(0.9, sum by (le) (label_replace(rate(src_search_response_latency_seconds_bucket{source=~"searchblitz.*",status="success"}[2h]),
+      "source", "$1", "source", "searchblitz_(.*)")))) >= 5)
+    for: 15m
+  - record: alert_count
+    labels:
+      alert_type: builtin
+      description: 'frontend: 5s+ 90th percentile successful sentinel search duration
+        over 2h for 15m0s'
+      grafana_panel_id: "104010"
+      level: warning
+      name: 90th_percentile_successful_sentinel_duration_over_2h
+      owner: code-search
+      service_name: frontend
+    expr: max(ALERTS{alertname="warning_frontend_90th_percentile_successful_sentinel_duration_over_2h",alertstate="firing"}
+      OR on() vector(0))
+  - alert: critical_frontend_90th_percentile_successful_sentinel_duration_over_2h
+    labels:
+      alert_type: builtin
+      description: 'frontend: 10s+ 90th percentile successful sentinel search duration
+        over 2h for 3h30m0s'
+      grafana_panel_id: "104010"
+      level: critical
+      name: 90th_percentile_successful_sentinel_duration_over_2h
+      owner: code-search
+      service_name: frontend
+    expr: max((histogram_quantile(0.9, sum by (le) (label_replace(rate(src_search_response_latency_seconds_bucket{source=~"searchblitz.*",status="success"}[2h]),
+      "source", "$1", "source", "searchblitz_(.*)")))) >= 10)
+    for: 3h30m
+  - record: alert_count
+    labels:
+      alert_type: builtin
+      description: 'frontend: 10s+ 90th percentile successful sentinel search duration
+        over 2h for 3h30m0s'
+      grafana_panel_id: "104010"
+      level: critical
+      name: 90th_percentile_successful_sentinel_duration_over_2h
+      owner: code-search
+      service_name: frontend
+    expr: max(ALERTS{alertname="critical_frontend_90th_percentile_successful_sentinel_duration_over_2h",alertstate="firing"}
+      OR on() vector(0))
+  - alert: critical_frontend_90th_percentile_sentinel_stream_latency_over_2h
+    labels:
+      alert_type: builtin
+      description: 'frontend: 6s+ 90th percentile successful sentinel stream latency
+        over 2h for 3h30m0s'
+      grafana_panel_id: "104011"
+      level: critical
+      name: 90th_percentile_sentinel_stream_latency_over_2h
+      owner: code-search
+      service_name: frontend
+    expr: max((histogram_quantile(0.9, sum by (le) (label_replace(rate(src_search_streaming_latency_seconds_bucket{source=~"searchblitz.*"}[2h]),
+      "source", "$1", "source", "searchblitz_(.*)")))) >= 6)
+    for: 3h30m
+  - record: alert_count
+    labels:
+      alert_type: builtin
+      description: 'frontend: 6s+ 90th percentile successful sentinel stream latency
+        over 2h for 3h30m0s'
+      grafana_panel_id: "104011"
+      level: critical
+      name: 90th_percentile_sentinel_stream_latency_over_2h
+      owner: code-search
+      service_name: frontend
+    expr: max(ALERTS{alertname="critical_frontend_90th_percentile_sentinel_stream_latency_over_2h",alertstate="firing"}
+      OR on() vector(0))
+  - alert: warning_frontend_90th_percentile_sentinel_stream_latency_over_2h
+    labels:
+      alert_type: builtin
+      description: 'frontend: 4s+ 90th percentile successful sentinel stream latency
+        over 2h for 15m0s'
+      grafana_panel_id: "104011"
+      level: warning
+      name: 90th_percentile_sentinel_stream_latency_over_2h
+      owner: code-search
+      service_name: frontend
+    expr: max((histogram_quantile(0.9, sum by (le) (label_replace(rate(src_search_streaming_latency_seconds_bucket{source=~"searchblitz.*"}[2h]),
+      "source", "$1", "source", "searchblitz_(.*)")))) >= 4)
+    for: 15m
+  - record: alert_count
+    labels:
+      alert_type: builtin
+      description: 'frontend: 4s+ 90th percentile successful sentinel stream latency
+        over 2h for 15m0s'
+      grafana_panel_id: "104011"
+      level: warning
+      name: 90th_percentile_sentinel_stream_latency_over_2h
+      owner: code-search
+      service_name: frontend
+    expr: max(ALERTS{alertname="warning_frontend_90th_percentile_sentinel_stream_latency_over_2h",alertstate="firing"}
+      OR on() vector(0))
+  interval: 30s
