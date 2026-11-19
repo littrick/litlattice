@@ -31,7 +31,7 @@ cd <repository>
   移除了 `buffer.SlowBuffer`，`pnpm run generate` 会失败）、`pnpm 8.9.2`
   （或 `corepack`）、`go 1.22.x`、`cargo`/`rustup`
   （仓库的 `rust-toolchain.toml` 固定工具链版本）、`clang`/`clang++`
-  （syntax-highlighter 的 oniguruma 使用 clang + C17 构建）。
+  （syntax-highlighter 的 oniguruma 使用 clang 构建，避免新版 GCC 的 C23 语义问题）。
 - 编译阶段（`frontend`/`rust`/`go`/`syntect`）建议以普通用户身份运行：
   `sudo` 会按 `secure_path` 重置 `PATH`，用户级安装的 `node`/`cargo`
   （如 `~/.cargo/bin`）在 root 下不可见。

@@ -328,13 +328,12 @@ stage_syntect() {
     (
         cd "$src"
         # Build the vendored oniguruma with clang. Its K&R-era declarations
-        # trip newer GCC's C23 semantics (empty parameter lists mean zero
-        # arguments); clang with an explicit C17 standard still accepts them.
+        # trip newer GCC's C23 semantics; clang's default C17 mode accepts
+        # them without extra warning flags.
         command -v clang >/dev/null ||
             fail "clang is required to build syntect_server/scip-ctags"
         export CC=clang
         export CXX=clang++
-        export CFLAGS="${CFLAGS:-} -std=gnu17 -Wno-error=incompatible-pointer-types -Wno-error=implicit-function-declaration -Wno-error=int-conversion"
         cargo build --release --locked --bin syntect_server --bin scip-ctags
     )
     mkdir -p "$EXT_DIR"
