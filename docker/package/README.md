@@ -131,8 +131,7 @@ docker run -d --name sg-rust -p 7080:7080 \
 
 流程始终上传 rootfs tarball；`docker_image` 开启时同时上传
 `*.docker.tar`。构建脚本以普通用户运行，rootfs 阶段内部使用 `sudo -n`；
-工作流会优先把 Rust target 放到 `/mnt` 的大磁盘（若可用），并清理预装
-SDK 以腾出空间。
+工作流会优先把 Rust target 放到 `/mnt` 的大磁盘（若可用）。
 
 ## 保真度说明
 
