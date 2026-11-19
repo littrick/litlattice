@@ -84,6 +84,23 @@ proxy_env() {
     fi
 }
 
+# Download Sourcegraph's patched universal-ctags (the symbols service spawns
+# it for languages that scip-ctags does not cover, e.g. C/C++/Markdown).
+fetch_universal_ctags() {
+    local dest="$EXT_DIR/universal-ctags"
+    [ -x "$dest" ] && return 0
+    log "downloading universal-ctags $UNIVERSAL_CTAGS_VERSION"
+    mkdir -p "$EXT_DIR"
+    local tmp="$dest.tmp"
+    rm -f "$tmp"
+    curl -fsSL --retry 5 --retry-delay 2 -o "$tmp" "$UNIVERSAL_CTAGS_URL" ||
+        fail "failed to download universal-ctags from $UNIVERSAL_CTAGS_URL"
+    echo "$UNIVERSAL_CTAGS_SHA256  $tmp" | sha256sum -c - >/dev/null ||
+        fail "universal-ctags checksum mismatch"
+    chmod 0755 "$tmp"
+    mv "$tmp" "$dest"
+}
+
 usage() {
     sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//'
     exit "${1:-0}"
@@ -267,6 +284,7 @@ stage_rootfs() {
     command -v debootstrap >/dev/null ||
         fail "debootstrap is required (apt-get install debootstrap)"
     [ "$(id -u)" = 0 ] || [ -n "$SUDO" ] || fail "rootfs staging needs root"
+    fetch_universal_ctags
     local packages="bash,ca-certificates,curl,git,git-lfs,gosu,openssh-client,nginx,postgresql,postgresql-contrib,redis-server,prometheus-postgres-exporter,locales,tini,python3,procps"
     if [ "${REUSE_ROOTFS:-0}" = 1 ] && [ -x "$ROOTFS/bin/bash" ]; then
         log "reusing existing rootfs at $ROOTFS"
@@ -332,6 +350,10 @@ stage_rootfs() {
     # Syntax highlighter.
     run_root install -m 0755 "$EXT_DIR/syntect_server" "$ROOTFS/usr/local/bin/syntect_server"
     run_root install -m 0755 "$EXT_DIR/scip-ctags" "$ROOTFS/usr/local/bin/scip-ctags"
+    # `type:symbol` search for languages outside scip-ctags' allowlist (C/C++,
+    # Markdown, ...) spawns `universal-ctags` from PATH.
+    run_root install -m 0755 "$EXT_DIR/universal-ctags" \
+        "$ROOTFS/usr/local/bin/universal-ctags"
     # blobstore wrapper expected by the Procfile (/opt/s3proxy/run-docker-container.sh).
     run_root sh -c "cat >'$ROOTFS/opt/s3proxy/run-docker-container.sh' <<'EOF'
 #!/bin/sh
