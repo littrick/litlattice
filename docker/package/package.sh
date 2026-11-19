@@ -327,19 +327,14 @@ stage_syntect() {
     [ -f "$src/Cargo.toml" ] || fail "missing syntax-highlighter source: $src"
     (
         cd "$src"
-        # oniguruma 6.9.x predates GCC 14, which turns several C type
-        # diagnostics into errors by default. Keep them as warnings so the
-        # vendored onig_sys build works on newer Ubuntu runners.
-        # GCC >= 15 defaults to C23, where `int (*compare)()` declares a
-        # zero-argument function; oniguruma's K&R-style declarations then fail
-        # when called with arguments. Pin the C standard for this build.
+        # Build the vendored oniguruma with clang. Its K&R-era declarations
+        # trip newer GCC's C23 semantics (empty parameter lists mean zero
+        # arguments); clang with an explicit C17 standard still accepts them.
+        command -v clang >/dev/null ||
+            fail "clang is required to build syntect_server/scip-ctags"
+        export CC=clang
+        export CXX=clang++
         export CFLAGS="${CFLAGS:-} -std=gnu17 -Wno-error=incompatible-pointer-types -Wno-error=implicit-function-declaration -Wno-error=int-conversion"
-        # `-Wreturn-mismatch` only exists on GCC 14+; older compilers treat an
-        # unknown -Wno-error= option as an error.
-        cc_major=$(cc -dumpfullversion -dumpversion 2>/dev/null | cut -d. -f1 || true)
-        if [ "${cc_major:-0}" -ge 14 ] 2>/dev/null; then
-            export CFLAGS="$CFLAGS -Wno-error=return-mismatch"
-        fi
         cargo build --release --locked --bin syntect_server --bin scip-ctags
     )
     mkdir -p "$EXT_DIR"

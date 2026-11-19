@@ -55,7 +55,7 @@ jobs:
           set -eux
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            debootstrap build-essential pkg-config libssl-dev git protobuf-compiler libprotobuf-dev
+            debootstrap build-essential clang pkg-config libssl-dev git protobuf-compiler libprotobuf-dev
           df -h
 
       - name: Use the larger scratch disk when available
@@ -121,6 +121,8 @@ jobs:
         env:
           FEATURES: ${{ steps.features.outputs.value }}
           IMAGE_TAG: ${{ inputs.image_tag }}
+          CC: clang
+          CXX: clang++
           CARGO_INCREMENTAL: "0"
           CARGO_PROFILE_RELEASE_DEBUG: "0"
           CARGO_BUILD_JOBS: "2"
