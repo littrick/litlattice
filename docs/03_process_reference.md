@@ -503,6 +503,23 @@ Procfile 不再添加这两个进程。
 未设置 `DISABLE_OBSERVABILITY` 时会追加这两行，并使用
 `$CONFIG_DIR/grafana` 等目录。
 
+`prom-wrapper` 为 Rust 实现（`sg-bin-prom-wrapper`）：
+
+- 路径：`/bin/prom-wrapper`（Procfile 契约；Go 版曾构建自
+  `docker-images/prometheus/cmd/prom-wrapper`）
+- 启动 `/prometheus.sh` 与 `/alertmanager.sh`，等待 Alertmanager `:9093`
+  就绪后开始订阅站点配置
+- 监听 `EXPORT_PORT`（默认 `:9090`）：`/` 反代 Prometheus `:9092`，
+  `/alertmanager/*` 反代 Alertmanager `:9093`，并提供
+  `/prom-wrapper/config-subscriber` 与 `/prom-wrapper/alerts-status`
+- 环境：`EXPORT_PORT`、`PROMETHEUS_INTERNAL_PORT`、
+  `ALERTMANAGER_INTERNAL_PORT`、`ALERTMANAGER_CONFIG_PATH`、
+  `ALERTMANAGER_ENABLE_CLUSTER`、`DISABLE_ALERTMANAGER`、
+  `DISABLE_SOURCEGRAPH_CONFIG`、`OPSGENIE_API_KEY`、
+  `SRC_FRONTEND_INTERNAL`
+- 注意：本镜像 rootfs 只安装了 `postgres_exporter`，没有 Prometheus/
+  Alertmanager/Grafana 本体；默认观测关闭时该进程不启动。
+
 ---
 
 ## 20. 常用运维命令

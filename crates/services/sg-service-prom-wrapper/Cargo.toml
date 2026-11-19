@@ -1,0 +1,32 @@
+[package]
+name = "sg-service-prom-wrapper"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+sg-core = { path = "../../base/sg-core" }
+sg-config = { path = "../../domain/sg-config" }
+sg-http = { path = "../../net/sg-http" }
+async-trait = { workspace = true }
+bytes = { workspace = true }
+http = { workspace = true }
+http-body-util = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+time = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+tokio-util = { workspace = true }
+tonic = { workspace = true }
+tracing = { workspace = true }
+url = { workspace = true }
+serde_yaml = "0.9"
+
+[dev-dependencies]
+tempfile = "3"

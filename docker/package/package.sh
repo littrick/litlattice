@@ -226,7 +226,7 @@ stage_rust() {
     mkdir -p "$RUST_BIN"
     local dir="$RUST_TARGET_DIR/$CARGO_PROFILE"
     for bin in server frontend gitserver searcher symbols worker repo-updater \
-               migrator blobstore precise-code-intel-worker embeddings; do
+               migrator blobstore prom-wrapper precise-code-intel-worker embeddings; do
         [ -x "$dir/$bin" ] || fail "missing Rust binary: $dir/$bin"
         install -m 0755 "$dir/$bin" "$RUST_BIN/$bin"
         # The workspace builds release with debug = 1; the shipped image does
@@ -245,8 +245,6 @@ stage_go() {
     (
         cd "$SRC_DIR"
         export CGO_ENABLED=0
-        go build -trimpath -buildvcs=false -ldflags="-s -w" -o "$GO_BIN/prom-wrapper" \
-            ./docker-images/prometheus/cmd/prom-wrapper
         # The zoekt binaries live in the pinned module dependency (cmd/server/BUILD.bazel ZOEKT_DEPS).
         for zoekt in zoekt-archive-index zoekt-git-index zoekt-sourcegraph-indexserver zoekt-webserver; do
             go build -trimpath -buildvcs=false -ldflags="-s -w" -o "$GO_BIN/$zoekt" \
@@ -338,13 +336,15 @@ stage_rootfs() {
                precise-code-intel-worker embeddings; do
         run_root install -m 0755 "$RUST_BIN/$bin" "$ROOTFS/usr/local/bin/$bin"
     done
+    # prom-wrapper is a one-shot/observability helper installed at /bin, the
+    # path the Procfile expects.
+    run_root install -m 0755 "$RUST_BIN/prom-wrapper" "$ROOTFS/bin/prom-wrapper"
     # Go sidecars. A reused rootfs may still carry binaries replaced by Rust
     # implementations (migrator, blobstore); remove those stale copies.
     run_root rm -f "$ROOTFS/usr/local/bin/migrator-go"
     for zoekt in zoekt-archive-index zoekt-git-index zoekt-sourcegraph-indexserver zoekt-webserver; do
         run_root install -m 0755 "$GO_BIN/$zoekt" "$ROOTFS/usr/local/bin/$zoekt"
     done
-    run_root install -m 0755 "$GO_BIN/prom-wrapper" "$ROOTFS/bin/prom-wrapper"
     # Syntax highlighter.
     run_root install -m 0755 "$EXT_DIR/syntect_server" "$ROOTFS/usr/local/bin/syntect_server"
     run_root install -m 0755 "$EXT_DIR/scip-ctags" "$ROOTFS/usr/local/bin/scip-ctags"

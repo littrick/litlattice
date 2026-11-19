@@ -1,0 +1,133 @@
+route:
+  receiver: src-noop-receiver
+  group_by:
+  - alertname
+  - level
+  - service_name
+  - name
+  - owner
+  - description
+  continue: false
+  routes:
+  - receiver: src-warning-on-team-a|team-b
+    match:
+      level: warning
+    match_re:
+      owner: ^(team-a|team-b)$
+    continue: true
+  - receiver: src-warning-receiver
+    match:
+      level: warning
+    continue: false
+  - receiver: src-critical-receiver
+    match:
+      level: critical
+    continue: false
+  group_wait: 1s
+  group_interval: 1m
+  repeat_interval: 1w
+receivers:
+- name: src-noop-receiver
+- name: src-warning-on-team-a|team-b
+  email_configs:
+  - send_resolved: true
+    to: oncall@example.com
+    headers:
+      subject: '{{ if eq .Status "firing" }}[{{ .CommonLabels.level | toUpper }}]
+        {{ .CommonLabels.description }}{{ else }}[RESOLVED] {{ .CommonLabels.description
+        }}{{ end }}'
+    html: |-
+      <body>{{ if eq .Status "firing" }}{{ .CommonLabels.level | title }} alert '{{ .CommonLabels.name }}' is firing for service '{{ .CommonLabels.service_name }}' ({{ .CommonLabels.owner }}).
+
+      For next steps, please refer to our documentation: https://sourcegraph.com/docs/admin/observability/alerts#{{ .CommonLabels.service_name }}-{{ .CommonLabels.name | reReplaceAll "_" "-" }}
+      For more details, please refer to the service dashboard: https://sourcegraph.example.com/-/debug/grafana/d/{{ .CommonLabels.service_name }}/{{ .CommonLabels.service_name }}?viewPanel={{ .CommonLabels.grafana_panel_id }}{{ $start := (index .Alerts 0).StartsAt.Unix }}{{ $end := (index .Alerts 0).EndsAt.Unix }}{{ if gt $end 0 }}&from={{ $start }}000&end={{ $end }}000{{ else }}&time={{ $start }}000&time.window=3600000{{ end }}{{ else }}{{ .CommonLabels.level | title }} alert '{{ .CommonLabels.name }}' for service '{{ .CommonLabels.service_name }}' has resolved.{{ end }}</body>
+    text: |-
+      {{ if eq .Status "firing" }}{{ .CommonLabels.level | title }} alert '{{ .CommonLabels.name }}' is firing for service '{{ .CommonLabels.service_name }}' ({{ .CommonLabels.owner }}).
+
+      For next steps, please refer to our documentation: https://sourcegraph.com/docs/admin/observability/alerts#{{ .CommonLabels.service_name }}-{{ .CommonLabels.name | reReplaceAll "_" "-" }}
+      For more details, please refer to the service dashboard: https://sourcegraph.example.com/-/debug/grafana/d/{{ .CommonLabels.service_name }}/{{ .CommonLabels.service_name }}?viewPanel={{ .CommonLabels.grafana_panel_id }}{{ $start := (index .Alerts 0).StartsAt.Unix }}{{ $end := (index .Alerts 0).EndsAt.Unix }}{{ if gt $end 0 }}&from={{ $start }}000&end={{ $end }}000{{ else }}&time={{ $start }}000&time.window=3600000{{ end }}{{ else }}{{ .CommonLabels.level | title }} alert '{{ .CommonLabels.name }}' for service '{{ .CommonLabels.service_name }}' has resolved.{{ end }}
+- name: src-warning-receiver
+  pagerduty_configs:
+  - send_resolved: false
+    routing_key: pd-key
+    description: '{{ if eq .Status "firing" }}[{{ .CommonLabels.level | toUpper }}]
+      {{ .CommonLabels.description }}{{ else }}[RESOLVED] {{ .CommonLabels.description
+      }}{{ end }}'
+    links:
+    - href: https://sourcegraph.com/docs/admin/observability/alerts#{{ .CommonLabels.service_name
+        }}-{{ .CommonLabels.name | reReplaceAll "_" "-" }}
+      text: Next steps
+    - href: https://sourcegraph.example.com/-/debug/grafana/d/{{ .CommonLabels.service_name
+        }}/{{ .CommonLabels.service_name }}?viewPanel={{ .CommonLabels.grafana_panel_id
+        }}{{ $start := (index .Alerts 0).StartsAt.Unix }}{{ $end := (index .Alerts
+        0).EndsAt.Unix }}{{ if gt $end 0 }}&from={{ $start }}000&end={{ $end }}000{{
+        else }}&time={{ $start }}000&time.window=3600000{{ end }}
+      text: Dashboard
+    severity: warning
+- name: src-critical-receiver
+  slack_configs:
+  - send_resolved: true
+    api_url: https://hooks.slack.com/services/T/B/X
+    channel: '#alerts'
+    username: Sourcegraph Alerts
+    color: '{{ if eq .Status "firing" }}#FF0000{{ else }}#00FF00{{ end }}'
+    title: '{{ if eq .Status "firing" }}[{{ .CommonLabels.level | toUpper }}] {{ .CommonLabels.description
+      }}{{ else }}[RESOLVED] {{ .CommonLabels.description }}{{ end }}'
+    title_link: https://sourcegraph.com/docs/admin/observability/alerts#{{ .CommonLabels.service_name
+      }}-{{ .CommonLabels.name | reReplaceAll "_" "-" }}
+    text: '{{ if eq .Status "firing" }}{{ .CommonLabels.level | title }} alert ''{{
+      .CommonLabels.name }}'' is firing for service ''{{ .CommonLabels.service_name
+      }}'' ({{ .CommonLabels.owner }}).{{ else }}{{ .CommonLabels.level | title }}
+      alert ''{{ .CommonLabels.name }}'' for service ''{{ .CommonLabels.service_name
+      }}'' has resolved.{{ end }}'
+    short_fields: false
+    link_names: false
+    actions:
+    - type: button
+      text: Next steps
+      url: https://sourcegraph.com/docs/admin/observability/alerts#{{ .CommonLabels.service_name
+        }}-{{ .CommonLabels.name | reReplaceAll "_" "-" }}
+    - type: button
+      text: Dashboard
+      url: https://sourcegraph.example.com/-/debug/grafana/d/{{ .CommonLabels.service_name
+        }}/{{ .CommonLabels.service_name }}?viewPanel={{ .CommonLabels.grafana_panel_id
+        }}{{ $start := (index .Alerts 0).StartsAt.Unix }}{{ $end := (index .Alerts
+        0).EndsAt.Unix }}{{ if gt $end 0 }}&from={{ $start }}000&end={{ $end }}000{{
+        else }}&time={{ $start }}000&time.window=3600000{{ end }}
+  webhook_configs:
+  - send_resolved: true
+    http_config:
+      basic_auth:
+        username: u
+        password: <secret>
+      bearer_token: <secret>
+      follow_redirects: false
+      enable_http2: false
+    url: https://example.com/hook
+    url_file: ""
+    max_alerts: 0
+  opsgenie_configs:
+  - send_resolved: true
+    api_key: og-key
+    message: '{{ if eq .Status "firing" }}[{{ .CommonLabels.level | toUpper }}] {{
+      .CommonLabels.description }}{{ else }}[RESOLVED] {{ .CommonLabels.description
+      }}{{ end }}'
+    description: '{{ if eq .Status "firing" }}{{ .CommonLabels.level | title }} alert
+      ''{{ .CommonLabels.name }}'' is firing for service ''{{ .CommonLabels.service_name
+      }}'' ({{ .CommonLabels.owner }}).{{ else }}{{ .CommonLabels.level | title }}
+      alert ''{{ .CommonLabels.name }}'' for service ''{{ .CommonLabels.service_name
+      }}'' has resolved.{{ end }}'
+    source: https://sourcegraph.example.com/-/debug/grafana/d/{{ .CommonLabels.service_name
+      }}/{{ .CommonLabels.service_name }}?viewPanel={{ .CommonLabels.grafana_panel_id
+      }}{{ $start := (index .Alerts 0).StartsAt.Unix }}{{ $end := (index .Alerts 0).EndsAt.Unix
+      }}{{ if gt $end 0 }}&from={{ $start }}000&end={{ $end }}000{{ else }}&time={{
+      $start }}000&time.window=3600000{{ end }}
+    details:
+      Next steps: https://sourcegraph.com/docs/admin/observability/alerts#{{ .CommonLabels.service_name
+        }}-{{ .CommonLabels.name | reReplaceAll "_" "-" }}
+    responders:
+    - name: sre
+      type: team
+    tags: '{{ range $key, $value := .CommonLabels }}{{$key}}={{$value}},{{end}}'
+    priority: P1
+templates: []

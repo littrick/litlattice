@@ -44,7 +44,7 @@ flowchart TB
         end
 
         subgraph optional["可选观测（默认关闭）"]
-            prom["prom-wrapper / prometheus"]
+            prom["prom-wrapper (Rust) / prometheus / alertmanager"]
             grafana["grafana"]
         end
 
@@ -245,6 +245,7 @@ flowchart LR
 | worker → frontend（内部） | gRPC `ConfigService` + HTTP `/.internal/{graphql,search/stream,compute/stream}` | `127.0.0.1:3090` | `SRC_FRONTEND_INTERNAL` | 初始配置（gRPC）；批量变更 webhook / insights 搜索走 `/.internal/*` HTTP（内部监听器同时接受带/不带前缀两种路径） |
 | gitserver / repo-updater / worker / precise-worker → frontend（内部） | gRPC `ConfigService` | `127.0.0.1:3090` | `SRC_FRONTEND_INTERNAL` | 获取初始配置与热更新（含 Postgres DSN、服务连接等）；服务启动时阻塞等待首个配置 |
 | blobstore → frontend | 无 | — | — | Rust `blobstore` 只读写本地 `$DATA_DIR/blobstore`，不建立配置连接 |
+| prom-wrapper → frontend（内部，观测开启时） | gRPC `ConfigService` | `127.0.0.1:3090` | `SRC_FRONTEND_INTERNAL` | 订阅站点配置，生成 Alertmanager receivers/routes/SMTP/silences |
 | worker → gitserver / searcher / symbols / zoekt | gRPC | 同上各端口 | 同上 | 作业执行所需的各后端 |
 | worker / precise-worker → blobstore | S3 API（HTTP） | `http://127.0.0.1:9000` | precise-worker 读 `PRECISE_CODE_INTEL_UPLOAD_*`；worker 由作业装配注入对象存储配置（字段同第 10 节） | 上传与读取索引 |
 | repo-updater → code host | HTTPS | 由站点配置/外部服务决定 | `HTTPS_PROXY` 等 | 拉取仓库、同步元数据 |

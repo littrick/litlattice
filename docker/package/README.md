@@ -17,7 +17,7 @@ cd <repository>
 | --- | --- |
 | Rust 服务二进制 | 本仓库（`cargo build --release --bins`） |
 | Web UI（`/assets-dist`） | 固定提交的 `sourcegraph/sourcegraph-public-snapshot`，`pnpm` 构建 |
-| Go sidecar（`zoekt-*`、`prom-wrapper`） | 同一份 Sourcegraph 源码 |
+| Go sidecar（`zoekt-*`） | 同一份 Sourcegraph 源码 |
 | `syntect_server`、`scip-ctags` | 该源码中的 `docker-images/syntax-highlighter` |
 | Postgres、Redis、nginx、git、tini、gosu 等 | 通过 `debootstrap`/apt 安装的 Ubuntu 24.04 |
 | 根文件系统 | 直接组装，不使用 `docker build` |
@@ -80,9 +80,10 @@ docker run -d --name sg-rust -p 7080:7080 \
 1. `fetch` — 克隆/检出 `SOURCEGRAPH_COMMIT`（Web UI + Go sidecar）。
 2. `frontend` — `pnpm install --frozen-lockfile`、`pnpm run generate`、
    `pnpm --filter @sourcegraph/web run build`；复制 `client/web/dist`。
-3. `rust` — `cargo build --release --bins`；暂存服务二进制（含 `migrator`
-   与 `blobstore`，数据库迁移和对象存储均已由 Rust 实现）。
-4. `go` — 从固定的模块依赖构建 `prom-wrapper` 以及四个 `zoekt-*` 命令。
+3. `rust` — `cargo build --release --bins`；暂存服务二进制（含 `migrator`、
+   `blobstore` 与 `prom-wrapper`，数据库迁移/对象存储/观测包装器均已由 Rust
+   实现）。
+4. `go` — 从固定的模块依赖构建四个 `zoekt-*` 命令。
 5. `syntect` — 构建 `syntect_server`/`scip-ctags`，并去除调试信息。
 6. `rootfs` — 使用标准软件包执行 `debootstrap noble`，配置用户/组、
    运行时目录、应用文件、`/version.txt` = `SOURCEGRAPH_VERSION`，
