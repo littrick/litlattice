@@ -25,8 +25,9 @@
 #   docker         after writing the rootfs tarball, import it as a Docker image
 #                  and save an additional `<name>.docker.tar` artifact;
 #   sveltekit      build and ship the SvelteKit web app (`_sk`) and expose the
-#                  opt-in "Try a new, faster experience" toggle.
-# Combine them as `--features observability,docker,sveltekit`.
+#                  opt-in "Try a new, faster experience" toggle;
+#   sourcemaps     keep `*.map` files in /assets-dist (excluded by default).
+# Combine them as `--features observability,docker,sveltekit,sourcemaps`.
 #
 # Important environment:
 #   BUILD_DIR        build workspace (default <repo>/.package-build)
@@ -140,8 +141,8 @@ done
 FEATURES=${FEATURES// /}
 for feature in ${FEATURES//,/ }; do
     case "$feature" in
-        observability | docker | sveltekit) ;;
-        *) fail "unknown feature: $feature (supported: observability, docker, sveltekit)" ;;
+        observability | docker | sveltekit | sourcemaps) ;;
+        *) fail "unknown feature: $feature (supported: observability, docker, sveltekit, sourcemaps)" ;;
     esac
 done
 
@@ -158,6 +159,9 @@ if has_feature observability; then
 fi
 if has_feature sveltekit; then
     FEATURE_SUFFIX="$FEATURE_SUFFIX-sveltekit"
+fi
+if has_feature sourcemaps; then
+    FEATURE_SUFFIX="$FEATURE_SUFFIX-sourcemaps"
 fi
 OUT_NAME=${OUT_NAME:-sourcegraph-server-rust-${SOURCEGRAPH_VERSION}${FEATURE_SUFFIX}-fs.tar.gz}
 IMAGE_TAG=${IMAGE_TAG:-sourcegraph/server:rust-${SOURCEGRAPH_VERSION}${FEATURE_SUFFIX}}
@@ -488,6 +492,10 @@ chmod 0755 '$ROOTFS/opt/s3proxy/run-docker-container.sh'"
     # Web bundle (stage-assets enforces a real web.manifest.json). It writes
     # into the root-owned rootfs, so run it through the root prefix.
     run_root bash "$REPO_ROOT/docker/server/stage-assets.sh" --dist-dir "$DIST_DIR" "$ROOTFS"
+    if ! has_feature sourcemaps; then
+        # Source maps are ~180 MB of the bundle and unused at runtime.
+        run_root find "$ROOTFS/assets-dist" -name '*.map' -delete
+    fi
     run_root chroot "$ROOTFS" chown -R sourcegraph:sourcegraph /assets-dist
 
     # Migration SQL corpus for the Rust migrator (`MIGRATIONS_DIR`,
@@ -537,6 +545,12 @@ stage_package() {
     fi
     if ! has_feature sveltekit && [ -e "$ROOTFS/assets-dist/_sk/index.html" ]; then
         fail "SvelteKit assets present in the rootfs but the feature is off; rebuild the frontend/rootfs stages"
+    fi
+    if has_feature sourcemaps; then
+        find "$ROOTFS/assets-dist" -name '*.map' -print -quit | grep -q . ||
+            fail "sourcemaps feature enabled but /assets-dist contains no *.map files; rebuild the frontend stage"
+    elif find "$ROOTFS/assets-dist" -name '*.map' -print -quit | grep -q .; then
+        fail "source maps present in /assets-dist but the sourcemaps feature is off; rerun the rootfs stage"
     fi
 
     log "writing $OUT_NAME"
