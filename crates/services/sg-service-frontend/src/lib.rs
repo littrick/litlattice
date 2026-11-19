@@ -161,6 +161,7 @@ pub mod search_graphql;
 pub mod search_job;
 pub mod search_job_printer;
 pub mod search_jobutil_combinators;
+pub mod search_jobs_graphql;
 pub mod search_jobutil_exhaustive;
 pub mod search_jobutil_expression;
 pub mod search_jobutil_filters;
@@ -210,6 +211,7 @@ pub mod user_emails_graphql;
 pub mod user_provisioning;
 pub mod user_store;
 pub mod userpasswd;
+pub mod viewer_graphql;
 pub mod version;
 pub mod webhook_logs;
 

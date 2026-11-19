@@ -650,12 +650,56 @@ pub async fn cancel_search_job(
     Ok(total_canceled)
 }
 
-/// `store.ListArgs` without pagination (see the module docs).
+/// `store.ListArgs`.
 #[derive(Debug, Clone, Default)]
 pub struct ListArgs {
     pub query: String,
     pub states: Vec<String>,
     pub user_ids: Vec<i32>,
+    /// `database.PaginationArgs` (`internal/database/helpers.go:145-204`),
+    /// supplied by the search-jobs GraphQL connection.
+    pub pagination: Option<PaginationArgs>,
+}
+
+/// One value bound for a cursor comparison
+/// (`database.PaginationArgs.After`/`Before` entries).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CursorValue {
+    Text(String),
+    Int(i64),
+}
+
+/// `database.PaginationArgs` + `database.OrderBy` for
+/// `ListExhaustiveSearchJobs`: the frontend connection passes
+/// `first`/`last` (already `pageSize + 1`), composite cursors and the
+/// fully-normalized order columns (`[<field>, "id"]`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PaginationArgs {
+    pub first: Option<i32>,
+    pub last: Option<i32>,
+    pub after: Vec<CursorValue>,
+    pub before: Vec<CursorValue>,
+    pub ascending: bool,
+    pub order_by: Vec<String>,
+}
+
+impl PaginationArgs {
+    fn order_columns(&self) -> Vec<String> {
+        if self.order_by.is_empty() {
+            vec!["id".to_owned()]
+        } else {
+            self.order_by.clone()
+        }
+    }
+
+    fn order_sql(&self, ascending: bool) -> String {
+        let direction = if ascending { "ASC" } else { "DESC" };
+        self.order_columns()
+            .iter()
+            .map(|column| format!("{column} {direction}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
 }
 
 enum Bind {
@@ -717,12 +761,81 @@ pub async fn list_exhaustive_search_jobs(
         conditions.push(format!("initiator_id = ${}", binds.len()));
     }
 
+    // `database.PaginationArgs.SQL()`: composite cursor comparisons over the
+    // ordered columns (`(created_at, id) < ($1, $2)`-style), then ORDER BY and
+    // LIMIT. `after` moves forward, `before` moves backward; both flip with
+    // the sort direction.
+    if let Some(pagination) = &args.pagination {
+        let columns = pagination.order_columns();
+        let push_cursor = |values: &[CursorValue], binds: &mut Vec<Bind>| {
+            values
+                .iter()
+                .zip(columns.iter())
+                .map(|(value, column)| match value {
+                    CursorValue::Text(value) => {
+                        binds.push(Bind::Text(value.clone()));
+                        // Go injects untyped literals; typed parameters need
+                        // the comparisons' casts.
+                        let cast = if column == "created_at" || column == "updated_at" {
+                            "timestamptz"
+                        } else {
+                            "text"
+                        };
+                        format!("${}::{cast}", binds.len())
+                    }
+                    CursorValue::Int(value) => {
+                        binds.push(Bind::Long(*value));
+                        format!("${}::bigint", binds.len())
+                    }
+                })
+                .collect::<Vec<_>>()
+        };
+        if !pagination.after.is_empty() {
+            let placeholders = push_cursor(&pagination.after, &mut binds);
+            let comparison = if pagination.ascending { ">" } else { "<" };
+            conditions.push(format!(
+                "({}) {comparison} ({})",
+                columns.join(", "),
+                placeholders.join(", ")
+            ));
+        }
+        if !pagination.before.is_empty() {
+            let placeholders = push_cursor(&pagination.before, &mut binds);
+            let comparison = if pagination.ascending { "<" } else { ">" };
+            conditions.push(format!(
+                "({}) {comparison} ({})",
+                columns.join(", "),
+                placeholders.join(", ")
+            ));
+        }
+    }
+
     let where_clause = if conditions.is_empty() {
         String::new()
     } else {
         format!("WHERE {}", conditions.join("\n AND "))
     };
-    let sql = list_search_job_query(&where_clause);
+    let mut sql = list_search_job_query(&where_clause);
+    if let Some(pagination) = &args.pagination {
+        if let Some(first) = pagination.first {
+            sql.push_str(&format!(
+                "\nORDER BY {}\nLIMIT {first}",
+                pagination.order_sql(pagination.ascending)
+            ));
+        } else if let Some(last) = pagination.last {
+            // `PaginationArgs.Last` queries in the opposite direction; the
+            // connection reverses the nodes before returning them.
+            sql.push_str(&format!(
+                "\nORDER BY {}\nLIMIT {last}",
+                pagination.order_sql(!pagination.ascending)
+            ));
+        } else {
+            sql.push_str(&format!(
+                "\nORDER BY {}",
+                pagination.order_sql(pagination.ascending)
+            ));
+        }
+    }
 
     let mut query = sqlx::query(&sql);
     for bind in &binds {

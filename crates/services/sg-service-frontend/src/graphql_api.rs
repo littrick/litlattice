@@ -489,6 +489,15 @@ pub struct SchemaGraphqlDeps {
     /// `SavedSearchesResolver`'s database seam (M9.13a); `None` reproduces an
     /// absent optional resolver (SDL not appended, root fields/types absent).
     saved_searches: Option<crate::saved_searches_graphql::SavedSearchesHandle>,
+    /// `Query.viewer` / `User.affiliatedNamespaces`'s database seam (M9.67a);
+    /// `None` leaves the fields unported in transport-only tests.
+    viewer: Option<crate::viewer_graphql::ViewerHandle>,
+    /// `dotcom.SourcegraphDotComMode()` (M9.67a): whether anonymous visitors
+    /// may use `Query.viewer`.
+    dotcom_mode: bool,
+    /// `SearchJobsResolver`'s surface (M9.68a); `None` reproduces an absent
+    /// optional resolver (SDL not appended, root fields/types absent).
+    search_jobs: Option<crate::search_jobs_graphql::SearchJobsHandle>,
     /// `OwnResolver`'s database seam (M9.48c); `None` reproduces an absent
     /// optional resolver (`own.graphql` not appended).
     own: Option<crate::own_graphql::OwnHandle>,
@@ -624,6 +633,9 @@ impl SchemaGraphqlDeps {
             executor_secrets: None,
             rbac: None,
             saved_searches: None,
+            viewer: None,
+            dotcom_mode: false,
+            search_jobs: None,
             own: None,
             batches: None,
             github_apps: None,
@@ -709,6 +721,9 @@ impl SchemaGraphqlDeps {
             executor_secrets: None,
             rbac: None,
             saved_searches: None,
+            viewer: None,
+            dotcom_mode: false,
+            search_jobs: None,
             own: None,
             batches: None,
             github_apps: None,
@@ -1238,6 +1253,33 @@ impl SchemaGraphqlDeps {
         Ok(self)
     }
 
+    /// Attach the `Query.viewer` / `User.affiliatedNamespaces` surface
+    /// (M9.67a). The SDL is part of `assemble_oss()`, so no document is
+    /// appended here.
+    pub fn with_viewer(
+        mut self,
+        viewer: Option<crate::viewer_graphql::ViewerHandle>,
+        dotcom_mode: bool,
+    ) -> Self {
+        self.viewer = viewer;
+        self.dotcom_mode = dotcom_mode;
+        self
+    }
+
+    /// Enable the search-jobs GraphQL surface (M9.68a): append the vendored
+    /// `search_jobs.graphql` document and inject the resolver.
+    pub fn with_search_jobs(
+        mut self,
+        search_jobs: crate::search_jobs_graphql::SearchJobsHandle,
+    ) -> Result<Self, sg_graphql::schema::SchemaError> {
+        self.schema = Arc::new(sg_graphql::schema::assemble(&[
+            self.schema.schema_string.as_str(),
+            sg_graphql::schema::SEARCH_JOBS_SCHEMA,
+        ])?);
+        self.search_jobs = Some(search_jobs);
+        Ok(self)
+    }
+
     /// Enable the own ownership GraphQL surface (M9.48c): append the vendored
     /// `own.graphql` document (as `NewSchema` does for a non-nil
     /// `OwnResolver`) and hand the database/gitserver seam to the executor.
@@ -1588,6 +1630,9 @@ impl SchemaGraphqlDeps {
             executor_secrets: None,
             rbac: None,
             saved_searches: None,
+            viewer: None,
+            dotcom_mode: false,
+            search_jobs: None,
             own: None,
             batches: None,
             github_apps: None,
@@ -3048,6 +3093,8 @@ impl GraphqlDeps for SchemaGraphqlDeps {
             .with_executor_secret_roots(executor_secret_roots)
             .with_search_contexts(self.search_contexts.clone())
             .with_saved_searches(self.saved_searches.clone())
+            .with_viewer(self.viewer.clone(), self.dotcom_mode)
+            .with_search_jobs(self.search_jobs.clone())
             .with_own(self.own.clone())
             .with_batches(self.batches.clone())
             .with_github_apps(self.github_apps.clone())

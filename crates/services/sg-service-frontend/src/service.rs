@@ -1530,6 +1530,17 @@ impl Service for FrontendService {
                 std::env::var(key).ok()
             }),
         ));
+        // M9.67a: `Query.viewer` + `User.affiliatedNamespaces`; the viewer SDL
+        // is part of the OSS base, so this only injects the database seam and
+        // the dotcom-mode gate for anonymous visitors.
+        let viewer: crate::viewer_graphql::ViewerHandle =
+            Arc::new(crate::viewer_graphql::PgAffiliatedNamespacesStore::new(
+                session_pool.clone(),
+            ));
+        let dotcom_mode = crate::service_connections::sourcegraph_dotcom_mode(&|key: &str| {
+            std::env::var(key).ok()
+        });
+        let graphql_deps = graphql_deps.with_viewer(Some(viewer), dotcom_mode);
         let graphql_deps = graphql_deps
             .with_code_monitors(code_monitors)
             .and_then(|deps| deps.with_saved_searches(saved_searches))
@@ -1754,6 +1765,37 @@ impl Service for FrontendService {
                 autoindexing_jobs,
             ),
         ));
+        // M9.68a: search-jobs GraphQL (`Query.searchJobs`, the three
+        // mutations and `node(SearchJob)`). Validation reuses the same search
+        // executor as `Query.search` (`service.FromSearchClient`).
+        let search_jobs_external_url = {
+            let live = Arc::clone(wiring.live());
+            Arc::new(move || {
+                live.current()
+                    .site
+                    .raw()
+                    .get("externalURL")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or_default()
+                    .to_owned()
+            }) as Arc<dyn Fn() -> String + Send + Sync>
+        };
+        let search_jobs = Arc::new(crate::search_jobs_graphql::SearchJobsResolver::new(
+            Arc::new(crate::search_jobs_graphql::PgSearchJobsDatabase::new(
+                session_pool.clone(),
+            )),
+            Some(Arc::new(
+                crate::search_jobs_graphql::ExecutorSearchJobValidator::new(Arc::clone(
+                    &search_executor,
+                )),
+            )),
+            search_jobs_external_url,
+        ));
+        let graphql_deps = graphql_deps.with_search_jobs(search_jobs).map_err(|err| {
+            ServiceError::new(format!(
+                "failed to register search-jobs GraphQL surface: {err}"
+            ))
+        })?;
         let graphql_deps = graphql_deps
             .with_production_surfaces(
                 Some(search_contexts),

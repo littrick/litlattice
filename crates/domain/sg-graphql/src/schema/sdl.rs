@@ -33,6 +33,11 @@ pub const CODE_MONITORS_SCHEMA: &str = include_str!("sdl/code_monitors.graphql")
 /// SDL, appended directly after the code-monitors document.
 pub const SAVED_SEARCHES_SCHEMA: &str = include_str!("sdl/saved_searches.graphql");
 
+/// `//go:embed search_jobs.graphql` — `OptionalResolver.SearchJobsResolver`
+/// SDL (M9.68a): `Query.searchJobs`/`validateSearchJob`,
+/// `Mutation.{create,cancel,delete}SearchJob` and the `SearchJob` types.
+pub const SEARCH_JOBS_SCHEMA: &str = include_str!("sdl/search_jobs.graphql");
+
 /// `//go:embed batches.graphql` — `OptionalResolver.BatchChangesResolver` SDL
 /// (M9.24c). `NewSchema` appends it when the batches resolver is present.
 pub const BATCHES_SCHEMA: &str = include_str!("sdl/batches.graphql");

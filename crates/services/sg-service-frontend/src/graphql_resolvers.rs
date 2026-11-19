@@ -1142,6 +1142,8 @@ pub struct NestedPrefetch {
     pub code_monitors: Option<crate::code_monitors_graphql::CodeMonitorsHandleWrapper>,
     /// `User.teams` / `Team` surface (M9.27a).
     pub teams: Option<crate::teams_graphql::TeamsHandleWrapper>,
+    /// `Query.viewer` / `User.affiliatedNamespaces` surface (M9.67a).
+    pub viewer: Option<crate::viewer_graphql::ViewerHandleWrapper>,
     /// `User.emails` / `primaryEmail` / `accessTokens` / `session` /
     /// `hasVerifiedEmail` per-user account data (M9.18a).
     pub user_accounts: HashMap<i32, crate::graphql_inventory_c::UserAccountsData>,
@@ -2797,6 +2799,7 @@ impl FrontendRootResolver {
                 organizations,
                 organizations_connections,
                 viewer_site_admin,
+                dotcom_mode: false,
                 nested: Arc::new(NestedPrefetch::default()),
                 nodes: NodeRoots::default(),
                 namespaces: NamespaceRoots::default(),
@@ -2834,6 +2837,7 @@ impl FrontendRootResolver {
                 teams: None,
                 outbound_webhooks: None,
                 authz: None,
+                search_jobs: None,
             },
             mutation: MutationRoot {
                 inventory: Arc::new(InventoryRoots::default()),
@@ -3029,6 +3033,30 @@ impl FrontendRootResolver {
             .map(|user| user.with_teams(user_handle.clone()));
         let nested = Arc::make_mut(&mut self.query.nested);
         nested.teams = teams.map(crate::teams_graphql::TeamsHandleWrapper);
+        self
+    }
+
+    /// Attach the `Query.viewer` / `User.affiliatedNamespaces` surface
+    /// (M9.67a) and the dotcom-mode gate for anonymous visitors.
+    pub fn with_viewer(
+        mut self,
+        viewer: Option<crate::viewer_graphql::ViewerHandle>,
+        dotcom_mode: bool,
+    ) -> Self {
+        self.query.dotcom_mode = dotcom_mode;
+        let nested = Arc::make_mut(&mut self.query.nested);
+        nested.viewer = viewer.map(crate::viewer_graphql::ViewerHandleWrapper);
+        self
+    }
+
+    /// Attach the optional search-jobs surface (M9.68a): `Query.searchJobs` /
+    /// `validateSearchJob`, the three mutations and `node(SearchJob)`.
+    pub fn with_search_jobs(
+        mut self,
+        search_jobs: Option<crate::search_jobs_graphql::SearchJobsHandle>,
+    ) -> Self {
+        self.query.search_jobs = search_jobs.clone();
+        self.mutation.search_jobs = search_jobs;
         self
     }
 
@@ -3360,6 +3388,9 @@ struct QueryRoot {
     /// The viewer's `users.site_admin`; see
     /// `auth.CheckSiteAdminOrSameUserFromActor`.
     viewer_site_admin: bool,
+    /// `dotcom.SourcegraphDotComMode()` (M9.67a): gates `Query.viewer` for
+    /// unauthenticated visitors (`auth.CheckUnauthenticatedVisitorAccess`).
+    dotcom_mode: bool,
     /// Nested resolver data prefetched for this request (see
     /// [`prefetch_nested`]); attached to every `User` object the root builds.
     nested: Arc<NestedPrefetch>,
@@ -3483,6 +3514,8 @@ struct QueryRoot {
     outbound_webhooks: Option<crate::outbound_webhooks_graphql::OutboundWebhooksHandle>,
     /// M9.48a authz surface (`Query.permissionsSyncJobs` etc.).
     authz: Option<crate::authz_graphql::AuthzHandle>,
+    /// M9.68a search-jobs surface (`Query.searchJobs`, mutations, `node`).
+    search_jobs: Option<crate::search_jobs_graphql::SearchJobsHandle>,
 }
 
 /// `Mutation` root: `settingsMutation`/log events/temporary settings/feature
@@ -3551,6 +3584,8 @@ pub struct MutationRoot {
     authz: Option<crate::authz_graphql::AuthzHandle>,
     /// The viewer's `users.site_admin` for the authz mutation gates.
     authz_viewer_site_admin: bool,
+    /// Optional search-jobs mutations (M9.68a).
+    search_jobs: Option<crate::search_jobs_graphql::SearchJobsHandle>,
 }
 
 impl MutationRoot {
@@ -3637,6 +3672,18 @@ impl ObjectValue for MutationRoot {
             return Ok(Some(FieldValue::Object(Arc::new(
                 crate::telemetry_graphql::TelemetryMutationObject,
             ))));
+        }
+        // M9.68a search-jobs mutations (`createSearchJob` /
+        // `cancelSearchJob` / `deleteSearchJob`).
+        if let Some(search_jobs) = &self.search_jobs {
+            if crate::search_jobs_graphql::is_mutation_field(field) {
+                return crate::search_jobs_graphql::mutation_field(
+                    search_jobs,
+                    field,
+                    arguments,
+                    actor,
+                );
+            }
         }
         // M9.48d embeddings scheduling/cancellation mutations.
         if let Some(graphql) = self
@@ -4106,6 +4153,18 @@ impl ObjectValue for QueryRoot {
         arguments: &Arguments,
         actor: Actor,
     ) -> Result<Option<FieldValue>, ExecError> {
+        // M9.68a search-jobs read surface (`Query.searchJobs` /
+        // `Query.validateSearchJob`).
+        if let Some(search_jobs) = &self.search_jobs {
+            if crate::search_jobs_graphql::is_root_field(field) {
+                return crate::search_jobs_graphql::root_field(
+                    search_jobs,
+                    field,
+                    arguments,
+                    actor,
+                );
+            }
+        }
         match field {
             // `schemaResolver.Root` (`graphqlbackend.go:843`) returns the
             // same resolver; the snapshot is cloneable, so replay the whole
@@ -4572,6 +4631,24 @@ impl ObjectValue for QueryRoot {
                     None => Ok(None),
                 }
             }
+            // `schemaResolver.Viewer` (`viewer.go:11-25`, M9.67a): the current
+            // user when authenticated; otherwise a `Visitor` only in dotcom
+            // mode (`auth.CheckUnauthenticatedVisitorAccess`).
+            "viewer" => crate::viewer_graphql::viewer(
+                self.user.as_ref(),
+                self.dotcom_mode,
+                actor,
+                self.nested.clone(),
+            )
+            .map(Some),
+            // `schemaResolver.ViewerCanChangeLibraryItemVisibilityToPublic`
+            // (`viewer.go:48-56`, M9.67a).
+            "viewerCanChangeLibraryItemVisibilityToPublic" => Ok(Some(
+                crate::viewer_graphql::viewer_can_change_library_item_visibility_to_public(
+                    actor,
+                    self.viewer_site_admin,
+                ),
+            )),
             // `CurrentUser` -> `db.Users().GetByCurrentAuthUser`: anonymous
             // actors get `nil`; an authenticated actor gets the prefetched row
             // (or `nil` if it disappeared between authentication and here).
@@ -4893,6 +4970,14 @@ impl ObjectValue for QueryRoot {
                             Ok(None) => Ok(None),
                             Err(error) => Err(ExecError::new(error.to_string())),
                         }
+                    }
+                    // `NodeResolvers()["SearchJob"]` (M9.68a).
+                    "SearchJob" if self.search_jobs.is_some() => {
+                        crate::search_jobs_graphql::node_field(
+                            self.search_jobs.as_ref().expect("checked search jobs"),
+                            id,
+                            actor,
+                        )
                     }
                     "ExternalService" => match self.nodes.external_services.get(id) {
                         Some(Ok(data)) => Ok(Some(FieldValue::Object(Arc::new(
@@ -5690,6 +5775,11 @@ impl UserObject {
         self
     }
 
+    /// The viewer's `users.site_admin` flag used by the field resolvers.
+    pub fn is_viewer_site_admin(&self) -> bool {
+        self.viewer_site_admin
+    }
+
     pub fn user_data(&self) -> &UserData {
         &self.data
     }
@@ -5733,6 +5823,17 @@ impl ObjectValue for UserObject {
             }
         }
         match field {
+            // `UserResolver.AffiliatedNamespaces` (M9.67a): the user's own
+            // namespace plus their organizations. `None` without the seam.
+            "affiliatedNamespaces" => match &self.nested.viewer {
+                Some(wrapper) => crate::viewer_graphql::user_affiliated_namespaces(
+                    self,
+                    actor,
+                    wrapper.0.as_ref(),
+                )
+                .map(Some),
+                None => Ok(None),
+            },
             "id" => Ok(Some(FieldValue::Json(Json::Str(Self::relay_id(
                 self.data.id,
             ))))),
