@@ -120,10 +120,11 @@ docker run -d --name sg-rust -p 7080:7080 \
   `/var/opt/sourcegraph/prometheus`；即使误设 `DISABLE_OBSERVABILITY=`，
   `/server` 检测到 `/bin/prom-wrapper` 缺失也会跳过观测进程。
 - 需要观测时使用 `--features observability` 打包：安装 Prometheus、
-  Alertmanager、基线配置、23 个告警规则、单容器 target 列表与 Rust
-  `prom-wrapper`；运行时设置 `DISABLE_OBSERVABILITY=`（空值）启动
-  Prometheus/Alertmanager，并用 `-p 9091:9090` 暴露 Prometheus。
-  Grafana 仍未打包，`/server` 在二进制缺失时跳过 grafana 进程。
+  Alertmanager、`postgres_exporter`、基线配置、23 个告警规则、单容器
+  target 列表与 Rust `prom-wrapper`；运行时设置
+  `DISABLE_OBSERVABILITY=`（空值）启动 Prometheus/Alertmanager，
+  并用 `-p 9091:9090` 暴露 Prometheus。Grafana 仍未打包，`/server` 在
+  二进制缺失时跳过 grafana 进程。
 - 混合/zoekt 搜索已禁用（`DISABLE_HYBRID_SEARCH=true`）；为保持一致性仍随附
   zoekt 二进制，但不运行索引服务器。
 - `/var/opt/sourcegraph/postgresql{,-markers}` 有意**不**预先创建：`/server`

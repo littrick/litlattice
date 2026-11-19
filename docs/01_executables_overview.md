@@ -42,7 +42,7 @@
 | `tini` | Ubuntu `tini` 包 | `/sbin/tini` | PID 1，负责回收僵尸进程与信号转发 | Docker `ENTRYPOINT` |
 | `nginx` | Ubuntu `nginx` 包 | `/usr/sbin/nginx` | 单容器唯一对外入口，`7080 → 127.0.0.1:8080` | `/server` Procfile |
 | `postgres` | Ubuntu `postgresql-16` | `/usr/lib/postgresql/16/bin/postgres` | 本地数据库（sourcegraph / sourcegraph-codeintel / 可选 codeinsights） | `/server` 的 `postgres:` Procfile 行 |
-| `postgres_exporter` | Ubuntu 包 | `/usr/bin/prometheus-postgres-exporter` | 导出 Postgres 指标（观测组件禁用时仍会启动该进程） | `/server` Procfile |
+| `postgres_exporter` | Ubuntu 包 | `/usr/bin/prometheus-postgres-exporter` | 导出 Postgres 指标；仅在 `--features observability` 镜像中安装并由 Procfile 启动 | `/server` Procfile |
 | `redis-server` | Ubuntu `redis-server` 包 | `/usr/bin/redis-server` | 两个实例：session/持久存储 `:6379`、缓存 `:6380` | `/server` Procfile |
 | `syntect_server` | syntax-highlighter 源码构建 | `/usr/local/bin/syntect_server` | 语法高亮服务（Rocket） | `/server` Procfile |
 | `scip-ctags` | syntax-highlighter 源码构建 | `/usr/local/bin/scip-ctags` | 为 scip-ctags 支持语言生成符号/高亮数据 | symbols / syntax-analysis 子进程 |

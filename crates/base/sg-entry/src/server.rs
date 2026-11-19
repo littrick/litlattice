@@ -1134,8 +1134,14 @@ pub fn build_plan(
         "repo-updater: repo-updater".to_owned(),
         "precise-code-intel-worker: precise-code-intel-worker".to_owned(),
         SYNTECT_LINE.to_owned(),
-        postgres_exporter_line,
     ];
+    // postgres_exporter is observability-only; the default feature set does
+    // not install it.
+    if std::path::Path::new("/usr/local/bin/postgres_exporter").exists()
+        || std::path::Path::new("/usr/bin/prometheus-postgres-exporter").exists()
+    {
+        procfile.push(postgres_exporter_line);
+    }
     procfile.extend(extras.procfile_additions.iter().cloned());
     procfile.extend(maybe_observability(env));
     procfile.extend(maybe_blobstore(env, &paths.data_dir));

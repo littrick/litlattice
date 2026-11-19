@@ -487,7 +487,8 @@ Procfile 不再添加这两个进程。
 - `DATA_SOURCE_NAME` 由 `sg-entry` 用主库 DSN 生成；`--log.level` 由
   `SRC_LOG_LEVEL` 转换（`dbug→debug`、`crit→fatal`）
 - 默认监听 `:9187`
-- 即使 `DISABLE_OBSERVABILITY=1`，该进程仍会启动（只采指标，不依赖 Prometheus）
+- 仅在启用 `observability` 打包特性时安装并启动；默认镜像没有该二进制，
+  `/server` 会跳过对应 Procfile 行
 
 ---
 

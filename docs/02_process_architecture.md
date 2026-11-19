@@ -308,7 +308,7 @@ sequenceDiagram
     S->>PG: 等待数据库就绪
     S->>M: migrator up -db frontend / codeintel（— 可选 codeinsights）
     M-->>S: 退出码
-    S->>P: 启动应用 Procfile（nginx、frontend、gitserver、searcher、symbols、worker、repo-updater、precise-worker、zoekt、syntect、blobstore、redis、postgres_exporter）
+    S->>P: 启动应用 Procfile（nginx、frontend、gitserver、searcher、symbols、worker、repo-updater、precise-worker、zoekt、syntect、blobstore、redis；postgres_exporter 仅 observability feature）
     Note over S,P: 子进程在独立进程组中运行；SIGTERM 转发 SIGINT，10 秒后升级 SIGKILL
     S-->>T: 任一子进程退出 → 整体关闭（IGNORE_PROCESS_DEATH 可关闭该行为）
 ```

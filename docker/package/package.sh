@@ -324,17 +324,21 @@ stage_rootfs() {
         fail "debootstrap is required (apt-get install debootstrap)"
     [ "$(id -u)" = 0 ] || [ -n "$SUDO" ] || fail "rootfs staging needs root"
     fetch_universal_ctags
-    local packages="bash,ca-certificates,curl,git,git-lfs,gosu,openssh-client,nginx,postgresql,postgresql-contrib,redis-server,prometheus-postgres-exporter,locales,tini,python3,procps"
+    local packages="bash,ca-certificates,curl,git,git-lfs,gosu,openssh-client,nginx,postgresql,postgresql-contrib,redis-server,locales,tini,python3,procps"
     if has_feature observability; then
-        packages="$packages,prometheus,prometheus-alertmanager"
+        packages="$packages,prometheus,prometheus-alertmanager,prometheus-postgres-exporter"
     fi
     if [ "${REUSE_ROOTFS:-0}" = 1 ] && [ -x "$ROOTFS/bin/bash" ]; then
         # Feature sets change the installed packages; reusing a rootfs built
         # for the other set would silently ship the wrong image.
-        if has_feature observability && [ ! -x "$ROOTFS/usr/bin/prometheus" ]; then
+        if has_feature observability &&
+           { [ ! -x "$ROOTFS/usr/bin/prometheus" ] ||
+             [ ! -x "$ROOTFS/usr/bin/prometheus-postgres-exporter" ]; }; then
             fail "REUSE_ROOTFS=1 rootfs lacks observability packages; rebuild without reuse"
         fi
-        if ! has_feature observability && [ -x "$ROOTFS/usr/bin/prometheus" ]; then
+        if ! has_feature observability &&
+           { [ -x "$ROOTFS/usr/bin/prometheus" ] ||
+             [ -x "$ROOTFS/usr/bin/prometheus-postgres-exporter" ]; }; then
             fail "REUSE_ROOTFS=1 rootfs contains observability packages; rebuild without reuse"
         fi
         log "reusing existing rootfs at $ROOTFS"
@@ -349,16 +353,19 @@ stage_rootfs() {
     run_root chroot "$ROOTFS" localedef -i en_US -f UTF-8 en_US.UTF-8
     run_root chroot "$ROOTFS" sh -c '
         set -e
-        # Ubuntu 24.04 prometheus-postgres-exporter creates a prometheus
-        # user/group at exactly the image sourcegraph ids (100:101).
-        # Keep the exporter binary but free the ids first.
-        if getent passwd prometheus >/dev/null 2>&1 &&
-           [ "$(id -u prometheus)" = 100 ]; then
-            userdel prometheus
+        # The image contract fixes sourcegraph at 100:101. Which Ubuntu
+        # packages occupy those ids depends on the feature set (redis,
+        # ssl-cert, prometheus, ...), so relocate whatever owns them and
+        # update the affected files.
+        uid_owner=$(getent passwd 100 | cut -d: -f1 || true)
+        if [ -n "$uid_owner" ] && [ "$uid_owner" != sourcegraph ]; then
+            usermod -u 1999 "$uid_owner"
+            find / -xdev -uid 100 -exec chown -h "$uid_owner" {} + 2>/dev/null || true
         fi
-        if getent group prometheus >/dev/null 2>&1 &&
-           [ "$(getent group prometheus | cut -d: -f3)" = 101 ]; then
-            groupdel prometheus
+        gid_owner=$(getent group 101 | cut -d: -f1 || true)
+        if [ -n "$gid_owner" ] && [ "$gid_owner" != sourcegraph ]; then
+            groupmod -g 1999 "$gid_owner"
+            find / -xdev -gid 101 -exec chgrp -h "$gid_owner" {} + 2>/dev/null || true
         fi
         getent group sourcegraph >/dev/null || groupadd -g 101 sourcegraph
         id -u sourcegraph >/dev/null 2>&1 ||
@@ -366,7 +373,6 @@ stage_rootfs() {
         getent group redis >/dev/null || groupadd -g 103 redis
         ln -sf /usr/bin/tini /sbin/tini
         ln -sf /usr/sbin/gosu /usr/local/bin/su-exec
-        ln -sf /usr/bin/prometheus-postgres-exporter /usr/local/bin/postgres_exporter
         mkdir -p /var/lib/nginx/tmp /root/.cache /sg_grafana_additional_dashboards \
                  /etc/sourcegraph /assets-dist /run/postgresql \
                  /var/opt/sourcegraph/repos /var/opt/sourcegraph/cache \
@@ -458,8 +464,10 @@ chmod 0755 '$ROOTFS/opt/s3proxy/run-docker-container.sh'"
             "$ROOTFS/sg_config_prometheus/"
         run_root cp "$REPO_ROOT/docker/package/monitoring/prometheus_targets.yml" \
             "$ROOTFS/sg_prometheus_add_ons/prometheus_targets.yml"
+        run_root ln -sf /usr/bin/prometheus-postgres-exporter \
+            "$ROOTFS/usr/local/bin/postgres_exporter"
+        run_root sh -c ": >'$ROOTFS/postgres_exporter.yaml'"
     fi
-    run_root sh -c ": >'$ROOTFS/postgres_exporter.yaml'"
 
     # Web bundle (stage-assets enforces a real web.manifest.json). It writes
     # into the root-owned rootfs, so run it through the root prefix.
