@@ -5,8 +5,8 @@
 1. **Rust 重写进程**：`bins/` 下的 11 个二进制，由 `cargo build --release --bins`
    产出，是 Sourcegraph 服务进程的 Rust 替代品；
 2. **Go 侧车（sidecar）**：打包镜像时从
-   `sourcegraph-public-snapshot@c864f15` 构建/复用的 Go 二进制（`blobstore`、
-   `zoekt-*`、`prom-wrapper`）；
+   `sourcegraph-public-snapshot@c864f15` 构建/复用的 Go 二进制（`zoekt-*`、
+   `prom-wrapper`）；
 3. **系统/第三方进程**：Ubuntu 软件包或 syntax-highlighter 产物（`nginx`、
    `postgres`、`redis-server`、`postgres_exporter`、`syntect_server`、
    `scip-ctags`、`universal-ctags`、`tini`）。
@@ -42,7 +42,7 @@
 | `postgres` | Ubuntu `postgresql-16` | `/usr/lib/postgresql/16/bin/postgres` | 本地数据库（sourcegraph / sourcegraph-codeintel / 可选 codeinsights） | `/server` 的 `postgres:` Procfile 行 |
 | `postgres_exporter` | Ubuntu 包 | `/usr/bin/prometheus-postgres-exporter` | 导出 Postgres 指标（观测组件禁用时仍会启动该进程） | `/server` Procfile |
 | `redis-server` | Ubuntu `redis-server` 包 | `/usr/bin/redis-server` | 两个实例：session/持久存储 `:6379`、缓存 `:6380` | `/server` Procfile |
-| `blobstore` | Sourcegraph Go 源码 | `/usr/local/bin/blobstore` | S3 兼容对象存储，保存精确代码智能上传（filesystem backend） | `/server` Procfile |
+| `blobstore` | `sg-bin-blobstore` | `/usr/local/bin/blobstore` | S3 兼容对象存储（Rust 实现）：桶/对象 CRUD、ListObjectsV2、multipart、Range GET；保存精确代码智能上传与 search jobs 结果（filesystem backend） | `/server` Procfile（经 `/opt/s3proxy/run-docker-container.sh`） |
 | `syntect_server` | syntax-highlighter 源码构建 | `/usr/local/bin/syntect_server` | 语法高亮服务（Rocket） | `/server` Procfile |
 | `scip-ctags` | syntax-highlighter 源码构建 | `/usr/local/bin/scip-ctags` | 为 scip-ctags 支持语言生成符号/高亮数据 | symbols / syntax-analysis 子进程 |
 | `universal-ctags` | Sourcegraph 补丁版（GCS 固定产物） | `/usr/local/bin/universal-ctags` | symbols 服务对 C/C++、Markdown 等非 scip 语言的解析器 | symbols 子进程 |
@@ -56,16 +56,17 @@
 
 ## 1.3 为什么有 Go 侧车
 
-本仓库重写了 Go 服务进程与数据库迁移工具。对象存储、zoekt 搜索引擎与
+本仓库重写了 Go 服务进程、数据库迁移工具与对象存储服务。zoekt 搜索引擎与
 语法高亮仍属于「保持不变的组件」，继续复用 Go 侧车；迁移谱系（schema、
-frozen definitions、stitched graph、OOB migrations）已由 `sg-migrator` 原生
-实现，镜像不再包含 `migrator-go`。详见 `docker/package/README.md` 与
+frozen definitions、stitched graph、OOB migrations）由 `sg-migrator` 原生
+实现，S3 对象存储由 `sg-service-blobstore` 实现，镜像不再包含
+`migrator-go` 或 Go `blobstore`。详见 `docker/package/README.md` 与
 `docker/server/README.md`。
 
 ## 1.4 构建与安装位置
 
 - `cargo build --release --bins` 产出 `target/release/{server,frontend,...}`；
-- `docker/package/package.sh` 的 `stage_rust` 把 10 个服务二进制（含 `server`、
+- `docker/package/package.sh` 的 `stage_rust` 把 11 个服务二进制（含 `server`、
   不含组合二进制 `sourcegraph`）`strip --strip-debug` 后放入
   `.package-build/rust-bin/`，再在 `stage_rootfs` 安装到镜像；
 - `sourcegraph` 组合二进制只在开发/差分测试中使用，不随镜像发布。

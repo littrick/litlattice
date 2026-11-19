@@ -404,18 +404,22 @@
 
 ---
 
-## 15. `blobstore`（Go，S3 兼容）
+## 15. `blobstore`（Rust，S3 兼容）
 
-- 路径：`/usr/local/bin/blobstore`，包装脚本 `/opt/s3proxy/run-docker-container.sh`
-- 命令行：`/opt/s3proxy/run-docker-container.sh`（`exec blobstore`）
-- 监听：`0.0.0.0:9000`（`S3PROXY_ENDPOINT`）
-- 存储：filesystem backend，`JCLOUDS_FILESYSTEM_BASEDIR=$DATA_DIR/blobstore`
-- 关键环境变量（`sg-entry` 默认值）：
-  `S3PROXY_AUTHORIZATION=none`、`JCLOUDS_PROVIDER=filesystem`、
-  `S3PROXY_IDENTITY=local-identity`、`S3PROXY_CREDENTIAL=local-credential`
-- 依赖：Go `svcmain` 启动时会执行 `conf.Init()`，通过 gRPC 向 frontend 内部
-  地址（`SRC_FRONTEND_INTERNAL`）读取站点配置；因此 blobstore 也会建立到
-  frontend `:3090` 的连接
+- 路径：`/usr/local/bin/blobstore`（crate `sg-bin-blobstore` / `sg-service-blobstore`），
+  包装脚本 `/opt/s3proxy/run-docker-container.sh`
+- 命令行：`/opt/s3proxy/run-docker-container.sh`（设置数据目录后 `exec blobstore`）
+- 监听：`DEPLOY_TYPE=docker-container` 或 `INSECURE_DEV` 时为
+  `127.0.0.1:9000`，否则 `0.0.0.0:9000`（与 Go `deploy.BlobstoreHostPort` 一致）
+- 存储：`BLOBSTORE_DATA_DIR`（包装脚本取 `JCLOUDS_FILESYSTEM_BASEDIR`，
+  默认 `$DATA_DIR/blobstore`）；对象落盘为
+  `buckets/<bucket>/<url.QueryEscape(key)>`，与 Go 布局相同
+- 支持的 S3 子集：`CreateBucket`、`Put/Get/Head/DeleteObject`、
+  `ListObjectsV2`、`CreateMultipartUpload`/`UploadPart`/`UploadPartCopy`/
+  `CompleteMultipartUpload`/`AbortMultipartUpload`、`DeleteObjects`；
+  `GetObject` 额外支持 `Range`
+- 环境变量：`BLOBSTORE_DATA_DIR`；`DEPLOY_TYPE`/`INSECURE_DEV` 只影响监听地址。
+  不再依赖 `S3PROXY_*`/`JCLOUDS_*`，也不会连接 frontend 配置服务
 - 关闭：`DISABLE_BLOBSTORE=1`（此时需自行提供外部对象存储）
 
 ---

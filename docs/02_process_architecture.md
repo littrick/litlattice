@@ -39,7 +39,7 @@ flowchart TB
             postgres[("postgres<br/>127.0.0.1:5432")]
             redisstore[("redis-store<br/>:6379")]
             rediscache[("redis-cache<br/>:6380")]
-            blobstore["blobstore (Go)<br/>:9000"]
+            blobstore["blobstore (Rust)<br/>:9000"]
             pg_exporter["postgres_exporter"]
         end
 
@@ -206,8 +206,8 @@ flowchart LR
 - **虚线** = 生命周期/启动依赖：`/server` 负责拉起并监管所有常驻进程；gitserver、
   repo-updater、worker、precise-worker 启动时还会阻塞等待 frontend 的
   `ConfigService` 初始配置（Postgres DSN、服务连接等），因此 frontend 必须在它们
-  之前就绪；Go 版 `blobstore`（`svcmain` 的 `conf.Init()`）同样会向 frontend
-  内部地址建立 gRPC 配置连接；
+  之前就绪；Rust `blobstore` 不依赖 frontend 配置服务，绑定后即可服务 S3
+  请求；
 - `searcher`、`symbols` 不经过 frontend 配置服务，直接按 `SRC_GIT_SERVERS` 等
   环境变量访问 gitserver；
 - `zoekt-indexserver` 使用 **gRPC `ZoektConfigurationService`**（`List`/
@@ -244,7 +244,7 @@ flowchart LR
 | symbols → ctags | 子进程（stdin/stdout JSON） | `universal-ctags` / `scip-ctags` | `CTAGS_COMMAND`、`SCIP_CTAGS_COMMAND` | 符号解析 |
 | worker → frontend（内部） | gRPC `ConfigService` + HTTP `/.internal/{graphql,search/stream,compute/stream}` | `127.0.0.1:3090` | `SRC_FRONTEND_INTERNAL` | 初始配置（gRPC）；批量变更 webhook / insights 搜索走 `/.internal/*` HTTP（内部监听器同时接受带/不带前缀两种路径） |
 | gitserver / repo-updater / worker / precise-worker → frontend（内部） | gRPC `ConfigService` | `127.0.0.1:3090` | `SRC_FRONTEND_INTERNAL` | 获取初始配置与热更新（含 Postgres DSN、服务连接等）；服务启动时阻塞等待首个配置 |
-| blobstore（Go，`conf.Init()`）→ frontend（内部） | gRPC `ConfigService` | `127.0.0.1:3090` | `SRC_FRONTEND_INTERNAL` | 启动时读取站点配置（`svcmain` 初始化） |
+| blobstore → frontend | 无 | — | — | Rust `blobstore` 只读写本地 `$DATA_DIR/blobstore`，不建立配置连接 |
 | worker → gitserver / searcher / symbols / zoekt | gRPC | 同上各端口 | 同上 | 作业执行所需的各后端 |
 | worker / precise-worker → blobstore | S3 API（HTTP） | `http://127.0.0.1:9000` | precise-worker 读 `PRECISE_CODE_INTEL_UPLOAD_*`；worker 由作业装配注入对象存储配置（字段同第 10 节） | 上传与读取索引 |
 | repo-updater → code host | HTTPS | 由站点配置/外部服务决定 | `HTTPS_PROXY` 等 | 拉取仓库、同步元数据 |
@@ -329,9 +329,9 @@ sequenceDiagram
 6. **配置依赖顺序**：gitserver、repo-updater、worker、precise-code-intel-worker
    启动时会先通过 gRPC 向 frontend 内部地址（`SRC_FRONTEND_INTERNAL`，
    即 `127.0.0.1:3090`）的 `ConfigService` 拉取初始配置（含 Postgres DSN 与
-   服务连接），在 frontend 提供配置之前这些进程会阻塞等待；Go 版 `blobstore`
-   在 `svcmain` 初始化时同样会建立该配置连接。Procfile 中 frontend 排在
-   gitserver 等进程之前，正是为了满足该顺序。
+   服务连接），在 frontend 提供配置之前这些进程会阻塞等待；Rust `blobstore`
+   直接监听本地端口，不参与该配置依赖。Procfile 中 frontend 排在 gitserver
+   等进程之前，正是为了满足该顺序。
 
 ## 2.6 典型请求链路
 
