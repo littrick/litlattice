@@ -397,6 +397,16 @@ chmod 0755 '$ROOTFS/opt/s3proxy/run-docker-container.sh'"
     # the same corpus from disk.
     run_root rm -rf "$ROOTFS/migrations"
     run_root cp -a "$SRC_DIR/migrations" "$ROOTFS/migrations"
+    # Expected schema descriptions (`drift`) and frozen definitions
+    # (`upgrade`/`downgrade` at older revisions).
+    run_root cp "$SRC_DIR/internal/database/schema.json" "$ROOTFS/migrations/schema.json"
+    run_root cp "$SRC_DIR/internal/database/schema.codeintel.json" \
+        "$ROOTFS/migrations/schema.codeintel.json"
+    run_root cp "$SRC_DIR/internal/database/schema.codeinsights.json" \
+        "$ROOTFS/migrations/schema.codeinsights.json"
+    run_root mkdir -p "$ROOTFS/migrations/frozen"
+    run_root cp "$SRC_DIR/internal/database/migration/shared/data/frozen/4.5.0.json" \
+        "$ROOTFS/migrations/frozen/4.5.0.json"
 
     # The image serves the front door on nginx :7080 and runs as root.
     # Only regular files: /usr/local/bin also holds symlinks into the rootfs

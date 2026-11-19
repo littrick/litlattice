@@ -34,7 +34,7 @@ pub const DEFAULT_DELEGATE: &str = "migrator-go";
 pub const MIGRATIONS_DIR_ENV: &str = "MIGRATIONS_DIR";
 
 /// Commands implemented by this binary.
-const LOCAL_COMMANDS: &[&str] = &["up", "upto", "downto", "validate", "add-log", "describe"];
+const LOCAL_COMMANDS: &[&str] = &["up", "upto", "downto", "validate", "add-log", "describe", "drift", "upgrade", "downgrade", "run-out-of-band-migrations"];
 
 fn main() {
     sg_core::sanity_check();
@@ -76,6 +76,31 @@ fn main() {
 }
 
 async fn run_local(command: &str, args: &[String]) -> Result<(), MigratorError> {
+    if command == "upgrade" || command == "downgrade" {
+        return run_upgrade_command(command == "upgrade", args).await;
+    }
+    if command == "run-out-of-band-migrations" {
+        let options = cli::parse_run_out_of_band_options(args)?;
+        let frontend_pool = connect_pool("frontend").await?;
+        let codeintel_pool = connect_pool("codeintel").await?;
+        let insights_pool = if sg_migrator::oobmigration::insights::insights_enabled() {
+            Some(connect_pool("codeinsights").await?)
+        } else {
+            None
+        };
+        return sg_migrator::oobmigration::run_out_of_band_migrations_with_pools(
+            &frontend_pool,
+            Some(&codeintel_pool),
+            insights_pool.as_ref(),
+            &sg_migrator::oobmigration::RunOutOfBandOptions {
+                ids: options.id,
+                apply_reverse: options.apply_reverse,
+                dry_run: false,
+                disable_animation: options.disable_animation,
+            },
+        )
+        .await;
+    }
     let (schema_names, target, options) = match command {
         "up" => {
             let options = cli::parse_options(args)?;
@@ -102,6 +127,125 @@ async fn run_local(command: &str, args: &[String]) -> Result<(), MigratorError> 
                 None,
                 MigrationOptions::default(),
             )
+        }
+        "drift" => {
+            let options = cli::parse_drift_options(args)?;
+            let schema_name = options
+                .schema
+                .ok_or_else(|| MigratorError::new("the -schema flag is required for drift"))?;
+            if options.version.is_some() && options.file.is_some() {
+                return Err(MigratorError::new(
+                    "the flags -version or -file are mutually exclusive",
+                ));
+            }
+            let version = match (&options.version, &options.file) {
+                (Some(version), _) => version.clone(),
+                (None, Some(_)) => String::new(),
+                (None, None) => {
+                    if options.skip_version_check {
+                        return Err(MigratorError::new(
+                            "-skip-version-check was supplied without -version or -file",
+                        ));
+                    }
+                    // No instance-version inference in the Rust port yet: the
+                    // bundled expected schema ships with this build.
+                    format!(
+                        "v{}",
+                        std::env::var("SOURCEGRAPH_VERSION").unwrap_or_else(|_| "5.5.0".to_owned())
+                    )
+                }
+            };
+            let root = migrations_dir();
+            let schema = schemas::resolve_schema_in(&root, &schema_name)?;
+            let dsn = dsn_for_schema(&schema_name);
+            let pool = sqlx::postgres::PgPoolOptions::new()
+                .max_connections(4)
+                .connect(&dsn)
+                .await
+                .map_err(|error| {
+                    MigratorError::new(format!(
+                        "failed to connect to the {schema_name} database: {error}"
+                    ))
+                })?;
+            let store = Store::new(
+                pool.clone(),
+                schema.name.clone(),
+                schema.migrations_table_name.clone(),
+            );
+            let expected = sg_migrator::drift::fetch_expected_schema(
+                &schema_name,
+                &version,
+                options.file.as_deref(),
+                &root,
+            )
+            .await?;
+            let mut actual = sg_migrator::describe::describe(&store).await?;
+            let mut expected = expected;
+            sg_migrator::drift::canonicalize(&mut actual);
+            sg_migrator::drift::canonicalize(&mut expected);
+            let mut summaries = sg_migrator::drift::compare_schema_descriptions(
+                &schema_name,
+                &version,
+                &actual,
+                &expected,
+            );
+
+            if options.auto_fix {
+                // `attemptAutofix` (`cliutil/drift_autofix.go`): apply the
+                // suggested statements up to three times, re-describing after
+                // each attempt. Statement failures are reported, not fatal.
+                let mut attempts = 3;
+                while attempts > 0 && !summaries.is_empty() {
+                    let mut attempted = false;
+                    let mut successes = 0usize;
+                    let mut failures = 0usize;
+                    for summary in &summaries {
+                        let Some(statements) = &summary.statements else {
+                            continue;
+                        };
+                        attempted = true;
+                        let mut failed = false;
+                        for statement in statements {
+                            if let Err(error) = sqlx::raw_sql(statement).execute(&pool).await {
+                                eprintln!(
+                                    "failed to apply autofix {:?}: {error}",
+                                    statements.join("\n")
+                                );
+                                failed = true;
+                            }
+                        }
+                        if failed {
+                            failures += 1;
+                        } else {
+                            successes += 1;
+                        }
+                    }
+                    if !attempted {
+                        println!("No autofix to apply");
+                        break;
+                    }
+                    println!("Successfully applied {successes} autofixes");
+                    if failures > 0 {
+                        eprintln!("Failed to apply {failures} autofixes");
+                    }
+                    println!("Re-checking drift");
+                    actual = sg_migrator::describe::describe(&store).await?;
+                    sg_migrator::drift::canonicalize(&mut actual);
+                    summaries = sg_migrator::drift::compare_schema_descriptions(
+                        &schema_name,
+                        &version,
+                        &actual,
+                        &expected,
+                    );
+                    attempts -= 1;
+                }
+            }
+
+            print!("{}", sg_migrator::drift::display_schema_summaries(&summaries));
+            if !summaries.is_empty() {
+                std::process::exit(1);
+            }
+            return Ok(());
         }
         "describe" => {
             let options = cli::parse_describe_options(args)?;
@@ -184,6 +328,7 @@ async fn run_local(command: &str, args: &[String]) -> Result<(), MigratorError> 
         },
         privileged_hash: (!options.privileged_hash.is_empty())
             .then(|| options.privileged_hash.clone()),
+        privileged_hashes: Vec::new(),
         ignore_single_dirty_log: options.ignore_single_dirty_log,
         ignore_single_pending_log: options.ignore_single_pending_log,
     };
@@ -259,6 +404,119 @@ async fn build_runner(root: &std::path::Path, names: &[String]) -> Result<Runner
         stores.push(SchemaStore { schema, store });
     }
     Ok(Runner::new(stores))
+}
+
+async fn connect_pool(schema: &str) -> Result<sqlx::PgPool, MigratorError> {
+    let dsn = dsn_for_schema(schema);
+    sqlx::postgres::PgPoolOptions::new()
+        .max_connections(4)
+        .connect(&dsn)
+        .await
+        .map_err(|error| {
+            MigratorError::new(format!("failed to connect to the {schema} database: {error}"))
+        })
+}
+
+/// `upgrade` / `downgrade` (`cliutil/upgrade.go`, `cliutil/downgrade.go`).
+async fn run_upgrade_command(up: bool, args: &[String]) -> Result<(), MigratorError> {
+    use sg_migrator::oobmigration::version::VersionOrder;
+
+    let options = if up {
+        cli::parse_upgrade_options(args)?
+    } else {
+        cli::parse_downgrade_options(args)?
+    };
+    let root = migrations_dir();
+    let frontend_pool = connect_pool("frontend").await?;
+    let (current, auto_upgrade) =
+        sg_migrator::service_version::get_auto_upgrade(&frontend_pool).await?;
+
+    let (from_str, to_str) = match (&options.from, &options.to) {
+        (Some(from), Some(to)) => (from.clone(), to.clone()),
+        (None, None) if auto_upgrade => {
+            let current = current.ok_or_else(|| {
+                MigratorError::new("version assertion failed: unknown current version")
+            })?;
+            let to = format!(
+                "v{}",
+                std::env::var("SOURCEGRAPH_VERSION").unwrap_or_else(|_| "5.5.0".to_owned())
+            );
+            (current, to)
+        }
+        _ => {
+            return Err(MigratorError::new(
+                "the -from and -to flags are required when auto upgrade is not enabled",
+            ))
+        }
+    };
+
+    let from = sg_migrator::oobmigration::version::Version::from_string(&from_str)
+        .ok_or_else(|| MigratorError::new(format!("bad format for -from = {from_str}")))?;
+    let to = sg_migrator::oobmigration::version::Version::from_string(&to_str)
+        .ok_or_else(|| MigratorError::new(format!("bad format for -to = {to_str}")))?;
+    let order = sg_migrator::oobmigration::version::compare_versions(from, to);
+    if up && order != VersionOrder::Before {
+        return Err(MigratorError::new(format!(
+            "invalid range (from={from} >= to={to})"
+        )));
+    }
+    if !up && order != VersionOrder::After {
+        return Err(MigratorError::new(format!(
+            "invalid range (from={from} <= to={to})"
+        )));
+    }
+
+    let plan = sg_migrator::multiversion::plan_migration(from, to, &root)?;
+    for (index, step) in plan.steps.iter().enumerate() {
+        println!(
+            "Migrating to v{} (step {} of {})",
+            step.instance_version,
+            index + 1,
+            plan.steps.len()
+        );
+    }
+
+    let mut stores = Vec::with_capacity(sg_migrator::schemas::SCHEMA_NAMES.len());
+    for name in sg_migrator::schemas::SCHEMA_NAMES {
+        let definitions = plan
+            .stitched_definitions_by_schema_name
+            .get(name)
+            .cloned()
+            .ok_or_else(|| {
+                MigratorError::new(format!("no stitched definitions for schema {name:?}"))
+            })?;
+        let pool = connect_pool(name).await?;
+        let schema = sg_migrator::types::Schema::new(
+            name,
+            sg_migrator::schemas::migrations_table_name(name),
+            definitions,
+        );
+        let store = Store::new(
+            pool,
+            schema.name.clone(),
+            schema.migrations_table_name.clone(),
+        );
+        stores.push(SchemaStore { schema, store });
+    }
+    let runner = Runner::new(stores);
+
+    let run_options = sg_migrator::multiversion::RunMigrationOptions {
+        privileged_mode: if options.unprivileged_only {
+            PrivilegedMode::Refuse
+        } else if options.noop_privileged {
+            PrivilegedMode::Noop
+        } else {
+            PrivilegedMode::Apply
+        },
+        privileged_hashes: options.privileged_hash.clone(),
+        skip_version_check: options.skip_version_check,
+        skip_drift_check: options.skip_drift_check,
+        dry_run: options.dry_run,
+        up,
+        disable_animation: options.disable_animation,
+        root,
+    };
+    sg_migrator::multiversion::run_migration(&runner, &frontend_pool, &plan, &run_options).await
 }
 
 /// Replace the current process with the delegate, forwarding the selected

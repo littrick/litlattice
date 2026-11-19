@@ -4280,14 +4280,21 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
+ "reqwest",
+ "rsa",
  "serde",
  "serde_json",
+ "sg-encryption",
+ "sg-jsonx",
+ "sg-keyring",
+ "sg-scip",
  "sha1 0.10.7",
  "sqlx",
  "thiserror 1.0.69",
  "time",
  "tokio",
  "tracing",
+ "url",
 ]
 
 [[package]]

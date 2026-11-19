@@ -13,7 +13,15 @@ thiserror = { workspace = true }
 sha1 = "0.10"
 base64 = { workspace = true }
 serde = { workspace = true }
+reqwest = { workspace = true }
+url = { workspace = true }
 serde_json = { workspace = true }
+
+rsa = { version = "0.9", features = ["pem"] }
+sg-jsonx = { path = "../../domain/sg-jsonx" }
+sg-scip = { path = "../../domain/sg-scip" }
+sg-encryption = { path = "../../domain/sg-encryption" }
+sg-keyring = { path = "../../domain/sg-keyring" }
 time = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }

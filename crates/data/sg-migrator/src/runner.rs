@@ -174,6 +174,8 @@ pub struct RunOptions {
     pub privileged_mode: PrivilegedMode,
     /// `-privileged-hash` (only meaningful with [`PrivilegedMode::Noop`]).
     pub privileged_hash: Option<String>,
+    /// Extra accepted hashes (`-privileged-hash` is a StringSlice in Go).
+    pub privileged_hashes: Vec<String>,
     pub ignore_single_dirty_log: bool,
     pub ignore_single_pending_log: bool,
 }
@@ -212,7 +214,17 @@ impl Runner {
         options: &RunOptions,
     ) -> Result<(), MigratorError> {
         for entry in self.selected(schema_names) {
-            self.run_schema(entry, Direction::Up, target, options).await?;
+            let targets = match target {
+                Some(id) => vec![id],
+                None => entry
+                    .schema
+                    .definitions
+                    .leaves()
+                    .into_iter()
+                    .map(|definition| definition.id)
+                    .collect(),
+            };
+            self.run_schema(entry, Direction::Up, targets, options).await?;
         }
         Ok(())
     }
@@ -225,7 +237,7 @@ impl Runner {
         options: &RunOptions,
     ) -> Result<(), MigratorError> {
         for entry in self.selected(schema_names) {
-            self.run_schema(entry, Direction::Down, Some(target), options).await?;
+            self.run_schema(entry, Direction::Down, vec![target], options).await?;
         }
         Ok(())
     }
@@ -292,11 +304,40 @@ impl Runner {
         Ok(())
     }
 
+    /// `runner.Run` with explicit per-schema targeted operations (used by the
+    /// multi-version `upgrade`/`downgrade` steps).
+    pub async fn run_operations(
+        &self,
+        operations: &[MigrationOperation],
+        options: &RunOptions,
+    ) -> Result<(), MigratorError> {
+        for operation in operations {
+            let entry = self
+                .schemas
+                .iter()
+                .find(|entry| entry.schema.name == operation.schema_name)
+                .ok_or_else(|| {
+                    MigratorError::new(format!(
+                        "unknown schema {:?}",
+                        operation.schema_name
+                    ))
+                })?;
+            let direction = if operation.up {
+                Direction::Up
+            } else {
+                Direction::Down
+            };
+            self.run_schema(entry, direction, operation.targets.clone(), options)
+                .await?;
+        }
+        Ok(())
+    }
+
     async fn run_schema(
         &self,
         entry: &SchemaStore,
         direction: Direction,
-        target: Option<i32>,
+        targets: Vec<i32>,
         options: &RunOptions,
     ) -> Result<(), MigratorError> {
         prepare_store(entry).await?;
@@ -306,25 +347,18 @@ impl Runner {
         // concurrent migrator's progress is observed.
         let versions = entry.store.versions().await?;
         let (definitions, up) = match direction {
-            Direction::Up => {
-                let targets = match target {
-                    Some(id) => vec![id],
-                    None => entry
-                        .schema
-                        .definitions
-                        .leaves()
-                        .into_iter()
-                        .map(|definition| definition.id)
-                        .collect(),
-                };
-                (entry.schema.definitions.up(&versions.applied, &targets)?, true)
-            }
+            Direction::Up => (
+                entry.schema.definitions.up(&versions.applied, &targets)?,
+                true,
+            ),
             Direction::Down => {
-                let target = target.ok_or_else(|| {
-                    MigratorError::new("downto requires a target migration version")
-                })?;
+                if targets.is_empty() {
+                    return Err(MigratorError::new(
+                        "downto requires a target migration version",
+                    ));
+                }
                 (
-                    entry.schema.definitions.down(&versions.applied, &[target])?,
+                    entry.schema.definitions.down(&versions.applied, &targets)?,
                     false,
                 )
             }
@@ -726,8 +760,12 @@ impl Runner {
 
         let hash = hash_definition_ids(&privileged);
         if up {
-            let supplied = options.privileged_hash.as_deref().unwrap_or("");
-            if supplied != hash {
+            let accepted = options
+                .privileged_hash
+                .iter()
+                .chain(options.privileged_hashes.iter())
+                .any(|candidate| candidate == &hash);
+            if !accepted {
                 let sql: String = privileged
                     .iter()
                     .map(|definition| definition.up_sql.clone())
@@ -819,6 +857,14 @@ async fn prepare_store(entry: &SchemaStore) -> Result<(), MigratorError> {
             .await?;
     }
     Ok(())
+}
+
+/// One targeted operation for [`Runner::run_operations`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MigrationOperation {
+    pub schema_name: String,
+    pub up: bool,
+    pub targets: Vec<i32>,
 }
 
 /// Migration direction.

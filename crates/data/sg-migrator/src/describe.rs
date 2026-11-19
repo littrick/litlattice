@@ -1461,8 +1461,172 @@ fn html_escape(value: &str) -> String {
 pub fn format_json(description: &SchemaDescription) -> Result<String, MigratorError> {
     let mut description = description.clone();
     canonicalize(&mut description);
-    serde_json::to_string_pretty(&description)
-        .map_err(|error| MigratorError::new(error.to_string()))
+    let mut out = String::new();
+    write_json(&schema_json(&description), &mut out, 0);
+    Ok(out)
+}
+
+/// A minimal JSON tree that preserves Go's struct field order; serde_json's
+/// `Value` sorts object keys, which would break byte-parity with
+/// `json.MarshalIndent`.
+enum J {
+    Null,
+    Bool(bool),
+    Num(i64),
+    Str(String),
+    Arr(Vec<J>),
+    Obj(Vec<(&'static str, J)>),
+}
+
+fn schema_json(description: &SchemaDescription) -> J {
+    J::Obj(vec![
+        ("Extensions", nil_if_empty(description.extensions.iter().map(|value| J::Str(value.clone())).collect())),
+        ("Enums", nil_if_empty(description.enums.iter().map(|value| J::Obj(vec![
+            ("Name", J::Str(value.name.clone())),
+            ("Labels", J::Arr(value.labels.iter().cloned().map(J::Str).collect())),
+        ])).collect())),
+        ("Functions", nil_if_empty(description.functions.iter().map(|value| J::Obj(vec![
+            ("Name", J::Str(value.name.clone())),
+            ("Definition", J::Str(value.definition.clone())),
+        ])).collect())),
+        ("Sequences", nil_if_empty(description.sequences.iter().map(|value| J::Obj(vec![
+            ("Name", J::Str(value.name.clone())),
+            ("TypeName", J::Str(value.type_name.clone())),
+            ("StartValue", J::Num(value.start_value)),
+            ("MinimumValue", J::Num(value.minimum_value)),
+            ("MaximumValue", J::Num(value.maximum_value)),
+            ("Increment", J::Num(value.increment)),
+            ("CycleOption", J::Str(value.cycle_option.clone())),
+        ])).collect())),
+        ("Tables", nil_if_empty(description.tables.iter().map(table_json).collect())),
+        ("Views", nil_if_empty(description.views.iter().map(|value| J::Obj(vec![
+            ("Name", J::Str(value.name.clone())),
+            ("Definition", J::Str(value.definition.clone())),
+        ])).collect())),
+    ])
+}
+
+fn table_json(table: &TableDescription) -> J {
+    J::Obj(vec![
+        ("Name", J::Str(table.name.clone())),
+        ("Comment", J::Str(table.comment.clone())),
+        ("Columns", J::Arr(table.columns.iter().map(|column| J::Obj(vec![
+            ("Name", J::Str(column.name.clone())),
+            ("Index", J::Num(i64::from(column.index))),
+            ("TypeName", J::Str(column.type_name.clone())),
+            ("IsNullable", J::Bool(column.is_nullable)),
+            ("Default", J::Str(column.default.clone())),
+            ("CharacterMaximumLength", J::Num(i64::from(column.character_maximum_length))),
+            ("IsIdentity", J::Bool(column.is_identity)),
+            ("IdentityGeneration", J::Str(column.identity_generation.clone())),
+            ("IsGenerated", J::Str(column.is_generated.clone())),
+            ("GenerationExpression", J::Str(column.generation_expression.clone())),
+            ("Comment", J::Str(column.comment.clone())),
+        ])).collect())),
+        ("Indexes", J::Arr(table.indexes.iter().map(|index| J::Obj(vec![
+            ("Name", J::Str(index.name.clone())),
+            ("IsPrimaryKey", J::Bool(index.is_primary_key)),
+            ("IsUnique", J::Bool(index.is_unique)),
+            ("IsExclusion", J::Bool(index.is_exclusion)),
+            ("IsDeferrable", J::Bool(index.is_deferrable)),
+            ("IndexDefinition", J::Str(index.index_definition.clone())),
+            ("ConstraintType", J::Str(index.constraint_type.clone())),
+            ("ConstraintDefinition", J::Str(index.constraint_definition.clone())),
+        ])).collect())),
+        // Go leaves Constraints nil unless a constraint row was appended.
+        ("Constraints", if table.constraints.is_empty() { J::Null } else { J::Arr(table.constraints.iter().map(|constraint| J::Obj(vec![
+            ("Name", J::Str(constraint.name.clone())),
+            ("ConstraintType", J::Str(constraint.constraint_type.clone())),
+            ("RefTableName", J::Str(constraint.ref_table_name.clone())),
+            ("IsDeferrable", J::Bool(constraint.is_deferrable)),
+            ("ConstraintDefinition", J::Str(constraint.constraint_definition.clone())),
+        ])).collect()) }),
+        ("Triggers", J::Arr(table.triggers.iter().map(|trigger| J::Obj(vec![
+            ("Name", J::Str(trigger.name.clone())),
+            ("Definition", J::Str(trigger.definition.clone())),
+        ])).collect())),
+    ])
+}
+
+fn nil_if_empty(values: Vec<J>) -> J {
+    if values.is_empty() {
+        J::Null
+    } else {
+        J::Arr(values)
+    }
+}
+
+fn write_json(value: &J, out: &mut String, depth: usize) {
+    match value {
+        J::Null => out.push_str("null"),
+        J::Bool(value) => out.push_str(if *value { "true" } else { "false" }),
+        J::Num(value) => out.push_str(&value.to_string()),
+        J::Str(value) => write_go_string(value, out),
+        J::Arr(values) => {
+            if values.is_empty() {
+                out.push_str("[]");
+                return;
+            }
+            out.push('[');
+            out.push('\n');
+            for (index, value) in values.iter().enumerate() {
+                push_json_indent(out, depth + 1);
+                write_json(value, out, depth + 1);
+                if index + 1 != values.len() {
+                    out.push(',');
+                }
+                out.push('\n');
+            }
+            push_json_indent(out, depth);
+            out.push(']');
+        }
+        J::Obj(entries) => {
+            out.push('{');
+            out.push('\n');
+            for (index, (key, value)) in entries.iter().enumerate() {
+                push_json_indent(out, depth + 1);
+                write_go_string(key, out);
+                out.push_str(": ");
+                write_json(value, out, depth + 1);
+                if index + 1 != entries.len() {
+                    out.push(',');
+                }
+                out.push('\n');
+            }
+            push_json_indent(out, depth);
+            out.push('}');
+        }
+    }
+}
+
+fn push_json_indent(out: &mut String, depth: usize) {
+    for _ in 0..depth {
+        out.push_str("  ");
+    }
+}
+
+/// Go `json.Marshal` string escaping with HTML escaping enabled.
+fn write_go_string(value: &str, out: &mut String) {
+    out.push('"');
+    for character in value.chars() {
+        match character {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '&' => out.push_str("\\u0026"),
+            '<' => out.push_str("\\u003c"),
+            '>' => out.push_str("\\u003e"),
+            '\u{2028}' => out.push_str("\\u2028"),
+            '\u{2029}' => out.push_str("\\u2029"),
+            character if (character as u32) < 0x20 => {
+                out.push_str(&format!("\\u{:04x}", character as u32))
+            }
+            character => out.push(character),
+        }
+    }
+    out.push('"');
 }
 
 #[cfg(test)]
@@ -1677,7 +1841,7 @@ mod tests {
           "ConstraintType": "c",
           "RefTableName": "",
           "IsDeferrable": false,
-          "ConstraintDefinition": "CHECK ((name <> ''::text))"
+          "ConstraintDefinition": "CHECK ((name \u003c\u003e ''::text))"
         }
       ],
       "Triggers": []
