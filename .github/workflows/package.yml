@@ -20,7 +20,7 @@ on:
         type: boolean
         default: true
       image_tag:
-        description: "Optional Docker image tag (default: sourcegraph/server:rust-<version><feature-suffix>)"
+        description: "Optional Docker image name:tag (default: litlattice:<repository tag at HEAD, else latest>)"
         type: string
         required: false
         default: ""
@@ -57,7 +57,7 @@ on:
         type: boolean
         default: true
       image_tag:
-        description: "Optional Docker image tag (default: sourcegraph/server:rust-<version><feature-suffix>)"
+        description: "Optional Docker image name:tag (default: litlattice:<repository tag at HEAD, else latest>)"
         type: string
         default: ""
       retention_days:
@@ -83,6 +83,11 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          # The default image tag is derived from the repository tag at HEAD
+          # (`git describe --tags --exact-match`); fetch tags even though the
+          # build only needs the checked-out commit.
+          fetch-tags: true
 
       - name: Install system dependencies
         run: |

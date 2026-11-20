@@ -9,7 +9,7 @@
 flowchart TB
     browser["浏览器 / API 客户端"]
 
-    subgraph container["容器（sourcegraph/server:rust）"]
+    subgraph container["容器（litlattice）"]
         tini["tini (PID 1)<br/>/sbin/tini"]
         server["server (Rust)<br/>/server 监督器"]
 

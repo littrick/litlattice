@@ -65,7 +65,7 @@ sudo -E ./docker/package/package.sh --features observability,docker
 | feature | 作用 | 额外输出 |
 | --- | --- | --- |
 | `observability` | 安装 Prometheus/Alertmanager/prom-wrapper、基线配置、告警规则与 target 列表 | 主包名加 `-observability` 后缀 |
-| `docker` | 用 rootfs tarball 执行 `docker import` | `<name>.docker.tar` 镜像包 + sha256（tag 由 `IMAGE_TAG` 决定） |
+| `docker` | 用 rootfs tarball 执行 `docker import` | `<name>.docker.tar` 镜像包 + sha256（默认镜像 `litlattice:<仓库 tag>`，无 tag 时为 `litlattice:latest`） |
 | `sveltekit` | 构建并打包 SvelteKit Web UI（`_sk`），启用 “Try a new, faster experience” opt-in | 主包名加 `-sveltekit` 后缀 |
 | `sourcemaps` | 保留 `/assets-dist` 中的 `*.map`（默认删除，约 180 MB） | 主包名加 `-sourcemaps` 后缀 |
 
@@ -79,18 +79,20 @@ sourcegraph-server-rust-5.5.0-fs.tar.gz.sha256
 开启 `observability` 后主包为
 `sourcegraph-server-rust-5.5.0-observability-fs.tar.gz`；开启 `docker` 后
 额外输出 `sourcegraph-server-rust-5.5.0[-observability].docker.tar`（约
-1.2 GB）及 sha256。可用 `IMAGE_TAG`、`IMAGE_OUT_NAME`、`OUT_NAME` 覆盖默认
-名称。
+1.2 GB）及 sha256。可用 `IMAGE_TAG`、`IMAGE_NAME`、`IMAGE_OUT_NAME`、`OUT_NAME`
+覆盖默认名称；`IMAGE_TAG` 未设置时镜像名为 `litlattice`，tag 取本仓库在 HEAD 的
+git tag（`git describe --tags --exact-match`，如 `litlattice:v5.5.0-rust.1`），
+不是 tag 时回退为 `latest`。
 
 导入并运行：
 
 ```sh
 ./docker/package/import-image.sh \
   .package-build/out/sourcegraph-server-rust-5.5.0-fs.tar.gz \
-  sourcegraph/server:rust
+  litlattice:latest
 
 docker run -d --name sg-rust -p 7080:7080 \
-  -v sg-rust-data:/var/opt/sourcegraph sourcegraph/server:rust
+  -v sg-rust-data:/var/opt/sourcegraph litlattice:latest
 ```
 
 `import-image.sh` 会补上 `docker import` 无法推断的元数据：

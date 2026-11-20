@@ -108,8 +108,8 @@ nginx 仅作为反向代理（`listen 7080` → `127.0.0.1:8080`）；它不得�
 cd docker/server
 ./build-rootfs.sh --build --stage rootfs --external-dir /path/to/externals
 ./verify-rootfs.sh --stage rootfs --with-external
-docker build -t sourcegraph/server:rust .
-docker run --rm sourcegraph/server:rust /opt/image_tests/test_services.sh
+docker build -t litlattice .
+docker run --rm litlattice /opt/image_tests/test_services.sh
 ```
 
 `test_services.sh` 以 `SANITY_CHECK=true` 运行每个服务。Rust 的 `gitserver`

@@ -563,7 +563,7 @@ docker run -d --name sg-rust -p 7080:7080 \
   -e SRC_LOG_LEVEL=dbug \
   -e REDIS_CACHE_ENDPOINT=127.0.0.1:6381 \
   -e SRC_ENABLE_EMBEDDINGS=true \
-  sourcegraph/server:rust
+  litlattice:latest
 ```
 
 > 修改 `DATA_DIR`、`CONFIG_DIR`、`SRC_HTTP_ADDR`、`SRC_NGINX_HTTP_ADDR` 等启动级

@@ -3,7 +3,7 @@
 #
 #   docker/package/import-image.sh \
 #     .package-build/out/sourcegraph-server-rust-5.5.0-fs.tar.gz \
-#     sourcegraph/server:rust
+#     litlattice:latest
 #
 # `docker import` does not read the filesystem's config, so the entrypoint,
 # exposed port and runtime environment are supplied here (the same values the

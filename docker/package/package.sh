@@ -164,7 +164,14 @@ if has_feature sourcemaps; then
     FEATURE_SUFFIX="$FEATURE_SUFFIX-sourcemaps"
 fi
 OUT_NAME=${OUT_NAME:-sourcegraph-server-rust-${SOURCEGRAPH_VERSION}${FEATURE_SUFFIX}-fs.tar.gz}
-IMAGE_TAG=${IMAGE_TAG:-sourcegraph/server:rust-${SOURCEGRAPH_VERSION}${FEATURE_SUFFIX}}
+# Image name is fixed; the tag is this repository's tag at HEAD (e.g.
+# `v5.5.0-rust.1`), falling back to `latest` when HEAD is not tagged or the
+# build tree is not a git checkout. CI passes the release tag through
+# IMAGE_TAG explicitly (`.github/workflows/release-docker.yml`).
+IMAGE_NAME=${IMAGE_NAME:-litlattice}
+IMAGE_VERSION=$(git -C "$REPO_ROOT" describe --tags --exact-match 2>/dev/null || true)
+IMAGE_VERSION=${IMAGE_VERSION:-latest}
+IMAGE_TAG=${IMAGE_TAG:-${IMAGE_NAME}:${IMAGE_VERSION}}
 IMAGE_OUT_NAME=${IMAGE_OUT_NAME:-sourcegraph-server-rust-${SOURCEGRAPH_VERSION}${FEATURE_SUFFIX}.docker.tar}
 
 want() {
