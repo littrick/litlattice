@@ -64,8 +64,29 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # Validate the tag before the (expensive) package job so a malformed tag
+  # fails immediately instead of after a full build.
+  validate:
+    name: Validate release tag
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate tag
+        env:
+          # On a tag push there are no `inputs`; fall back to the pushed tag.
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          if ! [[ "$TAG" =~ ^v[0-9A-Za-z][0-9A-Za-z._+-]*$ ]]; then
+            echo "::error::invalid release tag '$TAG' (expected e.g. v5.5.0-rust.1)"
+            exit 1
+          fi
+          echo "release tag: $TAG"
+
   package:
     name: Package rootfs + Docker image
+    needs: validate
     permissions:
       contents: read
     uses: ./.github/workflows/package.yml
@@ -97,13 +118,9 @@ jobs:
           name: docker-image-${{ github.run_id }}
           path: dist
 
-      - name: Validate release inputs
+      - name: Verify artifact checksums
         run: |
           set -euo pipefail
-          if ! [[ "$TAG" =~ ^v[0-9A-Za-z][0-9A-Za-z._+-]*$ ]]; then
-            echo "::error::invalid release tag '$TAG' (expected e.g. v5.5.0-rust.1)"
-            exit 1
-          fi
           # Verify the archive against the checksum written by package.sh
           # before publishing anything.
           shopt -s nullglob
