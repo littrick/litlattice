@@ -119,6 +119,8 @@ jobs:
     runs-on: ubuntu-latest
     env:
       TAG: ${{ needs.validate.outputs.tag }}
+      # Must match the tag package.sh imported into the archive.
+      IMAGE_TAG: ${{ inputs.image_tag || needs.validate.outputs.image_tag }}
       COMPRESS: ${{ inputs.compress }}
     steps:
       - name: Download Docker image artifact
@@ -149,6 +151,7 @@ jobs:
           set -euo pipefail
           shopt -s nullglob
           assets=()
+          archive=""
           for tar in dist/*.docker.tar; do
             base="$(basename "$tar")"
             if [ "$COMPRESS" = "true" ]; then
@@ -157,9 +160,11 @@ jobs:
               gzip -6 -c "$tar" >"dist/$base.gz"
               ( cd dist && sha256sum "$base.gz" >"$base.gz.sha256" )
               rm -f "$tar" "dist/$base.sha256"
+              archive="$base.gz"
               assets+=("dist/$base.gz")
               assets+=("dist/$base.gz.sha256")
             else
+              archive="$base"
               assets+=("$tar")
               [ -f "dist/$base.sha256" ] && assets+=("dist/$base.sha256")
             fi
@@ -173,7 +178,29 @@ jobs:
             echo "files<<__EOF__"
             printf '%s\n' "${assets[@]}"
             echo "__EOF__"
+            echo "body_path=$RUNNER_TEMP/release_body.md"
           } >>"$GITHUB_OUTPUT"
+          # Release body: prepended to the generated notes by the action.
+          {
+            printf '## Docker image\n\n'
+            printf 'Image: `%s`\n\n' "$IMAGE_TAG"
+            printf '### Load\n\n'
+            printf 'Download `%s` and `%s.sha256` from this release into the same directory, then:\n\n' "$archive" "$archive"
+            printf '```sh\n'
+            printf 'sha256sum -c %s.sha256\n' "$archive"
+            printf 'docker load -i %s\n' "$archive"
+            printf '```\n\n'
+            printf '### Run\n\n'
+            printf '```sh\n'
+            printf 'docker run -d --name sg \\\n'
+            printf '  -p 7080:7080 \\\n'
+            printf '  -v ~/.local/sg-data:/var/opt/sourcegraph \\\n'
+            printf '  %s\n' "$IMAGE_TAG"
+            printf '```\n\n'
+            printf 'Open <http://localhost:7080/> and complete site initialization on first boot. '
+            printf 'PostgreSQL is provisioned inside the volume, so the first start takes a while before `/healthz` returns 200. '
+            printf 'Follow the service log with `docker logs -f sg`.\n'
+          } >"$RUNNER_TEMP/release_body.md"
 
       # Creates the release (tag at the packaged commit when it does not exist
       # yet) and uploads the assets; re-runs overwrite the same asset names and
@@ -192,6 +219,8 @@ jobs:
           fail_on_unmatched_files: true
           overwrite_files: true
           files: ${{ steps.assets.outputs.files }}
+          # Prepended to the generated notes.
+          body_path: ${{ steps.assets.outputs.body_path }}
         env:
           GITHUB_TOKEN: ${{ github.token }}
 
@@ -203,6 +232,7 @@ jobs:
             echo "## Docker release"
             echo
             echo "- Tag: \`$TAG\`"
+            echo "- Image: \`${IMAGE_TAG}\`"
             echo "- URL: ${{ steps.release.outputs.url }}"
             echo "- Compressed asset: \`$COMPRESS\`"
             echo
