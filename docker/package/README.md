@@ -136,6 +136,21 @@ build script 会失败：
 `*.docker.tar`。构建脚本以普通用户运行，rootfs 阶段内部使用 `sudo -n`；
 工作流会优先把 Rust target 放到 `/mnt` 的大磁盘（若可用）。
 
+### 发布 Docker 镜像
+
+`.github/workflows/release-docker.yml` 通过 `uses:` 复用上面的打包流程
+（`workflow_call` 入口，固定 `docker_image: true`），把 Docker 镜像归档发布为
+本仓库的 GitHub Release 资产：
+
+- 手动触发需填写 `tag`（如 `v5.5.0-rust.1`；tag 不存在时在被打包的提交上
+  创建），可选 `prerelease`/`draft`/`observability`/`sveltekit`/`sourcemaps`/
+  `image_tag`/`runner`/`compress`；也可推送 `v*` tag 直接触发（默认压缩）。
+- 下载 artifact 后先用其中自带的 sha256 校验；默认 gzip 压缩（GitHub Release
+  单文件上限 2 GiB），并生成 `*.docker.tar.gz.sha256`。
+  `docker load -i <file>.tar.gz` 可直接加载。
+- Release 已存在时按幂等处理：`--clobber` 上传资产并更新 draft/prerelease
+  标记，失败后重跑不会因 tag 已存在而失败。
+
 ## 保真度说明
 
 - 可观测性是**可选打包特性，默认不包含**。默认镜像不安装

@@ -35,6 +35,40 @@ on:
         required: false
         default: "ubuntu-latest"
 
+  # Reusable entry point: other workflows (e.g. release-docker.yml) call this
+  # with `uses: ./.github/workflows/package.yml`. Keep the inputs in sync with
+  # the workflow_dispatch block above.
+  workflow_call:
+    inputs:
+      observability:
+        description: "Build the observability feature (Prometheus/Alertmanager/prom-wrapper/postgres_exporter)"
+        type: boolean
+        default: false
+      sveltekit:
+        description: "Build and ship the SvelteKit web UI (_sk)"
+        type: boolean
+        default: false
+      sourcemaps:
+        description: "Keep *.map files in /assets-dist"
+        type: boolean
+        default: false
+      docker_image:
+        description: "Import the rootfs and also export a Docker image tar (the 'docker' feature)"
+        type: boolean
+        default: true
+      image_tag:
+        description: "Optional Docker image tag (default: sourcegraph/server:rust-<version><feature-suffix>)"
+        type: string
+        default: ""
+      retention_days:
+        description: "Artifact retention in days"
+        type: string
+        default: "7"
+      runner:
+        description: "Runner label (use a larger/self-hosted runner for release builds)"
+        type: string
+        default: "ubuntu-latest"
+
 permissions:
   contents: read
 

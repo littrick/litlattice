@@ -1,0 +1,193 @@
+name: release-docker
+
+# Build rootfs + Docker image through the reusable package workflow
+# (`package.yml`), then publish the Docker image archive as a GitHub Release
+# asset on this repository. The rootfs tarball is only kept as a run artifact.
+#
+# Trigger it by hand (the tag may not exist yet; it is created at the built
+# commit) or by pushing a `v*` tag.
+#
+# Release assets are capped at 2 GiB per file, and `docker save` output is
+# uncompressed, so the archive is gzipped for the release by default.
+# `docker load -i <file>.tar.gz` accepts it directly.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to publish (e.g. v5.5.0-rust.1); created at the built commit if missing"
+        type: string
+        required: true
+      prerelease:
+        description: "Mark the release as a pre-release"
+        type: boolean
+        default: false
+      draft:
+        description: "Create the release as a draft"
+        type: boolean
+        default: false
+      observability:
+        description: "Build the observability feature (adds -observability to the image name)"
+        type: boolean
+        default: false
+      sveltekit:
+        description: "Build and ship the SvelteKit web UI (_sk)"
+        type: boolean
+        default: false
+      sourcemaps:
+        description: "Keep *.map files in /assets-dist"
+        type: boolean
+        default: false
+      image_tag:
+        description: "Optional Docker image tag (default: sourcegraph/server:rust-<version><feature-suffix>)"
+        type: string
+        default: ""
+      runner:
+        description: "Runner label used for the build (use a larger/self-hosted runner for release builds)"
+        type: string
+        default: "ubuntu-latest"
+      compress:
+        description: "Gzip the Docker archive for the release asset (GitHub caps release assets at 2 GiB)"
+        type: boolean
+        default: true
+  push:
+    tags:
+      - "v*"
+
+# The release step needs to create tags/releases; the package job is granted
+# read-only access explicitly below.
+permissions:
+  contents: write
+
+concurrency:
+  group: release-docker-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  package:
+    name: Package rootfs + Docker image
+    permissions:
+      contents: read
+    uses: ./.github/workflows/package.yml
+    with:
+      observability: ${{ inputs.observability || false }}
+      sveltekit: ${{ inputs.sveltekit || false }}
+      sourcemaps: ${{ inputs.sourcemaps || false }}
+      docker_image: true
+      image_tag: ${{ inputs.image_tag || '' }}
+      runner: ${{ inputs.runner || 'ubuntu-latest' }}
+      retention_days: "7"
+
+  release:
+    name: Publish Docker image release
+    needs: package
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      # On a tag push there are no `inputs`; fall back to the pushed tag.
+      TAG: ${{ inputs.tag || github.ref_name }}
+      DRAFT: ${{ inputs.draft || false }}
+      PRERELEASE: ${{ inputs.prerelease || false }}
+      COMPRESS: ${{ inputs.compress || github.event_name != 'workflow_dispatch' }}
+      EVENT_NAME: ${{ github.event_name }}
+    steps:
+      - name: Download Docker image artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: docker-image-${{ github.run_id }}
+          path: dist
+
+      - name: Validate release inputs
+        run: |
+          set -euo pipefail
+          if ! [[ "$TAG" =~ ^v[0-9A-Za-z][0-9A-Za-z._+-]*$ ]]; then
+            echo "::error::invalid release tag '$TAG' (expected e.g. v5.5.0-rust.1)"
+            exit 1
+          fi
+          # Verify the archive against the checksum written by package.sh
+          # before publishing anything.
+          shopt -s nullglob
+          sums=(dist/*.docker.tar.sha256)
+          if [ "${#sums[@]}" -eq 0 ]; then
+            echo "::error::no *.docker.tar.sha256 in the docker-image artifact"
+            exit 1
+          fi
+          for sum in "${sums[@]}"; do
+            ( cd dist && sha256sum -c "$(basename "$sum")" )
+          done
+          ls -lh dist
+
+      - name: Prepare release assets
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          assets=()
+          for tar in dist/*.docker.tar; do
+            base="$(basename "$tar")"
+            if [ "$COMPRESS" = "true" ]; then
+              # gzip keeps the asset under GitHub's 2 GiB per-file limit;
+              # `docker load -i` reads gzip-compressed archives.
+              gzip -6 -c "$tar" >"dist/$base.gz"
+              ( cd dist && sha256sum "$base.gz" >"$base.gz.sha256" )
+              rm -f "$tar" "dist/$base.sha256"
+              assets+=("dist/$base.gz")
+              assets+=("dist/$base.gz.sha256")
+            else
+              assets+=("$tar")
+              [ -f "dist/$base.sha256" ] && assets+=("dist/$base.sha256")
+            fi
+          done
+          if [ "${#assets[@]}" -eq 0 ]; then
+            echo "::error::the docker-image artifact contains no *.docker.tar"
+            exit 1
+          fi
+          ls -lh dist
+          printf '%s\n' "${assets[@]}" >"$RUNNER_TEMP/assets.txt"
+
+      - name: Publish release
+        run: |
+          set -euo pipefail
+          mapfile -t assets <"$RUNNER_TEMP/assets.txt"
+          repo_args=(--repo "$GITHUB_REPOSITORY")
+          # REST lookup also sees drafts, unlike `gh release view` on some
+          # versions; makes re-runs of a partial publish idempotent.
+          if gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" >/dev/null 2>&1; then
+            # Re-run of a partially published release: refresh the assets and
+            # flags instead of failing.
+            gh release upload "$TAG" "${assets[@]}" "${repo_args[@]}" --clobber
+            gh release edit "$TAG" "${repo_args[@]}" --title "$TAG" \
+              --draft="$DRAFT" --prerelease="$PRERELEASE"
+          else
+            create_args=(release create "$TAG" "${assets[@]}" "${repo_args[@]}"
+              --title "$TAG" --generate-notes)
+            if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+              # Create the tag at the commit that was packaged.
+              create_args+=(--target "$GITHUB_SHA")
+            fi
+            if [ "$DRAFT" = "true" ]; then
+              create_args+=(--draft)
+            fi
+            if [ "$PRERELEASE" = "true" ]; then
+              create_args+=(--prerelease)
+            fi
+            gh "${create_args[@]}"
+          fi
+          gh release view "$TAG" "${repo_args[@]}" --json url,tagName,isDraft,isPrerelease,assets \
+            --jq '"Published \(.tagName) (\(.url))\ndraft=\(.isDraft) prerelease=\(.isPrerelease)", (.assets[] | "- \(.name) \(.size) bytes")'
+
+      - name: Write summary
+        if: always()
+        run: |
+          set -euo pipefail
+          {
+            echo "## Docker release"
+            echo
+            echo "- Tag: \`$TAG\`"
+            echo "- Compressed asset: \`$COMPRESS\`"
+            echo
+            echo "| file | size |"
+            echo "| --- | --- |"
+            if [ -d dist ]; then
+              find dist -maxdepth 1 -type f -printf '| %f | %s bytes |\n' | sort
+            fi
+          } >>"$GITHUB_STEP_SUMMARY"
