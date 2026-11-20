@@ -104,13 +104,9 @@ jobs:
     needs: package
     runs-on: ubuntu-latest
     env:
-      GH_TOKEN: ${{ github.token }}
       # On a tag push there are no `inputs`; fall back to the pushed tag.
       TAG: ${{ inputs.tag || github.ref_name }}
-      DRAFT: ${{ inputs.draft || false }}
-      PRERELEASE: ${{ inputs.prerelease || false }}
       COMPRESS: ${{ inputs.compress || github.event_name != 'workflow_dispatch' }}
-      EVENT_NAME: ${{ github.event_name }}
     steps:
       - name: Download Docker image artifact
         uses: actions/download-artifact@v4
@@ -135,6 +131,7 @@ jobs:
           ls -lh dist
 
       - name: Prepare release assets
+        id: assets
         run: |
           set -euo pipefail
           shopt -s nullglob
@@ -159,38 +156,31 @@ jobs:
             exit 1
           fi
           ls -lh dist
-          printf '%s\n' "${assets[@]}" >"$RUNNER_TEMP/assets.txt"
+          {
+            echo "files<<__EOF__"
+            printf '%s\n' "${assets[@]}"
+            echo "__EOF__"
+          } >>"$GITHUB_OUTPUT"
 
+      # Creates the release (tag at the packaged commit when it does not exist
+      # yet) and uploads the assets; re-runs overwrite the same asset names and
+      # refresh the draft/prerelease flags, matching the previous `gh`
+      # implementation.
       - name: Publish release
-        run: |
-          set -euo pipefail
-          mapfile -t assets <"$RUNNER_TEMP/assets.txt"
-          repo_args=(--repo "$GITHUB_REPOSITORY")
-          # REST lookup also sees drafts, unlike `gh release view` on some
-          # versions; makes re-runs of a partial publish idempotent.
-          if gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" >/dev/null 2>&1; then
-            # Re-run of a partially published release: refresh the assets and
-            # flags instead of failing.
-            gh release upload "$TAG" "${assets[@]}" "${repo_args[@]}" --clobber
-            gh release edit "$TAG" "${repo_args[@]}" --title "$TAG" \
-              --draft="$DRAFT" --prerelease="$PRERELEASE"
-          else
-            create_args=(release create "$TAG" "${assets[@]}" "${repo_args[@]}"
-              --title "$TAG" --generate-notes)
-            if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
-              # Create the tag at the commit that was packaged.
-              create_args+=(--target "$GITHUB_SHA")
-            fi
-            if [ "$DRAFT" = "true" ]; then
-              create_args+=(--draft)
-            fi
-            if [ "$PRERELEASE" = "true" ]; then
-              create_args+=(--prerelease)
-            fi
-            gh "${create_args[@]}"
-          fi
-          gh release view "$TAG" "${repo_args[@]}" --json url,tagName,isDraft,isPrerelease,assets \
-            --jq '"Published \(.tagName) (\(.url))\ndraft=\(.isDraft) prerelease=\(.isPrerelease)", (.assets[] | "- \(.name) \(.size) bytes")'
+        id: release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ env.TAG }}
+          name: ${{ env.TAG }}
+          target_commitish: ${{ github.sha }}
+          generate_release_notes: true
+          draft: ${{ inputs.draft || false }}
+          prerelease: ${{ inputs.prerelease || false }}
+          fail_on_unmatched_files: true
+          overwrite_files: true
+          files: ${{ steps.assets.outputs.files }}
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
 
       - name: Write summary
         if: always()
@@ -200,6 +190,7 @@ jobs:
             echo "## Docker release"
             echo
             echo "- Tag: \`$TAG\`"
+            echo "- URL: ${{ steps.release.outputs.url }}"
             echo "- Compressed asset: \`$COMPRESS\`"
             echo
             echo "| file | size |"
