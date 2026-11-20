@@ -14,6 +14,7 @@
 use std::process::Stdio;
 use std::time::Duration;
 
+use rustix::process::{kill_process_group, Pid, Signal};
 use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 use tokio::task::JoinSet;
 
@@ -186,14 +187,27 @@ where
     });
 }
 
-fn signal_group(pid: u32, signal: &str) {
-    // Negative pid addresses the process group created by `process_group(0)`.
-    let _ = std::process::Command::new("kill")
-        .arg("-s")
-        .arg(signal)
-        .arg("--")
-        .arg(format!("-{pid}"))
-        .status();
+fn signal_group(pid: u32, signal: Signal) {
+    // `kill(-pid, sig)` addresses the process group created by
+    // `process_group(0)`. This must be a syscall, not `/bin/kill`: procps
+    // reparses a negative operand such as `-45` as a signal name (1-31 and
+    // 34-64 are valid signals) even after `--`, so groups with small pids --
+    // the norm inside a PID namespace -- never received any signal. The Go
+    // baseline (`goreman/proc_posix.go`) also signaled with a syscall and
+    // ignored errors; a group that already exited yields `ESRCH` here and is
+    // discarded the same way.
+    // Pid 0 means "the caller's group" and Pid 1 means "every process": a
+    // supervised child is never either, so never let a bad value through.
+    if pid <= 1 {
+        return;
+    }
+    let Ok(pid) = i32::try_from(pid) else {
+        return;
+    };
+    let Some(pid) = Pid::from_raw(pid) else {
+        return;
+    };
+    let _ = kill_process_group(pid, signal);
 }
 
 struct Supervisor {
@@ -246,7 +260,9 @@ impl Supervisor {
             }
             match command.spawn() {
                 Ok(mut child) => {
-                    let pid = child.id().unwrap_or(0);
+                    // A just-spawned child always has an id; never record 0,
+                    // which `signal_group` would have to special-case anyway.
+                    let pid = child.id().expect("spawned child has a pid");
                     if let Some(stdout) = child.stdout.take() {
                         spawn_log_reader(stdout, entry.name.clone(), name_width);
                     }
@@ -267,31 +283,31 @@ impl Supervisor {
             }
         }
         if !all_spawned && self.died_action == DiedAction::Shutdown && !self.pids.is_empty() {
-            self.signal_all("INT");
+            self.signal_all(Signal::INT);
             true
         } else {
             all_spawned
         }
     }
 
-    fn signal_all(&mut self, signal: &str) {
+    fn signal_all(&mut self, signal: Signal) {
         for (_, pid) in &self.pids {
             signal_group(*pid, signal);
         }
     }
 
     async fn shutdown(&mut self) {
-        self.signal_all("INT");
+        self.signal_all(Signal::INT);
         let deadline = tokio::time::Instant::now() + SHUTDOWN_GRACE;
         loop {
             tokio::select! {
                 _ = termination_signal() => {
-                    self.signal_all("KILL");
+                    self.signal_all(Signal::KILL);
                     while self.tasks.join_next().await.is_some() {}
                     return;
                 }
                 _ = tokio::time::sleep_until(deadline) => {
-                    self.signal_all("KILL");
+                    self.signal_all(Signal::KILL);
                     while self.tasks.join_next().await.is_some() {}
                     return;
                 }
@@ -319,16 +335,16 @@ impl Supervisor {
                 _ = termination_signal() => {
                     if !stopping {
                         stopping = true;
-                        self.signal_all("INT");
+                        self.signal_all(Signal::INT);
                         deadline = Some(tokio::time::Instant::now() + SHUTDOWN_GRACE);
                     } else {
-                        self.signal_all("KILL");
+                        self.signal_all(Signal::KILL);
                         while self.tasks.join_next().await.is_some() {}
                         return 0;
                     }
                 }
                 _ = tokio::time::sleep_until(sleep_until), if deadline.is_some() => {
-                    self.signal_all("KILL");
+                    self.signal_all(Signal::KILL);
                     while self.tasks.join_next().await.is_some() {}
                     return 0;
                 }
@@ -597,5 +613,29 @@ mod tests {
         assert_eq!(outcome.sigint_targets, vec!["a", "b"]);
         assert_eq!(outcome.sigkill_targets, vec!["a", "b"]);
         assert_eq!(outcome.exit_code, 0);
+    }
+
+    // `signal_group` must use the syscall, not `/bin/kill`: procps treats a
+    // negative operand in 1-31/34-64 as a *signal name*, so a group whose pid
+    // is small (the norm in a PID namespace) silently received nothing.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn signal_group_signals_the_whole_child_group() {
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command.arg("-c").arg("exec sleep 60");
+        command.stdout(Stdio::null()).stderr(Stdio::null());
+        command.process_group(0);
+        let mut child = command.spawn().expect("spawn child");
+        let pid = child.id().expect("spawned child has a pid");
+
+        signal_group(pid, Signal::INT);
+        let status = tokio::time::timeout(SHUTDOWN_GRACE, child.wait())
+            .await
+            .expect("child receives SIGINT")
+            .expect("wait for child");
+        assert!(!status.success(), "child should die from SIGINT");
+
+        // The group is gone; the resulting ESRCH is discarded silently.
+        signal_group(pid, Signal::KILL);
     }
 }
